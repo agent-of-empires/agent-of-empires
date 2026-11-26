@@ -847,6 +847,7 @@ mod tests {
             cancel_capable: true,
             model: None,
             background: false,
+            runs: 1,
         };
         state.transcript.set_subagents(vec![child.clone()]);
         state.reconcile_interaction_authority();

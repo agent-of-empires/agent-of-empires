@@ -66,3 +66,25 @@ it("holds the trimmed row count while the bottom row oscillates, then trims once
   act(() => vi.advanceTimersByTime(SHRINK_DELAY_MS));
   expect(view.rowCount()).toBe(body.indexOf("INPUTBOX>") + 1);
 });
+
+it("trims to the rows present when the shrink fires, not those when it was scheduled", () => {
+  const blank = (n: number) => Array.from({ length: n }, () => "");
+  const rows = 30;
+  const full = linesFrame(
+    Array.from({ length: rows }, (_, i) => `seq ${i + 1}`),
+    { rows, history: 0 },
+  );
+  const cleared = linesFrame(["$ ", ...blank(rows - 1)], { rows, history: 0 });
+  const listing = Array.from({ length: 12 }, (_, i) => `file ${i + 1}`);
+  const listed = linesFrame(["$ ls -la", ...listing, "$ ", ...blank(rows - 14)], { rows, history: 0 });
+  const view = renderLiveTerminal({ frame: full });
+  expect(view.rowCount()).toBe(rows);
+
+  view.rerenderWith({ frame: cleared });
+  act(() => vi.advanceTimersByTime(SHRINK_DELAY_MS / 2));
+  // The listing lands while the shrink scheduled by `clear` is still pending.
+  view.rerenderWith({ frame: listed });
+  act(() => vi.advanceTimersByTime(SHRINK_DELAY_MS));
+  expect(view.rowCount()).toBe(14);
+  expect(screen.getByText("file 12")).toBeTruthy();
+});

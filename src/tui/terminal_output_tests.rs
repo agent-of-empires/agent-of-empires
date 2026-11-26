@@ -1,5 +1,22 @@
 use super::*;
 
+#[test]
+fn completed_terminal_write_survives_a_late_flush() {
+    let mut file = tempfile::tempfile().unwrap();
+    let cancel = CancellationToken::new();
+    let mut writer = DeadlineWriter {
+        file: &mut file,
+        deadline: Instant::now() + Duration::from_secs(5),
+        cancel: Some(&cancel),
+        written: 0,
+    };
+    writer.write_all(b"complete").unwrap();
+    writer.deadline = Instant::now();
+    cancel.cancel();
+    writer.flush().unwrap();
+    assert_eq!(writer.written, b"complete".len());
+}
+
 #[cfg(unix)]
 #[test]
 fn stalled_terminal_bounds_actual_writes_and_recovers_framing_before_later_bytes() {

@@ -14,8 +14,8 @@ use super::ConfirmationToken;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
     ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
-    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION, ICON_UNKNOWN,
-    ICON_UNREAD,
+    ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_SUGGESTED, ICON_TERMINAL, ICON_TRASH_SECTION,
+    ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::session::config::{GroupByMode, NarrowLayout, RowTagMode, SidebarPosition, SortOrder};
 use crate::session::{Item, Status};
@@ -1604,10 +1604,10 @@ impl HomeView {
             }
         };
         let borders = layout.list_borders();
-        // The Trash / Archived sections render in a pinned bottom shelf instead of
-        // scrolling with the list. They are a contiguous suffix of `flat_items` starting at
-        // `list_len`, with a divider between; when that divider shows it carries the sort
-        // indicator, so the bottom-border copy is suppressed.
+        // The Suggested row and the Archived / Trash sections render in a pinned bottom
+        // shelf instead of scrolling with the list. They are a contiguous suffix of
+        // `flat_items` starting at `list_len`, with a divider between; when that divider
+        // shows it carries the sort indicator, so the bottom-border copy is suppressed.
         let shelf_start = self.shelf_start();
         let list_len = shelf_start.unwrap_or(self.flat_items.len());
         let show_divider = shelf_start.is_some() && list_len > 0;
@@ -1672,7 +1672,7 @@ impl HomeView {
             );
         }
 
-        if !self.has_instances() && !self.has_any_groups() {
+        if !self.has_instances() && !self.has_any_groups() && self.flat_items.is_empty() {
             let empty_text = vec![
                 Line::from(""),
                 Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),
@@ -2067,6 +2067,18 @@ impl HomeView {
                 }
                 (icon, text, style)
             }
+            // A provider that failed to refresh marks the row; its pane says why.
+            Item::Suggested { total, failed } => (
+                ICON_SUGGESTED,
+                Cow::Owned(if *failed {
+                    format!("Suggested ({total}) !")
+                } else {
+                    format!("Suggested ({total})")
+                }),
+                Style::default()
+                    .fg(if *failed { theme.error } else { theme.group })
+                    .bold(),
+            ),
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
                     // Each view mode contributes only the live-state glyph and color for
@@ -3320,6 +3332,9 @@ impl HomeView {
                 &self.metrics,
                 self.system_health_scroll,
             );
+            return;
+        }
+        if self.render_suggestions_pane(frame, area, theme) {
             return;
         }
         let compact = responsive::is_narrow(area.width, self.narrow_breakpoint);
@@ -4583,7 +4598,14 @@ impl HomeView {
         // Shortcut groups carry a priority, optional key action, and display spans.
         let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
         let mut serving_status = None;
-        if !self.selected_is_trashed() {
+        // The focused suggestions pane lists its own keys.
+        if self.suggestions_focused {
+            groups.push((
+                0,
+                Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                mk("Esc", "Sessions"),
+            ));
+        } else if !self.selected_is_trashed() {
             // Other-TUI indicator, shown when more than one `aoe` TUI is alive: two TUIs
             // watching the same sessions clash over pane sizes (tmux reflows to the smallest
             // client). Recomputed on a throttle in the app loop, not per frame.
@@ -4615,6 +4637,7 @@ impl HomeView {
             // Enter to live-send or tmux attach and Tab does the other, so both labels resolve
             // here and can never advertise the same action. Acp rows ignore the setting and
             // keep the plain "Attach" label. Mirrors `HelpOverlay`'s wording.
+            let on_suggested = self.on_suggested_row();
             let (enter_action_text, tab_action_text) = match self.flat_items.get(self.cursor) {
                 Some(Item::Group {
                     collapsed: true, ..
@@ -4637,6 +4660,7 @@ impl HomeView {
                         (Some("Attach"), Some("Live"))
                     }
                 }
+                Some(Item::Suggested { .. }) => (Some("Browse"), None),
                 None => (None, None),
             };
             // After another window took live control: its status, then the key that takes
@@ -4675,17 +4699,20 @@ impl HomeView {
                 }
             }
 
-            let (click, key) = bound(ActionId::ToggleView);
-            groups.push((2, click, mk(&key, "View")));
-            if matches!(self.view_mode, ViewMode::Tool(_)) {
-                let (click, key) = bound(ActionId::ToolPicker);
-                groups.push((1, click, mk(&key, "Back")));
-            } else if self.has_tool_targets() {
-                let (click, key) = bound(ActionId::ToolPicker);
-                groups.push((2, click, mk(&key, "Tools")));
+            // The Suggested row is not a session: view, tool and group keys do not apply.
+            if !on_suggested {
+                let (click, key) = bound(ActionId::ToggleView);
+                groups.push((2, click, mk(&key, "View")));
+                if matches!(self.view_mode, ViewMode::Tool(_)) {
+                    let (click, key) = bound(ActionId::ToolPicker);
+                    groups.push((1, click, mk(&key, "Back")));
+                } else if self.has_tool_targets() {
+                    let (click, key) = bound(ActionId::ToolPicker);
+                    groups.push((2, click, mk(&key, "Tools")));
+                }
+                let (click, key) = bound(ActionId::GroupBy);
+                groups.push((3, click, mk(&key, "Group")));
             }
-            let (click, key) = bound(ActionId::GroupBy);
-            groups.push((3, click, mk(&key, "Group")));
 
             // c: container/host toggle hint for sandboxed sessions in Terminal view
             if self.view_mode == ViewMode::Terminal {
@@ -4716,14 +4743,14 @@ impl HomeView {
                 let (click, key) = bound(ActionId::SendMessage);
                 groups.push((1, click, mk(&key, "Msg")));
             }
-            if !self.flat_items.is_empty() {
+            if !self.flat_items.is_empty() && !on_suggested {
                 let (click, key) = bound(ActionId::Delete);
                 groups.push((3, click, mk(&key, "Del")));
             }
             // Archive / Snooze render only in Attention sort: they shape the Attention queue
             // and do nothing visible elsewhere, so they would just take footer space.
             let in_attention = self.sort_order == SortOrder::Attention;
-            if in_attention {
+            if in_attention && !on_suggested {
                 if !self.flat_items.is_empty() {
                     let (click, key) = bound(ActionId::ToggleArchive);
                     groups.push((1, click, mk(&key, "Archive")));
@@ -4757,8 +4784,10 @@ impl HomeView {
 
             let (click, key) = bound(ActionId::SearchStart);
             groups.push((4, click, mk_key(&key)));
-            let (click, key) = bound(ActionId::Diff);
-            groups.push((4, click, mk(&key, "Diff")));
+            if !on_suggested {
+                let (click, key) = bound(ActionId::Diff);
+                groups.push((4, click, mk(&key, "Diff")));
+            }
             // The R entry carries one state: a Daemon problem or limit, else the Web dashboard.
             let attention = self.daemon_attention();
             if attention.is_some() || !super::input::web_plugin_disabled() {

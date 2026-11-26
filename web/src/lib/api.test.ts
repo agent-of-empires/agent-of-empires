@@ -181,7 +181,6 @@ const requestCases: RequestCase[] = [
   ["GET /api/themes", () => api.fetchThemes(), { respond: json(["empire"]), result: ["empire"] }],
   ["GET /api/themes/My%20Theme", () => api.fetchResolvedTheme("My Theme")],
   ["GET /api/theme/current", () => api.fetchCurrentTheme()],
-  ["GET /api/sounds", () => api.fetchSounds(), { respond: json(["chime.wav"]), result: ["chime.wav"] }],
   [
     "GET /api/about",
     () => api.fetchAbout(),
@@ -855,7 +854,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["resolveMcpConflict", () => api.resolveMcpConflict("n", "a", "aoe", "fp"), "error"],
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
-  ["fetchSoundBlob", () => api.fetchSoundBlob("x.wav"), null],
+  ["fetchSound", () => api.fetchSound("idle"), null],
   ["fetchProfileAgents", () => api.fetchProfileAgents("work"), null],
   ["pullSandboxImage", () => api.pullSandboxImage(), { ok: false }],
   ["dismissSandboxImage", () => api.dismissSandboxImage("sha256:new"), false],
@@ -1140,10 +1139,10 @@ it("keeps a dispatched image upload result after write policy is revoked", async
   expect(fetchSpy).toHaveBeenCalledTimes(1);
 });
 
-it("fetchSoundBlob returns the file as a Blob", async () => {
+it("fetchSound returns the event's bytes", async () => {
   fetchSpy.mockResolvedValueOnce(new Response("bytes"));
-  expect(await (await api.fetchSoundBlob("my sound.wav"))!.text()).toBe("bytes");
-  expect(lastCall().url).toBe("/api/sounds/file/my%20sound.wav");
+  expect(new TextDecoder().decode((await api.fetchSound("idle"))!)).toBe("bytes");
+  expect(lastCall().url).toBe("/api/sounds/idle");
 });
 
 describe("fetchCityHallBundle", () => {
@@ -1404,6 +1403,85 @@ describe("createSession errors", () => {
     expect(await api.createSession(body)).toEqual({ ok: false, error: "restarted", outcomeUnknown: true });
     offline();
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline", network: true });
+  });
+
+  it("resets a preset by query, without a DELETE body", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    expect(await api.resetSuggestionPreset("acme.sugg", "assigned")).toEqual({ ok: true, data: undefined });
+    const [url, init] = fetchSpy.mock.calls.at(-1)!;
+    expect(url).toBe("/api/suggestions/presets?provider_id=acme.sugg&criterion=assigned");
+    expect(init?.method).toBe("DELETE");
+    expect(init?.body).toBeUndefined();
+  });
+
+  describe("startSuggestion", () => {
+    const reply = (status: number, body: object) =>
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify(body), { status }));
+
+    it("posts the item and options, and reads the 201 answer", async () => {
+      reply(201, { session_id: "s1", title: "Fix it" });
+      expect(await api.startSuggestion("acme.sugg", "i1", { project: { path: "/p" } })).toEqual({
+        kind: "started",
+        sessionId: "s1",
+        title: "Fix it",
+      });
+      const [url, init] = fetchSpy.mock.calls.at(-1)!;
+      expect(url).toBe("/api/suggestions/start");
+      expect(JSON.parse(init?.body as string)).toEqual({ provider_id: "acme.sugg", id: "i1", project: { path: "/p" } });
+    });
+
+    it.each([
+      [
+        "409 already_started",
+        409,
+        { error: "already_started", session_id: "s9" },
+        { kind: "already_started", sessionId: "s9" },
+      ],
+      [
+        "409 hooks_need_trust",
+        409,
+        { error: "hooks_need_trust", commands: { on_create: ["npm ci"] }, review_fingerprint: "fp" },
+        {
+          kind: "hooks_need_trust",
+          review: { error: "hooks_need_trust", commands: { on_create: ["npm ci"] }, review_fingerprint: "fp" },
+        },
+      ],
+      [
+        "422 start_failed",
+        422,
+        { error: "start_failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
+        { kind: "failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
+      ],
+      ["409 trust_changed", 409, { error: "trust_changed" }, { kind: "trust_changed" }],
+      ["409 stale_suggestion", 409, { error: "stale_suggestion", message: "gone" }, { kind: "stale" }],
+      ["400 no_project", 400, { error: "no_project", hint: "link_project" }, { kind: "no_project" }],
+    ])("maps %s", async (_name, status, body, expected) => {
+      reply(status, body);
+      expect(await api.startSuggestion("acme.sugg", "i1")).toEqual(expected);
+    });
+
+    it("reports anything else as an error, including no answer", async () => {
+      reply(500, { error: "boom", message: "server broke" });
+      expect(await api.startSuggestion("acme.sugg", "i1")).toMatchObject({ kind: "error" });
+      offline();
+      expect(await api.startSuggestion("acme.sugg", "i1")).toMatchObject({
+        kind: "error",
+        error: "Network error: offline",
+      });
+    });
+  });
+
+  it("tells a 2xx with an unreadable body apart from a network error on suggestion requests", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("<html>proxy</html>", { status: 200 }));
+    expect(await api.refreshSuggestions()).toEqual({
+      ok: false,
+      error: "Unexpected response from the server. Reload to see the current state.",
+      stale: false,
+    });
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
+    expect(await api.refreshSuggestions()).toEqual({ ok: true, data: undefined });
+    offline();
+    expect(await api.refreshSuggestions()).toMatchObject({ ok: false, error: "Network error: offline" });
   });
 
   it("reads create progress, null once the create has finished", async () => {

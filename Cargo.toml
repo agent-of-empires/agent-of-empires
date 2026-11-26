@@ -4,7 +4,7 @@ exclude = ["vendor/pulldown-cmark", "vendor/unicode-width", "vendor/crossterm"]
 
 [package]
 name = "agent-of-empires"
-version = "1.25.0"
+version = "1.26.0"
 edition = "2021"
 rust-version = "1.95"
 authors = ["Agent of Empires Contributors"]

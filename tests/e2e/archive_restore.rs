@@ -2,7 +2,7 @@ use serial_test::parallel;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::harness::{require_tmux, TuiTestHarness};
+use crate::harness::{recordings_dir, require_tmux, TuiTestHarness};
 
 /// Read sessions.json from the harness's isolated home.
 fn read_sessions_json(h: &TuiTestHarness) -> serde_json::Value {
@@ -938,16 +938,7 @@ fn trash_retained_transcript_is_read_only() {
                 .ok_or_else(|| format!("expected {marker:?} in clipboard, got {copied:?}"))
         });
     }
-    if std::env::var_os("RECORD_E2E").is_some() {
-        let directory = std::path::Path::new("target/e2e-recordings");
-        std::fs::create_dir_all(directory).unwrap();
-        std::fs::write(
-            directory.join("trash-unfinished.ansi"),
-            h.capture_screen_styled(),
-        )
-        .unwrap();
-        std::fs::write(directory.join("trash-unfinished.txt"), h.capture_screen()).unwrap();
-    }
+    record_trash_management(&h, "trash-unfinished");
     let before = h.read_sessions();
     let events = EventStore::open(&app_dir.join("acp_events.db"), 0).unwrap();
     events
@@ -980,15 +971,7 @@ fn trash_retained_transcript_is_read_only() {
             .then_some(())
             .ok_or_else(|| format!("expected fresh retained output, got {copied:?}"))
     });
-    if std::env::var_os("RECORD_E2E").is_some() {
-        let directory = std::path::Path::new("target/e2e-recordings");
-        std::fs::write(
-            directory.join("trash-late-output.ansi"),
-            h.capture_screen_styled(),
-        )
-        .unwrap();
-        std::fs::write(directory.join("trash-late-output.txt"), h.capture_screen()).unwrap();
-    }
+    record_trash_management(&h, "trash-late-output");
     let events = EventStore::open(&app_dir.join("acp_events.db"), 0).unwrap();
     events
         .record(
@@ -1035,15 +1018,7 @@ fn trash_retained_transcript_is_read_only() {
             .then_some(())
             .ok_or_else(|| format!("expected stopped retained output, got {copied:?}"))
     });
-    if std::env::var_os("RECORD_E2E").is_some() {
-        let directory = std::path::Path::new("target/e2e-recordings");
-        std::fs::write(
-            directory.join("trash-late-stop.ansi"),
-            h.capture_screen_styled(),
-        )
-        .unwrap();
-        std::fs::write(directory.join("trash-late-stop.txt"), h.capture_screen()).unwrap();
-    }
+    record_trash_management(&h, "trash-late-stop");
     h.send_keys("End");
     h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
     for _ in 0..10 {
@@ -1112,16 +1087,7 @@ fn trash_retained_transcript_is_read_only() {
             .then_some(())
             .ok_or_else(|| format!("expected retained text in isolated clipboard, got {copied:?}"))
     });
-    if std::env::var_os("RECORD_E2E").is_some() {
-        let directory = std::path::Path::new("target/e2e-recordings");
-        std::fs::create_dir_all(directory).unwrap();
-        std::fs::write(
-            directory.join("trash-readonly.ansi"),
-            h.capture_screen_styled(),
-        )
-        .unwrap();
-        std::fs::write(directory.join("trash-readonly.txt"), h.capture_screen()).unwrap();
-    }
+    record_trash_management(&h, "trash-readonly");
     h.send_keys("PageDown");
     h.wait_for_absent("retained-0010", Duration::from_secs(5));
     h.send_keys("Escape");
@@ -1173,19 +1139,7 @@ fn trash_retained_transcript_is_read_only() {
         .find(|row| row["id"] == empty_id)
         .expect("peer-restored session must survive old confirmation");
     assert!(restored["trashed_at"].is_null());
-    if std::env::var_os("RECORD_E2E").is_some() {
-        let directory = std::path::Path::new("target/e2e-recordings");
-        std::fs::write(
-            directory.join("trash-purge-cancelled.ansi"),
-            h.capture_screen_styled(),
-        )
-        .unwrap();
-        std::fs::write(
-            directory.join("trash-purge-cancelled.txt"),
-            h.capture_screen(),
-        )
-        .unwrap();
-    }
+    record_trash_management(&h, "trash-purge-cancelled");
     h.send_keys("Enter");
     h.wait_for_absent("No readable retained ACP content", Duration::from_secs(5));
     h.wait_for("Archived (");
@@ -1384,9 +1338,7 @@ fn trash_management_menu(h: &mut TuiTestHarness, title: &str) {
 
 fn record_trash_management(h: &TuiTestHarness, name: &str) {
     if std::env::var_os("RECORD_E2E").is_some() {
-        let directory =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/e2e-recordings");
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = recordings_dir();
         std::fs::write(
             directory.join(format!("{name}.ansi")),
             h.capture_screen_styled(),

@@ -3227,6 +3227,7 @@ mod tests {
             cancel_capable: true,
             model: None,
             background: false,
+            runs: 0,
         };
         let mut state = test_state();
         state
@@ -4325,6 +4326,7 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: false,
+                runs: 0,
             }]);
             let mut want: Vec<String> = head.into_iter().map(Into::into).collect();
             want.push("  tool ▶ · Read".into());
@@ -4365,6 +4367,7 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: false,
+                runs: 0,
             }]);
             let lines = tool_lines(&t);
             assert_eq!(lines[0], head);

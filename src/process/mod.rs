@@ -960,7 +960,11 @@ fn wait_with_timeout_inner_with_clock(
                 platform::kill_process_group(child);
             }
             let _ = child.kill();
-            let _ = child.wait();
+            if cleanup.is_some() {
+                poll_killed_status_child(child);
+            } else {
+                let _ = child.wait();
+            }
             return Ok(None);
         }
         let wake_at = if kill_process_group && !termination_requested {
@@ -970,6 +974,17 @@ fn wait_with_timeout_inner_with_clock(
         };
         sleep(poll.min(wake_at.saturating_duration_since(now)));
         poll = (poll * 2).min(WAIT_POLL_INTERVAL);
+    }
+}
+
+fn poll_killed_status_child(child: &mut Child) {
+    let deadline = Instant::now() + WAIT_POLL_INTERVAL;
+    while matches!(child.try_wait(), Ok(None)) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
     }
 }
 
@@ -1037,7 +1052,18 @@ pub(crate) fn run_status_with_timeout_process_group(
     if result.is_err() {
         platform::kill_process_group(&child);
         let _ = child.kill();
-        let _ = child.wait();
+        poll_killed_status_child(&mut child);
+    }
+    if !matches!(result, Ok(Some(_))) && matches!(child.try_wait(), Ok(None)) {
+        // A killed child may still be in uninterruptible sleep. Shutdown must not join it.
+        if let Err(error) = std::thread::Builder::new()
+            .name("status-child-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            })
+        {
+            tracing::warn!(%error, "could not start status child reaper");
+        }
     }
     result
 }

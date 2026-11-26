@@ -384,6 +384,7 @@ impl App {
         if self.suppress_first_run_dialogs {
             return false;
         }
+        self.home.arm_suggested_sessions_tip();
         let app_state = match AppStateConfig::load() {
             Ok(state) => state,
             Err(error) => {
@@ -953,6 +954,7 @@ impl App {
                                                             || self.home.handle_dialog_click(mouse.column, mouse.row)
                                                             || self.home.handle_sidebar_collapse_click(mouse.column, mouse.row)
                                                             || self.home.handle_diagnostics_click(mouse.column, mouse.row)
+                                                            || self.home.handle_suggestions_pane_click(mouse.column, mouse.row)
                                                         {
                                                         } else if self.home.handle_tips_badge_click(mouse.column, mouse.row) {
                                                             let _ = self.home.clear_preview_selection();
@@ -1175,6 +1177,7 @@ impl App {
                                     None
                                 } else if self.home.handle_sidebar_collapse_click(mouse.column, mouse.row)
                                     || self.home.handle_diagnostics_click(mouse.column, mouse.row)
+                                    || self.home.handle_suggestions_pane_click(mouse.column, mouse.row)
                                     || self.home.handle_tips_badge_click(mouse.column, mouse.row)
                                 {
                                     let _ = self.home.clear_preview_selection();
@@ -1454,6 +1457,7 @@ impl App {
             needs_full_refresh |= self.home.apply_structured_approval_results();
 
             needs_full_refresh |= self.home.apply_restart_results();
+            needs_full_refresh |= self.home.apply_suggestions_results();
 
             needs_full_refresh |= self.home.poll_store_move();
 
@@ -2279,7 +2283,9 @@ impl App {
             return Ok(());
         }
         let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
-        if !ctrl_c && self.home.retained_reader_focused() && !self.home.has_non_live_send_overlay()
+        if !ctrl_c
+            && (self.home.retained_reader_focused() || self.home.suggestions_pane_focused())
+            && !self.home.has_non_live_send_overlay()
         {
             let _ = self.home.handle_key(key, self.update_info.as_ref());
             return Ok(());
