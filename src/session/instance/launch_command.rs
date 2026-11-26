@@ -3646,16 +3646,14 @@ sandbox = "unsupported"
             let root = std::fs::canonicalize(temp_dir.path()).unwrap();
             let temp = root.as_path();
             // As on a Mac: the host base outside the shared HOME (`temp`), the sandbox base under
-            // the app dir inside it.
+            // the app dir inside it. Both runtimes use their own bases, never the per-user one.
             let host_hooks = tempfile::tempdir().unwrap();
             let sandbox_base = temp.join("app").join("sandbox-hooks");
-            let _hooks = (runtime == "colima").then(|| {
-                std::fs::create_dir_all(temp.join("app")).unwrap();
-                crate::hooks::test_support::BaseGuard::with_bases(
-                    host_hooks.path().join("aoe-hooks"),
-                    sandbox_base.clone(),
-                )
-            });
+            std::fs::create_dir_all(temp.join("app")).unwrap();
+            let _hooks = crate::hooks::test_support::BaseGuard::with_bases(
+                host_hooks.path().join("aoe-hooks"),
+                sandbox_base.clone(),
+            );
             let _app = crate::session::test_support::isolate_app_dir_at(&temp.join("app"));
             let project = temp.join("project");
             std::fs::create_dir_all(&project).unwrap();
