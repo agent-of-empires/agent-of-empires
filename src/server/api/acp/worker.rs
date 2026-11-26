@@ -681,7 +681,8 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     }
 }
 
-/// A dormant `Idle` row is resumed too, but is not a Retry from `Stopped`.
+/// A dormant `Idle` row is resumed too, but is not a Retry from `Stopped`. A `Starting` row
+/// gives `Error` here, but a takeover keeps the attempt it replaces.
 fn retry_origin(instance: &crate::session::Instance) -> RetryOrigin {
     if instance.status == crate::session::Status::Stopped {
         RetryOrigin::ResumedStop

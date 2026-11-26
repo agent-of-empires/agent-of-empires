@@ -794,6 +794,8 @@ pub(crate) struct RetryAttempt {
     watermark: u64,
     /// The launch's epoch: once its worker is installed, the attempt can no longer roll back.
     epoch: u64,
+    /// The status the first attempt started from; a takeover keeps it.
+    origin: RetryOrigin,
     /// The attempt's launch failed and its rollback restored the Error. Kept until the new worker
     /// reports past its cutoff, since its startup error can arrive after the rollback.
     rolled_back: bool,
@@ -820,6 +822,7 @@ impl RetryAttempt {
             attempt: 0,
             watermark: 0,
             epoch: 0,
+            origin: RetryOrigin::Error,
             rolled_back: true,
         }
     }
@@ -972,7 +975,7 @@ pub(crate) struct RetryStartingGuard {
 
 impl RetryStartingGuard {
     /// Moves a row at `origin`'s status to `Starting`, or takes over the `Starting` an earlier
-    /// attempt left; `None` otherwise. Callers hold the session's launch admission (a spawn
+    /// attempt left, keeping that attempt's origin; `None` otherwise. Callers hold the session's launch admission (a spawn
     /// reservation, or a restart claim with the old worker gone), which proves no earlier attempt
     /// is still launching, so taking over is safe even before that attempt's guard has dropped.
     /// `epoch` is that admission's launch epoch.
@@ -991,8 +994,8 @@ impl RetryStartingGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let took_over = inst.status == Status::Starting;
-        match (inst.status, owners.get(id)) {
-            (Status::Starting, Some(earlier)) if !earlier.rolled_back => {}
+        let origin = match (inst.status, owners.get(id)) {
+            (Status::Starting, Some(earlier)) if !earlier.rolled_back => earlier.origin,
             (Status::Starting, _) => return None,
             _ => {
                 apply_status_intent(inst, origin.policy(), Status::Starting, &state.status_tx);
@@ -1001,14 +1004,16 @@ impl RetryStartingGuard {
                 }
                 state.note_row_mutation();
                 state.runtime.request_publish();
+                origin
             }
-        }
+        };
         owners.insert(
             id.to_string(),
             RetryAttempt {
                 attempt,
                 watermark,
                 epoch,
+                origin,
                 rolled_back: false,
             },
         );
@@ -3046,6 +3051,59 @@ mod tests {
             got,
             [(1, Status::Starting), (0, Status::Idle), (0, Status::Idle)]
         );
+    }
+
+    /// A Retry that takes over a failed resumed stop's `Starting` keeps that origin, though its
+    /// handler read the `Starting` row as an `Error` one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_takeover_keeps_the_resumed_stops_origin() {
+        use crate::acp::supervisor::SupervisorError;
+        use retry_test_gate::RevertGate;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let spawn_error =
+            || SupervisorError::Acp(crate::acp::acp_client::AcpError::Spawn("boom".into()));
+        for (case, fails, want) in [
+            ("takeover-cancelled", false, (0, Status::Idle)),
+            ("takeover-failed", true, (1, Status::Starting)),
+        ] {
+            let mut inst = stopped_structured_instance();
+            inst.status = Status::Idle;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            let (gate, parked) = RevertGate::arm(&id);
+            let earlier =
+                RetryStartingGuard::begin(&state, &id, RetryOrigin::ResumedStop, NO_LAUNCH)
+                    .await
+                    .expect("a resumed stop starts");
+            earlier.fail("codex", &spawn_error());
+            tokio::time::timeout(std::time::Duration::from_secs(10), parked)
+                .await
+                .expect("the earlier rollback parks")
+                .expect("gate open");
+            let later = RetryStartingGuard::begin(&state, &id, RetryOrigin::Error, NO_LAUNCH)
+                .await
+                .unwrap_or_else(|| panic!("{case}: the later attempt takes over"));
+            gate.release();
+            if fails {
+                later.fail("codex", &spawn_error());
+            } else {
+                drop(later);
+            }
+            drained(&state).await;
+            let published = state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .into_iter()
+                .filter(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+                .count();
+            assert_eq!(
+                (published, state.instances.read().await[0].status),
+                want,
+                "{case}"
+            );
+        }
     }
 
     /// #5921: a Retry admitted while an earlier attempt's rollback is still to run owns the row.
