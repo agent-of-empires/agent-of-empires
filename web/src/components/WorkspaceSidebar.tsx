@@ -41,6 +41,7 @@ import { SessionRow } from "./sidebar/SessionRow";
 import { FacetPanel, SidebarToolbar } from "./sidebar/SidebarToolbar";
 import { SidebarNav } from "./sidebar/SidebarNav";
 import { SidebarLegend } from "./sidebar/SidebarLegend";
+import { useDrawerSwipe } from "./sidebar/useDrawerSwipe";
 import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
@@ -111,6 +112,9 @@ interface Props {
   axis: SidebarAxis;
   onAxisChange: (axis: SidebarAxis) => void;
 }
+
+/** The phone drawer moves on the iOS sheet curve; reduced motion skips it. */
+const DRAWER_MOTION = "duration-[400ms] ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
 
 export function WorkspaceSidebar(props: Props) {
   const {
@@ -306,13 +310,21 @@ export function WorkspaceSidebar(props: Props) {
     if (!filterOpen) requestAnimationFrame(() => filterRef.current?.focus());
   };
 
+  const swipe = useDrawerSwipe({
+    open,
+    side: rightSide ? "right" : "left",
+    onClose: () => props.onOpenChange(false),
+  });
+  const dragging = swipe.offset !== null;
+
   // The phone overlay starts under the header, which the app root insets below the status bar.
   return (
     <SidebarCompactContext.Provider value={compact}>
       <div
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] inset-x-0 bottom-0 z-30 md:hidden transition-opacity duration-300 ${
-          open ? "bg-black/50" : "opacity-0 pointer-events-none"
-        }`}
+        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] inset-x-0 bottom-0 z-30 md:hidden bg-black/50 ${DRAWER_MOTION} ${
+          dragging ? "transition-none" : "transition-opacity"
+        } ${open ? "" : "opacity-0 pointer-events-none"}`}
+        style={dragging ? { opacity: swipe.progress } : undefined}
         onClick={() => props.onOpenChange(false)}
       />
       <div
@@ -321,9 +333,12 @@ export function WorkspaceSidebar(props: Props) {
         aria-label="Sessions sidebar"
         tabIndex={-1}
         ref={panelRef}
-        style={{ width: effectiveWidth }}
+        style={{ width: effectiveWidth, ...(dragging ? { transform: `translateX(${swipe.offset}px)` } : {}) }}
+        {...swipe.handlers}
         data-compact={compact ? "true" : undefined}
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 max-md:max-w-full md:static md:z-auto bg-surface-800 md:bg-transparent border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
+        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 max-md:max-w-full md:static md:z-auto bg-surface-800 md:bg-transparent border-surface-700/60 flex flex-col md:h-full shrink-0 max-md:touch-pan-y max-md:shadow-2xl ${DRAWER_MOTION} ${
+          dragging ? "transition-none" : "transition-transform"
+        } md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
           rightSide ? "right-0 border-l md:border-l-0" : "left-0 border-r md:border-r-0"
         } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
       >
