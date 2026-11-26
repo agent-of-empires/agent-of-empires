@@ -302,9 +302,15 @@ impl GitWorktree {
         }
     }
 
-    /// The registered checkout path holding `branch`, including a stale locked
-    /// entry whose checkout no longer exists.
+    /// The first registered checkout path holding `branch`, including a stale
+    /// locked entry whose checkout no longer exists.
     pub(crate) fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+        Ok(self.worktree_paths_for_branch(branch)?.into_iter().next())
+    }
+
+    /// Every registered checkout path holding `branch`; `worktree add --force`
+    /// can register one branch more than once.
+    fn worktree_paths_for_branch(&self, branch: &str) -> Result<Vec<PathBuf>> {
         let output = run_git(&self.repo_path, ["worktree", "list", "--porcelain", "-z"])?;
         if !output.status.success() {
             return Err(GitError::WorktreeCommandFailed(format!(
@@ -314,24 +320,26 @@ impl GitWorktree {
         }
         let wanted = format!("refs/heads/{branch}");
         let mut path = None;
+        let mut paths = Vec::new();
         for field in output.stdout.split(|byte| *byte == 0) {
             if let Some(raw_path) = field.strip_prefix(b"worktree ") {
                 path = Some(PathBuf::from(
                     String::from_utf8_lossy(raw_path).into_owned(),
                 ));
             } else if field.strip_prefix(b"branch ") == Some(wanted.as_bytes()) {
-                return Ok(path);
+                paths.extend(path.clone());
             }
         }
-        Ok(None)
+        Ok(paths)
     }
 
     /// The checkout holding `branch` when it still exists on disk. A stale
-    /// entry whose checkout is gone is `None`; `delete_branch` reaps those.
+    /// entry whose checkout is gone is skipped; `delete_branch` reaps those.
     pub(crate) fn live_checkout_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
         Ok(self
-            .worktree_path_for_branch(branch)?
-            .filter(|path| matches!(path.try_exists(), Ok(true))))
+            .worktree_paths_for_branch(branch)?
+            .into_iter()
+            .find(|path| matches!(path.try_exists(), Ok(true))))
     }
 
     /// Unlock and prune the one entry git ties to the branch being deleted.
@@ -742,6 +750,37 @@ mod tests {
         );
         git.lock_worktree(&gone).unwrap();
         std::fs::remove_dir_all(&gone).unwrap();
+
+        // One branch registered twice: the vanished entry is listed first.
+        let dup_gone = main.join("wt-dup-a");
+        run_git(
+            main,
+            &["worktree", "add", "-b", "dup", dup_gone.to_str().unwrap()],
+        );
+        let dup_live = main.join("wt-dup-b");
+        run_git(
+            main,
+            &[
+                "worktree",
+                "add",
+                "--force",
+                dup_live.to_str().unwrap(),
+                "dup",
+            ],
+        );
+        git.lock_worktree(&dup_gone).unwrap();
+        std::fs::remove_dir_all(&dup_gone).unwrap();
+        let listed = git.worktree_paths_for_branch("dup").unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(!listed[0].exists() && listed[1].exists(), "{listed:?}");
+        assert_eq!(
+            git.live_checkout_for_branch("dup")
+                .unwrap()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            dup_live.canonicalize().unwrap()
+        );
 
         for (branch, held) in [("live", true), ("gone", false), ("absent", false)] {
             let found = git.live_checkout_for_branch(branch).unwrap();
