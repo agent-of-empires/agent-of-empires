@@ -65,7 +65,7 @@ impl Drop for StopSessionOnDrop<'_> {
     }
 }
 fn configure_fresh_restart_capture(h: &TuiTestHarness) {
-    h.append_config("[session]\nauto_resume_on_restart = false\nrestart_wake_message = \"\"");
+    h.append_config("[session]\nauto_resume_on_restart = false");
 }
 
 const OMP_TITLE_FIRST: &str = "CliSidOmpFirstE2E";

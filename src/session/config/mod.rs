@@ -946,7 +946,7 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_acknowledged_volume_ignores_globs: bool,
 
-    /// Lenient so a removed order still loads before migration v067 rewrites it.
+    /// Lenient so a removed order still loads before migration v068 rewrites it.
     #[serde(
         default,
         deserialize_with = "unknown_as_none",
@@ -954,7 +954,7 @@ pub struct AppStateConfig {
     )]
     pub sort_order: Option<SortOrder>,
 
-    /// Lenient so a removed grouping still loads before migration v067 rewrites it.
+    /// Lenient so a removed grouping still loads before migration v068 rewrites it.
     #[serde(
         default,
         deserialize_with = "unknown_as_none",
@@ -1719,28 +1719,6 @@ pub struct SessionConfig {
     )]
     pub prevent_sleep_idle_grace_minutes: u32,
 
-    /// Text sent after a successful explicit restart, or automatic startup
-    /// recovery when `startup_recovery_wake` is enabled, once the pane is ready.
-    /// An empty string disables the message without disabling the restart.
-    #[serde(default = "default_restart_wake_message")]
-    #[setting(
-        label = "Wake message",
-        widget = "text",
-        summary = "What AoE sends to wake a Session."
-    )]
-    pub restart_wake_message: String,
-
-    /// Send `restart_wake_message` after automatic Daemon startup recovery.
-    /// Disabled by default; recovery still restores missing panes and resumes
-    /// conversations. Explicit restarts are unaffected. An empty message stays off.
-    #[serde(default)]
-    #[setting(
-        label = "Wake after recovery",
-        widget = "toggle",
-        summary = "Send the wake message below to Sessions AoE recovers at startup."
-    )]
-    pub startup_recovery_wake: bool,
-
     /// What to show next to each session title: Branch (default), Auto
     /// (profile in all-profiles view), None, Profile (always), or Sandbox
     /// (sb on sandboxed rows).
@@ -2340,8 +2318,6 @@ impl Default for SessionConfig {
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             prevent_sleep_when_active: false,
             prevent_sleep_idle_grace_minutes: default_prevent_sleep_idle_grace_minutes(),
-            restart_wake_message: default_restart_wake_message(),
-            startup_recovery_wake: false,
             row_tag: RowTagMode::default(),
             show_activity_age: true,
             show_structured_badge: true,
@@ -2389,10 +2365,6 @@ fn default_session_id_poller_max_threads() -> u32 {
 
 fn default_trash_retention_minutes() -> u32 {
     30 * 24 * 60
-}
-
-fn default_restart_wake_message() -> String {
-    "wake up: pick up what you were doing".to_string()
 }
 
 fn default_live_send_exit_chord() -> String {
@@ -5856,7 +5828,7 @@ mod tests {
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
     }
 
-    /// Removed sorts and groupings read as unpicked, so Config loads before v067 rewrites them.
+    /// Removed sorts and groupings read as unpicked, so Config loads before v068 rewrites them.
     #[test]
     fn removed_sort_and_grouping_values_load_as_unpicked() {
         for (sort, group) in [
