@@ -705,4 +705,92 @@ mod tests {
         let custom = resolve_with_config("my-agent", &session);
         assert_eq!(custom.clear_aliases, ["/new"]);
     }
+
+    /// Pins the values `web/src/lib/__tests__/agentProfileFixtures.ts` hardcodes.
+    #[test]
+    fn serialized_profile_values_match_the_web_fixtures() {
+        use serde_json::{json, Value};
+        let claude = json!({
+            "todos": true, "skills": true, "legacy_mode_fallback": true,
+            "subagent_tool_names": [], "card_aliases": {},
+            "special_titles": {
+                "skill_names": ["skill", "claude-skill"],
+                "schedule_names": ["ScheduleWakeup", "CronCreate", "CronList", "CronDelete"],
+                "harness_names": ["ToolSearch", "Monitor", "TaskStop", "SendMessage"],
+                "workflow_names": ["Workflow"],
+            },
+            "memory_path_regex": r"/\.claude/projects/[^/]+/memory/.*\.md$",
+            "mobile_monitor_only": true,
+            "clear_aliases": ["/clear"], "compact_aliases": ["/compact"],
+            "mcp_prefixes": ["mcp__"],
+        });
+        let plain = |clear: &[&str], todos: bool, subagents: &[&str], cards: Value| {
+            json!({
+                "todos": todos, "skills": false, "legacy_mode_fallback": false,
+                "subagent_tool_names": subagents, "card_aliases": cards,
+                "special_titles": {
+                    "skill_names": [], "schedule_names": [],
+                    "harness_names": [], "workflow_names": [],
+                },
+                "memory_path_regex": null,
+                "mobile_monitor_only": false,
+                "clear_aliases": clear, "compact_aliases": [],
+                "mcp_prefixes": ["mcp__"],
+            })
+        };
+        let cases = [
+            ("claude", claude.clone()),
+            ("claude-code", claude),
+            (
+                "codex",
+                plain(
+                    &["/new"],
+                    false,
+                    &[],
+                    json!({
+                        "execute": ["shell", "bash"],
+                        "edit": ["apply_patch"],
+                        "read": ["view_file", "read_file", "read"],
+                    }),
+                ),
+            ),
+            (
+                "opencode",
+                plain(
+                    &["/new"],
+                    true,
+                    &["task"],
+                    json!({
+                        "execute": ["bash"],
+                        "read": ["read"],
+                        "edit": ["edit", "write"],
+                        "search": ["grep", "glob"],
+                        "fetch": ["webfetch"],
+                    }),
+                ),
+            ),
+            (
+                "gemini",
+                plain(
+                    &[],
+                    false,
+                    &[],
+                    json!({
+                        "execute": ["run_shell_command"],
+                        "read": ["read_file", "read_many_files"],
+                        "edit": ["write_file", "edit"],
+                        "search": ["grep", "glob"],
+                        "fetch": ["web_fetch"],
+                    }),
+                ),
+            ),
+            ("unknown", plain(&[], false, &[], json!({}))),
+        ];
+        for (key, expected) in cases {
+            let wire = serde_json::to_value(AgentProfileWire::new(resolve(key), false)).unwrap();
+            for (field, want) in expected.as_object().unwrap() {
+                assert_eq!(&wire[field], want, "{key}.{field}");
+            }
+        }
+    }
 }

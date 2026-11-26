@@ -4,6 +4,7 @@ export function makeAgentProfile(over: Partial<AgentProfile> = {}): AgentProfile
   return { ...DEFAULT_AGENT_PROFILE, ...over };
 }
 
+// The Rust test `serialized_profile_values_match_the_web_fixtures` in src/acp/agent_profiles.rs pins these values.
 export const CLAUDE_PROFILE = makeAgentProfile({
   key: "claude",
   parent_meta_namespaces: ["claudeCode"],
