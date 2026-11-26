@@ -166,6 +166,7 @@ pub async fn spawn_acp(
             Ok(instance) => instance,
             Err(response) => return response,
         };
+    let prepared = RetryStartingGuard::prepare(&state, &id, origin).await;
     let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
     let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
     let (native, exclusion) = match launch_store_for(&state, &instance, exclusion).await {
@@ -180,19 +181,30 @@ pub async fn spawn_acp(
         .iter()
         .map(|p| (p.key.clone(), p.value.clone()))
         .collect();
-    let (sandbox_info, exclusion) =
-        match crate::acp::sandbox::ensure_container_for_session_with_request_env(
-            native.clone(),
-            instance.clone(),
-            exclusion,
-            Some(agent.clone()),
-            request_env,
-        )
-        .await
-        {
-            Ok(info) => info,
-            Err(e) => return launch_error_response("sandbox container ensure", &e),
-        };
+    #[cfg(test)]
+    crate::server::acp_events::retry_test_gate::RevertGate::wait(&format!("{id}#prepare")).await;
+    let ensured = match preparation_fault(&id) {
+        Some(fault) => Err(fault),
+        None => {
+            crate::acp::sandbox::ensure_container_for_session_with_request_env(
+                native.clone(),
+                instance.clone(),
+                exclusion,
+                Some(agent.clone()),
+                request_env,
+            )
+            .await
+        }
+    };
+    let (sandbox_info, exclusion) = match ensured {
+        Ok(info) => info,
+        Err(e) => {
+            if let Some(prepared) = prepared {
+                prepared.fail_preparation(&agent, &e);
+            }
+            return launch_error_response("sandbox container ensure", &e);
+        }
+    };
     if spawn_request.cancellation().is_cancelled() {
         return supervisor_error_response(
             "spawn cancelled",
@@ -263,11 +275,15 @@ pub async fn spawn_acp(
         );
     }
     // Past every refusal: only the launch itself can fail from here.
-    let starting = match &reservation {
-        Some(reservation) => {
+    let starting = match (&reservation, prepared) {
+        (Some(reservation), Some(mut prepared)) => {
+            prepared.admit(reservation.lease().epoch()).await;
+            Some(prepared)
+        }
+        (Some(reservation), None) => {
             RetryStartingGuard::begin(&state, &id, origin, reservation.lease().epoch()).await
         }
-        None => None,
+        (None, _) => None,
     };
     drop(exclusion);
     if let Some(reservation) = reservation {
@@ -591,6 +607,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             Ok(instance) => instance,
             Err(response) => return response,
         };
+    let prepared = RetryStartingGuard::prepare(&state, &id, origin).await;
     if restart.is_cancelled() {
         return supervisor_error_response(
             "restart cancelled by a stop request",
@@ -601,15 +618,27 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         Ok(store) => store,
         Err(response) => return response,
     };
-    let (sandbox_info, exclusion) = match crate::acp::sandbox::ensure_container_for_session(
-        native.clone(),
-        instance.clone(),
-        exclusion,
-    )
-    .await
-    {
+    #[cfg(test)]
+    crate::server::acp_events::retry_test_gate::RevertGate::wait(&format!("{id}#prepare")).await;
+    let ensured = match preparation_fault(&id) {
+        Some(fault) => Err(fault),
+        None => {
+            crate::acp::sandbox::ensure_container_for_session(
+                native.clone(),
+                instance.clone(),
+                exclusion,
+            )
+            .await
+        }
+    };
+    let (sandbox_info, exclusion) = match ensured {
         Ok(info) => info,
-        Err(error) => return launch_error_response("sandbox container ensure", &error),
+        Err(error) => {
+            if let Some(prepared) = prepared {
+                prepared.fail_preparation(&agent, &error);
+            }
+            return launch_error_response("sandbox container ensure", &error);
+        }
     };
     if restart.is_cancelled() {
         return supervisor_error_response(
@@ -657,8 +686,13 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     };
     // Past every refusal, capacity included, and after resume_structured_stop read the row's
     // `Stopped`.
-    let starting =
-        RetryStartingGuard::begin(&state, &id, origin, reservation.lease().epoch()).await;
+    let starting = match prepared {
+        Some(mut prepared) => {
+            prepared.admit(reservation.lease().epoch()).await;
+            Some(prepared)
+        }
+        None => RetryStartingGuard::begin(&state, &id, origin, reservation.lease().epoch()).await,
+    };
     drop(exclusion);
     match state.acp_supervisor.spawn_inner(request, reservation).await {
         Ok(()) => {
@@ -679,6 +713,14 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
             supervisor_error_response("restart spawn failed", &e)
         }
     }
+}
+
+/// A sandbox preparation failure a test injected; never one outside tests.
+fn preparation_fault(_id: &str) -> Option<anyhow::Error> {
+    #[cfg(test)]
+    return crate::server::acp_events::retry_test_gate::take_preparation_fault(_id);
+    #[cfg(not(test))]
+    None
 }
 
 /// A dormant `Idle` row is resumed too, but is not a Retry from `Stopped`. A `Starting` row

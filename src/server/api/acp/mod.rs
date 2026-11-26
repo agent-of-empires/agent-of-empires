@@ -720,6 +720,163 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// #5977: a Retry from a Stopped row shows `Starting` while its sandbox is prepared, not the
+    /// resume's `Idle`. A failed preparation is the Agent's startup error, and a cancelled one
+    /// puts the `Idle` back as a rollback, which cues nothing.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_shows_starting_through_sandbox_preparation() {
+        use crate::server::acp_events::retry_test_gate::{fail_next_preparation, RevertGate};
+        use crate::server::push::StatusChange;
+        use crate::session::Status::{Error, Idle, Starting, Stopped};
+        async fn recv(
+            changes: &mut tokio::sync::broadcast::Receiver<StatusChange>,
+            case: &str,
+        ) -> StatusChange {
+            tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{case}: a status change"))
+                .expect("status channel open")
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let started = vec![(Stopped, Idle), (Idle, Starting)];
+        let failed = vec![(Stopped, Idle), (Idle, Starting), (Starting, Error)];
+        let cancelled = vec![(Stopped, Idle), (Idle, Starting), (Starting, Idle)];
+        // (case, endpoint, what the preparation does, the row's changes and status, at the gate
+        // for a parked preparation and once settled otherwise, startup errors, pushes)
+        for (case, endpoint, prepare, want_changes, want_status, want_errors, want_pushes) in [
+            ("prepare-delayed", "spawn", "park", &started, Starting, 0, 0),
+            (
+                "prepare-delayed-restart",
+                "restart",
+                "park",
+                &started,
+                Starting,
+                0,
+                0,
+            ),
+            ("prepare-failed", "spawn", "fail", &failed, Error, 1, 1),
+            (
+                "prepare-failed-restart",
+                "restart",
+                "fail",
+                &failed,
+                Error,
+                1,
+                1,
+            ),
+            (
+                "prepare-cancelled",
+                "spawn",
+                "cancel",
+                &cancelled,
+                Idle,
+                0,
+                0,
+            ),
+        ] {
+            let id = format!("sess-5977-{case}");
+            let state = errored_retry_state(project.path(), &id).await;
+            {
+                let mut rows = state.instances.write().await;
+                rows[0].status = Stopped;
+                crate::server::test_support::seed_instances_on_disk_for_test(
+                    "default",
+                    rows.clone(),
+                );
+            }
+            let listener =
+                tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()));
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while state.acp_events_tx.receiver_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener subscribes");
+            let mut changes = state.status_tx.subscribe();
+            let gate = (prepare != "fail").then(|| RevertGate::arm(&format!("{id}#prepare")));
+            if prepare == "fail" {
+                fail_next_preparation(&id);
+            }
+            let (launch_state, launch_id) = (state.clone(), id.clone());
+            let mut launch = Box::pin(async move {
+                if endpoint == "spawn" {
+                    spawn_acp(State(launch_state), Path(launch_id), retry_request())
+                        .await
+                        .into_response()
+                } else {
+                    restart_acp(State(launch_state), Path(launch_id), retry_request())
+                        .await
+                        .into_response()
+                }
+            });
+            let mut sent = Vec::new();
+            let status = match gate {
+                Some((gate, parked)) => {
+                    tokio::select! {
+                        response = &mut launch => panic!("{case}: launch ended before its preparation: {}", response.status()),
+                        parked = tokio::time::timeout(std::time::Duration::from_secs(10), parked) => {
+                            parked.expect("the launch reaches its preparation").expect("gate open");
+                        }
+                    }
+                    // The resume and the Retry's Starting are published before the gate.
+                    while let Ok(change) = changes.try_recv() {
+                        sent.push(change);
+                    }
+                    let at_gate = state.instances.read().await[0].status;
+                    if prepare == "cancel" {
+                        drop(launch);
+                        drop(gate);
+                        sent.push(recv(&mut changes, case).await);
+                        state.instances.read().await[0].status
+                    } else {
+                        // What the launch does past its preparation is covered elsewhere.
+                        drop(gate);
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), launch)
+                            .await
+                            .expect("the launch finishes");
+                        at_gate
+                    }
+                }
+                None => {
+                    let _ = launch.await;
+                    while sent.last().map(|c: &StatusChange| c.new) != Some(Error) {
+                        sent.push(recv(&mut changes, case).await);
+                    }
+                    state.instances.read().await[0].status
+                }
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                state.runtime.work.drain(),
+            )
+            .await
+            .expect("the rollback finishes");
+            listener.abort();
+            let errors = state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .into_iter()
+                .filter(|(_, event)| {
+                    matches!(event, crate::acp::Event::AgentStartupError { message, .. }
+                        if message.starts_with("Failed to prepare the sandbox"))
+                })
+                .count();
+            assert_eq!(
+                (
+                    sent.iter().map(|c| (c.old, c.new)).collect::<Vec<_>>(),
+                    status,
+                    errors,
+                    crate::server::push::pushes_for_test(sent),
+                ),
+                (want_changes.clone(), want_status, want_errors, want_pushes),
+                "{case}"
+            );
+        }
+    }
+
     /// #5921: restart takes its capacity slot before it shows `Starting`. With the only slot held
     /// by another session it is refused with no status change; its own worker in that slot is
     /// stopped first, so it restarts.

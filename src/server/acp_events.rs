@@ -792,8 +792,9 @@ pub(crate) struct RetryAttempt {
     attempt: u64,
     /// The latest event seq when the attempt began: frames at or below it are a retired worker's.
     watermark: u64,
-    /// The launch's epoch: once its worker is installed, the attempt can no longer roll back.
-    epoch: u64,
+    /// The launch's epoch, once admitted: once its worker is installed, the attempt can no
+    /// longer roll back. `None` while a resumed stop's sandbox is still being prepared.
+    epoch: Option<u64>,
     /// The status the first attempt started from; a takeover keeps it.
     origin: RetryOrigin,
     /// The attempt's launch failed and its rollback restored the Error. Kept until the new worker
@@ -821,7 +822,7 @@ impl RetryAttempt {
         Self {
             attempt: 0,
             watermark: 0,
-            epoch: 0,
+            epoch: None,
             origin: RetryOrigin::Error,
             rolled_back: true,
         }
@@ -851,7 +852,7 @@ impl RetryAttempt {
     /// background work). `retired` is the supervisor's `retired_through` for the session.
     fn retired_through(&self, retired: Option<(u64, u64)>) -> u64 {
         match retired {
-            Some((epoch, seq)) if epoch == self.epoch => self.watermark.max(seq),
+            Some((epoch, seq)) if Some(epoch) == self.epoch => self.watermark.max(seq),
             _ => self.watermark,
         }
     }
@@ -967,7 +968,7 @@ pub(crate) struct RetryStartingGuard {
     state: Arc<AppState>,
     id: String,
     attempt: u64,
-    epoch: u64,
+    epoch: Option<u64>,
     origin: RetryOrigin,
     failure: Option<String>,
     armed: bool,
@@ -975,15 +976,40 @@ pub(crate) struct RetryStartingGuard {
 
 impl RetryStartingGuard {
     /// Moves a row at `origin`'s status to `Starting`, or takes over the `Starting` an earlier
-    /// attempt left, keeping that attempt's origin; `None` otherwise. Callers hold the session's launch admission (a spawn
-    /// reservation, or a restart claim with the old worker gone), which proves no earlier attempt
-    /// is still launching, so taking over is safe even before that attempt's guard has dropped.
-    /// `epoch` is that admission's launch epoch.
+    /// attempt left, keeping that attempt's origin; `None` otherwise. Callers hold the session's
+    /// launch admission (a spawn reservation, or a restart claim with the old worker gone), which
+    /// proves no earlier attempt is still launching, so taking over is safe even before that
+    /// attempt's guard has dropped. `epoch` is that admission's launch epoch.
     pub(crate) async fn begin(
         state: &Arc<AppState>,
         id: &str,
         origin: RetryOrigin,
         epoch: u64,
+    ) -> Option<Self> {
+        Self::arm(state, id, origin, Some(epoch)).await
+    }
+
+    /// A resumed stop's `Starting`, armed before its sandbox is prepared so the row never shows
+    /// the resume's `Idle` while it waits; [`Self::admit`] gives it the launch's epoch. `None`
+    /// for any other origin, or a row already `Starting`: only admission proves an earlier
+    /// attempt is no longer launching, so a takeover waits for [`Self::begin`]. Callers hold the
+    /// session's launch exclusion.
+    pub(crate) async fn prepare(
+        state: &Arc<AppState>,
+        id: &str,
+        origin: RetryOrigin,
+    ) -> Option<Self> {
+        if origin != RetryOrigin::ResumedStop {
+            return None;
+        }
+        Self::arm(state, id, origin, None).await
+    }
+
+    async fn arm(
+        state: &Arc<AppState>,
+        id: &str,
+        origin: RetryOrigin,
+        epoch: Option<u64>,
     ) -> Option<Self> {
         let mut instances = state.instances.write().await;
         let inst = instances.iter_mut().find(|i| i.id == id)?;
@@ -995,6 +1021,7 @@ impl RetryStartingGuard {
             .unwrap_or_else(|e| e.into_inner());
         let took_over = inst.status == Status::Starting;
         let origin = match (inst.status, owners.get(id)) {
+            (Status::Starting, _) if epoch.is_none() => return None,
             (Status::Starting, Some(earlier)) if !earlier.rolled_back => earlier.origin,
             (Status::Starting, _) => return None,
             _ => {
@@ -1034,6 +1061,32 @@ impl RetryStartingGuard {
             failure: None,
             armed: true,
         })
+    }
+
+    /// Admitted with `epoch`: from here the attempt is a launch, as one [`Self::begin`] armed.
+    /// The watermark moves up to now, so frames before the launch stay the retired worker's.
+    pub(crate) async fn admit(&mut self, epoch: u64) {
+        let _instances = self.state.instances.write().await;
+        let watermark = self.state.acp_supervisor.latest_seq(&self.id);
+        if let Some(owner) = self
+            .state
+            .retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.id)
+            .filter(|owner| owner.attempt == self.attempt)
+        {
+            owner.epoch = Some(epoch);
+            owner.watermark = owner.watermark.max(watermark);
+        }
+        self.epoch = Some(epoch);
+    }
+
+    /// The sandbox preparation failed with `error`: for a resumed stop, the Agent's startup error.
+    pub(crate) fn fail_preparation(mut self, agent: &str, error: &anyhow::Error) {
+        self.failure = Some(format!(
+            "Failed to prepare the sandbox for structured view agent {agent:?}: {error:#}"
+        ));
     }
 
     /// The launch failed with `error`. A cancelled launch or one another worker won is not
@@ -1086,20 +1139,23 @@ async fn revert_retry_starting(
     state: &AppState,
     id: &str,
     attempt: u64,
-    epoch: u64,
+    epoch: Option<u64>,
     origin: RetryOrigin,
     failure: Option<String>,
 ) {
     #[cfg(test)]
     retry_test_gate::RevertGate::wait(id).await;
     // Installed, the launch succeeded even if its request dropped later: the worker's frames move
-    // the row. Its handler awaited the launch inline, so no install can follow this check.
-    if state
-        .acp_supervisor
-        .is_current_worker_generation(id, epoch)
-        .await
-    {
-        return;
+    // the row. Its handler awaited the launch inline, so no install can follow this check. An
+    // attempt never admitted has no launch to install.
+    if let Some(epoch) = epoch {
+        if state
+            .acp_supervisor
+            .is_current_worker_generation(id, epoch)
+            .await
+        {
+            return;
+        }
     }
     let mut instances = state.instances.write().await;
     let failure = failure.filter(|_| origin == RetryOrigin::ResumedStop);
@@ -1585,6 +1641,23 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
 pub(crate) mod retry_test_gate {
     use tokio::sync::oneshot;
 
+    static PREPARATION_FAULTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Test-only: `id`'s next sandbox preparation fails.
+    pub(crate) fn fail_next_preparation(id: &str) {
+        PREPARATION_FAULTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(id.to_owned());
+    }
+
+    pub(crate) fn take_preparation_fault(id: &str) -> Option<anyhow::Error> {
+        let mut faults = PREPARATION_FAULTS.lock().unwrap_or_else(|e| e.into_inner());
+        let at = faults.iter().position(|fault| fault == id)?;
+        faults.remove(at);
+        Some(anyhow::anyhow!("injected preparation failure"))
+    }
+
     type Gate = (Option<oneshot::Sender<()>>, Option<oneshot::Receiver<()>>);
     static GATES: std::sync::Mutex<Vec<(String, Gate)>> = std::sync::Mutex::new(Vec::new());
 
@@ -1592,7 +1665,8 @@ pub(crate) mod retry_test_gate {
     /// `instances`; with `id#mode`, a spawn applying its mode to an installed worker; or with
     /// `id#launched`, a spawn past both; with `id#retire`, an install between publishing for the
     /// retired worker and its final cutoff; with `id#evidence`, a status read between its scan
-    /// and its apply. Dropping the gate releases a parked Retry.
+    /// and its apply; with `id#prepare`, a Retry before its sandbox is prepared. Dropping the
+    /// gate releases a parked Retry.
     pub(crate) struct RevertGate {
         id: String,
         release: Option<oneshot::Sender<()>>,
@@ -3118,6 +3192,57 @@ mod tests {
             .filter(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
             .count();
         assert_eq!(published, 1);
+    }
+
+    /// Only a resumed stop arms before its preparation, and never over a `Starting` an earlier
+    /// attempt may still be launching: only the launch admission proves that one gone.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_preparing_retry_arms_only_a_resumed_stop_it_owns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        for (case, status, origin, earlier, arms) in [
+            (
+                "resumed-stop",
+                Status::Idle,
+                RetryOrigin::ResumedStop,
+                false,
+                true,
+            ),
+            (
+                "error-origin",
+                Status::Error,
+                RetryOrigin::Error,
+                false,
+                false,
+            ),
+            (
+                "starting-row-no-prepare",
+                Status::Idle,
+                RetryOrigin::ResumedStop,
+                true,
+                false,
+            ),
+        ] {
+            let mut inst = stopped_structured_instance();
+            inst.status = status;
+            let id = inst.id.clone();
+            let state = test_support::build_test_app_state(vec![inst]);
+            let _earlier = if earlier {
+                Some(
+                    RetryStartingGuard::begin(&state, &id, origin, NO_LAUNCH)
+                        .await
+                        .expect("an earlier attempt starts"),
+                )
+            } else {
+                None
+            };
+            let prepared = RetryStartingGuard::prepare(&state, &id, origin).await;
+            assert_eq!(prepared.is_some(), arms, "{case}");
+            if let Some(prepared) = prepared {
+                prepared.disarm();
+            }
+        }
     }
 
     /// A Retry that takes over a failed resumed stop's `Starting` keeps that origin, though its
