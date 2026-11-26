@@ -3,6 +3,8 @@
 
 import type { Page } from "@playwright/test";
 
+import { CLAUDE_PROFILE } from "../../src/lib/__tests__/agentProfileFixtures";
+
 export interface SessionInput extends Record<string, unknown> {
   id: string;
   title?: string;
@@ -17,6 +19,7 @@ export function sessionResponse({ id, title, project_path, ...rest }: SessionInp
     project_path: projectPath,
     group_path: projectPath,
     tool: "claude",
+    agent_profile: CLAUDE_PROFILE,
     status: "Idle",
     yolo_mode: false,
     lifecycle_generation: 0,

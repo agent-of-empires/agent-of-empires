@@ -28,7 +28,7 @@ import {
 } from "../../lib/api";
 import { VolumeIgnoresGlobDialog } from "./VolumeIgnoresGlobDialog";
 import { HooksTrustDialog } from "./HooksTrustDialog";
-import { ACP_CAPABLE_TOOLS, acpAdapterMissing, isAcpEligible, structuredAvailable } from "../../lib/acpCapableTools";
+import { acpAdapterMissing, isAcpCapable, isAcpEligible, structuredAvailable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { normalizeProjectPathKey, overridesForPath } from "../../lib/registeredProjects";
@@ -75,7 +75,6 @@ import { BUTTON_INLINE, BUTTON_SECONDARY } from "../../lib/surfaces";
 import { CloseButton, DialogHeader, ModalFrame } from "../Dialog";
 import { DIALOG_BODY } from "../../lib/surfaces";
 
-// Validated against ACP_CAPABLE_TOOLS on read, since another install may have written it.
 const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
 const LAST_USED_INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 
@@ -83,8 +82,7 @@ const LAST_USED_INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 const LAST_USED_PROJECT_KEY = "aoe-new-session-last-project";
 
 function loadLastUsedTool(): string {
-  const stored = safeGetItem(LAST_USED_TOOL_KEY);
-  return stored && ACP_CAPABLE_TOOLS.has(stored) ? stored : "claude";
+  return safeGetItem(LAST_USED_TOOL_KEY) || "claude";
 }
 
 export interface WizardPrefill {
@@ -792,7 +790,7 @@ export function SessionWizard({
       }
       if (result.ok) {
         dispatch({ type: "SUBMIT_SUCCESS" });
-        if (ACP_CAPABLE_TOOLS.has(tool)) safeSetItem(LAST_USED_TOOL_KEY, tool);
+        if (isAcpCapable(agents.find((a) => a.name === tool)?.acp_capable)) safeSetItem(LAST_USED_TOOL_KEY, tool);
         safeSetItem(LAST_USED_INSTRUCTION_KEY, body.custom_instruction ?? "");
         if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
         for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
@@ -867,7 +865,6 @@ export function SessionWizard({
       ...buildCreateRequest(
         d,
         structuredAvailable(
-          d.tool,
           agents.find((a) => a.name === d.tool),
           d,
         ),
@@ -977,8 +974,8 @@ export function SessionWizard({
         // On the host a missing adapter turns Structured into Terminal, so show that rather than send it.
         if (
           sent.useStructuredView &&
-          structuredAvailable(sent.tool, agent, sent) &&
-          !structuredAvailable(sent.tool, agent, { ...sent, sandboxEnabled: false })
+          structuredAvailable(agent, sent) &&
+          !structuredAvailable(agent, { ...sent, sandboxEnabled: false })
         ) {
           // The box held focus and is gone, so focus the row that explains why nothing launched.
           requestAnimationFrame(() =>
@@ -1035,7 +1032,7 @@ export function SessionWizard({
     return !canResend || (resendsSandbox && d.sandboxEnabled && !state.dockerChecked);
   };
   const selectedAgent = agents.find((a) => a.name === d.tool);
-  const acpCapable = isAcpEligible(d.tool, selectedAgent);
+  const acpCapable = isAcpEligible(selectedAgent);
   // `agents` is the list loaded for the selected Profile and project, whose hooks `acp_create_ready` counts.
   const adapterMissing = acpCapable && acpAdapterMissing(selectedAgent, d);
   const structuredOn = acpCapable && !adapterMissing && d.useStructuredView;

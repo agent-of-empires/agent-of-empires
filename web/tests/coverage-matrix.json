@@ -4633,14 +4633,13 @@
       "risk": "medium",
       "specs": [
         "src/components/acp/ToolCards.render.test.tsx",
-        "src/lib/agentProfiles.test.ts",
         "src/lib/acpTypes.test.ts",
         "src/components/acp/activityMessages.test.ts"
       ],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
-        "web/src/lib/agentProfiles.ts",
+        "web/src/lib/agentProfile.ts",
         "web/src/lib/acpArgs.ts",
         "web/src/lib/acpTypes.ts",
         "web/src/components/acp/CoreToolCards.tsx",
@@ -4652,11 +4651,15 @@
       ]
     },
     {
-      "id": "acp.omp-profile",
+      "id": "acp.agent-profile",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/agentProfiles.test.ts"],
-      "components": ["web/src/lib/agentProfiles.ts"]
+      "specs": ["src/lib/agentProfile.test.ts", "src/lib/memoryClassify.test.ts"],
+      "components": [
+        "web/src/lib/agentProfile.ts",
+        "web/src/lib/agentProfileContext.tsx",
+        "web/src/lib/memoryClassify.ts"
+      ]
     },
     {
       "id": "acp.compaction-reminder-banner",
