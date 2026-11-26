@@ -379,16 +379,18 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         let _ = std::fs::remove_file(config);
     }
     let cleanup_record = record.clone();
-    tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&cleanup_record))
-        .await??;
+    let cleanup =
+        tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&cleanup_record))
+            .await?;
     if !preserve_registry {
         if let Err(error) = worker_registry::delete_if_owned(&session_id, our_pid) {
             warn!(target: "acp.runner", session = %session_id, %error, "failed to delete worker record");
         }
     }
     // Last, so a grandchild that outlived its parent (a proxy's adapter) dies too.
+    // A cleanup error must not spare the group, so it is returned only if this process survives.
     crate::process::worker::kill_own_process_group_if_leader(our_pid);
-    Ok(())
+    cleanup
 }
 
 async fn run_watchdog(

@@ -238,7 +238,7 @@ fn write_proxy_launch_config(
     config: &SpawnConfig,
     session_id: &str,
 ) -> Result<std::path::PathBuf, AcpError> {
-    let spawn_err = |e: anyhow::Error| AcpError::Spawn(format!("proxy launch config: {e:#}"));
+    let spawn_err = |e: anyhow::Error| AcpError::ProxyLaunchConfig(format!("{e:#}"));
     crate::process::worker_registry::remove_proxy_launch_configs(session_id).map_err(spawn_err)?;
     let contents = serde_json::json!({
         "version": 1,

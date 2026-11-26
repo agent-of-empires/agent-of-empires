@@ -20,7 +20,7 @@ use crate::acp::acp_client::{AcpClient, AcpError, ProxyFailurePolicy, SpawnConfi
 use crate::acp::agent_policy::AgentPolicy;
 use crate::acp::mcp_config::PluginCredentials;
 use crate::acp::runner_lifecycle::{AdmitError, InstallError, Lease, RunnerIdentity};
-use crate::acp::state::{AcpSessionId, Event, StartupErrorDetail};
+use crate::acp::state::{AcpSessionId, Event, StartupErrorDetail, PROXY_DEGRADED_NOTICE_KEY};
 use crate::process::worker_registry;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
 use crate::session::mcp::mcp_model::{McpProvenance, ResolvedMcpServer};
@@ -367,7 +367,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     drop(warmup_guard);
                     return Err(self.cancelled_spawn(&lease).await);
                 }
-                if matches!(err, AcpError::IncompatibleAgent(_)) {
+                if blames_adapter_binary(&err) {
                     self.mark_incompatible_binary(session_id, &config.spec.command);
                 }
                 let deferred =
@@ -1147,13 +1147,23 @@ fn is_proxy_failure(err: &AcpError) -> bool {
     }
 }
 
+/// Whether a launch failure is the adapter binary's incompatibility; a proxy's invalid hello is not.
+pub(super) fn blames_adapter_binary(err: &AcpError) -> bool {
+    match err {
+        AcpError::IncompatibleAgent(error) => {
+            !matches!(error.detail, StartupErrorDetail::InvalidProxyHello { .. })
+        }
+        _ => false,
+    }
+}
+
 /// Keyed, so every re-assertion replaces the same notice.
 fn proxy_degraded_notice(display_name: &str) -> Event {
     Event::SessionNotice {
         severity: "warning".into(),
         title: format!("{display_name} features unavailable"),
         description: Some("The plugin proxy failed to start; the agent runs without it.".into()),
-        key: Some("proxy-degraded".into()),
+        key: Some(PROXY_DEGRADED_NOTICE_KEY.into()),
     }
 }
 
@@ -5568,7 +5578,7 @@ time.sleep(60)
             .iter()
             .filter_map(|event| match event {
                 Event::SessionNotice { title, key, .. }
-                    if key.as_deref() == Some("proxy-degraded") =>
+                    if key.as_deref() == Some(PROXY_DEGRADED_NOTICE_KEY) =>
                 {
                     Some(title.as_str())
                 }
@@ -5644,5 +5654,38 @@ time.sleep(60)
             Err(SupervisorError::Acp(AcpError::ProjectPathMissing { .. }))
         ));
         assert_eq!(configs.len(), 1);
+
+        let (result, configs, events) = spawn_with_proxy(
+            "s-neutral-config",
+            ProxyFailurePolicy::NeutralBoot,
+            vec![Err(AcpError::ProxyLaunchConfig("disk full".into()))],
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SupervisorError::Acp(AcpError::ProxyLaunchConfig(_)))
+        ));
+        assert_eq!(
+            configs.len(),
+            1,
+            "a config write failure is not the proxy's"
+        );
+        assert!(degraded_notices(&events).is_empty());
+    }
+
+    #[test]
+    fn a_proxy_hello_fault_does_not_blame_the_adapter_binary() {
+        assert!(!blames_adapter_binary(&bad_hello()));
+        let detail = StartupErrorDetail::MissingAgentInfo {
+            expected_package: "claude-agent-acp".into(),
+            install_command: "npm i".into(),
+            auto_install: false,
+        };
+        let adapter =
+            AcpError::IncompatibleAgent(Box::new(crate::acp::acp_client::IncompatibleAgentError {
+                message: detail.user_message(),
+                detail,
+            }));
+        assert!(blames_adapter_binary(&adapter));
     }
 }

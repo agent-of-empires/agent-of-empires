@@ -1210,7 +1210,7 @@ impl<S: BroadcastSink> Drain<S> {
                 session = %session_id,
                 "respawn failed: {e}"
             );
-            if matches!(e, AcpError::IncompatibleAgent(_)) {
+            if super::launch::blames_adapter_binary(&e) {
                 lock_recover(&self.incompatible_binaries)
                     .insert(session_id.clone(), config.spec.command.clone());
             }

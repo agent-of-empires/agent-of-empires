@@ -164,6 +164,9 @@ pub struct SessionNotice {
     pub description: Option<String>,
 }
 
+/// Key of the notice a `neutral_boot` fallback posts; it lasts as long as the degraded session.
+pub const PROXY_DEGRADED_NOTICE_KEY: &str = "proxy-degraded";
+
 /// A keyed notice keeps one id across updates; others are minted from the seq.
 pub fn notice_id(key: Option<&str>, seq: u64) -> String {
     match key {
@@ -1557,8 +1560,9 @@ impl AcpState {
         }
         self.rate_limit = None;
         // Advisories describe the turn they arrived in, so a new prompt retires
-        // them. Their transcript rows keep the history.
-        self.session_notices.clear();
+        // them, except the degraded-proxy banner. Their transcript rows keep the history.
+        let degraded = notice_id(Some(PROXY_DEGRADED_NOTICE_KEY), 0);
+        self.session_notices.retain(|n| n.id == degraded);
     }
 
     /// A fresh worker attached: a startup error no longer holds the row.
@@ -2032,6 +2036,17 @@ mod tests {
         assert!(
             titles(&applied([notice("stale"), prompt("next")])).is_empty(),
             "a new turn retires the previous turn's advisories"
+        );
+        let degraded = Event::SessionNotice {
+            severity: "warning".into(),
+            title: "Fake features unavailable".into(),
+            description: None,
+            key: Some(PROXY_DEGRADED_NOTICE_KEY.into()),
+        };
+        assert_eq!(
+            titles(&applied([degraded, notice("stale"), prompt("next")])),
+            ["Fake features unavailable"],
+            "a degraded proxy's banner outlives the turn"
         );
         assert!(
             titles(&applied([
