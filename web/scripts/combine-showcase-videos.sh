@@ -48,8 +48,9 @@ FONT="${FONT:-}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS="${ROOT}/test-results"
 OUT="${1:-${RESULTS}/showcase-combined.mp4}"
-# Encode to a sibling file so a failed run never clobbers a good ${OUT}.
-PARTIAL="${OUT}.partial.mp4"
+# Encode to a unique sibling file so a failed run never clobbers a good ${OUT}
+# and a planted symlink is never followed.
+PARTIAL="$(mktemp "${OUT}.XXXXXX")"
 
 if [[ ! -d "${RESULTS}" ]]; then
   echo "no test-results/ directory at ${RESULTS}" >&2
@@ -302,7 +303,7 @@ if [[ -n "${GRID}" ]]; then
     -an \
     -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
     -movflags +faststart \
-    "${PARTIAL}"
+    -f mp4 "${PARTIAL}"
 
 else
   # ---- concat mode ------------------------------------------------------
@@ -340,7 +341,7 @@ else
       -an \
       -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
       -movflags +faststart \
-      "${PARTIAL}"
+      -f mp4 "${PARTIAL}"
   else
     # Cheap path: concat demuxer + setpts filter. One re-encode, no
     # per-input scaling so input resolution must match across files
@@ -356,7 +357,7 @@ else
       -an \
       -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
       -movflags +faststart \
-      "${PARTIAL}"
+      -f mp4 "${PARTIAL}"
   fi
 fi
 
