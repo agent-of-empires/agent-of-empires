@@ -161,7 +161,6 @@ pub fn parse_trust_pointer(pointer: &str) -> Option<Vec<&str>> {
             .filter(|segment| **segment == "{path}")
             .count()
             == 1
-        && segments.last() != Some(&"{path}")
         && segments
             .iter()
             .all(|segment| segment.parse::<usize>().is_err());

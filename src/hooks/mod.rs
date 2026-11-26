@@ -60,8 +60,9 @@ pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
 };
 pub use trust::{
-    disable_gemini_folder_trust, trust_claude_project, trust_codex_project, trust_gemini_project,
-    trust_host_project,
+    declared_trust_applies_in_sandbox, declared_trust_path, disable_gemini_folder_trust,
+    trust_claude_project, trust_codex_project, trust_gemini_project, trust_host_project,
+    write_declared_trust,
 };
 
 /// Where the agent's settings live, which decides the base directory baked into

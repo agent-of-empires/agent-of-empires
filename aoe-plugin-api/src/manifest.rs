@@ -926,8 +926,8 @@ fn validate_agent_trust(
         parse_trust_pointer(&trust.pointer).is_some(),
         format!(
             "agent_integrations[{i}].trust.pointer must be an absolute pointer such as \
-             \"/projects/{{path}}/trusted\" with exactly one `{{path}}` segment, no empty \
-             or numeric segments, and a leaf after it"
+             \"/projects/{{path}}/trusted\" with exactly one `{{path}}` segment and no empty \
+             or numeric segments"
         ),
     );
     if let AgentTrustValue::String(value) = &trust.value {

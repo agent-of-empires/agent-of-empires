@@ -1004,7 +1004,6 @@ fn trust_declarations_are_validated() {
         "projects/{path}/trusted",
         "/projects/trusted",
         "/projects/{path}/{path}",
-        "/projects/{path}",
         "/projects//{path}/trusted",
         "/projects/{path}/0",
         "/projects/x{path}/trusted",
@@ -1048,5 +1047,6 @@ fn trust_declarations_are_validated() {
         assert!(error.to_string().contains(want), "{want}: {error}");
     }
     parse(26, &with("value = true", "value = \"TRUST_FOLDER\""));
+    parse(26, &with("/projects/{path}/trusted", "/{path}"));
     parse(26, &with("sandbox = \"always\"", "sandbox = \"yolo_only\""));
 }

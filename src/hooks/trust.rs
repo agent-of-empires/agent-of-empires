@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use aoe_plugin_api::agent_integration::{
+    parse_trust_pointer, AgentTrustDeclaration, AgentTrustSandbox, AgentTrustValue,
+};
 use serde_json::Value;
 
 use super::codex::{read_codex_config, with_codex_config_lock, write_codex_config};
@@ -10,6 +13,31 @@ use super::config_io::{object_at, parse_json_or_empty, with_config_lock_policy, 
 use super::resolve_config_dir_override;
 
 /// Merge-edits a JSON config under its lock, writing only when `edit` changed it.
+fn edit_json(
+    path: &Path,
+    policy: SymlinkPolicy,
+    lock_path: &Path,
+    parse: impl FnOnce(Option<String>) -> Result<Value>,
+    edit: impl FnOnce(&mut serde_json::Map<String, Value>) -> Result<()>,
+    root_error: &str,
+) -> Result<bool> {
+    with_config_lock_policy(lock_path, "json.lock", policy, || {
+        let mut config = parse(policy.read(path)?)?;
+        let before = config.clone();
+        edit(
+            config
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("{root_error}"))?,
+        )?;
+        if config == before {
+            return Ok(false);
+        }
+        policy.write(path, serde_json::to_string_pretty(&config)?.as_bytes())?;
+        Ok(true)
+    })
+}
+
+/// A torn file reads as empty, so it cannot block a launch.
 fn edit_json_config(
     path: &Path,
     policy: SymlinkPolicy,
@@ -17,20 +45,17 @@ fn edit_json_config(
     edit: impl FnOnce(&mut serde_json::Map<String, Value>),
     root_error: &str,
 ) -> Result<bool> {
-    with_config_lock_policy(lock_path, "json.lock", policy, || {
-        let mut config = parse_json_or_empty(policy.read(path)?, path);
-        let before = config.clone();
-        edit(
-            config
-                .as_object_mut()
-                .ok_or_else(|| anyhow::anyhow!("{root_error}"))?,
-        );
-        if config == before {
-            return Ok(false);
-        }
-        policy.write(path, serde_json::to_string_pretty(&config)?.as_bytes())?;
-        Ok(true)
-    })
+    edit_json(
+        path,
+        policy,
+        lock_path,
+        |content| Ok(parse_json_or_empty(content, path)),
+        |root| {
+            edit(root);
+            Ok(())
+        },
+        root_error,
+    )
 }
 
 /// Merge `security.folderTrust.enabled = false` into a sandbox-staged Gemini
@@ -152,6 +177,94 @@ pub fn trust_gemini_project(
         tracing::info!(target: "hooks.install",
             "Marked {} trusted in Gemini trustedFolders {}",
             project_path, trusted_folders_path.display());
+    }
+    Ok(())
+}
+
+/// Where a plugin-declared trust record lives: the session's config dir, else the
+/// declared env var's dir, else `home`.
+pub fn declared_trust_path(
+    trust: &AgentTrustDeclaration,
+    home: &Path,
+    host_env: &[String],
+    config_dir: Option<&Path>,
+) -> PathBuf {
+    config_dir
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            trust
+                .config_dir_env_var
+                .as_deref()
+                .and_then(|var| resolve_config_dir_override(var, host_env))
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| home.to_path_buf())
+        .join(&trust.file)
+}
+
+/// Whether a sandbox launch gets the declared record.
+pub fn declared_trust_applies_in_sandbox(trust: &AgentTrustDeclaration, yolo: bool) -> bool {
+    match trust.sandbox {
+        AgentTrustSandbox::Always => true,
+        AgentTrustSandbox::YoloOnly => yolo,
+    }
+}
+
+/// Writes a plugin-declared trust leaf, with the project path as one object key.
+///
+/// Strict where the built-in writers are lenient: a malformed file or a non-object
+/// on the pointer is an error, never replaced. The host picks `policy`.
+pub fn write_declared_trust(
+    path: &Path,
+    trust: &AgentTrustDeclaration,
+    project_path: &str,
+    policy: SymlinkPolicy,
+) -> Result<()> {
+    let segments = parse_trust_pointer(&trust.pointer)
+        .ok_or_else(|| anyhow::anyhow!("invalid trust pointer {:?}", trust.pointer))?;
+    let (leaf, parents) = segments
+        .split_last()
+        .ok_or_else(|| anyhow::anyhow!("empty trust pointer"))?;
+    let leaf_value = match &trust.value {
+        AgentTrustValue::Bool(value) => Value::Bool(*value),
+        AgentTrustValue::String(value) => Value::String(value.clone()),
+    };
+    let written = edit_json(
+        path,
+        policy,
+        &policy.lock_path(path)?,
+        |content| match content {
+            None => Ok(Value::Object(Default::default())),
+            Some(content) => serde_json::from_str(&content)
+                .with_context(|| format!("{} is not valid JSON", path.display())),
+        },
+        |root| {
+            let key_for = |segment: &str| {
+                if segment == "{path}" {
+                    project_path.to_string()
+                } else {
+                    segment.to_string()
+                }
+            };
+            let mut node = root;
+            for segment in parents {
+                let key = key_for(segment);
+                node = node
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Default::default()))
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{key:?} in {} is not a JSON object", path.display())
+                    })?;
+            }
+            node.insert(key_for(leaf), leaf_value);
+            Ok(())
+        },
+        "Trust file root is not a JSON object",
+    )?;
+    if written {
+        tracing::info!(target: "hooks.install",
+            "Marked {} trusted in {}", project_path, path.display());
     }
     Ok(())
 }
@@ -404,5 +517,120 @@ mod tests {
             assert!(!from_env.join(rel).exists(), "{agent}");
             std::fs::remove_dir_all(&declared).unwrap();
         }
+    }
+
+    fn declared_trust(pointer: &str, value: AgentTrustValue) -> AgentTrustDeclaration {
+        AgentTrustDeclaration {
+            file: ".example.json".into(),
+            location: aoe_plugin_api::agent_integration::AgentTrustLocation::ConfigDirOrHome,
+            config_dir_env_var: Some("EXAMPLE_CONFIG_DIR".into()),
+            pointer: pointer.into(),
+            value,
+            sandbox: AgentTrustSandbox::YoloOnly,
+        }
+    }
+
+    #[test]
+    fn declared_trust_inserts_the_path_as_one_key() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".example.json");
+        std::fs::write(
+            &path,
+            r#"{"projects":{"/other":{"trusted":true}},"keep":1}"#,
+        )
+        .unwrap();
+        let trust = declared_trust("/projects/{path}/trusted", AgentTrustValue::Bool(true));
+        write_declared_trust(&path, &trust, "/work/a b/~1", SymlinkPolicy::Follow).unwrap();
+        let config = read_json(&path);
+        assert_eq!(config["projects"]["/work/a b/~1"]["trusted"], true);
+        assert_eq!(config["projects"]["/other"]["trusted"], true);
+        assert_eq!(config["keep"], 1);
+        assert_eq!(config["projects"].as_object().unwrap().len(), 2);
+        assert_not_rewritten(&path, || {
+            write_declared_trust(&path, &trust, "/work/a b/~1", SymlinkPolicy::Follow).unwrap()
+        });
+
+        let fresh = tmp.path().join("fresh.json");
+        let string = declared_trust("/trusted/{path}", AgentTrustValue::String("YES".into()));
+        write_declared_trust(&fresh, &string, "/repo", SymlinkPolicy::Follow).unwrap();
+        assert_eq!(read_json(&fresh)["trusted"]["/repo"], "YES");
+    }
+
+    #[test]
+    fn declared_trust_fails_closed_on_unexpected_content() {
+        let tmp = TempDir::new().unwrap();
+        let trust = declared_trust("/projects/{path}/trusted", AgentTrustValue::Bool(true));
+        for (content, label) in [
+            ("{not json", "malformed"),
+            ("[]", "array root"),
+            (r#"{"projects":[]}"#, "array intermediate"),
+            (r#"{"projects":{"/repo":"yes"}}"#, "string intermediate"),
+            (r#"{"projects":null}"#, "null intermediate"),
+        ] {
+            let path = tmp.path().join(format!("{}.json", label.replace(' ', "-")));
+            std::fs::write(&path, content).unwrap();
+            assert!(
+                write_declared_trust(&path, &trust, "/repo", SymlinkPolicy::Follow).is_err(),
+                "{label}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content, "{label}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_trust_symlink_policies() {
+        let tmp = TempDir::new().unwrap();
+        let trust = declared_trust("/projects/{path}/trusted", AgentTrustValue::Bool(true));
+        let dotfiles = tmp.path().join("dotfiles.json");
+        std::fs::write(&dotfiles, "{}").unwrap();
+        let linked = tmp.path().join("linked.json");
+        std::os::unix::fs::symlink(&dotfiles, &linked).unwrap();
+        write_declared_trust(&linked, &trust, "/repo", SymlinkPolicy::Follow).unwrap();
+        assert!(std::fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read_json(&dotfiles)["projects"]["/repo"]["trusted"], true);
+
+        let outside = tmp.path().join("host-secret");
+        std::fs::write(&outside, "{}").unwrap();
+        let bind = tmp.path().join("bind");
+        std::fs::create_dir(&bind).unwrap();
+        let planted = bind.join(".example.json");
+        std::os::unix::fs::symlink(&outside, &planted).unwrap();
+        write_declared_trust(&planted, &trust, "/repo", SymlinkPolicy::Never).unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "{}");
+        assert!(!std::fs::symlink_metadata(&planted)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read_json(&planted)["projects"]["/repo"]["trusted"], true);
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn declared_trust_location_and_sandbox_policy() {
+        let _guard = EnvGuard::unset(&["EXAMPLE_CONFIG_DIR"]);
+        let home = Path::new("/home/me");
+        let mut trust = declared_trust("/p/{path}/t", AgentTrustValue::Bool(true));
+        let env = ["EXAMPLE_CONFIG_DIR=/from/env".to_string()];
+        let dir = Path::new("/declared");
+        assert_eq!(
+            declared_trust_path(&trust, home, &env, Some(dir)),
+            Path::new("/declared/.example.json")
+        );
+        assert_eq!(
+            declared_trust_path(&trust, home, &env, None),
+            Path::new("/from/env/.example.json")
+        );
+        assert_eq!(
+            declared_trust_path(&trust, home, &[], None),
+            Path::new("/home/me/.example.json")
+        );
+        assert!(!declared_trust_applies_in_sandbox(&trust, false));
+        assert!(declared_trust_applies_in_sandbox(&trust, true));
+        trust.sandbox = AgentTrustSandbox::Always;
+        assert!(declared_trust_applies_in_sandbox(&trust, false));
     }
 }
