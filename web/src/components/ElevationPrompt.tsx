@@ -49,6 +49,8 @@ export function ElevationPrompt() {
   return (
     <Dialog
       id="elevation-prompt"
+      // Over the sandbox Log in dialog, which can ask for it.
+      layer="z-[70]"
       title="Confirm passphrase"
       panelClassName="md:w-[384px]"
       describedBy="elevation-prompt-note"

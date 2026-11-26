@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { CARD, CAPTION, PHONE_BANNER_CARD } from "../lib/surfaces";
 
 import { useServerDown } from "../lib/connectionState";
+import { SandboxLoginStatusRow } from "./SandboxLoginDialog";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { PasskeySettings } from "./PasskeySettings";
 import { McpServers } from "./McpServers";
@@ -44,6 +45,9 @@ import {
 } from "../lib/settingsIntros";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { LogsSettings } from "./settings/LogsSettings";
+import { SuggestionsSettings } from "./settings/SuggestionsSettings";
+import type { PresetFocus } from "./settings/SuggestionPresetEditor";
+import { useSuggestionsSnapshot } from "./settings/useSuggestionsSnapshot";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { StructuredViewDisplaySettings } from "./settings/StructuredViewDisplaySettings";
 import { ProfilesSection } from "./profiles/ProfilesSection";
@@ -71,6 +75,7 @@ export type TabId =
   | "structured-view"
   | "mcp"
   | "skills"
+  | "suggestions"
   | "logging"
   | "logs"
   | "plugins"
@@ -103,7 +108,7 @@ const PROFILES_ICON = (
 // Dashboard settings lead, since the web is where they apply; tabs that only
 // tune the daemon, TUI, or host follow. Exported to test the order without the
 // duplicated list and sidebar in the DOM.
-export function buildSidebar(readOnly = false): SidebarItem[] {
+export function buildSidebar(readOnly = false, suggestions = false): SidebarItem[] {
   const items: SidebarItem[] = [
     { kind: "divider", label: "Dashboard" },
     { kind: "tab", id: "theme", label: "Theme" },
@@ -119,6 +124,7 @@ export function buildSidebar(readOnly = false): SidebarItem[] {
     { kind: "tab", id: "structured-view", label: "Structured view" },
     { kind: "tab", id: "mcp", label: "MCP servers" },
     { kind: "tab", id: "skills", label: "Skills" },
+    ...(suggestions ? [{ kind: "tab" as const, id: "suggestions" as const, label: "Suggestions" }] : []),
     { kind: "divider", label: "Environment" },
     { kind: "tab", id: "sandbox", label: "Sandbox" },
     { kind: "tab", id: "worktree", label: "Worktree" },
@@ -195,6 +201,10 @@ interface Props {
    *  advanced settings PATCH is closed server-side in this mode; theme and the
    *  surfaced fields write through their own endpoints. See #7. */
   cityhall?: boolean;
+  /** Opens the full Suggested sessions view, optionally on its Dismissed filter. */
+  onOpenSuggestions?: (dismissed: boolean) => void;
+  /** Opens Settings > Suggestions on one kind's preset editor. */
+  presetFocus?: PresetFocus;
 }
 
 const LAST_TAB_KEY = "aoe-settings-last-tab";
@@ -219,6 +229,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "structured-view",
   "mcp",
   "skills",
+  "suggestions",
   "logging",
   "logs",
   "plugins",
@@ -274,8 +285,13 @@ export function SettingsView({
   field,
   readOnly,
   cityhall = false,
+  onOpenSuggestions,
+  presetFocus,
 }: Props) {
   const offline = useServerDown();
+  const suggestions = useSuggestionsSnapshot();
+  // A failed load keeps the tab, so its error and Retry stay reachable.
+  const hasSuggestionProviders = (suggestions.snapshot?.providers.length ?? 0) > 0 || suggestions.failed;
   // Seed empty rather than "default" so the initial
   // useEffect-gated loadSettings doesn't fire a wasted
   // fetchSettings("default") against a profile that may not exist.
@@ -308,7 +324,7 @@ export function SettingsView({
     },
     [onSelectProfile],
   );
-  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(readOnly);
+  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(readOnly, hasSuggestionProviders);
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab");
   const allowedTab = (t: unknown): t is TabId =>
     isTabId(t) && (cityhall ? CITYHALL_TAB_IDS.has(t) : sidebar.some((s) => s.kind === "tab" && s.id === t));
@@ -460,6 +476,7 @@ export function SettingsView({
     reloadSettings();
   }, [reloadSettings]);
 
+  const [credentialSaves, setCredentialSaves] = useState(0);
   const sendSave = useCallback(
     (section: string, field: string, value: unknown): Promise<boolean> => {
       if (!selectedProfile) return Promise.resolve(false);
@@ -468,7 +485,13 @@ export function SettingsView({
       // toggles are profile overrides with their own narrow endpoint.
       const send = () =>
         cityhall ? updateProfileSettings(selectedProfile, patch) : updateSettings(patch, selectedProfile);
-      return saveField(selectedProfile, section, field, value, send);
+      // The login row re-reads once the credential mode is on the server: when the save commits, or when a fetch confirms an uncertain one.
+      const credential = section === "sandbox" && field === "shared_credential";
+      const reread = () => setCredentialSaves((n) => n + 1);
+      return saveField(selectedProfile, section, field, value, send, 0, credential ? reread : undefined).then((ok) => {
+        if (ok && credential) reread();
+        return ok;
+      });
     },
     [selectedProfile, cityhall],
   );
@@ -530,6 +553,7 @@ export function SettingsView({
       activeTab !== "structured-view" &&
       activeTab !== "mcp" &&
       activeTab !== "skills" &&
+      activeTab !== "suggestions" &&
       activeTab !== "plugins" &&
       activeTab !== "telemetry" &&
       activeTab !== "cityhall" &&
@@ -627,14 +651,21 @@ export function SettingsView({
 
       case "sandbox":
         return (
-          <SchemaSection
-            section="sandbox"
-            schema={schema}
-            focusRequest={focusRequest}
-            values={sandbox}
-            onSaveField={sendSave}
-            advancedSubtitle="Resource limits, custom instructions, environment, volumes, and ports."
-          />
+          <>
+            <SandboxLoginStatusRow
+              profile={selectedProfile || undefined}
+              reloadKey={credentialSaves}
+              readOnly={readOnly || cityhall}
+            />
+            <SchemaSection
+              section="sandbox"
+              schema={schema}
+              focusRequest={focusRequest}
+              values={sandbox}
+              onSaveField={sendSave}
+              advancedSubtitle="Resource limits, custom instructions, environment, volumes, and ports."
+            />
+          </>
         );
 
       case "worktree":
@@ -753,7 +784,14 @@ export function SettingsView({
       case "plugins":
         return (
           <div className="space-y-6">
-            <PluginsSettings readOnly={cityhall} />
+            <PluginsSettings
+              readOnly={cityhall}
+              initialMarketplaceFilter={
+                new URLSearchParams(window.location.search).get("marketplace") === "suggestions"
+                  ? "suggestions"
+                  : undefined
+              }
+            />
             {!cityhall &&
               (schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaveField={sendSave} />)}
           </div>
@@ -801,6 +839,18 @@ export function SettingsView({
         return <McpServers readOnly={cityhall} />;
       case "skills":
         return <SkillsManager readOnly={readOnly || cityhall} />;
+      case "suggestions":
+        return (
+          <SuggestionsSettings
+            snapshot={suggestions.snapshot}
+            failed={suggestions.failed}
+            reload={suggestions.reload}
+            readOnly={readOnly ?? false}
+            onOpenSuggestions={onOpenSuggestions}
+            presetFocus={presetFocus}
+            pluginSettings={cityhall ? undefined : { schema, settings, onSaveField: sendSave, notice: schemaGuard() }}
+          />
+        );
       case "structured-view": {
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;

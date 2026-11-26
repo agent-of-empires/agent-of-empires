@@ -80,8 +80,6 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe tmux`↴](#aoe-tmux)
 * [`aoe tmux status`↴](#aoe-tmux-status)
 * [`aoe sounds`↴](#aoe-sounds)
-* [`aoe sounds install`↴](#aoe-sounds-install)
-* [`aoe sounds list`↴](#aoe-sounds-list)
 * [`aoe sounds test`↴](#aoe-sounds-test)
 * [`aoe theme`↴](#aoe-theme)
 * [`aoe theme list`↴](#aoe-theme-list)
@@ -175,7 +173,7 @@ Run without arguments to launch the TUI dashboard.
 * `sandbox` — Clean up sandbox agent stores and log in sandboxed agents
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
-* `sounds` — Manage sound effects for agent state transitions
+* `sounds` — Test the built-in sound effects
 * `theme` — Manage color themes (list, export, customize)
 * `settings` — Inspect resolved settings and their provenance
 * `cityhall` — Export and apply the CityHall config bundle (settings + projects)
@@ -195,7 +193,7 @@ Run without arguments to launch the TUI dashboard.
 ###### **Options:**
 
 * `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it. `AGENT_OF_EMPIRES_PROFILE` names one too, and an explicit `-p` wins over it
-* `--daemon-url <DAEMON_URL>` — Select a daemon endpoint for read-only CLI commands or the TUI.
+* `--daemon-url <DAEMON_URL>` — Select a Daemon endpoint for commands that use the Daemon API, or for the TUI.
 
    Explicit endpoints and `AOE_DAEMON_URL` never fall back to local storage or start a local daemon. Authenticate with `AOE_DAEMON_TOKEN` or `AOE_DAEMON_PASSPHRASE`. An unauthenticated daemon needs neither. See the HTTP API reference for transport and authentication rules.
 * `--no-autostart` — Fail instead of starting a local daemon when none is running
@@ -1339,43 +1337,37 @@ Add this to your ~/.tmux.conf: set -g status-right "#(aoe tmux status)"
 
 ## `aoe sounds`
 
-Manage sound effects for agent state transitions
+Test the built-in sound effects
 
 **Usage:** `aoe sounds <COMMAND>`
 
 ###### **Subcommands:**
 
-* `install` — Install bundled sound effects
-* `list` — List currently installed sounds
-* `test` — Test a sound by playing it
-
-
-
-## `aoe sounds install`
-
-Install bundled sound effects
-
-**Usage:** `aoe sounds install`
-
-
-
-## `aoe sounds list`
-
-List currently installed sounds
-
-**Usage:** `aoe sounds list`
+* `test` — Play a built-in sound on this machine to check that audio works
 
 
 
 ## `aoe sounds test`
 
-Test a sound by playing it
+Play a built-in sound on this machine to check that audio works
 
-**Usage:** `aoe sounds test <NAME>`
+**Usage:** `aoe sounds test [EVENT]`
 
 ###### **Arguments:**
 
-* `<NAME>` — Sound file name (without extension)
+* `<EVENT>` — The sound to play
+
+  Default value: `idle`
+
+  Possible values:
+  - `start`
+  - `running`
+  - `waiting`
+  - `idle`
+  - `error`
+  - `approval`:
+    A Structured view Session asks for permission or a question; browser only
+
 
 
 

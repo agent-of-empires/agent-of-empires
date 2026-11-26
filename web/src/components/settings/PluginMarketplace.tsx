@@ -1,5 +1,6 @@
-import { BUTTON_SECONDARY, CARD, INPUT } from "../../lib/surfaces";
-import { BUTTON_PRIMARY_SM } from "../../lib/surfaces";
+import { Sparkles } from "lucide-react";
+
+import { BUTTON_PRIMARY_SM, BUTTON_SECONDARY, CARD, INPUT } from "../../lib/surfaces";
 import { PanelMessage } from "../panelParts";
 import { PILL } from "./PluginCard";
 import { sourceFromCommand, type PluginMarketplaceState } from "./pluginFlows";
@@ -13,7 +14,27 @@ interface Props {
 
 /** The marketplace tab: GitHub search results, each installable in-app. */
 export function PluginMarketplace({ market, installedSources, onOpenDetail }: Props) {
-  const { query, setQuery, results, error, discovering, previewingSource, discover, install } = market;
+  const {
+    query,
+    setQuery,
+    suggestionsOnly,
+    setSuggestionsOnly,
+    results,
+    error,
+    discovering,
+    previewingSource,
+    discover,
+    install,
+  } = market;
+  const suggestingCount = results?.filter((r) => r.suggestions).length ?? 0;
+  const shown = suggestionsOnly ? results?.filter((r) => r.suggestions) : results;
+  // A filter chip, the picked one filled as the redesign marks a current choice.
+  const chipClass = (active: boolean) =>
+    `inline-flex h-8 max-md:h-10 items-center gap-1.5 rounded-lg border px-3 text-[12px] max-md:text-[14px] cursor-pointer transition-colors ${
+      active
+        ? "border-surface-600 bg-surface-700 text-text-primary"
+        : "border-surface-700/60 text-text-secondary hover:bg-surface-800"
+    }`;
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-2">
@@ -45,12 +66,41 @@ export function PluginMarketplace({ market, installedSources, onOpenDetail }: Pr
         </PanelMessage>
       )}
 
-      {results && (
+      {results && results.length > 0 && (
+        <div className="flex flex-wrap gap-2" data-testid="plugins-filter">
+          <button
+            type="button"
+            className={chipClass(!suggestionsOnly)}
+            aria-pressed={!suggestionsOnly}
+            onClick={() => setSuggestionsOnly(false)}
+            data-testid="plugins-filter-all"
+          >
+            All
+          </button>
+          <button
+            type="button"
+            className={chipClass(suggestionsOnly)}
+            aria-pressed={suggestionsOnly}
+            onClick={() => setSuggestionsOnly(true)}
+            data-testid="plugins-filter-suggestions"
+          >
+            <Sparkles className="size-3.5" aria-hidden="true" />
+            Works with Suggestions
+            <span className="font-mono text-text-dim">{suggestingCount}</span>
+          </button>
+        </div>
+      )}
+
+      {shown && (
         <div className="space-y-2" data-testid="plugins-discover-results">
-          {results.length === 0 ? (
-            <PanelMessage className="px-1">No plugins found on the aoe-plugin topic.</PanelMessage>
+          {shown.length === 0 ? (
+            <PanelMessage className="px-1">
+              {results?.length === 0
+                ? "No plugins found on the aoe-plugin topic."
+                : "No plugins here work with Suggestions yet."}
+            </PanelMessage>
           ) : (
-            results.map((r) => {
+            shown.map((r) => {
               const source = sourceFromCommand(r.install_command);
               return (
                 <div
@@ -78,6 +128,16 @@ export function PluginMarketplace({ market, installedSources, onOpenDetail }: Pr
                       {r.slug}
                     </button>
                     <span className={`${PILL} bg-accent-500/20 text-accent-500`}>{r.badge}</span>
+                    {r.suggestions && (
+                      <span
+                        className={`${PILL} inline-flex items-center gap-1 border border-brand-600/60 text-brand-400`}
+                        title={`This plugin can suggest Sessions. Turn it on in Settings › Suggestions${r.badge === "installed" ? "" : " after installing"}.`}
+                        data-testid={`plugins-suggestions-chip-${r.slug}`}
+                      >
+                        <Sparkles className="size-3" aria-hidden="true" />
+                        Suggestions
+                      </span>
+                    )}
                     <span className="text-text-dim">★ {r.stars}</span>
                     <a href={r.html_url} target="_blank" rel="noreferrer" className="text-text-dim hover:underline">
                       GitHub ↗

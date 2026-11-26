@@ -1,15 +1,20 @@
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import type { SessionResponse } from "../lib/types";
 import { isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandMark";
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
+import { DashboardSuggestions } from "./DashboardSuggestions";
+import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
+import type { WizardPrefill } from "./session-wizard/SessionWizard";
 import { PluginCards, PluginHomePanes } from "./plugin/PluginSlots";
 import { StrokeIcon } from "./icons";
 import { CARD } from "../lib/surfaces";
 
 interface Props {
   sessions: SessionResponse[];
+  /** Opens a Session a suggestion already started. */
+  onSelectSession: (sessionId: string) => void;
   onNewSession: () => void;
   onCloneFromUrl: () => void;
   /** When false (CityHall client mode), the "Clone URL" action is hidden;
@@ -18,16 +23,37 @@ interface Props {
   readOnly?: boolean;
   /** Shown above the action panes, e.g. the setup checklist. */
   banner?: ReactNode;
+  /** Both required to show the Suggested sessions section. */
+  onPrepareSuggestion?: (prefill: WizardPrefill) => void;
+  onEditSuggestionPreset?: (providerId: string, criterion: string) => void;
+  canLinkSuggestions?: boolean;
+  /** False in CityHall: suggestions are read-only there. Defaults to true. */
+  canManageSuggestions?: boolean;
+  onViewAllSuggestions?: () => void;
+  /** The onboarding tour is running; the first-run hint stays out of it. */
+  tourActive?: boolean;
+  /** Opens Settings > Plugins > Marketplace filtered to Suggestions; the first-run hint shows only when set. */
+  onOpenSuggestionsMarketplace?: () => void;
 }
 
 export function Dashboard({
   sessions,
+  onSelectSession,
   onNewSession,
   onCloneFromUrl,
   readOnly,
   canManageProjects = true,
   banner,
+  onPrepareSuggestion,
+  onEditSuggestionPreset,
+  canLinkSuggestions,
+  canManageSuggestions = true,
+  onViewAllSuggestions,
+  onOpenSuggestionsMarketplace,
+  tourActive = false,
 }: Props) {
+  // Bumped when the setup sheet finishes so the Suggested section refetches.
+  const [suggestionsEpoch, setSuggestionsEpoch] = useState(0);
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const stats = useMemo(() => {
     const projects = new Set<string>();
@@ -128,6 +154,20 @@ export function Dashboard({
         </div>
       )}
 
+      {onPrepareSuggestion && onViewAllSuggestions && (
+        <DashboardSuggestions
+          key={suggestionsEpoch}
+          readOnly={readOnly || !canManageSuggestions}
+          cityhall={!canManageSuggestions}
+          onPrepare={onPrepareSuggestion}
+          onEditPreset={onEditSuggestionPreset}
+          canLink={canLinkSuggestions}
+          onViewAll={onViewAllSuggestions}
+          onOpenSession={onSelectSession}
+          sessions={sessions}
+        />
+      )}
+
       {banner}
 
       {/* Action panes */}
@@ -161,6 +201,13 @@ export function Dashboard({
             icon="book"
           />
         </div>
+      )}
+
+      {!readOnly && canManageProjects && !tourActive && onOpenSuggestionsMarketplace && (
+        <SuggestionsSetupHint
+          onOpenMarketplace={onOpenSuggestionsMarketplace}
+          onFinished={() => setSuggestionsEpoch((n) => n + 1)}
+        />
       )}
 
       {/* Plugin-contributed dashboard cards (#2366). Renders nothing (and adds

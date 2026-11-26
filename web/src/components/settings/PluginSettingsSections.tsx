@@ -3,8 +3,11 @@ import { CAPTION } from "../../lib/surfaces";
 
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import { SchemaSection } from "./SchemaSection";
+import { SectionHeader } from "./suggestionsShared";
 
 const PLUGIN_PREFIX = "plugin:";
+/** Plugin settings with this key prefix also show in Settings > Suggestions. */
+const SUGGESTION_PREFIX = "suggestion_";
 
 interface Props {
   /** Includes the virtual `plugin:<id>` sections. */
@@ -14,9 +17,18 @@ interface Props {
   onSaveField: (section: string, field: string, value: unknown) => Promise<boolean>;
 }
 
-function storedSettings(settings: Record<string, unknown> | null, id: string): Record<string, unknown> {
+/** Manifest defaults overlaid with the stored plugin settings. */
+function pluginValues(
+  schema: SettingsFieldDescriptor[],
+  settings: Record<string, unknown> | null,
+  id: string,
+): Record<string, unknown> {
+  const values: Record<string, unknown> = {};
+  for (const d of schema) {
+    if (d.section === PLUGIN_PREFIX + id && d.default !== undefined) values[d.field] = d.default;
+  }
   const plugins = (settings?.plugins ?? {}) as Record<string, { settings?: Record<string, unknown> }>;
-  return plugins[id]?.settings ?? {};
+  return Object.assign(values, plugins[id]?.settings);
 }
 
 /** One SchemaSection per active plugin; plugin settings are global, saved via `PATCH /api/settings`. */
@@ -40,12 +52,7 @@ export function PluginSettingsSections({ schema, settings, onSaveField }: Props)
       <h4 className={CAPTION}>Plugin settings</h4>
       {sections.map((section) => {
         const id = section.slice(PLUGIN_PREFIX.length);
-        // Seed manifest defaults for fields with no stored value yet.
-        const values: Record<string, unknown> = {};
-        for (const d of schema) {
-          if (d.section === section && d.default !== undefined) values[d.field] = d.default;
-        }
-        Object.assign(values, storedSettings(settings, id));
+        const values = pluginValues(schema, settings, id);
         return (
           <div key={section} className="space-y-3">
             <h5 className="text-xs font-mono text-text-secondary">{id}</h5>
@@ -54,5 +61,35 @@ export function PluginSettingsSections({ schema, settings, onSaveField }: Props)
         );
       })}
     </div>
+  );
+}
+
+/** One plugin's `suggestion_*` settings, unfolded, saved like on the Plugins tab. */
+export function PluginSuggestionSettings({
+  pluginId,
+  title,
+  schema,
+  settings,
+  onSaveField,
+}: Props & { pluginId: string; title: string }) {
+  const section = PLUGIN_PREFIX + pluginId;
+  const fields = useMemo(
+    () =>
+      schema
+        .filter((d) => d.section === section && d.field.startsWith(SUGGESTION_PREFIX))
+        .map((d) => ({ ...d, advanced: false })),
+    [schema, section],
+  );
+  if (fields.length === 0) return null;
+  return (
+    <section aria-label={title}>
+      <SectionHeader>{title}</SectionHeader>
+      <SchemaSection
+        section={section}
+        schema={fields}
+        values={pluginValues(schema, settings, pluginId)}
+        onSaveField={onSaveField}
+      />
+    </section>
   );
 }

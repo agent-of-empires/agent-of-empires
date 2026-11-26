@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
+import type { WizardPrefill } from "./session-wizard/SessionWizard";
 import type { RuntimeCursor, SessionMutation } from "../lib/api";
 import type { TrashRecoveryTarget } from "../lib/trashActions";
 import { SidebarSystemHealth } from "./SystemHealthStrip";
@@ -41,6 +42,7 @@ import {
 } from "./sidebar/filterGroups";
 import { FlatGroupList, NestedGroupList, OrgGroupList, type ListContext } from "./sidebar/GroupLists";
 import { SessionRow } from "./sidebar/SessionRow";
+import { SidebarSuggestions } from "./sidebar/SidebarSuggestions";
 import { FacetPanel, SidebarToolbar } from "./sidebar/SidebarToolbar";
 import { SidebarNav } from "./sidebar/SidebarNav";
 import { TrashMenu } from "./sidebar/TrashMenu";
@@ -92,6 +94,8 @@ interface Props {
   pageTop?: ReactNode;
   /** The app's banners on the phone page, under its title row. */
   pageBanner?: ReactNode;
+  /** A section the phone page lists above the sessions, scrolling with them, such as Suggested sessions. */
+  pageSection?: ReactNode;
   /** Phone with a Session open: the list is a drawer from the left, opened and closed through `open`. */
   drawer?: boolean;
   /** The app's ⋯ items, which a phone's list carries in its title row. */
@@ -114,7 +118,6 @@ interface Props {
   onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
   onStopSession?: (sessionId: string) => void;
   onStartSession?: (sessionId: string) => void;
-  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   /** False in CityHall client mode, which hides project management. */
@@ -125,6 +128,16 @@ interface Props {
   onPluginSortChange: (ref: { pluginId: string; entryId: string }) => void;
   axis: SidebarAxis;
   onAxisChange: (axis: SidebarAxis) => void;
+  /** Enables the "Suggested" Group, which shows only while the `sidebar` suggestions pref is on. */
+  suggestions?: {
+    /** Overrides the sidebar's `readOnly` for the Group. */
+    readOnly?: boolean;
+    cityhall?: boolean;
+    onEditPreset?: (providerId: string, criterion: string) => void;
+    onPrepare: (prefill: WizardPrefill) => void;
+    onViewAll: () => void;
+    onOpenSession: (sessionId: string) => void;
+  };
 }
 
 export function WorkspaceSidebar(props: Props) {
@@ -284,7 +297,6 @@ export function WorkspaceSidebar(props: Props) {
       onDelete: props.onDeleteSession,
       onStop: props.onStopSession,
       onStart: props.onStartSession,
-      onRestartForUpdate: props.onRestartForUpdate,
       onSwitchView: props.onSwitchView,
       readOnly,
       optimistic: triage.optimisticFor(v.workspace),
@@ -403,6 +415,7 @@ export function WorkspaceSidebar(props: Props) {
         )}
 
         <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/40 px-2 pt-1">
+          {props.pageSection && <div className="px-1">{props.pageSection}</div>}
           {isNested ? (
             <NestedGroupList
               ctx={ctx}
@@ -494,6 +507,8 @@ export function WorkspaceSidebar(props: Props) {
               </button>
             </div>
           )}
+
+          {props.suggestions && <SidebarSuggestions readOnly={readOnly} {...props.suggestions} />}
         </div>
 
         <SidebarSystemHealth />

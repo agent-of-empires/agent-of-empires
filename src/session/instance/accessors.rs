@@ -11,7 +11,7 @@ pub(crate) const UNBOUND_STORE_HINT: &str = "ACP does not prove a native convers
 #[error("Cannot create sub-session of a sub-session (single level only)")]
 pub struct NestedSubSession;
 
-fn generate_id() -> String {
+pub(crate) fn generate_id() -> String {
     Uuid::new_v4().to_string().replace("-", "")[..16].to_string()
 }
 
@@ -53,6 +53,7 @@ impl Instance {
             plugin_meta: std::collections::BTreeMap::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            suggestion: None,
             plugin_revival_pending: false,
             pending_initial_turn: None,
             queued_prompts: Vec::new(),
@@ -108,9 +109,7 @@ impl Instance {
             launch_admission: None,
             before_start_minted_for_launch: false,
             capture_started_at: None,
-            started_at: None,
             launch_executable: None,
-            launch_resolved_executable: None,
             pi_extension_launched: false,
             identity_publisher_launched: false,
             pi_session_path: None,

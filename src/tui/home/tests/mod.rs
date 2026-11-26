@@ -222,6 +222,7 @@ mod preview_links;
 mod profile_duplicate_reconciliation;
 mod render_and_save;
 mod right_click_context_menu;
+mod sandbox_login_dialog;
 mod save_field_merge;
 mod scroll_pane_isolation;
 mod search;
@@ -233,6 +234,7 @@ mod split_terminal;
 mod stacked_divider_drag;
 mod stacked_single_seam;
 mod status_rows_menu;
+mod suggested_group;
 
 fn setup_test_home(temp: &TempDir) -> AppDirGuard {
     isolate_app_dir_at(temp.path())
@@ -612,7 +614,7 @@ fn earn_tip(env: &mut TestEnv) {
     let config = crate::session::config::load_config()
         .unwrap()
         .unwrap_or_default();
-    env.view.tips_unseen = crate::tui::home::tips_unseen_count(&config);
+    env.view.tips_unseen = env.view.tips_unseen_count(&config);
 }
 
 // Group deletion tests
@@ -917,6 +919,8 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         scratch: false,
         fork_seed: None,
         structured: false,
+        initial_prompt: None,
+        suggestion: None,
     }
 }
 

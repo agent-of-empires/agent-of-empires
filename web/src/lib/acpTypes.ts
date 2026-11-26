@@ -299,9 +299,6 @@ export type IncompatibleAgentDetail =
       reason: string;
     };
 
-/** Mirror of `StartupCause` in src/acp/state.rs; the event leaves it out when nothing was diagnosed. */
-export type StartupCause = { kind: "container_missing" };
-
 /** Mirror of `IntegrationLostReason` in src/acp/state.rs. */
 export type IntegrationLostReason =
   | { kind: "contract_violation"; detail: string }
@@ -591,6 +588,24 @@ export interface ReducedState {
   }[];
 }
 
+/**
+ * A startup failure the daemon diagnosed; mirrors `StartupCause` in `src/acp/state.rs`. A login-required
+ * cause carries the `command` and `profile` the banner hands to the login it starts.
+ */
+export type StartupCause =
+  | { kind: "container_missing" }
+  | { kind: "sandbox_login_required"; command?: string; profile?: string }
+  | { kind: "sandbox_login_unsupported" };
+
+const STARTUP_CAUSE_KINDS: ReadonlyArray<string> = [
+  "container_missing",
+  "sandbox_login_required",
+  "sandbox_login_unsupported",
+];
+
+/** `error` of the 409 a launch held until the sandbox login exists answers with. */
+export const SANDBOX_LOGIN_REQUIRED_CODE = "sandbox_login_required";
+
 export interface AcpState {
   agent: string | null;
   model: string | null;
@@ -614,6 +629,8 @@ export interface AcpState {
   optimisticRows: ActivityRow[];
   /** Frames with `seq` at or below this are dropped, so replays are idempotent. */
   lastSeq: number;
+  /** Highest seq a `reduced_state` snapshot covered; replayed frames at or below it are already in its `runs`. */
+  subagentsSeq?: number;
   /** `session/new` or `session/load` answered, so the Agent's session exists. */
   sessionAssigned: boolean;
   /** This dashboard restarted a start still in progress; its own stop doesn't read as a stopped Worker. Not persisted. */
@@ -634,6 +651,10 @@ export interface AcpState {
   startupError: string | null;
   /** Why `startupError` happened, when the Daemon said; set and cleared with it. */
   startupCause: StartupCause | null;
+  /** Counts the events that cleared the startup error; a late blocked launch from before one is stale. */
+  startupRecoveries: number;
+  /** `startupRecoveries` as each in-flight prompt was sent, for the refused-launch guard. */
+  promptRecoveries: Record<string, number>;
   /** Adapter compatibility failure; replaces the session view with `StartupErrorScreen`. */
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
@@ -752,6 +773,10 @@ export interface SubagentRecord {
   model?: string | null;
   /** Launched in the background: its card stays open until it goes idle. */
   background?: boolean;
+  /** Client-only: when the child last went idle, from the event's `at`; kept across metadata-only updates, absent on a cold load. */
+  idle_since?: string;
+  /** Number of runs: 1 is the first, each later idle -> active transition adds one. Daemon-published. */
+  runs?: number;
 }
 
 export interface BackgroundAgentTool {
@@ -1054,6 +1079,8 @@ export function emptyAcpState(): AcpState {
     lagged: false,
     startupError: null,
     startupCause: null,
+    startupRecoveries: 0,
+    promptRecoveries: {},
     incompatibleAgent: null,
     lastError: null,
     turnActive: false,
@@ -1101,6 +1128,7 @@ function isSteeredContinuation(state: AcpState): boolean {
 }
 
 function applyNewTurnResets(next: AcpState): void {
+  next.startupRecoveries += 1;
   next.startupError = null;
   next.startupCause = null;
   if (!next.restartInFlight) next.retriedError = null;
@@ -1321,8 +1349,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
-    next.startupCause =
-      event.AgentStartupError.cause?.kind === "container_missing" ? { kind: "container_missing" } : null;
+    const cause = event.AgentStartupError.cause;
+    // A kind from a newer Daemon reads as none, as an old client would see it.
+    next.startupCause = cause && STARTUP_CAUSE_KINDS.includes(cause.kind) ? cause : null;
     // A diagnosed cause gets its own banner, which doesn't compare with a Retry's error.
     const retried = state.restartInFlight && !next.startupCause ? state.retriedError : null;
     endRestart(next);
@@ -1382,6 +1411,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     endRestart(next);
     next.startupError = null;
     next.startupCause = null;
+    next.startupRecoveries += 1;
     next.lastError = null;
     next.incompatibleAgent = null;
     next.workerStopped = false;
@@ -1541,8 +1571,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       );
     }
     const i = next.subagents.findIndex((s) => s.session_id === subagent.session_id);
-    next.subagents =
-      i >= 0 ? next.subagents.map((s, idx) => (idx === i ? subagent : s)) : [...next.subagents, subagent];
+    const prev = next.subagents[i];
+    const resumed =
+      prev?.state === "idle" &&
+      (subagent.state === "running" || subagent.state === "requires_action") &&
+      frame.seq > (state.subagentsSeq ?? 0);
+    const stamped: SubagentRecord = {
+      ...subagent,
+      idle_since: subagent.state === "idle" ? (prev?.state === "idle" ? prev.idle_since : at) : undefined,
+      runs: prev ? (prev.runs ?? 1) + (resumed ? 1 : 0) : subagent.runs || 1,
+    };
+    next.subagents = i >= 0 ? next.subagents.map((s, idx) => (idx === i ? stamped : s)) : [...next.subagents, stamped];
     return next;
   }
   if ("BackgroundTaskStarted" in event) {
@@ -1630,7 +1669,14 @@ function mergeSubagents(
   const fromSnapshot = new Map(snapshot.map((r) => [r.session_id, r]));
   const heldIds = new Set(held.map((r) => r.session_id));
   return [
-    ...held.map((r) => (snapshotIsNewer ? (fromSnapshot.get(r.session_id) ?? r) : r)),
+    ...held.map((r) => {
+      const fresh = snapshotIsNewer ? fromSnapshot.get(r.session_id) : undefined;
+      if (!fresh) return r;
+      // The idle stamp comes from an event time the snapshot lacks, so it holds only while the state agrees.
+      // Runs only grow, so a seen resume survives a snapshot that predates it.
+      const idle_since = fresh.state === r.state ? r.idle_since : undefined;
+      return { ...fresh, idle_since, runs: Math.max(r.runs ?? 0, fresh.runs ?? 0) || undefined };
+    }),
     ...snapshot.filter((r) => !heldIds.has(r.session_id)),
   ];
 }
@@ -1682,6 +1728,7 @@ export function applyReducedState(
     backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     subagents: mergeSubagents(state.subagents, reduced.subagents ?? [], seq === undefined || seq >= state.lastSeq),
+    subagentsSeq: seq === undefined ? state.subagentsSeq : Math.max(state.subagentsSeq ?? 0, seq),
     locallyResolved,
   };
 }

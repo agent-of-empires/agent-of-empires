@@ -1385,6 +1385,7 @@ pub(crate) async fn start_server(
             });
     }
     callback::spawn_consumer(state.clone()).await;
+    super::sound_cues::spawn_host_player(state.clone());
 
     // Report this process's own session commits exactly; the disk consumer covers the rest.
     // Held for the server's lifetime, and only worth running when a plugin host consumes it.
@@ -1466,13 +1467,17 @@ pub(crate) async fn start_server(
         }
         notify_stopping().await;
         let plugin_host = shutdown_state.plugin_host.clone();
+        let sandbox_login = shutdown_state.session_service.sandbox_login.clone();
         run_shutdown_sequence(
             &shutdown_state.shutdown,
             SHUTDOWN_GRACE,
             async move {
-                if let Some(host) = plugin_host {
-                    host.shutdown().await;
-                }
+                let reap_plugins = async {
+                    if let Some(host) = plugin_host {
+                        host.shutdown().await;
+                    }
+                };
+                tokio::join!(reap_plugins, sandbox_login.shutdown());
             },
             || std::process::exit(0),
         )
