@@ -2462,46 +2462,72 @@ impl RunnerShared {
             }
             (Arc::clone(&cached.receipt), Arc::clone(postimage))
         };
-        tokio::task::spawn_blocking(move || {
-            match scope {
+        let original_attempt = Arc::clone(&receipt.attempt);
+        let mut prepare = move || -> anyhow::Result<NativeWriteAuthority> {
+            match &scope {
                 crate::acp::establishment::NativeRequestScope::Operation { permission } => {
-                    let fence = permission.session.effect_fence(&receipt).map_err(|_| ())?;
+                    let fence = permission.session.effect_fence(&receipt)?;
                     Ok(NativeWriteAuthority {
                         owner: permission.session.owner,
-                        request_scope: crate::acp::establishment::NativeRequestScope::Operation {
-                            permission: Arc::clone(&permission),
-                        },
+                        request_scope: scope.clone(),
                         attachment: Some(attachment_id),
                         scope: NativeWriteScope::Operation {
-                            receipt,
-                            permission,
+                            receipt: Arc::clone(&receipt),
+                            permission: Arc::clone(permission),
                         },
                         fence,
                     })
                 }
-                original @ crate::acp::establishment::NativeRequestScope::Original { .. } => {
+                crate::acp::establishment::NativeRequestScope::Original { .. } => {
                     {
-                        let _effect = original.effect_guard(&receipt).map_err(|_| ())?;
+                        let _effect = scope.effect_guard(&receipt)?;
                     }
-                    let fence = receipt.attempt.applied_fence(&postimage).map_err(|_| ())?;
+                    let fence = receipt.attempt.applied_fence(&postimage)?;
                     Ok(NativeWriteAuthority {
                         scope: NativeWriteScope::Applied {
                             attempt: Arc::clone(&receipt.attempt),
-                            postimage,
+                            postimage: Arc::clone(&postimage),
                         },
                         fence,
                         owner: receipt.owner,
-                        request_scope: original,
+                        request_scope: scope.clone(),
                         attachment: Some(attachment_id),
                     })
                 }
                 // A server callback ticket or an observation is not authority
                 // for a new client-to-agent business request.
-                _ => Err(()),
+                _ => anyhow::bail!("native request has no business authority"),
             }
-        })
-        .await
-        .map_err(|_| ())?
+        };
+        let mut registry_deadline = None;
+        loop {
+            let (result, next_prepare) = tokio::task::spawn_blocking(move || (prepare(), prepare))
+                .await
+                .map_err(|_| ())?;
+            match result {
+                Ok(authority) => return Ok(authority),
+                Err(error) if error.is::<worker_registry::RegistryBusy>() => {
+                    // The failed guard released lifecycle exclusion. Wait only for
+                    // contention, then check the same receipt and frozen scope again.
+                    #[cfg(test)]
+                    if let Some(waiting) = self.test_native_registry_wait.lock().unwrap().take() {
+                        let _ = waiting.send(());
+                    }
+                    let deadline = *registry_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + Duration::from_secs(3)
+                    });
+                    tokio::select! {
+                        biased;
+                        _ = self.wait_native_loss() => return Err(()),
+                        result = worker_registry::registry_lock_until(&original_attempt.session_id, deadline) => {
+                            drop(result.map_err(|_| ())?);
+                        }
+                    }
+                    prepare = next_prepare;
+                }
+                Err(_) => return Err(()),
+            }
+        }
     }
 
     async fn refuse_prompt(&self, id: i64) {
@@ -3487,6 +3513,131 @@ mod tests {
             .expect("spawn cat");
         let stdin = child.stdin.take().expect("stdin piped");
         (Arc::new(RunnerShared::new(None)), Mutex::new(stdin), child)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prompt_waits_for_registry_contention_and_rechecks_frozen_permission() {
+        use super::super::test_support::OwnedNativeFixture;
+        use crate::acp::establishment::{
+            NativeOperationCorrelation, NativeOperationPermission, NativeRequestScope,
+        };
+        use crate::acp::event_sender::{EventSender, ProjectionState};
+        use crate::acp::event_store::{EventStore, ReplayCommit};
+
+        for invalidate in [false, true] {
+            let mut fixture = OwnedNativeFixture::load("prompt-registry-contention");
+            fixture.begin().await;
+            let load = fixture.read_request().await;
+            fixture
+                .deliver(&serde_json::json!({"jsonrpc":"2.0","id":load["id"],"result":{}}))
+                .await;
+            let ControlBody::SessionReady {
+                acp_session_id,
+                receipt,
+                delivery,
+                original_delivery,
+                ..
+            } = fixture
+                .wait_for_frame(|frame| matches!(frame, ControlBody::SessionReady { .. }))
+                .await
+            else {
+                unreachable!()
+            };
+            let projection = Arc::new(ProjectionState::new(Some(Arc::clone(&fixture.attempt))));
+            assert!(projection.receipt(Arc::clone(&receipt), original_delivery, delivery));
+            projection.close_wire(receipt.attempt.id, receipt.replay, delivery);
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            let sender = EventSender::tracked(sender, projection, Some(receipt.owner));
+            let completed = sender.close_establishment(None).await.unwrap();
+            let replay = ReplayCommit::new(Arc::clone(&fixture.attempt), completed.first);
+            let db = tempfile::tempdir().unwrap();
+            let journal =
+                EventStore::open(&db.path().join("events.sqlite"), 100, Arc::default()).unwrap();
+            let id = &fixture.attempt.session_id;
+            {
+                let _native = fixture.storage.acquire_instance_lifecycle_lock(id).unwrap();
+                let seal = journal.seal_establishment(&replay, &completed).unwrap();
+                fixture
+                    .storage
+                    .update(|rows, _| {
+                        let row = rows.iter_mut().find(|row| &row.id == id).unwrap();
+                        row.commit_acp_establishment(
+                            &fixture.storage,
+                            &receipt,
+                            &seal,
+                            receipt.attempt.context,
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let permission = NativeOperationPermission::capture_owned(
+                &receipt,
+                receipt.owner,
+                NativeOperationCorrelation::new(None),
+                tokio::time::Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+            let registry = worker_registry::acquire_registry_lock(id).unwrap();
+            let (waiting, waited) = std::sync::mpsc::channel();
+            *fixture.shared.test_native_registry_wait.lock().unwrap() = Some(waiting);
+            let input = Arc::clone(&fixture.stdin);
+            let shared = Arc::clone(&fixture.shared);
+            let attachment = shared.control.lock().await.active_attachment.unwrap();
+            let prompt = tokio::spawn(async move {
+                shared
+                    .agent_prompt(
+                        &input,
+                        attachment,
+                        serde_json::json!({"sessionId":acp_session_id,"prompt":[]}),
+                        NativeRequestScope::Operation {
+                            permission: Arc::new(permission),
+                        },
+                    )
+                    .await
+            });
+            tokio::task::spawn_blocking(move || waited.recv_timeout(Duration::from_secs(3)))
+                .await
+                .unwrap()
+                .expect("prompt must wait on transient registry contention");
+            let native = fixture
+                .storage
+                .try_acquire_instance_lifecycle_lock(id)
+                .unwrap()
+                .expect("registry wait must release lifecycle exclusion");
+            if invalidate {
+                fixture
+                    .storage
+                    .update(|rows, _| {
+                        rows.iter_mut().find(|row| &row.id == id).unwrap().status =
+                            crate::session::Status::Stopped;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            drop(native);
+            drop(registry);
+            let prompt_id = prompt.await.unwrap().unwrap();
+            if invalidate {
+                fixture
+                    .wait_for_frame(|frame| {
+                        matches!(frame,
+                            ControlBody::PromptCompleted {
+                                prompt_req_id,
+                                outcome: PromptOutcome::Error { code: -32602, .. },
+                                ..
+                            } if *prompt_req_id == prompt_id)
+                    })
+                    .await;
+                fixture.assert_no_more_requests();
+            } else {
+                let sent = fixture.read_request().await;
+                assert_eq!(sent["id"], prompt_id);
+                assert_eq!(sent["method"], "session/prompt");
+            }
+        }
     }
 
     #[tokio::test]

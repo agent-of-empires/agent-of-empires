@@ -261,7 +261,7 @@ fn acp_refuses_input_after_unresolved_first_handshake() {
             !status.is_success(),
             "unresolved establishment accepted input"
         );
-        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        if status == reqwest::StatusCode::CONFLICT
             && body.contains("Conversation establishment is unresolved")
         {
             Ok(body)
