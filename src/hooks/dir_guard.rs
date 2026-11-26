@@ -152,6 +152,10 @@ thread_local! {
     /// Runs inside [`switch_instance_dir`] between its two steps.
     static SWITCH_PAUSE_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Runs inside [`write_instance_file`] between the lookup and the write.
+    static WRITE_PAUSE_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -163,6 +167,11 @@ pub(crate) fn reset_for_test() {
 #[cfg(test)]
 pub(crate) fn pause_switch_for_test(pause: impl FnOnce() + 'static) {
     SWITCH_PAUSE_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(Box::new(pause)));
+}
+
+#[cfg(test)]
+fn pause_write_for_test(pause: impl FnOnce() + 'static) {
+    WRITE_PAUSE_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(Box::new(pause)));
 }
 
 /// Told the lock file's path when an instance lock is contended.
@@ -680,8 +689,24 @@ pub(crate) fn write_session_id_via_guard(
     source: Option<&str>,
 ) -> Result<()> {
     let leaf = session_id_leaf(source)?;
+    write_instance_file(instance_id, &leaf, session_id.as_bytes())
+}
+
+/// Writes `name` atomically into the row's hook dir. The lookup doesn't hold the switch lock
+/// through the write, so a switch can remove the dir in between and the write fails with
+/// `ENOENT`; the dir is then looked up again, once.
+pub(crate) fn write_instance_file(instance_id: &str, name: &str, bytes: &[u8]) -> Result<()> {
     let dir = open_instance_dir(instance_id)?;
-    write_atomic(dir.as_fd(), &leaf, session_id.as_bytes())
+    #[cfg(test)]
+    if let Some(pause) = WRITE_PAUSE_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
+        pause();
+    }
+    match write_atomic(dir.as_fd(), name, bytes) {
+        Err(error) if error.root_cause().downcast_ref::<Errno>() == Some(&Errno::ENOENT) => {
+            write_atomic(open_instance_dir(instance_id)?.as_fd(), name, bytes)
+        }
+        result => result,
+    }
 }
 
 /// Delete the `session_id` sidecar with `unlinkat` against a verified
@@ -1140,6 +1165,28 @@ mod tests {
     /// A switch makes the new dir before removing the old one, so a read in between still finds
     /// the old status, and a writer that arrives in between waits on the switch lock and then
     /// lands in the new dir.
+    /// A write whose dir a switch removed after the lookup lands in the dir the switch made.
+    #[test]
+    #[serial(hook_base)]
+    fn a_write_resolved_before_a_switch_lands_in_the_new_dir() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let id = "outpaced";
+        write_status(HookBase::Host, id, "idle");
+        pause_write_for_test(move || {
+            switch_instance_dir(id, HookBase::Sandbox).unwrap();
+        });
+        write_session_id_via_guard(id, "sid", None).unwrap();
+        assert!(
+            !kind_exists(HookBase::Host, id),
+            "the switch removed the host dir"
+        );
+        assert_eq!(
+            std::fs::read_to_string(HookBase::Sandbox.label(id).join("session_id")).unwrap(),
+            "sid"
+        );
+        remove_instance_dir(id).unwrap();
+    }
+
     /// A waiter that wins a lock whose name was unlinked meanwhile takes the current one, so it
     /// and a later opener never both hold the row's lock.
     #[test]
