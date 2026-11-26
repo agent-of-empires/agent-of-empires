@@ -43,6 +43,7 @@ const RUNTIME_ROUTING_KEYS: &[&str] = &[
     "CONTAINERS_STORAGE_CONF",
     "SSH_AUTH_SOCK",
     "COLIMA_HOME",
+    "LIMA_HOME",
 ];
 
 impl RuntimeExecutionSnapshot {
@@ -297,6 +298,7 @@ impl RuntimeExecutionSnapshot {
                                 std::path::Path::new(socket),
                                 std::path::Path::new(home),
                                 snapshot.value("COLIMA_HOME").map(std::path::Path::new),
+                                snapshot.value("LIMA_HOME").map(std::path::Path::new),
                             )
                         });
                     snapshot.shared_root = shared;
@@ -664,12 +666,15 @@ fn canonical_prefix(path: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 /// The home directory a Colima VM shares at the same path, when `socket` is a profile's
-/// `<colima home>/<profile>/docker.sock` and that profile keeps Colima's default mounts. A
-/// missing config proves nothing, so it gives `None`.
+/// `<colima home>/<profile>/docker.sock` and the running instance keeps Colima's default
+/// mounts. Its state file, `<lima home>/<id>/colima.yaml`, holds the config the VM started
+/// with; the profile's own `colima.yaml` may have been edited since. A missing or unreadable
+/// state file proves nothing, so it gives `None`.
 fn colima_shared_root(
     socket: &std::path::Path,
     home: &std::path::Path,
     colima_home: Option<&std::path::Path>,
+    lima_home: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     use std::path::Component;
     let base = colima_home.map_or_else(|| home.join(".colima"), std::path::Path::to_path_buf);
@@ -682,7 +687,13 @@ fn colima_shared_root(
     if file != "docker.sock" {
         return None;
     }
-    let config = std::fs::read_to_string(base.join(profile).join("colima.yaml")).ok()?;
+    let id = if profile == "default" {
+        "colima".to_owned()
+    } else {
+        format!("colima-{}", profile.to_str()?)
+    };
+    let lima = lima_home.map_or_else(|| base.join("_lima"), std::path::Path::to_path_buf);
+    let config = std::fs::read_to_string(lima.join(id).join("colima.yaml")).ok()?;
     colima_default_mounts(&config).then(|| home.to_path_buf())
 }
 
@@ -753,34 +764,51 @@ mod tests {
         assert_eq!(path, std::path::PathBuf::from("/unmapped/file.txt"));
     }
 
-    /// Colima's profile socket is trusted only with the default mounts, an explicit empty list,
-    /// which share `$HOME` at the same path; any other socket or config proves nothing.
+    /// Colima's profile socket is trusted only when its running instance's state file keeps the
+    /// default mounts, an explicit empty list, which share `$HOME` at the same path; any other
+    /// socket, config or a missing state file proves nothing.
     #[test]
     fn colima_shared_root_trusts_only_the_default_home_share() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
         let elsewhere = temp.path().join("ch");
-        let profile = |base: &std::path::Path, name: &str, yaml: Option<&str>| {
-            let dir = base.join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            if let Some(yaml) = yaml {
-                std::fs::write(dir.join("colima.yaml"), yaml).unwrap();
-            }
-            dir.join("docker.sock")
+        let id = |name: &str| match name {
+            "default" => "colima".to_owned(),
+            name => format!("colima-{name}"),
         };
+        let write = |path: std::path::PathBuf, yaml: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, yaml).unwrap();
+        };
+        // A profile's socket, with `state` as its running instance's state file.
+        let profile = |base: &std::path::Path, name: &str, state: Option<&str>| {
+            std::fs::create_dir_all(base.join(name)).unwrap();
+            if let Some(yaml) = state {
+                write(base.join("_lima").join(id(name)).join("colima.yaml"), yaml);
+            }
+            base.join(name).join("docker.sock")
+        };
+        // The profile's own config, which an edit can change while the VM runs.
+        let edited = |base: &std::path::Path, name: &str, yaml: &str| {
+            write(base.join(name).join("colima.yaml"), yaml);
+        };
+        let lima_home = temp.path().join("lima");
+        let custom = "mounts:\n  - location: /Volumes/x\n";
         let colima = home.join(".colima");
         let shared = Some(home.clone());
-        // (case, socket, COLIMA_HOME, expected)
-        for (case, socket, colima_home, want) in [
+        // (case, socket, COLIMA_HOME, LIMA_HOME, expected)
+        for (case, socket, colima_home, lima, want) in [
             (
                 "default-empty-mounts",
                 profile(&colima, "default", Some("cpu: 2\nmounts: [] # none\n")),
+                None,
                 None,
                 shared.clone(),
             ),
             (
                 "no-mounts-key",
                 profile(&colima, "nokey", Some("cpu: 2\nvmType: vz\n")),
+                None,
                 None,
                 None,
             ),
@@ -793,6 +821,7 @@ mod tests {
                 ),
                 None,
                 None,
+                None,
             ),
             (
                 "custom-mounts-inline",
@@ -801,6 +830,7 @@ mod tests {
                     "inline",
                     Some("mounts: [{location: /Volumes/x}]\n"),
                 ),
+                None,
                 None,
                 None,
             ),
@@ -813,6 +843,7 @@ mod tests {
                 ),
                 None,
                 None,
+                None,
             ),
             (
                 "spaced-key",
@@ -821,6 +852,7 @@ mod tests {
                     "spaced",
                     Some("mounts : [{location: /Volumes/work}]\n"),
                 ),
+                None,
                 None,
                 None,
             ),
@@ -833,10 +865,12 @@ mod tests {
                 ),
                 None,
                 None,
+                None,
             ),
             (
                 "explicit-null-mounts",
                 profile(&colima, "nulled", Some("mounts: null\n")),
+                None,
                 None,
                 None,
             ),
@@ -845,10 +879,12 @@ mod tests {
                 profile(&colima, "null", Some("cpu: 2\nmounts:\n")),
                 None,
                 None,
+                None,
             ),
             (
                 "malformed",
                 profile(&colima, "malformed", Some("mounts: [\n")),
+                None,
                 None,
                 None,
             ),
@@ -857,11 +893,13 @@ mod tests {
                 profile(&colima, "sequence", Some("- mounts\n")),
                 None,
                 None,
+                None,
             ),
-            ("no-yaml", profile(&colima, "bare", None), None, None),
+            ("no-yaml", profile(&colima, "bare", None), None, None, None),
             (
                 "named-profile",
                 profile(&colima, "work", Some("mounts: []\n")),
+                None,
                 None,
                 shared.clone(),
             ),
@@ -869,6 +907,7 @@ mod tests {
                 "colima-home",
                 profile(&elsewhere, "default", Some("mounts: []\n")),
                 Some(elsewhere.as_path()),
+                None,
                 shared.clone(),
             ),
             (
@@ -876,17 +915,65 @@ mod tests {
                 profile(&colima, "default", Some("mounts: []\n")),
                 Some(elsewhere.as_path()),
                 None,
+                None,
             ),
             (
                 "nested",
                 profile(&colima.join("default"), "x", Some("mounts: []\n")),
                 None,
                 None,
+                None,
             ),
-            ("other-socket", temp.path().join("docker.sock"), None, None),
+            (
+                "state-shares",
+                {
+                    edited(&colima, "relisted", custom);
+                    profile(&colima, "relisted", Some("mounts: []\n"))
+                },
+                None,
+                None,
+                shared.clone(),
+            ),
+            (
+                "state-custom",
+                {
+                    edited(&colima, "emptied", "mounts: []\n");
+                    profile(&colima, "emptied", Some(custom))
+                },
+                None,
+                None,
+                None,
+            ),
+            (
+                "state-missing",
+                {
+                    edited(&colima, "stopped", "mounts: []\n");
+                    profile(&colima, "stopped", None)
+                },
+                None,
+                None,
+                None,
+            ),
+            (
+                "lima-home",
+                {
+                    write(lima_home.join("colima-lh/colima.yaml"), "mounts: []\n");
+                    profile(&colima, "lh", None)
+                },
+                None,
+                Some(lima_home.as_path()),
+                shared.clone(),
+            ),
+            (
+                "other-socket",
+                temp.path().join("docker.sock"),
+                None,
+                None,
+                None,
+            ),
         ] {
             assert_eq!(
-                colima_shared_root(&socket, &home, colima_home),
+                colima_shared_root(&socket, &home, colima_home, lima),
                 want,
                 "{case}"
             );

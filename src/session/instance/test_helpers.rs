@@ -217,7 +217,8 @@ pub(super) fn route_through_colima(
 ) -> crate::session::test_support::EnvGuard {
     let colima = root.join("colima");
     std::fs::create_dir_all(colima.join("default")).unwrap();
-    std::fs::write(colima.join("default/colima.yaml"), "mounts: []\n").unwrap();
+    std::fs::create_dir_all(colima.join("_lima/colima")).unwrap();
+    std::fs::write(colima.join("_lima/colima/colima.yaml"), "mounts: []\n").unwrap();
     crate::session::test_support::EnvGuard::set(&[
         (
             "DOCKER_HOST",
