@@ -148,8 +148,9 @@ export function TopBar({
   return (
     <header
       {...tourAnchor(TOUR_ANCHORS.topbar)}
-      // On a phone the bar dissolves into the page: its controls float, as in Claude's app.
-      className="h-12 max-md:h-14 bg-surface-900 md:bg-transparent flex items-stretch shrink-0"
+      // On a phone the bar dissolves into the page: its controls float, as in Claude's app. It stays a sticky,
+      // solid box so iOS 26 tints the status bar from it instead of laying its scroll-edge blur over the page.
+      className="h-12 max-md:h-14 bg-surface-900 md:bg-transparent max-md:sticky max-md:top-0 max-md:z-30 flex items-stretch shrink-0"
     >
       {/* Left zone: widens to the sidebar column when it's visible, so the header lines up with the sidebar on the
          canvas. */}

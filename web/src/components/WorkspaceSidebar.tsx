@@ -468,7 +468,7 @@ export function WorkspaceSidebar(props: Props) {
 
         {/* The rail is a fixed 88px, so its controls stack to fit a scaled root font. */}
         <div
-          className={`relative p-2 max-md:px-4 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] max-md:before:pointer-events-none max-md:before:absolute max-md:before:inset-x-0 max-md:before:-top-10 max-md:before:h-10 max-md:before:bg-gradient-to-t max-md:before:from-surface-900 max-md:before:to-transparent max-md:before:content-[''] flex items-center ${
+          className={`p-2 max-md:px-4 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] max-md:sticky max-md:bottom-0 max-md:bg-surface-900 flex items-center ${
             compact ? "flex-col gap-2" : "gap-1"
           }`}
         >

@@ -229,7 +229,7 @@ export function MobileTerminalToolbar({
       // keys keep all of it. Without, they drop to 8px less than the inset and move in from the rounded corners.
       data-terminal-toolbar
       data-compact={compact || undefined}
-      className={`shrink-0 flex items-center gap-1.5 pt-1.5 bg-surface-900 ${
+      className={`shrink-0 sticky bottom-0 flex items-center gap-1.5 pt-1.5 bg-surface-900 ${
         compact
           ? "px-[max(0.5rem,calc(env(safe-area-inset-bottom)*0.7))] pb-[max(0.375rem,calc(env(safe-area-inset-bottom)-0.5rem))] [&_button]:h-9 [&_svg]:size-4 [&_span]:text-[11px]"
           : "px-2 pb-[calc(env(safe-area-inset-bottom)+0.375rem)]"

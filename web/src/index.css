@@ -256,6 +256,8 @@ html[data-ios-standalone]:not([data-editing]) {
   --app-height: 100lvh;
 }
 
+/* iOS 26 blurs an installed app's top and bottom edges unless a fixed or sticky box there paints one solid colour,
+   which it then extends under the status bar and home indicator. The fixed root is that box wherever no edge bar is. */
 @media (pointer: coarse) {
   #root {
     position: fixed;
@@ -263,6 +265,7 @@ html[data-ios-standalone]:not([data-editing]) {
     height: var(--app-height);
     width: 100%;
     overflow: hidden;
+    background-color: var(--color-surface-900);
   }
 }
 
