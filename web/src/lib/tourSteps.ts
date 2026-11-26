@@ -40,6 +40,8 @@ export interface TourStep {
   desktopOnly?: boolean;
   /** Adds the install and notifications steps when the page is a phone's browser tab. */
   installHint?: true;
+  /** For an anchor on the dashboard's first screen: the page can scroll less than Joyride's offset asks, which stalls the tour. */
+  skipScroll?: true;
 }
 
 /** One platform's notification steps, shared by the install banner, Settings › Notifications and the tour. */
@@ -121,6 +123,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
     id: "new-session",
     anchor: TOUR_ANCHORS.dashboardNewSession,
     scopes: ["dashboard"],
+    skipScroll: true,
     title: "Start a session",
     body: "Pick a project and an agent, and it gets to work. A scratch session skips the project and gets its own directory that AoE creates, which you can keep when you delete it.",
     shortcutHints: [
