@@ -131,6 +131,8 @@ pub(super) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
         Some("empty key")
     } else if key == "AOE_TOKEN" {
         Some("aoe auth token, must not reach the agent")
+    } else if key == crate::process::worker_registry::PROXY_LAUNCH_CONFIG_ENV {
+        Some("reserved proxy launch carrier")
     } else if INFRA_KEYS.contains(&key) {
         Some("infrastructure key, controlled by operator env")
     } else if key.starts_with("LD_") || key.starts_with("DYLD_") {
@@ -157,6 +159,8 @@ pub(crate) fn host_environment_denyreason(key: &str) -> Option<&'static str> {
         Some("aoe auth token, must not reach the agent")
     } else if key == crate::process::runner::ACP_AGENT_ENV {
         Some("reserved structured-worker environment carrier")
+    } else if key == crate::process::worker_registry::PROXY_LAUNCH_CONFIG_ENV {
+        Some("reserved proxy launch carrier")
     } else {
         None
     }
@@ -752,6 +756,9 @@ mod tests {
             );
         }
         assert!(host_environment_denyreason(crate::process::runner::ACP_AGENT_ENV).is_some());
+        let carrier = crate::process::worker_registry::PROXY_LAUNCH_CONFIG_ENV;
+        assert!(host_environment_denyreason(carrier).is_some());
+        assert!(request_env_denyreason(carrier).is_some());
     }
 
     /// #3262: structured-view agents get the desktop env; sandboxed ones

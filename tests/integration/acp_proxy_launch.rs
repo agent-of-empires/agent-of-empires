@@ -57,6 +57,8 @@ fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
         .args(["--session-id", session_id, "--agent-name", "shim", "--cwd"])
         .arg(temp.path())
         .args(["--proxy", PROXY_SPEC_JSON, "--degraded", "Fake"])
+        .arg("--proxy-launch-config")
+        .arg(&launch_config)
         .args(["--", node.to_str().unwrap(), proxy.to_str().unwrap()])
         .args(["--flag", "a b", "it's \"quoted\"", "--"])
         .args([node.to_str().unwrap(), shim_path().to_str().unwrap()])
@@ -122,6 +124,43 @@ fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
         !launch_config.exists(),
         "config must be removed at session end"
     );
+}
+
+/// A request-supplied env var must not choose what the runner unlinks at exit.
+#[test]
+#[serial]
+fn runner_exit_ignores_a_launch_config_env_it_was_not_given_by_flag() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _home = set_temp_home(temp.path());
+    let victim = temp.path().join("victim");
+    std::fs::write(&victim, b"keep").unwrap();
+
+    let session_id = "launch-env-victim";
+    let node = shim_node().expect("shim prerequisite");
+    let socket = worker_registry::socket_path_for(session_id).unwrap();
+    let mut runner = Command::new(env!("CARGO_BIN_EXE_aoe"))
+        .args(["__acp-runner", "--socket"])
+        .arg(&socket)
+        .args(["--session-id", session_id, "--agent-name", "shim", "--cwd"])
+        .arg(temp.path())
+        .args(["--", node.to_str().unwrap(), shim_path().to_str().unwrap()])
+        .env("AOE_PROXY_LAUNCH_CONFIG", &victim)
+        .spawn()
+        .expect("spawn acp runner");
+
+    wait_until("runner record never appeared", || {
+        worker_registry::load(session_id).unwrap().is_some()
+    });
+    signal("-TERM", &runner.id().to_string());
+    wait_until("runner did not exit", || {
+        runner.try_wait().unwrap().is_some()
+    });
+    assert!(victim.exists(), "the runner unlinked an env-named path");
 }
 
 fn pid_alive(pid: &str) -> bool {

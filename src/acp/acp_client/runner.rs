@@ -420,6 +420,9 @@ pub(super) async fn spawn_runner_detached(
     if let Some(name) = &config.degraded {
         cmd.arg("--degraded").arg(name);
     }
+    if let Some(path) = &launch_config {
+        cmd.arg("--proxy-launch-config").arg(path);
+    }
     cmd.arg("--");
     let (command, args) = match &sandbox_argv {
         Some(s) => (s.docker_binary.as_str(), s.docker_args.as_slice()),

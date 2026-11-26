@@ -350,6 +350,25 @@ pub fn write_proxy_launch_config(session_id: &str, contents: &[u8]) -> Result<Pa
     Ok(path)
 }
 
+/// Removes the one config this runner was given, only if it is a launch config
+/// of `session_id` directly inside the worker dir. Never scans by session: a
+/// replacement runner's newer config must survive.
+pub fn remove_proxy_launch_config(session_id: &str, path: &Path) -> Result<()> {
+    let dir = workers_dir()?;
+    let name = path.file_name().map(|n| n.to_string_lossy());
+    anyhow::ensure!(
+        path.parent() == Some(dir.as_path())
+            && name.is_some_and(|n| is_proxy_launch_config_of(&n, session_id)),
+        "refusing to remove {}: not a proxy launch config of this session",
+        path.display()
+    );
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("removing proxy launch config"),
+    }
+}
+
 pub fn remove_proxy_launch_configs(session_id: &str) -> Result<()> {
     for entry in std::fs::read_dir(workers_dir()?)? {
         let entry = entry?;
@@ -1836,5 +1855,31 @@ mod tests {
         retire_record_files("sess-a").unwrap();
         assert!(!path.exists());
         assert!(other.exists(), "a sibling session's config must survive");
+    }
+
+    #[test]
+    #[serial]
+    fn remove_proxy_launch_config_refuses_anything_but_its_own_file() {
+        let root = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let own = write_proxy_launch_config("sess-a", b"{}").unwrap();
+        let sibling = write_proxy_launch_config("sess-a-b", b"{}").unwrap();
+        let dir = workers_dir().unwrap();
+        let foreign = dir.join("sess-a.victim.txt");
+        std::fs::write(&foreign, b"x").unwrap();
+        let outside = root.path().join("sess-a.1.proxy-launch");
+        std::fs::write(&outside, b"x").unwrap();
+        let nested = dir.join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        let nested_cfg = nested.join("sess-a.1.proxy-launch");
+        std::fs::write(&nested_cfg, b"x").unwrap();
+
+        for refused in [&foreign, &sibling, &outside, &nested_cfg] {
+            assert!(remove_proxy_launch_config("sess-a", refused).is_err());
+            assert!(refused.exists(), "{}", refused.display());
+        }
+        remove_proxy_launch_config("sess-a", &own).unwrap();
+        assert!(!own.exists());
+        remove_proxy_launch_config("sess-a", &own).unwrap();
     }
 }
