@@ -137,6 +137,7 @@ export const TOUR_STEPS: readonly TourStep[] = [
     id: "suggestions",
     anchor: TOUR_ANCHORS.dashboardSuggestions,
     scopes: ["dashboard"],
+    skipScroll: true,
     title: "Suggested sessions",
     body: "Your agents and plugins can propose sessions worth starting, like a pull request waiting for your review. Nothing runs until you press Start.",
   },
