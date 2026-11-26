@@ -361,6 +361,10 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     watchdog_handle.abort();
     agent_stdout_task.abort();
+    // Not covered by the registry retire below when a replacement runner owns the session.
+    if let Some(config) = std::env::var_os(worker_registry::PROXY_LAUNCH_CONFIG_ENV) {
+        let _ = std::fs::remove_file(config);
+    }
     let cleanup_record = record.clone();
     tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&cleanup_record))
         .await??;

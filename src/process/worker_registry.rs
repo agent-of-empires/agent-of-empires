@@ -309,6 +309,53 @@ pub fn log_path_for(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::log_path(&workers_dir()?, session_id)
 }
 
+/// Names the launch config file a proxy reads; set on the runner only.
+pub const PROXY_LAUNCH_CONFIG_ENV: &str = "AOE_PROXY_LAUNCH_CONFIG";
+
+fn is_proxy_launch_config_of(name: &str, session_id: &str) -> bool {
+    // Session ids contain no `.`, so the prefix cannot match another session.
+    name.strip_prefix(session_id)
+        .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".proxy-launch"))
+}
+
+/// Writes `<id>.<random>.proxy-launch` in the worker dir, owner-only from creation.
+/// Not `.json`: the registry scan reads every `*.json` there as a worker record.
+pub fn write_proxy_launch_config(session_id: &str, contents: &[u8]) -> Result<PathBuf> {
+    use std::io::Write as _;
+    crate::process::worker::validate_id(session_id)?;
+    let path = workers_dir()?.join(format!(
+        "{session_id}.{:016x}.proxy-launch",
+        rand::random::<u64>()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("creating proxy launch config {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("writing proxy launch config {}", path.display()))?;
+    Ok(path)
+}
+
+pub fn remove_proxy_launch_configs(session_id: &str) -> Result<()> {
+    for entry in std::fs::read_dir(workers_dir()?)? {
+        let entry = entry?;
+        if is_proxy_launch_config_of(&entry.file_name().to_string_lossy(), session_id) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("removing proxy launch config"),
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Written by `aoe acp restart` before the delete and SIGTERM so the daemon treats the
 /// teardown as a pending restart. Holds the restarted runner's generation.
 pub fn restart_marker_path(session_id: &str) -> Result<PathBuf> {
@@ -493,6 +540,7 @@ fn delete_unlocked(session_id: &str) -> Result<()> {
 
 fn retire_record_files(session_id: &str) -> Result<()> {
     remove_runner_sockets(&socket_path_for(session_id)?)?;
+    remove_proxy_launch_configs(session_id)?;
     let path = record_path(session_id)?;
     match std::fs::remove_file(&path) {
         Ok(()) => {}
@@ -1761,5 +1809,24 @@ mod tests {
             assert!(victim.0.try_wait().unwrap().is_none());
             assert_eq!(load("deferred").unwrap().unwrap().generation, 2);
         });
+    }
+
+    #[test]
+    #[serial]
+    fn proxy_launch_config_is_owner_only_and_removed_with_its_session() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let path = write_proxy_launch_config("sess-a", b"{}").unwrap();
+        let other = write_proxy_launch_config("sess-a-b", b"{}").unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{}");
+
+        retire_record_files("sess-a").unwrap();
+        assert!(!path.exists());
+        assert!(other.exists(), "a sibling session's config must survive");
     }
 }
