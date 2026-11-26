@@ -2531,6 +2531,19 @@ describe("SessionWizard suggestion source", () => {
     expect(payload()).toMatchObject({ worktree_enabled: true });
   });
 
+  it("keeps the preset's sandbox over the Project's override", async () => {
+    const prepared = { title: "t", initial_prompt: "p", project: null, sandbox: true } as unknown as SuggestionPrepared;
+    expect(toWizardPrefill(prepared, { label: "G", title: "t", url: "" }).useSandbox).toBe(true);
+    vi.mocked(fetchProjects).mockResolvedValue([
+      { name: "proj", path: "/tmp/proj", scope: "global", pinned: false, overrides: { sandbox_enabled: false } },
+    ] as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", useSandbox: true });
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("true"),
+    );
+  });
+
   it("drops the preset's worktree when the profile changes", async () => {
     vi.mocked(fetchProfiles).mockResolvedValue([
       { name: "default", is_default: true },
