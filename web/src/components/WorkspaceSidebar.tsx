@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
@@ -41,7 +41,6 @@ import { SessionRow } from "./sidebar/SessionRow";
 import { FacetPanel, SidebarToolbar } from "./sidebar/SidebarToolbar";
 import { SidebarNav } from "./sidebar/SidebarNav";
 import { SidebarLegend } from "./sidebar/SidebarLegend";
-import { useDrawerDrag } from "./sidebar/useDrawerDrag";
 import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
@@ -82,6 +81,10 @@ interface Props {
   onNew: (prefill?: { group?: string }) => void;
   /** Opens the command palette from the sidebar's Search row. */
   onOpenPalette?: () => void;
+  /** Phone home: render as the full-width page rather than a column. */
+  asPage?: boolean;
+  /** Shown above the list on the phone page, such as the setup banner. */
+  pageTop?: ReactNode;
   onCreateSession: (repoPath: string) => void;
   onPinProject?: (repoPath: string) => void;
   onUnpinProject?: (group: SidebarGroup) => void;
@@ -113,9 +116,6 @@ interface Props {
   onAxisChange: (axis: SidebarAxis) => void;
 }
 
-/** The phone drawer moves on the iOS sheet curve; reduced motion skips it. */
-const DRAWER_MOTION = "duration-[400ms] ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
-
 export function WorkspaceSidebar(props: Props) {
   const {
     groups,
@@ -129,8 +129,7 @@ export function WorkspaceSidebar(props: Props) {
     axis,
   } = props;
   const { settings: webSettings, update: updateWebSettings } = useWebSettings();
-  const rightSide = webSettings.sidebarSide === "right";
-  // Only the in-flow sidebar has the handle that leaves the rail, so the phone drawer ignores a saved rail.
+  // Only the in-flow sidebar has the handle that leaves the rail, so the phone page ignores a saved rail.
   const inFlow = useMediaQuery("(min-width: 768px)");
   const compact = webSettings.sidebarCompact && inFlow;
   const offline = useServerDown();
@@ -310,41 +309,24 @@ export function WorkspaceSidebar(props: Props) {
     if (!filterOpen) requestAnimationFrame(() => filterRef.current?.focus());
   };
 
-  // The window-level swipe (useDrawerSwipe in App) decides closing; this makes the drawer track the finger.
-  const swipe = useDrawerDrag({ open, side: rightSide ? "right" : "left" });
-  const dragging = swipe.offset !== null;
-  // The phone drawer's width, shared with the app shell so the view it pushes aside moves by as much.
-  const phoneWidth = `min(${effectiveWidth}px, 85vw)`;
-  useEffect(() => {
-    document.documentElement.style.setProperty("--aoe-drawer-w", phoneWidth);
-  }, [phoneWidth]);
-
-  // The phone overlay starts under the header, which the app root insets below the status bar.
+  // A phone shows the sidebar as its own page, the app's home, as Claude's app lists sessions; a Session opens
+  // over it with a back button, so there is no phone drawer.
+  const phoneClass = props.asPage ? "max-md:flex-1 max-md:!w-full" : "max-md:hidden";
   return (
     <SidebarCompactContext.Provider value={compact}>
-      <div
-        className={`fixed inset-0 z-30 md:hidden bg-black/30 ${DRAWER_MOTION} ${
-          dragging ? "transition-none" : "transition-opacity"
-        } ${open ? "" : "opacity-0 pointer-events-none"}`}
-        style={dragging ? { opacity: swipe.progress } : undefined}
-        onClick={() => props.onOpenChange(false)}
-      />
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
         role="navigation"
         aria-label="Sessions sidebar"
         tabIndex={-1}
         ref={panelRef}
-        style={{ width: effectiveWidth, ...(dragging ? { transform: `translateX(${swipe.offset}px)` } : {}) }}
-        // On a phone the drawer runs the full height, as Claude's app does, beside the view it pushes aside.
-        {...swipe.handlers}
+        style={{ width: effectiveWidth }}
         data-compact={compact ? "true" : undefined}
-        className={`fixed top-0 max-md:pt-[env(safe-area-inset-top)] bottom-0 z-40 max-md:!w-[var(--aoe-drawer-w)] md:static md:z-auto bg-surface-800 chrome-drawer md:bg-transparent md:bg-none border-surface-700/60 flex flex-col md:h-full shrink-0 max-md:touch-pan-y max-md:shadow-2xl ${DRAWER_MOTION} ${
-          dragging ? "transition-none" : "transition-transform"
-        } md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
-          rightSide ? "right-0 border-l md:border-l-0" : "left-0 border-r md:border-r-0"
-        } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
+        className={`${phoneClass} flex flex-col h-full min-h-0 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
+          open || props.asPage ? "" : "md:hidden"
+        }`}
       >
+        {props.asPage && props.pageTop}
         <SidebarNav compact={compact} offline={offline} onNew={() => props.onNew()} onSearch={props.onOpenPalette} />
         <SidebarToolbar
           compact={compact}
@@ -361,7 +343,6 @@ export function WorkspaceSidebar(props: Props) {
           onToggleFacets={() => setFacetOpen((o) => !o)}
           filterOpen={filterOpen}
           onToggleFilter={toggleFilter}
-          onClose={() => props.onOpenChange(false)}
           onSearch={props.onOpenPalette}
         />
 
@@ -487,7 +468,7 @@ export function WorkspaceSidebar(props: Props) {
 
         {/* The rail is a fixed 88px, so its controls stack to fit a scaled root font. */}
         <div
-          className={`max-md:border-t border-surface-700/20 p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center ${
+          className={`relative p-2 max-md:px-4 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] max-md:before:pointer-events-none max-md:before:absolute max-md:before:inset-x-0 max-md:before:-top-10 max-md:before:h-10 max-md:before:bg-gradient-to-t max-md:before:from-surface-900 max-md:before:to-transparent max-md:before:content-[''] flex items-center ${
             compact ? "flex-col gap-2" : "gap-1"
           }`}
         >
@@ -526,8 +507,9 @@ export function WorkspaceSidebar(props: Props) {
               type="button"
               onClick={() => props.onNew()}
               disabled={offline}
+              {...tourAnchor(TOUR_ANCHORS.dashboardNewSession)}
               data-testid="sidebar-new-session-pill"
-              className="md:hidden ml-auto inline-flex items-center gap-2 h-11 px-5 rounded-full bg-text-primary text-surface-950 text-[15px] font-medium shadow-lg cursor-pointer active:scale-[0.97] transition-transform disabled:opacity-40"
+              className="md:hidden ml-auto inline-flex items-center gap-2 h-12 px-5 rounded-full bg-text-primary text-surface-950 text-[15px] font-semibold shadow-[0_1px_2px_rgb(0_0_0/0.3),0_12px_28px_-8px_rgb(0_0_0/0.7)] cursor-pointer active:scale-[0.97] transition-transform disabled:opacity-40"
             >
               <PlusIcon size={16} />
               New session

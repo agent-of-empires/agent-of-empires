@@ -291,11 +291,15 @@
       "components": ["web/src/components/Dashboard.tsx"]
     },
     {
-      "id": "dashboard.mobile-recent-sessions",
+      "id": "mobile.session-stack",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["src/components/__tests__/DashboardRecentSessions.test.tsx", "tests/dashboard.spec.ts"],
-      "components": ["web/src/components/Dashboard.tsx"]
+      "specs": ["tests/dashboard.spec.ts", "tests/mobile-panes.spec.ts"],
+      "components": [
+        "web/src/components/TopBar.tsx",
+        "web/src/components/OverflowMenu.tsx",
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
     },
     {
       "id": "app-shell.dashboard-update-banner",

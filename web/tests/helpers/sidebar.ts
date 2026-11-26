@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import type { Locator, Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 import { initWorkingRepo } from "./gitFixture";
 import { resolveAoeBinary } from "./aoeServe";
 
@@ -37,21 +37,19 @@ export async function dragSidebarHandle(page: Page, ...xs: number[]) {
   await page.mouse.up();
 }
 
-/** Open the mobile sidebar only if it is closed, then wait for the slide-in to settle. */
+/** Show the phone's session list, its home screen: from an open Session, back returns to it. */
 export async function openMobileSidebar(page: Page) {
-  const toggle = page.getByRole("button", { name: "Toggle sidebar" });
-  await toggle.waitFor({ state: "visible", timeout: 10_000 });
-  const probe = page.getByTestId("sidebar-session-row").first();
-  await probe.waitFor({ state: "attached", timeout: 10_000 });
-  const initial = await probe.boundingBox();
-  if (!initial || initial.x < 0) await toggle.click();
+  const back = page.getByTestId("topbar-back");
+  const row = page.getByTestId("sidebar-session-row").first();
+  await expect(back.or(row).first()).toBeVisible({ timeout: 10_000 });
+  if (await back.isVisible()) await back.click();
   await page.waitForFunction(
     () => {
       const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();
       return !!r && r.x >= 0 && r.width > 0;
     },
     null,
-    { timeout: 5_000 },
+    { timeout: 10_000 },
   );
 }
 

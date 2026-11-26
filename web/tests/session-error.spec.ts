@@ -55,7 +55,6 @@ test.describe("An Error Session's recorded error (#5636)", () => {
       await context.grantPermissions(["clipboard-read", "clipboard-write"]);
       const state = await mockErrorSession(page, ERROR);
       await page.goto("/");
-      await page.getByRole("button", { name: "Toggle sidebar" }).click();
       await page.getByTestId("sidebar-session-row").tap();
 
       const panel = page.getByTestId("session-error-panel");

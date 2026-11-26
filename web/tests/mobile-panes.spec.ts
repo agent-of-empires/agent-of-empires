@@ -90,15 +90,17 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await page.getByTestId("mobile-right-panel-picker-backdrop").click({ position: { x: 20, y: 80 } });
     await expect(picker(page)).toBeHidden();
 
-    // A sideways swipe no longer raises More; it stays with the sidebar drawer.
+    // A swipe left raises nothing; a swipe right goes back to the session list.
     const y = viewport.height / 2;
     await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
     await expect(picker(page)).toBeHidden();
+    await expect(page.getByTestId("topbar-back")).toBeVisible();
     await swipe(page, viewport.width / 2 - 80, viewport.width / 2 + 80, y);
-    await expect(page.locator('[data-tour="sidebar"]')).not.toHaveClass(/-translate-x-full/);
+    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
+    await expect(page.getByTestId("topbar-back")).toHaveCount(0);
   });
 
-  test("adjusting selected chat text does not open either drawer", async ({ page }) => {
+  test("adjusting selected chat text neither raises More nor goes back", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: null });
     const content = liveContent(page).first();
     await expect(content).toContainText("$ ready");
@@ -118,12 +120,12 @@ test.describe("Mobile session view tabs (#1452)", () => {
     ]) {
       await swipe(page, from, to, height / 2);
       await expect(picker(page)).toBeHidden();
-      await expect(page.locator('[data-tour="sidebar"]')).toHaveClass(/-translate-x-full/);
+      await expect(page.getByTestId("topbar-back")).toBeVisible();
       expect(await page.evaluate(() => document.getSelection()?.toString())).toBe(selected);
     }
     await page.evaluate(() => document.getSelection()?.removeAllRanges());
     await swipe(page, width / 2 - 80, width / 2 + 80, height / 2);
-    await expect(page.locator('[data-tour="sidebar"]')).not.toHaveClass(/-translate-x-full/);
+    await expect(page.getByTestId("topbar-back")).toHaveCount(0);
   });
 
   test("the Terminal tab promotes the paired terminal and it survives the keyboard", async ({ page }) => {

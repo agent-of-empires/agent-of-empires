@@ -8,7 +8,18 @@ import {
   type ComponentProps,
   type ReactNode,
 } from "react";
-import { Puzzle } from "lucide-react";
+import {
+  AlarmClock,
+  AlarmClockOff,
+  Archive,
+  ArchiveRestore,
+  Copy,
+  Pin,
+  PinOff,
+  Puzzle,
+  Square,
+  Trash2,
+} from "lucide-react";
 import {
   confirmFileEditNavigation,
   confirmFileEditPanes,
@@ -142,7 +153,8 @@ import { PanelDefaultsContext, parsePanelDefaults, usePanelDefaults, type PanelD
 import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
-import { toastBus, reportError } from "./lib/toastBus";
+import { toastBus, reportError, reportInfo } from "./lib/toastBus";
+import { writeClipboard } from "./lib/clipboard";
 import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
@@ -208,6 +220,7 @@ import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { MainViewTabs } from "./components/MainViewTabs";
+import type { OverflowItem } from "./components/OverflowMenu";
 import { MAIN_VIEW_IDS } from "./lib/mainViewIds";
 import { DiffScopeContext, loadDiffScope, saveDiffScope, type DiffScope, type DiffScopeState } from "./lib/diffScope";
 import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
@@ -259,10 +272,6 @@ import { ElevationPrompt } from "./components/ElevationPrompt";
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
-
-/** The phone drawer's push moves on the iOS sheet curve; reduced motion and wide screens skip it. */
-const PUSH_MOTION =
-  "max-md:transition-[translate,border-radius] max-md:duration-[400ms] max-md:ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
 
 export default function App() {
   useMobileViewportLock();
@@ -1951,11 +1960,12 @@ function AppContent({
   const closePicker = useCallback(() => setPickerOpen(false), []);
   const handleDrawerSwipe = useCallback(
     (action: DrawerSwipeAction) => {
-      if (action === "open-sidebar" || action === "close-sidebar") {
-        if (!focusMode) setSidebarOpen(action === "open-sidebar");
-      } else setPickerOpen(action === "open-panels");
+      // Phones have no sidebar drawer: the opening swipe goes back from a Session to the list.
+      if (action === "open-sidebar") {
+        if (!focusMode && activeSession) handleGoDashboard();
+      } else if (action === "close-panels") setPickerOpen(false);
     },
-    [focusMode],
+    [focusMode, activeSession, handleGoDashboard],
   );
   useDrawerSwipe(
     {
@@ -2112,14 +2122,21 @@ function AppContent({
   }, [attentionJump, activeSessionId, handleSelectSession]);
 
   const handleFocusSidebar = useCallback(() => {
-    setSidebarOpen(true);
-    requestAnimationFrame(() => {
+    // A phone's list is a screen of its own: go back to it, landing on the Session just left.
+    const leaving = singlePane ? activeSessionId : null;
+    if (leaving) navigate("/");
+    else setSidebarOpen(true);
+    const focusRow = () => {
       const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
-      const activeRow = sidebar?.querySelector<HTMLElement>("[data-active-session-row]");
+      const activeRow = sidebar?.querySelector<HTMLElement>(
+        leaving ? `[href="/session/${CSS.escape(leaving)}"]` : "[data-active-session-row]",
+      );
       const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
       target?.focus();
-    });
-  }, []);
+    };
+    // Going back re-renders the list first; wait a frame more for it.
+    requestAnimationFrame(() => (leaving ? requestAnimationFrame(focusRow) : focusRow()));
+  }, [singlePane, activeSessionId, navigate]);
 
   useKeyboardShortcuts(
     useCallback(
@@ -2227,6 +2244,40 @@ function AppContent({
     },
     [applySession, handleRestoreSession],
   );
+
+  // A phone reaches the open Session's actions from the header's ⋯, as Claude's app does; desktop keeps the
+  // sidebar row's menu.
+  const phoneSessionItems = useMemo<OverflowItem[] | undefined>(() => {
+    if (!singlePane || !activeSession || caps.readOnly) return undefined;
+    const s = activeSession;
+    const items: OverflowItem[] = [];
+    if (s.branch) {
+      const branch = s.branch;
+      items.push({
+        label: "Copy branch",
+        detail: branch,
+        icon: Copy,
+        onClick: () =>
+          void writeClipboard(branch).then((ok) => (ok ? reportInfo("Branch copied") : reportError("Couldn't copy"))),
+      });
+    }
+    items.push(
+      s.pinned_at != null
+        ? { label: "Unpin", icon: PinOff, onClick: () => void handleSessionStateAction(s.id, "unpin") }
+        : { label: "Pin", icon: Pin, onClick: () => void handleSessionStateAction(s.id, "pin") },
+      s.snoozed_until != null
+        ? { label: "Unsnooze", icon: AlarmClockOff, onClick: () => void handleSessionStateAction(s.id, "unsnooze") }
+        : { label: "Snooze…", icon: AlarmClock, onClick: () => void handleSessionStateAction(s.id, "snooze") },
+      s.archived_at != null
+        ? { label: "Unarchive", icon: ArchiveRestore, onClick: () => void handleSessionStateAction(s.id, "unarchive") }
+        : { label: "Archive", icon: Archive, onClick: () => void handleSessionStateAction(s.id, "archive") },
+    );
+    if (s.status !== "Stopped" && s.status !== "Error") {
+      items.push({ label: "Stop", icon: Square, onClick: () => handleStopSession(s.id) });
+    }
+    items.push({ label: "Move to Trash", icon: Trash2, onClick: () => void handleSessionStateAction(s.id, "trash") });
+    return items;
+  }, [singlePane, activeSession, caps.readOnly, handleSessionStateAction, handleStopSession]);
 
   const commandActions = useCommandActions({
     sessions,
@@ -2663,22 +2714,11 @@ function AppContent({
       return (
         <Dashboard
           sessions={sessions}
-          onSelectSession={handleSelectSession}
           onNewSession={handleNewSession}
           onCloneFromUrl={handleCloneFromUrl}
-          onToggleSidebar={handleToggleSidebar}
           readOnly={caps.readOnly}
           canManageProjects={caps.canManageProjects}
-          banner={
-            setupBannerSteps.length > 0 &&
-            setup.status && (
-              <SetupBanner
-                steps={setup.status.steps}
-                open={setupBannerSteps}
-                onDismiss={() => void setup.update({ banner_dismissed: true })}
-              />
-            )
-          }
+          banner={setupBanner}
         />
       );
     }
@@ -2920,6 +2960,15 @@ function AppContent({
     automated: isAutomatedSession(),
   };
   const setupBannerSteps = bannerSteps(setupViewer);
+  const setupBanner =
+    setupBannerSteps.length > 0 && setup.status ? (
+      <SetupBanner
+        steps={setup.status.steps}
+        open={setupBannerSteps}
+        onDismiss={() => void setup.update({ banner_dismissed: true })}
+      />
+    ) : null;
+
   // On / and /setup, also hold it until setup status answers, so a fresh install never sees the dashboard
   // flash before /setup. Deep links render without it, so a stalled /api/setup can't blank them.
   if (!serverAboutLoaded || (setup.status === undefined && (location.pathname === "/" || setupMatch))) {
@@ -2944,8 +2993,8 @@ function AppContent({
   // The header collapse is a phone affordance for the conversation view only:
   // at md and up there is room for both the bar and the transcript, and on the
   // dashboard / settings / diff panes the bar is the only navigation there is.
-  // On a phone the open sidebar drawer pushes the header and the view aside, as Claude's app does.
-  const drawerPushed = sidebarOpen && !isMdUp && !fullPageView && !focusMode;
+  // A phone is a two-screen stack, as Claude's app is: the session list is home, and a Session opens over it.
+  const phoneHome = singlePane && !activeSession && !fullPageView && !focusMode;
   const headerCollapsible =
     singlePane &&
     !fullPageView &&
@@ -2971,54 +3020,51 @@ function AppContent({
             flips, e.g. opening settings on a phone. An expanded region is a
             `1fr` grid row around a fixed-height bar, so the wrapper is inert
             for every view that cannot collapse. */}
-            <div
-              className={`${PUSH_MOTION} ${drawerPushed ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-tl-3xl max-md:overflow-hidden" : ""}`}
-            >
-              <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
-                <TopBar
-                  activeWorkspace={activeWorkspace}
-                  activeSession={activeSession ?? null}
-                  onToggleSidebar={handleToggleSidebar}
-                  onOpenPalette={() => setShowPalette(true)}
-                  terminal={
-                    caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
-                  }
-                  panels={
-                    dockPaneIds.length > 0
-                      ? {
-                          ...paneMenu,
-                          open: !rightDockCollapsed,
-                          onToggle: toggleRightDock,
-                          badge: caps.canUseDiff ? diffFiles.length : 0,
-                        }
-                      : undefined
-                  }
-                  onOpenHelp={handleOpenHelp}
-                  onOpenAbout={handleOpenAbout}
-                  onStartTutorial={tour.startTour}
-                  unreadCount={unreadCount}
-                  waitingCount={waitingCount}
-                  attentionBadgeColors={attentionBadgeColors}
-                  onLogout={onLogout}
-                  loginRequired={loginRequired}
-                  isOffline={!!error}
-                  isDevBuild={isDebugBuild(serverAbout)}
-                  onOpenTips={tips.open}
-                  onGoDashboard={handleGoDashboard}
-                  onExitFocusMode={focusMode ? exitFocusMode : undefined}
-                  sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
-                  rightColumnVisible={
-                    isMdUp &&
-                    !rightDockSheet &&
-                    !rightMaximized &&
-                    !fullPageView &&
-                    !!activeWorkspace &&
-                    !!activeSession &&
-                    !rightDockCollapsed
-                  }
-                />
-              </CollapsibleRegion>
-            </div>
+            <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+              <TopBar
+                activeWorkspace={activeWorkspace}
+                activeSession={activeSession ?? null}
+                onToggleSidebar={handleToggleSidebar}
+                onOpenPalette={() => setShowPalette(true)}
+                terminal={
+                  caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
+                }
+                sessionItems={phoneSessionItems}
+                panels={
+                  dockPaneIds.length > 0
+                    ? {
+                        ...paneMenu,
+                        open: !rightDockCollapsed,
+                        onToggle: toggleRightDock,
+                        badge: caps.canUseDiff ? diffFiles.length : 0,
+                      }
+                    : undefined
+                }
+                onOpenHelp={handleOpenHelp}
+                onOpenAbout={handleOpenAbout}
+                onStartTutorial={tour.startTour}
+                unreadCount={unreadCount}
+                waitingCount={waitingCount}
+                attentionBadgeColors={attentionBadgeColors}
+                onLogout={onLogout}
+                loginRequired={loginRequired}
+                isOffline={!!error}
+                isDevBuild={isDebugBuild(serverAbout)}
+                onOpenTips={tips.open}
+                onGoDashboard={handleGoDashboard}
+                onExitFocusMode={focusMode ? exitFocusMode : undefined}
+                sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
+                rightColumnVisible={
+                  isMdUp &&
+                  !rightDockSheet &&
+                  !rightMaximized &&
+                  !fullPageView &&
+                  !!activeWorkspace &&
+                  !!activeSession &&
+                  !rightDockCollapsed
+                }
+              />
+            </CollapsibleRegion>
 
             <BannerStack
               onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
@@ -3047,6 +3093,8 @@ function AppContent({
             <div className="flex flex-1 min-h-0">
               {!fullPageView && !focusMode && (
                 <WorkspaceSidebar
+                  asPage={phoneHome}
+                  pageTop={setupBanner}
                   observedById={observedById}
                   runtimeEpoch={runtimeEpoch}
                   onSessionMutation={applySessionMutation}
@@ -3101,13 +3149,8 @@ function AppContent({
                 />
               )}
 
-              <div
-                className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${
-                  drawerPushed
-                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-bl-3xl max-md:overflow-hidden"
-                    : ""
-                }`}
-              >
+              {/* The phone home is the session list, so the dashboard behind it stays out of the way. */}
+              <div className={`flex-1 flex flex-col min-h-0 min-w-0 ${phoneHome ? "max-md:hidden" : ""}`}>
                 {renderContent()}
               </div>
             </div>

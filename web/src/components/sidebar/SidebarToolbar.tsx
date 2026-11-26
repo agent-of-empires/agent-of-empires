@@ -30,7 +30,6 @@ export function SidebarToolbar({
   onToggleFacets,
   filterOpen,
   onToggleFilter,
-  onClose,
   onSearch,
 }: {
   compact: boolean;
@@ -47,7 +46,6 @@ export function SidebarToolbar({
   onToggleFacets: () => void;
   filterOpen: boolean;
   onToggleFilter: () => void;
-  onClose: () => void;
   /** Opens the command palette from the phone title row's Search button. */
   onSearch?: () => void;
 }) {
@@ -71,7 +69,7 @@ export function SidebarToolbar({
               onClick={onSearch}
               aria-label="Search"
               data-testid="sidebar-search-round"
-              className="md:hidden w-10 h-10 mr-2 flex items-center justify-center rounded-full bg-surface-800 text-text-secondary cursor-pointer active:bg-surface-700"
+              className="md:hidden w-10 h-10 mr-2 flex items-center justify-center rounded-full float-control text-text-secondary cursor-pointer active:scale-95 transition-transform"
             >
               <Search className="size-[18px]" strokeWidth={1.75} aria-hidden />
             </button>
@@ -93,13 +91,6 @@ export function SidebarToolbar({
           />
         </>
       )}
-      <button
-        onClick={onClose}
-        aria-label="Close sidebar"
-        className="md:hidden w-10 h-10 flex items-center justify-center rounded-full bg-surface-800 text-text-secondary cursor-pointer active:bg-surface-700 ml-2 text-lg"
-      >
-        &times;
-      </button>
     </div>
   );
 }

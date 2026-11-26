@@ -183,9 +183,7 @@ test.describe("resize handle and compact rail (#2288)", () => {
     expect(await page.evaluate(() => localStorage.getItem("aoe-sidebar-width"))).toBe("280");
   });
 
-  test("a phone drawer ignores a compact rail saved on a wider screen and fits a saved maximum width", async ({
-    page,
-  }) => {
+  test("a phone's session list ignores a compact rail and a width saved on a wider screen", async ({ page }) => {
     await installSidebarMocks(page, { sessions: SESSIONS });
     await page.addInitScript(() => {
       localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarCompact: true }));
@@ -197,10 +195,7 @@ test.describe("resize handle and compact rail (#2288)", () => {
     const panel = page.locator('[data-tour="sidebar"]');
     await expect(panel).not.toHaveAttribute("data-compact", "true");
     await expect(page.locator(COUNT).first()).toBeVisible();
-    // A phone drawer takes at most 85% of the width, leaving the pushed view's edge in sight.
-    expect((await panel.boundingBox())!.width).toBeCloseTo(390 * 0.85, 0);
-    const close = (await page.getByRole("button", { name: "Close sidebar" }).boundingBox())!;
-    expect(close.x + close.width).toBeLessThanOrEqual(390);
+    expect((await panel.boundingBox())!.width).toBe(390);
 
     await page.setViewportSize({ width: 1280, height: 720 });
     await expect(panel).toHaveAttribute("data-compact", "true");
@@ -360,22 +355,18 @@ test.describe("row chips and naming actions", () => {
   });
 });
 
-test.describe("mobile overlay on a notched phone", () => {
+test.describe("session list on a notched phone", () => {
   test.use(iPhone13);
 
-  test("runs the full height, clears the status bar, and keeps its footer above the home indicator", async ({
-    page,
-  }) => {
+  test("clears the status bar and keeps its footer above the home indicator", async ({ page }) => {
     const cdp = await page.context().newCDPSession(page);
     await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: { top: 47, bottom: 34 } });
     await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
     await page.goto("/");
     await openMobileSidebar(page);
 
-    const sidebar = (await page.locator("[data-tour='sidebar']").boundingBox())!;
-    const title = (await page.getByTestId("sidebar-axis-heading").boundingBox())!;
-    expect(sidebar.y).toBe(0);
-    expect(title.y).toBeGreaterThanOrEqual(47);
+    const menu = (await page.getByRole("button", { name: "More options" }).boundingBox())!;
+    expect(menu.y).toBeGreaterThanOrEqual(47);
     const settings = (await page.getByRole("button", { name: "Settings" }).boundingBox())!;
     expect(settings.y + settings.height).toBeLessThanOrEqual(page.viewportSize()!.height - 34);
   });

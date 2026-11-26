@@ -32,13 +32,13 @@ interface Props {
   inputElRef: RefObject<HTMLTextAreaElement | null>;
 }
 
-// Uniform key caps: a framed surface reads as a key, and one height, label size, and icon weight keep the row calm.
+// Uniform floating key pills, matching the header's controls; one height, label size and icon weight keep the row calm.
 const KEY_BASE =
-  "flex-1 min-w-0 h-10 flex items-center justify-center rounded-md border shadow-[inset_0_-1px_0_rgb(0_0_0/0.3)] transition-colors duration-75 select-none touch-manipulation [-webkit-touch-callout:none]";
-const KEY_CLASS = `${KEY_BASE} border-surface-700/70 bg-surface-800 text-text-primary active:bg-surface-700 active:border-surface-600`;
+  "flex-1 min-w-0 h-10 flex items-center justify-center rounded-full border transition-[color,background-color,scale] duration-75 active:scale-95 select-none touch-manipulation [-webkit-touch-callout:none]";
+const KEY_CLASS = `${KEY_BASE} float-control text-text-primary active:bg-surface-700`;
 const LATCHED_KEY_CLASS = `${KEY_BASE} border-brand-500/80 bg-brand-600/30 text-brand-400`;
 // Compose is the primary action: a neutral cap with an accent glyph, so it never reads as latched.
-const COMPOSE_KEY_CLASS = `${KEY_BASE} border-surface-700/70 bg-surface-800 text-brand-400 active:bg-surface-700 active:border-surface-600`;
+const COMPOSE_KEY_CLASS = `${KEY_BASE} float-control text-brand-400 active:bg-surface-700`;
 
 const ARROW_ROTATION = { up: 0, right: 90, down: 180, left: 270 } as const;
 
@@ -229,7 +229,7 @@ export function MobileTerminalToolbar({
       // keys keep all of it. Without, they drop to 8px less than the inset and move in from the rounded corners.
       data-terminal-toolbar
       data-compact={compact || undefined}
-      className={`shrink-0 flex items-center gap-1.5 pt-1.5 bg-surface-900 border-t border-surface-700/50 ${
+      className={`shrink-0 flex items-center gap-1.5 pt-1.5 bg-surface-900 ${
         compact
           ? "px-[max(0.5rem,calc(env(safe-area-inset-bottom)*0.7))] pb-[max(0.375rem,calc(env(safe-area-inset-bottom)-0.5rem))] [&_button]:h-9 [&_svg]:size-4 [&_span]:text-[11px]"
           : "px-2 pb-[calc(env(safe-area-inset-bottom)+0.375rem)]"

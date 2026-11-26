@@ -231,7 +231,6 @@ test.describe("touch rows", () => {
   async function openMobile(page: Page, sessions = threeSessionsInOneRepo()) {
     const handle = await installSidebarMocks(page, { sessions });
     await page.goto("/");
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
     const rows = page.getByTestId("sidebar-session-row");
     await expect(rows).toHaveCount(3);
     await page.waitForFunction(

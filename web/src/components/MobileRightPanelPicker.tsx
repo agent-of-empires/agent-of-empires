@@ -109,7 +109,7 @@ export function MobileRightPanelPicker({
         data-testid="mobile-right-panel-picker-backdrop"
       />
       <div
-        className={`fixed inset-x-0 bottom-0 z-50 max-h-[75dvh] rounded-t-2xl bg-surface-800 chrome-drawer border-t border-surface-700/60 shadow-2xl flex flex-col px-[env(safe-area-inset-left)] pb-[env(safe-area-inset-bottom)] transition-[translate,visibility] ${SHEET_MOTION} ${
+        className={`fixed inset-x-0 bottom-0 z-50 max-h-[75dvh] rounded-t-[28px] bg-surface-800 chrome-drawer border-t border-surface-600/40 shadow-[0_-12px_40px_-12px_rgb(0_0_0/0.6)] flex flex-col px-[env(safe-area-inset-left)] pb-[env(safe-area-inset-bottom)] transition-[translate,visibility] ${SHEET_MOTION} ${
           open ? "translate-y-0" : "translate-y-full invisible"
         }`}
         role="dialog"

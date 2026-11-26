@@ -208,7 +208,6 @@ test.describe("Cmd/Ctrl+` mobile", () => {
     await mockTerminalApis(page);
     await openPanelsByDefault(page);
     await page.goto("/");
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await openSession(page);
 
     // #1452: one full-viewport pane; the chord promotes a single paired instance.
@@ -226,7 +225,6 @@ test.describe("Cmd/Ctrl+` mobile", () => {
     const terminal = await mockTerminalApis(page);
     await openPanelsByDefault(page);
     await page.goto("/");
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await openSession(page);
     await terminal.waitForLiveReady();
 
@@ -237,9 +235,11 @@ test.describe("Cmd/Ctrl+` mobile", () => {
     await page.keyboard.press("Control+a");
     await expect.poll(() => terminal.liveInput.some((input) => input.equals(Buffer.from([0x01])))).toBe(true);
 
+    // A phone goes back to the session list, on the row of the Session it left.
     await page.keyboard.press("Control+q");
+    await expect(page).toHaveURL(/\/$/);
     const sidebar = page.getByRole("navigation", { name: "Sessions sidebar" });
-    await expect(sidebar.locator("[data-active-session-row]")).toBeFocused();
+    await expect(sidebar.getByTestId("sidebar-session-row").first()).toBeFocused();
     await observeFor(page, 250, async () => {
       expect(terminal.liveInput.some((input) => input.includes(0x11))).toBe(false);
     });

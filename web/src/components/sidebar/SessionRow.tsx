@@ -138,6 +138,13 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
       });
   // Only a recorded error's first line is a detail; the glyph's aria-label doesn't carry it.
   const errorLine = tooltip.detail;
+  // A phone row reads in two lines, as Claude's app lists sessions: what is happening, then where.
+  const phoneStatusLine = [
+    attention ? model.attentionHint.charAt(0).toUpperCase() + model.attentionHint.slice(1) : model.status,
+    model.branchLabel,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const navigationSessionId = navigationSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
 
@@ -267,6 +274,14 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 />
               )}
             </span>
+            {!compact && phoneStatusLine && (
+              <span
+                data-testid="sidebar-row-status-line"
+                className="md:hidden mt-0.5 block truncate text-[13px] text-text-dim"
+              >
+                {phoneStatusLine}
+              </span>
+            )}
             {!compact && <RowSubRows first={model.firstSession} />}
           </div>
         </div>

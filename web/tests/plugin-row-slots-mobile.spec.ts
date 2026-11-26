@@ -80,8 +80,6 @@ test.describe("Plugin row slots on a mobile sidebar (#2514)", () => {
     await mockApis(page);
     await page.goto("/");
 
-    // The drawer starts closed on mobile; open it.
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(1, { timeout: 8000 });
 
     const column = "[data-plugin-slot='row-column']";
@@ -113,7 +111,6 @@ test.describe("Plugin row slots on a mobile sidebar (#2514)", () => {
       },
     ]);
     await page.goto("/");
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(1, { timeout: 8000 });
 
     const chip = page.locator("button[data-plugin-slot='row-badge']");

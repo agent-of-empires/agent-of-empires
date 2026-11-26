@@ -82,6 +82,15 @@ export function tourSelector(anchor: TourAnchorId): string {
   return `[data-tour="${anchor}"]:not([inert] *)`;
 }
 
+/** The first rendered match: a phone hides one layout's anchors while the other shows its own. */
+export function findTourAnchor(anchor: TourAnchorId): HTMLElement | null {
+  if (typeof document === "undefined") return null;
+  for (const el of document.querySelectorAll<HTMLElement>(tourSelector(anchor))) {
+    if (typeof el.checkVisibility !== "function" || el.checkVisibility()) return el;
+  }
+  return null;
+}
+
 /** The only sanctioned way to attach a tour anchor; spread it onto the element. */
 export function tourAnchor(anchor: TourAnchorId): {
   "data-tour": TourAnchorId;
@@ -188,8 +197,7 @@ export function isStepEligible(
 }
 
 function defaultHasAnchor(anchor: TourAnchorId): boolean {
-  if (typeof document === "undefined") return false;
-  return document.querySelector(tourSelector(anchor)) !== null;
+  return findTourAnchor(anchor) !== null;
 }
 
 /** Metadata eligibility, then DOM presence, in TOUR_STEPS order. */

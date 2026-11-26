@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { Folder } from "lucide-react";
+import { ChevronLeft, Folder } from "lucide-react";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
@@ -20,6 +20,8 @@ interface Props {
   onOpenPalette: () => void;
   /** The terminal toggle; omitted where the Session cannot open one. */
   terminal?: { open: boolean; onToggle: () => void };
+  /** The open Session's actions for the overflow menu (a phone's only way to them); omitted on desktop. */
+  sessionItems?: OverflowItem[];
   /** The review panel toggle and its pane menu; omitted where the Session has no review panel. */
   panels?: PanelControlProps;
   onOpenHelp: () => void;
@@ -65,6 +67,7 @@ export function TopBar({
   onOpenPalette,
   terminal,
   panels,
+  sessionItems,
   onOpenHelp,
   onOpenAbout,
   onStartTutorial,
@@ -91,6 +94,15 @@ export function TopBar({
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
   }, [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
+  // The open Session's own actions lead the menu, with the app's after them.
+  const menuItems = useMemo<OverflowItem[]>(
+    () =>
+      sessionItems && sessionItems.length > 0
+        ? [...sessionItems, ...overflowItems.map((item, i) => (i === 0 ? { ...item, separated: true } : item))]
+        : overflowItems,
+    [sessionItems, overflowItems],
+  );
+  const phoneSession = !!activeSession && !onExitFocusMode;
 
   // The left zone only borrows the sidebar's width while that column is visible, so the compact rail only crowds
   // the wordmark in that combination.
@@ -101,19 +113,46 @@ export function TopBar({
   return (
     <header
       {...tourAnchor(TOUR_ANCHORS.topbar)}
-      className="h-12 bg-surface-850 chrome-header md:bg-transparent md:bg-none flex items-stretch shrink-0"
+      // On a phone the bar dissolves into the page: its controls float, as in Claude's app.
+      className="h-12 max-md:h-14 bg-surface-900 md:bg-transparent flex items-stretch shrink-0"
     >
       {/* Left zone: widens to the sidebar column when it's visible, so the header lines up with the sidebar on the
          canvas. */}
       <div
-        className={`flex items-center gap-2 px-3 min-w-0 shrink-0 border-b border-surface-700/60 md:border-transparent ${
+        className={`flex items-center gap-2 px-3 min-w-0 shrink-0 ${
           sidebarColumnVisible ? "md:w-[var(--aoe-sidebar-width)]" : ""
         }`}
       >
+        {phoneSession && (
+          // A Session opens over the list on a phone; back returns to it, carrying the list's attention counts.
+          <button
+            onClick={onGoDashboard}
+            aria-label={
+              waitingCount > 0 ? `Back to sessions, ${waitingCount} waiting for your input` : "Back to sessions"
+            }
+            data-testid="topbar-back"
+            className="md:hidden relative w-10 h-10 flex items-center justify-center shrink-0 rounded-full float-control text-text-secondary cursor-pointer active:scale-95 transition-transform"
+          >
+            <ChevronLeft className="size-5" strokeWidth={1.75} aria-hidden />
+            {waitingCount + unreadCount > 0 && (
+              <span
+                aria-hidden="true"
+                className="absolute -top-0.5 -right-0.5 min-w-[1.1rem] rounded-full px-1 text-[10px] font-semibold leading-[1.1rem] tabular-nums text-center shadow"
+                style={
+                  waitingCount > 0
+                    ? { backgroundColor: attentionBadgeColors.waitingBg, color: attentionBadgeColors.waitingFg }
+                    : { backgroundColor: attentionBadgeColors.unreadBg, color: attentionBadgeColors.unreadFg }
+                }
+              >
+                {waitingCount > 0 ? waitingCount : unreadCount}
+              </span>
+            )}
+          </button>
+        )}
         <button
           onClick={onExitFocusMode ?? onToggleSidebar}
           className={`h-8 flex items-center shrink-0 cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50 ${
-            onExitFocusMode ? "pr-2.5" : ""
+            onExitFocusMode ? "pr-2.5" : "max-md:hidden"
           }`}
           title={toggleLabel}
           data-testid={onExitFocusMode ? "topbar-exit-focus" : undefined}
@@ -179,7 +218,9 @@ export function TopBar({
         {!onExitFocusMode && (
           <button
             onClick={onGoDashboard}
-            className="flex items-center gap-1.5 shrink-0 text-text-muted hover:text-text-secondary transition-colors cursor-pointer"
+            className={`flex items-center gap-1.5 shrink-0 text-text-muted hover:text-text-secondary transition-colors cursor-pointer ${
+              phoneSession ? "max-md:hidden" : ""
+            }`}
             aria-label="Go to dashboard"
           >
             <img src="/icon-192.png" alt="" width="18" height="18" className="rounded-sm shrink-0" />
@@ -201,29 +242,42 @@ export function TopBar({
 
       {/* Center zone: on desktop the open session's `project / title`, as Claude Code desktop heads its pane, with
           search in the sidebar; otherwise the palette trigger. Plugin page buttons follow. */}
-      <div className="flex-1 flex items-center px-3 min-w-0 border-b border-surface-700/60 md:border-transparent">
+      <div className="flex-1 flex items-center px-3 max-md:px-1 min-w-0">
         <div
           className={`group/center flex-1 flex justify-center items-center gap-1 px-2 min-w-0 ${activeSession ? "md:justify-start" : ""}`}
         >
           {activeSession && (
-            // Phones name only the session: the sidebar that would otherwise say it is usually hidden there.
             <div
               data-testid="session-breadcrumb"
-              // A phone gives the slower-updates notice the room instead.
-              className="flex items-center gap-1.5 min-w-0 flex-1 text-[13px] max-md:group-has-[[data-live-slow-notice]]/center:hidden"
+              className="hidden md:flex items-center gap-1.5 min-w-0 flex-1 text-[13px]"
               title={activeSession.project_path}
             >
-              <Folder className="hidden md:block size-3.5 shrink-0 text-text-dim" strokeWidth={1.5} aria-hidden />
-              <span className="hidden md:inline text-text-secondary truncate shrink">
-                {projectName(activeSession.project_path)}
-              </span>
-              <span className="hidden md:inline text-text-dim" aria-hidden>
+              <Folder className="size-3.5 shrink-0 text-text-dim" strokeWidth={1.5} aria-hidden />
+              <span className="text-text-secondary truncate shrink">{projectName(activeSession.project_path)}</span>
+              <span className="text-text-dim" aria-hidden>
                 /
               </span>
               <span className="text-text-primary font-medium truncate">{activeSession.title}</span>
             </div>
           )}
-          <div className={activeSession ? "contents md:hidden" : "contents"}>
+          {activeSession && (
+            // A phone heads the Session with a floating pill, its title over its project, as Claude's app does;
+            // it gives the slower-updates notice the room when that shows.
+            <div
+              data-testid="session-title-pill"
+              title={activeSession.project_path}
+              className="md:hidden min-w-0 max-w-full h-10 px-4 flex flex-col items-center justify-center rounded-full float-control leading-tight group-has-[[data-live-slow-notice]]/center:hidden"
+            >
+              <span className="max-w-full truncate text-[13px] font-semibold text-text-primary">
+                {activeSession.title}
+              </span>
+              <span className="max-w-full truncate text-[11px] text-text-dim">
+                {projectName(activeSession.project_path)}
+              </span>
+            </div>
+          )}
+          {/* Search lives in the sidebar on desktop with a Session open, and on the phone's session list. */}
+          <div className={activeSession ? "hidden" : "hidden md:contents"}>
             <PaletteTriggerPill onClick={onOpenPalette} />
           </div>
           <PluginPageButtons />
@@ -233,14 +287,16 @@ export function TopBar({
 
       {/* Right zone: widens to the right-panel column when it's visible, so its controls sit over the panel. */}
       <div
-        className={`flex items-center justify-end gap-1.5 px-3 shrink-0 border-b border-surface-700/60 md:border-transparent ${
+        className={`flex items-center justify-end gap-1.5 px-3 shrink-0 ${
           rightColumnVisible ? "md:w-[var(--aoe-right-panel-width)]" : ""
         }`}
       >
         <PluginStatusBarSegments />
         {isDevBuild && (
           <span
-            className="font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-status-waiting/15 text-status-waiting ring-1 ring-status-waiting/30"
+            className={`font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-status-waiting/15 text-status-waiting ring-1 ring-status-waiting/30 ${
+              phoneSession ? "max-md:hidden" : ""
+            }`}
             title="Debug build (cfg!(debug_assertions)); distinguishes the dev instance from a concurrent release build. See issue #1055."
             aria-label="Debug build"
           >
@@ -265,7 +321,7 @@ export function TopBar({
           </>
         )}
 
-        <OverflowMenu items={overflowItems} triggerDataTour={TOUR_ANCHORS.topbarMore} />
+        <OverflowMenu items={menuItems} triggerDataTour={TOUR_ANCHORS.topbarMore} phoneFloating />
       </div>
     </header>
   );

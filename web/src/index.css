@@ -780,17 +780,32 @@ select:focus-visible,
     var(--color-surface-950) 55%
   );
 }
-@utility chrome-header {
-  background-image: linear-gradient(
-    to bottom,
-    var(--color-surface-850),
-    color-mix(in srgb, var(--color-surface-850) 45%, var(--color-surface-900))
-  );
-}
 @utility chrome-drawer {
   background-image: linear-gradient(
     to bottom,
     var(--color-surface-800),
     color-mix(in srgb, var(--color-surface-800) 55%, var(--color-surface-850))
   );
+}
+
+/* Floating controls on phones, after Claude's iOS app: a raised surface with a hairline edge, a faint top
+   highlight and a soft two-layer shadow, so they read as sitting above the content. */
+@utility float-control {
+  background-color: color-mix(in srgb, var(--color-surface-800) 92%, transparent);
+  border: 1px solid color-mix(in srgb, var(--color-surface-600) 35%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 6%, transparent),
+    0 1px 2px rgb(0 0 0 / 0.35),
+    0 8px 20px -8px rgb(0 0 0 / 0.55);
+}
+/* A frosted popover for menus: translucent surface, blur behind, a deep soft shadow. */
+@utility glass-menu {
+  background-color: color-mix(in srgb, var(--color-surface-800) 82%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  backdrop-filter: blur(24px) saturate(1.4);
+  border: 1px solid color-mix(in srgb, var(--color-surface-600) 30%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 6%, transparent),
+    0 24px 48px -12px rgb(0 0 0 / 0.6),
+    0 8px 16px -8px rgb(0 0 0 / 0.45);
 }

@@ -98,8 +98,11 @@ content. It is denser and quieter than the marketing site.
 - Fixed palette colors are allowed only when hue carries meaning, such as
   status, severity, syntax, user content, third-party visualizations, and the
   brand mark.
-- Mobile prioritizes monitoring and conversation controls; overlays replace
-  persistent side panels.
+- Mobile prioritizes monitoring and conversation controls, after Claude's iOS
+  app: the session list is home and a Session opens over it. Controls float
+  (`float-control`: round, raised, soft shadow) over a page with no header
+  rule; menus are frosted (`glass-menu`); views switch from a segmented pill;
+  sheets replace persistent side panels.
 - Sessions stay on the left. The right dock is the Session's review panel
   (Diff, Files, Background, plugins), with the terminal tabs stacked below
   them in the same dock, as in Conductor.
