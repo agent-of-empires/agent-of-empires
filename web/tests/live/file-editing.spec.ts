@@ -1,4 +1,5 @@
 import { chmodSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { pickPhoneView } from "../helpers/phoneViews";
 import { join } from "node:path";
 import type { Dialog, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
@@ -20,7 +21,7 @@ async function openFile(page: Page, serve: ServeHandle, title?: string) {
 
 async function showNotes(page: Page) {
   if (page.viewportSize()!.width < 768) {
-    await page.getByTestId("mobile-tab-files").click();
+    await pickPhoneView(page, "Files");
   } else {
     await openReviewPane(page, "files");
   }
@@ -255,7 +256,7 @@ test("mobile editing keeps controls usable and confirms leaving the Files pane",
   await editor.fill("phone edit");
   await page.screenshot({ path: testInfo.outputPath("mobile-editor.png") });
   page.once("dialog", (dialog) => dialog.dismiss());
-  await page.getByTestId("mobile-tab-agent").click();
+  await pickPhoneView(page, "Agent");
   await expect(editor).toHaveValue("phone edit");
   page.once("dialog", (dialog) => dialog.accept());
   await editor.press("Escape");

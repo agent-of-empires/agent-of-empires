@@ -125,6 +125,11 @@ function pushFlickSample(samples: FlickSample[], sample: FlickSample) {
   while (samples.length > 1 && sample.t - samples[0]!.t > FLICK_VELOCITY_WINDOW_MS) samples.shift();
 }
 
+function dismissSoftKeyboard() {
+  const el = document.activeElement;
+  if (el instanceof HTMLElement) el.blur();
+}
+
 export function MobileLiveTerminal({
   readOnly,
   frame: streamFrame,
@@ -715,6 +720,8 @@ export function MobileLiveTerminal({
     uploadPastedImage,
     captureWriteAdmission,
     onTabEscape,
+    // Sending a line puts the soft keyboard away so the reply has the screen; a full-screen app keeps it.
+    onSubmit: coarse && !altScreen ? dismissSoftKeyboard : undefined,
   });
 
   const cursorRow = connected && !reading ? live.row : -1;

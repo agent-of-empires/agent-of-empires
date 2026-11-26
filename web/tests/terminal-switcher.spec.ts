@@ -2,6 +2,7 @@
 // shell. Layout and binding logic: paneLayout.test.ts; the list: pairedShells.test.ts, TerminalSwitcher.test.tsx.
 
 import type { Page } from "@playwright/test";
+import { expectPhoneView, pickPhoneView } from "./helpers/phoneViews";
 
 import { test, expect } from "./helpers/mockedTest";
 import { mockSessionShellApis, mockStaticApis } from "./helpers/apiMocks";
@@ -72,12 +73,23 @@ test("a terminal tab keeps its Session's shell across a sidebar switch, and the 
 
 test("on a phone More opens another Session's live shell", async ({ page }) => {
   const sockets = await boot(page, 390, "/session/alpha");
-  await page.getByTestId("mobile-tab-more").click();
+  await pickPhoneView(page, "More panes…");
+  // A full-width sheet resting on the bottom edge, leaving out the views the ⋯ lists itself.
+  const sheet = page.getByTestId("mobile-right-panel-picker");
+  await expect
+    .poll(async () => {
+      const box = await sheet.boundingBox();
+      return box && { left: box.x, width: box.width, bottom: Math.round(box.y + box.height) };
+    })
+    .toEqual({ left: 0, width: 390, bottom: page.viewportSize()!.height });
+  // Tailwind v4 `translate-y-*` sets `translate`, so a transition on `transform` alone would snap it.
+  expect(await sheet.evaluate((el) => getComputedStyle(el).transitionProperty)).toContain("translate");
+  await expect(page.getByTestId("mobile-right-panel-pick-agent")).toHaveCount(0);
   const pick = page.getByTestId("mobile-shell-pick-beta-2-host");
   await expect(pick).toContainText("beta · 3");
   await pick.click();
   await expect(page.getByTestId("mobile-paired-layer")).toBeVisible();
   await expect(page.getByTestId("mobile-paired-bar")).toContainText("beta · 3");
-  await expect(page.getByTestId("mobile-tab-paired")).toHaveAttribute("aria-current", "page");
+  await expectPhoneView(page, "Terminal");
   await expect.poll(() => pairedSocket(sockets, "beta", 2)).toBe(true);
 });

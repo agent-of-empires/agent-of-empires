@@ -7,16 +7,11 @@ import { openPanelsByDefault } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 import { iPhone13 } from "./helpers/viewports";
+import { expectPhoneView, pickPhoneView } from "./helpers/phoneViews";
 import { liveContent, openLiveSession, openLiveTerminal } from "./helpers/liveTerminal";
 
 const liveTerminal = (page: Page) => page.locator("[data-live-terminal]").first();
 const picker = (page: Page) => page.getByTestId("mobile-right-panel-picker");
-const tab = (page: Page, view: string) => page.getByTestId(`mobile-tab-${view}`);
-
-async function openMore(page: Page) {
-  await tab(page, "more").click();
-  await expect(picker(page)).toBeVisible({ timeout: 5_000 });
-}
 
 /** One-finger horizontal swipe dispatched on the window, where useDrawerSwipe listens. */
 async function swipe(page: Page, fromX: number, toX: number, y: number) {
@@ -68,27 +63,17 @@ async function expectSafeAreaInset(page: Page, testId: string) {
 test.describe("Mobile session view tabs (#1452)", () => {
   test.use(iPhone13);
 
-  test("a tab bar switches the Session's views, and More rises as a bottom sheet with the rest", async ({ page }) => {
+  test("the header's ⋯ lists the Session's views, and a swipe right goes back", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: null });
     const viewport = page.viewportSize()!;
-    await expect(tab(page, "agent")).toHaveAttribute("aria-current", "page");
-    // The header holds no panels toggle: the tabs replace it.
+    await expectPhoneView(page, "Agent");
+    await page.getByRole("button", { name: "More options" }).click();
+    // More panes shows only with something to hold, such as another Session's shell.
+    await expect(page.getByRole("menuitemradio")).toHaveText(["Agent", "Terminal", "Diff", "Files"]);
+    await expect(page.getByRole("menuitemradio", { name: "Agent" })).toHaveAttribute("aria-checked", "true");
+    await page.keyboard.press("Escape");
+    // The header holds no panels toggle: the ⋯ replaces it.
     await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
-
-    await openMore(page);
-    // A full-width sheet resting on the bottom edge, not a side drawer.
-    await expect
-      .poll(async () => {
-        const box = await picker(page).boundingBox();
-        return box && { left: box.x, width: box.width, bottom: Math.round(box.y + box.height) };
-      })
-      .toEqual({ left: 0, width: viewport.width, bottom: viewport.height });
-    // Tailwind v4 `translate-y-*` sets `translate`, so a transition on `transform` alone would snap it.
-    expect(await picker(page).evaluate((el) => getComputedStyle(el).transitionProperty)).toContain("translate");
-    // The tabs' own views stay out of More.
-    await expect(page.getByTestId("mobile-right-panel-pick-agent")).toHaveCount(0);
-    await page.getByTestId("mobile-right-panel-picker-backdrop").click({ position: { x: 20, y: 80 } });
-    await expect(picker(page)).toBeHidden();
 
     // A swipe left raises nothing; a swipe right goes back to the session list.
     const y = viewport.height / 2;
@@ -128,9 +113,12 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await expect(page.getByTestId("topbar-back")).toHaveCount(0);
   });
 
-  test("the Terminal tab promotes the paired terminal and it survives the keyboard", async ({ page }) => {
+  test("Terminal promotes the paired terminal, survives the keyboard, and back returns to the agent", async ({
+    page,
+  }) => {
     await openLiveTerminal(page, { mobile: true, settings: { mobileFontSize: 10 } });
-    await tab(page, "paired").click();
+    await pickPhoneView(page, "Terminal");
+    await expectPhoneView(page, "Terminal");
     const paired = page.locator('[data-term="paired"]');
     await paired.waitFor({ state: "visible", timeout: 10_000 });
     await expectSafeAreaInset(page, "mobile-paired-layer");
@@ -142,8 +130,9 @@ test.describe("Mobile session view tabs (#1452)", () => {
       })
       .toBeGreaterThan(150);
 
-    // Back to the agent: the paired shell stays mounted, keeping its PTY and scrollback.
-    await tab(page, "agent").click();
+    // Back returns to the agent first: the paired shell stays mounted, keeping its PTY and scrollback.
+    await page.getByTestId("topbar-back").click();
+    await expectPhoneView(page, "Agent");
     await expect(paired).toHaveCount(1);
     await expect(liveTerminal(page)).toBeVisible();
   });
@@ -154,8 +143,7 @@ test.describe("Mobile session view tabs (#1452)", () => {
     });
     await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
     await openLiveSession(page, handle, { mobile: true, settings: null, title: "acp-mobile", waitForLive: false });
-    await tab(page, "paired").waitFor({ state: "visible", timeout: 10_000 });
-    await tab(page, "paired").click();
+    await pickPhoneView(page, "Terminal");
     const paired = page.locator('[data-term="paired"]');
     await paired.waitFor({ state: "visible", timeout: 10_000 });
 
@@ -166,8 +154,8 @@ test.describe("Mobile session view tabs (#1452)", () => {
       })
       .toBeGreaterThan(150);
 
-    await tab(page, "agent").click();
-    await expect(tab(page, "agent")).toHaveAttribute("aria-current", "page");
+    await pickPhoneView(page, "Agent");
+    await expectPhoneView(page, "Agent");
   });
 });
 
@@ -184,7 +172,7 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
 
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();
     await expect(page.getByTestId("panel-control")).toBeVisible();
-    await expect(page.getByTestId("mobile-view-tabs")).toHaveCount(0);
+    await expect(page.getByTestId("session-title-pill")).toBeHidden();
     await expect(picker(page)).toBeHidden();
     await expect(page.getByRole("button", { name: "Compose", exact: true })).toHaveCount(0);
     await expect(page.getByRole("group", { name: "Arrow keys joystick" })).toHaveCount(0);

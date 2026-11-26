@@ -114,7 +114,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
             if (e.key === "Escape") setRenaming(false);
           }}
           data-testid="sidebar-rename-input"
-          className="w-full bg-surface-900 border border-brand-600 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
+          className="w-full bg-surface-900 border border-brand-600 rounded px-2 py-1 text-[17px] md:text-[14px] font-mono text-text-primary focus:outline-none"
         />
       </div>
     );
@@ -242,7 +242,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           )}
           <div className="min-w-0 flex-1">
             <span
-              className={`flex items-center gap-1.5 text-[16px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic" : ""}`}
+              className={`flex items-center gap-1.5 text-[17px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic" : ""}`}
             >
               {!compact && model.effectivePinned && (
                 <Tooltip text={meaningText(MARK_MEANING.pinned)}>
@@ -277,7 +277,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
             {!compact && phoneStatusLine && (
               <span
                 data-testid="sidebar-row-status-line"
-                className="md:hidden mt-0.5 block truncate text-[13px] text-text-dim"
+                className="md:hidden mt-0.5 block truncate text-[15px] text-text-dim"
               >
                 {phoneStatusLine}
               </span>

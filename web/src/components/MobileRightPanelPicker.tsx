@@ -6,7 +6,7 @@ import { sessionRowChromeClass } from "../lib/sessionRowChrome";
 import type { PaneDisplay } from "./Dock";
 import { PaneIcon } from "./PaneIcon";
 
-/** Views the phone's tab bar shows itself, so More leaves them out. */
+/** Views the phone's ⋯ menu lists itself, so More panes leaves them out. */
 const TAB_VIEWS = new Set<string>(["agent", "paired", "diff", "files"]);
 
 /** The sheet moves on the iOS sheet curve; reduced motion skips it. */
@@ -97,7 +97,7 @@ export function MobileRightPanelPicker({
 
   const panes = availablePanes.filter((id) => !TAB_VIEWS.has(id));
 
-  // The phone tab bar's More: a bottom sheet with what the tabs leave out. Stays mounted so it can slide out;
+  // The ⋯ menu's More panes: a bottom sheet with what the menu leaves out. Stays mounted so it can slide out;
   // `invisible` flips after the transform finishes, which also takes the closed sheet out of focus and the a11y tree.
   return (
     <div className="md:hidden">

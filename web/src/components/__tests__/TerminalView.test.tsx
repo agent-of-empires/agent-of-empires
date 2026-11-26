@@ -34,7 +34,6 @@ vi.mock("../../hooks/useTerminal", () => ({
       connected: false,
       reconnecting: false,
       retryCount: 0,
-      retryCountdown: 0,
       isPrimary: true,
       isInScrollback: false,
     },

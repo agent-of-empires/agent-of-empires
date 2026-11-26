@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { type TourAnchorId } from "../lib/tourSteps";
-import type { LucideIcon } from "lucide-react";
+import { Check, type LucideIcon } from "lucide-react";
 import { StrokeIcon } from "./icons";
 
 export interface OverflowItem {
@@ -11,6 +11,8 @@ export interface OverflowItem {
   icon?: LucideIcon;
   /** Starts a new group with a rule above it. */
   separated?: boolean;
+  /** Makes the item one of a set of choices; true marks the current one. */
+  checked?: boolean;
 }
 
 interface Props {
@@ -70,11 +72,12 @@ export function OverflowMenu({ items, triggerDataTour, phoneFloating = false }: 
             phoneFloating ? "max-md:mt-2 max-md:min-w-[240px] max-md:rounded-2xl max-md:glass-menu max-md:py-1.5" : ""
           }`}
         >
-          {items.map(({ label, onClick, detail, icon: Icon, separated }) => (
+          {items.map(({ label, onClick, detail, icon: Icon, separated, checked }) => (
             <div key={label}>
               {separated && <div className="my-1 mx-3 border-t border-surface-600/40" role="separator" />}
               <button
-                role="menuitem"
+                role={checked === undefined ? "menuitem" : "menuitemradio"}
+                aria-checked={checked}
                 onClick={() => {
                   setOpen(false);
                   onClick();
@@ -84,10 +87,11 @@ export function OverflowMenu({ items, triggerDataTour, phoneFloating = false }: 
                 }`}
               >
                 {Icon && <Icon className="size-[18px] shrink-0 text-text-secondary" strokeWidth={1.6} aria-hidden />}
-                <span className="min-w-0">
+                <span className="min-w-0 flex-1">
                   <span className="block truncate">{label}</span>
                   {detail && <span className="block truncate text-[12px] text-text-dim">{detail}</span>}
                 </span>
+                {checked && <Check className="size-4 shrink-0 text-text-primary" strokeWidth={2} aria-hidden />}
               </button>
             </div>
           ))}

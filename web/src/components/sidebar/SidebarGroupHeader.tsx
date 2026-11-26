@@ -183,7 +183,10 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               </Tooltip>
             )
           )}
-          <span className="text-[13px] font-medium truncate flex-1" title={group.groupPath ?? group.repoPath}>
+          <span
+            className="text-[13px] max-md:text-[15px] font-medium truncate flex-1"
+            title={group.groupPath ?? group.repoPath}
+          >
             {group.displayName}
           </span>
           {attentionCount > 0 && (
@@ -198,7 +201,10 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             </Tooltip>
           )}
           {!compact && (
-            <span className="shrink-0 text-[12px] tabular-nums text-text-dim" data-testid="sidebar-group-session-count">
+            <span
+              className="shrink-0 text-[12px] max-md:text-[14px] tabular-nums text-text-dim"
+              data-testid="sidebar-group-session-count"
+            >
               ({sessionCount})
             </span>
           )}

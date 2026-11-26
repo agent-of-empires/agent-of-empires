@@ -60,6 +60,17 @@ test.describe("Live terminal mobile controls", () => {
     });
   }
 
+  test("Enter sends the line and puts the keyboard away; Shift+Enter keeps it up", async ({ page }) => {
+    const handle = await openLiveTerminal(page, { mobile: true });
+    const input = page.getByLabel("Live terminal input");
+    await input.focus();
+    await page.keyboard.press("Shift+Enter");
+    await expect(input).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => handle.liveInput.map((b) => b.toString())).toContain("\r");
+    await expect(input).not.toBeFocused();
+  });
+
   test("the default key row fits one line, and an eight-key row still does not scroll", async ({ page }) => {
     const handle = await openLiveTerminal(page, { mobile: true });
     const row = ["Escape", "Tab", "Ctrl", "Paste from clipboard", "Compose"];

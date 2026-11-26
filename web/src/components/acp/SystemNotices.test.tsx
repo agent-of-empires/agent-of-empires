@@ -20,7 +20,6 @@ function noticeProps(overrides?: Partial<NoticeProps>): NoticeProps {
     hasEverOpened: true,
     reconnecting: false,
     retryCount: 0,
-    retryCountdown: 0,
     maxRetries: 7,
     manualReconnect: vi.fn(),
     ...overrides,

@@ -3416,8 +3416,7 @@
         "web/src/components/MobileRightPanelPicker.tsx",
         "web/src/components/MobileMainPane.tsx",
         "web/src/components/PairedTerminal.tsx",
-        "web/src/components/ContentSplit.tsx",
-        "web/src/components/MobileViewTabs.tsx"
+        "web/src/components/ContentSplit.tsx"
       ]
     },
     {

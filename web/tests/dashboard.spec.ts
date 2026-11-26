@@ -171,7 +171,7 @@ test.describe("Phone session stack", () => {
     await expect(back).toHaveCount(0);
   });
 
-  test("the header's ⋯ leads with the open Session's actions", async ({ page }) => {
+  test("the header's ⋯ holds the open Session's views, then its actions", async ({ page }) => {
     await page.goto("/session/alpha");
     await page.getByRole("button", { name: "More options" }).click();
     const items = page.getByRole("menuitem");
@@ -187,6 +187,6 @@ test.describe("Phone session stack", () => {
       "Tips",
       "About",
     ]);
-    await expect(page.getByRole("separator")).toHaveCount(1);
+    await expect(page.getByRole("separator")).toHaveCount(2);
   });
 });

@@ -69,14 +69,11 @@ const diffComments = makeStore();
 
 function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
   const onBackToAgent = vi.fn();
-  const onPick = vi.fn();
-  const onMore = vi.fn();
   const props: Parameters<typeof MobileMainPane>[0] = {
     view: "agent",
     readOnly: false,
     pluginPanes: [],
     onBackToAgent,
-    tabs: { available: ["diff", "files", "agents"], terminal: true, onPick, onMore },
     onOpenAgentsPane: vi.fn(),
     pairedMounted: false,
     pairedShell: { session: session(), index: 0 },
@@ -114,7 +111,7 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     ...overrides,
   };
   render(<MobileMainPane {...props} />);
-  return { onBackToAgent, onPick, onMore };
+  return { onBackToAgent };
 }
 
 describe("MobileMainPane", () => {
@@ -123,21 +120,6 @@ describe("MobileMainPane", () => {
     setup({ view: "agent", activeSession: structured, sessions: [structured] });
     // StructuredView is lazy-loaded behind Suspense, so await its resolution.
     expect(await screen.findByTestId("acp-view")).toBeDefined();
-  });
-
-  it("switches views from the tab bar, marking the shown one, with the rest under More", () => {
-    const { onPick, onMore } = setup({ view: "paired", pairedMounted: true });
-    expect(screen.getByTestId("mobile-tab-paired").getAttribute("aria-current")).toBe("page");
-    fireEvent.click(screen.getByTestId("mobile-tab-agent"));
-    fireEvent.click(screen.getByTestId("mobile-tab-diff"));
-    fireEvent.click(screen.getByTestId("mobile-tab-more"));
-    expect([onPick.mock.calls, onMore.mock.calls.length]).toEqual([[["agent"], ["diff"]], 1]);
-    cleanup();
-    // Diff, Files and Terminal show only where the Session offers them.
-    setup({ tabs: { available: [], terminal: false, onPick: vi.fn(), onMore: vi.fn() } });
-    expect(
-      ["agent", "paired", "diff", "files", "more"].map((t) => screen.queryByTestId(`mobile-tab-${t}`) !== null),
-    ).toEqual([true, false, false, false, true]);
   });
 
   it("names the shown shell, another Session's included, and offers its mode only when sandboxed", () => {
@@ -162,13 +144,12 @@ describe("MobileMainPane", () => {
   });
 
   it("passes the active session to the agents and files panes", async () => {
-    for (const [view, testId, current] of [
-      ["agents", "background-agents-panel", "mobile-tab-more"],
-      ["files", "files-pane", "mobile-tab-files"],
+    for (const [view, testId] of [
+      ["agents", "background-agents-panel"],
+      ["files", "files-pane"],
     ] as const) {
       setup({ view, activeSessionId: "s1" });
       expect((await screen.findByTestId(testId)).textContent).toBe("s1");
-      expect(screen.getByTestId(current).getAttribute("aria-current")).toBe("page");
       cleanup();
     }
   });
@@ -206,8 +187,6 @@ describe("MobileMainPane", () => {
     setup({ view: pane.id, pluginPanes: [pane] });
     expect(screen.getByTestId("plugin-pane-body")).toBeDefined();
     expect(screen.getByText("PR #1 open")).toBeDefined();
-    // A view from More names itself on the More tab.
-    expect(screen.getByTestId("mobile-tab-more").textContent).toBe("GitHub");
   });
 
   it("shows the comments banner when there are comments", () => {

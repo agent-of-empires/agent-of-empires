@@ -523,7 +523,6 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
         connected={live.state.connected}
         reconnecting={live.state.reconnecting}
         retryCount={live.state.retryCount}
-        retryCountdown={live.state.retryCountdown}
         maxRetries={live.maxRetries}
         onRetry={reconnect}
         paneDead={live.state.paneDead}

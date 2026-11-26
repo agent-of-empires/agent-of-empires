@@ -32,11 +32,11 @@ Focusing or zooming a secondary tmux pane does not retarget them.
 
 ## Paired terminal
 
-Each session can open a **paired terminal**: a host shell (or, for a sandboxed session, one inside the container) rooted at the session's working directory. On desktop it opens as a tab in the right dock, stacked below Diff and the other review panes, so hiding the review panel hides it too; drag a tab to the bottom dock to keep it below the agent instead. On a phone it is the **Terminal** tab. It stays alive in the background when you switch away. Its terminal 1 is the same shell the TUI opens with `T`, in the matching Host or Container mode.
+Each session can open a **paired terminal**: a host shell (or, for a sandboxed session, one inside the container) rooted at the session's working directory. On desktop it opens as a tab in the right dock, stacked below Diff and the other review panes, so hiding the review panel hides it too; drag a tab to the bottom dock to keep it below the agent instead. On a phone, pick **Terminal** from the header's **⋯**. It stays alive in the background when you switch away. Its terminal 1 is the same shell the TUI opens with `T`, in the matching Host or Container mode.
 
 A terminal tab belongs to the shell it opened, labelled with its session and number (`api · 2`). Selecting another session changes the main pane but leaves the terminal tabs showing their own shells, so you can keep shells from several sessions open side by side. `` Cmd+` `` / `` Ctrl+` `` focuses the selected session's tab if it has one, else opens one; the top-bar terminal icon opens or closes the selected session's tabs and leaves the others. The **+** on a dock's tab strip starts another shell for the selected session; closing a tab other than terminal 1 ends its shell. A tab closes when its session is deleted.
 
-The **⌄** beside it, or `` Cmd+Shift+` `` / `` Ctrl+Shift+` ``, lists every live paired shell across sessions, grouped by session. Pick one to focus its tab, or open a tab for it. On a phone, the **More** sheet lists the same shells under **Paired terminals**.
+The **⌄** beside it, or `` Cmd+Shift+` `` / `` Ctrl+Shift+` ``, lists every live paired shell across sessions, grouped by session. Pick one to focus its tab, or open a tab for it. On a phone, **⋯ › More panes…** lists the same shells under **Paired terminals**.
 
 On a writable server, opening or reconnecting either paired shell is refused while the session is held by a lifecycle operation such as purge. A live shell is preserved. Host recovery uses the current project directory; container recovery keeps its pinned working directory and reuses minted values while the container remains running.
 
@@ -44,7 +44,7 @@ For a sandboxed session, a **Host** / **Container** control on the dock's tab st
 
 ## Reconnect
 
-If the WebSocket drops (network blip, tunnel re-auth, daemon restart), the terminal reconnects on a fast-start retry ladder (200ms, 400ms, 800ms, 1.5s, 3s, 6s, 10s) so transient warm-up failures recover in well under five seconds. A disconnect banner shows the current state; a permanently dead pane surfaces a manual retry button instead of looping.
+If the WebSocket drops (network blip, tunnel re-auth, daemon restart), the terminal reconnects on a fast-start retry ladder (200ms, 400ms, 800ms, 1.5s, 3s, 6s, 10s) so transient warm-up failures recover in well under five seconds. A **Reconnecting…** banner shows only once a drop outlasts two seconds, so a phone resuming from the background redials quietly, and not while the dashboard's Daemon unreachable banner already says so. Once the ladder is spent, **Connection lost** offers **Retry**; an exited agent shows **Agent exited** with **Restart** instead of looping.
 
 ### Terminal WebSocket close codes
 
@@ -68,7 +68,7 @@ The phone renders the same live view, tuned for touch:
 
 - **Scrolling is the browser's own scroll**: momentum, rubber-banding, and finger-true tracking, over the pane's real scrollback. For a full-screen agent, whose scrollback lives inside the app, a drag is forwarded to the app as wheel input instead, one line at a time and paced to the app's redraws.
 - **Text selection is native**: long-press to select and copy, like any web page.
-- **Typing** goes back over the same WebSocket. Tapping the terminal opens the soft keyboard, except in a full-screen app with mouse support, where a tap is a click; the floating keyboard button toggles it either way. The key row adds Esc, Tab, a `Ctrl` toggle, paste, and compose by default, and ends with Enter while the soft keyboard is closed if the row has room; pick and order its keys under Settings > Terminal. Toolbar key sequences consume the one-shot Ctrl modifier, including Enter, Ctrl+C, and held repeats. Drag the joystick above the keyboard button for arrow keys. Compose opens a text box for dictation, autocorrect, and long-press paste, and sends the text as one paste. Opening the keyboard never resizes the agent's pane.
+- **Typing** goes back over the same WebSocket. Tapping the terminal opens the soft keyboard, except in a full-screen app with mouse support, where a tap is a click; the floating keyboard button toggles it either way. The key row adds Esc, Tab, a `Ctrl` toggle, paste, and compose by default, and ends with Enter while the soft keyboard is closed if the row has room; pick and order its keys under Settings > Terminal. Toolbar key sequences consume the one-shot Ctrl modifier, including Enter, Ctrl+C, and held repeats. Drag the joystick above the keyboard button for arrow keys. Compose opens a text box for dictation, autocorrect, and long-press paste, and sends the text as one paste. Opening the keyboard never resizes the agent's pane. Enter sends the line and puts the keyboard away, except in a full-screen app; Shift+Enter does not.
 - **Pinch** adjusts the font size; the pane is resized to the resulting grid once, when the gesture ends.
 
 A "Back to live" pill appears while you are scrolled up; tapping it (or scrolling to the bottom) returns to the live tail. The pane stays mounted while you switch views so the connection and scroll position survive.

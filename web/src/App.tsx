@@ -14,10 +14,14 @@ import {
   Archive,
   ArchiveRestore,
   Copy,
+  FileDiff,
+  FolderTree,
   Pin,
   PinOff,
   Puzzle,
+  Sparkles,
   Square,
+  SquareTerminal,
   Trash2,
 } from "lucide-react";
 import {
@@ -221,6 +225,7 @@ import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { MainViewTabs } from "./components/MainViewTabs";
 import type { OverflowItem } from "./components/OverflowMenu";
+import type { PhoneViewChoice } from "./components/TopBar";
 import { MAIN_VIEW_IDS } from "./lib/mainViewIds";
 import { DiffScopeContext, loadDiffScope, saveDiffScope, type DiffScope, type DiffScopeState } from "./lib/diffScope";
 import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
@@ -1962,10 +1967,12 @@ function AppContent({
     (action: DrawerSwipeAction) => {
       // Phones have no sidebar drawer: the opening swipe goes back from a Session to the list.
       if (action === "open-sidebar") {
-        if (!focusMode && activeSession) handleGoDashboard();
+        if (focusMode || !activeSession) return;
+        if (rightPanelView !== "agent") handlePickView("agent");
+        else handleGoDashboard();
       } else if (action === "close-panels") setPickerOpen(false);
     },
-    [focusMode, activeSession, handleGoDashboard],
+    [focusMode, activeSession, rightPanelView, handlePickView, handleGoDashboard],
   );
   useDrawerSwipe(
     {
@@ -2245,12 +2252,32 @@ function AppContent({
     [applySession, handleRestoreSession],
   );
 
-  // A phone reaches the open Session's actions from the header's ⋯, as Claude's app does; desktop keeps the
-  // sidebar row's menu.
+  // A phone keeps the Session's other views in the header's ⋯, as Claude's app does: the agent fills the screen,
+  // and the views it is reviewed with are a tap away. TopBar builds the items, since a pick switches views.
+  const phoneViews = useMemo(() => {
+    if (!singlePane || !activeSession) return undefined;
+    const choices: PhoneViewChoice[] = [{ id: "agent", label: "Agent", icon: Sparkles }];
+    if (caps.canUseTerminal) choices.push({ id: "paired", label: "Terminal", icon: SquareTerminal });
+    if (dockPaneIds.includes("diff")) choices.push({ id: "diff", label: "Diff", icon: FileDiff });
+    if (dockPaneIds.includes("files")) choices.push({ id: "files", label: "Files", icon: FolderTree });
+    const hasMore =
+      dockPaneIds.some((id) => id !== "diff" && id !== "files") || (caps.canUseTerminal && shellGroups.length > 0);
+    const current = choices.find((c) => c.id === rightPanelView);
+    return {
+      choices,
+      current: rightPanelView,
+      // The pill names any view but the agent; More's entry names one picked from it.
+      label: rightPanelView === "agent" ? undefined : (current?.label ?? paneDescriptor(rightPanelView).title),
+      moreDetail: hasMore && !current ? paneDescriptor(rightPanelView).title : undefined,
+      hasMore,
+    };
+  }, [singlePane, activeSession, caps.canUseTerminal, dockPaneIds, shellGroups.length, rightPanelView, paneDescriptor]);
+  // The open Session's actions, a phone's only way to them; desktop keeps the sidebar row's menu.
   const phoneSessionItems = useMemo<OverflowItem[] | undefined>(() => {
-    if (!singlePane || !activeSession || caps.readOnly) return undefined;
+    if (!singlePane || !activeSession) return undefined;
     const s = activeSession;
     const items: OverflowItem[] = [];
+    if (caps.readOnly) return undefined;
     if (s.branch) {
       const branch = s.branch;
       items.push({
@@ -2739,12 +2766,6 @@ function AppContent({
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
-          tabs={{
-            available: dockPaneIds,
-            terminal: caps.canUseTerminal,
-            onPick: handlePickView,
-            onMore: () => setPickerOpen(true),
-          }}
           agentFocus={agentFocus}
           onOpenAgentsPane={(agentId) => {
             focusAgent(agentId);
@@ -3030,6 +3051,7 @@ function AppContent({
                   caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
                 }
                 sessionItems={phoneSessionItems}
+                phoneViews={phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }}
                 panels={
                   dockPaneIds.length > 0
                     ? {

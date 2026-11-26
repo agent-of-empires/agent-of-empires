@@ -1,5 +1,6 @@
 import { useMemo } from "react";
-import { ChevronLeft, Folder } from "lucide-react";
+import { ChevronLeft, Folder, LayoutGrid, type LucideIcon } from "lucide-react";
+import type { RightPanelView } from "../lib/rightPanelView";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
@@ -13,6 +14,12 @@ import { StrokeIcon } from "./icons";
 import { Tooltip } from "./Tooltip";
 import { LiveSlowNotice } from "./LiveSlowNotice";
 
+export interface PhoneViewChoice {
+  id: RightPanelView;
+  label: string;
+  icon: LucideIcon;
+}
+
 interface Props {
   activeWorkspace: Workspace | undefined;
   activeSession: SessionResponse | null;
@@ -22,6 +29,17 @@ interface Props {
   terminal?: { open: boolean; onToggle: () => void };
   /** The open Session's actions for the overflow menu (a phone's only way to them); omitted on desktop. */
   sessionItems?: OverflowItem[];
+  /** A phone's views of the open Session, chosen from the ⋯; away from the agent, the pill names the view and
+   *  back returns to the agent. */
+  phoneViews?: {
+    choices: PhoneViewChoice[];
+    current: RightPanelView;
+    label: string | undefined;
+    hasMore: boolean;
+    moreDetail: string | undefined;
+    onPick: (view: RightPanelView) => void;
+    onMore: () => void;
+  };
   /** The review panel toggle and its pane menu; omitted where the Session has no review panel. */
   panels?: PanelControlProps;
   onOpenHelp: () => void;
@@ -68,6 +86,7 @@ export function TopBar({
   terminal,
   panels,
   sessionItems,
+  phoneViews,
   onOpenHelp,
   onOpenAbout,
   onStartTutorial,
@@ -94,14 +113,30 @@ export function TopBar({
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
   }, [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
-  // The open Session's own actions lead the menu, with the app's after them.
-  const menuItems = useMemo<OverflowItem[]>(
-    () =>
-      sessionItems && sessionItems.length > 0
-        ? [...sessionItems, ...overflowItems.map((item, i) => (i === 0 ? { ...item, separated: true } : item))]
-        : overflowItems,
-    [sessionItems, overflowItems],
-  );
+  // A phone's menu: the Session's views, then its actions, then the app's items.
+  const menuItems = useMemo<OverflowItem[]>(() => {
+    const views: OverflowItem[] = (phoneViews?.choices ?? []).map(({ id, label, icon }) => ({
+      label,
+      icon,
+      checked: phoneViews?.current === id,
+      onClick: () => phoneViews?.onPick(id),
+    }));
+    if (phoneViews?.hasMore) {
+      views.push({
+        label: "More panes…",
+        icon: LayoutGrid,
+        detail: phoneViews.moreDetail,
+        checked: phoneViews.moreDetail !== undefined,
+        onClick: phoneViews.onMore,
+      });
+    }
+    const groups = [views, sessionItems ?? [], overflowItems].filter((g) => g.length > 0);
+    return groups.flatMap((group, g) =>
+      group.map((item, i) => (g > 0 && i === 0 ? { ...item, separated: true } : item)),
+    );
+  }, [phoneViews, sessionItems, overflowItems]);
+  const phoneView =
+    phoneViews?.label !== undefined ? { label: phoneViews.label, onBack: () => phoneViews.onPick("agent") } : undefined;
   const phoneSession = !!activeSession && !onExitFocusMode;
 
   // The left zone only borrows the sidebar's width while that column is visible, so the compact rail only crowds
@@ -126,15 +161,19 @@ export function TopBar({
         {phoneSession && (
           // A Session opens over the list on a phone; back returns to it, carrying the list's attention counts.
           <button
-            onClick={onGoDashboard}
+            onClick={phoneView ? phoneView.onBack : onGoDashboard}
             aria-label={
-              waitingCount > 0 ? `Back to sessions, ${waitingCount} waiting for your input` : "Back to sessions"
+              phoneView
+                ? "Back to agent"
+                : waitingCount > 0
+                  ? `Back to sessions, ${waitingCount} waiting for your input`
+                  : "Back to sessions"
             }
             data-testid="topbar-back"
             className="md:hidden relative w-10 h-10 flex items-center justify-center shrink-0 rounded-full float-control text-text-secondary cursor-pointer active:scale-95 transition-transform"
           >
             <ChevronLeft className="size-5" strokeWidth={1.75} aria-hidden />
-            {waitingCount + unreadCount > 0 && (
+            {!phoneView && waitingCount + unreadCount > 0 && (
               <span
                 aria-hidden="true"
                 className="absolute -top-0.5 -right-0.5 min-w-[1.1rem] rounded-full px-1 text-[10px] font-semibold leading-[1.1rem] tabular-nums text-center shadow"
@@ -272,7 +311,9 @@ export function TopBar({
                 {activeSession.title}
               </span>
               <span className="max-w-full truncate text-[11px] text-text-dim">
-                {projectName(activeSession.project_path)}
+                {phoneView
+                  ? `${phoneView.label} · ${projectName(activeSession.project_path)}`
+                  : projectName(activeSession.project_path)}
               </span>
             </div>
           )}

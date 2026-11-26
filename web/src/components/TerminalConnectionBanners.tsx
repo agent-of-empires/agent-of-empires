@@ -1,11 +1,16 @@
-// Shared connection-state banners for every terminal surface (live views and desktop xterm views render identical
-// chrome here): the retry countdown while the WS redials, and the manual-retry strip once the budget is exhausted.
+import { useEffect, useState } from "react";
+import { useConnectionBanner } from "../hooks/useConnectionBanner";
+
+// Connection banners for every terminal surface: Reconnecting while the socket redials, and a manual retry once
+// the budget is spent.
+
+/** A phone drops its sockets on every resume and redials at once; only a drop that outlasts this is shown. */
+const RECONNECTING_GRACE_MS = 2000;
 
 interface Props {
   connected: boolean;
   reconnecting: boolean;
   retryCount: number;
-  retryCountdown: number;
   maxRetries: number;
   onRetry: () => void;
   /** The pane's process exited; Restart re-ensures the session instead of just redialing. */
@@ -17,12 +22,21 @@ export function TerminalConnectionBanners({
   connected,
   reconnecting,
   retryCount,
-  retryCountdown,
   maxRetries,
   onRetry,
   paneDead,
   onRestart,
 }: Props) {
+  const daemon = useConnectionBanner();
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (!reconnecting) return;
+    const timer = setTimeout(() => setSlow(true), RECONNECTING_GRACE_MS);
+    return () => {
+      clearTimeout(timer);
+      setSlow(false);
+    };
+  }, [reconnecting]);
   if (connected) return null;
   if (paneDead) {
     return (
@@ -37,11 +51,11 @@ export function TerminalConnectionBanners({
     );
   }
   if (reconnecting) {
+    // The app's Daemon unreachable banner already says it for every pane.
+    if (!slow || daemon === "down") return null;
     return (
       <div className="bg-status-waiting/15 border-b border-status-waiting/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
-        <span className="text-xs text-status-waiting">
-          Reconnecting in {retryCountdown}s... ({retryCount}/{maxRetries})
-        </span>
+        <span className="text-xs text-status-waiting">Reconnecting…</span>
       </div>
     );
   }
