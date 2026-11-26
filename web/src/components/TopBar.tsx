@@ -18,8 +18,6 @@ interface Props {
   activeSession: SessionResponse | null;
   onToggleSidebar: () => void;
   onOpenPalette: () => void;
-  /** Mobile (below md): opens the view picker. Desktop uses `terminal` and `panels`. */
-  onToggleDiff: () => void;
   /** The terminal toggle; omitted where the Session cannot open one. */
   terminal?: { open: boolean; onToggle: () => void };
   /** The review panel toggle and its pane menu; omitted where the Session has no review panel. */
@@ -65,7 +63,6 @@ export function TopBar({
   activeSession,
   onToggleSidebar,
   onOpenPalette,
-  onToggleDiff,
   terminal,
   panels,
   onOpenHelp,
@@ -265,17 +262,6 @@ export function TopBar({
             {/* Desktop: the terminal, then the review panel with its pane menu. */}
             {terminal && <TerminalToggle {...terminal} />}
             {panels && <PanelControl {...panels} />}
-            <button
-              onClick={onToggleDiff}
-              className="md:hidden w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-secondary hover:text-text-primary hover:bg-surface-700/50"
-              title="Toggle panels"
-              aria-label="Toggle panels"
-            >
-              <StrokeIcon size={16} strokeWidth="1.5">
-                <rect x="3" y="3" width="18" height="18" rx="2" />
-                <line x1="15" y1="3" x2="15" y2="21" />
-              </StrokeIcon>
-            </button>
           </>
         )}
 

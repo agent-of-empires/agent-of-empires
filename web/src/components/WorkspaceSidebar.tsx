@@ -41,7 +41,7 @@ import { SessionRow } from "./sidebar/SessionRow";
 import { FacetPanel, SidebarToolbar } from "./sidebar/SidebarToolbar";
 import { SidebarNav } from "./sidebar/SidebarNav";
 import { SidebarLegend } from "./sidebar/SidebarLegend";
-import { useDrawerSwipe } from "./sidebar/useDrawerSwipe";
+import { useDrawerDrag } from "./sidebar/useDrawerDrag";
 import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
@@ -310,11 +310,8 @@ export function WorkspaceSidebar(props: Props) {
     if (!filterOpen) requestAnimationFrame(() => filterRef.current?.focus());
   };
 
-  const swipe = useDrawerSwipe({
-    open,
-    side: rightSide ? "right" : "left",
-    onClose: () => props.onOpenChange(false),
-  });
+  // The window-level swipe (useDrawerSwipe in App) decides closing; this makes the drawer track the finger.
+  const swipe = useDrawerDrag({ open, side: rightSide ? "right" : "left" });
   const dragging = swipe.offset !== null;
 
   // The phone overlay starts under the header, which the app root insets below the status bar.

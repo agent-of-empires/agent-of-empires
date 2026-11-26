@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { MobileRightPanelPicker } from "../MobileRightPanelPicker";
 import { FileDiff, Puzzle } from "lucide-react";
@@ -61,22 +61,21 @@ describe("MobileRightPanelPicker", () => {
     ).toEqual([null, "true"]);
   });
 
-  it("hides gated entries not in availablePanes and marks the active one", () => {
+  it("leaves out what the tab bar shows and lists only offered panes", () => {
     setup({ availablePanes: [], active: "paired" });
-    expect(screen.queryByTestId("mobile-right-panel-pick-agents")).toBeNull();
-    expect(screen.queryByTestId("mobile-right-panel-pick-diff")).toBeNull();
-    expect(screen.queryByTestId("mobile-right-panel-pick-files")).toBeNull();
-    // The mobile-only pseudo-views are never gated.
-    expect(screen.getByTestId("mobile-right-panel-pick-agent")).toBeDefined();
-    expect(screen.getByTestId("mobile-right-panel-pick-paired").getAttribute("aria-current")).toBe("true");
-  });
-
-  it("shows the Background and Files entries and selects them when available", () => {
-    const { onSelect } = setup({ availablePanes: ["diff", "files", "agents"] });
-    fireEvent.click(screen.getByTestId("mobile-right-panel-pick-agents"));
+    for (const id of ["agent", "paired", "diff", "files", "agents"]) {
+      expect(screen.queryByTestId(`mobile-right-panel-pick-${id}`)).toBeNull();
+    }
+    cleanup();
+    const { onSelect } = setup({ availablePanes: ["diff", "files", "agents"], active: "agents" });
+    expect([
+      screen.queryByTestId("mobile-right-panel-pick-diff"),
+      screen.queryByTestId("mobile-right-panel-pick-files"),
+    ]).toEqual([null, null]);
+    const background = screen.getByTestId("mobile-right-panel-pick-agents");
+    expect(background.getAttribute("aria-current")).toBe("true");
+    fireEvent.click(background);
     expect(onSelect).toHaveBeenCalledWith("agents");
-    fireEvent.click(screen.getByTestId("mobile-right-panel-pick-files"));
-    expect(onSelect).toHaveBeenCalledWith("files");
   });
 
   it("lists plugin panes with their descriptor title and selects them by id", () => {

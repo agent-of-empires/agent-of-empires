@@ -22,8 +22,8 @@ test.describe("mobile sub-agent view", () => {
     });
     await openStructuredSession(page, mock);
 
-    await page.getByRole("button", { name: "Toggle panels" }).click();
-    await page.getByText("Background", { exact: true }).first().click();
+    await page.getByTestId("mobile-tab-more").click();
+    await page.getByTestId("mobile-right-panel-pick-agents").click();
     await page
       .getByRole("button", { name: /agent number/ })
       .first()

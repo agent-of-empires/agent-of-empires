@@ -1803,13 +1803,6 @@ function AppContent({
 
   // The right-panel control toggles the desktop split, but on mobile there
   // is no split to collapse: it opens the view picker instead (#1452).
-  const toggleDiff = useCallback(() => {
-    if (isMdUp) {
-      toggleKind("diff", "right");
-    } else {
-      setPickerOpen((o) => !o);
-    }
-  }, [isMdUp, toggleKind]);
 
   // Collapse or restore the whole right dock (the "toggle right panel"
   // shortcut). Collapse hides the dock without removing its tabs so expanding
@@ -1841,6 +1834,12 @@ function AppContent({
     },
     [activeSessionId, rightPanelView, transitionKeyboardProxy],
   );
+
+  // On a phone the Diff tab toggles with the Agent.
+  const toggleDiff = useCallback(() => {
+    if (isMdUp) toggleKind("diff", "right");
+    else handlePickView(rightPanelView === "diff" ? "agent" : "diff");
+  }, [isMdUp, toggleKind, handlePickView, rightPanelView]);
 
   const handleSelectFile = useCallback(
     (path: string, repoName?: string, line?: number) => {
@@ -1959,7 +1958,8 @@ function AppContent({
       sidebarOpen,
       sidebarSide: webSettings.sidebarSide,
       panelsOpen: pickerOpen,
-      panelsAvailable: !!activeWorkspace && !!activeSession,
+      // More opens from the phone tab bar; a sideways swipe raising a bottom sheet is no gesture people expect.
+      panelsAvailable: false,
     },
     handleDrawerSwipe,
   );
@@ -2695,6 +2695,12 @@ function AppContent({
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
+          tabs={{
+            available: dockPaneIds,
+            terminal: caps.canUseTerminal,
+            onPick: handlePickView,
+            onMore: () => setPickerOpen(true),
+          }}
           agentFocus={agentFocus}
           onOpenAgentsPane={(agentId) => {
             focusAgent(agentId);
@@ -2965,7 +2971,6 @@ function AppContent({
                 activeSession={activeSession ?? null}
                 onToggleSidebar={handleToggleSidebar}
                 onOpenPalette={() => setShowPalette(true)}
-                onToggleDiff={toggleDiff}
                 terminal={
                   caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
                 }

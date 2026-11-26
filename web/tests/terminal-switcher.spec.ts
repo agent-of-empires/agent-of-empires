@@ -70,13 +70,14 @@ test("a terminal tab keeps its Session's shell across a sidebar switch, and the 
   await expect(alphaTab).toHaveAttribute("aria-selected", "true");
 });
 
-test("on a phone the panel picker opens another Session's live shell", async ({ page }) => {
+test("on a phone More opens another Session's live shell", async ({ page }) => {
   const sockets = await boot(page, 390, "/session/alpha");
-  await page.getByRole("button", { name: "Toggle panels" }).click();
+  await page.getByTestId("mobile-tab-more").click();
   const pick = page.getByTestId("mobile-shell-pick-beta-2-host");
   await expect(pick).toContainText("beta · 3");
   await pick.click();
   await expect(page.getByTestId("mobile-paired-layer")).toBeVisible();
-  await expect(page.getByTestId("mobile-back-to-agent").locator("..")).toContainText("beta · 3");
+  await expect(page.getByTestId("mobile-paired-bar")).toContainText("beta · 3");
+  await expect(page.getByTestId("mobile-tab-paired")).toHaveAttribute("aria-current", "page");
   await expect.poll(() => pairedSocket(sockets, "beta", 2)).toBe(true);
 });

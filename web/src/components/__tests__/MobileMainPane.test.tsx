@@ -69,11 +69,14 @@ const diffComments = makeStore();
 
 function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
   const onBackToAgent = vi.fn();
+  const onPick = vi.fn();
+  const onMore = vi.fn();
   const props: Parameters<typeof MobileMainPane>[0] = {
     view: "agent",
     readOnly: false,
     pluginPanes: [],
     onBackToAgent,
+    tabs: { available: ["diff", "files", "agents"], terminal: true, onPick, onMore },
     onOpenAgentsPane: vi.fn(),
     pairedMounted: false,
     pairedShell: { session: session(), index: 0 },
@@ -111,7 +114,7 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     ...overrides,
   };
   render(<MobileMainPane {...props} />);
-  return { onBackToAgent };
+  return { onBackToAgent, onPick, onMore };
 }
 
 describe("MobileMainPane", () => {
@@ -122,10 +125,19 @@ describe("MobileMainPane", () => {
     expect(await screen.findByTestId("acp-view")).toBeDefined();
   });
 
-  it("shows the back header and returns to agent on click", () => {
-    const { onBackToAgent } = setup({ view: "paired", pairedMounted: true });
-    fireEvent.click(screen.getByTestId("mobile-back-to-agent"));
-    expect(onBackToAgent).toHaveBeenCalled();
+  it("switches views from the tab bar, marking the shown one, with the rest under More", () => {
+    const { onPick, onMore } = setup({ view: "paired", pairedMounted: true });
+    expect(screen.getByTestId("mobile-tab-paired").getAttribute("aria-current")).toBe("page");
+    fireEvent.click(screen.getByTestId("mobile-tab-agent"));
+    fireEvent.click(screen.getByTestId("mobile-tab-diff"));
+    fireEvent.click(screen.getByTestId("mobile-tab-more"));
+    expect([onPick.mock.calls, onMore.mock.calls.length]).toEqual([[["agent"], ["diff"]], 1]);
+    cleanup();
+    // Diff, Files and Terminal show only where the Session offers them.
+    setup({ tabs: { available: [], terminal: false, onPick: vi.fn(), onMore: vi.fn() } });
+    expect(
+      ["agent", "paired", "diff", "files", "more"].map((t) => screen.queryByTestId(`mobile-tab-${t}`) !== null),
+    ).toEqual([true, false, false, false, true]);
   });
 
   it("names the shown shell, another Session's included, and offers its mode only when sandboxed", () => {
@@ -143,7 +155,6 @@ describe("MobileMainPane", () => {
   it("mounts the paired shell only once activated", () => {
     setup({ view: "agent", pairedMounted: false });
     expect(screen.getByTestId("agent-terminal")).toBeDefined();
-    expect(screen.queryByTestId("mobile-back-to-agent")).toBeNull();
     expect(screen.queryByTestId("paired-shell")).toBeNull();
     cleanup();
     setup({ view: "agent", pairedMounted: true });
@@ -151,13 +162,13 @@ describe("MobileMainPane", () => {
   });
 
   it("passes the active session to the agents and files panes", async () => {
-    for (const [view, testId] of [
-      ["agents", "background-agents-panel"],
-      ["files", "files-pane"],
+    for (const [view, testId, current] of [
+      ["agents", "background-agents-panel", "mobile-tab-more"],
+      ["files", "files-pane", "mobile-tab-files"],
     ] as const) {
       setup({ view, activeSessionId: "s1" });
       expect((await screen.findByTestId(testId)).textContent).toBe("s1");
-      expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
+      expect(screen.getByTestId(current).getAttribute("aria-current")).toBe("page");
       cleanup();
     }
   });
@@ -195,7 +206,8 @@ describe("MobileMainPane", () => {
     setup({ view: pane.id, pluginPanes: [pane] });
     expect(screen.getByTestId("plugin-pane-body")).toBeDefined();
     expect(screen.getByText("PR #1 open")).toBeDefined();
-    expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
+    // A view from More names itself on the More tab.
+    expect(screen.getByTestId("mobile-tab-more").textContent).toBe("GitHub");
   });
 
   it("shows the comments banner when there are comments", () => {

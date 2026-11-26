@@ -20,8 +20,7 @@ async function openFile(page: Page, serve: ServeHandle, title?: string) {
 
 async function showNotes(page: Page) {
   if (page.viewportSize()!.width < 768) {
-    await page.getByRole("button", { name: "Toggle panels" }).click();
-    await page.getByTestId("mobile-right-panel-picker").getByRole("button", { name: "Files", exact: true }).click();
+    await page.getByTestId("mobile-tab-files").click();
   } else {
     await openReviewPane(page, "files");
   }
@@ -256,7 +255,7 @@ test("mobile editing keeps controls usable and confirms leaving the Files pane",
   await editor.fill("phone edit");
   await page.screenshot({ path: testInfo.outputPath("mobile-editor.png") });
   page.once("dialog", (dialog) => dialog.dismiss());
-  await page.getByTestId("mobile-back-to-agent").click();
+  await page.getByTestId("mobile-tab-agent").click();
   await expect(editor).toHaveValue("phone edit");
   page.once("dialog", (dialog) => dialog.accept());
   await editor.press("Escape");

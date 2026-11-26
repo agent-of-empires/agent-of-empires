@@ -43,7 +43,6 @@ function topBarProps(overrides: TopBarOverrides = {}) {
     activeSession: overrides.activeSession ?? null,
     onToggleSidebar: overrides.onToggleSidebar ?? vi.fn(),
     onOpenPalette: vi.fn(),
-    onToggleDiff: vi.fn(),
     paneIds: ["diff", "terminal"],
     paneDescriptor: (id: string) => ({ title: id, icon: (() => null) as never }),
     isPaneOpen: () => true,

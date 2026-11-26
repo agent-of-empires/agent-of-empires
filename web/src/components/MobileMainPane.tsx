@@ -1,6 +1,7 @@
 import { StructuredSessionStack } from "./StructuredSessionStack";
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane, ShellModeToggle, type ShellMode } from "./PairedTerminal";
+import { MobileViewTabs } from "./MobileViewTabs";
 import { shellLabel } from "../lib/pairedShells";
 import type { AgentFocus } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
@@ -41,6 +42,13 @@ interface Props {
   view: RightPanelView;
   pluginPanes: PluginPane[];
   onBackToAgent: () => void;
+  /** The tab bar: pane views this Session offers, whether its terminal can show, and the handlers. */
+  tabs: {
+    available: readonly string[];
+    terminal: boolean;
+    onPick: (view: RightPanelView) => void;
+    onMore: () => void;
+  };
   onOpenAgentsPane: (agentId?: string) => void;
   agentFocus: AgentFocus | null;
   /** Opens the switch-view confirmation for that Session; omitted where it can't switch. */
@@ -104,6 +112,7 @@ export function MobileMainPane({
   view,
   pluginPanes,
   onBackToAgent,
+  tabs,
   onOpenAgentsPane,
   agentFocus,
   onSwitchToTerminal,
@@ -144,32 +153,29 @@ export function MobileMainPane({
   onOpenSettings,
 }: Props) {
   const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
-  const viewLabel =
-    view === "diff"
-      ? "Diff"
-      : view === "files"
-        ? "Files"
-        : view === "paired"
-          ? pairedShell.session
-            ? `${pairedShell.session.title} · ${pairedShell.index + 1}`
-            : "Paired terminal"
-          : view === "agents"
-            ? "Background"
-            : (activePluginPane?.title ?? "Plugin");
+  // A view picked from More names itself on the More tab.
+  const moreLabel = view === "agents" ? "Background" : activePluginPane ? activePluginPane.title : null;
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      {view !== "agent" && (
-        <div className="flex items-center gap-2 h-9 px-2 border-b border-surface-700/60 bg-surface-900 shrink-0">
-          <button
-            onClick={onBackToAgent}
-            data-testid="mobile-back-to-agent"
-            className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-text-secondary hover:text-text-primary hover:bg-surface-800 cursor-pointer transition-colors"
-          >
-            <span aria-hidden>&larr;</span> Agent
-          </button>
-          <span className="text-xs text-text-dim truncate">{viewLabel}</span>
-          {view === "paired" && pairedShell.session?.is_sandboxed && (
+      <MobileViewTabs
+        view={view}
+        available={tabs.available}
+        terminal={tabs.terminal}
+        moreLabel={moreLabel}
+        onSelect={tabs.onPick}
+        onMore={tabs.onMore}
+      />
+      {view === "paired" && (
+        // Which shell shows, since it can be another Session's, and its Host/Container control.
+        <div
+          data-testid="mobile-paired-bar"
+          className="flex items-center gap-2 h-8 px-3 border-b border-surface-700/40 bg-surface-900 shrink-0"
+        >
+          <span className="text-xs text-text-dim truncate">
+            {pairedShell.session ? `${pairedShell.session.title} · ${pairedShell.index + 1}` : "Paired terminal"}
+          </span>
+          {pairedShell.session?.is_sandboxed && (
             <div className="ml-auto shrink-0">
               <ShellModeToggle
                 mode={shellMode}
