@@ -153,6 +153,9 @@ thread_local! {
     static SWITCH_PAUSE_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 
+    /// Makes [`set_aside`]'s rename fail, which tests running as root can't cause otherwise.
+    static SET_ASIDE_FAILS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// Runs inside [`write_instance_file`] between the lookup and the write.
     static WRITE_PAUSE_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
@@ -167,6 +170,11 @@ pub(crate) fn reset_for_test() {
 #[cfg(test)]
 pub(crate) fn pause_switch_for_test(pause: impl FnOnce() + 'static) {
     SWITCH_PAUSE_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(Box::new(pause)));
+}
+
+#[cfg(test)]
+fn fail_set_aside_for_test(fails: bool) {
+    SET_ASIDE_FAILS_FOR_TEST.with(|slot| slot.set(fails));
 }
 
 #[cfg(test)]
@@ -452,7 +460,8 @@ fn lock_instance_file(instance_id: &str, name: &str) -> Option<std::fs::File> {
 
 /// Moves a row's hook dir to `to`: creates it there, then removes the other, under the row's
 /// switch lock so a creating open waits rather than recreating the dir being removed. Returns
-/// the canonical path, for a bind-mount source. Without the lock it changes nothing.
+/// the canonical path, for a bind-mount source, and then no dir for the row is left under the
+/// other base's lookup name. Without the lock it changes nothing.
 pub(crate) fn switch_instance_dir(instance_id: &str, to: HookBase) -> Result<PathBuf> {
     crate::session::validate_instance_id(instance_id)?;
     let _lock = lock_instance(instance_id)
@@ -463,36 +472,89 @@ pub(crate) fn switch_instance_dir(instance_id: &str, to: HookBase) -> Result<Pat
         pause();
     }
     remove_child(to.other(), instance_id)?;
-    set_aside(to.other(), instance_id);
+    set_aside(to.other(), instance_id)?;
     let lexical = to.path()?.join(instance_id);
     std::fs::canonicalize(&lexical)
         .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
 }
 
-/// Moves a dir cleanup couldn't empty to `.stale-<id>` in its base, so the lookup no longer
-/// finds it beside the one a switch made. It replaces an earlier one, which is first emptied
-/// as cleanup empties. Whatever still can't be removed stays where it is, with a warning, as
-/// cleanup leaves it: a stale dir never blocks a switch.
-fn set_aside(kind: HookBase, instance_id: &str) {
-    let stale = format!(".stale-{instance_id}");
+/// Moves a dir cleanup couldn't empty out of the lookup's way, so it never reads it beside the
+/// one a switch made. The row's earlier set-aside dirs are removed first, keeping only those
+/// that still can't go; the dir then takes `.stale-<id>`, or a fresh `.stale-<id>.<n>` while an
+/// earlier one holds that name. Only a rename that fails is an error.
+fn set_aside(kind: HookBase, instance_id: &str) -> Result<()> {
     let moved = with_base(kind, |base| {
-        match fstatat(base, instance_id, AtFlags::AT_SYMLINK_NOFOLLOW) {
-            Err(Errno::ENOENT) => return Ok(false),
-            Err(e) => return Err(e).with_context(|| format!("fstatat {instance_id}")),
-            Ok(_) => {}
+        remove_stale(kind, base, instance_id);
+        if !entry_exists(base, instance_id)? {
+            return Ok(None);
         }
-        remove_entry(kind, base, &stale)?;
-        renameat(base, instance_id, base, stale.as_str())
-            .with_context(|| format!("renameat {instance_id} -> {stale}"))?;
-        Ok(true)
-    });
-    match moved {
-        Ok(false) => {}
-        Ok(true) => tracing::warn!(target: "hooks.guard",
-            "set aside {}, which cleanup couldn't empty, as {stale}",
-            kind.label(instance_id).display()),
-        Err(e) => tracing::warn!(target: "hooks.guard",
-            "left {} in place: {e:#}", kind.label(instance_id).display()),
+        let mut name = format!(".stale-{instance_id}");
+        while entry_exists(base, &name)? {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            name = format!(".stale-{instance_id}.{}-{n}", std::process::id());
+        }
+        #[cfg(test)]
+        if SET_ASIDE_FAILS_FOR_TEST.with(std::cell::Cell::get) {
+            anyhow::bail!("injected set-aside failure");
+        }
+        renameat(base, instance_id, base, name.as_str())
+            .with_context(|| format!("renameat {instance_id} -> {name}"))?;
+        Ok(Some(name))
+    })
+    .with_context(|| {
+        format!(
+            "set aside {}, which cleanup couldn't empty",
+            kind.label(instance_id).display()
+        )
+    })?;
+    if let Some(name) = moved {
+        tracing::warn!(target: "hooks.guard",
+            "set aside {}, which cleanup couldn't empty, as {name}",
+            kind.label(instance_id).display());
+    }
+    Ok(())
+}
+
+fn entry_exists(base: BorrowedFd<'_>, name: &str) -> Result<bool> {
+    match fstatat(base, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(true),
+        Err(Errno::ENOENT) => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("fstatat {name}")),
+    }
+}
+
+/// Removes the row's set-aside dirs in `base`: `.stale-<id>` and `.stale-<id>.<anything>`, never
+/// another row's whose id extends this one. Whatever can't be removed stays, with a warning.
+fn remove_stale(kind: HookBase, base: BorrowedFd<'_>, instance_id: &str) {
+    let exact = format!(".stale-{instance_id}");
+    let suffixed = format!("{exact}.");
+    // A fresh open, not a dup: a dup shares the cached base's offset, so a later listing would
+    // start where this one ended.
+    let names: Vec<String> = match openat(
+        base,
+        ".",
+        OFlag::O_DIRECTORY | OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .context("open base for readdir")
+    .and_then(|fd| nix::dir::Dir::from_fd(fd).context("Dir::from_fd"))
+    {
+        Ok(mut dir) => dir
+            .iter()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().to_str().ok().map(str::to_owned))
+            .filter(|name| *name == exact || name.starts_with(&suffixed))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(target: "hooks.guard", "list set-aside dirs: {e:#}");
+            return;
+        }
+    };
+    for name in names {
+        if let Err(e) = remove_entry(kind, base, &name) {
+            tracing::warn!(target: "hooks.guard", "left {}: {e:#}", kind.label(&name).display());
+        }
     }
 }
 
@@ -804,14 +866,15 @@ pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
     crate::session::validate_instance_id(instance_id)?;
     let sandbox_base = sandbox_hook_base_path().is_ok_and(|base| base.exists());
     let _lock = sandbox_base.then(|| lock_instance(instance_id)).flatten();
-    let stale = format!(".stale-{instance_id}");
     let _ = with_base(HookBase::Host, |base| {
-        remove_entry(HookBase::Host, base, &stale)
+        remove_stale(HookBase::Host, base, instance_id);
+        Ok(())
     });
     let host = remove_child(HookBase::Host, instance_id);
     if sandbox_base {
         let _ = with_base(HookBase::Sandbox, |base| {
-            remove_entry(HookBase::Sandbox, base, &stale)
+            remove_stale(HookBase::Sandbox, base, instance_id);
+            Ok(())
         });
         remove_child(HookBase::Sandbox, instance_id)?;
         let _ = with_base(HookBase::Sandbox, |base| {
@@ -1432,8 +1495,11 @@ mod tests {
         remove_instance_dir(id).unwrap();
     }
 
-    /// A dir a switch can't empty is set aside, at one name per row, so the lookup reads the
-    /// new one; deleting the row removes it; and one that can't be removed never blocks a switch.
+    /// A dir a switch can't empty is set aside, so the bind source and identity reads after a
+    /// host-to-sandbox switch are the sandbox dir. Earlier set-aside dirs are swept on each
+    /// switch and on deletion, and one that can't go gets a fresh name rather than leaving the
+    /// old dir where the lookup finds it. Only a rename that fails fails the switch, and then
+    /// the container launch refuses.
     #[test]
     #[serial(hook_base)]
     fn a_switch_sets_aside_a_host_dir_it_cannot_empty() {
@@ -1443,48 +1509,100 @@ mod tests {
             create_child(HookBase::Host, id).unwrap();
             std::fs::create_dir(HookBase::Host.label(id).join("sub")).unwrap();
         };
-        // subdir: set aside, and the lookup reads the sandbox dir.
+        let set_aside = |id: &str| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(hook_base_path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| *n == format!(".stale-{id}") || n.starts_with(&format!(".stale-{id}.")))
+                .collect();
+            names.sort();
+            names
+        };
+        let sandbox_path = |id: &str| std::fs::canonicalize(HookBase::Sandbox.label(id)).unwrap();
+        // skip-then-bind: set aside, and bind configuration and identity reads get the sandbox
+        // dir.
         stuck("subdir");
-        switch_instance_dir("subdir", HookBase::Sandbox).unwrap();
-        assert!(!kind_exists(HookBase::Host, "subdir"), "subdir");
-        assert!(stale("subdir").join("sub").is_dir(), "subdir");
+        switch_instance_dir("subdir", HookBase::Sandbox).expect("skip-then-bind");
+        assert!(!kind_exists(HookBase::Host, "subdir"), "skip-then-bind");
+        assert!(stale("subdir").join("sub").is_dir(), "skip-then-bind");
+        assert_eq!(
+            ensure_instance_dir_path("subdir").unwrap(),
+            sandbox_path("subdir"),
+            "skip-then-bind: bind source"
+        );
+        write_status(HookBase::Sandbox, "subdir", "running");
+        assert_eq!(
+            read_status("subdir").as_deref(),
+            Some("running"),
+            "skip-then-bind: identity read"
+        );
         // second-switch: an earlier set-aside that empties is replaced, never stacked. A file
         // keeps it non-empty, so a rename alone couldn't replace it.
         std::fs::remove_dir(stale("subdir").join("sub")).unwrap();
         std::fs::write(stale("subdir").join("status"), "idle").unwrap();
         stuck("subdir");
-        switch_instance_dir("subdir", HookBase::Sandbox).unwrap();
+        switch_instance_dir("subdir", HookBase::Sandbox).expect("second-switch");
         assert!(stale("subdir").join("sub").is_dir(), "second-switch");
-        let siblings = std::fs::read_dir(hook_base_path())
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("subdir")
-            })
-            .count();
-        assert_eq!(siblings, 1, "second-switch: one set-aside dir per row");
-        // deleted: removing the row removes its set-aside dir once it can be emptied.
+        assert_eq!(
+            set_aside("subdir").len(),
+            1,
+            "second-switch: one set-aside dir"
+        );
+        // deleted: removing the row removes its set-aside dirs once they can be emptied.
         std::fs::remove_dir(stale("subdir").join("sub")).unwrap();
         remove_instance_dir("subdir").unwrap();
-        assert!(!stale("subdir").exists(), "deleted");
-        // stale-blocked: an earlier set-aside that can't be emptied leaves this one in place.
+        assert_eq!(set_aside("subdir"), Vec::<String>::new(), "deleted");
+        // stale-name-blocked: an earlier set-aside that can't be emptied keeps its name, and this
+        // one takes a fresh one; the lookup still reads the sandbox dir.
         stuck("blocked");
-        switch_instance_dir("blocked", HookBase::Sandbox).unwrap();
+        switch_instance_dir("blocked", HookBase::Sandbox).expect("stale-name-blocked");
         stuck("blocked");
-        switch_instance_dir("blocked", HookBase::Sandbox).unwrap();
+        switch_instance_dir("blocked", HookBase::Sandbox).expect("stale-name-blocked");
         assert!(
-            kind_exists(HookBase::Host, "blocked"),
-            "stale-blocked: left in place"
+            !kind_exists(HookBase::Host, "blocked"),
+            "stale-name-blocked: nothing under the lookup name"
         );
-        assert!(
-            stale("blocked").join("sub").is_dir(),
-            "stale-blocked: unchanged"
+        assert_eq!(set_aside("blocked").len(), 2, "stale-name-blocked");
+        assert_eq!(
+            ensure_instance_dir_path("blocked").unwrap(),
+            sandbox_path("blocked"),
+            "stale-name-blocked: bind source"
         );
-        switch_instance_dir("blocked", HookBase::Sandbox).unwrap();
-        for id in ["subdir", "blocked"] {
+        // blocked-twice-then-clean: once they can be emptied, the next switch sweeps them all.
+        stuck("blocked");
+        switch_instance_dir("blocked", HookBase::Sandbox).expect("blocked-twice-then-clean");
+        assert_eq!(
+            set_aside("blocked").len(),
+            3,
+            "blocked-twice-then-clean: blocked"
+        );
+        for name in set_aside("blocked") {
+            std::fs::remove_dir(hook_base_path().join(name).join("sub")).unwrap();
+        }
+        switch_instance_dir("blocked", HookBase::Sandbox).expect("blocked-twice-then-clean");
+        assert_eq!(
+            set_aside("blocked"),
+            Vec::<String>::new(),
+            "blocked-twice-then-clean"
+        );
+        // another-id-prefix: a row whose id extends this one keeps its set-aside dir.
+        stuck("blockedx");
+        switch_instance_dir("blockedx", HookBase::Sandbox).expect("another-id-prefix");
+        // Removable, so only the name match keeps it.
+        std::fs::remove_dir(stale("blockedx").join("sub")).unwrap();
+        std::fs::write(stale("blockedx").join("status"), "idle").unwrap();
+        stuck("blocked");
+        switch_instance_dir("blocked", HookBase::Sandbox).expect("another-id-prefix");
+        std::fs::remove_dir(stale("blocked").join("sub")).unwrap();
+        remove_instance_dir("blocked").unwrap();
+        assert!(stale("blockedx").is_dir(), "another-id-prefix");
+        // rename-fails: a set-aside that cannot rename fails the switch.
+        stuck("renamed");
+        fail_set_aside_for_test(true);
+        let switched = switch_instance_dir("renamed", HookBase::Sandbox);
+        fail_set_aside_for_test(false);
+        assert!(switched.is_err(), "rename-fails: {switched:?}");
+        for id in ["blockedx", "renamed"] {
             let _ = std::fs::remove_dir(stale(id).join("sub"));
             let _ = std::fs::remove_dir(HookBase::Host.label(id).join("sub"));
             remove_instance_dir(id).unwrap();

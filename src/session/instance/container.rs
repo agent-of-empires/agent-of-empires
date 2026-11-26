@@ -1370,17 +1370,15 @@ impl Instance {
         LaunchAuth::from_env(&env)
     }
 
-    fn ensure_container_hook_mount_source(&self) {
-        let prepared = match self.container_hook_base() {
+    /// Refuses rather than launch: the bind configuration resolves the dir again, and a
+    /// switch that failed can leave the old side's dir where that lookup finds it first.
+    fn ensure_container_hook_mount_source(&self) -> Result<()> {
+        match self.container_hook_base() {
             Some(base) => crate::hooks::switch_instance_dir(&self.id, base),
             None => crate::hooks::ensure_instance_dir_path(&self.id),
-        };
-        if let Err(error) = prepared {
-            tracing::warn!(
-                target: "session.profile",
-                "Failed to prepare hook directory before container launch: {error:#}"
-            );
         }
+        .map(drop)
+        .context("prepare the hook directory before the container launch")
     }
 
     /// The base this row's container binds its hook dir from. A container that exists keeps the
@@ -1516,7 +1514,7 @@ impl Instance {
         config: &crate::session::LaunchConfig,
         fold: container_config::CredentialFold,
     ) -> Result<crate::containers::ContainerConfig> {
-        self.ensure_container_hook_mount_source();
+        self.ensure_container_hook_mount_source()?;
 
         let sandbox = self
             .sandbox_info
@@ -2420,7 +2418,7 @@ mod tests {
         crate::hooks::cleanup_hook_status_dir(&inst.id);
         assert!(!hook_dir.exists());
 
-        inst.ensure_container_hook_mount_source();
+        inst.ensure_container_hook_mount_source().unwrap();
         assert!(hook_dir.is_dir());
 
         crate::hooks::cleanup_hook_status_dir(&inst.id);
