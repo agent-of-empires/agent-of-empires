@@ -2546,17 +2546,22 @@ impl HomeView {
                 .get_instance(&id)
                 .is_some_and(|inst| self.paired_terminal_running_for_display(inst))
         {
-            let key = if self.strict_hotkeys { "Ctrl+T" } else { "T" };
-            // Live mode forwards `T` to the agent; only the leader reaches the swap.
+            let key = self.key_label(ActionId::AttachTerminal);
+            // Live mode forwards the attach key to the agent; only the leader reaches the swap.
             let how = match self.live_send.as_ref().map(|state| state.leader) {
                 Some(Some(leader)) => {
-                    format!("Press {} then t", live_send::display_chord(leader))
+                    Some(format!("Press {} then t", live_send::display_chord(leader)))
                 }
-                Some(None) => format!("Exit live mode, then press {key}"),
-                None => format!("Press {key}"),
+                _ if key.is_empty() => None,
+                Some(None) => Some(format!("Exit live mode, then press {key}")),
+                None => Some(format!("Press {key}")),
+            };
+            let text = match how {
+                Some(how) => format!("No terminal running. {how} to start one."),
+                None => "No terminal running.".to_string(),
             };
             frame.render_widget(
-                Paragraph::new(format!("No terminal running. {how} to start one."))
+                Paragraph::new(text)
                     .style(Style::default().fg(theme.dimmed))
                     .alignment(Alignment::Center),
                 rect,
@@ -3390,8 +3395,8 @@ impl HomeView {
             // Advertise the info-header toggle: `i` gates the header in every view mode
             // (Agent's worktree-flavored one, Terminal/Tool's minimal one), so the hint
             // applies everywhere except the compact branch, whose title is taken.
-            let key = if self.strict_hotkeys { "I" } else { "i" };
-            let hint_text = if split.is_some() {
+            let key = self.key_label(ActionId::TogglePreviewInfo);
+            let hint_text = if split.is_some() || key.is_empty() {
                 String::new()
             } else if show_info {
                 format!(" hide info with {key} ")
@@ -4133,7 +4138,7 @@ impl HomeView {
             return;
         }
 
-        let key = if self.strict_hotkeys { "Z" } else { "z" };
+        let key = self.key_label(ActionId::ToggleArchive);
         let parked = if title.is_empty() {
             "This session is parked. Its agent was stopped.".to_string()
         } else {
@@ -4147,7 +4152,7 @@ impl HomeView {
                 heading: "Archived",
                 body: parked.into(),
                 inst,
-                hint: Some(press_hint(theme, key, " to unarchive it.")),
+                hint: (!key.is_empty()).then(|| press_hint(theme, key, " to unarchive it.")),
                 wrap: true,
             },
         );
@@ -4246,9 +4251,14 @@ impl HomeView {
         }
     }
 
+    /// The action's primary key in the active hotkey mode, or "" when it is unbound.
+    pub(super) fn key_label(&self, id: ActionId) -> String {
+        super::bindings::label(id, self.strict_hotkeys)
+    }
+
     /// "Press <activate key> {tail}", or nothing when activation is unbound.
     fn activate_hint(&self, theme: &Theme, tail: &'static str) -> Option<Line<'static>> {
-        let key = super::bindings::label(ActionId::Activate, self.strict_hotkeys);
+        let key = self.key_label(ActionId::Activate);
         (!key.is_empty()).then(|| press_hint(theme, key, tail))
     }
 

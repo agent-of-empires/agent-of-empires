@@ -5132,19 +5132,22 @@ impl HomeView {
     /// Info-dialog copy for a rename/delete attempted on a header derived automatically
     /// (Project/Org/Status), where there is no user-owned group to act on. `None` for `Manual`,
     /// where the caller proceeds with its normal flow.
-    fn automatic_group_hint(&self) -> Option<(String, String)> {
+    pub(super) fn automatic_group_hint(&self) -> Option<(String, String)> {
         let mode_label = match self.group_by {
             GroupByMode::Manual => return None,
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
             GroupByMode::Status => "Status",
         };
-        let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
+        let toggle = self.key_label(ActionId::GroupBy);
+        let how = if toggle.is_empty() {
+            "Pick Manual grouping".to_string()
+        } else {
+            format!("Press {toggle} and pick Manual")
+        };
         Some((
             format!("Cannot Modify {mode_label} Groups"),
-            format!(
-                "{mode_label} groups are automatic. Press {toggle} and pick Manual to manage groups."
-            ),
+            format!("{mode_label} groups are automatic. {how} to manage groups."),
         ))
     }
 
