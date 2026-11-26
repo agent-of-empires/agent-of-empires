@@ -1,3 +1,4 @@
+import { Search } from "lucide-react";
 import type { SidebarAxis } from "../../lib/sidebarAxis";
 import { SidebarViewMenu } from "./SidebarViewMenu";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
@@ -30,6 +31,7 @@ export function SidebarToolbar({
   filterOpen,
   onToggleFilter,
   onClose,
+  onSearch,
 }: {
   compact: boolean;
   axis: SidebarAxis;
@@ -46,17 +48,34 @@ export function SidebarToolbar({
   filterOpen: boolean;
   onToggleFilter: () => void;
   onClose: () => void;
+  /** Opens the command palette from the phone title row's Search button. */
+  onSearch?: () => void;
 }) {
   const axisHeading = AXIS_HEADING[axis];
   return (
-    <div className={`${compact ? "px-1" : "pl-4 pr-2"} pt-4 pb-1 flex items-center`}>
+    <div className={`${compact ? "px-1" : "pl-4 pr-2"} pt-4 pb-1 max-md:pb-2 flex items-center`}>
       {compact ? (
         <span className="flex-1" />
       ) : (
         <>
-          <span data-testid="sidebar-axis-heading" className="text-[12px] font-medium text-text-dim flex-1">
+          {/* A phone titles the drawer large, as Claude's app does; wide screens keep a quiet label. */}
+          <span
+            data-testid="sidebar-axis-heading"
+            className="text-[12px] font-medium text-text-dim max-md:text-[22px] max-md:font-semibold max-md:text-text-primary flex-1"
+          >
             {axisHeading}
           </span>
+          {onSearch && (
+            <button
+              type="button"
+              onClick={onSearch}
+              aria-label="Search"
+              data-testid="sidebar-search-round"
+              className="md:hidden w-10 h-10 mr-2 flex items-center justify-center rounded-full bg-surface-800 text-text-secondary cursor-pointer active:bg-surface-700"
+            >
+              <Search className="size-[18px]" strokeWidth={1.75} aria-hidden />
+            </button>
+          )}
           <SidebarViewMenu
             axis={axis}
             onAxisChange={onAxisChange}
@@ -77,7 +96,7 @@ export function SidebarToolbar({
       <button
         onClick={onClose}
         aria-label="Close sidebar"
-        className="md:hidden w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-800 ml-1"
+        className="md:hidden w-10 h-10 flex items-center justify-center rounded-full bg-surface-800 text-text-secondary cursor-pointer active:bg-surface-700 ml-2 text-lg"
       >
         &times;
       </button>

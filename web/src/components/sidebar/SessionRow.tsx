@@ -173,7 +173,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         }}
         {...longPress.handlers}
         data-selected={isSelected || undefined}
-        className={`block w-full text-left py-1.5 rounded-md cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
+        className={`block w-full text-left py-1.5 max-md:py-2.5 rounded-md cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
           compact ? (indented ? "pl-3 pr-1" : "px-2") : indented ? "pl-5 pr-2" : "px-2.5"
         } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500`}
       >
@@ -235,7 +235,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           )}
           <div className="min-w-0 flex-1">
             <span
-              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic" : ""}`}
+              className={`flex items-center gap-1.5 text-[16px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic" : ""}`}
             >
               {!compact && model.effectivePinned && (
                 <Tooltip text={meaningText(MARK_MEANING.pinned)}>

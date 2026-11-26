@@ -21,7 +21,10 @@ export function SidebarNav({
 }) {
   const searchKeys = formatShortcut(SHORTCUTS_BY_ID.palette.chord, { mac: IS_MAC, separator: "+" });
   return (
-    <nav aria-label="Sidebar actions" className={`flex flex-col gap-0.5 ${compact ? "px-1" : "px-2"} pt-2`}>
+    <nav
+      aria-label="Sidebar actions"
+      className={`max-md:hidden flex flex-col gap-0.5 ${compact ? "px-1" : "px-2"} pt-2`}
+    >
       <button
         type="button"
         onClick={onNew}

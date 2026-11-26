@@ -260,6 +260,10 @@ import { ElevationPrompt } from "./components/ElevationPrompt";
 // already dismissed the tour to the backend; no longer written.
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
 
+/** The phone drawer's push moves on the iOS sheet curve; reduced motion and wide screens skip it. */
+const PUSH_MOTION =
+  "max-md:transition-[translate,border-radius] max-md:duration-[400ms] max-md:ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
+
 export default function App() {
   useMobileViewportLock();
   // Apply the user-selected theme as CSS custom properties on the root
@@ -2940,6 +2944,8 @@ function AppContent({
   // The header collapse is a phone affordance for the conversation view only:
   // at md and up there is room for both the bar and the transcript, and on the
   // dashboard / settings / diff panes the bar is the only navigation there is.
+  // On a phone the open sidebar drawer pushes the header and the view aside, as Claude's app does.
+  const drawerPushed = sidebarOpen && !isMdUp && !fullPageView && !focusMode;
   const headerCollapsible =
     singlePane &&
     !fullPageView &&
@@ -2965,50 +2971,54 @@ function AppContent({
             flips, e.g. opening settings on a phone. An expanded region is a
             `1fr` grid row around a fixed-height bar, so the wrapper is inert
             for every view that cannot collapse. */}
-            <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
-              <TopBar
-                activeWorkspace={activeWorkspace}
-                activeSession={activeSession ?? null}
-                onToggleSidebar={handleToggleSidebar}
-                onOpenPalette={() => setShowPalette(true)}
-                terminal={
-                  caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
-                }
-                panels={
-                  dockPaneIds.length > 0
-                    ? {
-                        ...paneMenu,
-                        open: !rightDockCollapsed,
-                        onToggle: toggleRightDock,
-                        badge: caps.canUseDiff ? diffFiles.length : 0,
-                      }
-                    : undefined
-                }
-                onOpenHelp={handleOpenHelp}
-                onOpenAbout={handleOpenAbout}
-                onStartTutorial={tour.startTour}
-                unreadCount={unreadCount}
-                waitingCount={waitingCount}
-                attentionBadgeColors={attentionBadgeColors}
-                onLogout={onLogout}
-                loginRequired={loginRequired}
-                isOffline={!!error}
-                isDevBuild={isDebugBuild(serverAbout)}
-                onOpenTips={tips.open}
-                onGoDashboard={handleGoDashboard}
-                onExitFocusMode={focusMode ? exitFocusMode : undefined}
-                sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
-                rightColumnVisible={
-                  isMdUp &&
-                  !rightDockSheet &&
-                  !rightMaximized &&
-                  !fullPageView &&
-                  !!activeWorkspace &&
-                  !!activeSession &&
-                  !rightDockCollapsed
-                }
-              />
-            </CollapsibleRegion>
+            <div
+              className={`${PUSH_MOTION} ${drawerPushed ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-tl-3xl max-md:overflow-hidden" : ""}`}
+            >
+              <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+                <TopBar
+                  activeWorkspace={activeWorkspace}
+                  activeSession={activeSession ?? null}
+                  onToggleSidebar={handleToggleSidebar}
+                  onOpenPalette={() => setShowPalette(true)}
+                  terminal={
+                    caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined
+                  }
+                  panels={
+                    dockPaneIds.length > 0
+                      ? {
+                          ...paneMenu,
+                          open: !rightDockCollapsed,
+                          onToggle: toggleRightDock,
+                          badge: caps.canUseDiff ? diffFiles.length : 0,
+                        }
+                      : undefined
+                  }
+                  onOpenHelp={handleOpenHelp}
+                  onOpenAbout={handleOpenAbout}
+                  onStartTutorial={tour.startTour}
+                  unreadCount={unreadCount}
+                  waitingCount={waitingCount}
+                  attentionBadgeColors={attentionBadgeColors}
+                  onLogout={onLogout}
+                  loginRequired={loginRequired}
+                  isOffline={!!error}
+                  isDevBuild={isDebugBuild(serverAbout)}
+                  onOpenTips={tips.open}
+                  onGoDashboard={handleGoDashboard}
+                  onExitFocusMode={focusMode ? exitFocusMode : undefined}
+                  sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
+                  rightColumnVisible={
+                    isMdUp &&
+                    !rightDockSheet &&
+                    !rightMaximized &&
+                    !fullPageView &&
+                    !!activeWorkspace &&
+                    !!activeSession &&
+                    !rightDockCollapsed
+                  }
+                />
+              </CollapsibleRegion>
+            </div>
 
             <BannerStack
               onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
@@ -3091,7 +3101,15 @@ function AppContent({
                 />
               )}
 
-              <div className="flex-1 flex flex-col min-h-0 min-w-0">{renderContent()}</div>
+              <div
+                className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${
+                  drawerPushed
+                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-bl-3xl max-md:overflow-hidden"
+                    : ""
+                }`}
+              >
+                {renderContent()}
+              </div>
             </div>
 
             {showSessionWizard && (

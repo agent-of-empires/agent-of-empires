@@ -141,7 +141,7 @@ test.describe("Mobile responsive", () => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await page.getByText("Show sessions").click();
-    await expect(page.getByTestId("sidebar-new-session")).toBeInViewport();
+    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
   });
 
   test("mobile home offers the five most recent sessions while desktop keeps them hidden", async ({ page }) => {
@@ -204,13 +204,13 @@ test.describe("Mobile responsive", () => {
     await expect(page).toHaveURL(/\/session\/new$/);
   });
 
-  test("sidebar closes via toggle on mobile", async ({ page }) => {
+  test("sidebar opens from the toggle and closes from a tap on the pushed view on mobile", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByTestId("sidebar-new-session")).toBeInViewport();
-    // Toggle the sidebar closed again
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByTestId("sidebar-new-session")).not.toBeInViewport();
+    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
+    // The full-height drawer covers the header toggle; a tap on the view it pushed aside closes it.
+    await page.mouse.click(370, 400);
+    await expect(page.getByTestId("sidebar-new-session-pill")).not.toBeInViewport();
   });
 });

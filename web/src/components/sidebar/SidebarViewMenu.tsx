@@ -135,7 +135,8 @@ export function SidebarViewMenu({
           data-testid="sidebar-view-toggle"
           data-axis={axis}
           data-sort-mode={activePlugin ? "plugin" : sortMode}
-          className={`relative ${TOOLBAR_BUTTON} ${TOOLBAR_TINT(open)}`}
+          // A phone shows it as a round button beside the title, as Claude's app does.
+          className={`relative ${TOOLBAR_BUTTON} ${TOOLBAR_TINT(open)} max-md:w-10 max-md:h-10 max-md:rounded-full max-md:bg-surface-800`}
         >
           <SlidersHorizontal className="size-3.5" aria-hidden />
           {customized && <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-brand-500" aria-hidden />}

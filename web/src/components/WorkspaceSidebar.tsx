@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useEffect, useCallback, useMemo, useRef, useState } from "react";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
@@ -313,12 +313,17 @@ export function WorkspaceSidebar(props: Props) {
   // The window-level swipe (useDrawerSwipe in App) decides closing; this makes the drawer track the finger.
   const swipe = useDrawerDrag({ open, side: rightSide ? "right" : "left" });
   const dragging = swipe.offset !== null;
+  // The phone drawer's width, shared with the app shell so the view it pushes aside moves by as much.
+  const phoneWidth = `min(${effectiveWidth}px, 85vw)`;
+  useEffect(() => {
+    document.documentElement.style.setProperty("--aoe-drawer-w", phoneWidth);
+  }, [phoneWidth]);
 
   // The phone overlay starts under the header, which the app root insets below the status bar.
   return (
     <SidebarCompactContext.Provider value={compact}>
       <div
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] inset-x-0 bottom-0 z-30 md:hidden bg-black/50 ${DRAWER_MOTION} ${
+        className={`fixed inset-0 z-30 md:hidden bg-black/30 ${DRAWER_MOTION} ${
           dragging ? "transition-none" : "transition-opacity"
         } ${open ? "" : "opacity-0 pointer-events-none"}`}
         style={dragging ? { opacity: swipe.progress } : undefined}
@@ -331,9 +336,10 @@ export function WorkspaceSidebar(props: Props) {
         tabIndex={-1}
         ref={panelRef}
         style={{ width: effectiveWidth, ...(dragging ? { transform: `translateX(${swipe.offset}px)` } : {}) }}
+        // On a phone the drawer runs the full height, as Claude's app does, beside the view it pushes aside.
         {...swipe.handlers}
         data-compact={compact ? "true" : undefined}
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 max-md:max-w-full md:static md:z-auto bg-surface-800 chrome-drawer md:bg-transparent md:bg-none border-surface-700/60 flex flex-col md:h-full shrink-0 max-md:touch-pan-y max-md:shadow-2xl ${DRAWER_MOTION} ${
+        className={`fixed top-0 max-md:pt-[env(safe-area-inset-top)] bottom-0 z-40 max-md:!w-[var(--aoe-drawer-w)] md:static md:z-auto bg-surface-800 chrome-drawer md:bg-transparent md:bg-none border-surface-700/60 flex flex-col md:h-full shrink-0 max-md:touch-pan-y max-md:shadow-2xl ${DRAWER_MOTION} ${
           dragging ? "transition-none" : "transition-transform"
         } md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
           rightSide ? "right-0 border-l md:border-l-0" : "left-0 border-r md:border-r-0"
@@ -356,6 +362,7 @@ export function WorkspaceSidebar(props: Props) {
           filterOpen={filterOpen}
           onToggleFilter={toggleFilter}
           onClose={() => props.onOpenChange(false)}
+          onSearch={props.onOpenPalette}
         />
 
         {filterOpen && !compact && (
@@ -513,6 +520,19 @@ export function WorkspaceSidebar(props: Props) {
               <circle cx="12" cy="12" r="3" />
             </StrokeIcon>
           </button>
+          {/* The phone's New session is a floating pill, as Claude's app has it; wide screens keep the nav row. */}
+          {!compact && (
+            <button
+              type="button"
+              onClick={() => props.onNew()}
+              disabled={offline}
+              data-testid="sidebar-new-session-pill"
+              className="md:hidden ml-auto inline-flex items-center gap-2 h-11 px-5 rounded-full bg-text-primary text-surface-950 text-[15px] font-medium shadow-lg cursor-pointer active:scale-[0.97] transition-transform disabled:opacity-40"
+            >
+              <PlusIcon size={16} />
+              New session
+            </button>
+          )}
         </div>
       </div>
       {/* Hidden with the panel so no dead drag bar lingers when the sidebar is closed. On a touch screen the

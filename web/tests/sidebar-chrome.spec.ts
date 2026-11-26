@@ -197,7 +197,8 @@ test.describe("resize handle and compact rail (#2288)", () => {
     const panel = page.locator('[data-tour="sidebar"]');
     await expect(panel).not.toHaveAttribute("data-compact", "true");
     await expect(page.locator(COUNT).first()).toBeVisible();
-    expect((await panel.boundingBox())!.width).toBeCloseTo(390, 0);
+    // A phone drawer takes at most 85% of the width, leaving the pushed view's edge in sight.
+    expect((await panel.boundingBox())!.width).toBeCloseTo(390 * 0.85, 0);
     const close = (await page.getByRole("button", { name: "Close sidebar" }).boundingBox())!;
     expect(close.x + close.width).toBeLessThanOrEqual(390);
 
@@ -362,17 +363,19 @@ test.describe("row chips and naming actions", () => {
 test.describe("mobile overlay on a notched phone", () => {
   test.use(iPhone13);
 
-  test("starts below the inset header and keeps its footer above the home indicator", async ({ page }) => {
+  test("runs the full height, clears the status bar, and keeps its footer above the home indicator", async ({
+    page,
+  }) => {
     const cdp = await page.context().newCDPSession(page);
     await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: { top: 47, bottom: 34 } });
     await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
     await page.goto("/");
     await openMobileSidebar(page);
 
-    const header = (await page.locator("header").boundingBox())!;
     const sidebar = (await page.locator("[data-tour='sidebar']").boundingBox())!;
-    expect(header.y).toBe(47);
-    expect(sidebar.y).toBe(header.y + header.height);
+    const title = (await page.getByTestId("sidebar-axis-heading").boundingBox())!;
+    expect(sidebar.y).toBe(0);
+    expect(title.y).toBeGreaterThanOrEqual(47);
     const settings = (await page.getByRole("button", { name: "Settings" }).boundingBox())!;
     expect(settings.y + settings.height).toBeLessThanOrEqual(page.viewportSize()!.height - 34);
   });
