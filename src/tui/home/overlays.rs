@@ -51,6 +51,7 @@ impl HomeView {
                 changed = true;
             }
         }
+        changed |= self.tick_sandbox_login();
 
         // Poll the skills manager's in-flight share.
         if let Some(dialog) = &mut self.skills_manager_dialog {
@@ -111,6 +112,7 @@ impl HomeView {
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.worktree_name_dialog.is_some()
+            || self.sandbox_login_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
             || self.repo_trust_dialog.is_some()

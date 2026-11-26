@@ -2407,18 +2407,6 @@
       ]
     },
     {
-      "id": "sidebar.restart-for-update",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": ["src/components/__tests__/SessionRowSiblingTargets.test.tsx", "src/lib/restartForUpdate.test.ts"],
-      "components": [
-        "web/src/components/sidebar/sessionActionTargets.ts",
-        "web/src/components/sidebar/SessionRowMenu.tsx",
-        "web/src/components/sidebar/SessionActions.tsx",
-        "web/src/lib/restartForUpdate.ts"
-      ]
-    },
-    {
       "id": "sidebar.recreate-container",
       "kind": "vitest",
       "risk": "high",
@@ -4809,6 +4797,33 @@
       "notes": "An empty transcript under a startup error says <Agent> isn't running. and, during a Retry, <Agent> isn't running yet., with no starter prompts either way; the hint and starter prompts come back once the Agent starts. Archived and trashed Sessions show neither."
     },
     {
+      "id": "settings.sandbox-login",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SandboxLoginDialog.test.tsx",
+        "src/components/__tests__/SettingsView.sandboxLogin.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/acpTypes.test.ts"
+      ],
+      "components": [
+        "web/src/components/SandboxLoginDialog.tsx",
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/SettingsView.tsx"
+      ],
+      "notes": "Dialog request payloads and error codes run against MSW handlers shaped like the server contract in docs/api.md; the banner shows Log in only for the login-required startup code, and a prompt kept for the login (409 with queued_id) raises that banner. The `command` and `profile` a login-required startup event or 409 names reach the login the banner starts in its start request, so a session of another profile logs in that profile's file. Dialogs for one credential share a login: each leaves it with its own lease, and a lost answer to a code is settled by the outcome the server holds for that login id. The Settings row hides the button on a read-only server, drops another profile's status while the new one loads, and re-reads after an uncertain credential save is confirmed; the dialog yields Tab and Escape to the passphrase prompt and keeps the login after a too-large code."
+    },
+    {
+      "id": "settings.sandbox-login.browser",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sandbox-login-dialog.spec.ts"],
+      "components": ["web/src/components/SandboxLoginDialog.tsx", "web/src/components/ElevationPrompt.tsx"],
+      "notes": "Initial focus, Tab order, focus and the typed value after a rejected code, Escape cancelling the login, and the real passphrase prompt a code raises sitting above the dialog and taking pointer clicks."
+    },
+    {
       "id": "acp.startup-error-banner-live",
       "kind": "live-playwright",
       "risk": "high",
@@ -5982,7 +5997,7 @@
         "web/src/components/ContextMenu.tsx",
         "web/src/components/plugin/PluginSessionMenu.tsx"
       ],
-      "notes": "The Session menu groups its items into tiers (quick row, Rename, Run, Start another, More, Settings, plugin items, Move to Trash…) with a separator only between tiers that show something, in the popover and the mobile sheet. Restart to update and Recreate container carry a second line as their description. The Notify hint shows only for Off and All. The heading adds the Session's status and view, or a count for a row with several. Read-only leaves only Notify."
+      "notes": "The Session menu groups its items into tiers (quick row, Rename, Run, Start another, More, Settings, plugin items, Move to Trash…) with a separator only between tiers that show something, in the popover and the mobile sheet. Recreate container carries a second line as its description. The Notify hint shows only for Off and All. The heading adds the Session's status and view, or a count for a row with several. Read-only leaves only Notify."
     },
     {
       "id": "sidebar.context-menu-clamp",

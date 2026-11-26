@@ -1142,10 +1142,6 @@ impl Instance {
             .as_ref()
             .filter(|execution| execution.inputs.container.is_none())
             .map(|execution| execution.program.clone());
-        self.launch_resolved_executable = self
-            .launch_executable
-            .as_deref()
-            .and_then(|program| std::fs::canonicalize(program).ok());
         if let Some(execution) = prepared.execution.take() {
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
@@ -1344,7 +1340,6 @@ impl Instance {
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
-        self.started_at = Some(Timestamp::now());
 
         // Apply status bar options in a background thread to avoid blocking
         // the TUI on the multiple tmux subprocess calls they require.

@@ -30,6 +30,7 @@ vi.mock("../../lib/api", () => ({
   fetchSettings: vi.fn(() => Promise.resolve({ worktree: {}, sandbox: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
   getWebUiState: vi.fn(),
+  getSandboxLoginStatus: vi.fn(() => Promise.resolve(null)),
 }));
 
 const KEY = (id: string) => `aoe-settings-intro-${id}`;
