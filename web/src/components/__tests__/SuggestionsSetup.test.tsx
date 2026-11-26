@@ -218,6 +218,20 @@ describe("setup sheet", () => {
     api.refreshSuggestions.mockResolvedValue({ ok: true, data: undefined });
   });
 
+  it("takes focus on open, keeps Tab inside, and hands focus back on close", async () => {
+    renderHint();
+    const opener = await screen.findByTestId("suggestions-hint-open");
+    opener.focus();
+    fireEvent.click(opener);
+    const sheet = screen.getByTestId("suggestions-setup-sheet");
+    expect(sheet.contains(document.activeElement)).toBe(true);
+    screen.getByTestId("suggestions-setup-install").focus();
+    fireEvent.keyDown(document.activeElement!, { key: "Tab" });
+    expect(sheet.contains(document.activeElement)).toBe(true);
+    fireEvent.click(screen.getByTestId("suggestions-setup-close"));
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
   it("opens the Marketplace from the last row", async () => {
     const { onOpenMarketplace } = await openSheet();
     fireEvent.click(screen.getByTestId("suggestions-setup-marketplace"));

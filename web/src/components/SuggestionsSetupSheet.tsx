@@ -7,6 +7,7 @@ import {
   type PluginDiscoveryResult,
 } from "../lib/api";
 import { sourceLabel } from "../lib/featuredSuggestionSources";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import type { SuggestionSetupCheck, SuggestionsSnapshot } from "../lib/types";
 import { PluginInstallConsentModal } from "./settings/PluginInstallConsentModal";
 import { PluginJobProgressModal } from "./settings/PluginJobProgressModal";
@@ -39,6 +40,10 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
   // Plugin ids this sheet installed; only these are turned on, not one another client installed meanwhile.
   const [installedIds, setInstalledIds] = useState<string[]>([]);
   const approvedId = useRef<string | null>(null);
+  // The install dialogs over the sheet are aria-modal too, so the trap leaves Tab to them.
+  const dialog = useRef<HTMLDivElement>(null);
+  useFocusTrap(() => dialog.current, { restoreFocus: true });
+  useEffect(() => dialog.current?.focus(), []);
   const market = usePluginMarketplace(setJob);
   const installing = queue.length > 0;
   const toDone = useCallback(() => setStep("done"), []);
@@ -95,7 +100,9 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-surface-950/80 p-4"
+      ref={dialog}
+      tabIndex={-1}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-surface-950/80 p-4 outline-none"
       role="dialog"
       aria-modal="true"
       aria-label={title}
