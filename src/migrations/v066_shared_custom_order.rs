@@ -3,7 +3,7 @@
 //! The TUI kept its Custom order as a `sort_index` on each `sessions.json` row, and the
 //! dashboard kept its own in `workspace-ordering.json` (rows) and in `state.toml`'s
 //! `web_ui_state` (`aoe-repo-group-order-v1`, Repository headers). `workspace-ordering.json`
-//! is now the one store. Where the dashboard has none, the sort v064 left in
+//! is now the one store. Where the dashboard has none, the sort v065 left in
 //! `legacy_sort_order` seeds it, so the list keeps the order it had: the TUI order under
 //! Custom, the removed sort's order under Oldest or Last activity, and nothing otherwise:
 //! Newest first and Name are sorts of their own.
@@ -11,13 +11,13 @@
 //! dropped unused. The dashboard's header order is copied, not removed, because the
 //! dashboard still reads it. `sort_index` and `legacy_sort_order` are dropped only after
 //! the shared order is written, so an interrupted run retries from them. An install that
-//! ran an earlier v064 without `legacy_sort_order` falls back to the sort v064 left.
+//! ran an earlier v065 without `legacy_sort_order` falls back to the sort v065 left.
 //! A `sessions.json` that cannot be read is left untouched and the run completes without
 //! it; the sort and the skipped files are kept in `PENDING_FILE`, and a later run, `aoe
 //! migrate` or a retried upgrade, adds only those profiles' order to the shared one.
 
 use super::sessions_file;
-use super::v064_shared_sidebar_view::{web_effective_sort, LEGACY_SORT_KEY, WEB_SORT_KEY};
+use super::v065_shared_sidebar_view::{web_effective_sort, LEGACY_SORT_KEY, WEB_SORT_KEY};
 use crate::time::Timestamp;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -29,7 +29,7 @@ use tracing::{info, warn};
 const WEB_REPO_ORDER_KEY: &str = "aoe-repo-group-order-v1";
 /// The legacy sort on its first line, then the `sessions.json` paths, relative to the app
 /// directory, that still owe their order.
-const PENDING_FILE: &str = ".v065_custom_order_pending";
+const PENDING_FILE: &str = ".v066_custom_order_pending";
 
 pub fn run() -> Result<()> {
     run_in(&crate::session::get_app_dir()?, Pass::Upgrade)
@@ -47,7 +47,7 @@ enum Pass {
     Recovery,
 }
 
-/// A live row's place in each order v065 can seed.
+/// A live row's place in each order v066 can seed.
 struct LiveRow {
     workspace: String,
     repository: String,
@@ -135,7 +135,7 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
         Pass::Upgrade => in_state
             .clone()
             .or(pending)
-            .or_else(|| sort_left_by_v064(state.as_ref())),
+            .or_else(|| sort_left_by_v065(state.as_ref())),
         Pass::Recovery => pending.clone(),
     };
 
@@ -202,16 +202,16 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
         _ => {}
     }
     if in_state.is_some() {
-        super::config_file::rewrite_strict(&app_dir.join("state.toml"), "v065", |state| {
+        super::config_file::rewrite_strict(&app_dir.join("state.toml"), "v066", |state| {
             state.remove(LEGACY_SORT_KEY).is_some()
         })?;
     }
     Ok(())
 }
 
-/// The sort an earlier v064, which kept no `legacy_sort_order`, left: the dashboard's
+/// The sort an earlier v065, which kept no `legacy_sort_order`, left: the dashboard's
 /// pick while its key remains, else Custom only when that was the TUI's sort.
-fn sort_left_by_v064(state: Option<&toml::Table>) -> Option<String> {
+fn sort_left_by_v065(state: Option<&toml::Table>) -> Option<String> {
     let state = state?;
     let web = state
         .get("web_ui_state")
@@ -243,7 +243,7 @@ fn add_missing(current: &[String], seeded: &[String]) -> Vec<String> {
 }
 
 /// Live rows in the order the removed sort `sort` showed them, or `None` for a sort with
-/// nothing to seed; see v064's `tui_effective_sort`. Deduplicated, a workspace or
+/// nothing to seed; see v065's `tui_effective_sort`. Deduplicated, a workspace or
 /// repository then ranks by its newest session for last activity and by its oldest for
 /// oldest.
 fn legacy_rank(mut live: Vec<LiveRow>, sort: &str) -> Option<Vec<LiveRow>> {
@@ -273,18 +273,18 @@ fn read_session_rows(path: &Path) -> SessionList {
         Ok(Some(content)) => content,
         Ok(None) => return SessionList::Missing,
         Err(error) => {
-            warn!(target: "migrations.v065", path = %path.display(), %error, "Preserved unreadable session list; repair it and run aoe migrate");
+            warn!(target: "migrations.v066", path = %path.display(), %error, "Preserved unreadable session list; repair it and run aoe migrate");
             return SessionList::Unreadable;
         }
     };
     match serde_json::from_str::<Value>(&content) {
         Ok(Value::Array(rows)) => SessionList::Rows(content, rows),
         Ok(_) => {
-            warn!(target: "migrations.v065", path = %path.display(), "Preserved a file that is not a session list; repair it and run aoe migrate");
+            warn!(target: "migrations.v066", path = %path.display(), "Preserved a file that is not a session list; repair it and run aoe migrate");
             SessionList::Unreadable
         }
         Err(error) => {
-            warn!(target: "migrations.v065", path = %path.display(), %error, "Preserved a session list that does not parse; repair it and run aoe migrate");
+            warn!(target: "migrations.v066", path = %path.display(), %error, "Preserved a session list that does not parse; repair it and run aoe migrate");
             SessionList::Unreadable
         }
     }
@@ -608,10 +608,10 @@ mod tests {
         }
     }
 
-    /// An install whose v064 kept no `legacy_sort_order` seeds from the sort v064 left:
+    /// An install whose v065 kept no `legacy_sort_order` seeds from the sort v065 left:
     /// the TUI order under Custom, the dashboard's pick while its key remains.
     #[test]
-    fn an_earlier_v064_without_the_marker_keeps_the_custom_order() {
+    fn an_earlier_v065_without_the_marker_keeps_the_custom_order() {
         let (a, b) = ("/r/a::__session__::a", "/r/b::__session__::b");
         for (state, expected) in [
             ("sort_order = \"custom\"\n", vec![a]),
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(ordering(dir.path()).order, ["/r/web::main"]);
     }
 
-    /// With no TUI or dashboard order, the removed sort v064 kept seeds one that shows the
+    /// With no TUI or dashboard order, the removed sort v065 kept seeds one that shows the
     /// rows as that sort did, and is then dropped.
     #[test]
     fn seeds_the_order_the_removed_sort_showed() {
