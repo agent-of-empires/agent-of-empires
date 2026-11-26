@@ -259,6 +259,30 @@ describe("installFetchErrorToasts", () => {
       expect(clearToken).not.toHaveBeenCalled();
     });
 
+    it("does not open token entry when switching to login aborts a poll's 401 body", async () => {
+      await install();
+      const poll = new AbortController();
+      const body = new ReadableStream({
+        start(stream) {
+          poll.signal.addEventListener("abort", () => stream.error(poll.signal.reason), { once: true });
+        },
+      });
+      original
+        .mockResolvedValueOnce(new Response(body, { status: 401, headers: { "X-Aoe-Token": "rotated" } }))
+        .mockResolvedValueOnce(json(401, { error: "login_required" }));
+      const onLogin = listen(mod.LOGIN_REQUIRED_EVENT).mockImplementationOnce(() => poll.abort());
+      const onExpired = listen(mod.TOKEN_EXPIRED_EVENT);
+
+      const pendingPoll = window.fetch("/api/sessions", { signal: poll.signal });
+      await window.fetch("/api/devices");
+      await pendingPoll;
+
+      expect(onLogin).toHaveBeenCalledOnce();
+      expect(onExpired).not.toHaveBeenCalled();
+      expect(clearToken).not.toHaveBeenCalled();
+      expect(saveToken).not.toHaveBeenCalled();
+    });
+
     it.each(["/api/login", "/not-api"])("a 401 on %s fires no token event", async (path) => {
       await install();
       original.mockResolvedValue(json(401, { error: "unauthorized" }));

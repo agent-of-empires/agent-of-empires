@@ -92,20 +92,24 @@ export function installFetchErrorToasts(): void {
 
     try {
       const res = await original(input, patchedInit);
+      const authError = res.status === 401 && isApi ? await classifyAuthError(res) : null;
+      if (authError !== null) {
+        // Unmounting the dashboard can abort a poll while its 401 body is being read.
+        // An unreadable response from that poll must not send the user to token entry.
+        const signal = patchedInit?.signal ?? (input instanceof Request ? input.signal : undefined);
+        if (signal?.aborted) return res;
+      }
       if (sameOrigin) {
         // The header names the token current when the response was built, so a slow
         // response must not overwrite one saved since.
         const rotated = res.headers.get("x-aoe-token");
         if (rotated && getToken() === sentToken) saveToken(rotated);
       }
-      if (res.status === 401 && isApi) {
-        const authError = await classifyAuthError(res);
-        if (authError === "login_required") {
-          handleLoginRequired();
-        } else if (authError === "unauthorized" && !isLoginAttemptPath(path) && getToken() === sentToken) {
-          // A generic 401 outside login attempts means the token is dead.
-          handleTokenAuthFailure();
-        }
+      if (authError === "login_required") {
+        handleLoginRequired();
+      } else if (authError === "unauthorized" && !isLoginAttemptPath(path) && getToken() === sentToken) {
+        // A generic 401 outside login attempts means the token is dead.
+        handleTokenAuthFailure();
       }
       // `init.headers` replaces a Request's own headers, as in fetch.
       const sent = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
