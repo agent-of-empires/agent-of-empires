@@ -51,7 +51,7 @@ aoe add -t shell-urls -g web-shop --tool shell -l .
 aoe add -t claude-agent -g web-shop --tool claude -l --structured-view --prompt '<one tiny prompt>' .
 ```
 
-Before adding a `--structured-view` session, run `aoe acp doctor` (`--fix` installs the Claude adapter); without it the session falls back to a terminal view. Use `--tool shell` for anything scripted; use one real agent session where the PR touches agent views, and keep its prompt tiny (it may ignore `--model`). Done when every session the clips need shows in `aoe list`. Terminal sessions must have a tmux pane holding the state you will film. Structured sessions (`--structured-view`) have no agent pane, so check their `aoe list` status (Idle or Active) or the transcript.
+Before adding a `--structured-view` session, run `aoe acp doctor` (`--fix` installs the Claude adapter); without it the session falls back to a terminal view. Use `--tool shell` for anything scripted; use one real agent session where the PR touches agent views, and keep its prompt tiny (it may ignore `--model`). Done when every session the clips need shows in `aoe list`. Terminal sessions must have a tmux pane holding the state you will film. Structured sessions (`--structured-view`) have no agent pane, and `aoe list` shows the same persisted state for both view modes, so it cannot prove the view. Require the transcript as evidence: `GET /api/sessions/<id>/acp/replay` (with the dashboard token) must return events for your prompt. A refused replay (non-structured session) or no events after the prompt means it fell back to a terminal view, so fix the adapter before recording.
 
 ## 4. Record
 
