@@ -253,7 +253,7 @@ To seed from a new host login, stop every Claude sandbox, delete only `sandbox-v
 
 By default the shared file starts from the host's own token, so the first side to refresh logs the other out once. With `shared_credential = "separate_login"` under `[sandbox]` the sandboxes hold a login of their own. A host refresh or logout never touches it, and a sandbox refresh or logout never touches the host. AoE never reads the host file or the Keychain for it, and only creates the shared file empty when it is absent. The setting applies to every agent that declares a sandbox login; today that is Claude.
 
-Log in once with [`aoe sandbox login`](../cli/reference.md#aoe-sandbox-login). It prints a sign-in link and reads the code shown after you sign in. The login lands in the shared file every sandbox of that agent mounts.
+Log in once with [`aoe sandbox login`](../cli/reference.md#aoe-sandbox-login), by pressing Log in on the dashboard (Settings, Sandbox, or the banner of a session that waits for it), or by running "Log the sandboxes in" from the TUI command palette (Ctrl+K). It prints a sign-in link and reads the code shown after you sign in. The login lands in the shared file every sandbox of that agent mounts.
 
 - The file belongs to a profile and tool. A session of profile `work` running tool `T` waits for `aoe sandbox login -p work --tool T`; a session with its own command for the tool waits for `aoe sandbox login --tool T --command <command>`. The "sandbox login required" message prints the exact command.
 - Without `--tool`, the login is for the profile's default tool when it has a sandbox login, else the only agent that has one. `--check` reports whether a login is needed, and `--force` logs in again.
