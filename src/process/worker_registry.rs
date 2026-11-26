@@ -152,8 +152,11 @@ pub fn control_protocol_refusal(record: &WorkerRecord) -> Option<ControlAdmissio
 }
 
 /// An unavailable socket is not evidence that its recorded process died.
+/// An unreaped process has exited and cannot serve a retained control channel.
 pub(crate) fn retained_process_may_be_alive(record: &WorkerRecord) -> bool {
-    if !is_pid_alive(record.pid) {
+    let executing =
+        crate::process::process_executing(record.pid).unwrap_or_else(|_| is_pid_alive(record.pid));
+    if !executing {
         return false;
     }
     match (
@@ -1560,6 +1563,7 @@ mod tests {
                     is_record_live(&record),
                     "member {member}: a running runner is live"
                 );
+                assert!(retained_process_may_be_alive(&record));
 
                 drop(leader.stdin.take());
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -1574,6 +1578,10 @@ mod tests {
                 assert!(
                     !is_record_live(&record),
                     "member {member}: a zombie runner is not live"
+                );
+                assert!(
+                    !retained_process_may_be_alive(&record),
+                    "member {member}: a zombie runner cannot accept a retained attachment"
                 );
                 if member {
                     let fingerprint = record
