@@ -88,6 +88,35 @@ pub(crate) fn is_explicit_claude_store_route(
             .is_some_and(|ambient| claude_store_identity(ambient) == claude_store_identity(store))
 }
 
+/// The `CLAUDE_CONFIG_DIR` a launch environment already carries: the profile or hook value,
+/// else the daemon's inherited one (`daemon`, read only when the launch would see it).
+pub(crate) fn ambient_claude_config_dir(
+    environment: Option<String>,
+    daemon: impl FnOnce() -> Option<String>,
+) -> Option<PathBuf> {
+    environment
+        .or_else(daemon)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The store a launch declaring `dir` ends up reading, and whether it exports `dir` as
+/// `CLAUDE_CONFIG_DIR`. An implicit default stays unexported (see
+/// [`is_explicit_claude_store_route`]) and keeps the `ambient` store, else the default one.
+/// Shared by launch and the structured-switch preview so they cannot drift.
+pub(crate) fn declared_claude_store_route(
+    dir: &Path,
+    home: &Path,
+    ambient: Option<&Path>,
+) -> (PathBuf, bool) {
+    if is_default_claude_store(dir, home)
+        && !is_explicit_claude_store_route(dir, home, Some(dir), ambient)
+    {
+        return (ambient.unwrap_or(dir).to_path_buf(), false);
+    }
+    (dir.to_path_buf(), true)
+}
+
 /// Whether the effective route for `pin` exports `CLAUDE_CONFIG_DIR` at `home`.
 pub(crate) fn exports_claude_store(pin: &ClaudeStorePin, home: Option<&Path>) -> bool {
     !home.is_some_and(|home| {

@@ -1519,21 +1519,15 @@ pub(super) fn apply_declared_config_dir(
     let dir = session.agent_config_dir_for(key, &home)?;
     if variable == "CLAUDE_CONFIG_DIR" {
         // Setting the variable moves `.claude.json` into the store, so an implicit default stays unset.
-        let ambient = environment
-            .iter()
-            .rev()
-            .find(|(name, _)| name == variable)
-            .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var(variable).ok())
-            .filter(|value| !value.is_empty())
-            .map(std::path::PathBuf::from);
-        if crate::session::capture::is_default_claude_store(&dir, &home)
-            && !crate::session::capture::is_explicit_claude_store_route(
-                &dir,
-                &home,
-                Some(&dir),
-                ambient.as_deref(),
-            )
+        let ambient = crate::session::capture::ambient_claude_config_dir(
+            environment
+                .iter()
+                .rev()
+                .find(|(name, _)| name == variable)
+                .map(|(_, value)| value.clone()),
+            || std::env::var(variable).ok(),
+        );
+        if !crate::session::capture::declared_claude_store_route(&dir, &home, ambient.as_deref()).1
         {
             return None;
         }

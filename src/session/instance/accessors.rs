@@ -336,17 +336,24 @@ impl Instance {
         let home = super::hooks::host_home(&config.profile_environment)
             .filter(|home| home.is_absolute())?;
         let launcher_store = session.agent_config_dir_for(&self.tool, &home)?;
-        // Launch leaves an implicit default store unexported, so a profile `CLAUDE_CONFIG_DIR`
-        // decides the store instead.
-        if crate::session::capture::is_default_claude_store(&launcher_store, &home)
-            && crate::session::environment::resolve_host_environment_value(
+        // Launch's route: an implicit default store stays unexported and keeps the ambient one.
+        let ambient = crate::session::capture::ambient_claude_config_dir(
+            crate::session::environment::resolve_host_environment_value(
                 &config.profile_environment,
                 "CLAUDE_CONFIG_DIR",
-            )
-            .is_some_and(|value| !value.is_empty())
-        {
-            return None;
-        }
+            ),
+            || {
+                session
+                    .inherit_host_environment
+                    .then(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
+                    .flatten()
+            },
+        );
+        let (launcher_store, _) = crate::session::capture::declared_claude_store_route(
+            &launcher_store,
+            &home,
+            ambient.as_deref(),
+        );
         self.acp_transcript_cli_resumable_with("claude", session)
             .then_some((launcher_store, bound_store))
     }
@@ -1503,11 +1510,25 @@ replies = true
             );
         }
 
-        // A default-store declaration is not exported at launch, so a profile
-        // `CLAUDE_CONFIG_DIR` decides the store and the preview starts fresh.
+        // A default-store declaration is not exported at launch, so the store comes from the
+        // ambient `CLAUDE_CONFIG_DIR`: the profile `environment`, else the daemon's when
+        // `inherit_host_environment` is on.
         let default_store = home.path().join(".claude");
-        for (environment, expected) in [(None, true), (Some("CLAUDE_CONFIG_DIR=/elsewhere"), false)]
-        {
+        let elsewhere = home.path().join("elsewhere");
+        let same = format!("CLAUDE_CONFIG_DIR={}", default_store.display());
+        let other = format!("CLAUDE_CONFIG_DIR={}", elsewhere.display());
+        // (profile environment, inherit, daemon CLAUDE_CONFIG_DIR, resumes)
+        let cases: [(Option<&str>, bool, Option<&str>, bool); 8] = [
+            (None, false, None, true),
+            (Some(&same), false, None, true),
+            (Some(&other), false, None, false),
+            (Some(&same), true, Some("/daemon"), true),
+            (None, true, Some("/daemon"), false),
+            (None, true, Some(default_store.to_str().unwrap()), true),
+            (None, false, Some("/daemon"), true),
+            (Some(&same), false, Some("/daemon"), true),
+        ];
+        for (environment, inherit, daemon, expected) in cases {
             let mut session = toml::Table::new();
             let entry = |value: &str| {
                 toml::Value::Table(toml::Table::from_iter([(
@@ -1521,6 +1542,10 @@ replies = true
                 "agent_config_dir".into(),
                 entry(default_store.to_str().unwrap()),
             );
+            session.insert(
+                "inherit_host_environment".into(),
+                toml::Value::Boolean(inherit),
+            );
             let mut config =
                 toml::Table::from_iter([("session".into(), toml::Value::Table(session))]);
             if let Some(environment) = environment {
@@ -1532,11 +1557,17 @@ replies = true
             let path =
                 crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
             std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+            let _daemon = match daemon {
+                Some(value) => {
+                    crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", value)])
+                }
+                None => crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]),
+            };
             assert_eq!(
                 instance("claude-work", Some(&default_store))
                     .resumes_claude_under_own_acp_cmd("claude-work"),
                 expected,
-                "{environment:?}"
+                "{environment:?} inherit={inherit} daemon={daemon:?}"
             );
         }
     }
