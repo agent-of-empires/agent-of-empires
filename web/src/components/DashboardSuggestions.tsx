@@ -50,7 +50,9 @@ export function DashboardSuggestions({
   focusHeading = false,
 }: Props) {
   const wide = useIsWideViewport();
-  const ctrl = useSuggestions(onPrepare, onOpenSession);
+  // Nothing to show: no provider installed, or the homepage section is off, so a
+  // hidden dashboard tab has no reason to keep re-reading the snapshot.
+  const ctrl = useSuggestions(onPrepare, onOpenSession, (s) => s.providers.length === 0 || !s.prefs.homepage);
   const { snapshot, loadFailed, busy, refreshing, notice, refreshFailed, failures, offline, act, refresh } = ctrl;
   const agentName = useAgentNames();
   const presetOf = useSuggestionPresets();
