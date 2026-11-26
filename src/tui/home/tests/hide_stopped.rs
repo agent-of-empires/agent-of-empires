@@ -725,6 +725,86 @@ fn a_session_that_stops_needing_you_stays_until_the_cursor_leaves_it() {
     assert_eq!(env.view.selected_group.as_deref(), Some("util"));
 }
 
+/// Right-clicking another row under the needs-you filter drops the kept row above it, and
+/// the menu opens on the row clicked.
+#[test]
+#[serial]
+fn a_right_click_that_drops_the_kept_row_opens_on_the_row_clicked() {
+    let mut env = env_with_stopped(false);
+    // Repository drops the headers left with no rows, so the clicked row is the last.
+    env.view.apply_group_by(GroupByMode::Project);
+    let a = select_session(&mut env, "util-stopped-b");
+    let b = select_session(&mut env, "util-stopped-a");
+    publish_statuses(
+        &mut env.view,
+        &[(&a, Status::Waiting), (&b, Status::Waiting)],
+    );
+    env.view.toggle_needs_you_only();
+    select_session(&mut env, "util-stopped-b");
+    publish_statuses(
+        &mut env.view,
+        &[(&a, Status::Running), (&b, Status::Waiting)],
+    );
+    assert_eq!(
+        session_titles(&env.view),
+        ["util-stopped-b", "util-stopped-a"]
+    );
+    env.view.list_inner_area = ratatui::layout::Rect::new(1, 1, 28, 20);
+    env.view.list_area = ratatui::layout::Rect::new(0, 0, 30, 22);
+    let clicked = env.view.session_row(&b).unwrap();
+    assert_eq!(clicked + 1, env.view.flat_items.len(), "the last row");
+
+    assert!(env
+        .view
+        .handle_right_click(5, env.view.list_inner_area.y + clicked as u16));
+
+    assert_eq!(session_titles(&env.view), ["util-stopped-a"]);
+    assert_eq!(env.view.selected_session.as_deref(), Some(b.as_str()));
+    assert!(matches!(&env.view.flat_items[env.view.cursor], Item::Session { id, .. } if *id == b));
+    assert!(env.view.context_menu.is_some());
+}
+
+/// Under Newest first, a header keeps its place when the needs-you filter hides the member
+/// that ranks it, in both groupings.
+#[test]
+#[serial]
+fn the_needs_you_filter_keeps_headers_ranked_by_their_hidden_rows() {
+    for group_by in [GroupByMode::Group, GroupByMode::Project] {
+        let mut env = env_with_stopped(true);
+        env.view.apply_group_by(group_by);
+        env.view.sort_order = SortOrder::Newest;
+        let now = crate::time::Timestamp::now();
+        for (title, age, status) in [
+            ("ops-stopped-a", 0, Status::Stopped),
+            ("util-stopped-a", 1, Status::Waiting),
+            ("ops-stopped-b", 2, Status::Waiting),
+        ] {
+            let id = select_session(&mut env, title);
+            env.view.mutate_instance(&id, |inst| {
+                inst.created_at = now - crate::time::Duration::days(age);
+            });
+            publish_statuses(&mut env.view, &[(&id, status)]);
+        }
+        let headers = |view: &HomeView| -> Vec<String> {
+            view.flat_items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Group { name, depth: 0, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .filter(|name| name.starts_with("ops") || name.starts_with("util"))
+                .collect()
+        };
+        env.view.rebuild_flat_items();
+        let before = headers(&env.view);
+        assert_eq!(before.len(), 2, "{group_by:?}");
+
+        env.view.toggle_needs_you_only();
+
+        assert_eq!(headers(&env.view), before, "{group_by:?}");
+    }
+}
+
 /// The dwell that marks the selected unread session read does not pull it out from under the
 /// cursor; moving to another row does.
 #[test]

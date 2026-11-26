@@ -592,8 +592,11 @@ fn has_placed_favorite(path: &str, instances: &[Instance]) -> bool {
 }
 
 /// Flatten instances from multiple profiles into a single flat list.
+/// Every profile's rows from `instances`, with headers ranked by `ranked`'s members, so a
+/// filter that hides rows leaves the headers in place.
 pub fn flatten_tree_all_profiles(
     instances: &[Instance],
+    ranked: &[Instance],
     group_trees: &std::collections::HashMap<String, GroupTree>,
     sort_order: SortOrder,
 ) -> Vec<Item> {
@@ -615,19 +618,21 @@ pub fn flatten_tree_all_profiles(
     }
 
     // Collect and flatten groups from all profiles at depth 0
-    let mut all_roots: Vec<(&str, &Group, Vec<Instance>)> = Vec::new();
+    let mut all_roots: Vec<(&str, &Group, Vec<Instance>, Vec<Instance>)> = Vec::new();
     // Iterating the map directly would order the profile blocks differently on every rebuild
     // under Custom, which keeps whatever order it is handed.
     let mut profiles: Vec<(&String, &GroupTree)> = group_trees.iter().collect();
     profiles.sort_by(|a, b| a.0.cmp(b.0));
     for (profile_name, tree) in profiles {
-        let profile_instances: Vec<Instance> = instances
-            .iter()
-            .filter(|i| i.source_profile == *profile_name)
-            .cloned()
-            .collect();
+        let of_profile = |pool: &[Instance]| -> Vec<Instance> {
+            pool.iter()
+                .filter(|i| i.source_profile == *profile_name)
+                .cloned()
+                .collect()
+        };
+        let (listed, ranked) = (of_profile(instances), of_profile(ranked));
         for root in tree.get_roots() {
-            all_roots.push((profile_name, root, profile_instances.clone()));
+            all_roots.push((profile_name, root, listed.clone(), ranked.clone()));
         }
     }
 
@@ -636,18 +641,19 @@ pub fn flatten_tree_all_profiles(
     match sort_order {
         SortOrder::Custom => {}
         SortOrder::Newest => {
-            all_roots.sort_by_key(|(_, g, insts)| Reverse(newest_member(&g.path, insts)));
+            all_roots.sort_by_key(|(_, g, _, ranked)| Reverse(newest_member(&g.path, ranked)));
         }
-        SortOrder::Name => all_roots.sort_by_key(|(_, g, _)| g.name.to_lowercase()),
+        SortOrder::Name => all_roots.sort_by_key(|(_, g, _, _)| g.name.to_lowercase()),
     }
     if sort_order != SortOrder::Custom && crate::session::favorites_first() {
-        all_roots.sort_by_key(|(_, g, insts)| !has_placed_favorite(&g.path, insts));
+        all_roots.sort_by_key(|(_, g, _, ranked)| !has_placed_favorite(&g.path, ranked));
     }
 
-    for (profile_name, root, profile_instances) in &all_roots {
+    for (profile_name, root, listed, ranked) in &all_roots {
         flatten_group(
             root,
-            profile_instances,
+            listed,
+            ranked,
             &mut items,
             0,
             sort_order,
@@ -658,9 +664,12 @@ pub fn flatten_tree_all_profiles(
     items
 }
 
+/// The rows from `instances`, with headers ranked by `ranked`'s members, so a filter that
+/// hides rows leaves the headers in place.
 pub fn flatten_tree(
     group_tree: &GroupTree,
     instances: &[Instance],
+    ranked: &[Instance],
     sort_order: SortOrder,
 ) -> Vec<Item> {
     let mut items = Vec::new();
@@ -686,13 +695,13 @@ pub fn flatten_tree(
     sort_groups(
         &mut roots_to_iterate,
         sort_order,
-        instances,
+        ranked,
         |g| &g.name,
         |g| &g.path,
     );
 
     for root in roots_to_iterate {
-        flatten_group(root, instances, &mut items, 0, sort_order, None);
+        flatten_group(root, instances, ranked, &mut items, 0, sort_order, None);
     }
 
     items
@@ -701,6 +710,7 @@ pub fn flatten_tree(
 fn flatten_group(
     group: &Group,
     instances: &[Instance],
+    ranked: &[Instance],
     items: &mut Vec<Item>,
     depth: usize,
     sort_order: SortOrder,
@@ -742,13 +752,21 @@ fn flatten_group(
     sort_groups(
         &mut children_to_iterate,
         sort_order,
-        instances,
+        ranked,
         |g| &g.name,
         |g| &g.path,
     );
 
     for child in children_to_iterate {
-        flatten_group(child, instances, items, depth + 1, sort_order, profile);
+        flatten_group(
+            child,
+            instances,
+            ranked,
+            items,
+            depth + 1,
+            sort_order,
+            profile,
+        );
     }
 }
 
@@ -1082,7 +1100,7 @@ mod tests {
                 .count()
         };
 
-        let items = flatten_tree(&tree, &instances, SortOrder::Custom);
+        let items = flatten_tree(&tree, &instances, &instances, SortOrder::Custom);
         assert_eq!(group_names(&items), ["parent", "child"]);
         assert_eq!(count_sessions(&items), 2);
         let Item::Group {
@@ -1101,7 +1119,7 @@ mod tests {
         ));
 
         tree.toggle_collapsed("parent");
-        let items = flatten_tree(&tree, &instances, SortOrder::Custom);
+        let items = flatten_tree(&tree, &instances, &instances, SortOrder::Custom);
         assert_eq!(group_names(&items), ["parent"]);
         assert_eq!(count_sessions(&items), 0);
         assert!(matches!(
@@ -1121,7 +1139,7 @@ mod tests {
         let mut instances = vec![inst("a", "work"), inst("b", "work")];
         let group_count = |instances: &[Instance]| {
             let tree = GroupTree::new_with_groups(instances, &[]);
-            let items = flatten_tree(&tree, instances, SortOrder::Custom);
+            let items = flatten_tree(&tree, instances, instances, SortOrder::Custom);
             match group_item(&items, "work") {
                 Item::Group { session_count, .. } => *session_count,
                 _ => unreachable!(),
@@ -1190,9 +1208,9 @@ mod tests {
                 ["alpha", "zeta"],
             ),
         ] {
-            let items = flatten_tree(&tree, &groups, order);
+            let items = flatten_tree(&tree, &groups, &groups, order);
             assert_eq!(group_names(&items), want_groups, "{order:?}");
-            let items = flatten_tree(&nested_tree, &nested, order);
+            let items = flatten_tree(&nested_tree, &nested, &nested, order);
             assert_eq!(group_names(&items)[1..], want_children, "{order:?}");
         }
 
@@ -1203,7 +1221,7 @@ mod tests {
                 inst("Zebra", group),
             ];
             let tree = GroupTree::new_with_groups(&sessions, &[]);
-            let items = flatten_tree(&tree, &sessions, SortOrder::Name);
+            let items = flatten_tree(&tree, &sessions, &sessions, SortOrder::Name);
             assert_eq!(
                 session_titles(&items, &sessions),
                 ["Apple", "Mango", "Zebra"],
@@ -1348,7 +1366,7 @@ mod tests {
         let instances = vec![old_fav, new_plain];
         for (enabled, want) in [(false, "new"), (true, "old")] {
             crate::session::set_favorites_first(enabled);
-            let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::Name);
+            let items = flatten_tree_all_profiles(&instances, &instances, &trees, SortOrder::Name);
             assert_eq!(group_names(&items)[0], want, "favorites_first={enabled}");
         }
     }

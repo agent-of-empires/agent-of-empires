@@ -5756,10 +5756,16 @@ impl HomeView {
         // `resolve_row_to_index` already short-circuits while any non-live-send overlay is
         // open and inside the diff takeover, so no extra gating here.
         let anchor = (col.saturating_add(1), row.saturating_add(1));
-        if let Some(idx) = self.resolve_row_to_index(col, row) {
-            if self.cursor != idx {
-                self.cursor = idx;
+        if let Some(clicked) = self.resolve_row_to_index(col, row) {
+            if self.cursor != clicked {
+                self.cursor = clicked;
                 self.update_selected();
+            }
+            // Selecting can drop the row the cursor left, so the clicked row is where the
+            // rebuild put the cursor.
+            let idx = self.cursor;
+            if idx >= self.flat_items.len() {
+                return true;
             }
             // Every menu entry would be refused on the creating stub, so say why
             // instead of opening a menu that can only fail.

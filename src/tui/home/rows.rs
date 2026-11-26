@@ -332,20 +332,22 @@ impl HomeView {
         }
 
         let mut pool = self.shown_in_groups(self.cloned_instances_in_active_view(), hide_stopped);
+        // Headers rank by every member, so the rows the filter hides do not move them.
+        let ranked = needs_you_only.then(|| pool.clone());
         if needs_you_only {
             pool.retain(|inst| self.listed_by_needs_you(inst));
         }
+        let ranked = ranked.as_deref().unwrap_or(&pool);
+        let flatten = |tree| flatten_tree(tree, &pool, ranked, self.sort_order);
         let mut items = if let Some(profile) = &self.active_profile {
-            self.group_trees
-                .get(profile)
-                .map_or_else(Vec::new, |tree| flatten_tree(tree, &pool, self.sort_order))
+            self.group_trees.get(profile).map_or_else(Vec::new, flatten)
         } else if self.storages.len() <= 1 {
             self.group_trees
                 .values()
                 .next()
-                .map_or_else(Vec::new, |tree| flatten_tree(tree, &pool, self.sort_order))
+                .map_or_else(Vec::new, flatten)
         } else {
-            flatten_tree_all_profiles(&pool, &self.group_trees, self.sort_order)
+            flatten_tree_all_profiles(&pool, ranked, &self.group_trees, self.sort_order)
         };
         self.append_suggested(&mut items);
         append_archived_section(&mut items, &pool, self.archived_section_collapsed);
@@ -444,7 +446,9 @@ impl HomeView {
         for (path, _) in self.project_group_collapsed.iter().filter(|(_, &c)| c) {
             tree.set_collapsed(path, true);
         }
-        // Seeded before filtering, so a header keeps its place while its sessions are hidden.
+        // Seeded and ranked before filtering, so a header keeps its place while its sessions
+        // are hidden.
+        let ranked = needs_you_only.then(|| self.shown_in_groups(grouped.clone(), hide_stopped));
         let listed_paths = needs_you_only.then(|| {
             grouped.retain(|inst| self.listed_by_needs_you(inst));
             let mut paths = HashSet::new();
@@ -462,7 +466,12 @@ impl HomeView {
             paths
         });
         let grouped = self.shown_in_groups(grouped, hide_stopped);
-        let mut items = flatten_tree(&tree, &grouped, self.sort_order);
+        let mut items = flatten_tree(
+            &tree,
+            &grouped,
+            ranked.as_deref().unwrap_or(&grouped),
+            self.sort_order,
+        );
         if let Some(paths) = listed_paths {
             items.retain(|item| match item {
                 Item::Group { path, .. } => paths.contains(path),
