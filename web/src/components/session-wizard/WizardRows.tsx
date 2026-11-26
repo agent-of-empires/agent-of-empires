@@ -18,8 +18,13 @@ function Chevron() {
   );
 }
 
-function Label({ children }: { children: ReactNode }) {
-  return <span className="w-24 shrink-0 text-sm text-text-secondary">{children}</span>;
+function Label({ children, info }: { children: ReactNode; info?: ReactNode }) {
+  return (
+    <span className="w-24 shrink-0 inline-flex items-center gap-0.5 text-sm text-text-secondary">
+      {children}
+      {info}
+    </span>
+  );
 }
 
 /** Bordered group holding one-line wizard rows. */
@@ -74,6 +79,7 @@ export function SwitchRow({
   disabled = false,
   testId,
   highlight,
+  info,
 }: {
   label: string;
   checked: boolean;
@@ -85,11 +91,13 @@ export function SwitchRow({
   testId?: string;
   /** Outlines a row a failed create blames; its summary carries the text cue. */
   highlight?: "error";
+  /** Sits after the label, such as an info popover's icon. */
+  info?: ReactNode;
 }) {
   const summaryText = <span className="flex-1 min-w-0 truncate text-xs text-text-dim">{summary}</span>;
   return (
     <div className={`${ROW} ${highlightClass(highlight)}`} data-testid={testId}>
-      <Label>{label}</Label>
+      <Label info={info}>{label}</Label>
       {onConfigure ? (
         <button
           type="button"

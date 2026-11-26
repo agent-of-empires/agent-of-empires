@@ -1,5 +1,6 @@
-# Claude artifacts
-.claude/
+# Claude artifacts, except repo-level skills
+.claude/*
+!.claude/skills/
 # Rust build artifacts
 /target/
 /vendor/crossterm/Cargo.lock
@@ -70,6 +71,10 @@ website/src/pages/docs/cli/*.md
 website/src/pages/docs/structured-view/*.md
 website/src/pages/docs/development/*.md
 website/src/pages/docs/development/internals/*.md
+website/public/guides/
+website/public/docs/
+website/public/llms.txt
+website/public/llms-full.txt
 .worktrees/
 .gstack/
 .playwright-mcp/

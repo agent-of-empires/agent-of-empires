@@ -100,6 +100,18 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     },
 ];
 
+/// Where a prefilled prompt came from, shown above the form.
+#[derive(Clone)]
+pub struct PromptOrigin {
+    pub provider: String,
+    pub source_ref: String,
+    pub reason: String,
+    /// Untrusted provider text behind the prompt, shown in the Ctrl+O editor.
+    pub source_text: Option<String>,
+    /// Links the created Session to the suggestion; `None` for "Start another".
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
+}
+
 #[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
 pub struct NewSessionData {
@@ -135,6 +147,9 @@ pub struct NewSessionData {
     /// Create in the structured (ACP) view instead of a tmux terminal. Only
     /// true for ACP-capable tools; `validate_structured_choice` enforces it.
     pub structured: bool,
+    /// First turn typed into the agent once it is ready.
+    pub initial_prompt: Option<String>,
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
 }
 
 /// The one conversion from wizard output to builder input, so a new field
@@ -172,6 +187,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             no_submodules: false,
             tie_workdir_to_name: false,
             worktree_path_id: None,
+            session_id: None,
         }
     }
 }
@@ -282,6 +298,13 @@ pub struct NewSessionDialog {
     pub(super) fork_seed: Option<crate::session::ForkSeed>,
     /// The title the dialog was opened with, which the user did not type.
     pub(super) suggested_title: String,
+    /// First turn for the agent; `prompt_origin` is set only for a suggestion.
+    prompt: Input,
+    prompt_origin: Option<PromptOrigin>,
+    /// The prompt editor overlay, opened by Ctrl+O; it shows `prompt_origin.source_text` above the prompt.
+    pub(super) prompt_editor: bool,
+    /// A suggestion left the path unresolved: submit waits for the user to pick one.
+    path_required: bool,
     /// `(focused_field_index, rect)` per main-form field, repopulated every
     /// frame and empty while an overlay is up, so a click during one cannot
     /// snap focus to the field that used to sit there.
@@ -660,6 +683,10 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
+            prompt: Input::default(),
+            prompt_origin: None,
+            prompt_editor: false,
+            path_required: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -681,6 +708,13 @@ impl NewSessionDialog {
         }
     }
 
+    /// Leaves the path empty and focused until the user picks a project.
+    pub fn require_path(&mut self) {
+        self.path = Input::new(String::new());
+        self.path_required = true;
+        self.focused_field = self.path_field();
+    }
+
     pub fn set_group(&mut self, group: String) {
         self.group = Input::new(group);
     }
@@ -690,12 +724,39 @@ impl NewSessionDialog {
         self.suggested_title = title;
     }
 
+    /// Applies a preset's rows, each only as far as this form allows. Call after `set_tool`.
+    pub fn set_preset(
+        &mut self,
+        structured: Option<bool>,
+        worktree: bool,
+        sandbox: bool,
+        yolo: bool,
+    ) {
+        if let Some(structured) = structured.filter(|_| self.structured_capable) {
+            self.set_structured(structured);
+        }
+        if !self.selected_tool_host_only() {
+            self.worktree_enabled = worktree;
+            if sandbox && self.docker_available {
+                self.set_sandbox_enabled(true);
+                self.sandbox_dirty = true;
+            }
+        }
+        self.yolo_mode = yolo || self.yolo_mode;
+    }
+
+    /// Set the first turn a plugin proposed, edited with Ctrl+O.
+    pub fn set_suggestion(&mut self, prompt: String, origin: PromptOrigin) {
+        self.prompt = Input::new(prompt);
+        self.prompt_origin = Some(origin);
+    }
+
     pub fn set_fork_from(&mut self, seed: crate::session::ForkSeed) {
         self.fork_seed = Some(seed);
         if self.terminal_fork() {
             self.structured_capable = false;
-            self.apply_structured_default();
         }
+        self.apply_structured_default();
     }
 
     /// A terminal fork resumes through the agent CLI; a structured child would
@@ -704,6 +765,16 @@ impl NewSessionDialog {
         matches!(
             self.fork_seed,
             Some(crate::session::ForkSeed::Terminal { .. })
+        )
+    }
+
+    /// A structured fork seeds the child through the ACP `session/fork` handshake; a
+    /// terminal child would carry the parent's ACP id without that handshake, so the
+    /// view follows the seed whatever the configured default.
+    fn structured_fork(&self) -> bool {
+        matches!(
+            self.fork_seed,
+            Some(crate::session::ForkSeed::Structured { .. })
         )
     }
 
@@ -717,7 +788,8 @@ impl NewSessionDialog {
     /// Switch tools and reset the per-tool YOLO, sandbox and Ctrl+P fields.
     /// Reselecting the current tool keeps the user's edits.
     fn select_tool_index(&mut self, index: usize) {
-        if index == self.tool_index {
+        // A structured fork runs its parent's agent: the daemon refuses another.
+        if index == self.tool_index || self.structured_fork() {
             return;
         }
         self.tool_index = index;
@@ -739,6 +811,9 @@ impl NewSessionDialog {
     /// The Yolo choice resets only when the view moves the session onto or off an
     /// always-Yolo agent.
     fn set_structured(&mut self, enabled: bool) {
+        if self.structured_fork() && !enabled {
+            return;
+        }
         let was_locked = self.selected_tool_always_yolo();
         self.structured_enabled = enabled;
         self.structured_choice = Some(enabled);
@@ -821,6 +896,17 @@ impl NewSessionDialog {
         self.yolo_mode
     }
 
+    /// The view the session would be created in.
+    #[cfg(test)]
+    pub fn structured_value(&self) -> bool {
+        self.structured_enabled && self.structured_capable
+    }
+
+    #[cfg(test)]
+    pub fn profile_value(&self) -> &str {
+        self.selected_profile()
+    }
+
     #[cfg(test)]
     pub fn fork_seed(&self) -> Option<&crate::session::ForkSeed> {
         self.fork_seed.as_ref()
@@ -830,8 +916,9 @@ impl NewSessionDialog {
     /// incapable tool forces it off, and a capable one restores the user's
     /// choice or else the configured default.
     fn apply_structured_default(&mut self) {
-        self.structured_enabled =
-            self.structured_capable && self.structured_choice.unwrap_or(self.structured_default);
+        self.structured_enabled = self.structured_capable
+            && (self.structured_fork()
+                || self.structured_choice.unwrap_or(self.structured_default));
     }
 
     /// The test constructors skip config resolution, so capability is opted
@@ -1276,6 +1363,10 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
+            prompt: Input::default(),
+            prompt_origin: None,
+            prompt_editor: false,
+            path_required: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1360,6 +1451,10 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
+            prompt: Input::default(),
+            prompt_origin: None,
+            prompt_editor: false,
+            path_required: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1385,6 +1480,10 @@ impl NewSessionDialog {
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<NewSessionData>> {
         if self.show_help {
             self.show_help = false;
+            return Some(DialogResult::Continue);
+        }
+        if self.prompt_editor {
+            self.prompt_editor = false;
             return Some(DialogResult::Continue);
         }
 
@@ -1534,7 +1633,7 @@ impl NewSessionDialog {
         let fields = self.field_indices();
 
         if self.focused_field == fields.profile {
-            if self.available_profiles.len() > 1 {
+            if self.available_profiles.len() > 1 && !self.structured_fork() {
                 self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
                 self.reload_config_defaults();
             }
@@ -1569,6 +1668,23 @@ impl NewSessionDialog {
         if self.show_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.show_help = false;
+            }
+            return DialogResult::Continue;
+        }
+
+        if self.prompt_editor {
+            let toggle =
+                key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                _ if toggle => self.prompt_editor = false,
+                KeyCode::Esc => self.prompt_editor = false,
+                KeyCode::Enter => {
+                    self.prompt
+                        .handle(tui_input::InputRequest::InsertChar('\n'));
+                }
+                _ => {
+                    self.prompt.handle_event(&crossterm::event::Event::Key(key));
+                }
             }
             return DialogResult::Continue;
         }
@@ -1669,6 +1785,11 @@ impl NewSessionDialog {
             }
         }
 
+        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.prompt_editor = true;
+            return DialogResult::Continue;
+        }
+
         if self.handle_path_shortcuts(key) {
             return DialogResult::Continue;
         }
@@ -1690,6 +1811,11 @@ impl NewSessionDialog {
                 self.error_message = None;
                 if self.focused_field == self.path_field() {
                     self.seed_defaults_for_path();
+                }
+                if self.path_required && !self.scratch && self.path.value().trim().is_empty() {
+                    self.error_message = Some("Pick a project path before starting.".into());
+                    self.focused_field = self.path_field();
+                    return DialogResult::Continue;
                 }
                 // The server provisions the scratch dir, so no path check.
                 if !self.scratch {
@@ -1745,7 +1871,9 @@ impl NewSessionDialog {
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.profile =>
             {
-                if self.available_profiles.len() > 1 {
+                // A structured fork stays in its parent's profile, where its
+                // agent's command and store are defined: the daemon refuses another.
+                if self.available_profiles.len() > 1 && !self.structured_fork() {
                     if key.code == KeyCode::Left {
                         self.profile_index = if self.profile_index == 0 {
                             self.available_profiles.len() - 1
@@ -2341,6 +2469,12 @@ impl NewSessionDialog {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.prompt_editor {
+            for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+                self.prompt.handle(tui_input::InputRequest::InsertChar(ch));
+            }
+            return;
+        }
         let target: &mut Input = if let Some(ref mut input) = self.env_editing_input {
             input
         } else if let Some(ref mut input) = self.hook_env.editing_input {
@@ -2367,6 +2501,13 @@ impl NewSessionDialog {
     /// capable), surfacing a refusal inline. Runs before any worktree, scratch
     /// or container work, so a refusal cannot orphan resources.
     fn validate_structured(&mut self) -> bool {
+        if self.structured_fork() && !self.structured_capable {
+            self.error_message = Some(format!(
+                "This fork continues a structured view conversation, but '{}' cannot run in the structured view here.",
+                self.available_tools[self.tool_index]
+            ));
+            return false;
+        }
         if !(self.structured_enabled && self.structured_capable) {
             return true;
         }
@@ -2460,6 +2601,12 @@ impl NewSessionDialog {
             scratch: self.scratch,
             fork_seed: self.fork_seed.clone(),
             structured: self.structured_enabled && self.structured_capable,
+            initial_prompt: (!self.prompt.value().trim().is_empty())
+                .then(|| self.prompt.value().to_string()),
+            suggestion: self
+                .prompt_origin
+                .as_ref()
+                .and_then(|origin| origin.suggestion.clone()),
         })
     }
 

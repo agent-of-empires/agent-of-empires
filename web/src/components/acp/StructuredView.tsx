@@ -35,6 +35,7 @@ import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { SystemNotices } from "./SystemNotices";
+import { TRANSCRIPT_COLUMN } from "./transcriptColumn";
 import { AssistantMessage, UserMessage } from "./ThreadMessages";
 import { UsageLimitSection } from "./UsageLimitBanner";
 import { ToolExpansionProvider } from "./ToolExpansion";
@@ -59,6 +60,10 @@ interface Props {
   rateLimitFailoverTo?: string;
   /** The profile's Structured view settings; null where Settings can't be edited. */
   settingsHref?: string | null;
+  /** The profile's Agent defaults row; null where Settings can't be edited. */
+  agentDefaultsHref?: string | null;
+  /** Opens a Settings link in the app. */
+  onOpenSettings?: (href: string) => void;
   /** Session `tool` registry key; selects the AgentProfile. */
   tool: string | null | undefined;
   /** Resolved ACP agent key; the switch-agent modal's fallback before any `AgentSwitched`. */
@@ -314,7 +319,7 @@ function AcpChrome({
             tabIndex={0}
             className="flex-1 overflow-x-hidden overflow-y-auto [overflow-anchor:none]"
           >
-            <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
+            <div ref={messagesContentRef} className={`${TRANSCRIPT_COLUMN} px-4 py-6`}>
               {!readOnly && (
                 <ThreadPrimitive.Empty>
                   <EmptyState onPick={ctx.sendPrompt} notRunning={notRunning} />
@@ -456,6 +461,16 @@ function ComposerDock({
   const compactAliases = useCompactAliases();
   // The Daemon's solo commands: they run as their own turn, never steered into one.
   const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
+  const { agentDefaultsHref, onOpenSettings } = view;
+  const currentAgent = state.agent ?? acpAgent;
+  // The Daemon resolves which profile and Agent the default saves under, as the spawn does.
+  const modelDefault = useMemo(
+    () =>
+      agentDefaultsHref && onOpenSettings && currentAgent
+        ? { sessionId, agent: currentAgent, open: () => onOpenSettings(agentDefaultsHref) }
+        : null,
+    [sessionId, agentDefaultsHref, onOpenSettings, currentAgent],
+  );
   // A send would start the Session, which rebuilds the container without Recreate's warning.
   const blockedReason =
     state.startupError && state.startupCause?.kind === "container_missing"
@@ -590,6 +605,7 @@ function ComposerDock({
           primerPrefill={primerPrefill}
           queuedPrompts={state.queuedPrompts}
           editQueuedPrompt={ctx.editQueuedPrompt}
+          modelDefault={modelDefault}
         />
       </CollapsibleRegion>
     </>

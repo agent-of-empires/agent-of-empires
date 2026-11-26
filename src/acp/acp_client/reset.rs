@@ -68,6 +68,8 @@ mod tests {
         /// Emitted right after the first `session/new`.
         initial_update: Option<serde_json::Value>,
         claude_home: Option<PathBuf>,
+        /// Profile key in place of the default fake `codex`.
+        agent_key: Option<&'static str>,
     }
 
     impl FakeAgent {
@@ -138,9 +140,13 @@ done
 
         async fn spawn(self, dir: &Path, name: &str, effort: Option<&str>) -> (AcpClient, PathBuf) {
             let claude_home = self.claude_home.clone();
+            let agent_key = self.agent_key;
             let (script, capture) = self.write(dir);
             let mut config = reset_fake_spawn_config(&script, dir);
             config.default_effort = effort.map(Into::into);
+            if let Some(key) = agent_key {
+                config.agent_key = key.into();
+            }
             if let Some(store) = claude_home {
                 config.agent_key = "claude".into();
                 config.tool = "claude".into();
@@ -901,15 +907,17 @@ done
             ("load_failed", true, true, true, false, false, 1),
             ("unavailable_new_failed", true, false, false, true, false, 0),
             ("load_and_new_failed", true, true, true, true, false, 0),
-            ("fork_unsupported", true, false, false, false, true, 1),
+            // An adapter without session/fork fails a requested fork before
+            // any load or new, so it cannot start the child empty.
+            ("fork_unsupported", true, false, false, false, true, 0),
             (
-                "fork_unsupported_load_failed",
-                true,
+                "fork_unsupported_load_capable",
                 true,
                 true,
                 false,
+                false,
                 true,
-                1,
+                0,
             ),
         ] {
             let tmp = tempfile::TempDir::new().unwrap();
@@ -976,17 +984,24 @@ done
                 }
             }
             client.shutdown().await.unwrap();
+            let fails = new_fails || fork;
             let position = |pred: fn(&Event) -> bool| events.iter().position(pred);
             let assignment = position(|e| matches!(e, Event::AcpSessionAssigned { .. }));
-            assert_eq!(assignment.is_some(), !new_fails, "{name}");
-            assert_eq!(
-                position(|e| matches!(e, Event::AgentStartupError { .. })).is_some(),
-                new_fails,
-                "{name}"
-            );
+            assert_eq!(assignment.is_some(), !fails, "{name}");
+            let startup_error = events.iter().find_map(|e| match e {
+                Event::AgentStartupError { message, .. } => Some(message.as_str()),
+                _ => None,
+            });
+            assert_eq!(startup_error.is_some(), fails, "{name}");
+            if fork {
+                assert!(
+                    startup_error.is_some_and(|m| m.contains("session/fork")),
+                    "{name}: {startup_error:?}"
+                );
+            }
             assert_eq!(
                 position(|e| matches!(e, Event::Stopped { .. })).is_some(),
-                !new_fails,
+                !fails,
                 "{name}"
             );
             let is_reset = |e: &Event| matches!(e, Event::SessionContextReset { .. });
@@ -1035,7 +1050,11 @@ done
                 .iter()
                 .filter(|r| r["method"] == "session/load")
                 .collect();
-            assert_eq!(loads.len(), usize::from(stored && load_capable), "{name}");
+            assert_eq!(
+                loads.len(),
+                usize::from(!fork && stored && load_capable),
+                "{name}"
+            );
             if let Some(load) = loads.first() {
                 assert_eq!(load["params"]["sessionId"], "previous-session", "{name}");
             }
@@ -1045,10 +1064,96 @@ done
                 .count();
             assert_eq!(
                 news,
-                usize::from(!(stored && load_capable && !load_fails)),
+                usize::from(!fork && !(stored && load_capable && !load_fails)),
                 "{name}"
             );
         }
+    }
+
+    /// An adapter that advertises session/fork but refuses one fails the spawn
+    /// without a context reset, so the pending fork survives: the next start
+    /// forks again instead of opening an empty conversation in the fork row.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_fork_keeps_its_seed_for_the_next_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = tmp.path().join("fork-agent.sh");
+        let capture = tmp.path().join("capture.ndjson");
+        let refused = tmp.path().join("refused-once");
+        let script_body = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '__CAPTURE__'
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"fork":{}}}}}\n' "$id" ;;
+    *'"method":"session/fork"'*)
+      if [ -e '__REFUSED__' ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"forked-session"}}\n' "$id"
+      else
+        : > '__REFUSED__'
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"fixture refused the fork"}}\n' "$id"
+      fi ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"empty-session"}}\n' "$id" ;;
+  esac
+done
+"#
+        .replace("__CAPTURE__", capture.to_str().unwrap())
+        .replace("__REFUSED__", refused.to_str().unwrap());
+        std::fs::write(&script, script_body).unwrap();
+
+        for (start, assigned) in [("first", None), ("second", Some("forked-session"))] {
+            let mut config = reset_fake_spawn_config(&script, tmp.path());
+            config.fork_from = Some("parent-session".into());
+            let mut client = AcpClient::spawn(config, AcpSessionId(format!("fork-{start}")))
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while let Some(event) = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect(start)
+            {
+                let assigned = matches!(event, Event::AcpSessionAssigned { .. });
+                events.push(event);
+                if assigned {
+                    client.shutdown().await.unwrap();
+                }
+            }
+            client.shutdown().await.unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, Event::SessionContextReset { .. })),
+                "{start} start: a refused fork must not reset the context: {events:?}"
+            );
+            let got = events.iter().find_map(|e| match e {
+                Event::AcpSessionAssigned { acp_session_id } => Some(acp_session_id.as_str()),
+                _ => None,
+            });
+            assert_eq!(got, assigned, "{start} start");
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Event::AgentStartupError { .. })),
+                assigned.is_none(),
+                "{start} start: {events:?}"
+            );
+        }
+
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(capture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let count = |method: &str| requests.iter().filter(|r| r["method"] == method).count();
+        assert_eq!(count("session/fork"), 2, "both starts fork the parent");
+        assert_eq!(
+            count("session/new"),
+            0,
+            "neither start opens an empty session"
+        );
     }
 
     /// The deadline starts before enqueueing, so an expired command never
@@ -1143,9 +1248,15 @@ done
             } else {
                 None
             };
+            // Only a profile without subagents tails a legacy launch.
+            let agent_key = (index == 1).then_some("opencode");
+            if let Some(key) = agent_key {
+                assert!(!crate::acp::agent_profiles::resolve(key).supports_subagents);
+            }
             let agent = FakeAgent {
                 initial_update: Some(initial_update),
                 claude_home,
+                agent_key,
                 ..FakeAgent::default()
             };
             let (mut client, capture) = agent.spawn(&dir, "reset-open-work", None).await;

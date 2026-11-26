@@ -43,7 +43,7 @@ The host keeps the five newest logs per plugin and removes older ones when a wor
 
 ## Featured plugins
 
-Featured plugins are first-party plugins whose release hashes are pinned in `plugins/featured.toml`, so `aoe plugin list` shows them as `featured`. Seven are pinned today; install any of them with `aoe plugin install gh:agent-of-empires/<repo>`.
+Featured plugins are first-party plugins whose release hashes are pinned in `plugins/featured.toml`, so `aoe plugin list` shows them as `featured`. Seven are pinned today; install any of them with `aoe plugin install gh:agent-of-empires/<repo>`. Set `suggestions = true` on a featured entry by hand when its pinned manifest declares `[suggestions]`; discover results then carry that flag.
 
 - **Board** (`agent-of-empires.kanban`): a kanban board of your sessions in the web dashboard. Install with `aoe plugin install gh:agent-of-empires/plugin-kanban`; it needs Node 22 or newer on the daemon's `PATH`.
 
@@ -158,6 +158,24 @@ The previous tree stays backed up until both metadata writes commit. Restoration
 preserves the prior enabled, source, dev, grant, dismissal and settings values
 without overwriting unrelated config. A backup cleanup failure after commit is
 reported as recovery required; do not restore that backup over the committed tree.
+
+Default-mode remote installs and updates write
+`<app_dir>/.plugin-publication-active` before changing the installed tree. On
+writable Daemon startup, recovery takes the plugin operation lock. It can
+restore the prior installation if no build or metadata write could have
+started, or keep a committed installation and remove its owned backup if
+both metadata entries and descriptor-derived directory birth identities
+match the journal. Publication requires file birth and mount identity
+support. Recovery never traverses a mounted directory during cleanup.
+
+An interrupted build, a partial metadata write, or conflicting evidence
+still requires manual recovery. While the journal remains, plugin mutations
+and external worker launches are fenced. Verify that owned commands have
+exited and restore or confirm the intended tree and both metadata entries
+before removing the journal. Recovery does not scan or delete abandoned
+acquisition directories. Local sources and strict staging keep their
+existing recovery rules.
+
 Local release-binary targets must be regular executable files before publication.
 Release assets are streamed into staging and may only add files: an asset entry
 that would replace a file already in the source tree, or that is a symlink,
@@ -211,10 +229,18 @@ retry. The `<app_dir>/.plugin-staging-active` journal records native staging own
 Disabling strict mode does not clear existing recovery evidence.
 Startup and worker admission can retire an abandoned pre-consent journal only
 after proving its recorded owners, PID namespace and native supervisor groups
-have exited and its original host mountpoint is unchanged. This does not erase
-other recovery evidence. Partial journals, legacy markers and interrupted
-publication remain fenced; a started macOS image operation also requires manual
-inspection when ownership is uncertain.
+have exited. Initial recovery verifies the original host mountpoint. Once
+cleanup intent is durable, a retry accepts missing staging directories and
+verifies any that remain. Recovery removes only the empty staging mountpoint
+and directory if the journal proves their exact identities and the directories
+are owned by the Daemon user and not writable by group or others. If deletion
+authority cannot be recorded at acquisition, for example on a group-writable
+`plugins/` or without directory birth timestamps, the journal can still retire
+without deleting those directories. Recovery never removes nonempty, replaced,
+or unrelated directories.
+Partial journals, legacy markers, and interrupted publication remain fenced;
+a started macOS image operation also requires manual inspection when ownership
+is uncertain.
 Same-boot Linux recovery requires the original PID namespace. After a reboot,
 recovery requires a matching, nonempty machine identity; missing or foreign
 identity leaves the journal fenced.

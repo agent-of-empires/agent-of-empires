@@ -20,6 +20,8 @@ pub enum ApiErrorCode {
     LifecycleLocked,
     TrashIncomplete,
     LifecycleSuperseded,
+    /// The caller selected its target under a profile the Daemon does not serve.
+    ProfileMismatch,
     PendingTargetGone,
     TlsRequired,
     RuntimeEpochMismatch,
@@ -48,6 +50,8 @@ pub enum ApiErrorCode {
     SessionArchived,
     SessionTrashed,
     AccountSwapUnavailable,
+    ModelPinned,
+    UnknownAgent,
     TerminalSwitchRefused(TerminalSwitchReason),
 }
 
@@ -65,6 +69,7 @@ impl ApiErrorCode {
             Self::LifecycleLocked => "lifecycle_locked",
             Self::TrashIncomplete => "trash_incomplete",
             Self::LifecycleSuperseded => "lifecycle_superseded",
+            Self::ProfileMismatch => "profile_mismatch",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
             Self::SandboxMigrationDeferred => "sandbox_migration_deferred",
@@ -91,6 +96,8 @@ impl ApiErrorCode {
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
             Self::AccountSwapUnavailable => "account_swap_unavailable",
+            Self::ModelPinned => "model_pinned",
+            Self::UnknownAgent => "unknown_agent",
             Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
@@ -105,6 +112,7 @@ impl ApiErrorCode {
             Self::LifecycleLocked
             | Self::TrashIncomplete
             | Self::LifecycleSuperseded
+            | Self::ProfileMismatch
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
             | Self::ManagedResumeRefused(_)
@@ -122,12 +130,14 @@ impl ApiErrorCode {
             | Self::SessionNotRunning
             | Self::SessionArchived
             | Self::SessionTrashed
-            | Self::AccountSwapUnavailable => StatusCode::CONFLICT,
+            | Self::AccountSwapUnavailable
+            | Self::ModelPinned => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
-            Self::CreateHookFailed | Self::WorkingDirMissing | Self::BranchNotFound => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::CreateHookFailed
+            | Self::WorkingDirMissing
+            | Self::BranchNotFound
+            | Self::UnknownAgent => StatusCode::BAD_REQUEST,
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
             Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
@@ -178,6 +188,7 @@ impl ApiErrorCode {
             b"lifecycle_locked" => Self::LifecycleLocked,
             b"trash_incomplete" => Self::TrashIncomplete,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
+            b"profile_mismatch" => Self::ProfileMismatch,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
@@ -204,6 +215,8 @@ impl ApiErrorCode {
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
+            b"model_pinned" => Self::ModelPinned,
+            b"unknown_agent" => Self::UnknownAgent,
             other => Self::TerminalSwitchRefused(
                 TerminalSwitchReason::ALL
                     .into_iter()
@@ -285,6 +298,12 @@ mod tests {
                 Some(ApiErrorCode::NoRevive),
             ),
             (StatusCode::FORBIDDEN, "no_revive", false, None),
+            (
+                StatusCode::CONFLICT,
+                "profile_mismatch",
+                false,
+                Some(ApiErrorCode::ProfileMismatch),
+            ),
             (
                 StatusCode::CONFLICT,
                 "lifecycle_superseded",
@@ -370,6 +389,20 @@ mod tests {
                 false,
                 Some(ApiErrorCode::AccountSwapUnavailable),
             ),
+            (
+                StatusCode::CONFLICT,
+                "model_pinned",
+                false,
+                Some(ApiErrorCode::ModelPinned),
+            ),
+            (StatusCode::BAD_REQUEST, "model_pinned", false, None),
+            (
+                StatusCode::BAD_REQUEST,
+                "unknown_agent",
+                false,
+                Some(ApiErrorCode::UnknownAgent),
+            ),
+            (StatusCode::CONFLICT, "unknown_agent", false, None),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));

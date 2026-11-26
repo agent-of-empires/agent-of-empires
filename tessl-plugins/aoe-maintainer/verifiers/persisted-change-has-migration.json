@@ -1,0 +1,18 @@
+{
+  "name": "Breaking persisted data change ships a registered migration",
+  "instruction": "A change that breaks the shape or location of data stored in the platform app directory adds a registered migration in src/migrations/ instead of an inline compatibility path.",
+  "relevant_when": "A Rust patch renames, removes or changes the type of a serde field, adds a field with no serde default, or removes the serde default of an existing field, on a struct or enum that is written to an app-directory file (config.toml, profile or repo config, state.toml, sessions.json, groups.json, projects.json, or a SQLite store such as acp_events.db or state.db), renames or removes a variant of such an enum, changes such a type's serde rename or tag attributes, alters an existing SQLite table or column, or changes the file name or directory where such data is stored.",
+  "context": "AGENTS.md and docs/development/adding-a-migration.md require persisted schema or path changes to go through src/migrations/vNNN_description.rs, registered in src/migrations/mod.rs with CURRENT_VERSION bumped, and forbid inline fallbacks. Not breaking: adding an optional field whose missing and null forms mean the same thing (for example with #[serde(default)]), adding a new table or a new file, and changes to wire or telemetry payloads that are not stored.",
+  "scope": "diff",
+  "scope_reason": "The rule pairs a change to a persisted type with companion changes under src/migrations/, which only the change's patch set shows together.",
+  "checklist": [
+    {
+      "name": "migration-file-and-registration",
+      "rule": "The patch set adds a src/migrations/vNNN_*.rs file and changes src/migrations/mod.rs to register it and bump CURRENT_VERSION. Not applicable when the patch makes no breaking persisted change as defined in relevant_when."
+    },
+    {
+      "name": "no-inline-compat-path",
+      "rule": "The patch does not keep the old shape or location readable through an inline fallback outside src/migrations/, such as #[serde(alias = ...)] on a renamed persisted field, a deserializer that accepts both old and new shapes, or code that reads the old path when the new one is missing. Not applicable when the patch makes no breaking persisted change."
+    }
+  ]
+}

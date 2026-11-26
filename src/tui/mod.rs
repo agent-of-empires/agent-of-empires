@@ -23,6 +23,7 @@ mod session_feed;
 pub mod settings;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
+mod suggestions;
 mod telemetry;
 pub(crate) mod terminal_output;
 mod worker;

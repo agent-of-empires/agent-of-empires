@@ -23,6 +23,10 @@ const WORKTREE_SCHEMA = [
 ];
 
 vi.mock("../../lib/api", () => ({
+  fetchSuggestions: vi.fn(() => Promise.resolve(null)),
+  fetchAgents: vi.fn(() => Promise.resolve(null)),
+  fetchSuggestionPresets: vi.fn(() => Promise.resolve(null)),
+  fetchSuggestionMappings: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ worktree: {} })),
@@ -77,5 +81,38 @@ describe("SettingsView schema load", () => {
     await waitFor(() => expect(screen.getByText("Failed to load settings schema.")).toBeTruthy());
     // The non-schema selector is still there alongside the schema-slot error.
     expect(screen.getByText("Default profile")).toBeTruthy();
+  });
+
+  describe("Suggestions tab", () => {
+    const SNAPSHOT = {
+      prefs: {
+        homepage: true,
+        sidebar: false,
+        refresh_minutes: 15,
+        show_source_ref: true,
+        provider_order: ["gh"],
+      },
+      providers: [{ id: "gh", name: "GitHub", status: "ok", enabled: true, sources: [] }],
+      items: [],
+    };
+    beforeEach(() => {
+      vi.mocked(api.fetchSuggestions).mockResolvedValue(SNAPSHOT as never);
+    });
+
+    it("renders when general settings fail to load", async () => {
+      vi.mocked(api.fetchSettings).mockResolvedValue(null);
+      renderView("suggestions");
+      expect(await screen.findByText("Show in the sidebar")).toBeTruthy();
+      expect(screen.queryByText("Loading settings...")).toBeNull();
+    });
+
+    it("shows the schema failure and Retry beside the provider source settings", async () => {
+      vi.mocked(api.fetchSettings).mockResolvedValue({ worktree: {} });
+      vi.mocked(api.getSettingsSchema).mockResolvedValue(null);
+      renderView("suggestions");
+      expect(await screen.findByText("Show in the sidebar")).toBeTruthy();
+      await waitFor(() => expect(screen.getByText("Failed to load settings schema.")).toBeTruthy());
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    });
   });
 });

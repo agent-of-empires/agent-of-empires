@@ -177,14 +177,7 @@ impl Write for DeadlineWriter<'_> {
         }
     }
     fn flush(&mut self) -> io::Result<()> {
-        if self.cancel.is_some_and(CancellationToken::is_cancelled) {
-            return Err(io::ErrorKind::ConnectionAborted.into());
-        }
-        if Instant::now() >= self.deadline {
-            Err(io::ErrorKind::TimedOut.into())
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 }
 impl State {

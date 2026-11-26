@@ -160,7 +160,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/reclaim-ownership",
             post(api::reclaim_session_ownership).layer(read_only.clone()),
         )
-        .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
             patch(api::update_session_archive),
@@ -195,6 +194,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/account-targets",
             get(api::session_account_targets),
+        )
+        .route(
+            "/api/sessions/{id}/acp-default-model",
+            get(api::get_session_agent_default_model),
         )
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
@@ -236,6 +239,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/profiles/{name}/settings",
             get(api::get_profile_settings).patch(api::update_profile_settings),
+        )
+        .route(
+            "/api/profiles/{name}/acp-defaults/{agent}/model",
+            get(api::get_agent_default_model)
+                .put(api::set_agent_default_model)
+                .layer(read_only.clone()),
         )
         .route("/api/profiles/{name}/rename", patch(api::rename_profile))
         .route("/api/default-profile", patch(api::default_profile))
@@ -306,6 +315,41 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/plugins/{id}/pages/{page_id}/ticket",
             post(api::mint_plugin_page_ticket),
+        )
+        .route("/api/suggestions", get(api::get_suggestions))
+        .route("/api/suggestions/refresh", post(api::refresh_suggestions))
+        .route(
+            "/api/suggestions/checks/run",
+            post(api::run_suggestion_checks),
+        )
+        .route("/api/suggestions/fix", post(api::run_suggestion_fix))
+        .route("/api/suggestions/dismiss", post(api::dismiss_suggestion))
+        .route(
+            "/api/suggestions/undismiss",
+            post(api::undismiss_suggestion),
+        )
+        .route(
+            "/api/suggestions/sources",
+            patch(api::update_suggestion_source),
+        )
+        .route("/api/suggestions/prefs", patch(api::patch_suggestion_prefs))
+        .route(
+            "/api/suggestions/presets",
+            get(api::get_suggestion_presets)
+                .put(api::put_suggestion_preset)
+                .delete(api::delete_suggestion_preset),
+        )
+        .route("/api/suggestions/prepare", post(api::prepare_suggestion))
+        .route("/api/suggestions/start", post(api::start_suggestion))
+        .route(
+            "/api/suggestions/mappings",
+            get(api::list_suggestion_mappings)
+                .put(api::put_suggestion_mapping)
+                .delete(api::delete_suggestion_mapping),
+        )
+        .route(
+            "/api/suggestions/projects",
+            get(api::list_suggestion_projects),
         )
         .route("/api/plugins/commands", get(api::plugin_commands))
         .route(
@@ -379,8 +423,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/theme/current", get(api::get_current_theme))
         // Dedicated, non-elevated global-theme write.
         .route("/api/theme", patch(api::update_theme))
-        .route("/api/sounds", get(api::list_sounds))
-        .route("/api/sounds/file/{name}", get(api::serve_sound_file))
+        .route("/api/sounds/{event}", get(api::serve_sound))
         // Push notifications
         .route("/api/push/status", get(push::get_status))
         .route(

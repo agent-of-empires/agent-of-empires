@@ -1,0 +1,18 @@
+{
+  "name": "User-facing web change updates the coverage matrix and its test",
+  "instruction": "A patch that changes user-facing behavior in a web/AGENTS.md coverage area also updates web/tests/coverage-matrix.json and the test that entry names.",
+  "relevant_when": "A patch changes non-test code under web/src/ in a way a user can observe in one of these areas: auth, session creation, settings, profiles, sessions, sidebar, diff, notifications, directory browsing, devices, git clone, connectivity, or read-only behavior. Examples: a new or changed control, action, menu item, validation rule, request payload, state transition, or keyboard path.",
+  "context": "web/AGENTS.md: any user-facing change in those areas must update tests/coverage-matrix.json and its applicable test; copy-only or styling changes may use a deferred entry with a reason and linked issue. tests/validate-coverage-matrix.mjs only checks that each component file is listed somewhere, so it cannot tell whether a behavior change got its entry and test. Not in scope: refactors that keep behavior, type-only or generated changes, changes to tests only, and changes outside the listed areas.",
+  "scope": "diff",
+  "scope_reason": "The rule pairs a web/src change with companion changes to the matrix and a test file, which only the change's patch set shows together.",
+  "checklist": [
+    {
+      "name": "matrix-entry-updated",
+      "rule": "The patch adds or edits a web/tests/coverage-matrix.json entry whose components, specs or notes cover the changed behavior, or adds a deferred entry with a reason and issue link when the change is copy-only or styling. Not applicable when the patch makes no user-facing change in the listed areas."
+    },
+    {
+      "name": "applicable-test-changed",
+      "rule": "The patch adds or changes a test that exercises the changed behavior: a Vitest file (*.test.ts, *.test.tsx or under __tests__/) or a Playwright spec under web/tests/. Not applicable when the patch makes no user-facing change in the listed areas, or when the only matrix change is a deferred entry for a copy-only or styling change."
+    }
+  ]
+}

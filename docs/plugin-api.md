@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `24`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `25`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 24
+api_version = 25
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `24`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `25`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
@@ -352,7 +352,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 | `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
 | `sessions.message.send` | `session.message` | Deliver a short text message to **any** session, like `aoe send`. See [Messaging any session](#messaging-any-session). `api_version >= 15`. |
 | `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
-| `suggestions.set` / `error` / `sources` / `checks.set` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 23`. Not served until the store layer lands. |
+| `suggestions.set` / `error` / `sources` / `checks.set` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 23`. |
 | `projects.list` | `session.read` | Registered projects of the host profile, `{ projects: [{ name, path }] }`. `api_version >= 23`. |
 
 **Project selection (`api_version >= 11`).** `sessions.create` takes an optional `project_path` (the trust-checked primary repo) and `extra_project_paths` (the other repos of a multi-repo session). Omitting `project_path` creates a **scratch** session: a throwaway directory with no repository, so extras alongside it are refused. Every path is canonicalized and existence-checked host-side, fail-closed and capped per call.
@@ -476,9 +476,9 @@ Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swa
 
 ## Suggested sessions
 
-> **Availability:** the `[suggestions]` manifest block and the worker types in `aoe-plugin-api` are available now. The `suggestions.*` RPCs, the `/api/suggestions` routes and the web and TUI workflows below are not served by this host until the store layer of the suggested-sessions stack (#5595) lands.
+> **Availability:** the `[suggestions]` manifest block, the `suggestions.*` worker RPCs and the `/api/suggestions` routes are served by this host. The web dashboard and TUI workflows described below arrive with their own changes (#5599, #5600).
 
-For using suggestions from the web dashboard and the TUI, see the suggested sessions guide.
+For using suggestions from the web dashboard and the TUI, see the [suggested sessions guide](guides/suggested-sessions.md).
 
 A worker declares the criteria it publishes in a `[suggestions]` block:
 
@@ -530,48 +530,51 @@ Each call replaces the provider's whole list. It fails with invalid-params, and 
 
 ### Suggestions API
 
-Suggestions are stored per profile. The routes below list and act on them; none starts a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode; the `GET` routes below stay readable in both. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
+Suggestions are stored per profile. The routes below list and act on them; only `POST /api/suggestions/start` creates a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode; the `GET` routes below stay readable in both, and so does `POST /api/suggestions/prepare`, which mutates nothing (CityHall's "Start with changes" needs it, and `POST /api/sessions` is allowed there). `start` is refused. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
 
 | Route | Body | Result |
 |---|---|---|
-| `GET /api/suggestions` | none | `{ providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, start_without_review, show_source_ref, provider_order } }` |
+| `GET /api/suggestions` | none | `{ profile?, providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled, preset, customized }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, show_source_ref, provider_order } }` |
 | `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
 | `POST /api/suggestions/checks/run` | none | `{ ok, notified }` |
 | `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
 | `POST /api/suggestions/undismiss` | `{ provider_id, id }` | `{ ok }` |
 | `PATCH /api/suggestions/sources` | `{ provider_id, criterion, enabled }` | `{ provider_id, criterion, enabled }` |
-| `PATCH /api/suggestions/prefs` | any of `{ homepage, sidebar, refresh_minutes, start_without_review, show_source_ref, provider_order, provider_enabled }` | `{ ok }` |
-| `GET /api/suggestions/templates` | query `provider_id` and `criterion`, or neither | one: `{ provider_id, criterion, template, default }`; none: `{ templates: [{ provider_id, criterion, template }] }` |
-| `PUT /api/suggestions/templates` | `{ provider_id, criterion, template }` | `{ provider_id, criterion, template, default }` |
-| `DELETE /api/suggestions/templates` | `{ provider_id, criterion }` | `{ ok }` |
+| `PATCH /api/suggestions/prefs` | any of `{ homepage, sidebar, refresh_minutes, show_source_ref, provider_order, provider_enabled }` | `{ ok }` |
+| `GET /api/suggestions/presets` | none | `{ presets: [{ provider_id, criterion, customized, preset, defaults }] }`, one per declared source |
+| `PUT /api/suggestions/presets` | `{ provider_id, criterion, preset }` | `{ provider_id, criterion, customized: true, preset, defaults }` |
+| `DELETE /api/suggestions/presets?provider_id=&criterion=` | none | 204 |
+| `POST /api/suggestions/start` | `{ provider_id, id, project?: { path }, approve_hooks?, review_fingerprint? }` | 201 `{ session_id, title }` |
 | `POST /api/suggestions/fix` | `{ provider_id }` | `{ ok, notified }` |
-| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, templated, template_criterion, source_ref, project, extra_projects, tool, yolo, sandbox, worktree }` |
+| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, customized, source_ref, project, extra_projects, tool, view, yolo, sandbox, worktree }`; `view` is `structured` or `terminal` |
 | `GET /api/suggestions/mappings` | none | `{ mappings: [{ provider_id, mapping_key, projects }] }` |
 | `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
 | `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
 | `GET /api/suggestions/projects` | none | `{ projects: [{ name, path, origin }] }` |
 
-Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, start_without_review: false, show_source_ref: true, provider_order: [] }` and is per profile. `start_without_review` lets the web Start button create the session from the prepared draft instead of opening the wizard; clients only do so when `prepare` returns `templated: true` and a `project`. `show_source_ref` makes the web and TUI suggestion rows show each item's `source_ref`. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.
+Every route above except the `GET`s takes an optional `expected_profile`: a body field, or a query parameter on the two `DELETE` routes (`refresh` and `checks/run` take it in an optional JSON body; an empty body names none). It names the profile the caller selected its target under. When it is not the profile this Daemon serves, the route answers 409 `profile_mismatch` (also in the `AoE-Error-Code` header) and changes nothing, so a profile switch between selecting and sending cannot land the action on the new profile. Omitted, nothing is checked.
+
+Providers are off until switched on. A provider with no stored switch is listed with `enabled: false`, so a client tells an installed but off provider from no provider (an empty `providers`); its items are not returned and `refresh` and `checks/run` do not notify its worker. `PATCH /api/suggestions/prefs` with `provider_enabled: { "<id>": true }` turns it on, and a switch stored earlier is kept as it was. Ordering a provider does not switch it on. Providers are listed in the user's `provider_order`; a provider never ordered follows, sorted by id. `prefs` defaults to `{ homepage: true, sidebar: false, refresh_minutes: 15, show_source_ref: true, provider_order: [] }` and is per profile. `show_source_ref` makes the web and TUI suggestion rows show each item's `source_ref`. `PATCH /api/suggestions/prefs` is partial: `refresh_minutes` is one of 5, 15, 30, 60 or 120, `provider_order` must list every provider exactly once, and `provider_enabled` maps provider ids to booleans. Other values fail with 400 `validation_failed`, and nothing is stored. `refresh_minutes` is a hint for plugins; core does not schedule refreshes yet. The route is denied in read-only (403 `read_only`) and CityHall mode.
 
 `suggestions.error` may carry a `fix`: a `label` (non-empty, at most 64 bytes) shown on a button beside the error, and a `method` named `suggestions.fix.<name>` (at most 64 bytes, `a-z 0-9 . _ -`). Anything else fails with invalid params and stores nothing. `POST /api/suggestions/fix` sends that method, with `{}`, to the provider's worker as a notification; clients never choose the method, and the route fails with 400 `validation_failed` when the provider has no fix. The worker should open its own fix flow and publish again afterwards. The fix is dropped on the provider's next `suggestions.set` or `suggestions.error`. `GET /api/suggestions` lists `uses_agent: true` and `fix: { label }` (error only) on a provider; the method is never exposed. The route is denied in read-only (403 `read_only`) and CityHall mode.
 
-A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, templates and mappings are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh`, a `sources` change and a `refresh_minutes` change send `suggestions.refresh` to the affected workers.
+A provider's `status` is `pending` before its first publish, `ok`, or `error`. Uninstalling a plugin, or updating it to a build whose `[suggestions]` block differs, clears its items, checks and status so it is `pending` again until its next publish; source switches, dismissals, presets, mappings and Session links are kept. Each item is the published item plus `provider_id` and `dismissed`; dismissed items are still returned. Items of a disabled source or provider are hidden, and `refresh` skips a disabled provider. `updated_at` is Unix seconds of the provider's last report. `refresh`, a `sources` change and a `refresh_minutes` change send `suggestions.refresh` to the affected workers.
 
 `refreshing` is true while a refresh the host requested is unanswered, for at most two minutes, and is not stored. Each item has `resolved_project: { name, path }`, or `null`, the registered project a [mapping](#project-mappings) or the unambiguous `project` hint resolves to; group by `path`, never by the provider's `project` text.
 
-`POST /api/sessions` accepts an optional `suggestion: { provider_id, id }`, stored on the session. An item carries `started_session: { id, title, status, archived, created_at }` for the oldest non-trashed session in the profile that names it; trashing that session drops the link, and archiving keeps it. Clients omit `suggestion` to start another session without linking it.
+`POST /api/sessions` accepts an optional `suggestion: { provider_id, id }`, stored on the session. An item carries `started_session: { id, title, status, archived, created_at, started_via, initial_prompt }` for its primary Session while that Session exists and is not trashed; archiving keeps it. `started_via` is `start` for a Session made by `POST /api/suggestions/start` (the preset's own prompt, agent and project) and `wizard` for one made by `POST /api/sessions` with a `suggestion` ("Start with changes"); a link recorded before the field existed reads as `wizard`. `initial_prompt` is the exact prompt a `start` sent, kept with the link so a preset edited later cannot change it; it is `null` for `wizard`, for a `start` that sent no prompt, and for a link recorded before the field existed. It comes from the [primary link](#suggestions-api) below, so a session that merely carries the `suggestion` but lost the claim does not show. Each item also carries `start: { agent, view, worktree, sandbox, yolo, prompt?, project? }`, what `start` would create with. `yolo` says the Session will auto-approve every tool call, so a client showing what Start creates should show it. `prompt` is the `initial_prompt` it would send (the preset's template expanded as below, else the provider's `draft.prompt`); it is omitted when the expansion is over the limit, where `start` fails. Each source carries its effective `preset` and `customized`. Clients omit `suggestion` to start another session without linking it.
 
 `prepare` resolves settings through the normal repo and profile config. `project` is `{ name, path }` or `null`, resolved in this order: the user's mapping for the item's `mapping_key`, then the item's `project` hint (exactly one registered project by name or exact path), else `null`; an item is never given a scratch project.
 
-`templated` is `true` when a stored template produced `initial_prompt`, `false` when it is the provider's `draft.prompt`. `template_criterion` is then the item's criterion, else `null`.
+A preset is stored per profile and criterion: `{ agent, view: "structured" | "terminal", worktree, sandbox, yolo, prompt }`. Without a stored one (`customized: false`) a kind follows `defaults`: the profile's new-session settings, with the plugin's own prompt (`prompt: null`). `prepare` and `start` take `agent`, `view`, `worktree`, `sandbox` and `yolo` from the preset, and `customized` says whether one is stored. A non-null `prompt` is a template that replaces the provider's `draft.prompt` in `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name, scanning left to right (`{a{pr_number}}` becomes `{a42}`); unknown names and stray braces stay as typed, and expanded values are never scanned again. An empty or blank prompt gives an empty `initial_prompt`, so a client must then omit it when creating the session, which rejects a blank one. A prompt and its expansion are each limited to 64 KiB; `prepare` and `start` fail with 400 `validation_failed` when the expansion is longer. `PUT` replaces the whole preset and checks that the agent exists. `DELETE` resets the kind and checks neither provider nor criterion, so a preset of a disabled plugin can still be reset, and resetting an absent one succeeds. `GET` and `PUT /presets` list `project_overrides`: the preset fields (`agent`, `view`, `worktree`, `sandbox`, `yolo`) whose default differs in at least one registered Project, because Start resolves defaults per Project (repo config and the Project's worktree and sandbox overrides). `defaults` is the profile's; an editor should mark those fields rather than claim one value.
 
-A template is stored per profile and criterion and replaces the provider's `draft.prompt` in `prepare`'s `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name, scanning left to right (`{a{pr_number}}` becomes `{a42}`); unknown names and stray braces stay as typed, and expanded values are never scanned again. No stored template (`default: true`) uses `draft.prompt`; an empty template gives an empty prompt, so a client must then omit `initial_prompt` when creating the session, which rejects a blank one. A template and its expansion are each limited to 64 KiB; `prepare` fails with 400 `validation_failed` when the expansion is longer.
+`POST /api/suggestions/start` creates the Session from the item's kind preset and Project, in the profile the daemon serves. CityHall mode refuses the route. `project` first links the item's repo (its `mapping_key`) to that registered Project: it becomes the primary, the repo's other mapped Projects stay behind it, up to the 16-Project mapping cap (any no longer registered are dropped), and the link stays if the start then fails. Repository hooks are a security gate: when the Project's hooks or MCP servers are not yet approved, nothing is created and the answer is 409 `hooks_need_trust` with `{ commands: { on_create, on_launch, on_destroy }, needs_mcp_trust, mcp_summaries, review_fingerprint }`; `mcp_summaries` are the redacted one-line summaries of the repo's MCP servers. Repeat the call with `approve_hooks: true` and that `review_fingerprint` to approve and start in one step; a configuration that changed since the review is refused with 409 `trust_changed`, and `approve_hooks` without a fingerprint is 400 `validation_failed`. The answer is 201 once the Session exists, like `POST /api/sessions`. A failure answers 422 `start_failed` with `{ reason, hint, retryable }`, and 400 `no_project` (`hint: "link_project"`) when the repo is not linked to a Project.
 
-`GET` without parameters lists every stored template of the profile, including those of a disabled plugin or a criterion it no longer declares. `DELETE` checks neither, so any listed template can be removed and deleting an absent one succeeds.
+An item has one primary Session. The first create that carries `suggestion` (`start`, or `POST /api/sessions` from "Start with changes") claims it under the new Session's id, allocated before the create; a second gets 409 `already_started` with `{ session_id }`, the winner's id, which may still be provisioning. `session_id` is omitted when the caller cannot see that Session (CityHall does not see terminal Sessions or one still being created). A claim holds while its start is in flight, however long the create runs. One left by a crash is settled by the next start if its Session was persisted, and taken over if not. A failed create, even one whose client disconnected, frees the claim, so Try again works. Trashing the Session frees it; archiving keeps it. A create without `suggestion` ("Start another") takes no link.
 
-Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, or its source is disabled), 400 `validation_failed` (`criterion` not declared by the provider, or a template or its expansion over 64 KiB), 400 `stale` (`prepare` only: the item is marked stale because its source closed or changed), 403 `read_only`.
+Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, its source is disabled, or its source closed it; `prepare` and `start` answer all three the same way), 400 `validation_failed` (`criterion` not declared by the provider, an unknown preset agent, or a prompt or its expansion over 64 KiB), 403 `read_only`.
 
-The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). The view shows each item's `preview` and prompt as plain text; the first Enter resolves `prepare` and shows its final `initial_prompt` (after any template); a second Enter opens the new-session dialog prefilled with it, and an item whose `project` is `null` cannot be started. The dialog's Prompt row, which is always present and editable, holds that prompt; for a suggestion it is labelled with the provider and Ctrl+P on it shows the item's `preview` as source text. `r` only asks providers to refresh; `l` reloads the list. Items keep the order of the snapshot. Home also lists a collapsed **Suggested (N)** group above Trash, absent when there are no open suggestions. Enter expands it to the first 3 items and a "View all" row that opens the view above; Enter on an item prepares it and opens the prefilled dialog directly, `z` (`Z` in strict mode) dismisses it, and `N` (`Ctrl+N`) starts a blank session. `Ctrl+K` lists "Suggested sessions"; on a suggestion row, or on the selected item in the view, it also lists "Open in <provider>", which opens the item's `source_url`. Every TUI key is provisional pending #4597: `S` / `Ctrl+S` to open, `z` / `N` on a Home row, and `x` (dismiss), `d` (dismissed), `r` and `l` inside the view may move.
+The TUI shows suggestions in Home's preview pane and starts them with `start`, or with `prepare` and the new-session dialog for "Start with changes"; it shows each item's `preview` and `start.prompt` as plain text and sends the snapshot's `profile` as `expected_profile` on each suggestions request it posts. Keys and layout are in the [guide's TUI section](guides/suggested-sessions.md#tui).
 
 ### Project mappings
 
@@ -612,6 +615,7 @@ id = "my_pane"
 | `detail-badge` | per-session | A badge in the session detail view. |
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
 | `home-pane` | global | A host-wide docked pane on the dashboard overview and the structured-view pane overlay, carrying the same block vocabulary as `pane` but session-less (requires `api_version >= 13`). Several plugins' home panes stack in snapshot order. |
+| `composer-status` | per-session | A read-only badge in the ACP composer footer beside the context hint, web only (requires `api_version >= 25`). |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `page` | global | A full dashboard view rendered from a plugin HTML file (requires `api_version >= 16`). Optional pushed state is opaque to the host. See [Pages](#pages). |
 | `notification` | n/a | A transient notification pushed via `ui.notify`; gated by the `notifications` capability, not a slot declaration. |
@@ -705,9 +709,9 @@ With `api_version >= 20`, `ui.notify` takes an optional `link: { "page", "value"
 
 ### Badge payload
 
-`status-bar`, `header-start`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge. Row badges also accept `presentation?` on the badge and its items, as described below.
+`status-bar`, `header-start`, `row-badge`, `detail-badge` and `composer-status` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start`, `detail-badge` and `composer-status` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge. Row badges also accept `presentation?` on the badge and its items, as described below.
 
-`status-bar`, `header-start` and `detail-badge` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only.
+`status-bar`, `header-start`, `detail-badge` and `composer-status` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only. `composer-status` has no terminal rendering.
 
 `row-badge` items on terminal session rows render items with `text` or `tooltip`, using `tooltip` when `text` is absent. With no `items` list, the top-level `row-badge` uses `tooltip` as a fallback label for missing `text`. `row-column` renders text only; the TUI omits icons and links. The status strip is right-aligned. In the local session list, it appears before the activity age when enabled, and its bounded lane considers one item per plugin before considering a second item from any plugin. Items may be truncated or omitted when space runs out.
 

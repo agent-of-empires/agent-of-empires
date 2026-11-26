@@ -7,7 +7,9 @@ import { useAcpPrefs } from "../../lib/acpPrefs";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import type { QueuedAction, QueuedReason } from "./queuedReason";
+import { TRANSCRIPT_COLUMN } from "./transcriptColumn";
 import { Tooltip } from "../Tooltip";
+import { isImeComposing } from "../../lib/ime";
 
 const AMBER_STRIP = "border-amber-900/40 bg-amber-950/20";
 const AMBER_ROW = "flex items-start gap-2 rounded-lg border border-amber-700/30 bg-amber-950/15 px-2.5 py-1.5";
@@ -18,7 +20,7 @@ const AMBER_DISMISS =
 function Strip({ tone, testId, children }: { tone: string; testId?: string; children: React.ReactNode }) {
   return (
     <div data-testid={testId} className={`border-t ${tone} px-4 py-2`}>
-      <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">{children}</div>
+      <div className={TRANSCRIPT_COLUMN}>{children}</div>
     </div>
   );
 }
@@ -608,7 +610,7 @@ function QueuedPromptEditor({
         onChange={(e) => setDraft(e.target.value)}
         onBlur={() => onSave(draft)}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
+          if (e.key === "Enter" && !isImeComposing(e) && !e.shiftKey) {
             e.preventDefault();
             onSave(draft);
           } else if (e.key === "Escape") {

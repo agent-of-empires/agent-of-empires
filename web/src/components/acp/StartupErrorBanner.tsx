@@ -19,6 +19,9 @@ const RETRY = (
   </>
 );
 
+// Matches STOP_FENCE_MESSAGE in src/server/acp_reconciler/mod.rs
+const STOP_FENCE = /\(aoe acp stop\)/;
+
 /** Copy for the failures a reinstall won't fix, keyed off the message text. */
 function specificRemediation(
   message: string,
@@ -27,6 +30,14 @@ function specificRemediation(
   /** Unknown until the install info loads; a command could then name the wrong terminal. */
   sandboxed: boolean | undefined,
 ): React.ReactNode {
+  if (STOP_FENCE.test(message)) {
+    return (
+      <>
+        This Session was stopped (<Code>aoe acp stop</Code>). Your queued message is waiting. Click{" "}
+        <strong>Retry</strong> to start it.
+      </>
+    );
+  }
   if (/authentic|login|api[_ -]?key/i.test(message)) {
     const steps = signInSteps(sandboxed === undefined ? null : agent, name, sandboxed === true);
     // Retry respawns the Agent, which reads a new sign-in.
@@ -248,7 +259,11 @@ export function StartupErrorBanner({
     >
       <div role="alert">
         <h2 className="text-sm font-semibold">
-          {retriedError === null ? `${name} couldn't start in Structured view` : `${name} still couldn't start`}
+          {STOP_FENCE.test(message)
+            ? `${name} was stopped`
+            : retriedError === null
+              ? `${name} couldn't start in Structured view`
+              : `${name} still couldn't start`}
         </h2>
         {changed && (
           <div data-testid="startup-error-banner-changed" className="mt-1 text-xs wrap-anywhere text-text-primary">

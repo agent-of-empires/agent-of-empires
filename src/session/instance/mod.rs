@@ -35,6 +35,7 @@ use crate::session::capture::{
     OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
+pub(crate) use accessors::generate_id;
 mod capture_slot;
 mod container;
 #[cfg(test)]
@@ -54,6 +55,7 @@ pub(crate) use hooks::HostHookApprovalRequired;
 pub(crate) use status_update::CAPTURE_FAILED_RULE;
 mod identity_sidecar;
 mod kill;
+mod last_error;
 mod launch_command;
 mod prime_capture;
 
@@ -83,14 +85,13 @@ mod tmux_session;
 mod types;
 
 pub(crate) use accessors::{resolved_agent_for, UNBOUND_STORE_HINT};
-pub use flags::{
-    is_valid_session_color, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
-    StartBlocked, SESSION_COLORS,
-};
+pub use flags::{SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket, StartBlocked};
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 #[cfg(test)]
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
+pub use last_error::LastError;
+pub(crate) use last_error::TmuxAbsence;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub use resume::ManagedResumeCause;
@@ -103,6 +104,10 @@ pub(crate) use sid_persist::{
 };
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
+pub(crate) use status::{
+    reports_tmux_session_gone, REFUSED_RESTART, TMUX_SERVER_UNREACHABLE_LEAD,
+    TMUX_SESSION_GONE_LEAD,
+};
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
 pub(crate) use terminal::ToolLaunchUnavailable;
 #[cfg(test)]
@@ -158,8 +163,8 @@ pub(crate) enum TerminalContextResume {
 pub use types::{
     AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity,
     LegacyToolObservation, PaneObservation, PanePresence, PluginCreateIdempotency, SandboxInfo,
-    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    MAX_INITIAL_PROMPT_BYTES,
+    SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo,
+    WorktreeInfo, MAX_INITIAL_PROMPT_BYTES,
 };
 pub(crate) use types::{
     PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxPin, SandboxStoreTransitionPath,
@@ -177,9 +182,11 @@ use launch_command::{
     splice_subcommand_or_append, PreparedLaunch,
 };
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
-use pane_status::{resolve_detected_status, summarize_error_from_pane};
+use pane_status::{pane_error_line, resolve_detected_status, summarize_error_from_pane};
 
-use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
+use status::{
+    HANDOFF_ENDED, UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT,
+};
 use tmux_session::tmux_env_session_name_for_instance_id;
 use types::{deserialize_session_id, is_zero_u64, is_zero_u8};
 
@@ -217,6 +224,9 @@ pub struct DetectionState {
     /// flipped parked sessions between Idle and Running every few seconds.
     pub pending: Option<Status>,
     pub observation_key: Option<tmux::ObservationKey>,
+    /// Whether the last verdict was an Error for a pane that ended, so a poll that reuses it can
+    /// still reconcile the remedy a refused restart needs.
+    pub ended: bool,
 }
 
 /// A turn queued for delivery once the (resumed) worker is live. See
@@ -718,6 +728,12 @@ pub struct Instance {
     /// releases the key. Additive: absent in older rows, no migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
+
+    /// Suggestion this session was started from. Additive: absent in older
+    /// rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<SuggestionOrigin>,
+
     /// Set by a plugin's `sessions.turn.send` right before waking a resting session, under the
     /// same `instances` write lock that decides to revive it, so the plugin active-session cap
     /// treats it as occupying a slot immediately rather than waiting for a status to land.
@@ -909,17 +925,6 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
 
-    /// Per-session color label for at-a-glance status signaling in the web
-    /// sidebar (a colored dot next to the title). Purely a decoration: it does
-    /// not re-rank the session. Settable from the web context menu and from the
-    /// CLI (`aoe session color <id> <color>`) so a running agent can flag its
-    /// own state (red = needs attention, amber = working, green = done) without
-    /// the user opening the session. `None` clears the dot. Constrained to the
-    /// [`SESSION_COLORS`] palette by [`is_valid_session_color`]. Additive:
-    /// absent in older `sessions.json` rows, so no migration is needed. See
-    /// #2383.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
     /// Position within its group under `SortOrder::Custom`. `None` sorts last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_index: Option<u32>,
@@ -1088,7 +1093,7 @@ pub struct Instance {
     pub(crate) pi_session_path: Option<String>,
 
     #[serde(skip)]
-    pub last_error: Option<String>,
+    pub last_error: LastError,
     #[serde(skip)]
     pub(crate) capture_poller: capture_slot::CapturePollerSlot,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this

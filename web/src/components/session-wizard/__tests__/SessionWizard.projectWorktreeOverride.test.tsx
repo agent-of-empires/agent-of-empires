@@ -44,7 +44,15 @@ vi.mock("../../../lib/api", () => ({
 }));
 
 function renderWizard(prefill?: WizardPrefill) {
-  return render(<SessionWizard servedProfile="default" onClose={() => {}} onCreated={() => {}} prefill={prefill} />);
+  return render(
+    <SessionWizard
+      onOpenSettingsTab={vi.fn()}
+      servedProfile="default"
+      onClose={() => {}}
+      onCreated={() => {}}
+      prefill={prefill}
+    />,
+  );
 }
 
 afterEach(() => {

@@ -1041,8 +1041,8 @@ pub(super) fn apply_acp_session_change(
                 "clearing stored ACP session id after a context reset (session/load or session/fork failure)"
             );
             inst.acp_session_id = None;
-            // A structured fork that failed (or was refused by a resume-only agent) reaches
-            // here via SessionContextReset.
+            // A failed structured fork fails its spawn and keeps the marker; a reset
+            // that still finds one pending drops it with the conversation it seeded.
             if inst.fork_pending.take().is_some() {
                 inst.import_pending = None;
             }
@@ -2435,11 +2435,10 @@ mod tests {
         );
     }
 
-    // A SessionContextReset from a FAILED structured fork must clear the
-    // one-shot fork marker (and its paired import marker) so neither the
-    // reconciler nor the supervisor re-issues the same failing session/fork on
-    // the next reattach. This is the reducer side of the fork-failure retry-loop
-    // fix; the reset carries no new id, so acp_session_id is cleared too.
+    // A SessionContextReset that finds a structured fork still pending clears the
+    // one-shot fork marker (and its paired import marker) with the conversation it
+    // seeded. A refused session/fork emits no reset (the spawn fails and keeps the
+    // seed); the reset carries no new id, so acp_session_id is cleared too.
     #[test]
     fn reset_clears_fork_pending_and_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -2451,7 +2450,7 @@ mod tests {
         let profile = apply_acp_session_change(
             &mut inst,
             "sess-1",
-            Some(&AcpSessionChange::Reset("fork_failed: boom".into())),
+            Some(&AcpSessionChange::Reset("context reset".into())),
             true,
         );
 
@@ -2721,6 +2720,7 @@ mod tests {
                         cancel_capable: false,
                         model: None,
                         background: true,
+                        runs: 0,
                     },
                     at: crate::time::Timestamp::now(),
                 },

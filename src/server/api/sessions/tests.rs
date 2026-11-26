@@ -1262,11 +1262,11 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
     partial.push(serde_json::json!({"id": 5}));
     let damaged = serde_json::to_vec(&partial)?;
     std::fs::write(storage.sessions_path(), &damaged)?;
-    let response = update_session_color(
+    let response = update_session_pin(
         State(state.clone()),
         Path(id.clone()),
         Ok(Json(serde_json::from_value(
-            serde_json::json!({"color": "red"}),
+            serde_json::json!({"pinned": true}),
         )?)),
     )
     .await
@@ -1288,12 +1288,7 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
         }
     );
     let rows = state.instances.read().await;
-    assert!(rows
-        .iter()
-        .find(|row| row.id == id)
-        .unwrap()
-        .color
-        .is_none());
+    assert!(!rows.iter().find(|row| row.id == id).unwrap().is_pinned());
     Ok(())
 }
 
@@ -5056,6 +5051,154 @@ async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off(
     assert_eq!(off, [("svo-terminal", true), ("svo-structured", false)]);
 }
 
+/// A structured `fork_from` runs the agent of the row that recorded the
+/// conversation, since the TUI and web forks send only the parent's tool.
+#[test]
+fn a_structured_fork_runs_the_parents_agent() {
+    let row = |tool: &str, agent_name: Option<&str>, acp: &str| {
+        let mut inst = make_test_instance();
+        inst.tool = tool.into();
+        inst.agent_name = agent_name.map(Into::into);
+        inst.acp_session_id = Some(acp.into());
+        inst.source_profile = "work".into();
+        inst
+    };
+    let rows = [
+        row("claude-acct", None, "tool-only"),
+        row("claude", Some("claude-acct"), "named"),
+        row("claude", None, "builtin"),
+        row("claude", None, "ambiguous"),
+        row("claude", Some("claude-acct"), "ambiguous"),
+        row("claude", Some("claude-acct"), "ambiguous-reversed"),
+        row("claude", None, "ambiguous-reversed"),
+        row("claude-acct", None, "tool-first"),
+        row("claude", Some("claude-acct"), "tool-first"),
+        row("claude", Some("claude-acct"), "named-first"),
+        row("claude-acct", None, "named-first"),
+    ];
+    let ok = |agent: Option<&str>| Ok(agent.map(str::to_string));
+    for (parent, tool, agent_name, want) in [
+        ("tool-only", "claude-acct", None, ok(None)),
+        ("named", "claude", None, ok(Some("claude-acct"))),
+        (
+            "named",
+            "claude",
+            Some("claude-acct"),
+            ok(Some("claude-acct")),
+        ),
+        ("named", "claude", Some("claude"), Err(())),
+        // Naming the parent's agent as the tool runs that same agent.
+        ("named", "claude-acct", None, ok(None)),
+        ("builtin", "claude", None, ok(None)),
+        ("builtin", "claude-acct", None, Err(())),
+        ("ambiguous", "claude", None, Err(())),
+        ("ambiguous-reversed", "claude", None, Err(())),
+        // Rows agreeing on the agent resolve the same in either order.
+        ("tool-first", "claude", None, ok(Some("claude-acct"))),
+        ("named-first", "claude", None, ok(Some("claude-acct"))),
+        ("tool-first", "claude-acct", None, ok(None)),
+        ("named-first", "claude-acct", None, ok(None)),
+        ("unrecorded", "claude", Some("x"), ok(Some("x"))),
+    ] {
+        assert_eq!(
+            create::structured_fork_agent_name(&rows, parent, "work", tool, agent_name)
+                .map_err(|_| ()),
+            want,
+            "{parent} / {tool} / {agent_name:?}"
+        );
+    }
+    // Two profiles can share a custom alias with different commands and stores,
+    // so only a built-in parent forks into another profile.
+    for (parent, tool) in [("tool-only", "claude-acct"), ("named", "claude")] {
+        let refused = create::structured_fork_agent_name(&rows, parent, "home", tool, None);
+        assert!(
+            refused.is_err_and(|message| message.contains("profile")),
+            "{parent}"
+        );
+    }
+    assert_eq!(
+        create::structured_fork_agent_name(&rows, "builtin", "home", "claude", None),
+        Ok(None)
+    );
+}
+
+/// Both fork routes hold a custom parent to its own agent and profile: two
+/// profiles can share an alias that launches different commands and stores.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_holds_a_structured_fork_to_the_parents_agent_and_profile() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.session
+            .agent_acp_cmd
+            .insert("claude-acct".into(), "/state/acct-acp.sh".into());
+        c.session
+            .agent_execution_as
+            .insert("claude-acct".into(), "claude".into());
+        c.session
+            .agent_config_dir
+            .insert("claude-acct".into(), "~/.claude-acct".into());
+    })
+    .unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let acp_id = "11111111-1111-4111-8111-111111111111";
+    let mut parent = make_test_instance();
+    parent.source_profile = "work".into();
+    parent.tool = "claude".into();
+    parent.agent_name = Some("claude-acct".into());
+    parent.view = crate::session::View::Structured;
+    parent.acp_session_id = Some(acp_id.into());
+    let parent_id = parent.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![parent]);
+
+    // `fork_from`, from the served "test" profile.
+    for (agent_name, refusal) in [
+        ("claude", "the agent of the session it forks"),
+        ("claude-acct", "the profile of the session it forks"),
+    ] {
+        let response = create::create_session(
+            State(state.clone()),
+            axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            axum::http::HeaderMap::new(),
+            Ok(Json(create_body_from_json(serde_json::json!({
+                "path": project.path(), "tool": "claude", "agent_name": agent_name,
+                "view": "structured", "fork_from": acp_id,
+            })))),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{agent_name}");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains(refusal), "{agent_name}: {body}");
+    }
+
+    // `fork_session_id`.
+    let body = |profile: &str| {
+        create_body_from_json(serde_json::json!({
+            "path": project.path(), "profile": profile, "tool": "claude",
+            "agent_name": "claude-acct", "view": "structured",
+        }))
+    };
+    let refusal = create::resolve_canonical_fork_seed(&state, &body("test"), &parent_id)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.status(), StatusCode::CONFLICT);
+    let seed = create::resolve_canonical_fork_seed(&state, &body("work"), &parent_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        seed,
+        crate::session::ForkSeed::Structured {
+            parent_acp_session_id: acp_id.into(),
+        }
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
@@ -5065,6 +5208,15 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
         c.session
             .agent_acp_cmd
             .insert("acp-helper".into(), "acp-helper --acp".into());
+        c.session
+            .agent_acp_cmd
+            .insert("claude-acct".into(), "/state/acct-acp.sh".into());
+        c.session
+            .agent_execution_as
+            .insert("claude-acct".into(), "claude".into());
+        c.session
+            .agent_config_dir
+            .insert("claude-acct".into(), "~/.claude-acct".into());
     })
     .unwrap();
 
@@ -5079,6 +5231,7 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let state = crate::server::test_support::build_test_app_state(vec![
         mk("named-agent", Some("acp-helper")),
         mk("tool-only", None),
+        mk("claude-wrapper", Some("claude-acct")),
     ]);
 
     let response = list_sessions(
@@ -5095,9 +5248,16 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     let capable: Vec<_> = envelope
         .sessions
         .iter()
-        .map(|s| (s.id.as_str(), s.acp_capable))
+        .map(|s| (s.id.as_str(), s.acp_capable, s.acp_can_fork))
         .collect();
-    assert_eq!(capable, [("named-agent", true), ("tool-only", false)]);
+    assert_eq!(
+        capable,
+        [
+            ("named-agent", true, false),
+            ("tool-only", false, false),
+            ("claude-wrapper", true, true),
+        ]
+    );
 }
 
 /// The list advertises the solo commands of the agent that classifies the session's prompts:
@@ -7616,7 +7776,7 @@ async fn failed_delete_notifies_plugins_of_the_error() {
                     .find(|row| row.id == "sess-delete-error")
                     .unwrap();
                 row.status = Status::Error;
-                row.last_error = Some("boom".into());
+                row.last_error.set("boom");
                 Ok(())
             })
             .unwrap();
@@ -11128,6 +11288,15 @@ async fn create_persists_initial_prompt_as_pending_turn() {
     .unwrap();
     crate::session::Storage::new_unwatched("chosen-default").unwrap();
     let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let _registry = crate::server::api::suggestions_tests::register_provider();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", None, "42");
     let state = crate::server::test_support::build_test_app_state_impl(
         Vec::new(),
         Vec::new(),
@@ -11136,6 +11305,7 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         false,
         |state| {
             state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+            state.plugin_host = Some(host);
         },
         |supervisor| supervisor.with_launcher(launcher),
     );
@@ -11149,15 +11319,14 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         ("with-prompt", axum::http::HeaderMap::new()),
         ("with-prompt-tui", tui),
     ] {
-        let (status, bytes) = post_create_bytes_with(
-            &state,
-            headers,
-            serde_json::json!({
-                "title": title, "path": "", "tool": "claude",
-                "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
-            }),
-        )
-        .await;
+        let mut body = serde_json::json!({
+            "title": title, "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
+        });
+        if title == "with-prompt" {
+            body["suggestion"] = serde_json::json!({ "provider_id": "acme.gh", "id": "42" });
+        }
+        let (status, bytes) = post_create_bytes_with(&state, headers, body).await;
         assert_eq!(status, axum::http::StatusCode::CREATED, "{bytes:?}");
     }
     let instances = state.instances.read().await;
@@ -11176,6 +11345,678 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         origin_of("with-prompt-tui"),
         crate::daemon::PromptOrigin::Tui
     );
+    let linked = instances.iter().find(|i| i.title == "with-prompt").unwrap();
+    let origin = linked.suggestion.as_ref().expect("linked");
+    assert_eq!(
+        (origin.provider_id.as_str(), origin.id.as_str()),
+        ("acme.gh", "42")
+    );
+    // Created in `chosen-default`, published under the host's `default`.
+    assert_ne!(instances[0].source_profile, "default");
+    assert_eq!(origin.profile.as_deref(), Some("default"));
+    let host = state.plugin_host.clone().unwrap();
+    let links = host
+        .with_suggestions_db(crate::plugin::suggestions::links)
+        .unwrap();
+    let started = crate::plugin::suggestions::started_sessions(&links, instances.iter());
+    assert_eq!(
+        started[&("acme.gh".to_string(), "42".to_string())]["id"],
+        instances[0].id
+    );
+}
+
+/// App state with a plugin host holding suggestion "42" of `acme.gh`, and the
+/// guards that keep its isolated app dir and provider registered.
+async fn suggestion_state() -> (
+    (
+        crate::session::test_support::AppDirGuard,
+        tempfile::TempDir,
+        crate::plugin::ReloadRegistryOnDrop,
+    ),
+    std::sync::Arc<AppState>,
+) {
+    suggestion_state_in(false).await
+}
+
+async fn suggestion_state_in(
+    cityhall: bool,
+) -> (
+    (
+        crate::session::test_support::AppDirGuard,
+        tempfile::TempDir,
+        crate::plugin::ReloadRegistryOnDrop,
+    ),
+    std::sync::Arc<AppState>,
+) {
+    let home = crate::session::test_support::isolate_app_dir();
+    let adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("chosen-default").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let registry = crate::server::api::suggestions_tests::register_provider();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", None, "42");
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| {
+            state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+            state.plugin_host = Some(host);
+            state.cityhall_mode = cityhall;
+        },
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    ((home, adapter, registry), state)
+}
+
+fn linked_body(title: &str, key: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "title": title, "path": "", "tool": "claude", "scratch": true, "view": "structured",
+        "suggestion": { "provider_id": "acme.gh", "id": "42" },
+    });
+    if let Some(key) = key {
+        body["idempotency_key"] = key.into();
+    }
+    body
+}
+
+/// A link records which path made its Session, so a client can tell a preset
+/// start (safe to redo) from a wizard one (custom choices).
+#[tokio::test]
+#[serial_test::serial]
+async fn a_link_records_whether_start_or_the_wizard_made_it() {
+    use crate::plugin::suggestions::StartedVia;
+    let (_guards, state) = suggestion_state().await;
+    let host = state.plugin_host.clone().unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "43", None, "43");
+    let (status, body) = post_create(&state, linked_body("wizard", None)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{body}");
+    let mut start = linked_body("start", None);
+    start["suggestion"]["id"] = "43".into();
+    let response = create::create_session_with(
+        state.clone(),
+        false,
+        "test",
+        false,
+        serde_json::from_value(start).unwrap(),
+        create::CreateOrigin {
+            initial_turn: None,
+            prompt_origin: crate::daemon::PromptOrigin::Unknown,
+            via: StartedVia::Start(Some("the preset prompt".to_string())),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+
+    let links = host
+        .with_suggestions_db(crate::plugin::suggestions::links)
+        .unwrap();
+    let instances = state.instances.read().await;
+    let started = crate::plugin::suggestions::started_sessions(&links, instances.iter());
+    let field =
+        |id: &str, name: &str| started[&("acme.gh".to_string(), id.to_string())][name].clone();
+    assert_eq!(field("42", "started_via"), "wizard");
+    assert_eq!(field("43", "started_via"), "start");
+    assert_eq!(field("42", "initial_prompt"), serde_json::Value::Null);
+    assert_eq!(field("43", "initial_prompt"), "the preset prompt");
+
+    // A preset edited after Start cannot change what the link recorded.
+    host.with_suggestions_db(|conn, profile| {
+        crate::plugin::suggestions::set_preset(
+            conn,
+            profile,
+            "acme.gh",
+            "assigned",
+            &crate::plugin::suggestions::Preset {
+                agent: "claude".to_string(),
+                view: crate::plugin::suggestions::PresetView::Structured,
+                worktree: false,
+                sandbox: false,
+                yolo: false,
+                prompt: Some("a different prompt".to_string()),
+            },
+        )
+        .unwrap();
+    });
+    let links = host
+        .with_suggestions_db(crate::plugin::suggestions::links)
+        .unwrap();
+    let started = crate::plugin::suggestions::started_sessions(&links, instances.iter());
+    assert_eq!(
+        started[&("acme.gh".to_string(), "43".to_string())]["initial_prompt"],
+        "the preset prompt"
+    );
+}
+
+/// Starts racing on one suggestion leave exactly one primary Session.
+#[tokio::test]
+#[serial_test::serial]
+async fn concurrent_starts_of_one_suggestion_create_one_session() {
+    let (_guards, state) = suggestion_state().await;
+    let starts: Vec<_> = (0..8)
+        .map(|n| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                post_create(&state, linked_body(&format!("racer {n}"), None)).await
+            })
+        })
+        .collect();
+    let mut created = 0;
+    for start in starts {
+        let (status, body) = start.await.unwrap();
+        match status {
+            axum::http::StatusCode::CREATED => created += 1,
+            axum::http::StatusCode::CONFLICT => assert_eq!(body["error"], "already_started"),
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    assert_eq!(created, 1, "one winner");
+    let rows = state.instances.read().await;
+    assert_eq!(rows.len(), 1, "one Session exists");
+}
+
+/// A client that drops mid-create must not leave the link claimed: the create
+/// task frees it when the create fails, so the next start is not told "starting".
+#[tokio::test]
+#[serial_test::serial]
+async fn a_dropped_suggestion_create_frees_its_link() {
+    let (_guards, state) = suggestion_state().await;
+    let release = create::panic_hook::arm("drop-link");
+    let first = tokio::spawn({
+        let state = state.clone();
+        async move { post_create(&state, linked_body("dropped", Some("drop-link"))).await }
+    });
+    wait_for("the create to be registered", || {
+        state.create_progress.snapshot("drop-link", None).is_some()
+    })
+    .await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let host = state.plugin_host.clone().unwrap();
+    let linked = || {
+        host.with_suggestions_db(|conn, _| {
+            conn.query_row("SELECT COUNT(*) FROM suggestion_links", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        })
+    };
+    assert_eq!(linked(), 1, "claimed while provisioning");
+    let (status, starting) = post_create(&state, linked_body("second", None)).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{starting}");
+    assert_eq!(starting["error"], "already_started");
+    assert!(
+        starting["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "the 409 names the Session being created: {starting}"
+    );
+    release.notify_one();
+    wait_for("the failed create to free its link", || linked() == 0).await;
+    let (status, retry) = post_create(&state, linked_body("retry", None)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{retry}");
+}
+
+/// A 409 names the Session holding the link only to a caller that can see it:
+/// CityHall does not see terminal Sessions, nor one still being created.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_conflict_names_the_holder_only_where_the_caller_can_see_it() {
+    for cityhall in [false, true] {
+        let (_guards, state) = suggestion_state_in(cityhall).await;
+        let mut holder = crate::session::Instance::new("terminal holder", "/tmp/x");
+        holder.source_profile = "default".into();
+        let holder_id = holder.id.clone();
+        state.instances.write().await.push(holder);
+        let host = state.plugin_host.clone().unwrap();
+        let link = |holder: &str, pending: bool| {
+            host.with_suggestions_db(|conn, _| {
+                conn.execute("DELETE FROM suggestion_links", []).unwrap();
+                conn.execute(
+                    "INSERT INTO suggestion_links (profile, provider_id, item_id, holder, pending)
+                     VALUES ('default', 'acme.gh', '42', ?1, ?2)",
+                    rusqlite::params![holder, pending],
+                )
+                .unwrap();
+            })
+        };
+        let origin = crate::session::SuggestionOrigin {
+            provider_id: "acme.gh".into(),
+            id: "42".into(),
+            profile: Some("default".into()),
+        };
+        let refused = || async {
+            let response = create::claim_suggestion_link(
+                &state,
+                Some(&origin),
+                "new",
+                crate::plugin::suggestions::StartedVia::Wizard,
+            )
+            .await
+            .err()
+            .expect("the link is held");
+            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        link(&holder_id, false);
+        let settled = refused().await;
+        assert_eq!(settled["error"], "already_started");
+        assert_eq!(settled.get("session_id").is_some(), !cityhall, "{settled}");
+
+        let _starting = crate::plugin::suggestions::mark_starting("provisioning");
+        link("provisioning", true);
+        let starting = refused().await;
+        assert_eq!(starting["error"], "already_started");
+        assert_eq!(
+            starting.get("session_id").is_some(),
+            !cityhall,
+            "{starting}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_suggestion_has_one_primary_session() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("chosen-default").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let _registry = crate::server::api::suggestions_tests::register_provider();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", None, "42");
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| {
+            state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+            state.plugin_host = Some(host);
+        },
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let create = |title: &str, linked: bool, extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "title": title, "path": "", "tool": "claude",
+            "scratch": true, "view": "structured",
+        });
+        if linked {
+            body["suggestion"] = serde_json::json!({ "provider_id": "acme.gh", "id": "42" });
+        }
+        if let serde_json::Value::Object(extra) = extra {
+            body.as_object_mut().unwrap().extend(extra);
+        }
+        post_create(&state, body)
+    };
+    let null = serde_json::Value::Null;
+
+    // A failed start frees the link: this one is refused after it claimed.
+    let (status, _) = create("fails", true, serde_json::json!({ "trust_hooks": true })).await;
+    assert!(status.is_client_error(), "{status}");
+    let (status, first) = create("first", true, null.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{first}");
+
+    // A second start loses, and learns who won.
+    let (status, lost) = create("second", true, null.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{lost}");
+    assert_eq!(lost["error"], "already_started");
+    assert_eq!(lost["session_id"], first["id"]);
+
+    // "Start another" carries no origin, so it takes no link.
+    let (status, another) = create("another", false, null.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{another}");
+
+    // Trash frees the link; archive keeps it. Both go through the handlers, so the
+    // durable row changes too: an in-memory edit is replaced by the next publish.
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let response = update_session_archive(
+        State(state.clone()),
+        Path(first_id.clone()),
+        Ok(Json(UpdateArchiveBody {
+            archived: true,
+            kill_pane: false,
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let (status, _) = create("while archived", true, null.clone()).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    let response = trash_session(State(state.clone()), Path(first_id), None)
+        .await
+        .into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let (status, second) = create("after trash", true, null).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{second}");
+}
+
+#[tokio::test]
+async fn start_creates_the_session_from_the_preset_and_links_it() {
+    use axum::response::IntoResponse;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config.default_profile = "chosen-default".to_string();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("chosen-default").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let _registry = crate::server::api::suggestions_tests::register_provider();
+    let repo = tempfile::tempdir().unwrap();
+    crate::session::projects::add(
+        "default",
+        crate::session::projects::ProjectScope::Global,
+        crate::session::projects::Project::new(
+            "repo",
+            repo.path().to_string_lossy(),
+            crate::session::projects::ProjectScope::Global,
+        ),
+        false,
+    )
+    .unwrap();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", Some("acme/web"), "42");
+    host.with_suggestions_db(|conn, profile| {
+        crate::plugin::suggestions::put_mapping(
+            conn,
+            profile,
+            "acme.gh",
+            "acme/web",
+            &[repo.path().to_string_lossy().into_owned()],
+        )
+    })
+    .unwrap();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| {
+            state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+            state.plugin_host = Some(host);
+        },
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let start = || async {
+        let body: crate::server::api::StartBody =
+            serde_json::from_value(serde_json::json!({ "provider_id": "acme.gh", "id": "42" }))
+                .unwrap();
+        let response = crate::server::api::start_suggestion(
+            axum::extract::State(state.clone()),
+            Ok(axum::Json(body)),
+        )
+        .await
+        .into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        )
+    };
+
+    let (status, started) = start().await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{started}");
+    let instances = state.instances.read().await;
+    let session = instances
+        .iter()
+        .find(|i| i.id == started["session_id"])
+        .expect("created");
+    assert_eq!(session.tool, "claude");
+    assert_eq!(session.suggestion.as_ref().unwrap().id, "42");
+    // The plugin's own prompt, as the preset has none of its own.
+    assert_eq!(
+        session.pending_initial_turn.as_ref().unwrap().text,
+        "Fix #{number}"
+    );
+    drop(instances);
+
+    let (status, again) = start().await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{again}");
+    assert_eq!(again["error"], "already_started");
+    assert_eq!(again["session_id"], started["session_id"]);
+}
+
+/// Start shows the hooks and MCP servers it needs approved, starts once they are
+/// approved at the reviewed fingerprint, and refuses a stale approval.
+#[tokio::test]
+#[serial_test::serial]
+async fn start_approves_reviewed_hooks_and_refuses_a_changed_review() {
+    use axum::response::IntoResponse;
+    let (_guards, state) = suggestion_state().await;
+    let repo = tempfile::tempdir().unwrap();
+    let config = repo.path().join(".agent-of-empires/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[hooks]\non_create = [\"true\"]\n").unwrap();
+    std::fs::write(
+        repo.path().join(".mcp.json"),
+        r#"{ "mcpServers": { "fs": { "command": "mcp-fs" } } }"#,
+    )
+    .unwrap();
+    crate::session::projects::add(
+        "default",
+        crate::session::projects::ProjectScope::Global,
+        crate::session::projects::Project::new(
+            "repo",
+            repo.path().to_string_lossy(),
+            crate::session::projects::ProjectScope::Global,
+        ),
+        false,
+    )
+    .unwrap();
+    let host = state.plugin_host.clone().unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", Some("acme/web"), "42");
+    host.with_suggestions_db(|conn, profile| {
+        crate::plugin::suggestions::put_mapping(
+            conn,
+            profile,
+            "acme.gh",
+            "acme/web",
+            &[repo.path().to_string_lossy().into_owned()],
+        )
+    })
+    .unwrap();
+    let start = |extra: serde_json::Value| {
+        let state = state.clone();
+        async move {
+            let mut body = serde_json::json!({ "provider_id": "acme.gh", "id": "42" });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let body: crate::server::api::StartBody = serde_json::from_value(body).unwrap();
+            let response = crate::server::api::start_suggestion(
+                axum::extract::State(state),
+                Ok(axum::Json(body)),
+            )
+            .await
+            .into_response();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+
+    let (status, review) = start(serde_json::json!({})).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{review}");
+    assert_eq!(review["error"], "hooks_need_trust");
+    assert_eq!(review["commands"]["on_create"], serde_json::json!(["true"]));
+    assert_eq!(review["needs_mcp_trust"], true);
+    assert_eq!(
+        review["mcp_summaries"].as_array().unwrap().len(),
+        1,
+        "{review}"
+    );
+    assert!(review["mcp_summaries"][0].as_str().unwrap().contains("fs"));
+
+    // The repo's hooks change after the review: the old approval is refused.
+    std::fs::write(&config, "[hooks]\non_create = [\"true\", \"echo more\"]\n").unwrap();
+    let approve = |review: &serde_json::Value| {
+        serde_json::json!({
+            "approve_hooks": true,
+            "review_fingerprint": review["review_fingerprint"],
+        })
+    };
+    let (status, stale) = start(approve(&review)).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["error"], "trust_changed");
+
+    // Reviewed again, approving starts the Session.
+    let (_, fresh) = start(serde_json::json!({})).await;
+    assert_eq!(fresh["error"], "hooks_need_trust", "{fresh}");
+    let (status, started) = start(approve(&fresh)).await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{started}");
+    assert!(state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|i| i.id == started["session_id"]));
+}
+
+#[tokio::test]
+async fn create_rejects_a_suggestion_that_is_not_published() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _registry = crate::server::api::suggestions_tests::register_provider();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", None, "42");
+    let with_host = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| state.plugin_host = Some(host),
+        |supervisor| supervisor,
+    );
+    let without_host = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    for (state, provider, id) in [
+        (&with_host, "acme.gh", "gone"),
+        (&with_host, "nobody.else", "42"),
+        (&without_host, "acme.gh", "42"),
+    ] {
+        let (status, body) = post_create(
+            state,
+            serde_json::json!({
+                "title": "unpublished", "path": "", "tool": "claude",
+                "scratch": true, "view": "structured",
+                "suggestion": { "provider_id": provider, "id": id },
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "{provider} {id}: {body}"
+        );
+        assert_eq!(body["error"], "stale_suggestion");
+        assert!(state.instances.read().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn create_rejects_a_blank_or_oversized_suggestion_reference() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    for suggestion in [
+        serde_json::json!({ "provider_id": " ", "id": "42" }),
+        serde_json::json!({ "provider_id": "acme.github", "id": "x".repeat(257) }),
+    ] {
+        let (status, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "bad-ref", "path": "", "tool": "claude",
+                "scratch": true, "view": "structured", "suggestion": suggestion,
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "validation_failed");
+    }
+    assert!(state.instances.read().await.is_empty());
 }
 
 #[tokio::test]
@@ -14274,6 +15115,94 @@ async fn create_with_a_parent_joins_its_group_one_level_deep() {
             state
                 .acp_event_store
                 .replay_from(id, 0)
+                .iter()
+                .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
+        })
+        .await;
+    }
+}
+
+/// A structured spawn starts on the default its Session route reports, so a detect-as Session
+/// starts on its base's default and never on an entry saved under its own name.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_structured_spawn_starts_on_the_default_its_session_route_reports() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|config| {
+        config
+            .session
+            .custom_agents
+            .insert("corp-claude".into(), "claude".into());
+        config
+            .session
+            .agent_detect_as
+            .insert("corp-claude".into(), "claude".into());
+        config.acp.acp_defaults = serde_json::from_value(serde_json::json!({
+            "claude": {"model": "base"},
+            "corp-claude": {"model": "never-read"},
+        }))
+        .unwrap();
+    })
+    .unwrap();
+    crate::session::Storage::new_unwatched("test").unwrap();
+    let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor.with_launcher(launcher),
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+    for tool in ["claude", "corp-claude"] {
+        let (status, session) = post_create(
+            &state,
+            serde_json::json!({
+                "title": tool, "path": "", "tool": tool, "scratch": true,
+                "view": "structured", "profile": "test",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{tool}: {session}");
+        let id = session["id"].as_str().unwrap().to_string();
+        let row = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .cloned()
+            .unwrap();
+        assert_eq!(row.view, crate::session::View::Structured, "{tool}");
+        let resp = crate::server::api::get_session_agent_default_model(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(id.clone()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{tool}");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["agent_key"], "claude", "{tool}");
+        assert_eq!(body["model"], "base", "{tool}");
+        assert_eq!(row.agent_model.as_deref(), Some("base"), "{tool}");
+        wait_for("launcher-rejected startup", || {
+            state
+                .acp_event_store
+                .replay_from(&id, 0)
                 .iter()
                 .any(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
         })

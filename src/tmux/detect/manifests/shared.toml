@@ -5,7 +5,14 @@
 state = "waiting"
 region = "whole_recent"
 visible = true
-contains_any = ["(y/n)", "[y/n]", "approve", "allow"]
+contains_any = ["(y/n)", "[y/n]"]
+
+# An "Allow once" or "Allow always" choice row, which prose using the words is not.
+[templates.approval_choice]
+state = "waiting"
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)^[\s\x{2502}]*(?:[\x{25CF}\x{276F}\x{203A}>]\s*)?[1-9]\.\s+(?:yes,\s+)?allow (?:once|always)\s*\x{2502}?\s*$']
 
 # A braille spinner frame anywhere in the window.
 [templates.spinner]
