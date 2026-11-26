@@ -910,6 +910,17 @@ impl AcpClient {
                 "launch cancelled before preparation".into(),
             ));
         }
+        // A missing cwd would ENOENT like a missing binary and misdirect the
+        // user to reinstalling the adapter (#1089).
+        if !config.cwd.exists() {
+            return Err(AcpError::ProjectPathMissing {
+                path: config.cwd.clone(),
+            });
+        }
+        // A root missing at pin time would stay unavailable for the session.
+        if let Some(path) = config.additional_dirs.iter().find(|dir| !dir.exists()) {
+            return Err(AcpError::ProjectPathMissing { path: path.clone() });
+        }
         let establishment = config
             .launch_lease
             .as_ref()
@@ -929,17 +940,6 @@ impl AcpClient {
             .expect("validated original lease")
             .retirement()
             .retain_establishment_projection(Arc::clone(&projection));
-        // A missing cwd would ENOENT like a missing binary and misdirect the
-        // user to reinstalling the adapter (#1089).
-        if !config.cwd.exists() {
-            return Err(AcpError::ProjectPathMissing {
-                path: config.cwd.clone(),
-            });
-        }
-        // A root missing at pin time would stay unavailable for the session.
-        if let Some(path) = config.additional_dirs.iter().find(|dir| !dir.exists()) {
-            return Err(AcpError::ProjectPathMissing { path: path.clone() });
-        }
         let state = Arc::<SessionState>::default();
         state.pin_fs_roots(&config.cwd, &config.additional_dirs);
         let sandbox = match &config.sandbox_info {

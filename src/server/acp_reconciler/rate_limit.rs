@@ -1270,6 +1270,7 @@ mod tests {
                         ).await.expect("the actual runner releases registry admission");
                         registry.record().unwrap().expect("the original runner remains registered")
                     };
+                    assert!(original.detached_at.is_none());
                     let original_identity =
                         crate::acp::runner_lifecycle::RunnerIdentity::from_record(&original);
                     let original_birth = crate::process::process_birth_identity(original.pid)
@@ -1305,6 +1306,21 @@ mod tests {
                                 Some(&original_lease)
                             );
                             assert!(original_actual.ensure_available().is_err());
+                            // SDK shutdown closes its socket before the runner records detach.
+                            // Wait for that write so quota admission does not race its registry lock.
+                            tokio::time::timeout(Duration::from_secs(10), async {
+                                loop {
+                                    let record = crate::process::worker_registry::load(&id)
+                                        .unwrap()
+                                        .expect("the original runner remains registered");
+                                    if record.detached_at.is_some() {
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .expect("the original runner committed its detach");
                             let retained = {
                                 let registry = crate::process::worker_registry::registry_lock_until(
                                     &id, tokio::time::Instant::now() + Duration::from_secs(10),

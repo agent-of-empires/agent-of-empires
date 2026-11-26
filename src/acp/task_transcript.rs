@@ -1806,7 +1806,18 @@ mod tests {
                     fixture.parked().await;
                     assert!(fixture.rx.try_recv().is_err());
                     fixture.append(&notification_line("t-1", Some("completed")));
-                    assert_eq!(finished_id(&fixture.next().await), "t-1");
+                    let finished = fixture.next().await;
+                    assert!(matches!(
+                        finished.event.as_ref(),
+                        Event::BackgroundTaskFinished {
+                            task_id,
+                            ended_at: Some(_),
+                        } if task_id == "t-1"
+                    ));
+                    assert_eq!(
+                        finished.metadata.resource_ref,
+                        Some(fixture.authority.witness().unwrap().allocation)
+                    );
                     fixture.released().await;
                 }
             })
@@ -1883,6 +1894,7 @@ pub(crate) mod resource_test_support {
     use crate::acp::supervisor::test_support::managed::{ManagedClient, ManagedScope, NativePeer};
     use crate::acp::workflow_journal::WorkflowJournal;
     use crate::file_watch::FileWatchService;
+    use crate::process::worker_registry;
     use std::collections::HashSet;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -1994,16 +2006,18 @@ pub(crate) mod resource_test_support {
                 tracking: Some(tracking_tx),
                 ..Default::default()
             });
+            // Multiple bootstraps in one scope share the Claude store.
+            let native_id = format!("task-native-{}", uuid::Uuid::new_v4());
             let (config, peer) = scope.native_peer(
                 workdir.path().to_path_buf(),
                 agent_key,
                 agent_key,
-                |request| {
+                move |request| {
                     let result = match request["method"].as_str()? {
                         "initialize" => {
                             serde_json::json!({"protocolVersion":1,"agentCapabilities":{}})
                         }
-                        "session/new" => serde_json::json!({"sessionId":"task-native"}),
+                        "session/new" => serde_json::json!({"sessionId":native_id.as_str()}),
                         _ => return None,
                     };
                     Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
@@ -2154,6 +2168,24 @@ pub(crate) mod resource_test_support {
             })
             .await
             .expect("detached bootstrap has no producer, watcher, or admitted reader");
+            // SDK shutdown closes its socket before the runner commits detach.
+            // That registry write can otherwise deny the adopted reader's IO.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(registry) = worker_registry::try_registry_lock(&self.managed.id)
+                        .expect("read original runner registry")
+                    {
+                        let record = registry.record().unwrap().expect("retained runner record");
+                        assert!(self.receipt.owner.owns_record(&record));
+                        if record.detached_at.is_some() {
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("original runner committed its detach");
         }
     }
 
