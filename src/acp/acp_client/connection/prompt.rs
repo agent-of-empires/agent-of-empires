@@ -22,8 +22,8 @@ use crate::acp::acp_client::errors::{acp_internal_error, prompt_runtime_error, A
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_reset, classify_rate_limit_error, classify_rate_limit_from_message,
-    clear_captured_rejections, take_rate_limit_from_captured_rejection,
+    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
+    take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::acp_client::session_identity::{ordered_native_request, OrderedRequestResult};
@@ -470,18 +470,9 @@ impl Session {
         let shared = &self.shared;
         match result {
             Err(error) => {
-                let captured = captured_rate_limit_reset(
-                    &shared.rate_limit_rejections,
-                    crate::time::Timestamp::now(),
-                );
-                return classify_rate_limit_error(error, captured.as_ref()).or_else(|| {
-                    classify_rate_limit_from_message(&error.message, captured.as_ref()).map(
-                        |mut info| {
-                            info.status = super::super::errors::public_error_message(error);
-                            info
-                        },
-                    )
-                });
+                let now = crate::time::Timestamp::now();
+                let captured = captured_rate_limit_reset(&shared.rate_limit_rejections, now);
+                return classify_rate_limit_error(error, captured.as_ref(), now);
             }
             Ok(response) if matches!(response.stop_reason, StopReason::Cancelled) => return None,
             Ok(_) => {}
