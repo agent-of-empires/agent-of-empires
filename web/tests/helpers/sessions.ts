@@ -3,7 +3,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { CLAUDE_PROFILE } from "../../src/lib/__tests__/agentProfileFixtures";
+import { profileFor } from "../../src/lib/__tests__/agentProfileFixtures";
 
 export interface SessionInput extends Record<string, unknown> {
   id: string;
@@ -13,13 +13,14 @@ export interface SessionInput extends Record<string, unknown> {
 
 export function sessionResponse({ id, title, project_path, ...rest }: SessionInput) {
   const projectPath = project_path ?? `/tmp/${id}`;
+  const tool = typeof rest.tool === "string" ? rest.tool : "claude";
   return {
     id,
     title: title ?? id,
     project_path: projectPath,
     group_path: projectPath,
-    tool: "claude",
-    agent_profile: CLAUDE_PROFILE,
+    tool,
+    agent_profile: profileFor(tool),
     status: "Idle",
     yolo_mode: false,
     lifecycle_generation: 0,
