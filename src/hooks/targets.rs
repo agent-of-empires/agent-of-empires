@@ -69,33 +69,32 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                         });
                         continue;
                     }
-                    match crate::session::resolved_agent_for(&profile, tool, detect_as) {
-                        Some(agent) => {
-                            if agent.hook_config.is_some() {
-                                push_relocated_target(&mut targets, agent, root, &config);
-                            } else if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-                                let relative: PathBuf = Path::new(sidecar.host_config_subpath)
-                                    .components()
-                                    .skip(1)
-                                    .collect();
-                                let path = root.join(relative);
-                                if !targets.iter().any(|target| {
-                                    matches!(target.kind, HookTargetKind::Sidecar(_))
-                                        && target.path == path
-                                }) {
-                                    let events =
-                                        crate::agents::resolved_sidecar_hook_events(agent, &config)
-                                            .unwrap_or_default();
-                                    targets.push(HookTarget {
-                                        agent_name: agent.name.to_string(),
-                                        kind: HookTargetKind::Sidecar(sidecar),
-                                        path,
-                                        events,
-                                    });
-                                }
+                    if let Some(agent) =
+                        crate::session::resolved_agent_for(&profile, tool, detect_as)
+                    {
+                        if agent.hook_config.is_some() {
+                            push_relocated_target(&mut targets, agent, root, &config);
+                        } else if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
+                            let relative: PathBuf = Path::new(sidecar.host_config_subpath)
+                                .components()
+                                .skip(1)
+                                .collect();
+                            let path = root.join(relative);
+                            if !targets.iter().any(|target| {
+                                matches!(target.kind, HookTargetKind::Sidecar(_))
+                                    && target.path == path
+                            }) {
+                                let events =
+                                    crate::agents::resolved_sidecar_hook_events(agent, &config)
+                                        .unwrap_or_default();
+                                targets.push(HookTarget {
+                                    agent_name: agent.name.to_string(),
+                                    kind: HookTargetKind::Sidecar(sidecar),
+                                    path,
+                                    events,
+                                });
                             }
                         }
-                        None => {}
                     }
                 }
                 let instances = match crate::session::Storage::new_unwatched(&profile)
