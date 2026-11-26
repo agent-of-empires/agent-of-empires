@@ -289,15 +289,21 @@ test.describe("telemetry signals", () => {
       },
     });
     const pings = captureSeenPings(page);
+    const expectPing = (surface: string) =>
+      expect.poll(() => pings().map((p) => p.surface), { timeout: 10_000 }).toContain(surface);
     await page.goto(`${serve.baseUrl}/`);
     const sessionRow = page.getByRole("link").filter({ hasText: "usage-signals" }).first();
     await expect(sessionRow).toBeVisible({ timeout: 10_000 });
     await sessionRow.click();
-    // Diff starts closed; the signal fires once it shows.
-    await page.getByTestId("pane-toggle-diff").first().click();
-    for (const surface of ["web_terminal", "diff_panel"]) {
-      await expect.poll(() => pings().some((p) => p.surface === surface), { timeout: 10_000 }).toBe(true);
-    }
+    await expectPing("web_terminal");
+
+    const diffToggle = page.getByTestId("pane-toggle-diff").first();
+    await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+    // Wait for the badge so the panel opens with an already-loaded diff.
+    await expect(diffToggle).toHaveAccessibleName("Toggle diff pane, 1 changed");
+    expect(pings().map((p) => p.surface)).not.toContain("diff_panel");
+    await diffToggle.click();
+    await expectPing("diff_panel");
   });
 
   test("a read-only server fires no feature-usage signals", async ({ serveReadOnly, page }) => {
