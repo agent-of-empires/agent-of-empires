@@ -18,10 +18,10 @@ use crate::acp::event_store::EventStore;
 use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 
+pub(crate) use rate_limit::install_rate_limit_continuation;
 #[cfg(test)]
-pub(crate) use rate_limit::{failover_in_flight, reap_rate_limit_resumes};
+pub(crate) use rate_limit::{failover_in_flight, reap_rate_limit_resumes, ContinuationOutcome};
 pub(crate) use rate_limit::{failover_target, FailoverSettings};
-pub(crate) use rate_limit::{install_rate_limit_continuation, ContinuationOutcome};
 pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
 pub(crate) use resume::{trigger_resume_background, trigger_resume_observing, ResumeTrigger};
 

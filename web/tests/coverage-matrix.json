@@ -834,18 +834,12 @@
       "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
-      "id": "settings.startup-recovery-wake",
+      "id": "sessions.startup-recovery",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/settings-persistence.spec.ts", "tests/live/startup-recovery.spec.ts"],
-      "components": [
-        "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/SchemaSection.tsx",
-        "src/session/config/mod.rs",
-        "src/server/api/sessions/lifecycle.rs",
-        "src/server/startup_recovery.rs"
-      ],
-      "notes": "The real schema switch defaults off, validates boolean PATCH values, persists per profile, and resets to machine inheritance. Missing Idle/Waiting/Running panes still resume; opted-in default/custom text, empty opt-out, profile precedence, failed resume, and unchanged explicit API/CLI restart wake behavior use private fake agents."
+      "specs": ["tests/live/startup-recovery.spec.ts"],
+      "components": ["src/server/api/sessions/lifecycle.rs", "src/server/startup_recovery.rs"],
+      "notes": "Missing Idle/Waiting/Running terminal panes resume the recorded native conversation at Daemon startup, including in a non-default profile. A failed resume records the failed native ID, retains the conversation association, clears the lifecycle reservation, and leaves no pane. Startup recovery and API and CLI terminal restarts deliver neither prompts nor partial input to the private fake agents. Structured restarts are not covered here."
     },
     {
       "id": "settings.list-field",

@@ -14,6 +14,8 @@ release_always = true
 dependencies_update = false
 semver_check = false
 pr_labels = ["release"]
+# Tessl Code Review skips drafts, so refreshes of the release PR are not reviewed.
+pr_draft = true
 
 # Cargo leaves the nested crates out of the root package, so they share its version
 # group: their changes bump the release and land in its changelog, with no tag or
