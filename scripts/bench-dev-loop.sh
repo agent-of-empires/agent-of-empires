@@ -76,7 +76,7 @@ if [[ $RUN == *" 1 "* ]]; then
 echo "== 1. build/test alternation"
 hyperfine --runs 5 --export-markdown "$OUT/1-build-test.md" --export-json "$OUT/1-build-test.json" \
   --prepare "$DISK && touch src/lib.rs && cargo build -q" 'cargo test --no-run -q'
-echo "cargo test --no-run mean CPU seconds: $(jq -r '.results[0].summary | "user \(.time_user.mean) system \(.time_system.mean)"' "$OUT/1-build-test.json")" |
+echo "cargo test --no-run mean CPU seconds: $(jq -r '.results[0] | "user \(.summary.time_user.mean // .user) system \(.summary.time_system.mean // .system)"' "$OUT/1-build-test.json")" |
   tee -a "$OUT/summary.txt"
 touch src/lib.rs && cargo build -q
 with_rustc_rss cargo test --no-run -v >"$B/log" 2>&1
@@ -107,9 +107,9 @@ echo "== 3. xtask dev rebuild"
 "$DISK"
 cargo build --features web -q
 hyperfine --runs 5 --export-markdown "$OUT/3-xtask-dev.md" \
-  --prepare "$DISK && touch web/src/main.tsx src/lib.rs" \
-  -n 'cargo build --features web' 'cargo build --features web -q' \
-  -n 'cargo build' 'cargo build -q'
+  -n 'web, Rust edit' --prepare "$DISK && touch src/lib.rs" 'cargo build --features web -q' \
+  -n 'web, Rust edit after a frontend edit' --prepare "$DISK && touch web/src/main.tsx src/lib.rs" 'cargo build --features web -q' \
+  -n 'no web, Rust edit' --prepare "$DISK && touch src/lib.rs" 'cargo build -q'
 fi
 
 for f in "$OUT"/*; do echo "--- $(basename "$f")"; cat "$f"; done
