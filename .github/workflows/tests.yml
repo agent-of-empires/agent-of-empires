@@ -325,7 +325,9 @@ jobs:
               'src/session/config/container_config.rs',
               'src/session/instance/container.rs',
               'src/session/sandbox_store_reclaim.rs',
-              'build.rs', 'Cargo.lock', 'rust-toolchain.toml',
+              'build.rs', 'rust-toolchain.toml',
+              // A PR lockfile bump runs post-merge; the queue still checks it.
+              ...(pr ? [] : ['Cargo.lock']),
             ];
             const cfg = /target_os\s*=\s*"macos"/;
             const sensitive = path => !!path &&
@@ -340,7 +342,9 @@ jobs:
             if (diff.files.length >= 300) return run('diff too large to inspect');
             const hit = diff.files.find(f =>
               sensitive(f.filename) || sensitive(f.previous_filename) ||
-              !f.patch || f.patch.split('\n').some(line =>
+              // Only Rust and TOML hold the cfg; binaries have no patch.
+              (!f.patch && /\.(rs|toml)$/.test(f.filename)) ||
+              f.patch?.split('\n').some(line =>
                 /^[+-](?![+-]{2} )/.test(line) && cfg.test(line)));
             if (hit) return run(`${hit.filename} is macOS-sensitive`);
             core.notice('macOS skipped: runs post-merge on main. Add ci-macos and re-run this job to run it here.');

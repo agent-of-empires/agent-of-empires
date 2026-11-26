@@ -473,6 +473,7 @@ mod tests {
                         cancel_capable: true,
                         model: None,
                         background: true,
+                        runs: 0,
                     };
                     state
                         .acp_event_store
@@ -823,6 +824,7 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: true,
+                runs: 0,
             },
             at: Timestamp::now(),
         };

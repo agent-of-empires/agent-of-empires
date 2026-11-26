@@ -4,31 +4,21 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
 const fetchSettings = vi.fn();
-const fetchSoundBlob = vi.fn();
+const fetchSound = vi.fn();
 
 vi.mock("../lib/api", () => ({
   fetchSettings: (...args: unknown[]) => fetchSettings(...args),
-  fetchSoundBlob: (...args: unknown[]) => fetchSoundBlob(...args),
+  fetchSound: (...args: unknown[]) => fetchSound(...args),
 }));
 
 import { useApprovalSound } from "./useApprovalSound";
 import { notifySettingsChanged } from "../lib/settingsEvents";
 import { approvalChimedRecently, clearSoundCache } from "../lib/soundPlayer";
+import { fakeAudio, installFakeAudioContext, playedSounds, soundBytes } from "../lib/__tests__/fakeAudioContext";
 
 const REPLAY_QUIET_MS = 1500;
-
-let audioInstances: FakeAudio[] = [];
-let playImpl: () => Promise<void>;
-
-class FakeAudio {
-  volume = 1;
-  play = vi.fn(() => playImpl());
-  src: string;
-  constructor(src: string) {
-    this.src = src;
-    audioInstances.push(this);
-  }
-}
+// Longer than soundPlayer's wait for a context that may never resume.
+const RESUME_WAIT_MS = 250;
 
 async function flushPlayback(): Promise<void> {
   await act(async () => {
@@ -40,15 +30,10 @@ async function flushPlayback(): Promise<void> {
 describe("useApprovalSound", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    audioInstances = [];
-    playImpl = () => Promise.resolve();
-    fetchSettings.mockReset().mockResolvedValue({ sound: { enabled: true, browser_volume: 1.0, on_approval: "ding" } });
-    fetchSoundBlob.mockReset().mockResolvedValue(new Blob(["audio"], { type: "audio/wav" }));
-    vi.stubGlobal("Audio", FakeAudio);
-    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:fake-url");
-    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    installFakeAudioContext();
+    fetchSettings.mockReset().mockResolvedValue({ sound: { enabled: true, browser_volume: 1.0 } });
+    fetchSound.mockReset().mockImplementation(async (event: string) => soundBytes(event));
     clearSoundCache();
-    vi.mocked(URL.revokeObjectURL).mockClear();
   });
 
   afterEach(() => {
@@ -71,15 +56,13 @@ describe("useApprovalSound", () => {
     return view;
   }
 
-  it("plays the configured sound once per 0 -> >=1 edge after the grace window", async () => {
+  it("plays the approval sound once per 0 -> >=1 edge after the grace window", async () => {
     await walk(1, 3);
-    expect(audioInstances).toHaveLength(1);
-    expect(audioInstances[0]!.src).toBe("blob:fake-url");
-    expect(audioInstances[0]!.play).toHaveBeenCalledTimes(1);
-    expect(fetchSoundBlob).toHaveBeenCalledWith("ding");
+    expect(playedSounds()).toEqual(["approval"]);
+    expect(fetchSound).toHaveBeenCalledWith("approval");
 
     await walk(1, 0, 1);
-    expect(audioInstances).toHaveLength(3);
+    expect(playedSounds()).toHaveLength(3);
   });
 
   it("records the chime for the session so its Waiting sound can be skipped", async () => {
@@ -98,72 +81,56 @@ describe("useApprovalSound", () => {
     const { rerender } = renderHook((p: number) => useApprovalSound(p), { initialProps: 0 });
     rerender(2);
     await flushPlayback();
-    expect(audioInstances).toHaveLength(0);
-  });
-
-  it("stays silent when browser sounds are off", async () => {
-    fetchSettings.mockResolvedValue({ sound: { enabled: true, browser_enabled: false, on_approval: "ding" } });
-    await walk(1);
-    expect(audioInstances).toHaveLength(0);
+    expect(playedSounds()).toHaveLength(0);
   });
 
   it.each([
+    ["browser sounds are off", { sound: { enabled: true, browser_enabled: false } }, undefined],
+    ["the approval chime is off", { sound: { enabled: true, browser_approval_enabled: false } }, undefined],
     ["sound is disabled", { sound: { enabled: false } }, undefined],
     ["settings have no sound block", {}, undefined],
-    ["no sound name resolves", { sound: { enabled: true, on_approval: "   " } }, undefined],
-    ["the blob fetch returns null", undefined, () => fetchSoundBlob.mockResolvedValue(null)],
+    ["the sound fetch fails", undefined, () => fetchSound.mockResolvedValue(null)],
   ])("stays silent when %s", async (_label, settings, arrange) => {
     if (settings) fetchSettings.mockResolvedValue(settings);
     arrange?.();
     await walk(1);
-    expect(audioInstances).toHaveLength(0);
+    expect(playedSounds()).toHaveLength(0);
   });
 
-  it.each([1.5, undefined])("clamps volume %s into the 0..1 audio range", async (volume) => {
-    fetchSettings.mockResolvedValue({ sound: { enabled: true, on_approval: "ding", browser_volume: volume } });
-    await walk(1);
-    expect(audioInstances[0]!.volume).toBe(1);
+  it("stays silent, without recording a chime, while the page has not been interacted with", async () => {
+    fakeAudio.state = "suspended";
+    fakeAudio.resumable = false;
+    const view = renderHook((p: number) => useApprovalSound(p, "sess-blocked"), { initialProps: 0 });
+    await act(async () => {
+      vi.advanceTimersByTime(REPLAY_QUIET_MS);
+    });
+    view.rerender(1);
+    await flushPlayback();
+    await act(async () => {
+      vi.advanceTimersByTime(RESUME_WAIT_MS);
+    });
+    await flushPlayback();
+    expect(playedSounds()).toHaveLength(0);
+    expect(approvalChimedRecently("sess-blocked")).toBe(false);
   });
 
-  it("swallows an autoplay-policy rejection", async () => {
-    playImpl = () => Promise.reject(new Error("autoplay blocked"));
-    await walk(1);
-    expect(audioInstances[0]!.play).toHaveBeenCalledTimes(1);
-  });
-
-  it("caches settings and the blob URL across plays", async () => {
+  it("caches settings and the decoded sound across plays", async () => {
     await walk(1, 0, 1);
-    expect(audioInstances).toHaveLength(2);
+    expect(playedSounds()).toHaveLength(2);
     expect(fetchSettings).toHaveBeenCalledTimes(1);
-    expect(fetchSoundBlob).toHaveBeenCalledTimes(1);
-    expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
+    expect(fetchSound).toHaveBeenCalledTimes(1);
   });
 
-  it("clearSoundCache revokes the blob URL and forces a refetch", async () => {
-    clearSoundCache();
-    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
-
+  it("silences the next edge after a save turns browser sounds off", async () => {
     const { rerender } = await walk(1);
-    act(() => clearSoundCache());
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:fake-url");
-    for (const count of [0, 1]) {
-      rerender(count);
-      await flushPlayback();
-    }
-    expect(fetchSettings).toHaveBeenCalledTimes(2);
-    expect(fetchSoundBlob).toHaveBeenCalledTimes(2);
-  });
-
-  it("plays a newly saved sound on the next edge after a settings save", async () => {
-    const { rerender } = await walk(1);
-    fetchSettings.mockResolvedValue({ sound: { enabled: true, on_approval: "chime" } });
+    fetchSettings.mockResolvedValue({ sound: { enabled: true, browser_enabled: false } });
     act(() => notifySettingsChanged());
     for (const count of [0, 1]) {
       rerender(count);
       await flushPlayback();
     }
     expect(fetchSettings).toHaveBeenCalledTimes(2);
-    expect(fetchSoundBlob).toHaveBeenLastCalledWith("chime");
+    expect(playedSounds()).toHaveLength(1);
   });
 
   it("does not re-cache a read that started before a settings save", async () => {
@@ -171,14 +138,14 @@ describe("useApprovalSound", () => {
     fetchSettings.mockReturnValueOnce(new Promise((resolve) => (finishStaleRead = resolve)));
     const { rerender } = await walk(1);
     act(() => notifySettingsChanged());
-    finishStaleRead({ sound: { enabled: true, on_approval: "ding" } });
+    finishStaleRead({ sound: { enabled: true } });
     await flushPlayback();
-    fetchSettings.mockResolvedValue({ sound: { enabled: true, on_approval: "chime" } });
+    fetchSettings.mockResolvedValue({ sound: { enabled: true, browser_enabled: false } });
     for (const count of [0, 1]) {
       rerender(count);
       await flushPlayback();
     }
     expect(fetchSettings).toHaveBeenCalledTimes(2);
-    expect(fetchSoundBlob).toHaveBeenLastCalledWith("chime");
+    expect(playedSounds()).toHaveLength(0);
   });
 });

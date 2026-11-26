@@ -153,6 +153,7 @@ impl Shared {
                     cancel_capable: false,
                     model: None,
                     background: false,
+                    runs: 0,
                 });
             record.cancel_capable = self
                 .ingress
@@ -940,6 +941,7 @@ mod tests {
             cancel_capable: true,
             model: None,
             background: false,
+            runs: 0,
         };
         for (id, state, seen) in [
             ("stale", SubagentState::Running, now - floor - 1),

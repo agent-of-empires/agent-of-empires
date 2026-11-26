@@ -15,11 +15,58 @@ pub struct RateLimitPark {
     pub info: Option<RateLimitInfo>,
     /// When the latest `RateLimit` was recorded (epoch ms), 0 when unknown.
     pub recorded_at_ms: i64,
+    /// When the park's reset was last reported (epoch ms): `recorded_at_ms`, or the earlier
+    /// event an inherited reset was copied from.
+    pub observed_at_ms: i64,
+    /// The window an inherited reset was reported for; `None` when the park's reset is its own.
+    pub inherited_window: Option<String>,
     /// The redelivery cap already parked the session; only a queued prompt
     /// or a manual resume releases it.
     pub cap_reached: bool,
     /// When auto-resume last fired for this park, so a failed resume retries on a schedule.
     pub last_resume_attempt_ms: Option<i64>,
+}
+
+/// Key the sink adds to a `RateLimit` whose reset it copied from an earlier event: when that
+/// reset was originally reported (epoch ms). Decoding ignores it.
+pub(super) const INHERITED_OBSERVATION_KEY: &str = "inherited_observed_at_ms";
+
+/// Key beside it naming the window the inherited reset was reported for. Decoding ignores it.
+pub(super) const INHERITED_WINDOW_KEY: &str = "inherited_window";
+
+/// Where the latest `RateLimit`'s reset came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetProvenance {
+    /// When the reset was last reported (epoch ms): when the event was recorded, or for an
+    /// inherited reset, when its source reported it.
+    pub observed_at_ms: i64,
+    /// The window an inherited reset was reported for, `None` for one the event carried itself.
+    pub source_window: Option<String>,
+}
+
+fn latest_reset_provenance(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Option<ResetProvenance> {
+    conn.query_row(
+        &format!(
+            "SELECT COALESCE(json_extract(event_json, '$.RateLimit.{INHERITED_OBSERVATION_KEY}'),
+                            created_at),
+                    json_extract(event_json, '$.RateLimit.{INHERITED_WINDOW_KEY}')
+             FROM acp_events
+             WHERE session_id = ?1 AND discriminant = 'RateLimit'
+             ORDER BY seq DESC LIMIT 1"
+        ),
+        params![session_id],
+        |row| {
+            Ok(ResetProvenance {
+                observed_at_ms: row.get(0)?,
+                source_window: row.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .unwrap_or(None)
 }
 
 impl EventStore {
@@ -42,6 +89,12 @@ impl EventStore {
             Event::RateLimit { info } => Some((info, created_at)),
             _ => None,
         }
+    }
+
+    /// When the latest `RateLimit`'s reset was last reported, and for which window if the sink
+    /// inherited it.
+    pub fn latest_rate_limit_provenance(&self, session_id: &str) -> Option<ResetProvenance> {
+        latest_reset_provenance(&self.conn(), session_id)
     }
 
     /// The newest startup error and its recorded time (epoch ms), unless a session
@@ -150,10 +203,16 @@ impl EventStore {
                 |row| row.get::<_, Option<i64>>(0),
             )
             .unwrap_or(None);
+        let provenance = latest_reset_provenance(&conn, session_id);
+        let observed_at_ms = provenance
+            .as_ref()
+            .map_or(recorded_at_ms, |p| p.observed_at_ms);
         Some(RateLimitPark {
             seq: u64::try_from(park_seq).ok()?,
             info,
             recorded_at_ms,
+            observed_at_ms,
+            inherited_window: provenance.and_then(|p| p.source_window),
             cap_reached: cap_seq.is_some(),
             last_resume_attempt_ms,
         })
