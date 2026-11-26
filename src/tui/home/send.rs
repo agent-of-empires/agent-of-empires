@@ -418,11 +418,11 @@ mod deliver_to_live_pane_tests {
             on_input_checked(&checked, move || {
                 drop(pin);
                 match then {
-                    Then::Kill => {
-                        let _ = crate::tmux::tmux_command()
-                            .args(["kill-pane", "-t", &target])
-                            .status();
-                    }
+                    Then::Kill => assert!(crate::tmux::tmux_command()
+                        .args(["kill-pane", "-t", &target])
+                        .status()
+                        .unwrap()
+                        .success()),
                     Then::Move => move_pane(),
                     Then::MoveBeforeEnter => on_text_typed(&target, move_pane),
                     Then::Unpin => {}
