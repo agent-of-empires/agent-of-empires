@@ -146,7 +146,18 @@ struct ReattachSpec {
     source_profile: Option<String>,
     claude_home: Option<PathBuf>,
     proxy: Option<ProxySpec>,
+    /// A `neutral_boot` fallback ran the adapter raw; it keeps the neutral profile.
+    degraded: bool,
     state: Arc<SessionState>,
+}
+
+/// The neutral profile when a failed proxy left the adapter unmediated.
+fn launch_profile(agent_key: &str, degraded: bool) -> &'static agent_profiles::AgentProfile {
+    if degraded {
+        &agent_profiles::DEFAULT
+    } else {
+        agent_profiles::resolve(agent_key)
+    }
 }
 
 /// Resources and turn ownership survive replacement of the control connection.
@@ -590,7 +601,7 @@ impl AcpClient {
             cwd: config.cwd.clone(),
             additional_dirs: config.additional_dirs.clone(),
             sandbox,
-            profile: agent_profiles::resolve(&config.agent_key),
+            profile: launch_profile(&config.agent_key, config.degraded.is_some()),
             install_binary: config.spec.command.clone(),
             proxy: config.proxy.clone(),
             source_profile: config.source_profile.clone(),
@@ -631,6 +642,7 @@ impl AcpClient {
                 source_profile: launch.source_profile.clone(),
                 claude_home: launch.claude_home.clone(),
                 proxy: launch.proxy.clone(),
+                degraded: config.degraded.is_some(),
                 state: launch.state.clone(),
             };
             let mut client = Self::connect_via_socket(socket_path, launch, None).await?;
@@ -759,6 +771,7 @@ impl AcpClient {
         launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
         claude_home: Option<PathBuf>,
         proxy: Option<ProxySpec>,
+        degraded: bool,
     ) -> Result<Self, AcpError> {
         let spec = ReattachSpec {
             socket_path,
@@ -769,6 +782,7 @@ impl AcpClient {
             source_profile,
             claude_home,
             proxy,
+            degraded,
             state: Arc::default(),
         };
         let mode = ConnectMode::Resume {
@@ -798,7 +812,7 @@ impl AcpClient {
             cwd: spec.cwd.clone(),
             additional_dirs: spec.additional_dirs.clone(),
             sandbox: spec.sandbox.clone(),
-            profile: agent_profiles::resolve(&spec.agent_key),
+            profile: launch_profile(&spec.agent_key, spec.degraded),
             install_binary,
             proxy: spec.proxy.clone(),
             source_profile: spec.source_profile.clone(),

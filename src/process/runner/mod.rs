@@ -110,6 +110,12 @@ pub struct AcpRunnerArgs {
     pub systemd_scope: Option<String>,
     #[arg(long)]
     pub prime_runtime: Option<String>,
+    /// JSON `ProxySpec` of the proxy ahead of the adapter in `agent_argv`.
+    #[arg(long)]
+    pub proxy: Option<String>,
+    /// Display name of the proxy a `neutral_boot` fallback dropped.
+    #[arg(long)]
+    pub degraded: Option<String>,
     /// Agent program + args after `--`.
     #[arg(last = true, required = true)]
     pub agent_argv: Vec<String>,
@@ -210,6 +216,13 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         .map(serde_json::from_str)
         .transpose()
         .context("parsing Prime runtime")?;
+    record.proxy = args
+        .proxy
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("parsing proxy spec")?;
+    record.degraded = args.degraded.clone();
     let (control_listener, mut agent_child, agent_stdin, agent_stdout, agent_stderr) =
         register_and_spawn_agent(&args, &record)?;
     let agent_started_at = std::time::Instant::now();
@@ -723,6 +736,8 @@ mod tests {
             lifecycle_generation: Some(5),
             systemd_scope: None,
             prime_runtime: None,
+            proxy: None,
+            degraded: None,
             agent_argv: vec!["sh".into(), "-c".into(), "printf born > agent-born".into()],
         };
         let record = WorkerRecord::new(

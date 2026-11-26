@@ -130,7 +130,7 @@ impl ExpectedAgent {
 }
 
 /// Which adapters a plugin proxy supports; empty means any.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProxyCompat {
     /// Accepted `agent_info.name` values.
     pub agent_names: Vec<String>,

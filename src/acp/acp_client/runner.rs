@@ -412,6 +412,14 @@ pub(super) async fn spawn_runner_detached(
     if let crate::process::worker_registry::ScopeOwnership::Owned { unit } = &scope {
         cmd.arg("--systemd-scope").arg(unit);
     }
+    if let Some(proxy) = &config.proxy {
+        let encoded = serde_json::to_string(proxy)
+            .map_err(|e| AcpError::Spawn(format!("encode proxy spec: {e}")))?;
+        cmd.arg("--proxy").arg(encoded);
+    }
+    if let Some(name) = &config.degraded {
+        cmd.arg("--degraded").arg(name);
+    }
     cmd.arg("--");
     let (command, args) = match &sandbox_argv {
         Some(s) => (s.docker_binary.as_str(), s.docker_args.as_slice()),

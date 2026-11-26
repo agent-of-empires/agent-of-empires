@@ -14,6 +14,8 @@ use serial_test::serial;
 
 use crate::common::{set_temp_home, shim_node, shim_path, shim_ready};
 
+const PROXY_SPEC_JSON: &str = r#"{"plugin_id":"fake-proxy","command":"p","args":[],"failure_policy":"neutral_boot","display_name":"Fake","compat":{"agent_names":[],"version_req":null}}"#;
+
 fn wait_for(path: &Path, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
@@ -54,6 +56,7 @@ fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
         .arg(&socket)
         .args(["--session-id", session_id, "--agent-name", "shim", "--cwd"])
         .arg(temp.path())
+        .args(["--proxy", PROXY_SPEC_JSON, "--degraded", "Fake"])
         .args(["--", node.to_str().unwrap(), proxy.to_str().unwrap()])
         .args(["--flag", "a b", "it's \"quoted\"", "--"])
         .args([node.to_str().unwrap(), shim_path().to_str().unwrap()])
@@ -83,6 +86,14 @@ fn proxy_receives_argv_and_owner_only_launch_config_removed_at_session_end() {
         launch_config.to_str().unwrap()
     );
     assert!(launch_config.exists(), "config must outlive launch");
+    let record = worker_registry::load(session_id)
+        .unwrap()
+        .expect("runner record");
+    assert_eq!(
+        record.proxy.expect("proxy persisted").plugin_id,
+        "fake-proxy"
+    );
+    assert_eq!(record.degraded.as_deref(), Some("Fake"));
     assert_eq!(
         std::fs::metadata(&launch_config)
             .unwrap()
@@ -246,6 +257,7 @@ mod attach {
             None,
             None,
             Some(proxy_spec()),
+            false,
         )
         .await;
         (result, runner)

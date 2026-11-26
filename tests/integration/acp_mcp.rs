@@ -59,6 +59,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
         generation: 0,
         artifact_dir: None,
         proxy: None,
+        degraded: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,

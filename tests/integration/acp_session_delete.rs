@@ -56,6 +56,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         generation: 0,
         artifact_dir: None,
         proxy: None,
+        degraded: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,

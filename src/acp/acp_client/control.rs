@@ -1481,6 +1481,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -1657,6 +1658,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -1747,6 +1749,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -1871,6 +1874,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await
             .expect("producer-admitted backlog must attach");

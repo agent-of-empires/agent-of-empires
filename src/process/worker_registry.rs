@@ -53,6 +53,12 @@ pub struct WorkerRecord {
     /// Together with `pid`, identifies the exact runner process. Older records default to 0.
     #[serde(default)]
     pub generation: u64,
+    /// The plugin proxy the runner launched ahead of the adapter, if any.
+    #[serde(default)]
+    pub proxy: Option<crate::acp::acp_client::ProxySpec>,
+    /// Display name of the proxy a `neutral_boot` fallback dropped; the adapter runs raw.
+    #[serde(default)]
+    pub degraded: Option<String>,
     pub scope: ScopeOwnership,
     pub started_at: u64,
     pub last_attached_at: Option<u64>,
@@ -91,6 +97,8 @@ impl WorkerRecord {
             source_profile,
             prime_runtime: None,
             generation: 0,
+            proxy: None,
+            degraded: None,
             scope: ScopeOwnership::Unscoped,
             started_at: now_secs(),
             last_attached_at: None,

@@ -81,6 +81,7 @@ async fn list_with_spec(
         generation: 0,
         artifact_dir: None,
         proxy: None,
+        degraded: None,
         claude_store_pin: None,
         base_host_environment,
     };

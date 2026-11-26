@@ -445,6 +445,7 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
         acp_mode_id: None,
         agent_command_override: None,
         claude_store_pin: None,
+        proxy: None,
     }
 }
 
@@ -479,6 +480,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         prior_conversation: false,
         artifact_dir: None,
         proxy: None,
+        degraded: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,

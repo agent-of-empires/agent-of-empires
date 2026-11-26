@@ -13,7 +13,8 @@ use super::errors::AcpError;
 use super::resolve_command::{resolve_agent_command, Unresolved};
 
 /// What to do when a launched proxy fails before a valid hello.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProxyFailurePolicy {
     Refuse,
     NeutralBoot,
@@ -22,7 +23,7 @@ pub enum ProxyFailurePolicy {
 /// A plugin-supplied process that sits between the runner and the adapter.
 /// The runner launches `command args... -- <adapter argv>`; `SpawnConfig::spec`
 /// stays the adapter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProxySpec {
     pub plugin_id: String,
     pub command: String,
@@ -107,6 +108,9 @@ pub struct SpawnConfig {
     pub mcp_credentials: crate::acp::mcp_rewrite::McpCredentialEnv,
     /// Runner launches only; the in-proc stdio spawn never uses a proxy.
     pub proxy: Option<ProxySpec>,
+    /// Display name of the proxy a `NeutralBoot` fallback dropped: the adapter
+    /// runs raw under the neutral profile.
+    pub degraded: Option<String>,
 }
 
 impl SpawnConfig {
