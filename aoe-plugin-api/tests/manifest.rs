@@ -970,10 +970,19 @@ fn hooks_declarations_are_validated() {
         (with(".example/settings.json", "../settings.json"), "settings_rel_path"),
         (with(".example/settings.json", ".example/./settings.json"), "settings_rel_path"),
         (with(".example/settings.json", ""), "settings_rel_path"),
+        (with(".example/settings.json", ".zshrc"), "settings_rel_path"),
+        (with(".example/settings.json", ".example/.zshrc"), "settings_rel_path"),
+        (with(".example/settings.json", "settings.json"), "settings_rel_path"),
         (with("EXAMPLE_CONFIG_DIR", "1BAD"), "config_dir_env_var"),
         (with("\"PreToolUse\"", "\"Bogus\""), "events[0].event"),
         (with("json_settings", "toml"), "unknown variant"),
         (with("status = \"running\"", "status = \"busy\""), "unknown variant"),
+        (
+            agent(&format!(
+                "{HOOKS}[[agent_integrations.hooks.events]]\nevent = \"Stop\"\n"
+            )),
+            "needs a status or an identity_field",
+        ),
         (
             agent(&format!(
                 "{HOOKS}[[agent_integrations.hooks.events]]\nevent = \"Notification\"\nmatcher = \"permission_prompt\"\n"
@@ -994,7 +1003,7 @@ fn hooks_declarations_are_validated() {
         }
     }
     // The same event may repeat with different matchers.
-    parse(26, &agent(&format!("{HOOKS}[[agent_integrations.hooks.events]]\nevent = \"Notification\"\nmatcher = \"idle_prompt\"\n")));
+    parse(26, &agent(&format!("{HOOKS}[[agent_integrations.hooks.events]]\nevent = \"Notification\"\nmatcher = \"idle_prompt\"\nstatus = \"idle\"\n")));
 }
 
 #[test]

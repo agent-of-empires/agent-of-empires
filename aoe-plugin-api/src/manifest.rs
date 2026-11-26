@@ -865,9 +865,12 @@ fn validate_agent_hooks(
 ) {
     use crate::agent_integration::{AGENT_HOOK_EVENTS, AGENT_HOOK_EVENTS_MAX};
     check(
-        declaration_rel_path_ok(&hooks.settings_rel_path),
+        declaration_rel_path_ok(&hooks.settings_rel_path)
+            && hooks.settings_rel_path.contains('/')
+            && hooks.settings_rel_path.ends_with(".json"),
         format!(
-            "agent_integrations[{i}].hooks.settings_rel_path must be a relative path without `..`"
+            "agent_integrations[{i}].hooks.settings_rel_path must be a relative `.json` file \
+             inside a directory, such as \".example/settings.json\", without `..`"
         ),
     );
     if let Some(var) = &hooks.config_dir_env_var {
@@ -888,6 +891,12 @@ fn validate_agent_hooks(
             AGENT_HOOK_EVENTS.contains(&event.event.as_str()),
             format!(
                 "agent_integrations[{i}].hooks.events[{j}].event must be one of {AGENT_HOOK_EVENTS:?}"
+            ),
+        );
+        check(
+            event.status.is_some() || event.identity_field.is_some(),
+            format!(
+                "agent_integrations[{i}].hooks.events[{j}] needs a status or an identity_field"
             ),
         );
         check(
