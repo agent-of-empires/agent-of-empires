@@ -217,6 +217,10 @@ pub struct AgentIntegrationSnapshot {
     pub provider_version: String,
     pub provider_session_id: String,
     pub writer_pid: u32,
+    /// The launch that wrote a sandboxed report, copied from `AOE_SESSION_SOURCE`.
+    /// The host ignores a sandboxed report whose value is not the active launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
     pub revision: u64,
     pub status: AgentIntegrationStatus,
     /// Function-key names sent only to wake the provider extension after a user reply.

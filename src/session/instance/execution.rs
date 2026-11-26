@@ -2111,11 +2111,18 @@ impl Instance {
         let mut pi_transcript_path = None;
         let mut namespace_arguments = Vec::new();
         let mut store_override = None;
-        let omp_backend = agent
+        let capture_backend = agent
             .session_support
             .and_then(|support| support.capture)
-            .is_some_and(|capture| capture.backend == crate::agents::SessionCaptureBackend::Omp);
-        let mut roots = if omp_backend {
+            .map(|capture| capture.backend);
+        let omp_backend = capture_backend == Some(crate::agents::SessionCaptureBackend::Omp);
+        // A declared sidecar has no conversation store of its own: the provider's
+        // extension publishes identity through the hook directory. It therefore
+        // skips the per-agent namespace dispatch, which has no entry for a
+        // plugin-provided tool.
+        let sidecar_backend =
+            capture_backend == Some(crate::agents::SessionCaptureBackend::ExtensionSidecar);
+        let mut roots = if omp_backend || sidecar_backend {
             Vec::new()
         } else {
             match agent.name {
@@ -2622,6 +2629,9 @@ impl Instance {
             inputs.cwd.clone()
         };
         let cwd = inputs.physical_location(&cwd);
+        // With no store, the binding still needs a filesystem domain, and the
+        // working directory the pane runs in is the one the sidecar describes.
+        let filesystem = filesystem.or_else(|| sidecar_backend.then(|| cwd.filesystem.clone()));
         let capture = if agent
             .session_support
             .as_ref()
@@ -4357,6 +4367,89 @@ sandbox = "unsupported"
                 assert!(validate_managed_arguments(agent, &words).is_err());
             })
             .unwrap();
+    }
+
+    /// Installs a sidecar-backed declaration for `example-helper`, a tool the
+    /// host has no built-in namespace for.
+    fn install_declared_sidecar_plugin() {
+        let manifest = r#"
+id = "acme.sidecar"
+name = "Sidecar"
+version = "1.0.0"
+api_version = 26
+[[agent_integrations]]
+tool = "example-helper"
+command = "example-helper"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+[agent_integrations.launch.capture]
+backend = "extension_sidecar"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+"#;
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.sidecar");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.sidecar".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: crate::time::Timestamp::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_generic_declared_sidecar_binds_hook_capture_without_a_store() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "example-helper",
+            "#!/bin/sh\nexit 0\n",
+        );
+        install_declared_sidecar_plugin();
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = Instance::new("declared-sidecar", project.to_str().unwrap());
+        instance.tool = "example-helper".into();
+        instance.command = "example-helper".into();
+
+        // The host has no namespace for a plugin tool, so resolution must not
+        // reach the per-agent store dispatch that refuses one.
+        let execution = instance
+            .resolve_native_execution(None)
+            .expect("a generic sidecar declaration resolves without a store");
+        assert!(execution.binding.stores.is_empty());
+        assert_eq!(execution.binding.filesystem, "host");
+        let Some(CaptureContext::Hooks(source)) = execution.capture else {
+            panic!("the sidecar declaration must own hook capture");
+        };
+        assert_eq!(
+            source.file_name().and_then(|name| name.to_str()),
+            Some(format!("session_id.{}", execution.inputs.launch_id).as_str())
+        );
     }
 
     /// Installs an OMP-backed declaration for `example-helper` in the isolated

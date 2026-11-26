@@ -1349,7 +1349,7 @@ impl PluginManifest {
                 format!("agent_integrations[{i}].session_id requires api_version >= 22"),
             );
             check(
-                self.api_version >= 25
+                self.api_version >= 26
                     || integration
                         .launch
                         .as_ref()
@@ -1359,7 +1359,7 @@ impl PluginManifest {
                                 != crate::agent_integration::AgentCaptureBackend::ExtensionSidecar
                         }),
                 format!(
-                    "agent_integrations[{i}].launch.capture.backend = \"extension_sidecar\" requires api_version >= 25"
+                    "agent_integrations[{i}].launch.capture.backend = \"extension_sidecar\" requires api_version >= 26"
                 ),
             );
             if let Some(delay) = integration
@@ -1745,7 +1745,7 @@ mod tests {
     const HEAD: &str = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = ";
 
     #[test]
-    fn extension_sidecar_capture_requires_api_25() {
+    fn extension_sidecar_capture_requires_api_26() {
         let manifest = |api_version: u32| {
             format!(
                 "id = \"acme.sidecar\"\nname = \"Sidecar\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\
@@ -1754,11 +1754,11 @@ mod tests {
                  [agent_integrations.launch.capture]\nbackend = \"extension_sidecar\"\nhost = \"pane_scoped\"\nsandbox = \"pane_scoped\"\n"
             )
         };
-        let error = PluginManifest::from_toml_str(&manifest(24))
+        let error = PluginManifest::from_toml_str(&manifest(25))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("requires api_version >= 25"), "{error}");
-        assert!(PluginManifest::from_toml_str(&manifest(25)).is_ok());
+        assert!(error.contains("requires api_version >= 26"), "{error}");
+        assert!(PluginManifest::from_toml_str(&manifest(26)).is_ok());
     }
 
     fn object_list_toml(api_version: u32) -> String {
