@@ -64,6 +64,18 @@ for bin in ffmpeg ffprobe awk; do
   fi
 done
 
+# -/filter_complex (option value from file) needs ffmpeg 7.0+. Git builds
+# (N-...) have no parsable release number, so the check is skipped for them.
+if [[ -n "${GRID}" || "${SHOW_TITLES}" == "1" ]]; then
+  ff_major="$(ffmpeg -version | awk 'NR == 1 { if (match($3, /^[nN]?[0-9]+/)) { v = substr($3, RSTART, RLENGTH); sub(/^[nN]/, "", v); print v } }')"
+  if [[ -z "${ff_major}" ]]; then
+    echo "note: cannot parse ffmpeg version, skipping the 7.0 minimum check" >&2
+  elif (( ff_major < 7 )); then
+    echo "ffmpeg 7.0 or newer is required for GRID or SHOW_TITLES (found major ${ff_major})" >&2
+    exit 1
+  fi
+fi
+
 # Default fonts per platform if drawtext is requested but FONT not set.
 if [[ "${SHOW_TITLES}" == "1" && -z "${FONT}" ]]; then
   for candidate in \

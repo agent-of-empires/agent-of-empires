@@ -119,6 +119,8 @@ test-results/tests-live-golden-path-create-view-delete.../video.webm
 
 The `tests-` and `live-` prefixes are stripped, dashes are turned into spaces, and the result is capped at 80 characters.
 
+Grid and titled modes read the filter graph from a file with `-/filter_complex`, which needs ffmpeg 7.0 or newer; the script exits early on older releases.
+
 Drawtext requires an ffmpeg build that links libfreetype. The default Homebrew ffmpeg 8.x does not include it; install the `homebrew-ffmpeg/ffmpeg` tap version instead:
 
 ```bash
