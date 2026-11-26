@@ -456,31 +456,35 @@ async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Re
         selector,
         select_favorited: favorited,
     };
-    let outcome = match client.set_favorite_by_selector(&body, &baseline).await {
-        Ok(outcome) => outcome,
-        Err(DaemonClientError::FavoriteSelection(error)) => {
-            let UpdateFavoriteBody::Scoped { selector, .. } = body else {
-                unreachable!()
-            };
+    let result = client.set_favorite_by_selector(&body, &baseline).await;
+    let outcome = match (result, body) {
+        (Ok(outcome), _) => outcome,
+        (
+            Err(DaemonClientError::FavoriteSelection(error)),
+            UpdateFavoriteBody::Scoped { selector, .. },
+        ) => {
             return Err(error.for_cli(&selector));
         }
-        Err(
-            error @ (DaemonClientError::Transport
-            | DaemonClientError::Timeout
-            | DaemonClientError::UnixTransport
-            | DaemonClientError::InvalidMutationReceipt
-            | DaemonClientError::AuthenticatedDecode
-            | DaemonClientError::Status {
-                status: reqwest::StatusCode::GATEWAY_TIMEOUT,
-                ..
-            }
-            | DaemonClientError::ResponseTooLarge { .. }),
+        (
+            Err(
+                error @ (DaemonClientError::Transport
+                | DaemonClientError::Timeout
+                | DaemonClientError::UnixTransport
+                | DaemonClientError::InvalidMutationReceipt
+                | DaemonClientError::AuthenticatedDecode
+                | DaemonClientError::Status {
+                    status: reqwest::StatusCode::GATEWAY_TIMEOUT,
+                    ..
+                }
+                | DaemonClientError::ResponseTooLarge { .. }),
+            ),
+            _,
         ) => {
             return Err(anyhow::Error::new(error).context(
                 "Favorite outcome may be unknown; check the session before running the command again",
             ));
         }
-        Err(error) => bail!("{}", super::terminal_text(&error.to_string())),
+        (Err(error), _) => bail!("{}", super::terminal_text(&error.to_string())),
     };
     let verb = if favorited {
         "Favorited"
