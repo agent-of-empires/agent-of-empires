@@ -19,52 +19,22 @@ fn is_default_scope(s: &BrowserScope) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "sound", category = "Sound")]
 pub struct SoundConfig {
-    /// Play sounds on agent state transitions. Needs .wav or .ogg files in the
-    /// sounds folder on the machine running aoe; run "aoe sounds install" there
-    /// for a starter pack.
+    /// Play built-in sounds when a Session changes status.
     #[serde(default)]
     #[setting(
         label = "Play sounds",
         widget = "toggle",
-        summary = "A sound when a Session changes status. Needs sound files on the computer running AoE: run aoe sounds install there for a starter set."
+        summary = "A sound when a Session changes status, and a chime when a Structured view Session needs you."
     )]
     pub enabled: bool,
 
-    /// Specify file name with extension.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Start", widget = "optional_text")]
-    pub on_start: Option<String>,
-
-    /// Specify file name with extension.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Running", widget = "optional_text")]
-    pub on_running: Option<String>,
-
-    /// Specify file name with extension.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Waiting", widget = "optional_text")]
-    pub on_waiting: Option<String>,
-
-    /// Specify file name with extension.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Idle", widget = "optional_text")]
-    pub on_idle: Option<String>,
-
-    /// Specify file name with extension.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Error", widget = "optional_text")]
-    pub on_error: Option<String>,
-
-    /// Acp only. Played in the browser when a session needs permission.
-    /// Specify file name with extension. Host playback has no approval
-    /// transition.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "On Approval", widget = "optional_text")]
-    pub on_approval: Option<String>,
-
-    /// Play status sounds on the machine running aoe.
+    /// Play status sounds on the machine running the Daemon.
     #[serde(default = "default_true")]
-    #[setting(label = "On the computer running AoE", widget = "toggle")]
+    #[setting(
+        label = "On the computer running AoE",
+        widget = "toggle",
+        summary = "Plays through afplay on macOS, or aplay or paplay on Linux."
+    )]
     pub server_enabled: bool,
 
     /// Play status sounds in the web dashboard for every session. Needs an
@@ -87,12 +57,12 @@ pub struct SoundConfig {
     )]
     pub server_volume: f64,
 
-    /// Browser playback volume, step 0.1. Browsers cap it at 1.0.
+    /// Browser playback volume (0.1 = min, 1.0 = normal, 1.5 = max), step 0.1.
     #[serde(default = "default_volume", skip_serializing_if = "is_default_volume")]
     #[setting(
         label = "Volume",
         widget = "custom:sound-volume",
-        summary = "From 0.1 to 1.5, but browsers play anything above 1.0 at 1.0."
+        summary = "From 0.1 to 1.5."
     )]
     pub browser_volume: f64,
 
@@ -132,7 +102,8 @@ pub struct SoundConfig {
     #[setting(label = "Server: Error", widget = "toggle", advanced)]
     pub server_error_enabled: bool,
 
-    /// Play the approval sound in the web dashboard.
+    /// Play the approval chime in the web dashboard when a Structured view
+    /// Session asks for permission or a question.
     #[serde(default = "default_true")]
     #[setting(label = "Browser: Approval", widget = "toggle", advanced)]
     pub browser_approval_enabled: bool,
@@ -157,12 +128,6 @@ impl Default for SoundConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            on_start: None,
-            on_running: None,
-            on_waiting: None,
-            on_idle: None,
-            on_error: None,
-            on_approval: None,
             server_enabled: true,
             browser_enabled: true,
             server_volume: default_volume(),
@@ -178,6 +143,23 @@ impl Default for SoundConfig {
             browser_idle_enabled: true,
             browser_error_enabled: true,
         }
+    }
+}
+
+impl SoundConfig {
+    /// Whether the Daemon plays `event` on its host. Approval has no host sound.
+    pub fn host_plays(&self, event: super::SoundEvent) -> bool {
+        use super::SoundEvent;
+        self.enabled
+            && self.server_enabled
+            && match event {
+                SoundEvent::Start => self.server_start_enabled,
+                SoundEvent::Running => self.server_running_enabled,
+                SoundEvent::Waiting => self.server_waiting_enabled,
+                SoundEvent::Idle => self.server_idle_enabled,
+                SoundEvent::Error => self.server_error_enabled,
+                SoundEvent::Approval => false,
+            }
     }
 }
 
@@ -210,47 +192,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deserialize_reads_known_keys_and_tolerates_the_removed_mode_field() {
-        let cases = [
-            ("", None, None),
-            ("enabled = true\non_error = \"alarm\"", Some("alarm"), None),
-            (
-                "enabled = true\non_approval = \"alarm\"",
-                None,
-                Some("alarm"),
-            ),
-            // The removed `mode` field must still deserialize.
-            (
-                "enabled = true\nmode = { specific = \"wololo\" }",
-                None,
-                None,
-            ),
-        ];
-        for (toml, on_error, on_approval) in cases {
+    fn deserialize_tolerates_removed_fields() {
+        // `mode` and the `on_*` file overrides are gone; old configs must still load.
+        for toml in [
+            "",
+            "enabled = true
+mode = { specific = \"wololo\" }",
+            "enabled = true
+on_idle = \"idle.wav\"
+on_approval = \"gem\"",
+        ] {
             let config: SoundConfig = toml::from_str(toml).expect(toml);
             assert_eq!(config.enabled, !toml.is_empty(), "{toml}");
-            assert_eq!(config.on_error.as_deref(), on_error, "{toml}");
-            assert_eq!(config.on_approval.as_deref(), on_approval, "{toml}");
             // A 0.0 default would mute playback on a fresh install.
             assert!((config.server_volume - 1.0).abs() < 1e-9, "{toml}");
         }
     }
 
     #[test]
-    fn target_toggles_default_on_and_parse_independently() {
-        for (toml, server, browser) in [
-            ("", true, true),
-            ("server_enabled = false", false, true),
-            ("browser_enabled = false", true, false),
-            (
-                "server_enabled = false\nbrowser_enabled = false",
-                false,
-                false,
-            ),
+    fn host_plays_needs_the_master_target_and_event_switches() {
+        use super::super::SoundEvent::{Approval, Error, Idle, Start};
+        for (toml, event, plays) in [
+            ("", Idle, false),
+            ("enabled = true", Idle, true),
+            ("enabled = true", Start, true),
+            ("enabled = true", Approval, false),
+            ("enabled = true\nserver_enabled = false", Idle, false),
+            ("enabled = true\nserver_idle_enabled = false", Idle, false),
+            ("enabled = true\nserver_idle_enabled = false", Error, true),
+            ("enabled = true\nbrowser_enabled = false", Idle, true),
         ] {
             let config: SoundConfig = toml::from_str(toml).expect(toml);
-            assert_eq!(config.server_enabled, server, "{toml}");
-            assert_eq!(config.browser_enabled, browser, "{toml}");
+            assert_eq!(config.host_plays(event), plays, "{toml} {event:?}");
         }
     }
 

@@ -878,6 +878,7 @@ mod tests {
             cancel_capable,
             model: None,
             background: false,
+            runs: 0,
         };
         let cases = [
             (vec![], None),

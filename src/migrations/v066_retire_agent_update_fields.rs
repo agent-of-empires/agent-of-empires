@@ -1,4 +1,4 @@
-//! Migration v064: drop the fields the retired agent-update restart read. Session rows lose
+//! Migration v066: drop the fields the retired agent-update restart read. Session rows lose
 //! `started_at` and `launch_resolved_executable`. Both are ignored on load, so this only stops
 //! dead keys from lingering. Worker records are rewritten at each spawn, so theirs need nothing.
 
@@ -27,7 +27,7 @@ fn drop_retired_fields(path: &Path) -> Result<()> {
     )?;
     // An unreadable component keeps its bytes for repair rather than aborting boot.
     let Ok(content) = String::from_utf8(fs::read(path)?) else {
-        warn!(target: "migrations.v064", path = %path.display(), "Preserved unreadable session component; its retired fields are ignored once it is repaired");
+        warn!(target: "migrations.v066", path = %path.display(), "Preserved unreadable session component; its retired fields are ignored once it is repaired");
         return Ok(());
     };
     let dropped = sessions_file::heal_rows(path, &content, |row| {
@@ -36,7 +36,7 @@ fn drop_retired_fields(path: &Path) -> Result<()> {
             .fold(false, |dropped, key| row.remove(*key).is_some() | dropped)
     })?;
     if dropped > 0 {
-        info!(target: "migrations.v064", dropped, path = %path.display(), "dropped retired agent-update fields");
+        info!(target: "migrations.v066", dropped, path = %path.display(), "dropped retired agent-update fields");
     }
     Ok(())
 }

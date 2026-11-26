@@ -72,7 +72,9 @@ mod v060_terminal_handoff_outcome;
 mod v061_unpin_default_sandbox_image;
 mod v062_plugin_staging_evidence;
 mod v063_retire_color_labels;
-mod v064_retire_agent_update_fields;
+mod v064_builtin_sounds;
+mod v065_account_limit_estimate_rows;
+mod v066_retire_agent_update_fields;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -113,7 +115,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 64;
+const CURRENT_VERSION: u32 = 66;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -331,10 +333,16 @@ const MIGRATIONS: &[Migration] = &[
         v062_plugin_staging_evidence::run,
     ),
     (63, "retire_color_labels", v063_retire_color_labels::run),
+    (64, "builtin_sounds", v064_builtin_sounds::run),
     (
-        64,
+        65,
+        "account_limit_estimate_rows",
+        v065_account_limit_estimate_rows::run,
+    ),
+    (
+        66,
         "retire_agent_update_fields",
-        v064_retire_agent_update_fields::run,
+        v066_retire_agent_update_fields::run,
     ),
 ];
 

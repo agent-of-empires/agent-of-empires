@@ -1,52 +1,77 @@
-//! Sound effects for agent state transitions, played from user .wav/.ogg files.
+//! Built-in sound effects for Session status changes and approvals.
 
-mod bundled;
 mod config;
-mod discovery;
 mod playback;
 
-pub use bundled::install_bundled_sounds;
 pub use config::{volume_from_option, volume_options, volume_to_index, SoundConfig};
-pub use discovery::{get_sounds_dir, list_available_sounds, validate_sound_exists};
-pub use playback::{play_sound, play_sound_blocking};
-
-use rand::seq::IndexedRandom;
+pub use playback::{play, play_blocking};
 
 use crate::session::Status;
 
-fn resolve_sound_name(override_name: Option<&str>) -> Option<String> {
-    if let Some(name) = override_name {
-        if !name.is_empty() {
-            return Some(name.to_string());
+/// One built-in sound. The Daemon plays the status ones on its host and serves
+/// every one to the Web dashboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, clap::ValueEnum)]
+pub enum SoundEvent {
+    Start,
+    Running,
+    Waiting,
+    Idle,
+    Error,
+    /// A Structured view Session asks for permission or a question; browser only.
+    Approval,
+}
+
+impl SoundEvent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Idle => "idle",
+            Self::Error => "error",
+            Self::Approval => "approval",
         }
     }
 
-    let sounds = list_available_sounds();
-    if sounds.is_empty() {
-        return None;
+    pub fn parse(name: &str) -> Option<Self> {
+        <Self as clap::ValueEnum>::from_str(name, false).ok()
     }
-    let mut rng = rand::rng();
-    sounds.choose(&mut rng).cloned()
+
+    pub fn for_status(status: Status) -> Option<Self> {
+        match status {
+            Status::Starting => Some(Self::Start),
+            Status::Running => Some(Self::Running),
+            Status::Waiting => Some(Self::Waiting),
+            Status::Idle => Some(Self::Idle),
+            Status::Error => Some(Self::Error),
+            Status::Unknown | Status::Stopped | Status::Deleting | Status::Creating => None,
+        }
+    }
+
+    /// The WAV bytes, from the CC0 pack in `bundled_sounds/`.
+    pub fn wav(self) -> &'static [u8] {
+        match self {
+            Self::Start => include_bytes!("../../bundled_sounds/start.wav"),
+            Self::Running => include_bytes!("../../bundled_sounds/running.wav"),
+            Self::Waiting => include_bytes!("../../bundled_sounds/waiting.wav"),
+            Self::Idle => include_bytes!("../../bundled_sounds/idle.wav"),
+            Self::Error => include_bytes!("../../bundled_sounds/error.wav"),
+            Self::Approval => include_bytes!("../../bundled_sounds/gem.wav"),
+        }
+    }
 }
 
-pub fn play_for_transition(old: Status, new: Status, config: &SoundConfig) {
-    if !config.enabled || !config.server_enabled || old == new {
-        return;
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let (enabled, override_name) = match new {
-        Status::Starting => (config.server_start_enabled, config.on_start.as_deref()),
-        Status::Running => (config.server_running_enabled, config.on_running.as_deref()),
-        Status::Waiting => (config.server_waiting_enabled, config.on_waiting.as_deref()),
-        Status::Idle => (config.server_idle_enabled, config.on_idle.as_deref()),
-        Status::Error => (config.server_error_enabled, config.on_error.as_deref()),
-        Status::Unknown | Status::Stopped | Status::Deleting | Status::Creating => return,
-    };
-    if !enabled {
-        return;
-    }
-
-    if let Some(name) = resolve_sound_name(override_name) {
-        play_sound(&name, config.server_volume);
+    #[test]
+    fn every_event_round_trips_its_name_and_embeds_a_wav() {
+        use clap::ValueEnum;
+        for event in SoundEvent::value_variants() {
+            assert_eq!(SoundEvent::parse(event.as_str()), Some(*event));
+            assert_eq!(&event.wav()[..4], b"RIFF", "{event:?}");
+        }
+        assert_eq!(SoundEvent::parse("idle.wav"), None);
     }
 }
