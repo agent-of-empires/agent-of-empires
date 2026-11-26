@@ -108,7 +108,7 @@ Strict mode moves the letters by Home's rule: a bare letter takes Shift, and a S
 | `j` / `k` | `j` / `k` | Select |
 | Enter | Enter | Start with the preset. On a started item it opens the session |
 | `e` | `E` | Start with changes: opens the New session dialog prefilled from the kind's preset and the final prompt |
-| `N` | `Ctrl+N` | A new session for the item that does not take its link, so a started item can have another |
+| `N` | `Ctrl+N` | Another session for the item that does not take its link, so a started item can have more than one |
 | `z` | `Z` | Dismiss or restore |
 | `d` | `D` | Show or hide dismissed items |
 | `t` | `T` | Turn on pre-trust, on a Session blocked on folder trust |

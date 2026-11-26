@@ -975,7 +975,7 @@ impl SuggestionsView {
             }
             if block.is_none() {
                 if !item.stale {
-                    keys.push(format!("{} new", self.key_label('N')));
+                    keys.push(format!("{} another", self.key_label('N')));
                 }
                 let verb = if item.dismissed { "restore" } else { "dismiss" };
                 keys.push(format!("{} {verb}", self.key_label('z')));
@@ -1008,7 +1008,7 @@ impl SuggestionsView {
             ),
             (
                 self.key_label('N'),
-                "a new session for the item, without its link",
+                "another session for the item, without its link",
             ),
             (self.key_label('z'), "dismiss or restore"),
             (self.key_label('d'), dismissed),
@@ -3709,7 +3709,7 @@ mod tests {
         rig.view.handle_key(ctrl_n, None, &mut rig.store);
         assert!(rig.view.preparing.is_some() && rig.view.prepare_another);
         let text = render_text(&rig);
-        assert!(text.contains("Ctrl+N new"), "{text}");
+        assert!(text.contains("Ctrl+N another"), "{text}");
     }
 
     /// At 80x24 a heading reads apart from its rows, the divider carries the
@@ -3741,7 +3741,7 @@ mod tests {
         let keys = [
             "↵ start",
             "e change first",
-            "N new",
+            "N another",
             "z dismiss",
             "PgDn more",
             "? all keys",
@@ -3771,7 +3771,7 @@ mod tests {
         let text = render_sized(&rig, None, 80, 24);
         for (key, what) in [
             ("E", "change first"),
-            ("Ctrl+N", "a new session"),
+            ("Ctrl+N", "another session"),
             ("T", "turn on pre-trust"),
         ] {
             assert!(
@@ -3840,7 +3840,7 @@ mod tests {
 
     #[test]
     fn key_rows_never_split_a_key_from_its_label() {
-        let units: Vec<String> = ["↵ start", "e change first", "N new", "Esc back"]
+        let units: Vec<String> = ["↵ start", "e change first", "N another", "Esc back"]
             .map(str::to_string)
             .to_vec();
         for width in [1, 10, 20, 40] {
