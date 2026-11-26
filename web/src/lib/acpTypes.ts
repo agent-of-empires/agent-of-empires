@@ -299,9 +299,6 @@ export type IncompatibleAgentDetail =
       reason: string;
     };
 
-/** Mirror of `StartupCause` in src/acp/state.rs; the event leaves it out when nothing was diagnosed. */
-export type StartupCause = { kind: "container_missing" };
-
 /** Mirror of `IntegrationLostReason` in src/acp/state.rs. */
 export type IntegrationLostReason =
   | { kind: "contract_violation"; detail: string }
@@ -591,6 +588,24 @@ export interface ReducedState {
   }[];
 }
 
+/**
+ * A startup failure the daemon diagnosed; mirrors `StartupCause` in `src/acp/state.rs`. A login-required
+ * cause carries the `command` and `profile` the banner hands to the login it starts.
+ */
+export type StartupCause =
+  | { kind: "container_missing" }
+  | { kind: "sandbox_login_required"; command?: string; profile?: string }
+  | { kind: "sandbox_login_unsupported" };
+
+const STARTUP_CAUSE_KINDS: ReadonlyArray<string> = [
+  "container_missing",
+  "sandbox_login_required",
+  "sandbox_login_unsupported",
+];
+
+/** `error` of the 409 a launch held until the sandbox login exists answers with. */
+export const SANDBOX_LOGIN_REQUIRED_CODE = "sandbox_login_required";
+
 export interface AcpState {
   agent: string | null;
   model: string | null;
@@ -636,6 +651,10 @@ export interface AcpState {
   startupError: string | null;
   /** Why `startupError` happened, when the Daemon said; set and cleared with it. */
   startupCause: StartupCause | null;
+  /** Counts the events that cleared the startup error; a late blocked launch from before one is stale. */
+  startupRecoveries: number;
+  /** `startupRecoveries` as each in-flight prompt was sent, for the refused-launch guard. */
+  promptRecoveries: Record<string, number>;
   /** Adapter compatibility failure; replaces the session view with `StartupErrorScreen`. */
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
@@ -1060,6 +1079,8 @@ export function emptyAcpState(): AcpState {
     lagged: false,
     startupError: null,
     startupCause: null,
+    startupRecoveries: 0,
+    promptRecoveries: {},
     incompatibleAgent: null,
     lastError: null,
     turnActive: false,
@@ -1107,6 +1128,7 @@ function isSteeredContinuation(state: AcpState): boolean {
 }
 
 function applyNewTurnResets(next: AcpState): void {
+  next.startupRecoveries += 1;
   next.startupError = null;
   next.startupCause = null;
   if (!next.restartInFlight) next.retriedError = null;
@@ -1327,8 +1349,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
-    next.startupCause =
-      event.AgentStartupError.cause?.kind === "container_missing" ? { kind: "container_missing" } : null;
+    const cause = event.AgentStartupError.cause;
+    // A kind from a newer Daemon reads as none, as an old client would see it.
+    next.startupCause = cause && STARTUP_CAUSE_KINDS.includes(cause.kind) ? cause : null;
     // A diagnosed cause gets its own banner, which doesn't compare with a Retry's error.
     const retried = state.restartInFlight && !next.startupCause ? state.retriedError : null;
     endRestart(next);
@@ -1388,6 +1411,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     endRestart(next);
     next.startupError = null;
     next.startupCause = null;
+    next.startupRecoveries += 1;
     next.lastError = null;
     next.incompatibleAgent = null;
     next.workerStopped = false;

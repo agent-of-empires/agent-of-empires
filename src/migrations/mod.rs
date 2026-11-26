@@ -74,6 +74,7 @@ mod v062_plugin_staging_evidence;
 mod v063_retire_color_labels;
 mod v064_builtin_sounds;
 mod v065_account_limit_estimate_rows;
+mod v066_retire_agent_update_fields;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -114,7 +115,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 65;
+const CURRENT_VERSION: u32 = 66;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -337,6 +338,11 @@ const MIGRATIONS: &[Migration] = &[
         65,
         "account_limit_estimate_rows",
         v065_account_limit_estimate_rows::run,
+    ),
+    (
+        66,
+        "retire_agent_update_fields",
+        v066_retire_agent_update_fields::run,
     ),
 ];
 

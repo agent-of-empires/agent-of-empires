@@ -223,6 +223,76 @@ async fn next_request(rx: tokio::sync::oneshot::Receiver<CapturedRequest>) -> Ca
 }
 
 #[tokio::test]
+async fn favorite_requires_a_newer_receipt_in_the_selected_epoch() {
+    let baseline = RuntimeCursor {
+        epoch: "epoch-1".into(),
+        revision: 7,
+    };
+    let body = UpdateFavoriteBody::Scoped {
+        profile: "main".into(),
+        selector: ".".into(),
+        select_favorited: true,
+    };
+    for (epoch, revision, accepted) in [
+        ("epoch-1", "7", false),
+        ("epoch-2", "8", false),
+        ("epoch-1", "8", true),
+    ] {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let base = serve_mutation_once(
+            "/api/sessions/by-selector/favorite",
+            200,
+            vec![
+                (RUNTIME_EPOCH_HEADER, epoch),
+                (RUNTIME_REVISION_HEADER, revision),
+            ],
+            r#"{"title":"Committed title"}"#,
+            tx,
+        )
+        .await;
+        let client = DaemonClient::new(&base, None).unwrap();
+        let result = client.set_favorite_by_selector(&body, &baseline).await;
+        if accepted {
+            assert_eq!(result.unwrap().title, "Committed title");
+        } else {
+            assert!(matches!(
+                result,
+                Err(DaemonClientError::InvalidMutationReceipt)
+            ));
+        }
+        let request = next_request(rx).await;
+        assert_eq!(request.method, "PATCH");
+        assert_eq!(request.epoch.as_deref(), Some("epoch-1"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["selector"],
+            "."
+        );
+    }
+}
+
+#[test]
+fn favorite_wire_rejects_partial_and_mixed_selectors() {
+    for malformed in [
+        serde_json::json!({"profile": "main", "favorited": true}),
+        serde_json::json!({"selector": null, "favorited": true}),
+        serde_json::json!({"select_favorited": null, "favorited": true}),
+        serde_json::json!({"profile": "main", "select_favorited": true}),
+        serde_json::json!({"profile": "main", "selector": "title", "select_favorited": true, "favorited": false}),
+        serde_json::json!({"profile": "main", "selector": "title", "select_favorited": true, "client_tag": "batch"}),
+        serde_json::json!(["main", "title", true]),
+    ] {
+        assert!(serde_json::from_value::<UpdateFavoriteBody>(malformed).is_err());
+    }
+    assert!(matches!(
+        serde_json::from_str::<UpdateFavoriteBody>(
+            r#"{"favorited":false,"client_tag":{"origin":"batch"}}"#
+        )
+        .unwrap(),
+        UpdateFavoriteBody::Unscoped { favorited: false }
+    ));
+}
+
+#[tokio::test]
 async fn stop_mutation_posts_to_stop_route_with_epoch_header() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let base = serve_mutation_once(

@@ -124,6 +124,10 @@ pub enum DaemonClientError {
     AuthenticatedDecode,
     #[error("daemon mutation acknowledgment does not match this runtime")]
     InvalidMutationReceipt,
+    #[error("The selected Daemon does not provide the runtime cursor required by this command. Upgrade the Daemon and run `aoe serve --restart` on its host.")]
+    RuntimeCursorUnsupported,
+    #[error("Daemon could not resolve the favorite selector")]
+    FavoriteSelection(SessionLookupError),
 }
 
 fn committed_failure_message(code: ApiErrorCode) -> &'static str {
@@ -145,6 +149,10 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         return message.into();
     }
     match code {
+        Some(ApiErrorCode::ReadOnly) => "Daemon is read-only; request refused".into(),
+        Some(ApiErrorCode::FavoriteNamespaceBusy) => "Profile namespace is busy; no favorite change was made.".into(),
+        Some(ApiErrorCode::OutcomeUnconfirmed) =>
+            "The change committed, but runtime publication is unconfirmed. Check canonical state before retrying.".into(),
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
         Some(ApiErrorCode::AgentHooksNotApproved) =>
             "Agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host before launching".into(),
@@ -303,6 +311,32 @@ impl DaemonClient {
             .map_err(|_| DaemonClientError::Transport)?;
         self.request_json_with_peer(self.http.get(url), expected_pid)
             .await
+    }
+
+    pub async fn runtime_info_with_cursor(
+        &self,
+    ) -> Result<(RuntimeInfo, RuntimeCursor), DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("runtime")
+            .map_err(|_| DaemonClientError::Transport)?;
+        let response = self.request_response(self.http.get(url)).await?;
+        if !response.headers().contains_key(RUNTIME_EPOCH_HEADER)
+            && !response.headers().contains_key(RUNTIME_REVISION_HEADER)
+        {
+            return Err(DaemonClientError::RuntimeCursorUnsupported);
+        }
+        let epoch = response
+            .headers()
+            .get(RUNTIME_EPOCH_HEADER)
+            .and_then(|epoch| epoch.to_str().ok())
+            .ok_or(DaemonClientError::InvalidMutationReceipt)?;
+        let cursor = mutation_cursor(response.headers(), epoch)?;
+        let info: RuntimeInfo = decode_json(response).await?;
+        if info.epoch != cursor.epoch {
+            return Err(DaemonClientError::InvalidMutationReceipt);
+        }
+        Ok((info, cursor))
     }
 
     /// Publish and read canonical state from the same Daemon epoch.
@@ -552,6 +586,21 @@ impl DaemonClient {
             cursor: receipt.cursor,
             outcome: receipt.outcome.outcome,
         })
+    }
+
+    pub async fn set_favorite_by_selector(
+        &self,
+        body: &UpdateFavoriteBody,
+        baseline: &RuntimeCursor,
+    ) -> Result<FavoriteOutcome, DaemonClientError> {
+        let url = format!("{}/{FAVORITE_BY_SELECTOR}/favorite", self.sessions_url);
+        let receipt: MutationReceipt<FavoriteOutcome> = self
+            .request_mutation_with_outcome(self.http.patch(url).json(body), &baseline.epoch)
+            .await?;
+        if receipt.cursor.revision <= baseline.revision {
+            return Err(DaemonClientError::InvalidMutationReceipt);
+        }
+        Ok(receipt.outcome)
     }
 
     /// Returns only the cursor; row state is adopted from the runtime stream.
@@ -1072,6 +1121,10 @@ impl DaemonClient {
                     body,
                     truncated,
                 });
+            }
+            if code == Some(ApiErrorCode::FavoriteSelectionRefused) {
+                let body = decode_json_bounded(response, MAX_ERROR_BODY_BYTES).await?;
+                return Err(DaemonClientError::FavoriteSelection(body));
             }
             if !self.should_read_error_body(code) {
                 return Err(DaemonClientError::Status {

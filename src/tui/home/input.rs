@@ -2006,6 +2006,11 @@ impl HomeView {
             self.press_dialog_key(key);
             return true;
         }
+        if let Some(dialog) = &mut self.sandbox_login_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
         if let Some(dialog) = &mut self.restart_dialog {
             let _ = dialog.handle_click(col, row);
             return true;
@@ -2858,6 +2863,15 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.sandbox_login_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => self.close_sandbox_login(),
+                DialogResult::Submit(request) => self.run_sandbox_login_request(request),
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.restart_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -3474,7 +3488,7 @@ impl HomeView {
 
     /// Execute a resolved [`ActionId`], the single home for each action's behavior, so
     /// the keyboard dispatcher and the command palette cannot diverge.
-    fn run_action(
+    pub(super) fn run_action(
         &mut self,
         id: ActionId,
         update_info: Option<&crate::update::UpdateInfo>,
@@ -3502,6 +3516,7 @@ impl HomeView {
                     | ActionId::Projects
                     | ActionId::Plugins
                     | ActionId::Skills
+                    | ActionId::SandboxLogin
                     | ActionId::Update
                     | ActionId::ToggleArchive
                     | ActionId::Delete
@@ -3626,6 +3641,7 @@ impl HomeView {
             ActionId::Skills => {
                 self.skills_manager_dialog = Some(crate::tui::dialogs::SkillsManagerDialog::new());
             }
+            ActionId::SandboxLogin => self.open_sandbox_login(),
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
             ActionId::ToggleArchive => {
@@ -4547,6 +4563,11 @@ impl HomeView {
             hotkey: bindings::label(ActionId::Quit, self.strict_hotkeys),
             payload: PaletteAction::Invoke(ActionId::Quit),
         });
+
+        if !self.sandbox_login_listed() {
+            let login = bindings::palette_id(ActionId::SandboxLogin);
+            entries.retain(|entry| entry.id != login);
+        }
 
         // Dynamic session/group entries, one per flat_items row, so the user can
         // fuzzy-search and jump to it. In-flight sessions are tagged in the title so it is
@@ -5706,23 +5727,14 @@ impl HomeView {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
                     _ => None,
                 };
-                let update_restart = match &self.flat_items[idx] {
-                    super::Item::Session { id, .. } => self.update_restart_offered(id),
-                    _ => false,
-                };
-                let menu = ContextMenuDialog::for_session(
+                ContextMenuDialog::for_session(
                     anchor,
                     is_archived,
                     snooze,
                     unread,
                     can_fork,
                     switch_view,
-                );
-                if update_restart {
-                    menu.with_restart_for_update()
-                } else {
-                    menu
-                }
+                )
             });
             return true;
         }
@@ -5858,15 +5870,6 @@ impl HomeView {
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::Fork => self.open_fork_from_selection(),
             ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
-            ContextMenuAction::RestartForUpdate => {
-                if let Err(e) = self.restart_selected_for_update() {
-                    tracing::warn!("restart_selected_for_update failed: {}", e);
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Restart Failed",
-                        &format!("Could not restart session: {e}"),
-                    ));
-                }
-            }
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::AddProject => self.open_add_project_for_selected(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
@@ -6771,6 +6774,9 @@ impl HomeView {
         if let Some(dialog) = &mut self.worktree_name_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
+        if let Some(dialog) = &mut self.sandbox_login_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
         if let Some(dialog) = &mut self.send_message_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
@@ -6978,6 +6984,10 @@ impl HomeView {
             return;
         }
         if let Some(ref mut dialog) = self.worktree_name_dialog {
+            dialog.handle_paste(text);
+            return;
+        }
+        if let Some(ref mut dialog) = self.sandbox_login_dialog {
             dialog.handle_paste(text);
             return;
         }
@@ -7783,6 +7793,10 @@ impl HomeView {
             return;
         }
         if let Some(ref mut dialog) = self.worktree_name_dialog {
+            dialog.handle_paste(&s);
+            return;
+        }
+        if let Some(ref mut dialog) = self.sandbox_login_dialog {
             dialog.handle_paste(&s);
             return;
         }

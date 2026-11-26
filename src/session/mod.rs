@@ -46,7 +46,6 @@ pub(crate) mod sync;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod trash;
-pub mod update_restart;
 pub mod worktree_edit;
 pub mod worktree_reconcile;
 
