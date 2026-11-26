@@ -326,6 +326,29 @@ describe("SuggestionsSettings", () => {
     expect(screen.queryByText(/Edit \u00b7 Review requests/)).toBeNull();
   });
 
+  it("a new focus while the editor is open edits and saves that kind, not the last one's draft", async () => {
+    open();
+    cleanup();
+    const view = render(
+      <Harness
+        readOnly={false}
+        onOpenSuggestions={vi.fn()}
+        presetFocus={{ providerId: "gh", criterion: "review-requested" }}
+      />,
+    );
+    await screen.findByText(/Edit \u00b7 Review requests/);
+    view.rerender(
+      <Harness
+        readOnly={false}
+        onOpenSuggestions={vi.fn()}
+        presetFocus={{ providerId: "gh", criterion: "ci-failed" }}
+      />,
+    );
+    await screen.findByText(/Edit \u00b7 CI failures/);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(api.putSuggestionPreset).toHaveBeenCalledWith("gh", "ci-failed", PRESETS[1]!.preset));
+  });
+
   describe("Linked repos", () => {
     const openLinked = async () => {
       open();

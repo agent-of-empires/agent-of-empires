@@ -222,6 +222,8 @@ export function SuggestionsSettings({
     if (provider && source) {
       return (
         <SuggestionPresetEditor
+          // The draft belongs to one kind; another focus gets a fresh editor.
+          key={`${provider.id}/${source.criterion}`}
           provider={provider}
           source={source}
           entry={presetOf(provider.id, source.criterion)}
