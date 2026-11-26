@@ -67,11 +67,11 @@ fn run_dev(_args: DevArgs) {
 }
 
 #[cfg(unix)]
-fn build_web() -> bool {
+fn build_backend() -> bool {
     use std::process::Command;
-    eprintln!("[xtask dev] building aoe --features web...");
+    eprintln!("[xtask dev] building aoe...");
     Command::new("cargo")
-        .args(["build", "--features", "web"])
+        .arg("build")
         .status()
         .map(|s| s.success())
         .unwrap_or_else(|e| {
@@ -147,7 +147,7 @@ fn run_dev(args: DevArgs) {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    if !build_web() {
+    if !build_backend() {
         std::process::exit(1);
     }
 
@@ -309,7 +309,7 @@ fn run_dev(args: DevArgs) {
                 if Instant::now() >= at {
                     rebuild_at = None;
                     eprintln!("[xtask dev] change detected; rebuilding aoe...");
-                    if build_web() {
+                    if build_backend() {
                         if let Some(mut old) = serve.take() {
                             terminate_group(&mut old, Duration::from_secs(2));
                         }
