@@ -1423,13 +1423,25 @@ impl NativeLaunchInputs {
 
     fn hook_capture_context(&self, instance_id: &str) -> Result<Option<CaptureContext>> {
         let leaf = crate::hooks::session_id_leaf(Some(&self.launch_id))?;
-        // A container reaches this directory through the launch's bind mount,
-        // so the host base holds everything either side writes.
-        let directory = crate::hooks::hook_base_path().join(instance_id);
-        let path = self.canonical_path(&directory.join(leaf.as_ref()))?;
+        let sidecar = hook_sidecar_path(self.container.is_some(), instance_id, leaf.as_ref());
+        let path = self.canonical_path(&sidecar)?;
         let location = self.physical_location(&path);
         Ok((location.filesystem == "host").then_some(CaptureContext::Hooks(location.path)))
     }
+}
+
+/// The hook sidecar's path as the execution sees it. A container reaches the
+/// directory through the launch's bind mount, whose target is the container-side
+/// base; the host base is a different path that the mount does not create, so
+/// resolving it inside the container finds nothing and the capture context is
+/// lost.
+fn hook_sidecar_path(sandboxed: bool, instance_id: &str, leaf: &str) -> PathBuf {
+    let base = if sandboxed {
+        PathBuf::from(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
+    } else {
+        crate::hooks::hook_base_path()
+    };
+    base.join(instance_id).join(leaf)
 }
 
 pub(super) fn hook_session_observation(
@@ -3577,6 +3589,33 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sandbox reaches the hook directory through a bind mount whose target is
+    /// the container-side base, so its sidecar path cannot be built from the host
+    /// base. The two are deliberately different here: a host base under a
+    /// tempdir, and the container's `/tmp/aoe-hooks`.
+    #[test]
+    #[serial_test::serial]
+    fn a_sandbox_hook_sidecar_uses_the_mount_target_not_the_host_base() {
+        let (_guard, host_base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let leaf = "session_id.7d442dd2-7b10-4cc4-9207-123456789abc";
+
+        let host = hook_sidecar_path(false, "instance-a", leaf);
+        assert_eq!(host, host_base.join("instance-a").join(leaf));
+
+        let sandbox = hook_sidecar_path(true, "instance-a", leaf);
+        assert_eq!(
+            sandbox,
+            PathBuf::from(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
+                .join("instance-a")
+                .join(leaf)
+        );
+        assert_ne!(sandbox, host, "the container target is not the host path");
+        assert!(
+            !sandbox.starts_with(&host_base),
+            "the sandbox path must not be spelled under the host base: {sandbox:?}"
+        );
+    }
 
     #[test]
     fn claude_store_must_be_the_config_root_holding_the_transcript() {
