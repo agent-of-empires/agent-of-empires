@@ -117,6 +117,26 @@ pub(crate) fn declared_claude_store_route(
     (dir.to_path_buf(), true)
 }
 
+/// The raw inputs of a structured-switch store preview, kept free of filesystem work so a
+/// caller can collect them under locks and run [`Self::launches_bound_store`] once per
+/// distinct value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct OwnCmdStoreProbe {
+    pub declared: PathBuf,
+    pub home: PathBuf,
+    pub ambient: Option<PathBuf>,
+    pub bound: PathBuf,
+}
+
+impl OwnCmdStoreProbe {
+    /// Whether the launch route for the declared store reads the bound store.
+    pub(crate) fn launches_bound_store(&self) -> bool {
+        let (launcher, _) =
+            declared_claude_store_route(&self.declared, &self.home, self.ambient.as_deref());
+        same_claude_store(&launcher, &self.bound)
+    }
+}
+
 /// Whether the effective route for `pin` exports `CLAUDE_CONFIG_DIR` at `home`.
 pub(crate) fn exports_claude_store(pin: &ClaudeStorePin, home: Option<&Path>) -> bool {
     !home.is_some_and(|home| {

@@ -37,18 +37,14 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-/// Rows whose `(launcher store, bound store)` pair names one store, probing each distinct pair once.
+/// Rows whose store probe admits resuming, running each distinct probe once.
 fn rows_on_same_store(
-    rows: Vec<(usize, (std::path::PathBuf, std::path::PathBuf))>,
-    mut same: impl FnMut(&std::path::Path, &std::path::Path) -> bool,
+    rows: Vec<(usize, crate::session::capture::OwnCmdStoreProbe)>,
+    mut admits: impl FnMut(&crate::session::capture::OwnCmdStoreProbe) -> bool,
 ) -> Vec<usize> {
     let mut probed = std::collections::HashMap::new();
     rows.into_iter()
-        .filter(|(_, (launcher, bound))| {
-            *probed
-                .entry((launcher.clone(), bound.clone()))
-                .or_insert_with(|| same(launcher, bound))
-        })
+        .filter(|(_, probe)| *probed.entry(probe.clone()).or_insert_with(|| admits(probe)))
         .map(|(i, _)| i)
         .collect()
 }
@@ -190,7 +186,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             }
             let agent = inst.effective_acp_agent_with(|| cfg);
             resp.keeps_context = inst.acp_transcript_cli_resumable_with(&agent, cfg);
-            // The store probe touches the filesystem, so it runs once the config lock is released.
+            // The store probe touches the filesystem, so only its inputs are collected here.
             if !resp.keeps_context && !inst.is_structured() {
                 let stores =
                     inst.own_acp_cmd_stores_with(&agent, || crate::session::OwnCmdConfig {
@@ -406,7 +402,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     drop(instances);
     if !own_cmd_stores.is_empty() {
         let matching = tokio::task::spawn_blocking(move || {
-            rows_on_same_store(own_cmd_stores, crate::session::capture::same_claude_store)
+            rows_on_same_store(own_cmd_stores, |probe| probe.launches_bound_store())
         })
         .await
         .unwrap_or_default();
@@ -851,25 +847,51 @@ mod context_resume_tests {
 #[cfg(test)]
 mod own_cmd_store_tests {
     use super::*;
+    use crate::session::capture::OwnCmdStoreProbe;
     use std::path::PathBuf;
 
+    fn probe(declared: &str, ambient: Option<&str>, bound: &str) -> OwnCmdStoreProbe {
+        OwnCmdStoreProbe {
+            declared: PathBuf::from(declared),
+            home: PathBuf::from("/home/u"),
+            ambient: ambient.map(PathBuf::from),
+            bound: PathBuf::from(bound),
+        }
+    }
+
     #[test]
-    fn rows_sharing_a_store_pair_are_probed_once() {
-        let pair = |a: &str, b: &str| (PathBuf::from(a), PathBuf::from(b));
+    fn rows_sharing_a_probe_run_it_once() {
         let rows = vec![
-            (0, pair("/w", "/w")),
-            (1, pair("/w", "/other")),
-            (2, pair("/w", "/w")),
-            (3, pair("/w", "/other")),
-            (4, pair("/w", "/w")),
+            (0, probe("/w", None, "/w")),
+            (1, probe("/w", None, "/other")),
+            (2, probe("/w", None, "/w")),
+            (3, probe("/w", None, "/other")),
+            (4, probe("/w", None, "/w")),
         ];
         let mut probes = 0;
-        let matching = rows_on_same_store(rows, |a, b| {
+        let matching = rows_on_same_store(rows, |p| {
             probes += 1;
-            a == b
+            p.declared == p.bound
         });
         assert_eq!(matching, vec![0, 2, 4]);
         assert_eq!(probes, 2);
+    }
+
+    #[test]
+    fn probes_differ_by_ambient_only() {
+        let default_store = "/home/u/.claude";
+        let rows = vec![
+            (0, probe(default_store, Some("/a"), "/a")),
+            (1, probe(default_store, Some("/a"), "/a")),
+            (2, probe(default_store, Some("/b"), "/a")),
+            (3, probe(default_store, None, "/a")),
+        ];
+        let mut probes = 0;
+        rows_on_same_store(rows, |_| {
+            probes += 1;
+            true
+        });
+        assert_eq!(probes, 3);
     }
 }
 

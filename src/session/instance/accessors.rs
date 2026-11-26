@@ -292,20 +292,18 @@ impl Instance {
         config: impl FnOnce() -> OwnCmdConfig<C>,
     ) -> bool {
         self.own_acp_cmd_stores_with(acp_agent, config)
-            .is_some_and(|(launcher, bound)| {
-                crate::session::capture::same_claude_store(&launcher, &bound)
-            })
+            .is_some_and(|probe| probe.launches_bound_store())
     }
 
-    /// The `(launcher store, bound store)` pair whose equality admits
-    /// [`Self::resumes_claude_under_own_acp_cmd_with`], so a caller can probe it later and once.
+    /// The route inputs whose probe admits [`Self::resumes_claude_under_own_acp_cmd_with`].
+    /// Does no filesystem work, so a caller can run the probe later and once per distinct value.
     pub(crate) fn own_acp_cmd_stores_with<
         C: std::borrow::Borrow<crate::session::config::SessionConfig>,
     >(
         &self,
         acp_agent: &str,
         config: impl FnOnce() -> OwnCmdConfig<C>,
-    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    ) -> Option<crate::session::capture::OwnCmdStoreProbe> {
         if self.tool == "claude"
             || acp_agent != self.tool
             || crate::session::fork::builtin_acp_registry()
@@ -349,13 +347,13 @@ impl Instance {
                     .flatten()
             },
         );
-        let (launcher_store, _) = crate::session::capture::declared_claude_store_route(
-            &launcher_store,
-            &home,
-            ambient.as_deref(),
-        );
         self.acp_transcript_cli_resumable_with("claude", session)
-            .then_some((launcher_store, bound_store))
+            .then_some(crate::session::capture::OwnCmdStoreProbe {
+                declared: launcher_store,
+                home,
+                ambient,
+                bound: bound_store,
+            })
     }
 
     /// The ACP agent a structured switch launches; resolves config at the repo
