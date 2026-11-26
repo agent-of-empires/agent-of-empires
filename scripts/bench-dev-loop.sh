@@ -14,9 +14,10 @@ TREE="synced tree"
 OUT=${TMPDIR:-/tmp}/bench-dev-loop-$(date +%Y%m%d-%H%M%S)
 B=$(mktemp -d)
 mkdir -p "$OUT"
-trap 'rm -rf "$B"' EXIT
+trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$B"' EXIT
 RUN=" ${*:-1 2 3} "
 command -v hyperfine >/dev/null || cargo install hyperfine --locked -q
+command -v jq >/dev/null || { echo "needs jq" >&2; exit 2; }
 
 # Bypass kache: real cargo (shim dir off PATH), no rustc wrapper, plain rustdoc and host CC.
 PATH=$(printf %s "$PATH" | tr : '\n' | grep -v '/kache/shims$' | paste -sd: -)
@@ -83,7 +84,7 @@ log=$(cat "$B/log")
 if grep -q 'kache [^ ]*rustc --crate-name' <<<"$log"; then echo "kache still in the build" >&2; exit 1; fi
 echo "agent_of_empires rustc runs in cargo test --no-run after cargo build: $(count_lib_rustc <<<"$log")" |
   tee -a "$OUT/summary.txt"
-echo "peak summed rustc RSS in that cargo test --no-run: $PEAK_MIB MiB" | tee -a "$OUT/summary.txt"
+echo "peak summed rustc RSS (sampled every 0.1 s) in that cargo test --no-run: $PEAK_MIB MiB" | tee -a "$OUT/summary.txt"
 for c in serde_json tokio tokio-stream regex-automata; do
   diff <(cargo tree -e normal -i "$c" -f '{p} {f}' --depth 0) \
     <(cargo tree -e all -i "$c" -f '{p} {f}' --depth 0) || true
