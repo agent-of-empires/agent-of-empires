@@ -1226,3 +1226,42 @@ fn declaration_bounds_each_reject() {
         parse(26, &with_env(HOOKS, "EXAMPLE_CONFIG_DIR", dir));
     }
 }
+
+#[test]
+fn identity_hooks_need_a_bare_executable_name() {
+    let body = |command: &str, identity: bool| {
+        let events = if identity {
+            "[[agent_integrations.hooks.events]]\nevent = \"SessionStart\"\nidentity_field = \"session_id\"\n"
+        } else {
+            ""
+        };
+        format!(
+            "[[agent_integrations]]\ntool = \"example\"\ncommand = \"{command}\"\n\
+             [agent_integrations.launch.container_env]\nEXAMPLE_CONFIG_DIR = \"/opt/example\"\n\
+             {HOOKS}{events}"
+        )
+    };
+    for command in [
+        "example+cli",
+        "/opt/bin/example",
+        "FOO=bar ex@mple",
+        "ex,ample",
+    ] {
+        let error = PluginManifest::from_toml_str(&manifest(26, &body(command, true)))
+            .map(|_| ())
+            .expect_err(command);
+        assert!(
+            error.to_string().contains("bare name"),
+            "{command}: {error}"
+        );
+        // Without an identity event there is no publisher guard to lose.
+        parse(26, &body(command, false));
+    }
+    for command in [
+        "example-cli",
+        "example.v2 --flag",
+        "PATH_HINT=x example_cli",
+    ] {
+        parse(26, &body(command, true));
+    }
+}

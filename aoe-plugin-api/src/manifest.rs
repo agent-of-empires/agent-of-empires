@@ -896,6 +896,32 @@ fn validate_agent_hooks(
     check: &mut impl FnMut(bool, String),
 ) {
     use crate::agent_integration::{AGENT_HOOK_EVENTS, AGENT_HOOK_EVENTS_MAX};
+    if hooks
+        .events
+        .iter()
+        .any(|event| event.identity_field.is_some())
+    {
+        // The executable names the identity hook's publisher guard; a name the guard
+        // cannot carry would silently lose it.
+        let bare = integration
+            .command
+            .as_deref()
+            .and_then(crate::agent_integration::launch_prefix)
+            .and_then(|(words, _)| words.last().copied())
+            .is_some_and(|program| {
+                !program.is_empty()
+                    && program
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            });
+        check(
+            bare,
+            format!(
+                "agent_integrations[{i}].hooks with an identity_field need a command whose \
+                 executable is a bare name of letters, digits, `.`, `_` and `-`"
+            ),
+        );
+    }
     check(
         declaration_rel_path_ok(&hooks.settings_rel_path)
             && hooks.settings_rel_path.contains('/')
