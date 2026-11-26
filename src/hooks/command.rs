@@ -261,11 +261,12 @@ fn hook_command_session_id_sandbox(
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
-         {publisher_guard}B=\"${{AOE_AGENT_BIN:-}}\"; Q=\"${{AOE_AGENT_PROGRAM:-}}\"; N=0; P=$PPID; \
-         while {{ [ -n \"$B\" ] || [ -n \"$Q\" ]; }} && [ \"${{P:-0}}\" -gt 0 ]; do \
+         {publisher_guard}B=\"${{AOE_AGENT_BIN:-}}\"; Q=\"${{AOE_AGENT_PROGRAM:-}}\"; E=\"${{AOE_AGENT_EXE:-}}\"; N=0; P=$PPID; \
+         while {{ [ -n \"$B\" ] || [ -n \"$Q\" ] || [ -n \"$E\" ]; }} && [ \"${{P:-0}}\" -gt 0 ]; do \
          A=$(tr \"\\0\" \"\\n\" < /proc/$P/cmdline 2>/dev/null | head -n 1); \
          A=\"${{A##*/}}\"; \
-         {{ {{ [ -n \"$B\" ] && [ \"$A\" = \"$B\" ]; }} || {{ [ -n \"$Q\" ] && [ \"$A\" = \"$Q\" ]; }}; }} && N=$((N + 1)); \
+         X=; [ -z \"$E\" ] || {{ X=$(readlink /proc/$P/exe 2>/dev/null); X=\"${{X% (deleted)}}\"; }}; \
+         {{ {{ [ -n \"$B\" ] && [ \"$A\" = \"$B\" ]; }} || {{ [ -n \"$Q\" ] && [ \"$A\" = \"$Q\" ]; }} || {{ [ -n \"$E\" ] && [ \"$X\" = \"$E\" ]; }}; }} && N=$((N + 1)); \
          P=$(sed -n \"s/^PPid:[[:space:]]*//p\" /proc/$P/status 2>/dev/null); \
          done; \
          [ \"$N\" -le 1 ] || exit 0; \
@@ -414,6 +415,8 @@ mod tests {
                     &[
                         "D=\"/tmp/aoe-hooks/$AOE_INSTANCE_ID\"",
                         "Q=\"${AOE_AGENT_PROGRAM:-}\"",
+                        "E=\"${AOE_AGENT_EXE:-}\"",
+                        "readlink /proc/$P/exe",
                         "command -v jq >/dev/null 2>&1 || exit 0",
                         "jq -r ",
                         ".session_id|type",
@@ -894,20 +897,29 @@ mod tests {
         let agent = tmp.path().join("aoe-fake-agent");
         let fallback = tmp.path().join("aoe-fake-fallback");
         let wrapper = tmp.path().join("aoe-fake-wrapper");
+        let real_exe = tmp.path().join("cursor-real");
+        let cursor_link = tmp.path().join("cursor-agent");
         std::os::unix::fs::symlink("/bin/sh", &agent).unwrap();
         std::os::unix::fs::symlink("/bin/sh", &fallback).unwrap();
         std::os::unix::fs::symlink("/bin/sh", &wrapper).unwrap();
+        let sh_target = std::fs::canonicalize("/bin/sh").unwrap();
+        std::fs::copy(&sh_target, &real_exe).unwrap();
+        std::fs::set_permissions(&real_exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&real_exe, &cursor_link).unwrap();
+        let real_exe_canonical = std::fs::canonicalize(&real_exe).unwrap();
+        let real_exe_str = real_exe_canonical.to_str().unwrap();
         let hook = hook_command_session_id_sandbox(
             tmp.path().to_str().unwrap(),
             HookIdentityField::SessionId,
             None,
         );
         let payload = r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#;
-        for (id, outer, agent_bin, agent_program, script, writes) in [
+        for (id, outer, agent_bin, agent_program, agent_exe, script, writes) in [
             (
                 "pane_agent",
                 &agent,
                 "aoe-fake-agent",
+                None,
                 None,
                 r#"eval "$HOOK"; true"#,
                 true,
@@ -917,6 +929,7 @@ mod tests {
                 &agent,
                 "aoe-fake-agent",
                 None,
+                None,
                 r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
                 false,
             ),
@@ -925,6 +938,7 @@ mod tests {
                 &fallback,
                 "aoe-fake-agent",
                 Some("aoe-fake-fallback"),
+                None,
                 r#"eval "$HOOK"; true"#,
                 true,
             ),
@@ -933,6 +947,7 @@ mod tests {
                 &fallback,
                 "aoe-fake-agent",
                 Some("aoe-fake-fallback"),
+                None,
                 r#""$FALLBACK" -c 'eval "$HOOK"; true'; true"#,
                 false,
             ),
@@ -941,6 +956,7 @@ mod tests {
                 &agent,
                 "aoe-fake-agent",
                 Some("aoe-fake-fallback"),
+                None,
                 r#""$FALLBACK" -c 'eval "$HOOK"; true'; true"#,
                 false,
             ),
@@ -949,13 +965,42 @@ mod tests {
                 &fallback,
                 "aoe-fake-agent",
                 Some("aoe-fake-fallback"),
+                None,
                 r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
+                false,
+            ),
+            (
+                "pane_symlink_target_exe",
+                &cursor_link,
+                "agent",
+                Some("cursor-agent"),
+                Some(real_exe_str),
+                r#"eval "$HOOK"; true"#,
+                true,
+            ),
+            (
+                "nested_different_argv0_same_exe",
+                &cursor_link,
+                "agent",
+                Some("cursor-agent"),
+                Some(real_exe_str),
+                r#""$REAL_EXE" -c 'eval "$HOOK"; true'; true"#,
+                false,
+            ),
+            (
+                "nested_real_exe_then_symlink",
+                &real_exe,
+                "agent",
+                Some("cursor-agent"),
+                Some(real_exe_str),
+                r#""$CURSOR_LINK" -c 'eval "$HOOK"; true'; true"#,
                 false,
             ),
             (
                 "native_wrapper_with_foreground_agent",
                 &wrapper,
                 "aoe-fake-agent",
+                None,
                 None,
                 r#""$AGENT" -c 'eval "$HOOK"; true'; true"#,
                 true,
@@ -965,6 +1010,7 @@ mod tests {
                 &wrapper,
                 "aoe-fake-agent",
                 None,
+                None,
                 r#""$AGENT" -c '"$AGENT" -c "eval \"\$HOOK\"; true"; true'; true"#,
                 false,
             ),
@@ -972,11 +1018,17 @@ mod tests {
             run_hook(outer, script, id, payload, |c| {
                 c.env("AGENT", &agent)
                     .env("FALLBACK", &fallback)
+                    .env("REAL_EXE", &real_exe)
+                    .env("CURSOR_LINK", &cursor_link)
                     .env("HOOK", &hook)
                     .env("AOE_AGENT_BIN", agent_bin)
-                    .env_remove("AOE_AGENT_PROGRAM");
+                    .env_remove("AOE_AGENT_PROGRAM")
+                    .env_remove("AOE_AGENT_EXE");
                 if let Some(program) = agent_program {
                     c.env("AOE_AGENT_PROGRAM", program);
+                }
+                if let Some(exe) = agent_exe {
+                    c.env("AOE_AGENT_EXE", exe);
                 }
             });
             assert_eq!(
