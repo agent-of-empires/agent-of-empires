@@ -58,7 +58,21 @@ fn is_registry_selector(selector: &str) -> bool {
     };
     let is_range = selector.split("||").all(|part| {
         let mut tokens = part.split_whitespace().peekable();
-        tokens.peek().is_some() && tokens.all(|t| t == "-" || is_comparator(t))
+        let is_operator = |t: &str| t.chars().all(|c| "^~<>=".contains(c));
+        let mut any = false;
+        while let Some(t) = tokens.next() {
+            any = true;
+            // An operator detached from its version ("`>= 1`") must precede a comparator.
+            let ok = if is_operator(t) {
+                tokens.next().is_some_and(is_comparator)
+            } else {
+                t == "-" || is_comparator(t)
+            };
+            if !ok {
+                return false;
+            }
+        }
+        any
     });
     is_tag || is_range
 }
@@ -528,6 +542,26 @@ mod tests {
             (
                 "npx \"@agentclientprotocol/claude-agent-acp@1.2 - 1.4\"",
                 true,
+            ),
+            (
+                "npx \"@agentclientprotocol/claude-agent-acp@>= 1 < 3\"",
+                true,
+            ),
+            ("npx \"@agentclientprotocol/claude-agent-acp@>=1 <3\"", true),
+            ("npx \"@agentclientprotocol/claude-agent-acp@^ 1.2\"", true),
+            (
+                "npx \"@agentclientprotocol/claude-agent-acp@~ 1.2 || >= 2\"",
+                true,
+            ),
+            ("npx \"@agentclientprotocol/claude-agent-acp@>=\"", false),
+            ("npx \"@agentclientprotocol/claude-agent-acp@1 >=\"", false),
+            (
+                "npx \"@agentclientprotocol/claude-agent-acp@>= >= 1\"",
+                false,
+            ),
+            (
+                "npx \"@agentclientprotocol/claude-agent-acp@>= - 1\"",
+                false,
             ),
             ("npx claude-agent-acp@npm:other", false),
             ("npx claude-agent-acp@", false),
