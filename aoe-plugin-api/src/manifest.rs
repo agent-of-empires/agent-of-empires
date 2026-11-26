@@ -832,6 +832,112 @@ fn cli_verb_ok(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
 }
 
+/// A relative path of plain components, so it cannot leave the config directory.
+fn declaration_rel_path_ok(path: &str) -> bool {
+    use std::path::{Component, Path};
+    (1..=crate::agent_integration::AGENT_HOOK_PATH_MAX).contains(&path.len())
+        && path.chars().all(|c| !c.is_control())
+        && path.split('/').all(|part| !part.is_empty() && part != ".")
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn declaration_env_var_ok(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    name.len() <= 64
+        && bytes
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+fn declaration_text_ok(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= crate::agent_integration::AGENT_HOOK_STRING_MAX
+        && value.chars().all(declaration_character_ok)
+}
+
+fn validate_agent_hooks(
+    i: usize,
+    hooks: &crate::agent_integration::AgentHooksDeclaration,
+    check: &mut impl FnMut(bool, String),
+) {
+    use crate::agent_integration::{AGENT_HOOK_EVENTS, AGENT_HOOK_EVENTS_MAX};
+    check(
+        declaration_rel_path_ok(&hooks.settings_rel_path),
+        format!(
+            "agent_integrations[{i}].hooks.settings_rel_path must be a relative path without `..`"
+        ),
+    );
+    if let Some(var) = &hooks.config_dir_env_var {
+        check(
+            declaration_env_var_ok(var),
+            format!("agent_integrations[{i}].hooks.config_dir_env_var must be an environment variable name"),
+        );
+    }
+    check(
+        (1..=AGENT_HOOK_EVENTS_MAX).contains(&hooks.events.len()),
+        format!(
+            "agent_integrations[{i}].hooks.events must hold 1..={AGENT_HOOK_EVENTS_MAX} events"
+        ),
+    );
+    let mut seen = std::collections::HashSet::new();
+    for (j, event) in hooks.events.iter().enumerate() {
+        check(
+            AGENT_HOOK_EVENTS.contains(&event.event.as_str()),
+            format!(
+                "agent_integrations[{i}].hooks.events[{j}].event must be one of {AGENT_HOOK_EVENTS:?}"
+            ),
+        );
+        check(
+            event.matcher.as_deref().is_none_or(declaration_text_ok),
+            format!("agent_integrations[{i}].hooks.events[{j}].matcher must be 1..=256 printable characters"),
+        );
+        check(
+            seen.insert((event.event.as_str(), event.matcher.as_deref())),
+            format!("agent_integrations[{i}].hooks.events[{j}] repeats an event and matcher"),
+        );
+        check(
+            event.waiting_tools.len() <= AGENT_HOOK_EVENTS_MAX
+                && event.waiting_tools.iter().all(|tool| declaration_word_ok(tool) && tool.len() <= 128),
+            format!("agent_integrations[{i}].hooks.events[{j}].waiting_tools must be at most 32 plain tool names"),
+        );
+    }
+}
+
+fn validate_agent_trust(
+    i: usize,
+    trust: &crate::agent_integration::AgentTrustDeclaration,
+    check: &mut impl FnMut(bool, String),
+) {
+    use crate::agent_integration::{parse_trust_pointer, AgentTrustValue};
+    check(
+        declaration_rel_path_ok(&trust.file) && !trust.file.contains('/'),
+        format!("agent_integrations[{i}].trust.file must be a single file name"),
+    );
+    if let Some(var) = &trust.config_dir_env_var {
+        check(
+            declaration_env_var_ok(var),
+            format!("agent_integrations[{i}].trust.config_dir_env_var must be an environment variable name"),
+        );
+    }
+    check(
+        parse_trust_pointer(&trust.pointer).is_some(),
+        format!(
+            "agent_integrations[{i}].trust.pointer must be an absolute pointer such as \
+             \"/projects/{{path}}/trusted\" with exactly one `{{path}}` segment, no empty \
+             or numeric segments, and a leaf after it"
+        ),
+    );
+    if let AgentTrustValue::String(value) = &trust.value {
+        check(
+            declaration_text_ok(value),
+            format!("agent_integrations[{i}].trust.value must be 1..=256 printable characters"),
+        );
+    }
+}
+
 fn validate_agent_declaration(
     i: usize,
     integration: &crate::agent_integration::AgentIntegrationContribution,
@@ -875,6 +981,8 @@ fn validate_agent_declaration(
         && integration.detection.is_none()
         && integration.reply_fallback.is_none()
         && integration.session_id.is_none()
+        && integration.hooks.is_none()
+        && integration.trust.is_none()
     {
         return;
     }
@@ -885,6 +993,12 @@ fn validate_agent_declaration(
             .is_some_and(|command| !command.trim().is_empty()),
         format!("agent_integrations[{i}] declarations require a non-blank command"),
     );
+    if let Some(hooks) = &integration.hooks {
+        validate_agent_hooks(i, hooks, check);
+    }
+    if let Some(trust) = &integration.trust {
+        validate_agent_trust(i, trust, check);
+    }
     if let Some(launch) = &integration.launch {
         for (j, alias) in launch.aliases.iter().enumerate() {
             check(!alias.is_empty() && alias.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_') && alias != &integration.tool && !launch.aliases[..j].contains(alias), format!("agent_integrations[{i}].launch.aliases[{j}] must be a unique lowercase agent id"));
@@ -1418,13 +1532,24 @@ impl PluginManifest {
                     || (integration.launch.is_none()
                         && integration.detection.is_none()
                         && integration.reply_fallback.is_none()
-                        && integration.session_id.is_none()),
+                        && integration.session_id.is_none()
+                        && integration.hooks.is_none()
+                        && integration.trust.is_none()),
                 format!("agent_integrations[{i}] declarations require api_version >= 21"),
             );
             check(
                 self.api_version >= 22 || integration.session_id.is_none(),
                 format!("agent_integrations[{i}].session_id requires api_version >= 22"),
             );
+            for (table, declared) in [
+                ("hooks", integration.hooks.is_some()),
+                ("trust", integration.trust.is_some()),
+            ] {
+                check(
+                    self.api_version >= 26 || !declared,
+                    format!("agent_integrations[{i}].{table} requires api_version >= 26"),
+                );
+            }
             if let Some(delay) = integration
                 .launch
                 .as_ref()
