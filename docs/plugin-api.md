@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `25`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `26`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 25
+api_version = 26
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,10 +30,11 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `25`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `26`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
+| `command_groups` | array of tables | no | Named CLI verbs that nest their commands under `aoe <verb>`. Requires `api_version >= 26`. See [Command groups](#command-groups-api_version--26). |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 23` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
@@ -182,7 +183,7 @@ A capability this host version does not recognize is rejected, not granted.
 
 ## Commands
 
-Palette entries, namespaced by the host as `plugin.<id>.<command-id>`. A command with no `action` is delivered to the worker as a `plugin.command.invoke` notification. The CLI lists them in `aoe --help` but cannot run them yet. A command whose name a core subcommand or an earlier plugin already uses is not listed.
+Palette entries, namespaced by the host as `plugin.<id>.<command-id>`. A command with no `action` is delivered to the worker as a `plugin.command.invoke` notification. The CLI lists them in `aoe --help` but cannot run them yet. A command whose name a core subcommand or an earlier plugin already uses is not listed. A command that names a `group` appears as `aoe <group> <id>` instead of a flat top-level verb.
 
 ```toml
 [[commands]]
@@ -197,6 +198,7 @@ description = "Show the status summary."
 | `title` | string | no | Display name. |
 | `description` | string | no | Help text. |
 | `action` | table | no | A client-executed action. Requires `api_version >= 6` and the `browser_open` capability. |
+| `group` | string | no | Id of a declared `[[command_groups]]` entry. Requires `api_version >= 26`. See [Command groups](#command-groups-api_version--26). |
 
 A command `action` is a client-executed action instead of a worker call. The only `kind` is `open-ui-link`, which opens the `href` from the plugin's own `(slot, id)` UI-state entry in the browser, with no worker round-trip; that pair must match a declared `[[ui]]` entry on a per-session slot.
 
@@ -212,6 +214,36 @@ to link back into aoe (a plugin cannot know the host, port, or tunnel origin).
 Relative hrefs must start with exactly one `/`; `//host`, backslashes, and
 embedded tab/CR/LF are rejected because a browser would resolve them onto a
 different origin. See [Link targets](#link-targets).
+
+### Command groups (`api_version >= 26`)
+
+A group gives the plugin a short CLI verb instead of a name-prefixed one.
+Declare the verb once and set `group` on the commands it carries:
+
+```toml
+[[command_groups]]
+id = "linear"
+about = "Linear issue commands"
+
+[[commands]]
+id = "refresh"
+title = "Refresh Linear issues"
+group = "linear"
+```
+
+That grafts `aoe linear refresh`. A `[[commands]]` entry with no `group` keeps
+its flat top-level name, so groups are additive and one level deep.
+
+`id` on a group, and on a command that names one, is a single bare lowercase
+verb (letters, digits, `-`, `_`). Nesting changes only the CLI path: the command
+id, the `plugin.<id>.<command-id>` worker method, `action` targets, and
+`[[keybinds]]` stay as they are.
+
+Core keeps the top level. A group whose id matches a core subcommand is not
+grafted, and neither are its commands; a group id goes to the first active
+plugin that declares it, and within a group the first plugin to claim a leaf
+name wins. A flat command whose name an accepted group verb already takes is not
+grafted.
 
 ## Keybinds
 

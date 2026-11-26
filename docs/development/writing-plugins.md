@@ -20,7 +20,7 @@ Every plugin declares identity, what it contributes, and, with a worker, how to 
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 25
+api_version = 26
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 
@@ -42,6 +42,8 @@ id = "my_plugin_pane"
 ```
 
 Pick an `id` outside the reserved `aoe.*` and `agent-of-empires.*` namespaces, set `api_version` to the schema version you target, and set `aoe_version` to the host range you have tested.
+
+A command is a flat top-level `aoe` verb unless it names a `group`. Declare a `[[command_groups]]` verb, set `group` on the commands it carries, and the CLI nests them as `aoe <group> <command>`; core and earlier plugins keep their claim on a name. See [Command groups](../plugin-api.md#command-groups-api_version--26).
 
 A worker requests only the grants it uses. `runtime.worker` is required to run any code at all; add `net`, `session.read`, `notifications`, and so on as needed. Static contributions (commands, keybinds, themes, ui, status) need no capability. The user grants the exact declared set at install, pinned to the manifest hash, so an update that widens capabilities must be re-approved. Keep the list honest and minimal.
 
