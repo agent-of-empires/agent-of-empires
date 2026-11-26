@@ -24,8 +24,7 @@ import { usePluginPages } from "../../lib/pluginUiContext";
 import type { SessionMenuRequest } from "./PluginSessionMenu";
 import { requestOpenSession } from "../../lib/sessionRoute";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
-import { THEME_CHANGED_EVENT, type ResolvedTheme } from "../../lib/theme";
-import { listen } from "../../hooks/domEvents";
+import { getResolvedTheme, subscribeTheme, type ResolvedTheme } from "../../lib/theme";
 import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { usePersistedFlag } from "../usePersistedFlag";
 import { BUTTON_SECONDARY } from "../../lib/surfaces";
@@ -308,11 +307,10 @@ export function PluginPageView({
 
   useEffect(
     () =>
-      listen(
-        (event) =>
-          port.current?.postMessage(bridgePush("theme", themePayload((event as CustomEvent<ResolvedTheme>).detail))),
-        [window, THEME_CHANGED_EVENT],
-      ),
+      subscribeTheme(() => {
+        const next = getResolvedTheme();
+        if (next) port.current?.postMessage(bridgePush("theme", themePayload(next)));
+      }),
     [],
   );
 

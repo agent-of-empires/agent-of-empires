@@ -175,12 +175,8 @@
   --color-diff-modified: #fbbf24;
   --color-diff-header: #0d9488;
 
-  /* Embedded terminal cold-load defaults. useResolvedTheme refetches
-     and overrides these once the resolved palette lands; the terminal
-     hook reads them on construction and on `aoe:theme-changed` to
-     build xterm.js's ITheme. These match the `zinc` builtin
-     projected by src/tui/styles/resolved.rs::terminal_projection so
-     the pre-fetch paint matches the post-fetch paint for the zinc theme. */
+  /* Terminal cold-load defaults, the `zinc` builtin's projection in
+     src/tui/styles/resolved.rs; the resolved theme overrides them. */
   --term-bg: #1c1c1f;
   --term-fg: #e4e4e7;
   --term-cursor: #f59e0b;

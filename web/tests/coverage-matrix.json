@@ -5336,6 +5336,14 @@
       ]
     },
     {
+      "id": "settings.theme-cross-window-sync",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/theme-switch.spec.ts", "src/hooks/useResolvedTheme.test.tsx"],
+      "components": ["web/src/hooks/useResolvedTheme.ts", "web/src/hooks/useShikiTheme.ts", "web/src/lib/theme.ts"],
+      "notes": "A theme picked in one window repaints every other open window of the browser at once, including already-mounted syntax highlighting; a window refetches the theme when it becomes visible."
+    },
+    {
       "id": "story.settings-logging-level",
       "kind": "vitest",
       "risk": "medium",
