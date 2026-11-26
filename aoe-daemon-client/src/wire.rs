@@ -489,7 +489,6 @@ pub struct RestartSessionBody {
     pub bound_hooks: bool,
     #[serde(default)]
     pub discard_sandbox_container: bool,
-    pub wake_message: Option<String>,
     /// Refuse, before anything stops, unless `tool` is an account swap that keeps the conversation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_account_carry: bool,
