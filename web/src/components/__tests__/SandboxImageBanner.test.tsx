@@ -887,6 +887,20 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
       expect(banner()?.textContent, "B's Cancel dropped A's refusal").toBe(FAILED);
       unmount();
     }
+
+    // × hides only that image's pull: B's running after it shows, and A, still running, stays hidden.
+    {
+      const { unmount } = await mount(running());
+      fireEvent.click(screen.getByRole("button", { name: "Hide sandbox image notice" }));
+      expect(bar()).toBeNull();
+      fetchSandboxImageStatus.mockResolvedValue(otherRunning());
+      await pollAfter(2000);
+      expect(banner()?.textContent, "B's pull started hidden by A's ×").toBe(DOWNLOADING);
+      fetchSandboxImageStatus.mockResolvedValue(running());
+      await pollAfter(2000);
+      expect(bar(), "A's hidden pull, still running, came back").toBeNull();
+      unmount();
+    }
   });
 
   it("drops a Cancel once the banner shows another image, so its reply and refusal stay off it", async () => {

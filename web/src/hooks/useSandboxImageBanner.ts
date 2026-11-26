@@ -83,8 +83,8 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   const [status, setStatus] = useState<SandboxImageStatus | null>(null);
   const [dismissedDigest, setDismissedDigest] = useState<string | null>(null);
   const [noticeDismissed, setNoticeDismissed] = useState(false);
-  // × on a running pull hides its banner until that pull ends; its outcome shows again.
-  const [hidden, setHidden] = useState(false);
+  // × on a running pull hides its banner until that image's pull ends; its outcome shows again.
+  const [hiddenImage, setHiddenImage] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState(false);
   // Why the Daemon refused the last Cancel; the pull keeps running. Kept until a click or the pull's end,
   // not the next 2 s poll, so Details stays readable.
@@ -183,7 +183,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
             setRefusal(null);
           }
         } else if (!predatesPull) {
-          setHidden(false);
+          setHiddenImage((h) => (h === answer.image ? null : h));
           setCancelRefused(null);
         }
         // The cap only limits what's shown: while the reply is out, keep watching for the pull.
@@ -249,7 +249,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     setSeenRunning(null);
     setAcceptedImage(null);
     setNoticeDismissed(false);
-    setHidden(false);
+    setHiddenImage((h) => (h === image ? null : h));
     setRefusal(null);
     setCancelling(false);
     setCancelRefused(null);
@@ -314,16 +314,16 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
         seenRunningRef.current = image;
         setSeenRunning(image);
         setNoticeDismissed(false);
-        setHidden(false);
+        setHiddenImage((h) => (h === image ? null : h));
         setStatus((s) => s && { ...s, pull });
       }
       pollNow.current();
     });
   }, []);
 
-  const show = useCallback(() => setHidden(false), []);
-  const hide = useCallback(() => {
-    setHidden(true);
+  const show = useCallback(() => setHiddenImage(null), []);
+  const hide = useCallback((image: string) => {
+    setHiddenImage(image);
     setCancelRefused(null);
   }, []);
 
@@ -357,6 +357,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
       const progress = pullProgress(pull);
       const image = status.image;
       const onCancel = status.pull_blocked ? undefined : () => cancel(image);
+      const hidden = hiddenImage === image;
       return {
         view: hidden
           ? null
@@ -367,7 +368,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
               cancelReady: tied(image),
               cancelling,
               cancelRefused,
-              onHide: hide,
+              onHide: () => hide(image),
             },
         running: { progress, hidden, onShow: show },
       };
