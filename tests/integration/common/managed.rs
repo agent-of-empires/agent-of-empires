@@ -2646,6 +2646,22 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let events = state.acp_events_tx.subscribe();
         original.supervisor.detach_all().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(registry) = crate::process::worker_registry::try_registry_lock(&id)
+                    .expect("read original runner registry")
+                {
+                    let record = registry.record().unwrap().expect("retained runner record");
+                    assert!(original_receipt.owner.owns_record(&record));
+                    if record.detached_at.is_some() {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("original runner committed its detach");
         between(state.clone(), id.clone()).await;
         let attached = self.installed_on(state, id, events).await;
         attached.ready().await;

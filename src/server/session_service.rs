@@ -7011,7 +7011,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-term-super", "term-super", "initial-turn-A");
+        let mut inst = terminal_turn_instance("sess-term-super", "term-super", "initial-turn-A");
+        inst.source_profile = "default".into();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &inst.source_profile,
             vec![inst.clone()],
@@ -7041,10 +7042,10 @@ mod tests {
         assert!(text.contains("user-message-B"), "{text}");
         assert!(!text.contains("initial-turn-A"), "{text}");
         assert!(pending_turn(&service, "sess-term-super").await.is_none());
+        assert!(disk_turn("default", "sess-term-super").is_none());
     }
 
-    /// The supersession clear queues blocking work of its own, so a send must
-    /// not hold the only blocking slot while it waits for that clear.
+    /// A send must settle supersession without waiting for a second blocking slot.
     #[test]
     #[serial_test::serial]
     fn a_terminal_send_clears_the_pending_turn_with_one_blocking_slot() {
@@ -7089,6 +7090,7 @@ mod tests {
                 "terminal send must succeed with one blocking slot"
             );
             assert!(pending_turn(&service, "sess-one-slot").await.is_none());
+            assert!(disk_turn("default", "sess-one-slot").is_none());
         });
     }
 
@@ -7101,7 +7103,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-cancel-ns", "cancel-ns", "initial-turn-A");
+        let mut inst = terminal_turn_instance("sess-cancel-ns", "cancel-ns", "initial-turn-A");
+        inst.source_profile = "default".into();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &inst.source_profile,
             vec![inst.clone()],
@@ -7132,18 +7135,29 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         sender.abort();
-        let _ = sender.await;
+        assert!(matches!(sender.await, Err(error) if error.is_cancelled()));
 
         assert!(
             state.profile_namespace.try_write().is_err(),
             "the detached send released the profile namespace"
         );
+        assert!(
+            service
+                .try_prompt_submission("sess-cancel-ns")
+                .await
+                .is_none(),
+            "the detached send released the submission gate"
+        );
+        assert!(pending_turn(&service, "sess-cancel-ns").await.is_some());
         drop(gate);
-        while state.profile_namespace.try_write().is_err() {
-            assert!(std::time::Instant::now() < deadline, "send never finished");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let _namespace = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            state.profile_namespace.write(),
+        )
+        .await
+        .expect("detached send never released the profile namespace");
         assert!(pending_turn(&service, "sess-cancel-ns").await.is_none());
+        assert!(disk_turn("default", "sess-cancel-ns").is_none());
     }
 
     /// The automatic drain holds the profile namespace through delivery and the

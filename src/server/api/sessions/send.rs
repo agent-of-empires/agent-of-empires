@@ -269,7 +269,8 @@ async fn send_terminal_message_inner(
         selection: initial_identity.selection,
     };
     let input_id = id.to_owned();
-    let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    // Once dispatched, the worker settles custody even if the caller drops the send.
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let mut instance = native
             .load()?
             .into_iter()
@@ -306,67 +307,57 @@ async fn send_terminal_message_inner(
             expected.profile_identity,
         )?;
         let session = instance.agent_input_session(&name, physical, true, Some(fence))?;
-        Ok((native, instance, session))
+        session.send_keys_with_ack(&message, instance.send_keys_enter_delay(), move |sent| {
+            let _custody = (namespace, submission, guard);
+            sent?;
+            let _lifecycle = native
+                .storage()
+                .acquire_instance_lifecycle_lock(&instance.id)?;
+            let recency = (&native as &dyn SessionStore).update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .ok_or(crate::session::SessionGone)?;
+                anyhow::ensure!(
+                    row.created_at == instance.created_at
+                        && row.lifecycle_generation == instance.lifecycle_generation,
+                    crate::session::LifecycleReservationError::Superseded
+                );
+                if instance
+                    .pending_initial_turn
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        row.pending_initial_turn
+                            .as_ref()
+                            .is_some_and(|current| current.key() == pending.key())
+                    })
+                {
+                    row.pending_initial_turn = None;
+                }
+                row.last_accessed_at = Some(crate::time::Timestamp::now());
+                if !refuse_if_ignored
+                    && row.ignored_at == instance.ignored_at
+                    && row.ensure_startable().is_ok()
+                {
+                    row.unignore();
+                }
+                Ok(())
+            });
+            if let Err(error) = recency {
+                if error.is::<crate::session::SessionCommitApplied>()
+                    || !(error.is::<crate::session::SessionGone>()
+                        || error.downcast_ref::<crate::session::LifecycleReservationError>()
+                            == Some(&crate::session::LifecycleReservationError::Superseded))
+                {
+                    return Err(error);
+                }
+            }
+            Ok(revived)
+        })
     })
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    let result = match prepared {
-        Ok((native, instance, session)) => {
-            tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-                use crate::session::SessionStore;
-                let _guards = (namespace, submission, guard);
-                session.send_keys_with_delay(&message, instance.send_keys_enter_delay())?;
-                let _lifecycle = native
-                    .storage()
-                    .acquire_instance_lifecycle_lock(&instance.id)?;
-                let recency = (&native as &dyn SessionStore).update(|rows, _| {
-                    let row = rows
-                        .iter_mut()
-                        .find(|row| row.id == instance.id)
-                        .ok_or(crate::session::SessionGone)?;
-                    anyhow::ensure!(
-                        row.created_at == instance.created_at
-                            && row.lifecycle_generation == instance.lifecycle_generation,
-                        crate::session::LifecycleReservationError::Superseded
-                    );
-                    if instance
-                        .pending_initial_turn
-                        .as_ref()
-                        .is_some_and(|pending| {
-                            row.pending_initial_turn
-                                .as_ref()
-                                .is_some_and(|current| current.key() == pending.key())
-                        })
-                    {
-                        row.pending_initial_turn = None;
-                    }
-                    row.last_accessed_at = Some(crate::time::Timestamp::now());
-                    if !refuse_if_ignored
-                        && row.ignored_at == instance.ignored_at
-                        && row.ensure_startable().is_ok()
-                    {
-                        row.unignore();
-                    }
-                    Ok(())
-                });
-                if let Err(error) = recency {
-                    if error.is::<crate::session::SessionCommitApplied>()
-                        || !(error.is::<crate::session::SessionGone>()
-                            || error.downcast_ref::<crate::session::LifecycleReservationError>()
-                                == Some(&crate::session::LifecycleReservationError::Superseded))
-                    {
-                        return Err(error);
-                    }
-                }
-                Ok(revived)
-            })
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|result| result)
-        }
-        Err(error) => Err(error),
-    };
     result.map_err(|error| terminal_send_failure(&state, error))
 }
 
