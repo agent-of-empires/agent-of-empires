@@ -111,10 +111,10 @@ content. It is denser and quieter than the marketing site.
   sit on the canvas without borders. Tabs are plain text, the active one
   brighter; a count follows its label (`Diff 3`).
 - The sidebar reads like Claude Code desktop's: **New session** and **Search**
-  rows first, quiet sentence-case section labels, inset rounded rows, and the
-  open session as a filled pill edged in `session-active` (which keeps the 3:1
-  non-text contrast the theme projection guarantees). The header names the open
-  session as `project / title`.
+  rows first, one View options menu by the Sessions label, quiet sentence-case
+  section labels, inset rounded rows, and the open session as a soft filled
+  pill with brighter text. The header names the open session as
+  `project / title`.
 - Follow the conventions of Claude Code desktop, VS Code and Conductor rather
   than inventing controls. The header toggles regions, not individual panes:
   a terminal icon, then the review panel's split button (panel icon toggles it,

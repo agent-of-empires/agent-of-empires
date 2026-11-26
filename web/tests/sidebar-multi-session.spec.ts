@@ -113,17 +113,9 @@ test.describe("Sidebar multi-session (#956)", () => {
     await page.mouse.up();
 
     await expect(row).toHaveAttribute("data-active-session-row", "true");
-    // The open row's edge bar has to resolve to the projected token, not just be requested (#3912): an
-    // unresolved variable would drop the shadow.
-    const bar = await row.evaluate((el) => {
-      const probe = document.createElement("span");
-      probe.style.color = getComputedStyle(document.documentElement).getPropertyValue("--color-session-active");
-      document.body.append(probe);
-      const token = getComputedStyle(probe).color;
-      probe.remove();
-      return { shadow: getComputedStyle(el).boxShadow, token };
-    });
-    expect(bar.shadow).toContain(bar.token);
+    // The open row reads as a filled pill: its background differs from the sidebar's.
+    const fill = await row.evaluate((el) => getComputedStyle(el).backgroundColor);
+    expect(fill).not.toBe("rgba(0, 0, 0, 0)");
     await expect(page).toHaveURL(/\/session\/sess-a$/);
     expect(sessionDocumentRequests).toBe(0);
   });

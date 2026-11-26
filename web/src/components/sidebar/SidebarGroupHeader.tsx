@@ -56,7 +56,8 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   const compact = useSidebarCompact();
 
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
-  const rowClass = `hover:bg-surface-800/50 ${hasActiveChild ? "border-l-2 border-session-active" : ""}`;
+  // A straight edge: the header's rounding would curve the bar into a bracket.
+  const rowClass = `hover:bg-surface-800/50 ${hasActiveChild ? "border-l-2 border-session-active rounded-l-none" : ""}`;
   // Like a Session row's glyph: the header button takes focus and is described by the dot.
   const [dotTip, setDotTip] = useState<"hover" | "focus" | null>(null);
   const dotTipId = useId();
