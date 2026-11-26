@@ -9,7 +9,7 @@ use super::{
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
-use crate::acp::state::{BackgroundAgentStatus, Event, SubagentState};
+use crate::acp::state::{BackgroundAgentStatus, Event, StartupCause, SubagentState};
 
 /// A prompt to record and route through [`Supervisor::publish_user_prompt_with_attachments`].
 #[derive(Default)]
@@ -34,7 +34,31 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
     pub fn publish_startup_error(&self, session_id: &str, message: String) {
-        self.publish_next(session_id, &Event::startup_error(message));
+        self.publish_startup_error_with_cause(session_id, message, None);
+    }
+
+    /// As [`Self::publish_startup_error`], naming the cause for clients that act on it.
+    pub fn publish_startup_error_with_cause(
+        &self,
+        session_id: &str,
+        message: String,
+        cause: Option<StartupCause>,
+    ) {
+        self.publish_next(session_id, &Event::AgentStartupError { message, cause });
+    }
+
+    /// The startup error of a launch held for the sandbox login: the instruction, and the
+    /// `command` and `profile` the recovery needs, as the 409 body carries them.
+    pub fn publish_login_required(
+        &self,
+        session_id: &str,
+        blocked: &crate::session::SandboxLoginRequired,
+    ) {
+        self.publish_startup_error_with_cause(
+            session_id,
+            blocked.to_string(),
+            Some(blocked.startup_cause()),
+        );
     }
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
@@ -556,6 +580,48 @@ mod tests {
     use super::*;
     use crate::acp::approvals::Nonce;
     use crate::process::worker_registry;
+
+    #[test]
+    fn login_required_startup_error_carries_the_recovery_fields() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let blocked = crate::session::SandboxLoginRequired {
+            tool: "claude".to_string(),
+            credential: std::path::PathBuf::from("/test/.credentials.json"),
+            command: Some("my claude".to_string()),
+            profile: Some("work".to_string()),
+        };
+        sup.publish_login_required("s-1", &blocked);
+        sup.publish_login_required(
+            "s-2",
+            &crate::session::SandboxLoginRequired {
+                command: None,
+                profile: None,
+                ..blocked.clone()
+            },
+        );
+
+        let frames = sink.frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), 2);
+        let Event::AgentStartupError { message, cause } = &frames[0].2 else {
+            panic!("expected a startup error, got {:?}", frames[0].2);
+        };
+        assert_eq!(*message, blocked.to_string());
+        assert_eq!(
+            *cause,
+            Some(StartupCause::SandboxLoginRequired {
+                command: Some("my claude".to_string()),
+                profile: Some("work".to_string()),
+            })
+        );
+        // Only what is set goes on the wire, as in the 409 body.
+        let wire = serde_json::to_value(&frames[1].2).unwrap();
+        assert_eq!(
+            wire["AgentStartupError"]["cause"],
+            serde_json::json!({ "kind": "sandbox_login_required" }),
+            "{wire}"
+        );
+    }
 
     #[tokio::test]
     async fn seq_counters_are_per_session_hydratable_and_forgettable() {

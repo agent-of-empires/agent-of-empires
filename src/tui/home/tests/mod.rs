@@ -222,6 +222,7 @@ mod preview_links;
 mod profile_duplicate_reconciliation;
 mod render_and_save;
 mod right_click_context_menu;
+mod sandbox_login_dialog;
 mod save_field_merge;
 mod scroll_pane_isolation;
 mod search;

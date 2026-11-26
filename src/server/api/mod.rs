@@ -18,6 +18,7 @@ pub mod plugins;
 mod projects;
 mod queue;
 mod sandbox_image;
+mod sandbox_login;
 pub(crate) mod sessions;
 mod setup;
 mod skills;
@@ -37,7 +38,8 @@ pub use acp::{
     spawn_acp, switch_acp_agent, switch_acp_provider,
 };
 pub(crate) use acp::{
-    publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
+    publish_startup_error_if_current, publish_startup_error_with_cause_if_current,
+    recover_pending_terminal_handoffs, HandoffRecovery,
 };
 
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
@@ -68,17 +70,22 @@ pub(crate) use sandbox_image::{
 pub use sandbox_image::{
     sandbox_image_cancel, sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status,
 };
+pub(crate) use sandbox_login::CODE_BODY_LIMIT as SANDBOX_LOGIN_CODE_BODY_LIMIT;
+pub use sandbox_login::{
+    cancel_sandbox_login, get_sandbox_login, get_sandbox_login_outcome, leave_sandbox_login,
+    start_sandbox_login, submit_sandbox_login_code,
+};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
     create_session_progress, delete_session, delete_workspace, empty_trash,
     ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool, force_smart_rename,
     get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
-    read_output, reclaim_session_ownership, recreate_container, rename_session, restart_for_update,
-    restart_session, restore_session, review_creation_trust, save_session_file, search_sessions,
-    send_message, serve_session_artifact, session_account_targets, session_diff_file,
-    session_diff_file_raw, session_diff_files, session_file, session_file_raw, set_worktree_name,
-    start_session, stop_auxiliary, stop_session, summarize_session, touch_session_access,
-    trash_session, update_session_archive, update_session_diff_base, update_session_favorite,
+    read_output, reclaim_session_ownership, recreate_container, rename_session, restart_session,
+    restore_session, review_creation_trust, save_session_file, search_sessions, send_message,
+    serve_session_artifact, session_account_targets, session_diff_file, session_diff_file_raw,
+    session_diff_files, session_file, session_file_raw, set_worktree_name, start_session,
+    stop_auxiliary, stop_session, summarize_session, touch_session_access, trash_session,
+    update_session_archive, update_session_diff_base, update_session_favorite,
     update_session_group, update_session_ignored, update_session_notifications, update_session_pin,
     update_session_snooze, update_session_unread, update_workspace_ordering, OutputQuery,
     SendMessageRequest,
@@ -585,7 +592,6 @@ mod tests {
             &[
                 "force_smart_rename",
                 "recreate_container",
-                "restart_for_update",
                 "restart_session",
                 "restore_session",
                 "start_session",
@@ -645,6 +651,16 @@ mod tests {
             ],
         ),
         ("setup.rs", include_str!("setup.rs"), &["patch_setup"]),
+        (
+            "sandbox_login.rs",
+            include_str!("sandbox_login.rs"),
+            &[
+                "cancel_sandbox_login",
+                "leave_sandbox_login",
+                "start_sandbox_login",
+                "submit_sandbox_login_code",
+            ],
+        ),
         (
             "system.rs",
             include_str!("system.rs"),
@@ -1893,7 +1909,6 @@ mod tests {
             (Method::PATCH, "/api/sessions/missing/access"),
             (Method::POST, "/api/sessions/missing/purge/abandon"),
             (Method::POST, "/api/sessions/missing/restart"),
-            (Method::POST, "/api/sessions/missing/restart-for-update"),
             (Method::POST, "/api/sessions/missing/tools/ensure"),
             (Method::POST, "/api/sessions/missing/auxiliary/stop"),
             (Method::POST, "/api/sessions/missing/acp/switch-agent"),

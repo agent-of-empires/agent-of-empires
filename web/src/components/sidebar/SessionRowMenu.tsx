@@ -18,7 +18,6 @@ import {
   Pin,
   Play,
   Plus,
-  RefreshCw,
   ScrollText,
   SquareTerminal,
   Sparkles,
@@ -106,7 +105,6 @@ export interface SingleRowActions {
   openOwnWindow?: (sessionId: string) => void;
   stop: (sessionId: string) => void;
   start: (sessionId: string) => void;
-  restartUpdate: (sessionId: string) => void;
   recreateContainer: (sessionId: string) => void;
   notify: (preset: NotifyPreset) => void;
   pin: () => void;
@@ -336,12 +334,6 @@ export function SingleRowMenuItems({
           ),
         ],
         [
-          item("restartUpdate", {
-            label: "Restart to update",
-            detail: "Keeps the conversation",
-            testId: "sidebar-context-menu-restart-update",
-            glyph: icon(RefreshCw, "text-brand-400"),
-          }),
           item("stop", { label: "Stop", testId: "sidebar-context-menu-stop", glyph: icon(CircleStop) }),
           item("start", { label: "Start", testId: "sidebar-context-menu-start", glyph: icon(Play) }),
           item("switchView", {

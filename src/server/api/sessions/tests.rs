@@ -3904,6 +3904,109 @@ async fn abandon_purge_preserves_read_only_and_cityhall_policy() -> anyhow::Resu
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn favorite_selector_refuses_busy_namespace_and_hidden_exact_ids() -> anyhow::Result<()> {
+    use crate::daemon::{ERROR_CODE_HEADER, RUNTIME_EPOCH_HEADER};
+    use crate::server::test_support;
+    use tower::ServiceExt;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut hidden = Instance::new("Hidden terminal", "/tmp/hidden-favorite");
+    hidden.view = crate::session::View::Terminal;
+    hidden.source_profile = "main".into();
+    let mut visible = Instance::new(&hidden.id, "/tmp/visible-favorite");
+    visible.view = crate::session::View::Structured;
+    visible.source_profile = "main".into();
+    let rows = vec![hidden.clone(), visible.clone()];
+    test_support::seed_instances_on_disk_for_test("main", rows.clone());
+    let state = test_support::build_test_app_state_with_policy_configured(
+        rows,
+        vec!["localhost".into()],
+        Vec::new(),
+        None,
+        |state| state.cityhall_mode = true,
+    );
+    test_support::refresh_canonical_metadata_for_test(&state).await;
+    let baseline = state.runtime.publish(&state).await?.value.cursor.clone();
+    let app = test_support::build_router_for_test(state.clone());
+    let request = |id: &str, body: serde_json::Value| {
+        axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/sessions/{id}/favorite"))
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header(RUNTIME_EPOCH_HEADER, &baseline.epoch)
+            .extension(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::UnixOwner {
+                    uid: nix::unistd::geteuid().as_raw(),
+                },
+            ))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    };
+    let scoped = |selector: &str| {
+        request(
+            "by-selector",
+            serde_json::json!({
+                "profile": "main", "selector": selector, "select_favorited": true
+            }),
+        )
+    };
+
+    let held = state.profile_namespace.read().await;
+    let busy = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.clone().oneshot(scoped(&visible.id)),
+    )
+    .await??;
+    let busy = assert_response_status(busy, StatusCode::CONFLICT, "namespace held").await;
+    assert_eq!(busy.headers()[ERROR_CODE_HEADER], "favorite_namespace_busy");
+    drop(held);
+
+    let absent = serde_json::to_vec(&crate::daemon::SessionLookupError::NotFound)?;
+    for selector in [hidden.id.as_str(), "not-found"] {
+        let response = app.clone().oneshot(scoped(selector)).await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response.headers()[ERROR_CODE_HEADER],
+            "favorite_selection_refused"
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await?
+                .as_ref(),
+            absent
+        );
+    }
+    let storage = Storage::open_unwatched("main")?;
+    assert!(storage.load()?.iter().all(|row| !row.is_favorited()));
+    assert_eq!(state.runtime.publish(&state).await?.value.cursor, baseline);
+    let accepted = app.clone().oneshot(scoped(&visible.id)).await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let is_favorited = || -> anyhow::Result<bool> {
+        Ok(storage
+            .load()?
+            .iter()
+            .find(|row| row.id == visible.id)
+            .unwrap()
+            .is_favorited())
+    };
+    assert!(is_favorited()?);
+
+    let legacy = app
+        .oneshot(request(
+            &visible.id,
+            serde_json::json!({
+                "favorited": false, "client_tag": "batch"
+            }),
+        ))
+        .await?;
+    assert_eq!(legacy.status(), StatusCode::OK);
+    assert!(!is_favorited()?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn abandon_purge_inherits_a_namespace_lease_published_after_it_started() -> anyhow::Result<()>
 {
     let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -8550,7 +8653,10 @@ async fn sandbox_login_gate_tmux_start_ensure_and_send_are_409() {
             serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
         assert_eq!(
             body,
-            serde_json::json!({"error": "sandbox_login_required", "message": message, "tool": "claude"}),
+            serde_json::json!({
+                "error": "sandbox_login_required", "message": message, "tool": "claude",
+                "profile": crate::session::config::effective_profile(""),
+            }),
             "{which}"
         );
         assert!(!spawned, "{which}");
@@ -10470,87 +10576,6 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
     assert!(
         plan.trust_write.is_none(),
         "inherited trust needs no new record"
-    );
-}
-
-#[test]
-fn update_restart_needs_a_captured_session_id_unless_resume_is_proven() {
-    let mut inst = Instance::new("t", "/tmp");
-    let unchecked = ContextResumeAvailability::Indeterminate {
-        reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
-    };
-    let handshake = ContextResumeAvailability::Indeterminate {
-        reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
-    };
-    assert!(update_restart_resumable(
-        &inst,
-        &ContextResumeAvailability::Available
-    ));
-    assert!(!update_restart_resumable(&inst, &unchecked));
-    assert!(!update_restart_resumable(&inst, &handshake));
-    inst.agent_session_id = Some("sid".into());
-    assert!(update_restart_resumable(&inst, &unchecked));
-    assert!(!update_restart_resumable(&inst, &handshake));
-}
-
-#[tokio::test]
-async fn restart_for_update_refuses_a_session_that_is_not_out_of_date() {
-    let mut inst = Instance::new("fresh-agent", "/tmp/fresh-agent");
-    inst.id = "fresh-agent".to_string();
-    inst.status = Status::Idle;
-    let state = crate::server::test_support::build_test_app_state(vec![inst]);
-    for (id, expected) in [
-        ("fresh-agent", StatusCode::CONFLICT),
-        ("missing", StatusCode::NOT_FOUND),
-    ] {
-        let response = restart_for_update(
-            axum::extract::State(state.clone()),
-            axum::extract::Path(id.to_string()),
-        )
-        .await
-        .into_response();
-        assert_eq!(response.status(), expected, "{id}");
-    }
-}
-
-#[tokio::test]
-async fn an_update_restart_refuses_a_session_that_became_busy_before_admission() {
-    let mut inst = Instance::new("busy-agent", "/tmp/busy-agent");
-    inst.id = "busy-agent".to_string();
-    inst.status = Status::Running;
-    let state = crate::server::test_support::build_test_app_state(vec![inst]);
-    let body = crate::daemon::RestartSessionBody {
-        only_if_idle: true,
-        ..Default::default()
-    };
-    let response = lifecycle::prepare_agent_session(
-        state.clone(),
-        "busy-agent".to_string(),
-        Ok(None),
-        lifecycle::AgentPreparation::Restart,
-        Some(Arc::new(body)),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let instances = state.instances.read().await;
-    assert_eq!(
-        instances[0].status,
-        Status::Running,
-        "nothing was torn down or relaunched"
-    );
-}
-
-#[tokio::test]
-async fn update_restart_of_a_structured_session_defers_to_the_reconciler() {
-    let mut inst = Instance::new("structured-agent", "/tmp/structured-agent");
-    inst.id = "structured-agent".to_string();
-    inst.view = crate::session::View::Structured;
-    let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
-    let response = apply_update_restart(&state, inst.id.clone(), inst).await;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
-    assert_eq!(
-        state.acp_supervisor.respawn_pending_ids(),
-        vec!["structured-agent".to_string()]
     );
 }
 
