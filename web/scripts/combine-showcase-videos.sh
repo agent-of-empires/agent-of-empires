@@ -122,7 +122,7 @@ fi
 # path+mtime so reruns are fast. Grid mode trims it off (see trims[]).
 LEAD_CACHE="${LEAD_CACHE:-${TMPDIR:-/tmp}/showcase-lead-cache.tsv}"
 touch "${LEAD_CACHE}"
-file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
 probe_lead() {
   local f="$1" lead
   lead="$(ffmpeg -v error -threads 1 -i "${f}" -vf "fps=10,scale=64:-1,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-" -f null - 2>/dev/null |
