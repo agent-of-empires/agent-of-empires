@@ -491,6 +491,61 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn a_running_child_holds_the_session_until_it_idles() {
+        use crate::acp::event_store::ControlKnowledge::Known;
+        use crate::acp::state::SubagentState;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = managed_idle_session(scope, "idle-child").await;
+                let id = live.id().to_owned();
+                for (wire_state, observed, holds) in [
+                    ("running", SubagentState::Running, true),
+                    ("idle", SubagentState::Idle, false),
+                ] {
+                    live.native
+                        .send(serde_json::json!({
+                            "jsonrpc": "2.0", "method": "session/update",
+                            "params": {"sessionId": live.sid, "update": {
+                                "sessionUpdate": "subagent_update", "sessionId": "child",
+                                "state": {"state": wire_state}, "background": true
+                            }}
+                        }))
+                        .await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        loop {
+                            let event = live.client.next_event().await.expect("child update");
+                            if matches!(event, crate::acp::Event::SubagentUpdated { subagent, .. }
+                                if subagent.state == observed)
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .expect("announced child activity reaches the durable view");
+                    live.make_quota_due();
+                    assert_eq!(
+                        live.state.acp_event_store.holds_live_work(&id).unwrap(),
+                        Known(holds)
+                    );
+                    reap_idle_workers(&live.state).await;
+                    let rows = live.state.instances.read().await;
+                    assert_eq!(
+                        rows.iter()
+                            .find(|row| row.id == id)
+                            .unwrap()
+                            .is_idle_dormant(),
+                        !holds,
+                    );
+                }
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn fresh_substantive_completion_before_sequence_capture_vetoes_idle_retirement() {
         use crate::acp::event_store::ControlKnowledge::Known;
         use crate::acp::supervisor::test_support::managed::with_managed;

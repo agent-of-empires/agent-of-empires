@@ -155,6 +155,7 @@ impl Shared {
             cancel_capable: route.1.cancel_capable,
             model: None,
             background: false,
+            runs: 0,
         };
         // A late frame retains its display history, never the replacement's live cache.
         let current_route = self
@@ -1011,6 +1012,7 @@ mod tests {
             cancel_capable: true,
             model: None,
             background: false,
+            runs: 0,
         };
         for (id, state, seen) in [
             ("stale", SubagentState::Running, now - floor - 1),

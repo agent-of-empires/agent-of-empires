@@ -427,9 +427,9 @@ describe("applyEvent control state", () => {
         SubagentUpdated: { subagent: stopped, at: "2026-01-01T00:00:00Z" },
       },
     });
-    expect(replayed.subagents).toEqual([stopped]);
+    expect(replayed.subagents).toEqual([{ ...stopped, idle_since: "2026-01-01T00:00:00Z", runs: 1 }]);
     // A snapshot older than the replayed frame must not roll the record back.
-    expect(applyReducedState(replayed, base, [], 8).subagents).toEqual([stopped]);
+    expect(applyReducedState(replayed, base, [], 8).subagents).toEqual(replayed.subagents);
   });
 
   it("refreshes a stale held subagent from a snapshot at or past lastSeq, keeping local-only children", () => {
@@ -476,6 +476,19 @@ describe("applyEvent control state", () => {
       record("local", "running", true),
       record("b", "running", true),
     ]);
+
+    // The idle stamp survives a snapshot that agrees on the state; runs never drop below the held count.
+    const stamps = { idle_since: "t2", runs: 2 };
+    const stamped = { ...held, lastSeq: 7, subagents: [{ ...record("a", "running", true), ...stamps }] };
+    expect(applyReducedState(stamped, snapshot([record("a", "running", true)]), [], 7).subagents[0]).toMatchObject(
+      stamps,
+    );
+    expect(applyReducedState(stamped, snapshot([record("a", "idle", true)]), [], 7).subagents[0]).toEqual({
+      ...record("a", "idle", true),
+      runs: 2,
+    });
+    const higher = { ...record("a", "idle", true), runs: 3 };
+    expect(applyReducedState(stamped, snapshot([higher]), [], 7).subagents[0]!.runs).toBe(3);
   });
 
   it("codex /new drops usage to the post-reset baseline (#2979)", () => {

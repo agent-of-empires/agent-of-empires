@@ -540,6 +540,7 @@ async fn admit_and_create(
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,
+        suggestion: None,
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
         pending_initial_turn: req
@@ -555,6 +556,7 @@ async fn admit_and_create(
         import_acp_session_id: None,
         import_binding: None,
         fork_seed: None,
+        session_id: None,
         progress: None,
         cli: None,
     };
@@ -1485,6 +1487,7 @@ mod tests {
             ui_contributions: std::collections::HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 1,
+            suggestions_spec: None,
         }
     }
 

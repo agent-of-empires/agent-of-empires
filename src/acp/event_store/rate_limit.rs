@@ -12,6 +12,11 @@ pub struct RateLimitPark {
     pub seq: u64,
     pub info: Option<RateLimitInfo>,
     pub recorded_at_ms: i64,
+    /// When the park's reset was last reported (epoch ms): `recorded_at_ms`, or the earlier
+    /// event an inherited reset was copied from.
+    pub observed_at_ms: i64,
+    /// The window an inherited reset was reported for; `None` when the park's reset is its own.
+    pub inherited_window: Option<String>,
     pub cap_reached: bool,
     pub last_resume_attempt_ms: Option<i64>,
 }
@@ -31,12 +36,59 @@ fn control_event(conn: &Connection, session_id: &str, seq: u64) -> Result<Option
     .transpose()
 }
 
-fn quota_at(conn: &Connection, session_id: &str, seq: u64) -> Result<Option<RateLimitInfo>> {
-    match control_event(conn, session_id, seq)? {
-        Some(Event::RateLimit { info }) => Ok(Some(info)),
-        None => Ok(None),
-        _ => anyhow::bail!("quota anchor does not identify a RateLimit event"),
-    }
+fn quota_at(
+    conn: &Connection,
+    session_id: &str,
+    seq: u64,
+) -> Result<Option<(RateLimitInfo, ResetProvenance)>> {
+    let record = conn
+        .query_row(
+            &format!(
+                "SELECT event_json,
+                        COALESCE(json_extract(event_json, '$.RateLimit.{INHERITED_OBSERVATION_KEY}'),
+                                 created_at),
+                        json_extract(event_json, '$.RateLimit.{INHERITED_WINDOW_KEY}')
+                 FROM acp_events WHERE session_id=?1 AND seq=?2"
+            ),
+            params![session_id, i64::try_from(seq)?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ResetProvenance {
+                        observed_at_ms: row.get(1)?,
+                        source_window: row.get(2)?,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    record
+        .map(|(json, provenance)| {
+            match serde_json::from_str(&json)
+                .with_context(|| format!("invalid ACP quota event at {session_id}@{seq}"))?
+            {
+                Event::RateLimit { info } => Ok((info, provenance)),
+                _ => anyhow::bail!("quota anchor does not identify a RateLimit event"),
+            }
+        })
+        .transpose()
+}
+
+/// Key the sink adds to a `RateLimit` whose reset it copied from an earlier event: when that
+/// reset was originally reported (epoch ms). Decoding ignores it.
+pub(super) const INHERITED_OBSERVATION_KEY: &str = "inherited_observed_at_ms";
+
+/// Key beside it naming the window the inherited reset was reported for. Decoding ignores it.
+pub(super) const INHERITED_WINDOW_KEY: &str = "inherited_window";
+
+/// Where the latest `RateLimit`'s reset came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetProvenance {
+    /// When the reset was last reported (epoch ms): when the event was recorded, or for an
+    /// inherited reset, when its source reported it.
+    pub observed_at_ms: i64,
+    /// The window an inherited reset was reported for, `None` for one the event carried itself.
+    pub source_window: Option<String>,
 }
 
 impl EventStore {
@@ -48,7 +100,20 @@ impl EventStore {
             let Some(quota) = cursor.projection.last_quota else {
                 return Ok(None);
             };
-            Ok(quota_at(conn, session_id, quota.seq)?.map(|info| (info, quota.created_at_ms)))
+            Ok(quota_at(conn, session_id, quota.seq)?.map(|(info, _)| (info, quota.created_at_ms)))
+        })
+    }
+
+    /// Look up the latest qualified reset and its source in one control snapshot.
+    pub(crate) fn latest_rate_limit_with_provenance(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(RateLimitInfo, ResetProvenance)>> {
+        self.with_control_snapshot(session_id, |conn, cursor| {
+            match cursor.projection.last_quota {
+                Some(quota) => quota_at(conn, session_id, quota.seq),
+                None => Ok(None),
+            }
         })
     }
 
@@ -75,13 +140,19 @@ impl EventStore {
         self.with_control_snapshot(session_id, |conn, cursor| {
             Ok(match cursor.projection.park {
                 ControlKnowledge::Known(Some(park)) => {
+                    let quota = match park.quota {
+                        Some(quota) => quota_at(conn, session_id, quota.seq)?,
+                        None => None,
+                    };
+                    let (info, provenance) = quota.unzip();
                     ControlKnowledge::Known(Some(RateLimitPark {
                         seq: park.seq,
-                        info: match park.quota {
-                            Some(quota) => quota_at(conn, session_id, quota.seq)?,
-                            None => None,
-                        },
+                        info,
                         recorded_at_ms: park.recorded_at_ms,
+                        observed_at_ms: provenance
+                            .as_ref()
+                            .map_or(park.recorded_at_ms, |source| source.observed_at_ms),
+                        inherited_window: provenance.and_then(|source| source.source_window),
                         cap_reached: park.cap_reached,
                         last_resume_attempt_ms: park.last_resume_attempt_ms,
                     }))
@@ -429,6 +500,45 @@ mod tests {
         assert_eq!(info.resets_at, expected_resets);
         assert!((before..=after).contains(&at));
         assert!(store.latest_rate_limit_event("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn inherited_reset_reads_the_qualified_quota_anchor() {
+        use crate::acp::event_sender::EventMetadata;
+        use crate::acp::protocol::{
+            AcpOriginalRequestResult, AcpPromptObservation, AcpPromptWindowId,
+        };
+        let (_tmp, store) = open_store(0);
+        let mut metadata = crate::server::test_support::sql_projection_metadata();
+        store
+            .record("s", 1, &Event::ThinkingStarted, &metadata)
+            .unwrap();
+        metadata.operation.as_mut().unwrap().outcome = Some(AcpOriginalRequestResult::Failed);
+        metadata.prompt_observation = Some(AcpPromptObservation::Written {
+            window_id: AcpPromptWindowId::new(),
+        });
+        let quota = rate_limit_event(120);
+        let inherited_at = Timestamp::now().as_millis() - 60_000;
+        store
+            .record_inherited_rate_limit("s", 2, &quota, &metadata, inherited_at, "rate_limit")
+            .unwrap();
+        store
+            .record("s", 3, &rate_limit_event(240), &EventMetadata::history())
+            .unwrap();
+        store.control_cache.forget("s");
+
+        let (info, source) = store
+            .latest_rate_limit_with_provenance("s")
+            .unwrap()
+            .unwrap();
+        let Known(Some(park)) = store.rate_limit_park("s").unwrap() else {
+            panic!("qualified quota park survives historical output");
+        };
+        assert_eq!(park.info.unwrap().resets_at, info.resets_at);
+        assert_eq!(park.observed_at_ms, inherited_at);
+        assert_eq!(park.inherited_window.as_deref(), Some("rate_limit"));
+        assert_eq!(source.observed_at_ms, inherited_at);
+        assert_eq!(source.source_window, park.inherited_window);
     }
 
     #[test]

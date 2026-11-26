@@ -78,6 +78,8 @@ anyhow = "1.0"
 
 # Time handling
 time = { version = "0.3.55", features = ["parsing"] }
+# Resolves the IANA zone a usage-limit message names; the bundled database keeps it host-independent.
+jiff = { version = "1", default-features = false, features = ["std", "tzdb-bundle-always"] }
 
 # UUID generation
 uuid = { version = "1.23", features = ["v4", "serde"] }

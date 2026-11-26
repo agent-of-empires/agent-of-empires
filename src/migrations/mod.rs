@@ -76,7 +76,9 @@ mod v060_terminal_handoff_outcome;
 mod v061_unpin_default_sandbox_image;
 mod v062_plugin_staging_evidence;
 mod v063_retire_color_labels;
-mod v064_reconcile_acp_lineages;
+mod v064_builtin_sounds;
+mod v065_account_limit_estimate_rows;
+mod v066_reconcile_acp_lineages;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -117,7 +119,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 64;
+const CURRENT_VERSION: u32 = 66;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -335,10 +337,16 @@ const MIGRATIONS: &[Migration] = &[
         v062_plugin_staging_evidence::run,
     ),
     (63, "retire_color_labels", v063_retire_color_labels::run),
+    (64, "builtin_sounds", v064_builtin_sounds::run),
     (
-        64,
+        65,
+        "account_limit_estimate_rows",
+        v065_account_limit_estimate_rows::run,
+    ),
+    (
+        66,
         "reconcile_acp_lineages",
-        v064_reconcile_acp_lineages::run,
+        v066_reconcile_acp_lineages::run,
     ),
 ];
 
@@ -355,7 +363,7 @@ pub fn has_pending_migrations() -> bool {
     let current = get_current_version();
     current < CURRENT_VERSION
         || (current == CURRENT_VERSION
-            && v064_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
+            && v066_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
 }
 
 /// Check compatibility before changing or stopping a managed daemon.
@@ -373,7 +381,7 @@ pub(crate) fn ensure_schema_supported() -> Result<u32> {
 pub fn assert_schema_current() -> Result<()> {
     let current = ensure_schema_supported()?;
     anyhow::ensure!(
-        current == CURRENT_VERSION && !v064_reconcile_acp_lineages::autonomous_pending()?,
+        current == CURRENT_VERSION && !v066_reconcile_acp_lineages::autonomous_pending()?,
         "data schema version {current} is behind this build ({CURRENT_VERSION}); \
          the parent `aoe serve` must migrate before launching the daemon child"
     );
@@ -474,7 +482,7 @@ fn run_migrations_inner(
     let needs_exclusion = |current| -> Result<bool> {
         Ok(announce
             || current < CURRENT_VERSION
-            || v064_reconcile_acp_lineages::autonomous_pending()?)
+            || v066_reconcile_acp_lineages::autonomous_pending()?)
     };
     let requires_exclusion = needs_exclusion(current)?;
     // Older daemons know serve.lock but not the lifecycle transaction. Hold
@@ -517,7 +525,7 @@ fn run_migrations_inner(
     }
     debug!("Current schema version: {}", current);
     if current == CURRENT_VERSION {
-        v064_reconcile_acp_lineages::reconcile_autonomous_metadata()?;
+        v066_reconcile_acp_lineages::reconcile_autonomous_metadata()?;
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
         v033_isolate_sandbox_content::reconcile_pending(announce)?;
     } else {
@@ -654,6 +662,7 @@ mod tests {
             assert!(*version > prev, "Migration {version} should be > {prev}");
             prev = *version;
         }
+        assert_eq!(prev, CURRENT_VERSION);
     }
 
     #[test]

@@ -45,7 +45,7 @@ use super::errors::{acp_internal_error, AcpError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
 use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
-use super::rate_limit::captured_rate_limit_reset;
+use super::rate_limit::{captured_rate_limit_reset, classify_rate_limit_error};
 use super::session_identity::{
     spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress,
     SessionIngressNotification,
@@ -1512,7 +1512,13 @@ async fn report_connection_error(
         session = %label,
         "ACP connection task ended with error: {:?}", e
     );
-    if shared.connection_state.loss().is_none()
+    let now = crate::time::Timestamp::now();
+    let captured = captured_rate_limit_reset(&shared.rate_limit_rejections, now);
+    let rate_limit = classify_rate_limit_error(e, captured.as_ref(), now);
+    let established = shared.connection_state.phase.load(Ordering::Acquire) >= 2;
+    // Before a session exists, an explicit account rejection is not transport loss.
+    if (established || rate_limit.is_none())
+        && shared.connection_state.loss().is_none()
         && !shared
             .connection_state
             .establishment_declined
@@ -1521,7 +1527,7 @@ async fn report_connection_error(
             .connection_state
             .foreground_finished
             .load(Ordering::Acquire)
-            || shared.connection_state.phase.load(Ordering::Acquire) >= 2)
+            || established)
     {
         shared
             .connection_state
@@ -1536,17 +1542,6 @@ async fn report_connection_error(
         shared.publish_connection_unavailable().await;
         return;
     }
-    let resets_at =
-        captured_rate_limit_reset(&shared.rate_limit_rejections, crate::time::Timestamp::now());
-    let rate_limit =
-        super::rate_limit::classify_rate_limit_error(e, resets_at.as_ref()).or_else(|| {
-            super::rate_limit::classify_rate_limit_from_message(&e.message, resets_at.as_ref()).map(
-                |mut info| {
-                    info.status = super::errors::public_error_message(e);
-                    info
-                },
-            )
-        });
     if let Some(tx) = ready_tx.lock().await.take() {
         // A handshake-time limit fails the spawn as rate-limited so the
         // supervisor parks instead of burning respawn budget (#3514).

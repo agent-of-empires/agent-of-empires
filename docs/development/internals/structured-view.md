@@ -49,6 +49,8 @@ Invariants worth knowing before touching this code:
 - **Background recovery.** Retained allocation witnesses bind only to the actual established Control receipt; adoption revalidates the original identity before transcript I/O. Retained selectors, never current configuration or paths alone, choose the source. Child progress and END retain the child's allocation without a prompt outcome or Written window. Captured teardown can publish Detached only for the exact durable allocation, including unfinished children of a finished workflow; it does not prove Native completion or success. Failed allocation reads retain cleanup debt. SDK teardown cancels local readers before joining their event drain; Native work and durable witnesses remain. Private witnesses and transcript paths never reach clients.
 - **Subagent sessions.** A profile with `supports_subagents` declares ACP subagents. `SessionIngress` admits a child only after an admitted `subagent_update` names it. Child permission and elicitation requests remain supported; filesystem and terminal requests are refused because they assume the root workspace. Child traffic uses `handle_child_notification`, not root dedup or compaction. Only source-qualified Current child traffic contributes watchdog liveness; a running child holds the turn through the 30-minute off-protocol floor. Historical replay grants neither liveness nor input authority.
   The adapter's parent-to-child `session_message` supplies the delegation card ID and the child's `parent_tool_call_id`. A reply or hand-back completes that card; background children follow roster state. Child tool calls and model reach the transcript under that card. `SubagentUpdated` is a merged, last-write-wins snapshot.
+  The reducer folds `runs` separately: each idle-to-active transition adds one.
+  Clients keep that count across snapshots and do not recount covered frames.
   Stop uses `session/cancel` for the child through `POST /api/sessions/{id}/acp/subagents/{child_id}/cancel` or control protocol 8, only with announced `capabilities.cancel`. The client freezes Current parent, route and capability. The wire carries parent, child and original `NativeRequestScope`; the runner retains attachment, owner and selected-parent checks through the scoped Native write. The emitted notification names only the child. Protocol 5/6/7 remains incompatible. Grandchild `session_message`s are dropped. Reset is refused while a child runs. `session/load` does not restore children; the resumed tailer resolves retained async agents.
   Native ingress freezes the physical source, observed parent SID and admitted
   ancestry before queueing or pending replay. Private persisted metadata, not
@@ -500,8 +502,6 @@ Acknowledged delivery settles the named row again, and retained-row replies
 upsert by ID, so a delayed list cannot erase new intent, duplicate a refused row
 or resurrect an already-claimed row.
 
-
-
 ## Terminal handoff
 
 Terminal handoff persists intent before retiring the original runner. It retains that intent through proven retirement, the exact Terminal commit, required terminal launch and projection cleanup. Cancellation or a committed-write adoption failure leaves recoverable debt, not a successful receipt. Recovery selects the matching intent and original authority; reservation age never permits another driver to steal it.
@@ -745,13 +745,17 @@ Client busy indicators include tasks without changing the main-turn rules for se
 
 ## Rate-limit handling
 
-A backend reporting `errorKind: "rate_limit"` ends the main turn with `RateLimit`
-and `Stopped { reason: "rate_limited" }`, without discarding a healthy native actor
-or its background work. The durable park holds ambient turn inference, pending
-delivery and idle reaping; observing the same actor through Attach or a Ready
-receipt is not replay consent. Canonical park metadata is independent of worker
-liveness. `RateLimitInfo.resets_at` contains only a reset attributed to the
-rejected window, or `None`, never a fabricated time.
+A backend reporting the account-level `errorKind` `rate_limit` or `billing_error`
+ends the main turn with `RateLimit` and `Stopped { reason: "rate_limited" }`
+without discarding a healthy native actor or its background work. The durable
+park holds ambient turn inference, pending delivery and idle reaping; observing
+the same actor through Attach or a Ready receipt is not replay consent.
+Canonical park metadata is independent of worker liveness.
+
+Quota windows such as `five_hour` and `seven_day` belong in `RateLimitInfo.kind`,
+not in `errorKind`. `RateLimitInfo.resets_at` uses a reset attributed to the
+rejection: the reported epoch for its window, or a reset parsed from its status
+text in the stated time zone. When neither gives a usable reset, it stays `None`.
 
 Original prompt quota hints remain bound to their authenticated physical source
 and Written window across control reconnection. Unnamed quota reports normalize
@@ -785,7 +789,17 @@ never raw historical stops. A projection-frontier mismatch reports unknown
 without advancing the frame's sequence. Storage errors fail the query or close
 the stream, rather than reporting an absent or unknown park.
 
-For a known qualified park with `[acp] rate_limit_auto_resume`, the reconciler resumes the same worker once `resets_at` plus a 15s grace passes, or, with no reported reset, an hour after the park with the wait doubling per redelivery (1h, 2h, 4h, 8h, 16h). Each selected continuation re-delivers the interrupted prompt once and consumes its independently durable retry budget, capped at 5 per streak, after which the session parks on `Stopped { reason: "rate_limit_exhausted_retries" }`. `RateLimitAutoResumed` breadcrumbs record retries; they never reconstruct or refund that budget. Indeterminate control remains held rather than exhausted or reset to zero. Nothing un-parks a session on a timer otherwise: dispatch treats a known park like idle dormancy, permitting distinct explicit input.
+For a known qualified park with `[acp] rate_limit_auto_resume`, the reconciler
+resumes the same worker once `resets_at` plus a 15s grace passes. With no reset
+from either source, it waits an hour after the park, doubling the wait per
+redelivery (1h, 2h, 4h, 8h, 16h). Each selected continuation re-delivers the
+interrupted prompt once and consumes its independently durable retry budget,
+capped at 5 per streak. After that, the session parks on
+`Stopped { reason: "rate_limit_exhausted_retries" }`. `RateLimitAutoResumed`
+breadcrumbs record retries; they never reconstruct or refund that budget.
+Indeterminate control remains held rather than exhausted or reset to zero.
+Nothing un-parks a session on a timer otherwise: dispatch treats a known park
+like idle dormancy, permitting distinct explicit input.
 
 Manual retry does not require auto-resume opt-in. Both paths serialize selection,
 breadcrumb and chosen delivery under one submission guard. Newer queued intent
