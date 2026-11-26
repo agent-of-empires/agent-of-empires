@@ -24,7 +24,7 @@ use crate::plugin::protocol::{self, codes, RpcResponse};
 use crate::plugin::registry::PluginRegistry;
 use crate::plugin::sandbox::{NoSandbox, SandboxBackend};
 use crate::plugin::worker_logs;
-use crate::plugin::worker_requests::{PendingRequests, WorkerRef, WorkerRequestError};
+use crate::plugin::worker_requests::{CallTicket, PendingRequests, WorkerRef, WorkerRequestError};
 use crate::process::worker;
 use crate::server::push::StatusChange;
 use crate::session::lifecycle::LifecycleChange;
@@ -394,8 +394,31 @@ impl PluginHost {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, WorkerRequestError> {
+        let ticket = CallTicket::new(self.pending.next_id());
+        self.request_worker_as(&ticket, worker, method, params, timeout, timeout)
+            .await
+    }
+
+    pub fn next_request_id(&self) -> String {
+        self.pending.next_id()
+    }
+
+    /// [`Self::request_worker`] with the envelope id of `ticket` (from [`Self::next_request_id`]),
+    /// waiting at most `start_wait` for a worker that is still starting. The ticket records the
+    /// worker instance the request was queued to.
+    pub async fn request_worker_as(
+        &self,
+        ticket: &CallTicket,
+        worker: WorkerRef<'_>,
+        method: &str,
+        params: Value,
+        start_wait: Duration,
+        timeout: Duration,
+    ) -> Result<Value, WorkerRequestError> {
+        let id = ticket.id();
         let plugin_id = worker.plugin_id;
         let deadline = Instant::now() + timeout;
+        let start_deadline = Instant::now() + start_wait.min(timeout);
         let (generation, inbound) = loop {
             let found = {
                 let table = self.state.lock().await;
@@ -405,7 +428,7 @@ impl PluginHost {
                         .map(|tx| (w.manifest_hash == worker.manifest_hash, w.supervisor_id, tx))
                 })
             };
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = start_deadline.saturating_duration_since(Instant::now());
             match found {
                 Some((false, ..)) => return Err(WorkerRequestError::Superseded),
                 Some((true, generation, inbound)) => break (generation, inbound),
@@ -413,9 +436,9 @@ impl PluginHost {
                 None => tokio::time::sleep(remaining.min(Duration::from_millis(50))).await,
             }
         };
-        let (id, rx) = self.pending.register(plugin_id, generation);
+        let rx = self.pending.register_as(id, plugin_id, generation);
         // A dropped caller must not leave its entry behind.
-        let _forget = self.pending.forget_on_drop(&id);
+        let _forget = self.pending.forget_on_drop(id);
         let line =
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
                 .to_string()
@@ -430,16 +453,17 @@ impl PluginHost {
                     tx.same_channel(&inbound)
                         && self
                             .pending
-                            .send_while_registered(&id, || tx.send(line).is_ok())
+                            .send_while_registered(id, || tx.send(line).is_ok())
                 })
             })
         };
         if !queued {
             return Err(WorkerRequestError::WorkerGone);
         }
+        ticket.set_queued_to(inbound);
         match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(_))) => Err(WorkerRequestError::Rejected),
+            Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(WorkerRequestError::WorkerGone),
             Err(_) => Err(WorkerRequestError::Timeout),
         }
@@ -1586,6 +1610,18 @@ impl PluginHost {
                 dropped_events: 0,
             },
         );
+        rx
+    }
+
+    /// Publishes a new stdin channel for `plugin_id` under the same supervisor, as an automatic
+    /// restart does.
+    pub(crate) async fn replace_test_inbound(
+        &self,
+        plugin_id: &str,
+    ) -> mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut table = self.state.lock().await;
+        table.running.get_mut(plugin_id).unwrap().inbound = Some(tx);
         rx
     }
 
@@ -2764,6 +2800,143 @@ rl.on('line', (line) => {
         );
     }
 
+    #[tokio::test]
+    async fn start_wait_bounds_the_wait_for_a_missing_worker_not_the_reply_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let id = host.next_request_id();
+        let ticket = CallTicket::new(id);
+        let request = host.request_worker_as(
+            &ticket,
+            worker_ref("acme.absent", "sha256:none"),
+            "mcp.tools.list",
+            json!({}),
+            Duration::from_millis(300),
+            Duration::from_secs(600),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .expect("the start wait, not the 600 s deadline, bounds a missing worker")
+            .unwrap_err();
+        assert!(matches!(err, WorkerRequestError::NoWorker), "{err}");
+    }
+
+    /// A cancellation goes to the worker instance that received the call, never to a
+    /// replacement and never for a call that was not queued.
+    #[tokio::test]
+    async fn a_notification_about_a_call_reaches_only_the_worker_that_got_it() {
+        use crate::plugin::worker_call::WorkerCall;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let mut first = host.register_test_inbound("acme.hook", "sha256:v1").await;
+        let ticket = Arc::new(CallTicket::new("h-test-1".to_string()));
+        let call = tokio::spawn({
+            let host = host.clone();
+            let ticket = ticket.clone();
+            async move {
+                host.request_worker_as(
+                    &ticket,
+                    worker_ref("acme.hook", "sha256:v1"),
+                    "mcp.tools.call",
+                    json!({}),
+                    Duration::from_secs(5),
+                    Duration::from_secs(60),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), first.recv())
+            .await
+            .expect("the worker receives the call")
+            .unwrap();
+        assert!(ticket.queued_to().is_some(), "the dispatch is recorded");
+
+        let mut second = host.register_test_inbound("acme.hook", "sha256:v1").await;
+        // The first process ended; a new one runs in its place.
+        drop(first);
+        let params = json!({"request_id": "h-test-1"});
+        assert!(
+            !host
+                .notify_sent(&ticket, "mcp.cancel", params.clone())
+                .await,
+            "the replaced worker is not notified"
+        );
+        assert!(
+            second.try_recv().is_err(),
+            "the replacement got a notification about a call it never saw"
+        );
+        let unsent = CallTicket::new("h-test-2".to_string());
+        assert!(!host.notify_sent(&unsent, "mcp.cancel", params).await);
+        assert!(
+            second.try_recv().is_err(),
+            "nothing for a call never queued"
+        );
+        call.abort();
+    }
+
+    /// An automatic restart keeps the supervisor id but publishes a new stdin channel; a
+    /// cancellation for a call the old process received must not reach the new one.
+    #[tokio::test]
+    async fn a_cancellation_does_not_reach_a_restart_under_the_same_supervisor() {
+        use crate::plugin::worker_call::WorkerCall;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let mut first = host.register_test_inbound("acme.hook", "sha256:v1").await;
+        let ticket = Arc::new(CallTicket::new("h-test-1".to_string()));
+        let call = tokio::spawn({
+            let host = host.clone();
+            let ticket = ticket.clone();
+            async move {
+                host.request_worker_as(
+                    &ticket,
+                    worker_ref("acme.hook", "sha256:v1"),
+                    "mcp.tools.call",
+                    json!({}),
+                    Duration::from_secs(5),
+                    Duration::from_secs(60),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), first.recv())
+            .await
+            .expect("the worker receives the call")
+            .unwrap();
+
+        // The old process ends; its supervisor starts another.
+        drop(first);
+        let mut restarted = host.replace_test_inbound("acme.hook").await;
+        let sent = host
+            .notify_sent(&ticket, "mcp.cancel", json!({"request_id": "h-test-1"}))
+            .await;
+        assert!(!sent, "the process that got the call has ended");
+        assert!(
+            restarted.try_recv().is_err(),
+            "the restarted process got a cancellation for a call it never saw"
+        );
+        call.abort();
+    }
+
     async fn worker_pid(host: &PluginHost, plugin_id: &str) -> Option<u32> {
         let table = host.state.lock().await;
         table
@@ -2791,41 +2964,7 @@ rl.on('line', (line) => {
     }
 
     fn install_worker(plugin_id: &str, command: &str) {
-        use crate::session::{update_config, CapabilityGrant, PluginConfig};
-
-        let manifest = format!(
-            r#"
-id = "{plugin_id}"
-name = "Sleeper"
-version = "1.0.0"
-api_version = 8
-capabilities = ["runtime.worker"]
-
-[runtime]
-kind = "command"
-system = true
-command = {command}
-"#
-        );
-        let dir = crate::plugin::plugins_dir().unwrap().join(plugin_id);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
-        update_config(|config| {
-            config.plugins.insert(
-                plugin_id.to_string(),
-                PluginConfig {
-                    grant: Some(CapabilityGrant {
-                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
-                            manifest.as_bytes(),
-                        ),
-                        capabilities: vec!["runtime.worker".to_string()],
-                        granted_at: crate::time::Timestamp::now(),
-                    }),
-                    ..PluginConfig::default()
-                },
-            );
-        })
-        .unwrap();
+        crate::plugin::install_test_plugin(plugin_id, 8, &["runtime.worker"], command);
     }
 
     #[cfg(unix)]
