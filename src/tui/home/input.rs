@@ -5343,9 +5343,10 @@ impl HomeView {
     fn visible_list(&self) -> Vec<(bool, Option<String>, String)> {
         self.flat_items
             .iter()
-            .map(|item| match item {
-                Item::Group { path, profile, .. } => (true, profile.clone(), path.clone()),
-                Item::Session { id, .. } => (false, None, id.clone()),
+            .filter_map(|item| match item {
+                Item::Group { path, profile, .. } => Some((true, profile.clone(), path.clone())),
+                Item::Session { id, .. } => Some((false, None, id.clone())),
+                Item::Suggested { .. } => None,
             })
             .collect()
     }

@@ -4352,8 +4352,9 @@ fn a_sidebar_write_closed_before_a_snapshot_adopts_the_next_one() {
     let before = SidebarView {
         group_by: GroupByMode::Project,
         sort: SortOrder::Custom,
+        ..Default::default()
     };
-    env.view.observed_sidebar_view = Some(before);
+    env.view.observed_sidebar_view = Some(before.clone());
     let reply = env.view.session_feed.sidebar_view_driver_for_test();
     env.view.apply_group_by(GroupByMode::Group);
     env.view.session_feed.forget_applied_for_test();
