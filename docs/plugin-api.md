@@ -534,7 +534,7 @@ Suggestions are stored per profile. The routes below list and act on them; only 
 
 | Route | Body | Result |
 |---|---|---|
-| `GET /api/suggestions` | none | `{ providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled, preset, customized }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, show_source_ref, provider_order } }` |
+| `GET /api/suggestions` | none | `{ profile?, providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled, preset, customized }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, show_source_ref, provider_order } }` |
 | `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
 | `POST /api/suggestions/checks/run` | none | `{ ok, notified }` |
 | `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
@@ -574,7 +574,7 @@ An item has one primary Session. The first create that carries `suggestion` (`st
 
 Errors: 404 `unknown_provider` (no active plugin provides suggestions under that id), 409 `stale_suggestion` (the item is no longer published, its source is disabled, or its source closed it; `prepare` and `start` answer all three the same way), 400 `validation_failed` (`criterion` not declared by the provider, an unknown preset agent, or a prompt or its expansion over 64 KiB), 403 `read_only`.
 
-The TUI lists suggestions from Home with `S` (`Ctrl+S` in strict mode). The view shows each item's `preview` and prompt as plain text; the first Enter resolves `prepare` and shows its final `initial_prompt` (after the preset prompt); a second Enter opens the new-session dialog prefilled with it, and an item whose `project` is `null` cannot be started. The dialog's Prompt row, which is always present and editable, holds that prompt; for a suggestion it is labelled with the provider and Ctrl+P on it shows the item's `preview` as source text. `r` only asks providers to refresh; `l` reloads the list. Items keep the order of the snapshot. Home also lists a collapsed **Suggested (N)** group above Trash, absent when there are no open suggestions. Enter expands it to the first 3 items and a "View all" row that opens the view above; Enter on an item prepares it and opens the prefilled dialog directly, `z` (`Z` in strict mode) dismisses it, and `N` (`Ctrl+N`) starts a blank session. `Ctrl+K` lists "Suggested sessions"; on a suggestion row, or on the selected item in the view, it also lists "Open in <provider>", which opens the item's `source_url`. Every TUI key is provisional: `S` / `Ctrl+S` to open, `z` / `N` on a Home row, and `x` (dismiss), `d` (dismissed), `r` and `l` inside the view may move.
+The TUI shows suggestions in Home's preview pane and starts them with `start`, or with `prepare` and the new-session dialog for "Start with changes"; it shows each item's `preview` and `start.prompt` as plain text and sends the snapshot's `profile` as `expected_profile` on each suggestions request it posts. Keys and layout are in the [guide's TUI section](guides/suggested-sessions.md#tui).
 
 ### Project mappings
 

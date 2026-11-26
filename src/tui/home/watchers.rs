@@ -34,16 +34,32 @@ pub(in crate::tui) enum ConfigRefreshOrigin {
     Watcher,
 }
 
-/// Eligible, unseen tip count for the home-view badge, honoring `session.show_tips`.
-pub(in crate::tui) fn tips_unseen_count(config: &crate::session::Config) -> usize {
-    if !config.session.show_tips {
-        return 0;
+impl HomeView {
+    /// Tip signals, with the suggestions setup signal taken from the daemon's
+    /// suggestions snapshot rather than this process's plugin registry.
+    pub(in crate::tui) fn tip_signals(
+        &self,
+        config: &crate::session::Config,
+    ) -> crate::tips::TipSignals {
+        let mut signals = crate::tips::TipSignals::from(config);
+        signals.suggestions_setup_available = self
+            .suggestions_feed
+            .providers_enabled()
+            .is_some_and(|enabled| crate::tips::suggestions_setup_available(&enabled));
+        signals
     }
-    crate::tips::unseen_count(
-        crate::tips::TipSurface::Tui,
-        &config.app_state.tips_seen,
-        &crate::tips::TipSignals::from(config),
-    )
+
+    /// Eligible, unseen tip count for the home-view badge, honoring `session.show_tips`.
+    pub(in crate::tui) fn tips_unseen_count(&self, config: &crate::session::Config) -> usize {
+        if !config.session.show_tips {
+            return 0;
+        }
+        crate::tips::unseen_count(
+            crate::tips::TipSurface::Tui,
+            &config.app_state.tips_seen,
+            &self.tip_signals(config),
+        )
+    }
 }
 
 /// A subscription plus the task forwarding its events into a dirty latch.

@@ -1,5 +1,6 @@
 import type { SessionResponse } from "../lib/types";
 import { liveSession } from "../lib/suggestionPlan";
+import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { StartedPromptNote } from "./PromptBlockedNote";
 import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
@@ -78,7 +79,11 @@ export function DashboardSuggestions({
   const alert = notice ?? (loadFailed ? "Could not load suggestions." : null);
 
   return (
-    <section className="mb-4 mt-3 w-full max-w-2xl" aria-labelledby="suggested-sessions-heading">
+    <section
+      className="mb-4 mt-3 w-full max-w-2xl"
+      aria-labelledby="suggested-sessions-heading"
+      {...tourAnchor(TOUR_ANCHORS.dashboardSuggestions)}
+    >
       <div className="mb-2 flex items-baseline justify-between px-1">
         <h2
           id="suggested-sessions-heading"

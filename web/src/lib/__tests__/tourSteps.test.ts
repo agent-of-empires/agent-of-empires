@@ -75,14 +75,31 @@ describe("resolveTourSteps", () => {
   const all: TourAnchorId[] = Object.values(TOUR_ANCHORS);
   const present = (anchor: TourAnchorId) => all.includes(anchor);
 
-  it("stays on the dashboard: five steps with every anchor present, none in Settings", () => {
+  it("stays on the dashboard: six steps with every anchor present, none in Settings", () => {
     const steps = resolveTourSteps({
       scope: "dashboard",
       readOnly: false,
       isDesktop: true,
       hasAnchor: present,
     });
-    expect(steps.map((s) => s.id)).toEqual(["topbar", "sidebar", "new-session", "settings", "topbar-more"]);
+    expect(steps.map((s) => s.id)).toEqual([
+      "topbar",
+      "sidebar",
+      "new-session",
+      "suggestions",
+      "settings",
+      "topbar-more",
+    ]);
+  });
+
+  it("skips the suggestions step when the Suggested section is not on the page", () => {
+    const ids = resolveTourSteps({
+      scope: "dashboard",
+      readOnly: false,
+      isDesktop: true,
+      hasAnchor: (a) => a !== TOUR_ANCHORS.dashboardSuggestions,
+    }).map((s) => s.id);
+    expect(ids).toEqual(["topbar", "sidebar", "new-session", "settings", "topbar-more"]);
   });
 
   it("drops steps filtered by read-only and coarse-pointer metadata", () => {

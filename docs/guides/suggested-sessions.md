@@ -8,9 +8,11 @@ Suggestions show up in the web dashboard (homepage section, `/suggestions`, and 
 
 ## Setting up
 
-With no provider installed, the web homepage and the empty `/suggestions` view offer **Set up suggestions** when a featured plugin exists. The sheet installs the sources you tick, runs each plugin's setup checks (✓, `!`, ✕, with the plugin's fix text and **Check again**), and ends with "Suggestions are on". **Finish later** closes it; the plugin stays installed. **More sources in the Marketplace ›** opens Settings › Plugins › Marketplace filtered to plugins that work with suggestions.
+With no provider installed, the web homepage and the empty `/suggestions` view offer **Set up suggestions** when a featured plugin exists. The sheet installs the sources you tick, runs each plugin's setup checks (✓, `!`, ✕, with the plugin's fix text and **Check again**), and ends with "Suggestions are on". **Finish later** closes it; the plugin stays installed. **More sources in the Marketplace ›** opens Settings › Plugins › Marketplace filtered to plugins that work with suggestions. With no provider, the TUI's list (`S`) says to run `aoe plugin install gh:agent-of-empires/plugin-github` and turn the provider on in the dashboard, and names **Set up suggestions** when the dashboard offers it. With every provider off, it says to turn one on in Settings › Suggestions.
 
 Providers are off until you turn one on, in the setup sheet, in Settings › Suggestions › Sources, or through the API (`PATCH /api/suggestions/prefs` with `provider_enabled`). The sheet turns on each source it installs, and no other. To skip the sheet, install a provider with `aoe plugin install` ([Plugins](../plugins.md)), then turn it on. While every installed provider is off, the homepage section and `/suggestions` say so and offer **Turn it on** (**Turn them on** for several); a read-only dashboard says it can't turn them on.
+
+Suggestions stay off until you set them up. A **New: suggested sessions** tip shows once in the TUI and the dashboard, saying how to turn them on, while every installed provider is off, or while none is installed and a featured plugin offers them. The dashboard walkthrough also has a step on the homepage's Suggested section, skipped when the section is not on the page. The TUI intro's last page lists `S`.
 
 ## Web dashboard
 
@@ -60,8 +62,8 @@ If a provider is switched off, its items are hidden and the view says "<provider
 | Setting | What it does |
 |---|---|
 | Show on the homepage | The homepage section. |
-| Show in the sidebar | A collapsed **Suggested (N)** group at the bottom of the web session sidebar, above Trash, absent when there are no open suggestions. Started suggestions are not listed, since the Session is already under its Project. Expanded, it lists 3 items and **View all**; clicking an item starts it like **Start**. Off by default. |
-| Show where each one comes from | Shows where each suggestion comes from, such as `owner/repo#123`, on web rows and before the title on TUI rows. On by default. |
+| Show in the sidebar | A collapsed **Suggested (N)** group at the bottom of the web session sidebar, above Trash, and a **Suggested (N)** row in the TUI Home list, below the live sessions and above Archived and Trash. Both are absent when there are no open suggestions. Started suggestions are not counted, since the Session is already under its Project. Expanded, the web group lists 3 items and **View all**; clicking an item starts it like **Start**. Off by default. |
+| Show where each one comes from | Shows where each suggestion comes from, such as `owner/repo#123`, on web rows and after the title in the TUI list. On by default. |
 | Sources | Drag to set which source comes first (Alt+↑/↓ on a focused row, a move-up button on a phone). Each has an on/off switch. A source that uses an agent says so, since it spends your agent usage. A source error can carry a fix button from the plugin. |
 | *Source* · Kinds | One row per kind of suggestion, such as Review requests: what it starts with ("Claude Code · Structured view · worktree"), a switch to suggest it, and **Edit** for its [preset](#presets). |
 | *Source* source settings | The plugin's own settings for its suggestions, such as the GitHub plugin's ignored organizations and repositories. The same settings, saved to the same place, also appear under Settings › Plugins. |
@@ -95,31 +97,37 @@ Change any proposal with its select, then **Link N repos** stores every checked 
 
 > The TUI keys below are provisional until #4597 settles the key bindings.
 
-**Home.** A collapsed **Suggested (N)** group sits above Trash and is absent when there are no open suggestions. Enter expands it to 3 items and a "View all" row. On an item, Enter prepares it and opens the prefilled dialog, `z` (`Z` in strict mode) dismisses it, and `Ctrl+K` lists "Open in <provider>". `N` (`Ctrl+N`) starts a blank session.
+**Home.** With **Show in the sidebar** on (off by default; `h` in the pane turns it on or off), one **Suggested (N)** row sits below the live sessions, pinned with Archived and Trash at the bottom of the list and directly above them. It is absent when there are no open suggestions, unless a provider failed: then the row stays, marked `!`. Selecting the row shows every suggestion in the preview pane, the way the System Health strip shows its view there. Enter or → moves the keys into the pane, and Esc gives them back to the row. `S` (`Ctrl+S` in strict mode) selects the row and moves the keys into the pane from anywhere; with the row hidden it still opens the pane, and Esc returns to the Session you were on. Clicking the pane moves the keys into it, and clicking a row in the list gives them back. If the row goes away while the pane has the keys (`h` hid it, or the suggestions belong to another profile), the pane stays until Esc, which lands on the row that took its place.
 
-**Full view.** `S` opens it (`Ctrl+S` in strict mode).
+**Pane.** Items are grouped under their repo or Project, each with its source reference after the title. The divider shows when each provider last updated, and a provider that failed to refresh is named at the top of the list with its fix and the key that retries. Below the divider are what Enter starts ("Starts with Claude Code · Structured · worktree"), the prompt, and the item's source text. While the pane has the keys, its key line shows only the keys for the selected item. A started suggestion stays listed with its Session's status, and Enter opens the Session.
 
-| Key | Action |
-|---|---|
-| `j` / `k` | Select |
-| Enter | First press resolves the final prompt and shows it ("Review the prompt below, then press Enter to start."); the second opens the dialog. On a started item it opens the session |
-| `N` | Start another session for a started item |
-| `x` | Dismiss or restore |
-| `d` | Toggle the dismissed list |
-| `r` | Ask providers to refresh |
-| `l` | Reload the list |
-| PgUp / PgDn | Scroll the prompt |
-| Esc | Back |
+Strict mode moves the letters by Home's rule: a bare letter takes Shift, and a Shift letter takes Ctrl.
 
-`r` only asks for a refresh ("Refresh requested. Press l to reload the list."). An item with no matching registered Project cannot be started ("No registered project matches this suggestion"), and a stale one says "No longer open at the source. Dismiss it, or wait for the next refresh."
+| Key | Strict mode | Action |
+|---|---|---|
+| `j` / `k` | `j` / `k` | Select |
+| Enter | Enter | Start with the preset. On a started item it opens the session |
+| `e` | `E` | Start with changes: opens the New session dialog prefilled from the kind's preset and the final prompt |
+| `N` | `Ctrl+N` | A new session for the item that does not take its link, so a started item can have another |
+| `z` | `Z` | Dismiss or restore |
+| `d` | `D` | Show or hide dismissed items |
+| `t` | `T` | Turn on pre-trust, on a Session blocked on folder trust |
+| `h` | `H` | Show or hide the Suggested row on Home (the **Show in the sidebar** setting). The pane stays open until Esc |
+| `r` | `R` | Ask providers to refresh, then reload the list. On a read-only dashboard it only reloads |
+| PgUp / PgDn | PgUp / PgDn | Scroll the detail: the prompt, then the item's source text |
+| `Ctrl+K` | `Ctrl+K` | Open in the provider |
+| `?` | `?` | List every key; any key closes the list |
+| Esc / `q` | Esc / `q` | Back to the Suggested row |
 
-**New-session dialog.** The dialog has a **Prompt** row for the first turn. A suggestion fills it, labelled with the provider and "not checked by AoE"; edit it freely. `Ctrl+P` on the row shows the item's source text. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
+If the repo has hooks nobody has approved, Enter shows them, with a one-line summary of each MCP server, in a review dialog; approving starts the session and cancelling starts nothing. A hooks review that is out of date (the hooks changed after you read them) shows again. A start that fails shows "Couldn't start: <reason>" with what to do on its row and in the detail until the next try, and Enter tries again. An item whose repo is linked to no Project opens the New session dialog to pick one. A stale item says "No longer open at the source. Dismiss it, or wait for the next refresh." When a started Claude Code Session did not get its prompt, its row says "Prompt not typed" and the detail pane gives the reason. If Claude Code is asking whether to trust the folder, `t` (`T` in strict mode) turns on pre-trust (`pre_trust_agent_folders`, after saying that the repo's own Claude Code settings then run too), and Enter then moves the blocked Session to Trash and starts the suggestion again. A Session started from the New session dialog is not retried: trust the folder in the Session itself. If it is asking to accept Bypass Permissions, open the Session once and accept it.
+
+**New-session dialog.** The dialog has no Prompt row. For a suggestion, the first turn is one line above the footer: "Prompt from GitHub, not checked by AoE", or "Prompt: none" once you erase it. A blank session shows no prompt line until you add one. `Ctrl+O` opens it in a small editor, which also shows the item's source text; `Esc` closes it and keeps your edits. `Ctrl+P` still opens the focused row's picker. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
 
 From the command line, `aoe add --prompt <text>` or `--prompt-file <path>` sets the same first turn. It is rejected for terminal sessions.
 
 ## Read-only dashboards and CityHall
 
-A read-only dashboard lists suggestions but cannot change anything: "This dashboard is read-only. Start, Dismiss and Refresh are off." The same applies to the TUI view. Offline, suggestions stay visible from the last fetch ("Disconnected. Suggestions show from the last fetch; reconnect to start one.").
+A read-only dashboard lists suggestions but cannot change anything: "This dashboard is read-only. Start, Dismiss and Refresh are off." The TUI says "Read-only daemon: you can browse, not start or dismiss." at the top of the pane and when a key there is refused, and `r` only reloads. Offline, suggestions stay visible from the last fetch ("Disconnected. Suggestions show from the last fetch; reconnect to start one.").
 
 In [CityHall mode](web-dashboard.md#cityhall-client-mode) the suggestion routes that change anything (start, refresh, dismiss, source and preference changes, preset and mapping edits) are refused server-side, and plugin lifecycle is hidden, so setup and the Marketplace are unavailable. Reading suggestions stays allowed. The [API reference](../plugin-api.md#suggestions-api) lists the exact routes.
 

@@ -1443,10 +1443,29 @@ pub struct TipsResponse {
 /// shared `crate::tips` catalog plus `app_state.tips_seen` and
 /// `session.show_tips`. A read projection, so it stays a plain GET behind the
 /// token wall like [`get_web_ui_state`]; the TUI-only tips never appear here.
-pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let result = tokio::task::spawn_blocking(|| {
+pub async fn get_tips(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let host = state.plugin_host.clone();
+    let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::Config::load()?;
-        let signals = crate::tips::TipSignals::from(&config);
+        let mut signals = crate::tips::TipSignals::from(&config);
+        // The same providers and switches GET /api/suggestions reports. A store
+        // error only drops this tip.
+        let snapshot = host.as_ref().and_then(|host| {
+            let providers = crate::plugin::suggestions::providers();
+            host.with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::snapshot(conn, profile, &providers)
+            })
+            .ok()
+        });
+        signals.suggestions_setup_available = snapshot.is_some_and(|snapshot| {
+            let enabled: Vec<bool> = snapshot["providers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|p| p["enabled"].as_bool().unwrap_or(false))
+                .collect();
+            crate::tips::suggestions_setup_available(&enabled)
+        });
         let seen = &config.app_state.tips_seen;
         let tips = crate::tips::eligible(crate::tips::TipSurface::Web, &signals)
             .into_iter()
