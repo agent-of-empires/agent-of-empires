@@ -34,6 +34,9 @@ pub(super) async fn settle_namespace(
     }
     fn wire(request: &NamespaceMutation) -> (&'static str, &'static str, serde_json::Value) {
         match request {
+            NamespaceMutation::CreateGroup(body) => {
+                ("POST", "/api/groups", serde_json::to_value(body).unwrap())
+            }
             NamespaceMutation::CollapseGroup(body) => (
                 "PATCH",
                 "/api/groups/collapse",
@@ -2647,7 +2650,6 @@ async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
         serde_json::to_value(crate::daemon::SidebarViewPatch {
             group_by: Some(crate::session::config::GroupByMode::Group),
             sort: Some(SortOrder::Custom),
-
             ..Default::default()
         })
         .unwrap(),
@@ -2756,7 +2758,6 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
         serde_json::to_value(crate::daemon::SidebarViewPatch {
             group_by: Some(crate::session::config::GroupByMode::Group),
             sort: Some(SortOrder::Name),
-
             ..Default::default()
         })
         .unwrap(),
@@ -4564,4 +4565,90 @@ async fn creation_reveal_keeps_owed_attach_while_newer_metadata_frame_is_unappli
     );
     assert!(env.view.take_created_attach().is_none());
     assert!(respond(Err("must not replay expansion".into())).is_none());
+}
+
+/// "+ New group…" closes the Group By popup and opens the dialog with the selected Session
+/// checked; the Group is created holding it in one Daemon commit, never empty.
+#[tokio::test]
+#[serial]
+async fn new_group_from_the_group_by_popup_holds_the_selected_session() {
+    use crate::daemon::{CreateGroupBody, GroupLocation, NamespaceMutation};
+    let (_temp, _guard) = test_home();
+    let rows: Vec<Instance> = ["Aztecs", "Britons"]
+        .into_iter()
+        .map(|title| {
+            let mut row = Instance::new(title, &format!("/tmp/{title}"));
+            row.source_profile = "test".into();
+            row
+        })
+        .collect();
+    seed_profile("test", &rows);
+    let state = native_state(&["test"]).await;
+    let mut view = test_view(Some("test"));
+    apply_published(&mut view, &state).await;
+    view.selected_session = Some(rows[1].id.clone());
+
+    view.show_group_picker();
+    view.handle_key(key(KeyCode::End), None);
+    view.handle_key(key(KeyCode::Enter), None);
+    assert!(view.group_picker_dialog.is_none());
+    assert!(view.new_group_dialog.is_some());
+    for c in "fresh".chars() {
+        view.handle_key(key(KeyCode::Char(c)), None);
+    }
+    let expected = NamespaceMutation::CreateGroup(CreateGroupBody {
+        group: GroupLocation {
+            profile: "test".into(),
+            path: "fresh".into(),
+        },
+        sessions: Some(vec![rows[1].id.clone()]),
+    });
+    settle_namespace(&state, &mut view, expected, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(view.new_group_dialog.is_none());
+    assert_eq!(view.get_instance(&rows[1].id).unwrap().group_path, "fresh");
+    assert_eq!(view.get_instance(&rows[0].id).unwrap().group_path, "");
+    assert!(view.group_trees["test"].group_exists("fresh"));
+}
+
+/// On a read-only Daemon or under CityHall the Group By and Sort popups still open on the
+/// current choice but refuse picks and send nothing. "+ New group…" stays available under
+/// CityHall, which allows creating Groups.
+#[test]
+#[serial]
+fn locked_view_popups_open_but_refuse_picks() {
+    for (read_only, cityhall, reason) in [
+        (true, false, "This Daemon is read-only."),
+        (false, true, "Managed by CityHall."),
+    ] {
+        let mut env = create_test_env_with_mixed_sessions();
+        env.view.session_feed.set_read_only_for_test(read_only);
+        env.view.session_feed.set_cityhall_for_test(cityhall);
+        assert_eq!(env.view.sidebar_view_lock(), Some(reason));
+        let before = (env.view.group_by, env.view.sort_order);
+
+        env.view.show_sort_picker();
+        for code in [KeyCode::Char('a'), KeyCode::Down, KeyCode::Enter] {
+            env.view.handle_key(key(code), None);
+        }
+        assert!(env.view.sort_picker_dialog.is_some(), "{reason}");
+        env.view.handle_key(key(KeyCode::Esc), None);
+
+        env.view.show_group_picker();
+        env.view.handle_key(key(KeyCode::Char('g')), None);
+        assert_eq!((env.view.group_by, env.view.sort_order), before, "{reason}");
+        assert!(!env.view.session_feed.sidebar_view_pending(), "{reason}");
+        env.view.handle_key(key(KeyCode::End), None);
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert_eq!(env.view.new_group_dialog.is_some(), cityhall, "{reason}");
+        assert_eq!(
+            env.view.group_picker_dialog.is_some(),
+            read_only,
+            "{reason}"
+        );
+    }
 }

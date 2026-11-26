@@ -303,6 +303,8 @@ pub struct HomeView {
     /// The Daemon's grouping and sort as of the last applied snapshot. Cleared on reconnect,
     /// so the new connection's first value is adopted.
     pub(in crate::tui) observed_sidebar_view: Option<crate::session::config::SidebarView>,
+    /// A web dashboard applies a plugin sort in place of the shared one.
+    pub(super) web_plugin_sort: bool,
     /// An order write that offers Undo once it commits.
     pending_order_change: Option<reorder::OrderChange>,
     /// What "Undo switch to Custom" writes back.
@@ -361,6 +363,7 @@ pub struct HomeView {
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
     pub(super) worktree_name_dialog: Option<WorktreeNameDialog>,
+    pub(super) new_group_dialog: Option<crate::tui::dialogs::NewGroupDialog>,
     pub(super) restart_dialog: Option<RestartDialog>,
     pub(super) context_menu: Option<ContextMenuDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,

@@ -4055,9 +4055,10 @@ fn the_view_follows_a_daemon_sidebar_change_but_not_a_stale_snapshot() {
     let changed = SidebarView {
         group_by: GroupByMode::Group,
         sort: SortOrder::Name,
+        ..Default::default()
     };
     publish(&mut env, SidebarView::default());
-    publish(&mut env, changed);
+    publish(&mut env, changed.clone());
     assert_eq!(
         (env.view.group_by, env.view.sort_order),
         (GroupByMode::Group, SortOrder::Name)
@@ -4067,6 +4068,113 @@ fn the_view_follows_a_daemon_sidebar_change_but_not_a_stale_snapshot() {
     env.view.group_by = GroupByMode::Project;
     publish(&mut env, changed);
     assert_eq!(env.view.group_by, GroupByMode::Project);
+}
+
+/// Another kind of Client's grouping or sort change is named only when it moves the list on
+/// screen; the TUI's own changes and ones that move nothing stay silent. A web plugin sort
+/// only marks the title.
+#[test]
+#[serial]
+fn a_peer_view_change_is_named_only_when_the_list_moves() {
+    use crate::session::config::ClientKind::{Cli, Tui, Web};
+    use crate::session::config::{GroupByMode, SidebarView, SortOrder};
+    use GroupByMode::{Group, Project};
+    use SortOrder::{Custom, Name};
+    let cases = [
+        (
+            true,
+            Some(Web),
+            Group,
+            Custom,
+            Some("Grouping changed on the web"),
+        ),
+        (
+            true,
+            Some(Cli),
+            Group,
+            Name,
+            Some("Grouping and sort changed in the CLI"),
+        ),
+        (
+            true,
+            Some(Web),
+            Project,
+            Name,
+            Some("Sort changed on the web"),
+        ),
+        // One row: the list holds still, so nothing is said.
+        (false, Some(Web), Project, Name, None),
+        (true, Some(Tui), Group, Custom, None),
+        (true, None, Group, Custom, None),
+    ];
+    for (two_rows, changed_by, group_by, sort, flash) in cases {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+        if two_rows {
+            // A second Repository, older and earlier in the alphabet, so Name reverses the
+            // newest-first Custom order and Groups drops the Repository headers.
+            let mut older = Instance::new("alpha", "/tmp/alpha");
+            older.source_profile = "test".into();
+            older.created_at = crate::time::Timestamp::from_millis(
+                crate::time::Timestamp::now().as_millis() - 3_600_000,
+            )
+            .unwrap();
+            env.view.add_instance(older);
+            env.view
+                .mutate_instance(&id, |row| row.title = "zulu".into());
+            seed_profile("test", &env.view.cloned_instances());
+        }
+        let publish = |env: &mut TestEnv, view: SidebarView| {
+            let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Idle")
+            else {
+                unreachable!()
+            };
+            Arc::make_mut(&mut snapshot).contents.sidebar_view = view;
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+            env.view.apply_session_feed();
+        };
+        env.view.show_sidebar_view(Project, Custom);
+        publish(&mut env, SidebarView::default());
+        env.view.status_flash = None;
+        let view = SidebarView {
+            group_by,
+            sort,
+            changed_by,
+            web_plugin_sort: None,
+        };
+        publish(&mut env, view);
+        let case = format!("{two_rows} {changed_by:?} {group_by:?} {sort:?}");
+        assert_eq!(
+            (env.view.group_by, env.view.sort_order),
+            (group_by, sort),
+            "{case}"
+        );
+        assert_eq!(env.view.status_flash_text(), flash, "{case}");
+    }
+
+    let mut env = create_test_env_empty();
+    let id = structured_row(&mut env, Status::Idle);
+    env.view.show_sidebar_view(Project, Custom);
+    for (marker, shown) in [(Some("Cost"), true), (None, false)] {
+        let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Idle")
+        else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut snapshot).contents.sidebar_view = SidebarView {
+            changed_by: Some(Web),
+            web_plugin_sort: marker.map(str::to_owned),
+            ..Default::default()
+        };
+        env.view
+            .session_feed
+            .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+        env.view.apply_session_feed();
+        assert_eq!(env.view.web_plugin_sort, shown);
+        assert_eq!(env.view.sort_order, SortOrder::Custom);
+        assert_eq!(env.view.status_flash_text(), None);
+    }
 }
 
 /// Snapshots are not shown while a local pick is in flight, so once the write settles the
@@ -4096,14 +4204,16 @@ fn a_settled_sidebar_write_converges_on_the_daemon_value() {
         let original = SidebarView {
             group_by: GroupByMode::Project,
             sort: SortOrder::Custom,
+            ..Default::default()
         };
-        publish(&mut env, original);
+        publish(&mut env, original.clone());
         env.view.apply_group_by(GroupByMode::Group);
         let merged = SidebarView {
             group_by: GroupByMode::Group,
             sort: SortOrder::Name,
+            ..Default::default()
         };
-        let committed = publish(&mut env, merged);
+        let committed = publish(&mut env, merged.clone());
         assert_eq!(env.view.sort_order, SortOrder::Custom, "case {same_epoch}");
         let receipt = if same_epoch {
             committed
@@ -4125,7 +4235,7 @@ fn a_settled_sidebar_write_converges_on_the_daemon_value() {
             "case {same_epoch}"
         );
         // A peer restoring the value seen before the write is still a change.
-        publish(&mut env, original);
+        publish(&mut env, original.clone());
         assert_eq!(
             (env.view.group_by, env.view.sort_order),
             (original.group_by, original.sort),

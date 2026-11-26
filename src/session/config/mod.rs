@@ -872,14 +872,28 @@ where
     Ok(value.and_then(|value| value.try_into().ok()))
 }
 
+/// The kind of Client that sent a Daemon write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientKind {
+    Tui,
+    Web,
+    Cli,
+}
+
 /// The one grouping and sort the Daemon owns. Clients read it from the runtime snapshot
 /// and change it through `PATCH /api/sidebar-view`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SidebarView {
     pub group_by: GroupByMode,
     pub sort: SortOrder,
+    /// The kind of Client that last changed the grouping or the sort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_by: Option<ClientKind>,
+    /// Label of the plugin sort a web dashboard applies in place of `sort`, which only
+    /// browsers can run; other Clients keep `sort`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_plugin_sort: Option<String>,
 }
 
 impl AppStateConfig {
@@ -887,6 +901,8 @@ impl AppStateConfig {
         SidebarView {
             group_by: self.group_by.unwrap_or_default(),
             sort: self.sort_order.unwrap_or_default(),
+            changed_by: self.sidebar_view_changed_by,
+            web_plugin_sort: self.web_plugin_sort.clone(),
         }
     }
 }
@@ -991,6 +1007,16 @@ pub struct AppStateConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub group_by: Option<GroupByMode>,
+
+    #[serde(
+        default,
+        deserialize_with = "unknown_as_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sidebar_view_changed_by: Option<ClientKind>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_plugin_sort: Option<String>,
 
     /// Last directory the user navigated to in the new-session dir picker.
     /// Restored on subsequent opens so users don't re-navigate every time.

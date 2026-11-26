@@ -862,7 +862,7 @@ impl HomeView {
                                 self.canonical_metadata_lag = None;
                                 self.reload_failure_state.record_canonical(&Ok(()));
                                 self.observed_workspace_ordering = persisted_ordering;
-                                self.adopt_sidebar_view(snapshot.contents.sidebar_view);
+                                self.adopt_sidebar_view(snapshot.contents.sidebar_view.clone());
                                 metadata_changed |=
                                     self.session_feed.mark_snapshot_applied(snapshot);
                                 snapshot_applied = true;

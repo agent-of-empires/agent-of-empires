@@ -515,6 +515,15 @@ async fn run_namespace(
 ) -> Result<MutationReceipt<crate::daemon::NamespaceOutcome>, crate::daemon::DaemonClientError> {
     use crate::daemon::{NamespaceMutation as N, NamespaceOutcome as O};
     match request {
+        N::CreateGroup(body) => {
+            client
+                .create_group(&body, epoch)
+                .await
+                .map(|cursor| MutationReceipt {
+                    cursor,
+                    outcome: O::Committed,
+                })
+        }
         N::CollapseGroup(body) => {
             client
                 .collapse_group(&body, epoch)
@@ -863,6 +872,8 @@ pub struct SessionFeed {
     /// grant, so it is recorded once per connection and read by the local-write
     /// gate on the home view.
     cityhall: Arc<AtomicBool>,
+    /// Whether the attached Daemon serves read-only, also a handshake property.
+    read_only: Arc<AtomicBool>,
     commands: Option<tokio::sync::mpsc::Sender<SessionCommand>>,
     pending: HashMap<String, PendingCommand>,
     pending_creations: HashMap<String, PendingCreation>,
@@ -904,6 +915,7 @@ impl SessionFeed {
             grant: Arc::new(AtomicU64::new(0)),
             native_grant: Arc::new(AtomicU64::new(0)),
             cityhall: Arc::new(AtomicBool::new(false)),
+            read_only: Arc::new(AtomicBool::new(false)),
             commands: None,
             pending: HashMap::new(),
             pending_creations: HashMap::new(),
@@ -947,6 +959,8 @@ impl SessionFeed {
         self.native_grant = native_grant.clone();
         let cityhall = Arc::new(AtomicBool::new(false));
         self.cityhall = cityhall.clone();
+        let read_only = Arc::new(AtomicBool::new(false));
+        self.read_only = read_only.clone();
         let (commands, requests) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
         self.commands = Some(commands);
         let (progress, progress_receiver) = tokio::sync::watch::channel(None);
@@ -971,6 +985,7 @@ impl SessionFeed {
                 let epoch = connection.info().epoch.clone();
                 diagnostics.send_replace(connection.info().owner_diagnostics.clone());
                 cityhall.store(connection.info().cityhall_mode, Ordering::SeqCst);
+                read_only.store(connection.info().read_only, Ordering::SeqCst);
                 set_grant(&grant, connection.mutations_allowed());
                 set_grant(&native_grant, connection.native_interaction_allowed());
                 quit_control.send_replace(Some(QuitCancellationHandle {
@@ -1116,6 +1131,11 @@ impl SessionFeed {
     /// a narrower mutation policy than the local owner this process runs as.
     pub(crate) fn cityhall_mode(&self) -> bool {
         self.cityhall.load(Ordering::SeqCst)
+    }
+
+    /// True when the attached Daemon was started read-only.
+    pub(crate) fn daemon_read_only(&self) -> bool {
+        self.read_only.load(Ordering::SeqCst)
     }
 
     pub(crate) fn native_interaction_available(&self) -> bool {
@@ -1267,8 +1287,9 @@ impl SessionFeed {
     /// from before the write.
     pub(crate) fn submit_sidebar_view(
         &mut self,
-        patch: crate::daemon::SidebarViewPatch,
+        mut patch: crate::daemon::SidebarViewPatch,
     ) -> anyhow::Result<()> {
+        patch.client = Some(crate::session::config::ClientKind::Tui);
         let lease = self.admitted_lease()?;
         if self.pending_sidebar_view.is_none() {
             self.pending_sidebar_view =
@@ -1285,6 +1306,7 @@ impl SessionFeed {
             patch: crate::daemon::SidebarViewPatch {
                 group_by: patch.group_by.or(queued.group_by),
                 sort: patch.sort.or(queued.sort),
+                client: patch.client,
                 ..Default::default()
             },
             grant: self.grant.clone(),
@@ -2684,6 +2706,11 @@ impl SessionFeed {
     #[cfg(test)]
     pub(crate) fn set_cityhall_for_test(&self, cityhall: bool) {
         self.cityhall.store(cityhall, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_read_only_for_test(&self, read_only: bool) {
+        self.read_only.store(read_only, Ordering::SeqCst);
     }
 
     /// Puts a store move on screen for an applied Session. Hold the receiver to keep the lane open.

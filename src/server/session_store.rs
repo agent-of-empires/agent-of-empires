@@ -1667,6 +1667,157 @@ mod tests {
         Ok(())
     }
 
+    /// `POST /api/groups` with `sessions` creates the Group and moves them in one commit,
+    /// and refuses, leaving storage untouched, when none is named or policy forbids it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_group_create_moves_its_sessions_in_one_commit() -> Result<()> {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        for (name, read_only, cityhall, structured, path, sessions, expected, code) in [
+            (
+                "read-only",
+                true,
+                false,
+                false,
+                "created",
+                Some(true),
+                StatusCode::FORBIDDEN,
+                Some("read_only"),
+            ),
+            (
+                "CityHall terminal",
+                false,
+                true,
+                false,
+                "created",
+                Some(true),
+                StatusCode::FORBIDDEN,
+                None,
+            ),
+            (
+                "CityHall structured",
+                false,
+                true,
+                true,
+                "created",
+                Some(true),
+                StatusCode::CREATED,
+                None,
+            ),
+            (
+                "no session",
+                false,
+                false,
+                false,
+                "created",
+                Some(false),
+                StatusCode::BAD_REQUEST,
+                Some("group_sessions_required"),
+            ),
+            (
+                "unknown session",
+                false,
+                false,
+                false,
+                "created",
+                None,
+                StatusCode::NOT_FOUND,
+                None,
+            ),
+            (
+                "existing group",
+                false,
+                false,
+                false,
+                "team",
+                Some(true),
+                StatusCode::CONFLICT,
+                None,
+            ),
+            (
+                "moved",
+                false,
+                false,
+                false,
+                "created",
+                Some(true),
+                StatusCode::CREATED,
+                None,
+            ),
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let (source, _, state, moving) = profile_move_fixture(read_only, cityhall).await?;
+            if structured {
+                source.update(|rows, _| {
+                    rows.iter_mut()
+                        .find(|row| row.id == moving.id)
+                        .unwrap()
+                        .view = crate::session::View::Structured;
+                    Ok(())
+                })?;
+            }
+            let snapshot = state.runtime.publish(&state).await?;
+            let sessions: Vec<&str> = match sessions {
+                Some(true) => vec![moving.id.as_str(), moving.id.as_str()],
+                Some(false) => Vec::new(),
+                None => vec!["missing"],
+            };
+            let body = serde_json::json!({"profile": "source", "path": path, "sessions": sessions});
+            let groups = source.sessions_path().with_file_name("groups.json");
+            let before = (
+                std::fs::read(source.sessions_path())?,
+                std::fs::read(&groups)?,
+            );
+            let response = crate::server::test_support::build_router_for_test(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/groups")
+                        .header("host", "localhost")
+                        .header("content-type", "application/json")
+                        .header(
+                            crate::daemon::RUNTIME_EPOCH_HEADER,
+                            &snapshot.value.cursor.epoch,
+                        )
+                        .extension(axum::extract::ConnectInfo(
+                            crate::server::peer::ConnectionPeer::UnixOwner {
+                                uid: nix::unistd::geteuid().as_raw(),
+                            },
+                        ))
+                        .body(axum::body::Body::from(body.to_string()))?,
+                )
+                .await?;
+            assert_eq!(response.status(), expected, "{name}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(crate::daemon::ERROR_CODE_HEADER)
+                    .map(|value| value.to_str().unwrap()),
+                code,
+                "{name}"
+            );
+            if expected != StatusCode::CREATED {
+                assert_eq!(
+                    (
+                        std::fs::read(source.sessions_path())?,
+                        std::fs::read(&groups)?
+                    ),
+                    before,
+                    "{name}"
+                );
+                continue;
+            }
+            let (rows, stored) = source.load_with_groups()?;
+            assert!(stored.iter().any(|group| group.path == "created"), "{name}");
+            for row in rows {
+                let expected = if row.id == moving.id { "created" } else { "" };
+                assert_eq!(row.group_path, expected, "{name}");
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn native_worktree_reconciliation_publishes_complete_profiles_and_enforces_policy(

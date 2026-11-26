@@ -113,6 +113,7 @@ impl HomeView {
             || self.rename_dialog.is_some()
             || self.worktree_name_dialog.is_some()
             || self.sandbox_login_dialog.is_some()
+            || self.new_group_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
             || self.repo_trust_dialog.is_some()

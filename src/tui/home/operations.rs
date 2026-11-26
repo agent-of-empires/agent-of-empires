@@ -520,6 +520,23 @@ impl HomeView {
         Ok(())
     }
 
+    /// Create a Group holding the given Sessions in one Daemon commit.
+    pub(super) fn create_group_with_sessions(
+        &mut self,
+        data: crate::tui::dialogs::NewGroupData,
+    ) -> anyhow::Result<()> {
+        self.submit_namespace_intent(
+            crate::daemon::NamespaceMutation::CreateGroup(crate::daemon::CreateGroupBody {
+                group: crate::daemon::GroupLocation {
+                    profile: data.profile,
+                    path: data.path,
+                },
+                sessions: Some(data.sessions),
+            }),
+            super::NamespaceIntent::Plain,
+        )
+    }
+
     /// Queue an explicit workdir/optional branch edit; the daemon owns filesystem and metadata.
     pub(super) fn set_worktree_name_for_selected(
         &mut self,

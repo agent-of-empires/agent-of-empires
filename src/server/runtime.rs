@@ -302,7 +302,7 @@ impl NativeRuntime {
             placed_workspaces: metadata.workspace_ordering.clone(),
             repository_order: metadata.repository_order.clone(),
             global_projects: metadata.global_projects.clone(),
-            sidebar_view: metadata.sidebar_view,
+            sidebar_view: metadata.sidebar_view.clone(),
         };
         if contents.health == RuntimeHealth::Healthy {
             self.owner_diagnostics.send_if_modified(|current| {

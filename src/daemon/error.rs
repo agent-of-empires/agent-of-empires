@@ -49,6 +49,8 @@ pub enum ApiErrorCode {
     SmartRenameFailed,
     SmartRenameTimeout,
     GroupNotEmpty,
+    /// A Group created with `sessions` must name at least one Session.
+    GroupSessionsRequired,
     SessionNotRunning,
     /// A person's unsent text is in the terminal agent's input box.
     InputLineBusy,
@@ -100,6 +102,7 @@ impl ApiErrorCode {
             Self::SmartRenameFailed => "smart_rename_failed",
             Self::SmartRenameTimeout => "smart_rename_timeout",
             Self::GroupNotEmpty => "group_not_empty",
+            Self::GroupSessionsRequired => "group_sessions_required",
             Self::SessionNotRunning => "session_not_running",
             Self::InputLineBusy => "input_line_busy",
             Self::SessionArchived => "session_archived",
@@ -148,6 +151,7 @@ impl ApiErrorCode {
             Self::CreateHookFailed
             | Self::WorkingDirMissing
             | Self::BranchNotFound
+            | Self::GroupSessionsRequired
             | Self::UnknownAgent => StatusCode::BAD_REQUEST,
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
             Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
@@ -227,6 +231,7 @@ impl ApiErrorCode {
             b"smart_rename_failed" => Self::SmartRenameFailed,
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
             b"group_not_empty" => Self::GroupNotEmpty,
+            b"group_sessions_required" => Self::GroupSessionsRequired,
             b"session_not_running" => Self::SessionNotRunning,
             b"input_line_busy" => Self::InputLineBusy,
             b"session_archived" => Self::SessionArchived,

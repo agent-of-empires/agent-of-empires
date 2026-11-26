@@ -66,6 +66,8 @@ A **project** is a saved directory path you register once so you can start sessi
 
 A **group** is unrelated: it is a label you assign to existing sessions to sort them in the sidebar, set from the rename dialog or with `aoe group move`. Projects are where sessions start; groups are how they are bucketed once they exist. See [the sidebar groupings](guides/web/dashboard.md#sidebar-grouping-and-sort).
 
+In the TUI, `g` opens Group By and `o` opens the sort. The last Group By entry, **+ New group…**, asks for a name and the sessions to move in, with the selected one checked; a group always starts with at least one session. On a read-only Daemon or under CityHall both popups show the current choice and why it cannot change. When the web or the CLI changes the grouping or sort and the list moves, the TUI says so in the status bar, and while a web dashboard applies a plugin sort the title shows `(plugin sort on web)` after the sort the TUI keeps.
+
 Rows keep their place when a session needs you. A session needs you when it is Waiting, in Error, flagged urgent, or finished and unread, and each header shows `●N` for those under it. `w` jumps to the next one, or to a session that just finished. **Show only sessions that need you** in the `Ctrl+K` palette hides the rest without reordering the list; a session that stops needing you while selected stays listed until you move off it.
 
 ## Worktrees
