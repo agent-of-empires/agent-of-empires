@@ -1138,7 +1138,10 @@ fn declaration_bounds_each_reject() {
             "trust.pointer",
         ),
         (
-            trust_with("/projects/{path}/trusted", &format!("/{}", "s".repeat(257))),
+            trust_with(
+                "/projects/{path}/trusted",
+                &format!("/{}/{{path}}", "s".repeat(257)),
+            ),
             "trust.pointer",
         ),
     ];
