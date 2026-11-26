@@ -208,7 +208,7 @@ export function LoggingTargetsWidget({ value, save, row }: CustomWidgetProps) {
     <div role="group" aria-labelledby={row.labelId} className="space-y-4">
       {Object.entries(grouped).map(([group, items]) => (
         <div key={group} className="space-y-2">
-          <h5 className="text-xs font-mono uppercase tracking-widest text-text-primary">{group}</h5>
+          <h5 className="text-[12px] font-semibold uppercase tracking-[0.06em] text-text-dim">{group}</h5>
           <div className="grid gap-3 sm:grid-cols-2">
             {items.map((t) => (
               <SelectField

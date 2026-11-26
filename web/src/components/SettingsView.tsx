@@ -1,5 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { SETTINGS_CAPTION, SETTINGS_CARD } from "./settings/FormFields";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { ConnectedDevices } from "./ConnectedDevices";
 import { PasskeySettings } from "./PasskeySettings";
@@ -593,13 +594,15 @@ export function SettingsView({
           <div className="space-y-4">
             {/* Non-schema row: choosing the default profile is a profile-
                 management action, not a config field. */}
-            <SelectField
-              label="Default profile"
-              description="Profile used for new sessions"
-              value={defaultProfile}
-              onChange={(v) => handleSetDefault(v)}
-              options={profiles.map((p) => ({ value: p.name, label: p.name }))}
-            />
+            <div className={`${SETTINGS_CARD} py-3`}>
+              <SelectField
+                label="Default profile"
+                description="Profile used for new sessions"
+                value={defaultProfile}
+                onChange={(v) => handleSetDefault(v)}
+                options={profiles.map((p) => ({ value: p.name, label: p.name }))}
+              />
+            </div>
             {/* acp_defaults (Structured View Defaults) is now schema-driven via
                 the acp-defaults custom widget, so it renders inside this
                 SchemaSection alongside the rest of the session fields. The
@@ -714,7 +717,7 @@ export function SettingsView({
               onSaveField={sendSave}
             />
             <div className="space-y-4">
-              <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">Daemon</h4>
+              <h4 className={SETTINGS_CAPTION}>Daemon</h4>
               <SchemaSection
                 section="serve"
                 schema={schema}
@@ -758,10 +761,12 @@ export function SettingsView({
             {/* Browser-push controls render regardless of schema state. */}
             <NotificationSettings />
             <div className="space-y-4">
-              <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">Server Defaults</h4>
-              <p className="text-xs text-text-dim">
-                Controls which session events trigger push notifications on the server.
-              </p>
+              <div>
+                <h4 className={SETTINGS_CAPTION}>Server defaults</h4>
+                <p className="px-1 -mt-1 text-[13px] text-text-dim">
+                  Which session events send a push notification, for every browser.
+                </p>
+              </div>
               {schemaGuard() ??
                 (settings && (
                   <SchemaSection

@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { SETTINGS_CAPTION } from "./FormFields";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import { SchemaSection } from "./SchemaSection";
 
@@ -35,7 +36,7 @@ export function PluginSettingsSections({ schema, settings, onSaveField }: Props)
 
   return (
     <div className="space-y-6">
-      <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">Plugin Settings</h4>
+      <h4 className={SETTINGS_CAPTION}>Plugin settings</h4>
       {sections.map((section) => {
         const id = section.slice(PLUGIN_PREFIX.length);
         // Seed manifest defaults for fields with no stored value yet.

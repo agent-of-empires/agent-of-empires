@@ -3,7 +3,16 @@ import { useId, useState, type ReactNode } from "react";
 import { rowInputProps, type RowLabel } from "./rowLabel";
 import { isImeComposing } from "../../lib/ime";
 
-const CONTROL = "w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary";
+// 16px on a phone, below which iOS zooms the page into a focused field.
+const CONTROL =
+  "w-full bg-surface-900 border border-surface-700/70 rounded-lg px-3 py-2 text-[16px] md:text-sm text-text-primary";
+
+/** A group's caption above its card, as the phone's section list and session list caption theirs. */
+export const SETTINGS_CAPTION = "block px-1 mb-2 text-[12px] font-semibold uppercase tracking-[0.06em] text-text-dim";
+
+/** A settings group's raised card: its rows, or a fold's header and rows, inside. */
+export const SETTINGS_CARD =
+  "rounded-xl max-md:rounded-2xl border border-surface-700/50 bg-surface-850 max-md:bg-surface-800 shadow-md px-4";
 const FOCUS = "focus:border-brand-600 focus:outline-none";
 
 /** Label above an optional description above the control. A `label` of `undefined` drops the element. */
@@ -24,9 +33,9 @@ function FieldShell({
   return (
     <div>
       {label !== undefined && (
-        <label className={labelClassName ?? "block text-sm text-text-bright mb-1"}>{label}</label>
+        <label className={labelClassName ?? "block text-[15px] md:text-sm text-text-primary mb-0.5"}>{label}</label>
       )}
-      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
+      {description && <div className="text-[13px] leading-normal text-text-secondary mb-2">{description}</div>}
       {children}
     </div>
   );
@@ -69,12 +78,12 @@ export function CollapsibleSection({
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className="border border-surface-700/40 rounded-lg overflow-hidden">
+    <div className={`${SETTINGS_CARD} !px-0 overflow-hidden`}>
       <button
         type="button"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
-        className="flex items-center justify-between w-full px-4 py-3 bg-surface-850 hover:bg-surface-800 cursor-pointer transition-colors text-left"
+        className="flex items-center justify-between w-full min-h-12 px-4 py-3 hover:bg-surface-700/30 cursor-pointer transition-colors text-left"
       >
         <div className="flex items-center gap-2">
           <svg
@@ -97,7 +106,7 @@ export function CollapsibleSection({
           )}
         </div>
       </button>
-      {open && <div className="px-4 py-4 space-y-4 border-t border-surface-700/20">{children}</div>}
+      {open && <div className="px-4 py-3 space-y-4 border-t border-surface-700/40">{children}</div>}
     </div>
   );
 }
@@ -118,8 +127,8 @@ export function CheckboxRow({
     <div>
       <label className="flex items-center justify-between gap-3 cursor-pointer">
         <div>
-          <div className="text-[13px] text-text-secondary">{title}</div>
-          <p className="text-[11px] text-text-muted mt-1">{description}</p>
+          <div className="text-[15px] md:text-sm text-text-primary">{title}</div>
+          <p className="text-[13px] leading-normal text-text-secondary mt-0.5">{description}</p>
         </div>
         <input
           type="checkbox"
@@ -152,10 +161,11 @@ export function ToggleField({
       aria-checked={checked}
       {...(row ? rowInputProps(row) : { "aria-label": label })}
       onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full transition-colors cursor-pointer ${checked ? "bg-brand-600" : "bg-surface-700"}`}
+      // iOS's switch proportions: a 51 by 31 track with a 27 knob, scaled to the row.
+      className={`relative inline-flex h-[26px] w-[44px] shrink-0 items-center rounded-full transition-colors duration-200 cursor-pointer ${checked ? "bg-brand-600" : "bg-surface-600"}`}
     >
       <span
-        className={`inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-5" : "translate-x-1"}`}
+        className={`inline-block h-[22px] w-[22px] rounded-full bg-white shadow-[0_1px_3px_rgb(0_0_0/0.35)] transition-transform duration-200 ${checked ? "translate-x-[20px]" : "translate-x-[2px]"}`}
       />
     </button>
   );

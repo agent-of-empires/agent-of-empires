@@ -8,6 +8,7 @@ import {
   SliderField,
   TextField,
   ToggleField,
+  SETTINGS_CARD,
 } from "./FormFields";
 import type { RowLabel } from "./rowLabel";
 import { CUSTOM_SETTINGS_WIDGETS } from "./customWidgetRegistry";
@@ -267,9 +268,14 @@ export function SchemaSection({
 
   return (
     <div className="space-y-4">
-      <div className="divide-y divide-surface-700/40">
-        {primary.map((d) => wrap(d, (row) => renderField(d, values, makeSave(d), row)))}
-      </div>
+      {primary.length > 0 && (
+        // One raised card of rows split by hairlines, as a phone groups its settings; the folds below match it.
+        <div className={SETTINGS_CARD}>
+          <div className="divide-y divide-surface-700/40">
+            {primary.map((d) => wrap(d, (row) => renderField(d, values, makeSave(d), row)))}
+          </div>
+        </div>
+      )}
       {advanced.length > 0 && (
         <CollapsibleSection title="Advanced" subtitle={advancedSubtitle} defaultOpen={targetAdvanced}>
           <div className="divide-y divide-surface-700/40">

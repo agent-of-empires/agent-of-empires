@@ -7,6 +7,7 @@ import {
 import { FontSizeControl } from "./settings/FontSizeControl";
 import { MobileKeysSettings } from "./settings/MobileKeysSettings";
 import { TerminalFontPicker } from "./settings/TerminalFontPicker";
+import { SETTINGS_CAPTION, SETTINGS_CARD } from "./settings/FormFields";
 
 export function TerminalSettings() {
   const { settings, update } = useWebSettings();
@@ -14,9 +15,9 @@ export function TerminalSettings() {
 
   return (
     <div>
-      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">Terminal</h3>
+      <h3 className={SETTINGS_CAPTION}>This browser</h3>
 
-      <div className="space-y-4">
+      <div className={`${SETTINGS_CARD} py-4 space-y-4`}>
         <FontSizeControl
           label="Mobile font size"
           testIdPrefix="terminal-mobile-font-size"
