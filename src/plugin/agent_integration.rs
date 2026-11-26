@@ -995,9 +995,11 @@ fn read_report(
     // A container pid cannot prove the writer is the pane's current provider, so
     // a sandboxed report names the launch that wrote it and liveness is that
     // match: an earlier launch's fresh report never describes the replacement.
+    // An unmanaged launch holds no launch id, and the freshness bound is the
+    // only liveness it can offer, so binding applies only where one exists.
     if sandboxed {
         ensure!(
-            launch.is_some_and(|active| report.launch_id.as_deref() == Some(active)),
+            launch.is_none_or(|active| report.launch_id.as_deref() == Some(active)),
             "integration report is not for the active launch"
         );
     }
@@ -3339,12 +3341,22 @@ command = "acme-omp-shim"
         dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
 
         // A replaced launch's fresh report must not describe the new pane.
-        for launch in [None, Some("launch-b")] {
-            let error = read_report("sandbox-test", "test-agent", &plugin, true, launch)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("not for the active launch"), "{error}");
-        }
+        let error = read_report(
+            "sandbox-test",
+            "test-agent",
+            &plugin,
+            true,
+            Some("launch-b"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not for the active launch"), "{error}");
+        // An unmanaged launch keeps no launch id, so its report is accepted and
+        // held to the freshness bound alone.
+        assert!(matches!(
+            read_report("sandbox-test", "test-agent", &plugin, true, None).unwrap(),
+            ReportRead::Snapshot(_)
+        ));
         assert!(matches!(
             read_report(
                 "sandbox-test",
