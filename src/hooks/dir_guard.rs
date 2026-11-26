@@ -383,11 +383,33 @@ fn create_child(kind: HookBase, instance_id: &str) -> Result<OwnedFd> {
 
 /// Exclusive `flock` on `<sandbox base>/.<id>.lock`, outside any bound dir. `None` when it
 /// can't be taken: the sandbox base is unusable, or the lock file can't be opened or locked.
+/// Cleanup unlinks the name while holding it, so a lock is kept only while the name still
+/// refers to the file locked; otherwise a later opener would lock a new file beside it.
 fn lock_instance(instance_id: &str) -> Option<std::fs::File> {
+    let name = format!(".{instance_id}.lock");
+    for _ in 0..3 {
+        let file = lock_instance_file(instance_id, &name)?;
+        let held = fstat(&file).ok();
+        let current = with_base(HookBase::Sandbox, |base| {
+            Ok(fstatat(base, name.as_str(), AtFlags::AT_SYMLINK_NOFOLLOW).ok())
+        })
+        .ok()
+        .flatten();
+        if held.zip(current).is_some_and(|(held, current)| {
+            (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+        }) {
+            return Some(file);
+        }
+    }
+    tracing::warn!(target: "hooks.guard", "switch lock for {instance_id} kept being replaced");
+    None
+}
+
+fn lock_instance_file(instance_id: &str, name: &str) -> Option<std::fs::File> {
     let file = with_base(HookBase::Sandbox, |base| {
         let fd = openat(
             base,
-            format!(".{instance_id}.lock").as_str(),
+            name,
             OFlag::O_CREAT
                 | OFlag::O_RDWR
                 | OFlag::O_NOFOLLOW
@@ -719,8 +741,10 @@ pub(crate) fn host_launch_instance_dir_path(instance_id: &str) -> Result<PathBuf
 /// `ENOTEMPTY`, which surfaces as a warn-skip.
 pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
     crate::session::validate_instance_id(instance_id)?;
+    let sandbox_base = sandbox_hook_base_path().is_ok_and(|base| base.exists());
+    let _lock = sandbox_base.then(|| lock_instance(instance_id)).flatten();
     let host = remove_child(HookBase::Host, instance_id);
-    if sandbox_hook_base_path().is_ok_and(|base| base.exists()) {
+    if sandbox_base {
         remove_child(HookBase::Sandbox, instance_id)?;
         let _ = with_base(HookBase::Sandbox, |base| {
             Ok(unlinkat(
@@ -1116,6 +1140,53 @@ mod tests {
     /// A switch makes the new dir before removing the old one, so a read in between still finds
     /// the old status, and a writer that arrives in between waits on the switch lock and then
     /// lands in the new dir.
+    /// A waiter that wins a lock whose name was unlinked meanwhile takes the current one, so it
+    /// and a later opener never both hold the row's lock.
+    #[test]
+    #[serial(hook_base)]
+    fn a_lock_unlinked_while_held_is_not_shared() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let id = "relocked";
+        let lock_path = sandbox_hook_base_path()
+            .unwrap()
+            .join(format!(".{id}.lock"));
+        let holder = lock_instance(id).unwrap();
+        let (contended, waiting) = std::sync::mpsc::channel();
+        *LOCK_CONTENTION_FOR_TEST.lock().unwrap() = Some(contended);
+        let (locked, held) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let waiter = std::thread::spawn(move || {
+            BaseGuard::set_thread_base(base);
+            let lock = lock_instance(id);
+            locked.send(lock.is_some()).unwrap();
+            let _ = released.recv();
+            drop(lock);
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the waiter blocks on the held lock");
+        *LOCK_CONTENTION_FOR_TEST.lock().unwrap() = None;
+        std::fs::remove_file(&lock_path).unwrap();
+        drop(holder);
+        assert!(held
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap());
+        let fresh = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert!(
+            matches!(fresh.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "a later opener must wait on the waiter's lock"
+        );
+        release.send(()).unwrap();
+        waiter.join().unwrap();
+        remove_instance_dir(id).unwrap();
+    }
+
     #[test]
     #[serial(hook_base)]
     fn a_writer_during_a_switch_lands_in_the_new_dir() {
