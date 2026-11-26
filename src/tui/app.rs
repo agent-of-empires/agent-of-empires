@@ -1961,10 +1961,12 @@ impl App {
                 self.pull_digest = self.offered_digest(&self.pull_image);
             }
         } else {
+            // The ended pull's digest goes with it: a retry, or a pull waiting behind its outcome,
+            // records its own.
             self.pull_started_here = false;
+            self.pull_digest = None;
             if !self.pull.holds_line() {
                 self.pull_image.clear();
-                self.pull_digest = None;
             }
         }
         if request == PullRequest::Start
@@ -5667,6 +5669,39 @@ mod tests {
         assert_eq!(
             app.image_update, None,
             "the pull behind Done didn't take its offer off"
+        );
+
+        // The same behind a failure, which leaves no digest for the pull that takes the line.
+        let (mut app, _terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        app.image_update = Some(a.clone());
+        app.start_pull(a.image.clone());
+        answer_sent(&mut app, &sent, 0, running());
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Failed {
+                reason: crate::containers::image_pull::PullFailureReason::Network,
+                message: String::new(),
+                error: String::new(),
+            }),
+        );
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullAnswer {
+                report: running(),
+                offer: Some(ImageOffer::Update(moved.clone())),
+                image: Some(a.image.clone()),
+                flight: None,
+            },
+        );
+        assert!(app.pull.dismiss(&app.pull.drawn().unwrap()));
+        answer_pull(&mut app, PullRequest::Poll, running());
+        answer_pull(&mut app, PullRequest::Poll, done());
+        assert_eq!(
+            app.image_update, None,
+            "the failed pull's digest left the newer install on offer"
         );
     }
 
