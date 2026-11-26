@@ -65,6 +65,8 @@ The host delivers a command that has no client [`action`](../plugin-api.md#comma
 
 The host also pushes notifications that carry no `id`, such as `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) for plugins that hold `session.read`. Ignore methods you do not handle and never reply. See [Session status events](../plugin-api.md#session-driving-rpcs) in the Plugin API reference.
 
+Host-initiated requests such as `mcp.rewrite` and the `mcp.serve` methods (`mcp.session.servers`, `mcp.tools.list`, `mcp.tools.call`) arrive with string ids like `h-1`; answer with the same id. The `mcp.cancel` notification has no id (the call to stop is in `params.request_id`); do not reply to it. A plugin that wants to offer MCP tools to agents holds `mcp.serve`; see [Serving MCP servers](../plugin-api.md#serving-mcp-servers-api_version--26).
+
 ## Build and launch
 
 The entrypoint must be **plugin-relative**, never resolved on the daemon's `PATH`. Build into `.aoe-build/`, which the host excludes from the plugin's integrity hash, then point `command` at the artifact:

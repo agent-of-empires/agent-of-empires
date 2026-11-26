@@ -117,7 +117,7 @@ When a launch requests resume, AoE preserves an unknown stored ID and attempts i
 
 Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. Capturing a different ID clears it; an explicit `set-session-id` assertion or a successful launch can also clear it.
 
-On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.
+On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends may then reach the new conversation.
 
 AoE reports this fresh result only after the new association, or the cleared association for an agent that publishes its own ID later, is durably committed. A publication failure refuses the launch instead of reporting fresh success with the old association still stored.
 
@@ -191,7 +191,7 @@ Two tool names can also point at the same agent on different accounts, through `
 
 The carry applies only when the new tool resolves to the same built-in agent, the session has a conversation to carry, and AoE knows the agent's transcript layout (Claude Code today). Anything else takes the parking swap above.
 
-The CLI reaches this swap with `aoe session restart <session> --tool <tool>`, and for a structured session `aoe acp switch-account <session> <tool>` does the same but refuses instead of parking when the carry does not apply. A structured session parked on a rate limit continues with the interrupted prompt instead of the restart wake message; see [Switching accounts manually](../structured-view/troubleshooting.md#switching-accounts-manually).
+The CLI reaches this swap with `aoe session restart <session> --tool <tool>`, and for a structured session `aoe acp switch-account <session> <tool>` does the same but refuses instead of parking when the carry does not apply. A structured session parked on a rate limit continues with the interrupted prompt; see [Switching accounts manually](../structured-view/troubleshooting.md#switching-accounts-manually).
 
 The outgoing account keeps its own copy, so swapping accounts back and forth stays continuous: the account you swap away from is the one that was just running, so on the way back its transcript replaces the older copy the earlier swap left behind. A copy the incoming account wrote more recently than the outgoing one is left alone.
 
@@ -204,8 +204,6 @@ Rebinding the record with `aoe session set-session-id --store` copies nothing, s
 ## Picking up an upgraded agent CLI
 
 Upgrading the agent binary from inside a session does not replace the process in the pane. Restart the session instead of creating a new one: press `e` (`E` with strict hotkeys) or `F5`, or run `aoe session restart <session>` (`--all` to restart every eligible session in the profile; from an agent session, the caller is skipped so the command can finish). A restart runs only `on_launch`, whose failures are warnings, and resumes the conversation while `session.auto_resume_on_restart` is on (the default). A new session runs `on_create`, whose failure [aborts creation](repo-config.md#hooks).
-
-AoE also notices when the agent binary was replaced after a session launched. While the session is idle, the web sidebar menu offers **Restart to update** (it keeps the conversation) and the TUI row shows an `[update]` badge, with the same restart under the context menu.
 
 ## Importing an existing conversation
 

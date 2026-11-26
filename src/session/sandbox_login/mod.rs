@@ -10,6 +10,8 @@ use crate::containers::EnvEntry;
 pub(crate) mod claude;
 pub(crate) mod code;
 pub(crate) mod helper;
+#[cfg(test)]
+pub(crate) mod test_fake;
 
 /// What a credential file holds, as the agent's integration reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
