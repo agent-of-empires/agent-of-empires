@@ -405,7 +405,6 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("PATCH", "/api/sessions/{id}/unread"),
     ("PATCH", "/api/sessions/{id}/worktree-name"),
     ("POST", "/api/sessions/{id}/purge/abandon"),
-    ("POST", "/api/sessions/{id}/restart-for-update"),
     ("POST", "/api/sessions/{id}/restore"),
     ("POST", "/api/sessions/{id}/start"),
     ("POST", "/api/sessions/{id}/stop"),
@@ -565,6 +564,50 @@ mod tests {
     use super::*;
     use crate::server::test_helpers::vecs;
     use crate::server::test_support;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cityhall_denies_sandbox_login_mutations_before_json() {
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.cityhall_mode = true,
+        );
+        let app = test_support::build_router_for_test(state);
+        for (method, path) in [
+            (Method::POST, "/api/sandbox/login"),
+            (Method::DELETE, "/api/sandbox/login"),
+            (Method::DELETE, "/api/sandbox/login/missing"),
+            (Method::POST, "/api/sandbox/login/missing/code"),
+        ] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{"))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::UnixOwner {
+                    uid: nix::unistd::geteuid().as_raw(),
+                },
+            ));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                "cityhall_mode",
+                "{method} {path}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn cityhall_reorder_preserves_native_rows_and_allows_structured_ordering() {
