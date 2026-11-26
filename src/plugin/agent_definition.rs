@@ -181,3 +181,83 @@ impl<'a> DefinitionData<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors the built-in Claude table in `src/agents.rs`.
+    const CLAUDE_SHAPED_HOOKS: &str = r#"
+[agent_integrations.hooks]
+settings_rel_path = ".claude/settings.json"
+config_dir_env_var = "CLAUDE_CONFIG_DIR"
+format = "json_settings"
+
+[[agent_integrations.hooks.events]]
+event = "SessionStart"
+identity_field = "session_id"
+[[agent_integrations.hooks.events]]
+event = "PreToolUse"
+status = "running"
+waiting_tools = ["AskUserQuestion"]
+[[agent_integrations.hooks.events]]
+event = "PostToolUse"
+matcher = "AskUserQuestion"
+status = "running"
+[[agent_integrations.hooks.events]]
+event = "UserPromptSubmit"
+status = "running"
+identity_field = "session_id"
+[[agent_integrations.hooks.events]]
+event = "Stop"
+status = "idle"
+[[agent_integrations.hooks.events]]
+event = "StopFailure"
+status = "idle"
+[[agent_integrations.hooks.events]]
+event = "Notification"
+matcher = "permission_prompt|elicitation_dialog|agent_needs_input"
+status = "waiting"
+[[agent_integrations.hooks.events]]
+event = "Notification"
+matcher = "idle_prompt|agent_completed"
+status = "idle"
+[[agent_integrations.hooks.events]]
+event = "ElicitationResult"
+status = "running"
+"#;
+
+    #[test]
+    #[serial_test::serial]
+    fn declared_claude_shaped_hooks_install_byte_identical_to_the_built_in() {
+        let app = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let manifest = aoe_plugin_api::PluginManifest::from_toml_str(&format!(
+            "id = \"acme.claude-shaped\"\nname = \"Claude shaped\"\nversion = \"1.0.0\"\n\
+             api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             command = \"claude\"\n{CLAUDE_SHAPED_HOOKS}"
+        ))
+        .unwrap();
+        let entry = &manifest.agent_integrations[0];
+        let data = DefinitionData::new(entry);
+        let declared = data.definition(entry, false).unwrap();
+        let built_in = crate::agents::get_agent("claude").unwrap();
+        let config = crate::session::config::Config::default();
+
+        let dir = tempfile::tempdir().unwrap();
+        let [from_declared, from_built_in] = ["declared.json", "built-in.json"].map(|name| {
+            let path = dir.path().join(name);
+            let agent = if name == "declared.json" {
+                &declared
+            } else {
+                built_in
+            };
+            let events = crate::agents::resolved_hook_events(agent, &config).unwrap();
+            crate::hooks::install_hooks(&path, &events, crate::hooks::HookInstallTarget::Host)
+                .unwrap();
+            std::fs::read(path).unwrap()
+        });
+        assert!(!from_built_in.is_empty());
+        assert_eq!(from_declared, from_built_in);
+    }
+}

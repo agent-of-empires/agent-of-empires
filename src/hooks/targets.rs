@@ -24,7 +24,7 @@ pub(crate) enum HookTargetKind {
 
 #[derive(Debug)]
 pub(crate) struct HookTarget {
-    pub agent_name: &'static str,
+    pub agent_name: String,
     pub kind: HookTargetKind,
     pub path: PathBuf,
     /// Default events: migrations repair canonical files, not profile status maps.
@@ -73,7 +73,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                                 let events = crate::agents::resolved_hook_events(agent, &config)
                                     .unwrap_or_default();
                                 targets.push(HookTarget {
-                                    agent_name: agent.name,
+                                    agent_name: agent.name.to_string(),
                                     kind: HookTargetKind::JsonSettings,
                                     path,
                                     events,
@@ -93,7 +93,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                                 crate::agents::resolved_sidecar_hook_events(agent, &config)
                                     .unwrap_or_default();
                             targets.push(HookTarget {
-                                agent_name: agent.name,
+                                agent_name: agent.name.to_string(),
                                 kind: HookTargetKind::Sidecar(sidecar),
                                 path,
                                 events,
@@ -148,7 +148,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                                 continue;
                             }
                             targets.push(HookTarget {
-                                agent_name: "claude",
+                                agent_name: "claude".to_string(),
                                 kind: HookTargetKind::JsonSettings,
                                 path,
                                 events: crate::agents::resolved_hook_events(
@@ -174,36 +174,10 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
     let defaults = crate::session::config::Config::default();
     let mut out = Vec::new();
     for agent in crate::agents::AGENTS {
-        if let Some(hook_cfg) = agent.hook_config.as_ref() {
-            let resolve = |env: &[String]| match hook_cfg.format {
-                HookFormat::JsonSettings => agent_settings_path_in(home, hook_cfg, env),
-                HookFormat::CodexJson => codex_hooks_json_path_in(home, env),
-            };
-            let kind = match hook_cfg.format {
-                HookFormat::JsonSettings => HookTargetKind::JsonSettings,
-                HookFormat::CodexJson => HookTargetKind::CodexJson,
-            };
-            let mut paths: Vec<PathBuf> = Vec::new();
-            for path in
-                std::iter::once(resolve(&[])).chain(env_lists.iter().map(|env| resolve(env)))
-            {
-                if !paths.contains(&path) {
-                    paths.push(path);
-                }
-            }
-            for path in paths {
-                out.push(HookTarget {
-                    agent_name: agent.name,
-                    kind,
-                    path,
-                    events: crate::agents::resolved_hook_events(agent, &defaults)
-                        .unwrap_or_default(),
-                });
-            }
-        }
+        push_hook_config_targets(&mut out, agent, home, env_lists, &defaults);
         if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
             out.push(HookTarget {
-                agent_name: agent.name,
+                agent_name: agent.name.to_string(),
                 kind: HookTargetKind::Sidecar(sidecar),
                 path: home.join(sidecar.host_config_subpath),
                 events: crate::agents::resolved_sidecar_hook_events(agent, &defaults)
@@ -211,7 +185,56 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
             });
         }
     }
+    // Declarations of plugins that are active now; hooks written by one that
+    // has since been removed stay until the plugin is back.
+    let registry = crate::plugin::registry();
+    for tool in crate::plugin::agent_integration::hook_declaring_tools(&registry) {
+        let Some(declared) = crate::plugin::agent_integration::declared_agent(
+            registry.clone(),
+            &tool,
+            std::iter::empty(),
+        ) else {
+            continue;
+        };
+        declared.with_definition(|agent| {
+            push_hook_config_targets(&mut out, agent, home, env_lists, &defaults)
+        });
+    }
     out
+}
+
+fn push_hook_config_targets(
+    out: &mut Vec<HookTarget>,
+    agent: &crate::agents::AgentDef,
+    home: &Path,
+    env_lists: &[Vec<String>],
+    defaults: &crate::session::config::Config,
+) {
+    let Some(hook_cfg) = agent.hook_config.as_ref() else {
+        return;
+    };
+    let resolve = |env: &[String]| match hook_cfg.format {
+        HookFormat::JsonSettings => agent_settings_path_in(home, hook_cfg, env),
+        HookFormat::CodexJson => codex_hooks_json_path_in(home, env),
+    };
+    let kind = match hook_cfg.format {
+        HookFormat::JsonSettings => HookTargetKind::JsonSettings,
+        HookFormat::CodexJson => HookTargetKind::CodexJson,
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for path in std::iter::once(resolve(&[])).chain(env_lists.iter().map(|env| resolve(env))) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    for path in paths {
+        out.push(HookTarget {
+            agent_name: agent.name.to_string(),
+            kind,
+            path,
+            events: crate::agents::resolved_hook_events(agent, defaults).unwrap_or_default(),
+        });
+    }
 }
 
 /// The global and per-profile `environment` lists. A missing config is silent;
@@ -422,5 +445,54 @@ mod tests {
             "{malformed}"
         );
         assert!(malformed.contains("session.store"), "{malformed}");
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn plugin_declared_hooks_are_listed_consented_and_uninstalled() {
+        let app = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _env = EnvGuard::unset(&["EXAMPLE_CONFIG_DIR"]);
+        let manifest =
+            "id = \"acme.declared-hooks\"\nname = \"Declared hooks\"\nversion = \"1.0.0\"\n\
+            api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+            command = \"example-helper\"\n\
+            [agent_integrations.hooks]\nsettings_rel_path = \".example/settings.json\"\n\
+            config_dir_env_var = \"EXAMPLE_CONFIG_DIR\"\nformat = \"json_settings\"\n\
+            [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n\
+            [agent_integrations.trust]\nfile = \".example.json\"\n\
+            location = \"config_dir_or_home\"\npointer = \"/projects/{path}/trusted\"\n\
+            value = true\nsandbox = \"always\"\n";
+        crate::session::test_support::install_agent_plugin("acme.declared-hooks", manifest);
+
+        let home = TempDir::new().unwrap();
+        let target = iter_hook_targets_in(home.path(), &[])
+            .into_iter()
+            .find(|target| target.agent_name == "example-helper")
+            .expect("declared agent is a hook target");
+        assert!(matches!(target.kind, HookTargetKind::JsonSettings));
+        assert_eq!(target.path, home.path().join(".example/settings.json"));
+        assert_eq!(target.events.len(), 1);
+
+        let lines = crate::plugin::agent_integration::consent_lines(
+            &aoe_plugin_api::PluginManifest::from_toml_str(manifest)
+                .unwrap()
+                .agent_integrations[0],
+        )
+        .join("\n");
+        assert!(lines.contains("~/.example/settings.json or $EXAMPLE_CONFIG_DIR/settings.json"));
+        assert!(lines.contains("/projects/{path}/trusted = true into ~/.example.json"));
+        assert!(lines.contains("kept on uninstall"));
+
+        super::super::install_hooks(
+            &target.path,
+            &target.events,
+            crate::hooks::HookInstallTarget::Host,
+        )
+        .unwrap();
+        assert!(has_aoe_marker(&target));
+        assert!(super::super::uninstall_hooks(&target.path).unwrap());
+        assert!(!has_aoe_marker(&target));
     }
 }

@@ -1719,7 +1719,7 @@ pub fn resolved_hook_events(
 }
 
 pub fn resolved_sidecar_hook_events(
-    agent: &AgentDef<'static>,
+    agent: &AgentDef,
     config: &crate::session::config::Config,
 ) -> anyhow::Result<Vec<ResolvedHookEvent>> {
     let Some(sidecar) = &agent.sidecar_hooks else {

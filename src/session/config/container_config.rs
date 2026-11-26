@@ -2318,6 +2318,7 @@ fn apply_folder_trust_config(
     container_workspace_path: &str,
     is_yolo_mode: bool,
     staged: bool,
+    declared: Option<&aoe_plugin_api::agent_integration::AgentTrustDeclaration>,
 ) -> Result<()> {
     match (mount.tool_name, mount.host_rel) {
         ("codex", ".codex") if is_yolo_mode => crate::hooks::trust_codex_project(
@@ -2344,7 +2345,18 @@ fn apply_folder_trust_config(
             // Bind-mounted into the container, which can plant a link here.
             crate::hooks::SymlinkPolicy::Never,
         ),
-        _ => Ok(()),
+        _ => match declared {
+            Some(trust) if crate::hooks::declared_trust_applies_in_sandbox(trust, is_yolo_mode) => {
+                crate::hooks::write_declared_trust(
+                    &sandbox_dir.join(&trust.file),
+                    trust,
+                    container_workspace_path,
+                    // Bind-mounted into the container, which can plant a link here.
+                    crate::hooks::SymlinkPolicy::Never,
+                )
+            }
+            _ => Ok(()),
+        },
     }
 }
 
@@ -2393,6 +2405,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
                     container_workspace_path,
                     is_yolo_mode,
                     agent_config_dir.is_none(),
+                    active_agent.and_then(|agent| agent.trust),
                 )
             })
         {
@@ -7376,6 +7389,48 @@ codex-work = "{}"
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
+    // A declared record is written through `SymlinkPolicy::Never`, and `yolo_only`
+    // follows the host launch state.
+    #[cfg(unix)]
+    #[test]
+    fn test_apply_folder_trust_config_declared_record_in_sandbox() {
+        use aoe_plugin_api::agent_integration::{
+            AgentTrustDeclaration, AgentTrustLocation, AgentTrustSandbox, AgentTrustValue,
+        };
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "pi")
+            .unwrap();
+        let trust = |sandbox| AgentTrustDeclaration {
+            file: ".example.json".into(),
+            location: AgentTrustLocation::ConfigDirOrHome,
+            config_dir_env_var: None,
+            pointer: "/projects/{path}/trusted".into(),
+            value: AgentTrustValue::Bool(true),
+            sandbox,
+        };
+        let apply = |dir: &Path, yolo, trust| {
+            apply_folder_trust_config(mount, dir, "/workspace/wt", yolo, true, Some(trust)).unwrap()
+        };
+
+        let dir = TempDir::new().unwrap();
+        let yolo_only = trust(AgentTrustSandbox::YoloOnly);
+        apply(dir.path(), false, &yolo_only);
+        assert!(!dir.path().join(".example.json").exists());
+        apply(dir.path(), true, &yolo_only);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(".example.json")).unwrap())
+                .unwrap();
+        assert_eq!(parsed["projects"]["/workspace/wt"]["trusted"], true);
+
+        let planted = TempDir::new().unwrap();
+        let outside = planted.path().join("host-secret");
+        fs::write(&outside, "{}").unwrap();
+        std::os::unix::fs::symlink(&outside, planted.path().join(".example.json")).unwrap();
+        apply(planted.path(), false, &trust(AgentTrustSandbox::Always));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "{}");
+    }
+
     // The wholesale folder-trust disable is only safe against a config AoE
     // stages for one container. In a config dir the user named (and also runs
     // on the host) it would outlive the session, so that arm trusts one path.
@@ -7388,7 +7443,8 @@ codex-work = "{}"
 
         for staged in [true, false] {
             let dir = TempDir::new().unwrap();
-            apply_folder_trust_config(mount, dir.path(), "/workspace/wt", true, staged).unwrap();
+            apply_folder_trust_config(mount, dir.path(), "/workspace/wt", true, staged, None)
+                .unwrap();
 
             let settings = dir.path().join("settings.json");
             let trusted = dir.path().join("trustedFolders.json");

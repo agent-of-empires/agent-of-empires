@@ -8,7 +8,9 @@
 use anyhow::Result;
 use clap::Subcommand;
 
-use crate::session::{host_hook_agent, host_hook_disclosure, update_app_state, Config};
+use crate::session::{
+    host_hook_agent, host_hook_declared_agent, host_hook_disclosure, update_app_state, Config,
+};
 
 #[derive(Subcommand)]
 pub enum HooksCommands {
@@ -68,8 +70,11 @@ fn print_disclosure(profile: &str) {
     let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
     let status_hooks = config.session.agent_status_hooks;
 
+    let declared_tools =
+        crate::plugin::agent_integration::hook_declaring_tools(&crate::plugin::registry());
     let mut tool_names = crate::agents::agent_names();
     tool_names.extend(config.session.custom_agents.keys().map(String::as_str));
+    tool_names.extend(declared_tools.iter().map(String::as_str));
     tool_names.sort_unstable();
     tool_names.dedup();
 
@@ -80,19 +85,23 @@ fn print_disclosure(profile: &str) {
     let disclosures: Vec<_> = tool_names
         .into_iter()
         .filter_map(|tool_name| {
-            let agent = host_hook_agent(
-                tool_name,
-                &config.session.launch_command_for(tool_name),
-                &config.session,
-            );
-            let Some(agent) = agent else {
-                unresolved.push(tool_name);
-                return None;
+            let command = config.session.launch_command_for(tool_name);
+            let describe = |agent: &crate::agents::AgentDef| {
+                crate::agents::hook_install_required(agent, status_hooks)
+                    .then(|| host_hook_disclosure(tool_name, agent, &config))
             };
-            if !crate::agents::hook_install_required(agent, status_hooks) {
-                return None;
-            }
-            let disclosure = host_hook_disclosure(tool_name, agent, &config);
+            let disclosure = match host_hook_agent(tool_name, &command, &config.session) {
+                Some(agent) => describe(agent),
+                None => {
+                    let Some(declared) =
+                        host_hook_declared_agent(tool_name, &command, &config.session)
+                    else {
+                        unresolved.push(tool_name);
+                        return None;
+                    };
+                    declared.with_definition(describe).flatten()
+                }
+            }?;
             (!disclosure.settings_paths.is_empty()).then_some((tool_name, disclosure))
         })
         .collect();

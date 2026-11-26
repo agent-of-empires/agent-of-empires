@@ -136,6 +136,28 @@ pub(crate) fn host_hook_agent(
         })
 }
 
+/// The active plugin declaration that runs `tool` as `command` when no built-in
+/// or bundled agent covers it. Its hooks and trust are installed like theirs.
+pub(crate) fn host_hook_declared_agent(
+    tool_name: &str,
+    command: &str,
+    session: &crate::session::config::SessionConfig,
+) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+    if host_hook_agent(tool_name, command, session).is_some() {
+        return None;
+    }
+    crate::plugin::agent_integration::declared_agent(
+        crate::plugin::registry(),
+        tool_name,
+        session
+            .custom_agents
+            .iter()
+            .filter(|(_, command)| !command.trim().is_empty())
+            .map(|(name, _)| name.as_str()),
+    )
+    .filter(|agent| agent.contribution().command.as_deref() == Some(command))
+}
+
 /// The repo-merged config the creation dialog's disclosure must read. A repo
 /// can move `agent_detect_as`, which is where the launcher's agent comes from;
 /// the other fields the disclosure reads are repo-denied, so merging costs
@@ -159,7 +181,7 @@ pub(crate) fn host_hook_disclosure_config_with_repo(
 /// is what the launch exports to the agent, so it is what the agent reads.
 fn host_hook_config_path(
     tool_name: &str,
-    agent: &'static crate::agents::AgentDef,
+    agent: &crate::agents::AgentDef,
     home: &std::path::Path,
     session_config: &crate::session::config::SessionConfig,
     host_environment: &[String],
@@ -204,7 +226,7 @@ fn routed_settings_path(
 /// decide the paths.
 pub(crate) fn host_hook_disclosure(
     tool_name: &str,
-    agent: &'static crate::agents::AgentDef,
+    agent: &crate::agents::AgentDef,
     config: &crate::session::config::Config,
 ) -> HostHookDisclosure {
     let mut disclosure = HostHookDisclosure {
@@ -369,12 +391,14 @@ impl Instance {
                 &self.extra_args,
             ))?;
         }
-        let agent = self.status_agent();
-        self.ensure_disclosed_host_hook_path(agent)?;
-        if self.is_sandboxed() {
-            self.install_agent_status_hooks(agent);
-        }
-        self.ensure_host_folder_trust(agent);
+        self.with_hook_agent(|this, agent| {
+            this.ensure_disclosed_host_hook_path(agent)?;
+            if this.is_sandboxed() {
+                this.install_agent_status_hooks(agent);
+            }
+            this.ensure_host_folder_trust(agent);
+            Ok::<(), anyhow::Error>(())
+        })?;
         self.propagate_managed_skills();
         let on_launch_hooks = if skip_on_launch {
             None
@@ -551,9 +575,30 @@ impl Instance {
         crate::session::skills_model::log_sync_outcomes(&self.tool, &outcomes);
     }
 
+    /// Runs `use_agent` with the agent this launch's hooks and trust belong to: a
+    /// built-in or bundled one, else the session's active plugin declaration.
+    pub(super) fn with_hook_agent<R>(
+        &mut self,
+        use_agent: impl FnOnce(&mut Self, Option<&crate::agents::AgentDef<'_>>) -> R,
+    ) -> R {
+        if let Some(agent) = self.status_agent() {
+            return use_agent(self, Some(agent));
+        }
+        let Some(declared) = self.declared_agent() else {
+            return use_agent(self, None);
+        };
+        let mut use_agent = Some(use_agent);
+        let result = declared
+            .with_definition(|agent| (use_agent.take().expect("called once"))(self, Some(agent)));
+        match result {
+            Some(result) => result,
+            None => (use_agent.take().expect("declaration yielded no agent"))(self, None),
+        }
+    }
+
     fn ensure_disclosed_host_hook_path(
         &self,
-        agent: Option<&'static crate::agents::AgentDef<'static>>,
+        agent: Option<&crate::agents::AgentDef<'_>>,
     ) -> Result<()> {
         let Some(agent) = agent else {
             return Ok(());
@@ -622,10 +667,7 @@ impl Instance {
     /// which never receives it, so the file hooks are installed into is the
     /// file the agent opens. An agent that routes no store gets no root, and
     /// keeps resolving its config directory from the environment.
-    fn routed_hook_root(
-        &self,
-        agent: &'static crate::agents::AgentDef,
-    ) -> Option<std::path::PathBuf> {
+    fn routed_hook_root(&self, agent: &crate::agents::AgentDef) -> Option<std::path::PathBuf> {
         let (_, binding, _) = self.conversation_target()?;
         let binding = binding.filter(|binding| binding.is_known())?;
         let execution = binding.execution.as_ref()?;
@@ -637,7 +679,7 @@ impl Instance {
     /// Install optional status hooks and mandatory authoritative identity hooks.
     pub(super) fn install_agent_status_hooks(
         &mut self,
-        agent: Option<&'static crate::agents::AgentDef<'static>>,
+        agent: Option<&crate::agents::AgentDef<'_>>,
     ) {
         self.identity_publisher_launched = false;
         let config = crate::session::config::profile_config::resolve_config_or_warn(
@@ -689,7 +731,7 @@ impl Instance {
     /// settings file written here is the file the agent reads.
     fn install_host_hooks(
         &self,
-        agent: &'static crate::agents::AgentDef,
+        agent: &crate::agents::AgentDef,
         home: &Path,
         session_cfg: &crate::session::config::SessionConfig,
         host_environment: &[String],
@@ -750,7 +792,7 @@ impl Instance {
     /// `session.pre_trust_agent_folders`. The path is canonicalized because
     /// agents key trust on the resolved directory, not the symlink used to
     /// reach it.
-    fn ensure_host_folder_trust(&self, agent: Option<&'static crate::agents::AgentDef<'static>>) {
+    fn ensure_host_folder_trust(&self, agent: Option<&crate::agents::AgentDef<'_>>) {
         if self.is_sandboxed() {
             return;
         }
@@ -778,6 +820,23 @@ impl Instance {
             tracing::warn!(target: "session.store",
                 "Failed to pre-trust {} in the host {} config: {}", project_path, agent.name, e);
         }
+        if let Some(trust) = agent.trust {
+            let path = crate::hooks::declared_trust_path(
+                trust,
+                &home,
+                &environment,
+                config_dir.as_deref(),
+            );
+            if let Err(e) = crate::hooks::write_declared_trust(
+                &path,
+                trust,
+                &project_path,
+                crate::hooks::SymlinkPolicy::Follow,
+            ) {
+                tracing::warn!(target: "session.store",
+                    "Failed to pre-trust {} in {}: {}", project_path, path.display(), e);
+            }
+        }
     }
 
     /// Install a sidecar agent's host hooks. For agents whose hooks are scoped
@@ -787,7 +846,7 @@ impl Instance {
     /// agent's standalone config and run any `post_install_host` follow-up.
     fn install_sidecar_host_hooks(
         &self,
-        sidecar: &'static crate::agents::SidecarHooks,
+        sidecar: &crate::agents::SidecarHooks,
         home: &Path,
         session_cfg: &crate::session::config::SessionConfig,
         host_environment: &[String],
@@ -973,7 +1032,7 @@ pub(super) fn host_home(host_environment: &[String]) -> Option<std::path::PathBu
 }
 
 fn resolved_host_hook_events(
-    agent: &'static crate::agents::AgentDef,
+    agent: &crate::agents::AgentDef,
     config: &crate::session::config::Config,
     status_hooks_enabled: bool,
 ) -> Option<Vec<crate::agents::ResolvedHookEvent>> {
