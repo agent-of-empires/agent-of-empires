@@ -283,6 +283,24 @@ describe("SuggestionsSettings", () => {
     await waitFor(() => expect(api.resetSuggestionPreset).toHaveBeenCalledWith("gh", "ci-failed"));
   });
 
+  it("moves focus into a sub-view and back to the control that opened it", async () => {
+    open();
+    const edit = await screen.findByRole("button", { name: "Edit CI failures" });
+    edit.focus();
+    fireEvent.click(edit);
+    const back = await screen.findByRole("button", { name: /\u2190 CI failures/ });
+    await waitFor(() => expect(document.activeElement).toBe(back));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit CI failures" })));
+
+    const linked = document.querySelector<HTMLElement>('[data-focus-key="linked"]')!;
+    fireEvent.click(linked);
+    const linkedBack = await screen.findByRole("button", { name: /\u2190 Suggestions/ });
+    await waitFor(() => expect(document.activeElement).toBe(linkedBack));
+    fireEvent.click(linkedBack);
+    await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-focus-key="linked"]')));
+  });
+
   it("keeps the editor open and shows the error when saving fails", async () => {
     open();
     api.putSuggestionPreset.mockResolvedValueOnce({ ok: false, error: "unknown agent", stale: false });

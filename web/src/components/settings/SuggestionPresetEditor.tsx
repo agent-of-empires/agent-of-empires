@@ -14,6 +14,9 @@ import { TemplateEditor } from "./TemplateEditor";
 import { SuggestionSwitch } from "./suggestionsShared";
 import { BUTTON_INLINE } from "../../lib/surfaces";
 
+/** The Back button mounts once the draft is there, so focus follows the open. */
+const focusOnMount = (el: HTMLElement | null) => el?.focus();
+
 /** A kind to open in the editor; `returnToSuggestions` swaps Back for a link to the suggestions view. */
 export interface PresetFocus {
   providerId: string;
@@ -122,7 +125,7 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
 
   return (
     <div className="space-y-4">
-      <button type="button" onClick={onBack} className="cursor-pointer text-sm text-brand-500">
+      <button ref={focusOnMount} type="button" onClick={onBack} className="cursor-pointer text-sm text-brand-500">
         &larr; {source.label}
       </button>
       <div>
