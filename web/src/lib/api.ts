@@ -3673,7 +3673,7 @@ async function suggestionMutation(url: string, method: string, body?: unknown): 
   return result;
 }
 
-export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refresh", "POST");
+export const refreshSuggestions = () => suggestionMutation("/api/suggestions/refresh", "POST");
 
 export const runSuggestionFix = (providerId: string) =>
   suggestionRequest("/api/suggestions/fix", "POST", { provider_id: providerId });

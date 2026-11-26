@@ -34,6 +34,8 @@ export interface HooksReview {
 }
 
 const REFRESH_POLL_MS = 2000;
+// ponytail: no push channel for suggestions, so an idle view polls; replace with a Daemon event if one lands.
+const IDLE_POLL_MS = 60_000;
 const UNDO_MS = 10_000;
 export const suggestionKey = (item: SuggestionItem) => `${item.provider_id}:${item.id}`;
 
@@ -82,13 +84,14 @@ export function useSuggestions(
     if (mounted.current) setLoadTick((t) => t + 1);
   }, [apply]);
 
-  // While a provider refreshes, follow it until it answers.
-  const refreshingProvider = !!snapshot && !idleFor?.(snapshot) && snapshot.providers.some((p) => p.refreshing);
+  // Re-read so later provider results show; while a provider refreshes, follow it closely.
+  const following = !!snapshot && !offline && !idleFor?.(snapshot);
+  const delay = snapshot?.providers.some((p) => p.refreshing) ? REFRESH_POLL_MS : IDLE_POLL_MS;
   useEffect(() => {
-    if (!refreshingProvider) return;
-    const timer = setTimeout(() => void load(), REFRESH_POLL_MS);
+    if (!following) return;
+    const timer = setTimeout(() => void load(), delay);
     return () => clearTimeout(timer);
-  }, [refreshingProvider, loadTick, load]);
+  }, [following, delay, loadTick, load]);
 
   useEffect(() => {
     mounted.current = true;

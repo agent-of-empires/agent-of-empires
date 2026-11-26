@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SidebarSuggestions } from "../sidebar/SidebarSuggestions";
-import { updateSuggestionPrefs } from "../../lib/api";
+import { refreshSuggestions, updateSuggestionPrefs } from "../../lib/api";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
 const { fetchSuggestions, startSuggestion, dismissSuggestion, fetchSuggestionProjects } = vi.hoisted(() => ({
@@ -101,6 +101,33 @@ describe("SidebarSuggestions", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("re-reads an idle snapshot, so later provider results show", async () => {
+    vi.useFakeTimers();
+    try {
+      fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
+      renderIt();
+      await act(async () => {});
+      expect(fetchSuggestions).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(61_000);
+      });
+      expect(fetchSuggestions).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reloads when another view asks for a refresh", async () => {
+    fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
+    renderIt();
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(1));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 200 })));
+    await act(async () => {
+      await refreshSuggestions();
+    });
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(2));
   });
 
   it("starts collapsed, then lists up to 3 items and View all", async () => {
