@@ -4,6 +4,7 @@ import { useRespawnSession } from "../../hooks/useRespawnSession";
 import type { AcpState } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
 import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
+import { IntegrationLostBanner } from "./IntegrationLostBanner";
 import { ContainerGoneBanner, type NewSessionLike } from "./ContainerGoneBanner";
 import { SECONDARY_BUTTON } from "./RecoveryActionRow";
 import { StartupErrorBanner } from "./StartupErrorBanner";
@@ -61,7 +62,7 @@ export function SessionBanners({
     snoozedUntil,
     workerStopping: acpWorkerState === "stopping",
   });
-  const healthy = !state.startupError && !state.workerStopped && !state.workerRestarting;
+  const healthy = !state.startupError && !state.integrationLost && !state.workerStopped && !state.workerRestarting;
   const idle = healthy && !state.turnActive;
   return (
     <>
@@ -93,6 +94,7 @@ export function SessionBanners({
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
+      {state.integrationLost && <IntegrationLostBanner reason={state.integrationLost} />}
       {variant === "trashed" && <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />}
       {variant === "archived" && <ArchivedWorkerStoppedBanner sessionId={sessionId} />}
       {variant === "snoozed" && snoozedUntil && (

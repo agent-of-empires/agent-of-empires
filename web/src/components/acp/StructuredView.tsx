@@ -529,7 +529,9 @@ function ComposerDock({
         rejected={state.rejectedPrompts}
         onRetry={ctx.retryRejectedPrompt}
         onDismiss={ctx.dismissRejectedPrompt}
-        disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
+        disabled={
+          state.workerRestarting || state.workerStopped || Boolean(state.startupError) || Boolean(state.integrationLost)
+        }
       />
 
       <SessionNoticesStrip notices={visibleSessionNotices(state)} onDismiss={ctx.dismissSessionNotice} />

@@ -4584,6 +4584,20 @@
       "components": ["web/src/components/acp/CompactionReminderBanner.tsx"]
     },
     {
+      "id": "acp.integration-lost-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/__tests__/IntegrationLostBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/components/sidebar/sessionQueuedReason.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/IntegrationLostBanner.tsx",
+        "web/src/components/sidebar/sessionQueuedReason.ts"
+      ]
+    },
+    {
       "id": "acp.context-primer-banner",
       "kind": "vitest",
       "risk": "medium",
