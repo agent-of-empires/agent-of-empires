@@ -795,6 +795,7 @@ impl Instance {
                         agent.name,
                         home,
                         host_environment,
+                        session_cfg,
                     )
                 {
                     tracing::warn!(target: "session.store",

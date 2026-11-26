@@ -196,20 +196,33 @@ pub(crate) fn iter_all_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -
 }
 
 /// Whether `path` is a built-in agent other than `agent_name`'s own settings file,
-/// which no plugin declaration may take over.
+/// at its default, environment or `session.agent_config_dir` location, which no
+/// plugin declaration may take over.
 pub(crate) fn is_other_builtin_hook_path(
     path: &Path,
     agent_name: &str,
     home: &Path,
     host_env: &[String],
+    session: &crate::session::config::SessionConfig,
 ) -> bool {
+    let destination = resolved(path);
+    let relocated = crate::agents::AGENTS
+        .iter()
+        .filter(|agent| agent.name != agent_name)
+        .filter_map(|agent| {
+            let leaf = Path::new(agent.hook_config.as_ref()?.settings_rel_path).file_name()?;
+            Some(session.agent_config_dir_for(agent.name, home)?.join(leaf))
+        });
     builtin_hook_targets_in(
         home,
         &[host_env.to_vec()],
         &crate::session::config::Config::default(),
     )
-    .iter()
-    .any(|target| target.agent_name != agent_name && resolved(&target.path) == resolved(path))
+    .into_iter()
+    .filter(|target| target.agent_name != agent_name)
+    .map(|target| target.path)
+    .chain(relocated)
+    .any(|builtin| resolved(&builtin) == destination)
 }
 
 fn builtin_hook_targets_in(
@@ -589,7 +602,7 @@ mod tests {
         std::fs::create_dir_all(&dotfiles).unwrap();
         std::os::unix::fs::symlink(&dotfiles, home.join(".mine")).unwrap();
         let owned = |path: &str, agent: &str| {
-            is_other_builtin_hook_path(&home.join(path), agent, home, &[])
+            is_other_builtin_hook_path(&home.join(path), agent, home, &[], &Default::default())
         };
 
         // An alias of another agent's directory is that agent's file, existing or not.
@@ -631,7 +644,9 @@ mod tests {
             home.join(".mine/own.json"),
         )
         .unwrap();
-        let owned = |path: &str| is_other_builtin_hook_path(&home.join(path), "example", home, &[]);
+        let owned = |path: &str| {
+            is_other_builtin_hook_path(&home.join(path), "example", home, &[], &Default::default())
+        };
 
         assert!(owned(".mine/settings.json"));
         assert!(owned(".rel/settings.json"));
@@ -639,6 +654,30 @@ mod tests {
         assert!(
             !owned(".mine/own.json"),
             "a link to the plugin's own file stays allowed"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn builtin_hook_ownership_covers_relocated_settings() {
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR", "CODEX_HOME"]);
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut session = crate::session::config::SessionConfig::default();
+        session.agent_config_dir.insert(
+            "claude".into(),
+            home.join("shared").to_string_lossy().into_owned(),
+        );
+        let owned = |path: &str, agent: &str| {
+            is_other_builtin_hook_path(&home.join(path), agent, home, &[], &session)
+        };
+
+        assert!(owned("shared/settings.json", "example"));
+        assert!(!owned("shared/settings.json", "claude"), "its own file");
+        assert!(!owned("elsewhere/settings.json", "example"));
+        assert!(
+            owned(".claude/settings.json", "example"),
+            "defaults still count"
         );
     }
 }
