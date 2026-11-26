@@ -234,7 +234,7 @@ const MIGRATIONS: &[Migration] = &[
         v032_bound_capture_exclusions::run,
     ),
     (
-        33,
+        v033_isolate_sandbox_content::VERSION,
         "isolate_sandbox_content",
         v033_isolate_sandbox_content::run,
     ),
@@ -504,10 +504,7 @@ fn run_migrations_inner(
         }
     }
     debug!("Current schema version: {}", current);
-    if current == CURRENT_VERSION {
-        v027_isolate_sandbox_stores::reconcile_pending(announce)?;
-        v033_isolate_sandbox_content::reconcile_pending(announce)?;
-    } else {
+    if current < CURRENT_VERSION {
         let pending: Vec<&Migration> = MIGRATIONS
             .iter()
             .filter(|(version, ..)| *version > current)
@@ -534,6 +531,11 @@ fn run_migrations_inner(
             });
             info!(target: "migrations", version, name, duration_ms = start.elapsed().as_millis() as u64, "migration completed");
         }
+    }
+    if current == CURRENT_VERSION || (announce && current >= v033_isolate_sandbox_content::VERSION)
+    {
+        v027_isolate_sandbox_stores::reconcile_pending(announce)?;
+        v033_isolate_sandbox_content::reconcile_pending(announce)?;
     }
     if announce {
         run_explicit_recovery(transaction, serve)?;

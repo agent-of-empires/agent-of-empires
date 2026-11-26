@@ -1,5 +1,6 @@
 //! `aoe migrate`: run pending data migrations now, with progress on stderr.
 
+use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -119,7 +120,7 @@ impl StderrRenderer {
             _ => {}
         }
         let discrete = !matches!(event, Event::Progress(_));
-        let notice = matches!(event, Event::Notice(_));
+        let notice = matches!(event, Event::Notice(_) | Event::SandboxDeferred { .. });
         self.console.apply(event);
         let slow = self
             .started
@@ -242,14 +243,34 @@ pub async fn run(args: &MigrateArgs) -> Result<()> {
     if !crate::migrations::has_pending_migrations() {
         eprintln!("{PREFIX}data schema is current; retrying any deferred migration work");
     }
+    let deferred = Arc::new(Mutex::new(BTreeSet::new()));
+    let captured = Arc::clone(&deferred);
+    let stderr = stderr_reporter();
+    let reporter: Reporter = Arc::new(move |event| {
+        if let Event::SandboxDeferred { id, .. } = &event {
+            captured.lock().unwrap().insert(id.clone());
+        }
+        stderr(event);
+    });
     crate::migrations::run_migrations_under_exclusion(
-        Some(stderr_reporter()),
+        Some(reporter),
         true,
         &transaction,
         &serve_lock,
     )?;
     if std::io::stderr().is_terminal() {
         eprint!("\r\x1b[2K");
+    }
+    let deferred = deferred.lock().unwrap();
+    if !deferred.is_empty() {
+        let sandboxes = deferred
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "Native history isolation remains pending for sandbox IDs [{sandboxes}]. Address the blockers reported above, then run `aoe migrate` again."
+        );
     }
     match crate::migrations::v027_isolate_sandbox_stores::sessions_on_shared_store()? {
         0 => eprintln!("{PREFIX}migrations complete"),
