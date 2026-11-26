@@ -147,14 +147,6 @@ pub struct App {
     /// The image the watched pull is of, so a changed default can't redirect its requests;
     /// empty for the Daemon's default.
     pull_image: String,
-    /// The update the watched pull installs, recorded when it starts.
-    pull_digest: Option<String>,
-    /// The update offered when another client's pull, waiting behind an outcome, was first seen
-    /// running: it installs that one.
-    behind_digest: Option<String>,
-    /// The watched pull is one this TUI started, so only the offer at its start names its
-    /// digest: a later one may be of a tag that moved since.
-    pull_started_here: bool,
     /// A Cancel asked for while the Start is in flight; sent once the Start's answer shows the pull.
     cancel_after_start: bool,
     /// The update a pull this TUI watched just installed, so a stale offer of it stays away. It
@@ -424,9 +416,6 @@ impl App {
             dismissed_update_version,
             image_update: None,
             pull_image: String::new(),
-            pull_started_here: false,
-            pull_digest: None,
-            behind_digest: None,
             cancel_after_start: false,
             pull: PullWatch::default(),
             pull_rx: None,
@@ -1833,11 +1822,9 @@ impl App {
     }
 
     fn start_pull(&mut self, image: String) {
-        self.pull_digest = self.offered_digest(&image);
-        self.pull_started_here = true;
+        self.pull.start(self.offered_digest(&image));
         self.pull_image = image.clone();
         self.cancel_after_start = false;
-        self.pull.start();
         self.request_pull(PullRequest::Start, image);
     }
 
@@ -1917,39 +1904,20 @@ impl App {
             }
         };
         let applied = self.pull.apply(request, report);
-        // A new id is another pull: a cancel prompt for the one shown ends, and repaints. That pull
-        // installs what was on offer when it was seen, not what the one before it started with.
-        let took_over = self.pull.running()
-            && flight.is_some()
-            && self
-                .pull
-                .cancel_flight()
-                .is_some_and(|shown| Some(shown) != flight);
+        // A new id is another pull: a cancel prompt for the one shown ends, and repaints.
         let replaced = self.pull.note_flight(flight);
-        if took_over {
-            self.pull_digest = None;
-            self.pull_started_here = false;
-        }
         // A Start the Daemon didn't answer may never have reached it, so a running pull it then
         // polls may be another client's, which a cancel would stop.
         let start_unanswered = request == PullRequest::Start && applied == Applied::Recheck;
         let changed = match applied {
             Applied::Unchanged => false,
             Applied::Changed => true,
-            Applied::Updated => {
-                let installed = self
-                    .pull_digest
-                    .take()
-                    .or_else(|| self.behind_digest.take())
-                    .or_else(|| {
-                        (!self.pull_started_here)
-                            .then(|| self.offered_digest(&self.pull_image))
-                            .flatten()
-                    })
-                    .map(|remote_digest| ImageUpdate {
-                        image: self.pull_image.clone(),
-                        remote_digest,
-                    });
+            // The finished pull's own record is the only source of what it installed.
+            Applied::Updated(flight) => {
+                let installed = flight.digest.map(|remote_digest| ImageUpdate {
+                    image: self.pull_image.clone(),
+                    remote_digest,
+                });
                 if self.image_update == installed {
                     self.image_update = None;
                 }
@@ -1967,28 +1935,14 @@ impl App {
             }
         };
         let offered = offer.is_some_and(|offer| self.offer_image_update(offer));
-        if !self.pull.behind_running() {
-            self.behind_digest = None;
-        } else if self.behind_digest.is_none() {
-            self.behind_digest = self.offered_digest(&self.pull_image);
+        // A pull seen running elsewhere is of the image this poll reported on, and installs the
+        // update on offer now.
+        if self.pull.running() && self.pull_image.is_empty() {
+            self.pull_image = image.unwrap_or_default();
         }
-        if self.pull.running() {
-            // A pull seen running elsewhere installs the update on offer now, and is of the
-            // image this poll reported on.
-            if self.pull_image.is_empty() {
-                self.pull_image = image.unwrap_or_default();
-            }
-            if self.pull_digest.is_none() && !self.pull_started_here {
-                self.pull_digest = self.offered_digest(&self.pull_image);
-            }
-        } else {
-            // The ended pull's digest goes with it: a retry, or a pull waiting behind its outcome,
-            // records its own.
-            self.pull_started_here = false;
-            self.pull_digest = None;
-            if !self.pull.holds_line() {
-                self.pull_image.clear();
-            }
+        self.pull.note_offer(self.offered_digest(&self.pull_image));
+        if !self.pull.running() && !self.pull.holds_line() {
+            self.pull_image.clear();
         }
         if request == PullRequest::Start
             && std::mem::take(&mut self.cancel_after_start)
@@ -5127,7 +5081,8 @@ mod tests {
 
         answer_pull(&mut app, PullRequest::Poll, offered(&image_update()));
         app.pull_image = image_update().image;
-        app.pull.start();
+        // Started here, as start_pull does, with the digest on offer at the click.
+        app.pull.start(Some(image_update().remote_digest));
         answer_pull(
             &mut app,
             PullRequest::Poll,
@@ -5149,7 +5104,8 @@ mod tests {
         app.update_info = Some(app_update());
         app.image_update = Some(image_update());
         app.pull_image = image_update().image;
-        app.pull.start();
+        // Started here, as start_pull does, with the digest on offer at the click.
+        app.pull.start(Some(image_update().remote_digest));
         let dismissed = || AppStateConfig::load().unwrap().dismissed_update_version;
 
         draw(&mut app);
@@ -5725,6 +5681,40 @@ mod tests {
             "the failed pull's digest left the newer install on offer"
         );
 
+        // A pull seen running elsewhere once this TUI's failure was acknowledged is another
+        // client's: it installs the update on offer then, not what the failed pull started with.
+        let (mut app, _terminal) = key_app();
+        let sent = hold_pull_requests(&mut app);
+        app.image_update = Some(a.clone());
+        app.start_pull(a.image.clone());
+        answer_sent(&mut app, &sent, 0, running());
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullReport::State(PullState::Failed {
+                reason: crate::containers::image_pull::PullFailureReason::Network,
+                message: String::new(),
+                error: String::new(),
+            }),
+        );
+        assert!(app.pull.dismiss(&app.pull.drawn().unwrap()));
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullAnswer {
+                report: running(),
+                offer: Some(ImageOffer::Update(moved.clone())),
+                image: Some(a.image.clone()),
+                flight: None,
+            },
+        );
+        answer_pull(&mut app, PullRequest::Poll, done());
+        assert_eq!(
+            app.pulled_image.as_ref(),
+            Some(&moved),
+            "the ended pull's record went to the next one"
+        );
+
         // This TUI's own pull learning its first flight id isn't a takeover: the offer at its
         // start still names what it installs.
         let (mut app, _terminal) = key_app();
@@ -5819,6 +5809,151 @@ mod tests {
                 "{case}: the pull that finished behind the failure recorded the wrong install"
             );
             assert_eq!(app.image_update.as_ref(), offered, "{case}: the offer");
+        }
+
+        // Another client's pull that started and finished between two polls is first seen at
+        // Done. Nothing here watched it, so it shows nothing and records no install; the Daemon's
+        // next status, read after the pull dropped its cached check, takes the offer off.
+        let (mut app, _terminal) = key_app();
+        app.image_update = Some(a.clone());
+        let seen = |offer| PullAnswer {
+            report: done(),
+            offer: Some(offer),
+            image: Some(a.image.clone()),
+            flight: Some(5),
+        };
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            seen(ImageOffer::Update(a.clone())),
+        );
+        assert_eq!(app.pull.line(), None, "a pull first seen at Done was shown");
+        assert_eq!(
+            app.pulled_image, None,
+            "a pull first seen at Done recorded an install"
+        );
+        answer_pull(&mut app, PullRequest::Poll, seen(ImageOffer::NoUpdate));
+        assert_eq!(
+            app.image_update, None,
+            "a pull first seen at Done: the offer"
+        );
+    }
+
+    /// Another client's pull waiting behind this TUI's Done installs what was on offer when it
+    /// was first seen, through a takeover while it waits, its promotion to the line, both in
+    /// either order, and whatever is offered by the time it finishes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pull_waiting_behind_an_outcome_records_its_own_digest() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let a = image_update();
+        let at = |digest: &str| ImageUpdate {
+            image: a.image.clone(),
+            remote_digest: digest.into(),
+        };
+        let (d1, d2, d3) = (at("sha256:d1"), at("sha256:d2"), at("sha256:d3"));
+        enum Step<'a> {
+            /// A poll shows this flight running, with this offer (none: nothing on offer).
+            Run(u64, Option<&'a ImageUpdate>),
+            /// Ctrl+X on the drawn Done: the pull behind it takes the line.
+            Ack,
+            End(u64, Option<&'a ImageUpdate>),
+        }
+        use Step::{Ack, End, Run};
+        let cases: [(&str, Vec<Step>, &ImageUpdate, &str); 5] = [
+            (
+                "replaced while waiting",
+                vec![Run(2, Some(&d1)), Run(3, Some(&d2)), End(3, Some(&d2))],
+                &d2,
+                "C's Done recorded B's digest",
+            ),
+            (
+                "promoted, offer gone",
+                vec![Run(2, Some(&d1)), Ack, Run(2, None), End(2, None)],
+                &d1,
+                "the promoted pull lost its digest",
+            ),
+            (
+                "promoted, offer moved",
+                vec![Run(2, Some(&d1)), Ack, Run(2, Some(&d3)), End(2, Some(&d3))],
+                &d1,
+                "the promoted pull took a later offer",
+            ),
+            (
+                "promoted, then replaced",
+                vec![Run(2, Some(&d1)), Ack, Run(4, Some(&d2)), End(4, Some(&d2))],
+                &d2,
+                "the pull that replaced the promoted one recorded its digest",
+            ),
+            (
+                "replaced, then promoted",
+                vec![
+                    Run(2, Some(&d1)),
+                    Run(3, Some(&d2)),
+                    Ack,
+                    Run(3, None),
+                    End(3, None),
+                ],
+                &d2,
+                "the replaced pull, once promoted, recorded another digest",
+            ),
+        ];
+        for (case, steps, installed, label) in cases {
+            let (mut app, _terminal) = key_app();
+            let sent = hold_pull_requests(&mut app);
+            app.image_update = Some(a.clone());
+            app.start_pull(a.image.clone());
+            answer_sent(
+                &mut app,
+                &sent,
+                0,
+                PullReport::State(PullState::Running(Default::default())),
+            );
+            answer_pull(
+                &mut app,
+                PullRequest::Poll,
+                PullReport::State(PullState::Done),
+            );
+            let mut last_offer = None;
+            for step in steps {
+                let (report, flight, offer) = match step {
+                    Run(flight, offer) => (PullState::Running(Default::default()), flight, offer),
+                    End(flight, offer) => (PullState::Done, flight, offer),
+                    Ack => {
+                        assert!(
+                            app.pull.dismiss(&app.pull.drawn().unwrap()),
+                            "{case}: Ctrl+X on Done"
+                        );
+                        continue;
+                    }
+                };
+                last_offer = offer;
+                answer_pull(
+                    &mut app,
+                    PullRequest::Poll,
+                    PullAnswer {
+                        report: PullReport::State(report),
+                        offer: Some(
+                            offer
+                                .cloned()
+                                .map_or(ImageOffer::NoUpdate, ImageOffer::Update),
+                        ),
+                        image: Some(a.image.clone()),
+                        flight: Some(flight),
+                    },
+                );
+            }
+            assert_eq!(
+                app.pulled_image.as_ref(),
+                Some(installed),
+                "{case}: {label}"
+            );
+            assert_eq!(
+                app.image_update.as_ref(),
+                last_offer.filter(|offer| *offer != installed),
+                "{case}: its install was left on offer"
+            );
         }
     }
 
@@ -5966,7 +6101,7 @@ mod tests {
         let (mut app, mut terminal) = key_app();
         let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, false).unwrap();
         app.update_status = Some(UpdateStatus::persistent(NOTICE.into()));
-        app.pull.start();
+        app.pull.start(None);
         let notice = Some(DrawnBar::Status(NOTICE.into()));
 
         app.handle_key(ctrl_e, &mut terminal).await.unwrap();
@@ -6026,7 +6161,7 @@ mod tests {
                     app.handle_key(ctrl_e, &mut terminal).await.unwrap();
                 }
                 "image no longer configured" => {
-                    app.pull.start();
+                    app.pull.start(None);
                     answer_pull(&mut app, PullRequest::Poll, PullReport::UnknownImage);
                 }
                 "dismissed" => app.set_pull_status(DISMISS_UNSAVED),
@@ -6099,7 +6234,7 @@ mod tests {
             };
             let (_, mut terminal) = key_app();
             let sent = record_pull_requests(&mut app);
-            app.pull.start();
+            app.pull.start(None);
             if case == "prompt" {
                 app.handle_key(ctrl_e, &mut terminal).await.unwrap();
                 assert!(app.pull.cancel_prompt(std::time::Instant::now()), "{path}");
@@ -6165,7 +6300,7 @@ mod tests {
             let help = bindings::key_event(bindings::ActionId::Help, strict).unwrap();
             let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
             let prompt = |app: &App| app.pull.cancel_prompt(std::time::Instant::now());
-            app.pull.start();
+            app.pull.start(None);
 
             app.handle_key(ctrl_e, &mut terminal).await.unwrap();
             assert!(prompt(&app), "strict={strict}: the first Ctrl+E didn't ask");
@@ -6234,7 +6369,7 @@ mod tests {
                 "strict={strict}: the key that cleared Done didn't act"
             );
 
-            app.pull.start();
+            app.pull.start(None);
             app.handle_key(ctrl_e, &mut terminal).await.unwrap();
             assert!(
                 !prompt(&app),
@@ -6281,7 +6416,7 @@ mod tests {
             assert!(app.home.search_active, "strict={strict}");
             let query = |app: &App| app.home.search_query.value().to_string();
 
-            app.pull.start();
+            app.pull.start(None);
             app.handle_key(ctrl_e, &mut terminal).await.unwrap();
             app.handle_key(ctrl_e, &mut terminal).await.unwrap();
             assert!(
