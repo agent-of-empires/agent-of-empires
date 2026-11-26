@@ -542,6 +542,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/suggestions/dismiss"),
     ("POST", "/api/suggestions/undismiss"),
     ("PATCH", "/api/suggestions/sources"),
+    ("PUT", "/api/suggestions/auto-start"),
     ("PATCH", "/api/suggestions/prefs"),
     ("PUT", "/api/suggestions/presets"),
     ("DELETE", "/api/suggestions/presets"),

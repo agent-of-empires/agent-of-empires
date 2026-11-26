@@ -98,14 +98,15 @@ pub use setup::{get_setup, get_setup_runtimes, patch_setup};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
-pub(crate) use suggestions::push_agent_suggestion;
 pub use suggestions::{
     delete_suggestion_mapping, delete_suggestion_preset, dismiss_suggestion,
     get_suggestion_presets, get_suggestions, list_suggestion_mappings, list_suggestion_projects,
-    patch_suggestion_prefs, prepare_suggestion, push_suggestion, put_suggestion_mapping,
-    put_suggestion_preset, refresh_suggestions, run_suggestion_checks, run_suggestion_fix,
-    start_suggestion, undismiss_suggestion, update_suggestion_source, StartBody,
+    patch_suggestion_prefs, prepare_suggestion, push_suggestion, put_suggestion_auto_start,
+    put_suggestion_mapping, put_suggestion_preset, refresh_suggestions, run_suggestion_checks,
+    run_suggestion_fix, start_suggestion, undismiss_suggestion, update_suggestion_source,
+    StartBody,
 };
+pub(crate) use suggestions::{push_agent_suggestion, spawn_auto_start};
 
 pub use system::{
     apply_cityhall_bundle, browse_filesystem, create_profile, default_profile, delete_profile,
@@ -756,6 +757,7 @@ mod tests {
                 "delete_suggestion_preset",
                 "dismiss_suggestion",
                 "patch_suggestion_prefs",
+                "put_suggestion_auto_start",
                 "put_suggestion_mapping",
                 "push_suggestion",
                 "put_suggestion_preset",
@@ -1965,6 +1967,7 @@ mod tests {
             (Method::POST, "/api/suggestions/dismiss"),
             (Method::POST, "/api/suggestions/undismiss"),
             (Method::PATCH, "/api/suggestions/sources"),
+            (Method::PUT, "/api/suggestions/auto-start"),
             (Method::PATCH, "/api/suggestions/prefs"),
             (Method::PUT, "/api/suggestions/presets"),
             (Method::DELETE, "/api/suggestions/presets"),

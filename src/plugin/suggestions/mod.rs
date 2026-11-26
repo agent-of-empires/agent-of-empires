@@ -162,6 +162,27 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              enabled     INTEGER NOT NULL DEFAULT 0,
              sort_order  INTEGER NOT NULL DEFAULT 2147483647,
              PRIMARY KEY (profile, provider_id)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_auto_start (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             criterion   TEXT NOT NULL,
+             cap         INTEGER NOT NULL,
+             PRIMARY KEY (profile, provider_id, criterion)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_auto_started (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             item_id     TEXT NOT NULL,
+             failure     TEXT,
+             PRIMARY KEY (profile, provider_id, item_id)
+         );
+         CREATE TABLE IF NOT EXISTS suggestion_auto_skips (
+             profile     TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             item_id     TEXT NOT NULL,
+             note        TEXT NOT NULL,
+             PRIMARY KEY (profile, provider_id, item_id)
          );",
     )?;
     Ok(())
@@ -201,6 +222,7 @@ fn effective_enabled(
 }
 
 mod agent;
+mod auto;
 mod ingest;
 mod links;
 mod prefs;
@@ -209,6 +231,7 @@ mod preset;
 mod store;
 
 pub(crate) use agent::{push as push_agent, Push as AgentPush, PROVIDER_ID as AGENT_PROVIDER_ID};
+pub(crate) use auto::*;
 pub(crate) use ingest::*;
 pub(crate) use links::*;
 pub(crate) use prefs::*;

@@ -106,7 +106,7 @@ pub(crate) fn set_source(
 }
 
 /// Stored items whose criterion is currently enabled.
-fn load_items(
+pub(super) fn load_items(
     conn: &Connection,
     profile: &str,
     provider: &Provider,

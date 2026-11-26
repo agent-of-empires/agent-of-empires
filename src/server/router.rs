@@ -329,6 +329,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/suggestions/sources",
             patch(api::update_suggestion_source),
         )
+        .route(
+            "/api/suggestions/auto-start",
+            put(api::put_suggestion_auto_start),
+        )
         .route("/api/suggestions/prefs", patch(api::patch_suggestion_prefs))
         .route(
             "/api/suggestions/presets",

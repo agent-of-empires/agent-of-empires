@@ -11,9 +11,15 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
+mod auto;
+
 use super::{api_error, AppState};
 use crate::plugin::suggestions::{self, PrepareRefusal, Preset, Provider};
 use axum::http::StatusCode;
+
+pub(crate) use auto::spawn as spawn_auto_start;
+#[cfg(test)]
+pub(crate) use auto::sweep as sweep_auto_start;
 
 /// Optional body of the routes that take none: the profile the caller selected
 /// its target under.
@@ -73,6 +79,17 @@ pub struct SourceBody {
     provider_id: String,
     criterion: String,
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoStartBody {
+    expected_profile: Option<String>,
+    provider_id: String,
+    criterion: String,
+    enabled: bool,
+    /// Items one refresh may start; the default when omitted.
+    cap: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -163,8 +180,10 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
         let registered = crate::session::projects::load_merged(&profile)?;
         let (mut snapshot, mappings, links, presets) =
             host.with_suggestions_db(|conn, profile| {
+                let mut snapshot = suggestions::snapshot(conn, profile, &providers)?;
+                suggestions::attach_auto(conn, profile, &mut snapshot)?;
                 Ok::<_, anyhow::Error>((
-                    suggestions::snapshot(conn, profile, &providers)?,
+                    snapshot,
                     suggestions::load_mappings(conn, profile)?,
                     suggestions::links(conn, profile)?,
                     suggestions::presets(conn, profile)?,
@@ -345,10 +364,14 @@ pub(crate) async fn push_agent_suggestion(
             "Plugin host is unavailable".into(),
         ));
     };
+    let notify = host.clone();
     let result = tokio::task::spawn_blocking(move || {
         host.with_suggestions_db(|conn, profile| suggestions::push_agent(conn, profile, input))
     })
     .await;
+    if matches!(result, Ok(Ok(_))) {
+        notify.notify_suggestions_published();
+    }
     match result {
         Ok(Ok(value)) => Ok(value["id"].as_str().unwrap_or_default().to_string()),
         Ok(Err(error)) if error.code == crate::plugin::protocol::codes::INVALID_PARAMS => {
@@ -484,6 +507,69 @@ pub async fn update_suggestion_source(
         "enabled": body.enabled,
     }))
     .into_response()
+}
+
+/// Turns auto start on or off for one kind. It acts from the next refresh on.
+pub async fn put_suggestion_auto_start(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<AutoStartBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    // A kind a plugin no longer declares stays switchable off.
+    if body.enabled {
+        if let Err(response) = check_declared(find_provider(&body.provider_id), &body.criterion) {
+            return response;
+        }
+    }
+    let cap = body.cap.unwrap_or(suggestions::DEFAULT_CAP);
+    if !(1..=suggestions::MAX_CAP).contains(&cap) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("cap must be between 1 and {}", suggestions::MAX_CAP),
+        );
+    }
+    let stored = {
+        let (host, provider_id, criterion) = (
+            host.clone(),
+            body.provider_id.clone(),
+            body.criterion.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            host.with_suggestions_db(|conn, profile| {
+                suggestions::set_auto_start(
+                    conn,
+                    profile,
+                    &provider_id,
+                    &criterion,
+                    body.enabled.then_some(cap),
+                )
+            })
+        })
+        .await
+    };
+    match stored {
+        Ok(Ok(())) => Json(json!({
+            "provider_id": body.provider_id,
+            "criterion": body.criterion,
+            "auto_start": body.enabled.then(|| json!({ "cap": cap })),
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
 }
 
 pub async fn patch_suggestion_prefs(
