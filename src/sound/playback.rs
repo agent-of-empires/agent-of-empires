@@ -77,8 +77,10 @@ fn sound_file(event: SoundEvent) -> std::io::Result<PathBuf> {
         return Ok(path);
     }
     std::fs::create_dir_all(&dir)?;
-    // Written aside and renamed, so a concurrent play never reads a partial file.
-    let staging = dir.join(format!(".{}.{}", event.as_str(), std::process::id()));
+    // Written aside under a per-call name and renamed, so a concurrent play never reads a partial file.
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging = dir.join(format!(".{}.{}.{call}", event.as_str(), std::process::id()));
     std::fs::write(&staging, bytes)?;
     std::fs::rename(&staging, &path)?;
     Ok(path)

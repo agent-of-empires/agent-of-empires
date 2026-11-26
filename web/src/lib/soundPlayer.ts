@@ -66,8 +66,8 @@ async function loadSettings(): Promise<SoundSettings | null> {
 }
 
 // One context for the page: browsers start it suspended until a user gesture, and once resumed it stays unlocked,
-// where each new <audio> element would need its own gesture on iOS. Resuming inside the first gesture of the
-// page means a sound that comes later can play.
+// where each new <audio> element would need its own gesture on iOS. Every gesture resumes it, since the system can
+// suspend it again later, as iOS does when the page goes to the background.
 let context: AudioContext | null = null;
 const UNLOCK_EVENTS = ["pointerdown", "keydown", "touchend"] as const;
 
@@ -78,18 +78,12 @@ function audioContext(): AudioContext | null {
 
 function unlock(): void {
   const ctx = audioContext();
-  if (!ctx) return;
-  void ctx.resume().then(
-    () => {
-      if (ctx.state !== "running") return;
-      for (const type of UNLOCK_EVENTS) window.removeEventListener(type, unlock, true);
-    },
-    () => {},
-  );
+  if (!ctx || ctx.state === "running") return;
+  void ctx.resume().catch(() => {});
 }
 
 if (typeof window !== "undefined") {
-  for (const type of UNLOCK_EVENTS) window.addEventListener(type, unlock, true);
+  for (const type of UNLOCK_EVENTS) window.addEventListener(type, unlock, { capture: true, passive: true });
 }
 
 // A resume outside a gesture settles at once when the page was unlocked earlier, and never when it was not.
@@ -173,6 +167,7 @@ export async function playSoundFor(event: SoundEvent, context: SoundContext = {}
     reportBlocked();
     return false;
   }
+  if (generation !== cacheGeneration || !inScope(sound, context)) return false;
   const gain = ctx.createGain();
   gain.gain.value = typeof sound.browser_volume === "number" ? Math.max(0, sound.browser_volume) : 1.0;
   gain.connect(ctx.destination);

@@ -110,6 +110,14 @@ describe("playSoundFor", () => {
     await vi.waitFor(() => expect(fakeAudio.state).toBe("running"));
     expect(await playSoundFor("idle")).toBe(true);
     expect(playedSounds()).toEqual(["idle"]);
+
+    // The system suspends it again; the next gesture, not a later sound, resumes it.
+    fakeAudio.state = "suspended";
+    window.dispatchEvent(new Event("pointerdown"));
+    await vi.waitFor(() => expect(fakeAudio.state).toBe("running"));
+    fakeAudio.resumable = false;
+    expect(await playSoundFor("idle")).toBe(true);
+    expect(playedSounds()).toEqual(["idle", "idle"]);
   });
 
   it("plays nothing when settings are saved while they are loading", async () => {

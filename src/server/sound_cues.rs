@@ -126,12 +126,14 @@ async fn run_host_player(
                 .collect(),
         };
         let instances = state.instances.read().await;
-        // Sessions whose dwell ends together play one sound per event.
+        // Sessions whose dwell ends together play one sound per event and profile; a profile
+        // with that sound off must not swallow another profile's.
         let mut sounded = HashSet::new();
         for (id, event) in due {
             if let Some(inst) = instances.iter().find(|i| i.id == id) {
-                if host_eligible(inst, event) && sounded.insert(event) {
-                    play(inst.effective_profile(), event);
+                let profile = inst.effective_profile();
+                if host_eligible(inst, event) && sounded.insert((profile.clone(), event)) {
+                    play(profile, event);
                 }
             }
         }
@@ -241,9 +243,11 @@ mod tests {
             move |profile, event| played_tx.send((profile, event, Instant::now())).unwrap(),
         ));
 
+        let sent = Instant::now();
         state.status_tx.send(change(&id, Status::Running)).unwrap();
-        let (profile, event, _) = played.recv().await.unwrap();
+        let (profile, event, at) = played.recv().await.unwrap();
         assert_eq!((profile.as_str(), event), ("work", SoundEvent::Running));
+        assert_eq!(at, sent, "running waited for a dwell");
 
         set_status(&state, &id, Status::Idle).await;
         let sent = Instant::now();
@@ -253,6 +257,47 @@ mod tests {
         assert!(
             at - sent >= Duration::from_millis(2_000),
             "idle sounded before its dwell"
+        );
+
+        state.shutdown.cancel();
+        player.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_player_plays_one_sound_per_profile_for_a_batch() {
+        let rows: Vec<Instance> = [("a", "work"), ("b", "work"), ("c", "home")]
+            .into_iter()
+            .map(|(title, profile)| {
+                let mut row = Instance::new(title, "/tmp/aoe-host-sound-batch");
+                row.status = Status::Idle;
+                row.source_profile = profile.to_string();
+                row
+            })
+            .collect();
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let state = crate::server::test_support::build_test_app_state(rows);
+        let (played_tx, mut played) = tokio::sync::mpsc::unbounded_channel();
+        let player = tokio::spawn(run_host_player(
+            state.clone(),
+            state.status_tx.subscribe(),
+            move |profile, event| played_tx.send((profile, event)).unwrap(),
+        ));
+
+        for id in &ids {
+            state.status_tx.send(change(id, Status::Idle)).unwrap();
+        }
+        // One batch plays without yielding, so its sounds are all queued once the first arrives.
+        let mut batch = vec![played.recv().await.unwrap()];
+        while let Ok(next) = played.try_recv() {
+            batch.push(next);
+        }
+        batch.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(
+            batch,
+            [
+                ("home".to_string(), SoundEvent::Idle),
+                ("work".to_string(), SoundEvent::Idle)
+            ]
         );
 
         state.shutdown.cancel();
