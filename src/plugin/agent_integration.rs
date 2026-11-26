@@ -1117,6 +1117,7 @@ fn sanitize_prompt(report: &mut AgentIntegrationSnapshot) {
 
 fn same_prompt(a: &AgentIntegrationSnapshot, b: &AgentIntegrationSnapshot) -> bool {
     a.instance_id == b.instance_id
+        && a.launch_id == b.launch_id
         && a.provider_version == b.provider_version
         && a.provider_session_id == b.provider_session_id
         && a.writer_pid == b.writer_pid
@@ -1603,14 +1604,21 @@ oneshot_flag = "-p"
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         make_alien_owned(&path);
 
-        let rejected = check_file(&std::fs::metadata(&path).unwrap(), false);
+        // The sandbox exception widens ownership to root alone, never to another
+        // uid, so the same file stays rejected for a sandboxed launch.
+        let (rejected, rejected_sandboxed) = (
+            check_file(&std::fs::metadata(&path).unwrap(), false),
+            check_file(&std::fs::metadata(&path).unwrap(), true),
+        );
         chown(
             &path,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
         )
         .unwrap();
-        assert!(rejected.unwrap_err().to_string().contains("another owner"));
+        for rejected in [rejected, rejected_sandboxed] {
+            assert!(rejected.unwrap_err().to_string().contains("another owner"));
+        }
     }
 
     fn install_test_integration(plugin_id: &str, tool: &str) {
@@ -3283,6 +3291,14 @@ command = "acme-omp-shim"
         let mut changed = snapshot();
         changed.provider_version = "1.3.0".into();
         assert!(!same_prompt(&snapshot(), &changed));
+        // A restarted sandbox can reuse the pid, conversation and revision, so a
+        // retained prompt only answers the launch that asked it.
+        let mut earlier = snapshot();
+        earlier.launch_id = Some("launch-a".into());
+        let mut relaunched = earlier.clone();
+        relaunched.launch_id = Some("launch-b".into());
+        assert!(same_prompt(&earlier, &earlier.clone()));
+        assert!(!same_prompt(&earlier, &relaunched));
     }
 
     #[test]

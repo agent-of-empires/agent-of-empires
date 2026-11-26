@@ -902,6 +902,8 @@ export interface PluginUpdateConsent {
   ui: PluginUpdateUiView[];
   agent_integrations: PluginAgentIntegration[];
   build_steps: string[];
+  /** Container path a sandboxed provider's integration reports are read from. */
+  sandbox_report_dir: string;
   runtime_change: string | null;
   trust_downgrade: boolean;
   fingerprint: string;
@@ -979,6 +981,8 @@ export interface PluginInstallConsent {
   ui: PluginUpdateUiView[];
   agent_integrations: PluginAgentIntegration[];
   build_steps: string[];
+  /** Container path a sandboxed provider's integration reports are read from. */
+  sandbox_report_dir: string;
   fingerprint: string;
 }
 

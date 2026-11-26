@@ -3010,15 +3010,15 @@ fn resume_contract(
                 .map(|capture| capture.backend),
         )
     };
-    if let Some(agent) = crate::agents::native_definition(&execution.agent) {
-        return contract(agent);
+    // A declaration that speaks for this pane's tool is what launched it, so it
+    // names the backend even where a retained built-in identity still answers: a
+    // declared sidecar has no store for the built-in reader to consult.
+    if execution.agent == own_tool {
+        if let Some(declared) = declared {
+            return declared.with_definition(contract).unwrap_or((false, None));
+        }
     }
-    if execution.agent != own_tool {
-        return (false, None);
-    }
-    declared
-        .and_then(|declared| declared.with_definition(contract))
-        .unwrap_or((false, None))
+    crate::agents::native_definition(&execution.agent).map_or((false, None), contract)
 }
 
 pub(super) fn validate_managed_arguments(
@@ -4249,6 +4249,43 @@ mod tests {
         assert!(!instance.launch_invokes_resolved_agent_directly(agent));
     }
 
+    /// An extension-sidecar declaration for `tool`, as `plugin-omp` will publish.
+    fn declared_sidecar_fixture(tool: &str) -> crate::plugin::agent_integration::DeclaredAgent {
+        let manifest: aoe_plugin_api::PluginManifest = toml::from_str(&format!(
+            r#"
+id = "acme.sidecar"
+name = "Sidecar"
+version = "1.0.0"
+api_version = 26
+[[agent_integrations]]
+tool = "{tool}"
+command = "{tool}"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+[agent_integrations.launch.capture]
+backend = "extension_sidecar"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+"#
+        ))
+        .unwrap();
+        let registry = std::sync::Arc::new(crate::plugin::PluginRegistry::from_test_plugins(vec![
+            crate::plugin::LoadedPlugin {
+                manifest,
+                enabled: true,
+                trust: aoe_plugin_api::TrustLevel::Community,
+                validation: crate::plugin::registry::ValidationState::Local,
+                source: None,
+                dir: None,
+                manifest_hash: String::new(),
+                granted: true,
+            },
+        ]));
+        crate::plugin::agent_integration::declared_agent(registry, tool, std::iter::empty())
+            .unwrap()
+    }
+
     /// An OMP-backed declaration whose tool label matches no built-in agent.
     fn declared_omp_fixture() -> crate::plugin::agent_integration::DeclaredAgent {
         let manifest: aoe_plugin_api::PluginManifest = toml::from_str(
@@ -4310,6 +4347,19 @@ sandbox = "unsupported"
         // The bundled identity answers even while a declaration hides it from
         // listings, so recovery does not depend on which plugin provides OMP.
         assert_eq!(resume_contract(&binding("omp"), "omp", None), (true, omp));
+        // A declared sidecar on that same tool answers with its own backend: it
+        // has no store for the retained built-in reader to consult.
+        assert_eq!(
+            resume_contract(
+                &binding("omp"),
+                "omp",
+                Some(declared_sidecar_fixture("omp"))
+            ),
+            (
+                true,
+                Some(crate::agents::SessionCaptureBackend::ExtensionSidecar)
+            )
+        );
         // Another tool's binding never inherits this pane's declaration.
         assert_eq!(
             resume_contract(
@@ -4450,6 +4500,12 @@ sandbox = "pane_scoped"
             source.file_name().and_then(|name| name.to_str()),
             Some(format!("session_id.{}", execution.inputs.launch_id).as_str())
         );
+        // Recovery reads the same backend, so an id binds without the transcript
+        // a built-in OMP reader would demand.
+        let bound = instance
+            .asserted_resume_binding("2f6a1f9c-0d7a-4d0e-9b58-2c4b3f1e5a11", None)
+            .expect("a declared sidecar binds an id without a store");
+        assert_eq!(bound.session_id, "2f6a1f9c-0d7a-4d0e-9b58-2c4b3f1e5a11");
     }
 
     /// Installs an OMP-backed declaration for `example-helper` in the isolated

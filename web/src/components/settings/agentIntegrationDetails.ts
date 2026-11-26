@@ -10,7 +10,10 @@ export function displayAgentText(value: string): string {
   return out;
 }
 
-export function agentIntegrationDetails(agent: PluginAgentIntegration): string[] {
+/** Disclosure lines for one declaration. `sandboxReportDir` is the container
+ *  path the daemon reads a sandboxed provider's reports from, so the text here
+ *  cannot drift from where the host actually looks. */
+export function agentIntegrationDetails(agent: PluginAgentIntegration, sandboxReportDir: string): string[] {
   const details: string[] = [];
   const launch = agent.launch;
   if (launch) {
@@ -52,7 +55,7 @@ export function agentIntegrationDetails(agent: PluginAgentIntegration): string[]
     if (launch.install_hint) details.push(`install: ${launch.install_hint}`);
   }
   if (agent.detection) details.push(`detection: ${agent.detection.mode}`);
-  details.push("sandbox reports: /tmp/aoe-hooks/<session id>");
+  if (sandboxReportDir) details.push(`sandbox reports: ${sandboxReportDir}/<session id>`);
   if (agent.provider_versions?.length) details.push(`provider versions: ${agent.provider_versions.join(", ")}`);
   details.push(`native replies: ${agent.replies ? "yes" : "no"}`);
   if (agent.reply_fallback) {
