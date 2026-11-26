@@ -132,17 +132,39 @@ ffmpeg -filters 2>/dev/null | grep drawtext  # must list it
 
 Without that build, run without `SHOW_TITLES=1`.
 
+### YouTube upload
+
+```bash
+YOUTUBE=1 GRID=2x2 SHOW_TITLES=1 MAX_SECONDS=180 ./scripts/combine-showcase-videos.sh ~/Desktop/aoe-showcase-4k.mp4
+```
+
+`YOUTUBE=1` is a preset. It changes the defaults of these settings; an explicit env var still wins:
+
+- `TARGET_W`/`TARGET_H` become `3840`/`2160`, `CRF` becomes `12`.
+- Title text grows to `TITLE_FONTSIZE=40`, `TITLE_BORDER=18`, `TITLE_MARGIN=40`, so it stays readable in a 1920x1080 cell.
+- Every encode gets `-profile:v high -pix_fmt yuv420p`, BT.709 limited-range color tags (matrix, primaries, transfer, range) and `+faststart`. The filter chain converts with `out_color_matrix=bt709:out_range=tv` so the pixels match the tags. The primaries and transfer tags only land in the file through `-x264-params`, so the preset passes them there too.
+
+Why a 4K canvas: a 2x2 grid on 3840x2160 gives 1920x1080 cells, and YouTube serves its high-bitrate 4K encode for 4K uploads. The sources are 1440x900, so cells are upscaled slightly and gain no detail.
+
+Measured with 710 clips in a 180 s grid on an M-series Mac: 3840x2160, about 6.5 Mbps average, about 140 MiB, encode about 5.5 minutes.
+
+CRF-driven bitrate follows content. Mostly static UI footage stays below YouTube's 4K bitrate guidance, and lowering CRF mostly inflates the file without a visible gain.
+
 ### All environment variables
 
 | Var | Default | Effect |
 |---|---|---|
+| `YOUTUBE` | `0` | `1` applies the YouTube upload preset (see above). |
 | `MAX_SECONDS` | `120` | Hard cap on output duration. Speed factor scales to fit. |
-| `CRF` | `14` | libx264 constant rate factor. 0 = lossless, 14 ~= near-lossless, 18 ~= visually lossless, 23 = libx264 default, 28+ = visibly lossy. Lower is better but file size grows fast. |
+| `CRF` | `14` (`12` with `YOUTUBE=1`) | libx264 constant rate factor. 0 = lossless, 14 ~= near-lossless, 18 ~= visually lossless, 23 = libx264 default, 28+ = visibly lossy. Lower is better but file size grows fast. |
 | `PRESET` | `slow` | libx264 preset. `veryslow` = best compression at same quality, `medium`/`fast` cheaper. |
 | `GRID` | unset | `COLSxROWS` enables grid mode (e.g. `2x2`, `3x3`, `4x2`). Must total >= 2 cells. |
 | `SHOW_TITLES` | `0` | `1` overlays the spec name on each cell/segment. Requires drawtext. |
-| `TARGET_W` | `1440` | Output canvas width. Matches Playwright viewport. Applies to grid and titled concat only; untitled concat keeps native size. |
-| `TARGET_H` | `900` | Output canvas height. Matches Playwright viewport. Applies to grid and titled concat only; untitled concat keeps native size. |
+| `TARGET_W` | `1440` (`3840` with `YOUTUBE=1`) | Output canvas width. Matches Playwright viewport. Applies to grid and titled concat only; untitled concat keeps native size. |
+| `TARGET_H` | `900` (`2160` with `YOUTUBE=1`) | Output canvas height. Matches Playwright viewport. Applies to grid and titled concat only; untitled concat keeps native size. |
+| `TITLE_FONTSIZE` | `22` (`40` with `YOUTUBE=1`) | drawtext font size in pixels. |
+| `TITLE_BORDER` | `10` (`18` with `YOUTUBE=1`) | Title box padding in pixels. |
+| `TITLE_MARGIN` | `24` (`40` with `YOUTUBE=1`) | Title distance from the left and bottom cell edges. |
 | `FONT` | auto-detect | Path to a TTF/TTC. Tries common macOS and Linux fonts if unset. |
 | `LEAD_CACHE` | `test-results/.lead-cache.tsv` | Cache of the per-clip blank lead-in probe. |
 

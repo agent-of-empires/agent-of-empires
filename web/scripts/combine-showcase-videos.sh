@@ -33,16 +33,34 @@ LIST=""
 PARTIAL=""
 trap 'rm -f "${FILTER_FILE}" "${LIST}" "${PARTIAL}"' EXIT
 
+# YOUTUBE=1: upload-ready 4K preset. Explicit env vars still win.
+YOUTUBE="${YOUTUBE:-0}"
+if [[ "${YOUTUBE}" == "1" ]]; then
+  d_crf=12 d_w=3840 d_h=2160 d_font=40 d_border=18 d_margin=40
+  # x264-params carries the primaries/transfer tags that -color_* alone drops.
+  color_filter="scale=out_color_matrix=bt709:out_range=tv,"
+  color_args=(-profile:v high -pix_fmt yuv420p
+    -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv
+    -x264-params colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv)
+else
+  d_crf=14 d_w=1440 d_h=900 d_font=22 d_border=10 d_margin=24
+  color_filter=""
+  color_args=()
+fi
+
 MAX_SECONDS="${MAX_SECONDS:-120}"
-CRF="${CRF:-14}"
+CRF="${CRF:-${d_crf}}"
 PRESET="${PRESET:-slow}"
 GRID="${GRID:-}"
 SHOW_TITLES="${SHOW_TITLES:-0}"
 # Playwright videos are captured at 1440x900 (see playwright.showcase.config.ts).
 # Keep the target at native resolution: upscaling adds no detail and just
 # bloats encode time.
-TARGET_W="${TARGET_W:-1440}"
-TARGET_H="${TARGET_H:-900}"
+TARGET_W="${TARGET_W:-${d_w}}"
+TARGET_H="${TARGET_H:-${d_h}}"
+TITLE_FONTSIZE="${TITLE_FONTSIZE:-${d_font}}"
+TITLE_BORDER="${TITLE_BORDER:-${d_border}}"
+TITLE_MARGIN="${TITLE_MARGIN:-${d_margin}}"
 FONT="${FONT:-}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -172,7 +190,7 @@ done
 
 # Common drawtext fragment (omit text= so we can plug in per-call).
 drawtext_style() {
-  printf "fontfile='%s':fontcolor=white:fontsize=22:box=1:boxcolor=black@0.55:boxborderw=10:x=24:y=h-th-24" "${FONT}"
+  printf "fontfile='%s':fontcolor=white:fontsize=%s:box=1:boxcolor=black@0.55:boxborderw=%s:x=%s:y=h-th-%s" "${FONT}" "${TITLE_FONTSIZE}" "${TITLE_BORDER}" "${TITLE_MARGIN}" "${TITLE_MARGIN}"
 }
 
 if [[ -n "${GRID}" ]]; then
@@ -303,7 +321,7 @@ if [[ -n "${GRID}" ]]; then
   done
 
   filter+="${stack_inputs}xstack=inputs=${cells}:layout=${layout}[stacked];"
-  filter+="[stacked]setpts=PTS/${factor},format=yuv420p[out]"
+  filter+="[stacked]setpts=PTS/${factor},${color_filter}format=yuv420p[out]"
 
   # Graph goes in a file: ~680 inputs exceed Linux's 128KB single-argument limit.
   FILTER_FILE="$(mktemp -t showcase-filter.XXXXXX)"
@@ -314,6 +332,7 @@ if [[ -n "${GRID}" ]]; then
     -map "[out]" \
     -an \
     -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
+    ${color_args[@]+"${color_args[@]}"} \
     -movflags +faststart \
     -f mp4 "${PARTIAL}"
 
@@ -342,7 +361,7 @@ else
       concat_inputs+="[s${i}]"
     done
     filter+="${concat_inputs}concat=n=${count}:v=1:a=0[joined];"
-    filter+="[joined]setpts=PTS/${factor},format=yuv420p[out]"
+    filter+="[joined]setpts=PTS/${factor},${color_filter}format=yuv420p[out]"
 
     FILTER_FILE="$(mktemp -t showcase-filter.XXXXXX)"
     printf '%s' "${filter}" >"${FILTER_FILE}"
@@ -352,6 +371,7 @@ else
       -map "[out]" \
       -an \
       -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
+    ${color_args[@]+"${color_args[@]}"} \
       -movflags +faststart \
       -f mp4 "${PARTIAL}"
   else
@@ -365,9 +385,10 @@ else
     done
 
     ffmpeg -y -f concat -safe 0 -i "${LIST}" \
-      -filter:v "setpts=PTS/${factor},format=yuv420p" \
+      -filter:v "setpts=PTS/${factor},${color_filter}format=yuv420p" \
       -an \
       -c:v libx264 -preset "${PRESET}" -crf "${CRF}" \
+    ${color_args[@]+"${color_args[@]}"} \
       -movflags +faststart \
       -f mp4 "${PARTIAL}"
   fi
