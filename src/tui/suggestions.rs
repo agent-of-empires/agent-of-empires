@@ -1464,15 +1464,14 @@ impl SuggestionsView {
             ));
         }
         let mut parts = vec![item.reason.clone()];
-        // A heading already names the Project.
+        // A heading already names the Project, or says there is none.
+        let named = item
+            .resolved_project
+            .as_ref()
+            .map(|p| p.name.clone())
+            .or_else(|| item.project.clone());
         if !(headed && item.group().is_some()) {
-            parts.push(
-                item.resolved_project
-                    .as_ref()
-                    .map(|p| p.name.clone())
-                    .or_else(|| item.project.clone())
-                    .unwrap_or_else(|| "no project".to_string()),
-            );
+            parts.extend(named.or_else(|| (!headed).then(|| "No project".to_string())));
         }
         if let Some(s) = &item.started_session {
             parts.push(if s.archived {
@@ -2657,10 +2656,18 @@ mod tests {
             at("▾ api") < at("▾ No project"),
             "the window scrolled to the last group"
         );
-        let flat = view_with(vec![item("x", None, false)], idle_worker());
         assert!(
-            !render_text(&flat).contains("No project"),
+            !text.to_lowercase().contains("· no project"),
+            "the heading already says so: {text}"
+        );
+        let flat = render_text(&view_with(vec![item("x", None, false)], idle_worker()));
+        assert!(
+            !flat.contains("▾ No project"),
             "no headings without a resolved project"
+        );
+        assert!(
+            flat.contains("reason · No project"),
+            "with no heading the row says it: {flat}"
         );
     }
 
