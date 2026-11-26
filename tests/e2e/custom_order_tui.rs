@@ -84,7 +84,7 @@ fn test_tui_custom_sort_reorders_and_persists() {
     // Under Groups, Home selects the `work` header and Down its first session.
     h.send_keys("g");
     h.wait_for(" Group By ");
-    h.send_keys("m");
+    h.send_keys("g");
     h.wait_for_absent(" Group By ", Duration::from_secs(10));
     h.send_keys("Home");
     h.send_keys("Down");
