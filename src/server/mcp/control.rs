@@ -14,7 +14,7 @@ use crate::acp::dispatch::PromptDispatch;
 use crate::daemon::{CreateSessionBody, SessionResponse};
 use crate::server::api::sessions::{
     capture_terminal_output, create_session_with, send_terminal_message, CaptureError,
-    SendKeysError, SendPane,
+    CreateOrigin, SendKeysError, SendPane,
 };
 use crate::server::api::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 use crate::server::session_service::{SendTurnError, SessionCaller};
@@ -247,8 +247,10 @@ impl McpServer {
             &reference,
             wait_ready,
             body,
-            initial_turn,
-            crate::daemon::PromptOrigin::Mcp,
+            CreateOrigin {
+                initial_turn,
+                ..CreateOrigin::wizard(crate::daemon::PromptOrigin::Mcp)
+            },
         )
         .await;
         let (session, fresh) = success_body(response).await.map_err(|e| *e)?;

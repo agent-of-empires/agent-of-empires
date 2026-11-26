@@ -58,10 +58,17 @@ impl HomeView {
             .as_ref()
             .and_then(|c| c.app_state.group_by)
             .unwrap_or(default_group_by);
-        let tips_unseen = user_config.as_ref().map_or_else(
-            || tips_unseen_count(&crate::session::Config::default()),
-            tips_unseen_count,
-        );
+        // No suggestions snapshot yet, so that signal starts false.
+        let tips_config = user_config.clone().unwrap_or_default();
+        let tips_unseen = if tips_config.session.show_tips {
+            crate::tips::unseen_count(
+                crate::tips::TipSurface::Tui,
+                &tips_config.app_state.tips_seen,
+                &crate::tips::TipSignals::from(&tips_config),
+            )
+        } else {
+            0
+        };
         let view_mode = ViewMode::default();
 
         let disk_watch = DiskWatchState {
@@ -329,6 +336,7 @@ impl HomeView {
             settings_view: None,
             settings_close_confirm: false,
             diff_view: None,
+            suggestions_view: None,
             list_width: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_list_width)
@@ -367,6 +375,14 @@ impl HomeView {
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
             trashed_section_collapsed: true,
+            suggestions_focused: false,
+            prompt_failures_announced: std::collections::HashSet::new(),
+            prompt_failures_seeded: false,
+            prompt_failure_queue: Vec::new(),
+            suggested_sessions_tip_armed: false,
+            undelivered_prompt: None,
+            start_after_trash: None,
+            suggestions_feed: crate::tui::suggestions::SuggestionsFeed::new(),
             hide_stopped_in_groups: false,
             group_totals: HashMap::new(),
             opener_exits: Vec::new(),
