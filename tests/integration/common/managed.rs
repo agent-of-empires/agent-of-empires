@@ -911,7 +911,7 @@ async fn with_managed_configured<F>(
                     "tool must be fixed before admission"
                 );
                 assert_eq!(
-                    actual.cwd,
+                    actual.cwd.canonicalize().expect("canonical factory cwd"),
                     template.cwd.canonicalize().expect("canonical case cwd"),
                     "factory must retain the canonical case cwd"
                 );
