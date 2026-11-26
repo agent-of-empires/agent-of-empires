@@ -389,10 +389,10 @@ describe("ShikiSyntaxHighlighter stale-content transitions (#3974)", () => {
   });
 
   it("skips cache insertion while streaming (smooth=true) and caches once complete", async () => {
-    renderCodeInPrimitive.current = { language: "rust", code: "fn main() {" };
+    renderCodeInPrimitive.current = { language: "rust", code: "fn main() {}" };
     const { rerender } = render(<Markdown text="streaming" smooth />);
     await waitFor(() => {
-      expect(highlightSnippet).toHaveBeenCalledWith("fn main() {", {
+      expect(highlightSnippet).toHaveBeenCalledWith("fn main() {}", {
         langHint: "rust",
         theme: "vitesse-dark",
         appearance: "dark",
@@ -401,7 +401,6 @@ describe("ShikiSyntaxHighlighter stale-content transitions (#3974)", () => {
     });
 
     vi.mocked(highlightSnippet).mockClear();
-    renderCodeInPrimitive.current = { language: "rust", code: "fn main() {}" };
     rerender(<Markdown text="done" smooth={false} />);
     await waitFor(() => {
       expect(highlightSnippet).toHaveBeenCalledWith("fn main() {}", {
