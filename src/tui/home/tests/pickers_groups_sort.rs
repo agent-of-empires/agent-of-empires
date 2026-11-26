@@ -2993,6 +2993,50 @@ fn test_alt_arrows_leave_live_send_before_jumping() {
     );
 }
 
+/// A peer's sidebar view can reshape the rows under an open palette or a live-send target:
+/// the palette still jumps to the session it named, and live-send ends once a collapsed
+/// header hides its target.
+#[test]
+#[serial]
+fn test_a_peer_sidebar_view_keeps_palette_and_live_send_on_their_session() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_with_mixed_sessions();
+    let id_of = |view: &HomeView, title: &str| {
+        view.instances()
+            .find(|i| i.title == title)
+            .map(|i| i.id.clone())
+            .unwrap()
+    };
+    let zebra = id_of(&env.view, "Zebra");
+    env.view.mutate_instance(&zebra, |inst| {
+        inst.created_at = crate::time::Timestamp::now() + crate::time::Duration::hours(1);
+    });
+    env.view
+        .show_sidebar_view(GroupByMode::Group, SortOrder::Name);
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        None,
+    );
+    for ch in "Zebra".chars() {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    let before = env.view.session_row(&zebra);
+    env.view
+        .show_sidebar_view(GroupByMode::Group, SortOrder::Newest);
+    assert_ne!(env.view.session_row(&zebra), before, "the rows moved");
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert_eq!(env.view.selected_session.as_deref(), Some(zebra.as_str()));
+
+    env.view.live_send = Some(live_send_state(&zebra, "Zebra", "aoe_test_live_collapsed"));
+    for tree in env.view.group_trees.values_mut() {
+        tree.set_collapsed("work", true);
+    }
+    env.view
+        .show_sidebar_view(GroupByMode::Group, SortOrder::Name);
+    assert!(env.view.live_send.is_none(), "live-send ended");
+}
+
 /// Project and Org headers are derived from repo paths, and their rows carry a rewritten
 /// `group_path` for display. A move there would persist a manual membership the list is not
 /// showing, so it is refused and the stored groups stay put.

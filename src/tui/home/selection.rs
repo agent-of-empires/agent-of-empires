@@ -3,7 +3,7 @@
 use super::*;
 
 impl HomeView {
-    fn session_row(&self, session_id: &str) -> Option<usize> {
+    pub(super) fn session_row(&self, session_id: &str) -> Option<usize> {
         self.flat_items
             .iter()
             .position(|item| matches!(item, Item::Session { id, .. } if id == session_id))

@@ -1165,23 +1165,8 @@ impl HomeView {
                 changed = true;
             }
             // Snapshots applied while the write was pending were not shown or recorded, so
-            // converge on the Daemon's value, which may carry another Client's change, once
-            // no queued pick is still on its way.
-            // With no snapshot to converge on, forget the baseline so the next one is adopted
-            // even when it repeats the value seen before the write.
-            let queued = self.session_feed.sidebar_view_pending();
-            match self.session_feed.applied_snapshot().filter(|_| !queued) {
-                Some(snapshot) => {
-                    let view = snapshot.contents.sidebar_view;
-                    self.observed_sidebar_view = Some(view);
-                    if (view.group_by, view.sort) != (self.group_by, self.sort_order) {
-                        self.show_sidebar_view(view.group_by, view.sort);
-                        changed = true;
-                    }
-                }
-                None if !queued => self.observed_sidebar_view = None,
-                None => {}
-            }
+            // converge on the Daemon's value, which may carry another Client's change.
+            changed |= self.converge_sidebar_view();
         }
         let mut purge_notes: Vec<(String, String)> = Vec::new();
         for (id, outcome) in row_outcomes {

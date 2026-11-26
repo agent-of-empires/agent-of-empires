@@ -4173,20 +4173,38 @@ fn a_pick_made_while_a_sidebar_write_is_in_flight_waits_and_keeps_the_earlier_fa
 #[serial]
 fn a_sidebar_pick_is_not_sent_once_mutations_are_revoked() {
     use crate::daemon::RuntimeCursor;
-    use crate::session::config::GroupByMode;
+    use crate::session::config::{GroupByMode, SidebarView, SortOrder};
     let mut env = create_test_env_empty();
     let mut reply = env.view.session_feed.sidebar_view_driver_for_test();
+    let id = structured_row(&mut env, Status::Idle);
+    let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Idle") else {
+        unreachable!()
+    };
+    let daemon = SidebarView {
+        group_by: GroupByMode::Group,
+        sort: SortOrder::Name,
+    };
+    Arc::make_mut(&mut snapshot).contents.sidebar_view = daemon;
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+    env.view.apply_session_feed();
+    assert_eq!(env.view.group_by, GroupByMode::Group);
     env.view
         .session_feed
         .set_mutation_permission_for_test(false);
-    env.view.apply_group_by(GroupByMode::Group);
+    env.view.apply_group_by(GroupByMode::Project);
     assert!(reply(Ok(RuntimeCursor {
         epoch: "e".into(),
         revision: 1,
     }))
     .is_none());
     assert!(!env.view.session_feed.sidebar_view_pending());
-    assert_eq!(env.view.group_by, GroupByMode::Group);
+    assert_eq!(
+        (env.view.group_by, env.view.sort_order),
+        (daemon.group_by, daemon.sort),
+        "a refused pick falls back to the Daemon's value"
+    );
 }
 
 /// A pick queued behind a write in flight stays bound to the lease it was admitted under, so
