@@ -171,6 +171,7 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
   // git treat the file as binary) so field concatenations cannot collide.
   const inputKey = `${language ?? ""}\u0000${code}`;
   const shiki = useShikiTheme();
+  const complete = useContext(TableSourceContext)?.complete ?? true;
   // A cache hit renders highlighted on first paint, so a remounted block never flashes plain text.
   const cached = useMemo(
     () =>
@@ -179,10 +180,13 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
         : undefined,
     [language, code, shiki.theme, shiki.appearance],
   );
-  // Seeded from a mount-time cache hit so a later theme switch keeps that palette.
+  // Kept in sync with cache hits so a later theme switch shows the latest rendered palette.
   const [result, setResult] = useState<{ key: string; html: string } | null>(() =>
     cached !== undefined ? { key: inputKey, html: cached } : null,
   );
+  if (cached !== undefined && (result?.key !== inputKey || result.html !== cached)) {
+    setResult({ key: inputKey, html: cached });
+  }
   const [wrapped, toggleWrap] = useWrapState();
 
   useEffect(() => {
@@ -195,6 +199,7 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
           langHint: language,
           theme: shiki.theme,
           appearance: shiki.appearance,
+          ...(complete ? {} : { cache: false }),
         });
         if (cancelled || !out) return;
         setResult({ key: inputKey, html: out });
@@ -205,7 +210,7 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
     return () => {
       cancelled = true;
     };
-  }, [language, code, inputKey, shiki.theme, shiki.appearance, cached]);
+  }, [language, code, inputKey, shiki.theme, shiki.appearance, cached, complete]);
 
   const html = cached ?? (result && result.key === inputKey ? result.html : null);
 

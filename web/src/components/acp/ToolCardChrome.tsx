@@ -346,10 +346,13 @@ export function HighlightedBlock({
         : undefined,
     [ansi, effectiveLang, shown, shiki.theme, shiki.appearance],
   );
-  // Seeded from a mount-time cache hit so a later theme switch keeps that palette.
+  // Kept in sync with cache hits so a later theme switch shows the latest rendered palette.
   const [result, setResult] = useState<{ key: string; html: string } | null>(() =>
     cached !== undefined ? { key: inputKey, html: cached } : null,
   );
+  if (cached !== undefined && (result?.key !== inputKey || result.html !== cached)) {
+    setResult({ key: inputKey, html: cached });
+  }
 
   useEffect(() => {
     if (ansi) return;

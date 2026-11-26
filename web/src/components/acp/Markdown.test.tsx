@@ -11,8 +11,9 @@ import remarkGfm from "remark-gfm";
 
 import type { FileRefSession } from "../../lib/fileRef";
 
-const { shikiThemeRef } = vi.hoisted(() => ({
+const { shikiThemeRef, renderCodeInPrimitive } = vi.hoisted(() => ({
   shikiThemeRef: { current: { theme: "vitesse-dark", appearance: "dark" } },
+  renderCodeInPrimitive: { current: null as { language: string; code: string } | null },
 }));
 
 vi.mock("../../hooks/useShikiTheme", () => ({
@@ -48,11 +49,16 @@ vi.mock("@assistant-ui/react-markdown", () => ({
       remarkPlugins: props.remarkPlugins ?? [],
       components: props.components ?? {},
     });
+    const SyntaxHighlighter = props.components?.SyntaxHighlighter;
     return (
       <div data-testid="markdown-primitive" className={props.className}>
-        <ReactMarkdown remarkPlugins={props.remarkPlugins as never} components={props.components as never}>
-          {text}
-        </ReactMarkdown>
+        {renderCodeInPrimitive.current && SyntaxHighlighter ? (
+          <SyntaxHighlighter {...renderCodeInPrimitive.current} />
+        ) : (
+          <ReactMarkdown remarkPlugins={props.remarkPlugins as never} components={props.components as never}>
+            {text}
+          </ReactMarkdown>
+        )}
       </div>
     );
   },
@@ -319,6 +325,7 @@ describe("ShikiSyntaxHighlighter stale-content transitions (#3974)", () => {
     vi.mocked(peekHighlight).mockReset();
     vi.mocked(peekHighlight).mockReturnValue(undefined);
     shikiThemeRef.current = { theme: "vitesse-dark", appearance: "dark" };
+    renderCodeInPrimitive.current = null;
   });
 
   it("keeps a mount-time cache hit while an uncached theme is pending", async () => {
@@ -346,6 +353,63 @@ describe("ShikiSyntaxHighlighter stale-content transitions (#3974)", () => {
       expect(container.textContent).toContain("theme B");
     });
     expect(container.textContent).not.toContain("theme A");
+  });
+
+  it("keeps the most recent cached theme (not an older mount-time theme) while a third theme is pending", async () => {
+    vi.mocked(peekHighlight).mockImplementation((_code, opts) => {
+      if (opts?.theme === "vitesse-dark") return '<pre class="shiki">theme A</pre>';
+      if (opts?.theme === "github-dark") return '<pre class="shiki">theme B</pre>';
+      return undefined;
+    });
+    const pending = Promise.withResolvers<string | null>();
+    const started = Promise.withResolvers<void>();
+    vi.mocked(highlightSnippet).mockImplementationOnce(() => {
+      started.resolve();
+      return pending.promise;
+    });
+    const Comp = getSyntaxHighlighter();
+
+    const { container, rerender } = render(<Comp language="rust" code="fn main() {}" />);
+    expect(container.textContent).toContain("theme A");
+
+    shikiThemeRef.current = { theme: "github-dark", appearance: "dark" };
+    rerender(<Comp language="rust" code="fn main() {}" />);
+    expect(container.textContent).toContain("theme B");
+
+    shikiThemeRef.current = { theme: "vitesse-light", appearance: "light" };
+    rerender(<Comp language="rust" code="fn main() {}" />);
+    await started.promise;
+    expect(container.textContent).toContain("theme B");
+    expect(container.textContent).not.toContain("theme A");
+
+    pending.resolve('<pre class="shiki">theme C</pre>');
+    await waitFor(() => {
+      expect(container.textContent).toContain("theme C");
+    });
+  });
+
+  it("skips cache insertion while streaming (smooth=true) and caches once complete", async () => {
+    renderCodeInPrimitive.current = { language: "rust", code: "fn main() {" };
+    const { rerender } = render(<Markdown text="streaming" smooth />);
+    await waitFor(() => {
+      expect(highlightSnippet).toHaveBeenCalledWith("fn main() {", {
+        langHint: "rust",
+        theme: "vitesse-dark",
+        appearance: "dark",
+        cache: false,
+      });
+    });
+
+    vi.mocked(highlightSnippet).mockClear();
+    renderCodeInPrimitive.current = { language: "rust", code: "fn main() {}" };
+    rerender(<Markdown text="done" smooth={false} />);
+    await waitFor(() => {
+      expect(highlightSnippet).toHaveBeenCalledWith("fn main() {}", {
+        langHint: "rust",
+        theme: "vitesse-dark",
+        appearance: "dark",
+      });
+    });
   });
 
   it("clears highlighted output when a reused block transitions to unfenced text", async () => {

@@ -155,7 +155,9 @@ cursor includes the maximum stored signed sequence rather than dropping it.
 
 ## Persistence and the context primer
 
-Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.
+Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (`aoe:acp-state:v1:<sessionId>`, 7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.
+
+Unconfirmed queued prompts without attachments are persisted separately per row under `aoe:acp-pending:v1:<sessionId>:<rowId>` (7-day expiry; attachment rows are excluded to protect origin quota), while confirmed or removed rows write a terminal tombstone under `aoe:acp-pending-done:v1:<sessionId>:<rowId>` before deleting the pending entry. When a tab reloads or opens a session, `withStoredPendingRows` and `adoptPendingRows` merge active pending entries from other tabs and drop any legacy transcript copy that another tab already marked done, so edits never resurrect a confirmed or cancelled prompt. `clearAcpCache` removes all three key families (per session on session delete, and globally on logout).
 
 Native ACP HTTP history decodes each existing JSON replay page incrementally, with a fixed-size read buffer and no copy of the entire encoded body. Replay pages and individual events or rows may exceed 16 MiB; the generic daemon response decoder remains size-bounded. The native history decoder retains the 15-second body-read deadline, requires a complete valid document through EOF, and cancels a pending body read if its caller is dropped. Count-based paging and raw/rows cursor metadata are unchanged. This does not change the pre-existing WebSocket message limits.
 
