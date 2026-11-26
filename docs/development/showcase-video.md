@@ -180,7 +180,7 @@ open test-results/showcase-combined.mp4
 
 ### Re-render combine without re-running tests
 
-The recordings persist in `test-results/` until Playwright cleans them up (it doesn't clean by default). Iterate on the combine command without re-recording:
+The recordings, and the default combined mp4 inside `test-results/`, are wiped when the next Playwright run starts. Combine-only reruns are safe. Copy the videos or the mp4 elsewhere to keep them. Iterate on the combine command without re-recording:
 
 ```bash
 GRID=2x2 SHOW_TITLES=1 ./scripts/combine-showcase-videos.sh
