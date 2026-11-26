@@ -340,6 +340,87 @@ async fn initial_host_intent_obeys_applied_and_stop_before_native_issue() {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn initial_host_admission_waits_without_retargeting() {
+    use crate::acp::establishment::AcpEstablishment;
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    for replace_permit in [false, true] {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let live = PendingInitialSession::new(scope, "contended-initial-host-intent").await;
+                let id = &live.client.id;
+                let supervisor = &live.state.acp_supervisor;
+                let actor = supervisor.current_native_availability(id).await.unwrap();
+                let owner = actor.owner.unwrap();
+                assert_eq!(Some(owner), live.client.lease.spawned_runner());
+                assert!(owner.birth_fingerprint.is_some());
+                let permit = actor.lease.admission().unwrap().establishment.unwrap();
+                let fence = actor.scope.fence.lock_observation().unwrap();
+                let admission = supervisor.prepare_initial_prompt(id, "held host input", &[]);
+                tokio::pin!(admission);
+                assert!(
+                    futures_util::poll!(&mut admission).is_pending(),
+                    "a contended Native fence is not a conversation refusal"
+                );
+                drop(fence);
+
+                let result = if replace_permit {
+                    let storage = crate::session::Storage::open_reference(&permit.profile).unwrap();
+                    let original = storage
+                        .update(|rows, _| {
+                            let row = rows.iter_mut().find(|row| row.id == *id).unwrap();
+                            let original = row.acp_establishment.clone();
+                            let Some(AcpEstablishment::Pending { attempt }) =
+                                &mut row.acp_establishment
+                            else {
+                                panic!("original session/new remains in flight");
+                            };
+                            attempt.producer = None;
+                            Ok(original)
+                        })
+                        .unwrap();
+                    let result = admission.await;
+                    storage
+                        .update(|rows, _| {
+                            let row = rows.iter_mut().find(|row| row.id == *id).unwrap();
+                            row.acp_establishment = original;
+                            Ok(())
+                        })
+                        .unwrap();
+                    result
+                } else {
+                    admission.await
+                };
+                if replace_permit {
+                    let Err(error) = result else {
+                        panic!("contention must not permit a changed creation attempt");
+                    };
+                    assert_eq!(
+                        resume_failed_response(&error).status(),
+                        StatusCode::CONFLICT
+                    );
+                } else {
+                    assert!(result.unwrap().is_some());
+                }
+                assert_eq!(Some(owner), live.client.lease.spawned_runner());
+                assert_eq!(live.client.initial_prompt_identity(), None);
+                assert!(!published(&live.state, id, |event| matches!(
+                    event,
+                    Event::UserPromptSent { .. }
+                )));
+                assert!(!live
+                    .native
+                    .requests()
+                    .iter()
+                    .any(|method| method == "session/prompt"));
+                live.client.shutdown().await.unwrap();
+            })
+        })
+        .await;
+    }
+}
+
 /// A structured session whose worker starts fail: on the provider limit when
 /// `rate_limited`, otherwise as a generic launch failure. The count proves a
 /// case reached the start it forced.

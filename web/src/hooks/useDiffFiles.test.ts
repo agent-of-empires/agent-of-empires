@@ -72,6 +72,22 @@ describe("useDiffFiles", () => {
     expect(mockReportSeen).not.toHaveBeenCalled();
   });
 
+  it("reports a prefetched diff when the panel opens, without waiting for another fetch", async () => {
+    mockGetFiles.mockResolvedValueOnce(resp());
+    const { result, rerender } = renderHook(({ enabled }) => useDiffFiles("s1", enabled), {
+      initialProps: { enabled: false },
+    });
+    await waitFor(() => expect(result.current.revision).toBe(1));
+    expect(mockReportSeen).not.toHaveBeenCalled();
+
+    rerender({ enabled: true });
+    expect(mockReportSeen.mock.calls).toEqual([["diff_panel"]]);
+    rerender({ enabled: false });
+    rerender({ enabled: true });
+    expect(mockReportSeen).toHaveBeenCalledTimes(1);
+    expect(mockGetFiles).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps revision 0 on a null response, but counts an empty list", async () => {
     mockGetFiles.mockResolvedValue(null);
     const { result } = renderHook(() => useDiffFiles("s1", true));

@@ -1113,13 +1113,30 @@ impl SessionService {
                 if needs_resume {
                     return PromptTouch::Establishment(refusal);
                 }
-                match current_native
-                    .as_mut()
-                    .map(|current| current.initial_prompt_attempt(&expected, native.storage()))
-                {
-                    Some(Ok(Some(attempt))) => Some(attempt),
-                    Some(Err(refusal)) => return PromptTouch::Establishment(refusal),
-                    _ => return PromptTouch::Establishment(refusal),
+                let Some(current) = current_native.as_mut() else {
+                    return PromptTouch::Establishment(refusal);
+                };
+                loop {
+                    match current.initial_prompt_attempt(&expected, native.storage()) {
+                        Ok(Some(attempt)) => break Some(attempt),
+                        Ok(None) => return PromptTouch::Establishment(refusal),
+                        Err(error) => match error.downcast::<NativeObservationWait>() {
+                            Ok(wait) => {
+                                if !wait.settle_before(observation_deadline).await {
+                                    return PromptTouch::Establishment(
+                                        EstablishmentRefusal::Unconfirmed,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                return PromptTouch::Establishment(
+                                    *error
+                                        .downcast_ref::<EstablishmentRefusal>()
+                                        .unwrap_or(&refusal),
+                                );
+                            }
+                        },
+                    }
                 }
             } else {
                 None
@@ -1171,24 +1188,34 @@ impl SessionService {
             let _identity = crate::session::acquire_session_identity_lock()?;
             let _title = crate::session::acquire_session_title_lock(&worker_id)?;
             use crate::session::SessionStore;
-            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&worker_id)?;
+            let _lifecycle = native
+                .storage()
+                .acquire_instance_lifecycle_lock(&worker_id)?;
             let store: &dyn crate::session::SessionStore = &native;
             let mut refused = None;
             let committed = store.update(|rows, _| {
-                let row = rows.iter_mut().find(|row| row.id == worker_id)
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == worker_id)
                     .ok_or(crate::session::SessionGone)?;
                 if refuse_if_ignored && row.is_ignored() {
                     refused = Some(PromptTouch::Ignored);
                     anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
                 }
                 if let Some(outcome) = prompt_touch_rejection(
-                    row, generation, &title, provider.as_deref(), view, no_revive,
+                    row,
+                    generation,
+                    &title,
+                    provider.as_deref(),
+                    view,
+                    no_revive,
                 ) {
                     refused = Some(outcome);
                     anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
                 }
                 if let Some(original) = initial_prompt.as_ref() {
-                    let admitted = current_native.as_mut()
+                    let admitted = current_native
+                        .as_mut()
                         .ok_or(crate::acp::establishment::EstablishmentRefusal::Superseded)?
                         .initial_prompt_attempt(row, native.storage())?;
                     if !admitted.as_ref().is_some_and(|admitted| {
@@ -1205,7 +1232,8 @@ impl SessionService {
                         return Err(refusal.into());
                     }
                 } else {
-                    let original = resume_reservation.as_ref()
+                    let original = resume_reservation
+                        .as_ref()
                         .and_then(|reservation| reservation.establishment.as_ref())
                         .ok_or(crate::acp::establishment::EstablishmentRefusal::Unresolved)?;
                     anyhow::ensure!(
@@ -1216,7 +1244,11 @@ impl SessionService {
                     );
                 }
                 let unavailable = if let Some(current) = current_native.as_mut() {
-                    let selected = current.scope.choice.as_ref().is_some_and(|choice| choice.matches(row));
+                    let selected = current
+                        .scope
+                        .choice
+                        .as_ref()
+                        .is_some_and(|choice| choice.matches(row));
                     let same_context = current.scope.context
                         == crate::acp::state::NativeEventContext::capture(row, native.storage())?;
                     let active = if same_context {
@@ -1238,7 +1270,8 @@ impl SessionService {
                     current.unavailable
                 } else {
                     crate::process::worker_registry::control_admission(&worker_id)
-                        .err().map(|refusal| refusal.observation())
+                        .err()
+                        .map(|refusal| refusal.observation())
                 };
                 if let Some(unavailable) = unavailable {
                     refused = Some(PromptTouch::Unavailable(unavailable));
