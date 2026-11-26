@@ -3967,6 +3967,7 @@ mod tests {
                 "error": "sandbox_login_required",
                 "message": "sandbox login required for claude: run `aoe sandbox login --tool claude`",
                 "tool": "claude",
+                "profile": crate::session::config::effective_profile(""),
             })
         );
         assert!(!state.acp_supervisor.is_running(&id).await);

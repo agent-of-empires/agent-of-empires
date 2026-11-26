@@ -97,7 +97,6 @@ interface Props {
   onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
   onStopSession?: (sessionId: string) => void;
   onStartSession?: (sessionId: string) => void;
-  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   /** False in CityHall client mode, which hides project management. */
@@ -278,7 +277,6 @@ export function WorkspaceSidebar(props: Props) {
       onDelete: props.onDeleteSession,
       onStop: props.onStopSession,
       onStart: props.onStartSession,
-      onRestartForUpdate: props.onRestartForUpdate,
       onSwitchView: props.onSwitchView,
       readOnly,
       optimistic: triage.optimisticFor(v.workspace),

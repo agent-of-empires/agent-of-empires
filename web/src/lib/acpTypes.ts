@@ -299,9 +299,6 @@ export type IncompatibleAgentDetail =
       reason: string;
     };
 
-/** Mirror of `StartupCause` in src/acp/state.rs; the event leaves it out when nothing was diagnosed. */
-export type StartupCause = { kind: "container_missing" };
-
 /** Mirror of `IntegrationLostReason` in src/acp/state.rs. */
 export type IntegrationLostReason =
   | { kind: "contract_violation"; detail: string }
@@ -635,6 +632,24 @@ export interface InteractionError {
   target?: { kind: "approval" | "elicitation"; nonce: string };
 }
 
+/**
+ * A startup failure the daemon diagnosed; mirrors `StartupCause` in `src/acp/state.rs`. A login-required
+ * cause carries the `command` and `profile` the banner hands to the login it starts.
+ */
+export type StartupCause =
+  | { kind: "container_missing" }
+  | { kind: "sandbox_login_required"; command?: string; profile?: string }
+  | { kind: "sandbox_login_unsupported" };
+
+const STARTUP_CAUSE_KINDS: ReadonlyArray<string> = [
+  "container_missing",
+  "sandbox_login_required",
+  "sandbox_login_unsupported",
+];
+
+/** `error` of the 409 a launch held until the sandbox login exists answers with. */
+export const SANDBOX_LOGIN_REQUIRED_CODE = "sandbox_login_required";
+
 export interface AcpState {
   agent: string | null;
   model: string | null;
@@ -683,6 +698,10 @@ export interface AcpState {
   integrationLostSnapshotSeq: number | null;
   /** Why `startupError` happened, when the Daemon said; set and cleared with it. */
   startupCause: StartupCause | null;
+  /** Counts the events that cleared the startup error; a late blocked launch from before one is stale. */
+  startupRecoveries: number;
+  /** `startupRecoveries` as each in-flight prompt was sent, for the refused-launch guard. */
+  promptRecoveries: Record<string, number>;
   /** Adapter compatibility failure; replaces the session view with `StartupErrorScreen`. */
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
@@ -1169,6 +1188,8 @@ export function emptyAcpState(): AcpState {
     inflightPromptIds: [],
     workflowSnapshotKeys: [],
     startupCause: null,
+    startupRecoveries: 0,
+    promptRecoveries: {},
   };
 }
 
@@ -1536,9 +1557,12 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("AgentStartupError" in event) {
+    const cause = event.AgentStartupError.cause;
+    // A kind from a newer Daemon reads as none, as an old client would see it.
+    const diagnosed = cause && STARTUP_CAUSE_KINDS.includes(cause.kind) ? cause : null;
+    if (covered && state.connectionReady && diagnosed) return next;
     next.startupError = event.AgentStartupError.message;
-    next.startupCause =
-      event.AgentStartupError.cause?.kind === "container_missing" ? { kind: "container_missing" } : null;
+    next.startupCause = diagnosed;
     // A diagnosed cause gets its own banner, which doesn't compare with a Retry's error.
     const retried = state.restartInFlight && !next.startupCause ? state.retriedError : null;
     endRestart(next);
@@ -1595,6 +1619,7 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.serverTurnActive = !next.connectionUnavailable;
     next.turnActive = deriveTurnActive(next);
     if (!isSteeredContinuation(state, rawTurnActive)) {
+      if (!covered || wasInflight) next.startupRecoveries += 1;
       applyNewTurnResets(next);
     }
     return next;
@@ -1604,6 +1629,7 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.serverTurnActive = !next.connectionUnavailable;
     next.turnActive = deriveTurnActive(next);
     if (!isSteeredContinuation(state, rawTurnActive)) {
+      if (!covered) next.startupRecoveries += 1;
       applyNewTurnResets(next);
     }
     return next;
@@ -1965,6 +1991,12 @@ export function applyReducedState(
     next.integrationLostSnapshotSeq = snapshotSeq;
   }
   if (connectionReady) {
+    if (!state.connectionReady) {
+      // Only a current ready projection can confirm that a failed launch recovered.
+      next.startupRecoveries += 1;
+      next.startupError = null;
+      next.startupCause = null;
+    }
     next.sessionAssigned = true;
     endRestart(next);
     next.workerStopped = false;

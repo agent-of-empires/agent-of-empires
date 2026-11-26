@@ -39,7 +39,8 @@ pub use prompt::{
 pub(crate) use prompt::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 pub use view::{acp_disable, acp_enable, acp_terminal_check};
 pub(crate) use view::{
-    publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
+    publish_startup_error_if_current, publish_startup_error_with_cause_if_current,
+    recover_pending_terminal_handoffs, HandoffRecovery,
 };
 pub(in crate::server::api) use worker::rate_limit_resume_probe;
 pub use worker::{

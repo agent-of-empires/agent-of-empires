@@ -36,6 +36,11 @@ fn a_clicked_hint_closes_its_dialog_through_the_key_path() {
             |v| v.worktree_name_dialog.is_some(),
         ),
         (
+            "Esc cancel",
+            |v| v.sandbox_login_dialog = Some(SandboxLoginDialog::new()),
+            |v| v.sandbox_login_dialog.is_some(),
+        ),
+        (
             "[Deny]",
             |v| v.permission_response_dialog = Some(PermissionResponseDialog::new("s", None)),
             |v| v.permission_response_dialog.is_some(),

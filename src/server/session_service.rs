@@ -1394,8 +1394,7 @@ impl SessionService {
                     // The held session is not respawned, so no startup error would explain the
                     // queue: publish one, once per hold.
                     if self.sandbox_login.hold(id, origin, &blocked) {
-                        self.acp_supervisor
-                            .publish_startup_error(id, blocked.to_string());
+                        self.acp_supervisor.publish_login_required(id, &blocked);
                     }
                     return Err(SendTurnError::LoginRequired(blocked));
                 }
@@ -8262,6 +8261,76 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_to_string(&calls).unwrap_or_default(), "");
+    }
+
+    /// A session that runs its own command for the tool waits on that command's file: the
+    /// startup error it publishes carries the `command` the recovery needs, so the dashboard
+    /// logs in what the message says.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_queue_send_turn_publishes_the_command_its_recovery_needs() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, _calls) =
+            crate::session::test_support::failing_container_runtime(home.path());
+        let id = "sess-login-command";
+        let mut row = Instance::new("personal", "/tmp/aoe-login-command");
+        row.id = id.to_string();
+        row.view = crate::session::View::Structured;
+        crate::session::test_support::sandbox_needing_login(home.path(), &mut row);
+        crate::session::config::update_config(|c| {
+            c.session
+                .custom_agents
+                .insert("personal".to_string(), "codex".to_string());
+            c.session
+                .agent_config_dir
+                .insert("personal".to_string(), "~/.claude-personal".to_string());
+        })
+        .unwrap();
+        row.tool = "personal".to_string();
+        row.command = "claude".to_string();
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        let service = &state.session_service;
+
+        let result = service
+            .send_turn(
+                &SessionCaller::User,
+                id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                    text: "hi",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_ids: Vec::new(),
+                    synthesized: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
+                    no_revive: false,
+                },
+            )
+            .await;
+
+        let Err(SendTurnError::LoginRequired(blocked)) = result else {
+            panic!("the launch is held");
+        };
+        assert_eq!(blocked.command.as_deref(), Some("claude"));
+        let events: Vec<_> = state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
+        let [crate::acp::Event::AgentStartupError { message, cause, .. }] = events.as_slice()
+        else {
+            panic!("expected one startup error, got {events:?}");
+        };
+        assert_eq!(*message, blocked.to_string());
+        assert_eq!(
+            *cause,
+            Some(crate::acp::state::StartupCause::SandboxLoginRequired {
+                command: Some("claude".to_string()),
+                profile: Some(crate::session::config::effective_profile("")),
+            })
+        );
     }
 
     /// On Apple Container the helper cannot run, so a turn that needs the login is refused
