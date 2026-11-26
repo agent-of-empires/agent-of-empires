@@ -116,7 +116,7 @@ An account is a tool name with its own `[session.agent_config_dir]` entry (see [
 
 In the web dashboard, **Switch account** sits in the usage-limit banner next to **Try again** and in the session's sidebar menu. It opens a picker over the configured tool names that can take the conversation over (names only; `agent_config_dir` paths stay in the aoe config and are not editable from the web), explains the transcript copy and the uncached first turn, and restarts on confirm. A refusal is shown as the server worded it, and nothing changes. The dialog shows the current tool and the label and plan the agent reported, never the email.
 
-- A session parked on a rate limit continues with the interrupted prompt as its next turn, once, and the park's auto-resume budget is disarmed like a manual **Try again**. The generic restart wake message is not sent. A session that is not parked gets the usual wake message.
+- A session parked on a rate limit continues with the interrupted prompt as its next turn, once, and the park's auto-resume budget is disarmed like a manual **Try again**. A session that is not parked gets no new turn.
 - `switch-account` refuses and changes nothing where the swap would start a fresh conversation: the tool runs a different agent, the agent has no known transcript layout (only Claude does), the session has no recorded conversation, or a sandboxed session still has its store move pending. `restart --tool` keeps the parking swap in those cases.
 - The first turn on the new account re-reads the whole context uncached, because the prompt cache belongs to the account.
 

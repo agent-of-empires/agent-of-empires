@@ -120,9 +120,9 @@ When a launch requests resume, AoE preserves an unknown stored ID and attempts i
 
 An inconclusive resume or fresh-pinned probe, a missing created-pane identity on a fresh launch, or an unknown query of an existing pane returns `launch_indeterminate`, never ready success. Observation errors and stabilization expiry prove neither death nor loaded history.
 
-During resume or fresh-pinned stabilization, a live pane that remains classified as a foreground shell until the deadline returns `launch_indeterminate` with cause `stabilization_expired`. AoE withholds sends, attach preparation and restart wake input instead of treating elapsed time or the launch command as readiness. Inspect the retained pane before retrying. Normal AoE-created panes use a protected environment wrapper that is excluded from this foreground-shell classification.
+During resume or fresh-pinned stabilization, a live pane that remains classified as a foreground shell until the deadline returns `launch_indeterminate` with cause `stabilization_expired`. AoE withholds sends and attach preparation instead of treating elapsed time or the launch command as readiness. Inspect the retained pane before retrying. Normal AoE-created panes use a protected environment wrapper that is excluded from this foreground-shell classification.
 
-AoE preserves the pane, process, conversation association, capture poller and scope ownership on this outcome. It releases only its own launch reservation when storage permits, without teardown even if release fails. The observed sandbox workdir is retained unless a concurrent change supersedes its container context. Sends, attach preparation and restart wake messages stop at this refusal. Inspect the existing pane and restore tmux access before retrying; do not assume that the Agent needs a replacement. This does not restrict an explicit owned Stop.
+AoE preserves the pane, process, conversation association, capture poller and scope ownership on this outcome. It releases only its own launch reservation when storage permits, without teardown even if release fails. The observed sandbox workdir is retained unless a concurrent change supersedes its container context. Inspect the existing pane and restore tmux access before retrying; do not assume that the Agent needs a replacement. This does not restrict an explicit owned Stop.
 
 Workspace conversion also reports an unconfirmed restart as a warning, retaining the runtime and concurrent record edits instead of claiming restart success. An automatic sandbox revival resolves any required credential hook outside the lifecycle locks, then rechecks admission while retaining the original physical restart target.
 
@@ -154,7 +154,7 @@ An accepted OMP pin confirmation also converges the local launch intent, so the 
 
 Reloads retain the compatible row's capture-repair pacing and managed-start retry deadline even when it has no poller handle. They use the existing tool-and-execution handoff guards, not the separate relaunch reset policy.
 
-On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.
+On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends may then reach the new conversation.
 
 AoE reports this fresh result only after the new association, or the cleared association for an agent that publishes its own ID later, is durably committed. A publication failure refuses the launch instead of reporting fresh success with the old association still stored.
 
@@ -273,7 +273,7 @@ Two tool names can also point at the same agent on different accounts, through `
 
 The carry applies only when the new tool resolves to the same built-in agent, the session has a conversation to carry, and AoE knows the agent's transcript layout (Claude Code today). Anything else takes the parking swap above.
 
-The CLI reaches this swap with `aoe session restart <session> --tool <tool>`, and for a structured session `aoe acp switch-account <session> <tool>` does the same but refuses instead of parking when the carry does not apply. A structured session parked on a rate limit continues with the interrupted prompt instead of the restart wake message; see [Switching accounts manually](../structured-view/troubleshooting.md#switching-accounts-manually).
+The CLI reaches this swap with `aoe session restart <session> --tool <tool>`, and for a structured session `aoe acp switch-account <session> <tool>` does the same but refuses instead of parking when the carry does not apply. A structured session parked on a rate limit continues with the interrupted prompt; see [Switching accounts manually](../structured-view/troubleshooting.md#switching-accounts-manually).
 
 The outgoing account keeps its own copy, so swapping accounts back and forth stays continuous: the account you swap away from is the one that was just running, so on the way back its transcript replaces the older copy the earlier swap left behind. A copy the incoming account wrote more recently than the outgoing one is left alone.
 
