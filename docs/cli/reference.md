@@ -36,7 +36,6 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session unsnooze`↴](#aoe-session-unsnooze)
 * [`aoe session favorite`↴](#aoe-session-favorite)
 * [`aoe session unfavorite`↴](#aoe-session-unfavorite)
-* [`aoe session color`↴](#aoe-session-color)
 * [`aoe session archive`↴](#aoe-session-archive)
 * [`aoe session unarchive`↴](#aoe-session-unarchive)
 * [`aoe session restore`↴](#aoe-session-restore)
@@ -82,8 +81,6 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe tmux`↴](#aoe-tmux)
 * [`aoe tmux status`↴](#aoe-tmux-status)
 * [`aoe sounds`↴](#aoe-sounds)
-* [`aoe sounds install`↴](#aoe-sounds-install)
-* [`aoe sounds list`↴](#aoe-sounds-list)
 * [`aoe sounds test`↴](#aoe-sounds-test)
 * [`aoe theme`↴](#aoe-theme)
 * [`aoe theme list`↴](#aoe-theme-list)
@@ -178,7 +175,7 @@ Run without arguments to launch the TUI dashboard.
 * `sandbox` — Clean up sandbox agent stores and log in sandboxed agents
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
-* `sounds` — Manage sound effects for agent state transitions
+* `sounds` — Test the built-in sound effects
 * `theme` — Manage color themes (list, export, customize)
 * `settings` — Inspect resolved settings and their provenance
 * `cityhall` — Export and apply the CityHall config bundle (settings + projects)
@@ -470,7 +467,6 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `unsnooze` — Wake a snoozed session immediately
 * `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
 * `unfavorite` — Clear the favorite flag on a session
-* `color` — Set (or clear) a per-session color label, rendered as a colored dot in the web sidebar for at-a-glance status signaling. Intended for a running agent to flag its own state, e.g. `aoe session color $(aoe session current -q) red`. Colors: `red` (needs attention), `amber` (working), `green` (done); `none` clears it
 * `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
 * `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
@@ -761,19 +757,6 @@ Clear the favorite flag on a session
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
-
-
-
-## `aoe session color`
-
-Set (or clear) a per-session color label, rendered as a colored dot in the web sidebar for at-a-glance status signaling. Intended for a running agent to flag its own state, e.g. `aoe session color $(aoe session current -q) red`. Colors: `red` (needs attention), `amber` (working), `green` (done); `none` clears it
-
-**Usage:** `aoe session color <IDENTIFIER> <COLOR>`
-
-###### **Arguments:**
-
-* `<IDENTIFIER>` — Session ID or title
-* `<COLOR>` — Color label: `red` (needs attention), `amber` (working), `green` (done), or `none`/`clear` to remove the label
 
 
 
@@ -1370,43 +1353,37 @@ Add this to your ~/.tmux.conf: set -g status-right "#(aoe tmux status)"
 
 ## `aoe sounds`
 
-Manage sound effects for agent state transitions
+Test the built-in sound effects
 
 **Usage:** `aoe sounds <COMMAND>`
 
 ###### **Subcommands:**
 
-* `install` — Install bundled sound effects
-* `list` — List currently installed sounds
-* `test` — Test a sound by playing it
-
-
-
-## `aoe sounds install`
-
-Install bundled sound effects
-
-**Usage:** `aoe sounds install`
-
-
-
-## `aoe sounds list`
-
-List currently installed sounds
-
-**Usage:** `aoe sounds list`
+* `test` — Play a built-in sound on this machine to check that audio works
 
 
 
 ## `aoe sounds test`
 
-Test a sound by playing it
+Play a built-in sound on this machine to check that audio works
 
-**Usage:** `aoe sounds test <NAME>`
+**Usage:** `aoe sounds test [EVENT]`
 
 ###### **Arguments:**
 
-* `<NAME>` — Sound file name (without extension)
+* `<EVENT>` — The sound to play
+
+  Default value: `idle`
+
+  Possible values:
+  - `start`
+  - `running`
+  - `waiting`
+  - `idle`
+  - `error`
+  - `approval`:
+    A Structured view Session asks for permission or a question; browser only
+
 
 
 
@@ -2068,7 +2045,9 @@ Restart a worker, or start a stopped one through `aoe serve`
 
 ## `aoe acp history`
 
-Print the persisted transcript for an agent session
+Print the persisted transcript for an agent session.
+
+By default prints a readable transcript: streamed agent chunks joined into whole messages, user prompts, and one line per tool call.
 
 **Usage:** `aoe acp history [OPTIONS] <SESSION>`
 
@@ -2082,6 +2061,16 @@ Print the persisted transcript for an agent session
 
   Default value: `0`
 * `--json` — Emit raw frames as JSON (one frame per line)
+* `--last <N>` — Only the last N transcript entries (after `--role` filtering)
+* `--role <ROLE>` — Only entries from these roles (comma-separated)
+
+  Possible values:
+  - `user`
+  - `agent`
+  - `tool`
+  - `notice`:
+    Errors and lifecycle notices
+
 
 
 

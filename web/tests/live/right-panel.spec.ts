@@ -1,11 +1,11 @@
 // Right panel against a real server (#1221): diff viewer, Files pane, comments. The diff list's toggle and
 // keyboard select are DiffFileList.test.tsx; the paired shell's mode picker is PairedShellPane.test.tsx.
 
-import { rmSync } from "node:fs";
+import { appendFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { commitAll, generateLargeFileContent, pngStubBytes, writeBinaryFile } from "../helpers/gitFixture";
 import { enableStructuredViewAndWait } from "../helpers/acp";
 
@@ -14,11 +14,15 @@ const decodablePng = Buffer.from(
   "base64",
 );
 
+/** Opens the Session and its Diff pane, which starts closed by default. */
 async function openSession(page: Page, serve: ServeHandle, title: string) {
   await page.goto(`${serve.baseUrl}/`);
   const row = page.getByRole("link").filter({ hasText: title }).first();
   await expect(row).toBeVisible({ timeout: 10_000 });
   await row.click();
+  const diffToggle = page.getByTestId("pane-toggle-diff").first();
+  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+  await diffToggle.click();
 }
 
 // The dashboard mounts a desktop and a hidden mobile right panel, so visible-anywhere checks use first().
@@ -47,15 +51,22 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
   page,
   spawnServe,
 }) => {
-  // #4574: the git case, where Diff auto-opens, is the diff viewer test below.
+  // #4574: with Diff set to open in Sessions, a non-git Session still starts without it.
+  const seed = seedSessionViaAoeAdd({ title: "rp-non-git", subdir: "plain-project", git: false });
   const serve = await spawnServe({
-    seedFn: seedSessionViaAoeAdd({ title: "rp-non-git", subdir: "plain-project", git: false }),
+    seedFn: async (env) => {
+      appendFileSync(
+        join(appDirFor(env.home, env.xdg, resolveAoeBinary()), "config.toml"),
+        "\n[web]\nauto_open_diff_pane = true\n",
+      );
+      await seed(env);
+    },
   });
   const [session] = await listSessions(serve.baseUrl);
   expect(session!.outside_repository).toBe(true);
   const storedTabs = () =>
     page.evaluate((id) => {
-      const store = JSON.parse(localStorage.getItem("aoe-pane-layout-v2") ?? "{}");
+      const store = JSON.parse(localStorage.getItem("aoe-pane-layout-v3") ?? "{}");
       const layout = store.sessions?.[id];
       return layout ? [...layout.right, ...layout.bottom].flatMap((g: { tabs: string[] }) => g.tabs) : null;
     }, session!.id);
@@ -86,13 +97,11 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
     release();
   }
   await expect(diffToggle).toBeVisible({ timeout: 10_000 });
-  await expect.poll(storedTabs).not.toBeNull();
-  const pinned = (await storedTabs())!;
-  expect(pinned.some((t) => t.startsWith("terminal:"))).toBe(true);
-  expect(pinned).not.toContain("diff");
   await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+  expect(await storedTabs()).toBeNull();
 
   await diffToggle.click();
+  await expect.poll(storedTabs).toEqual(["diff"]);
   const neutral = `The working directory (${String(session!.project_path)}) isn't a git repository, so there's nothing to compare.`;
   await expect(page.getByText(neutral, { exact: true }).first()).toBeVisible({ timeout: 10_000 });
   await expect(page.getByText(/No changes vs|Could not open repository/)).toHaveCount(0);

@@ -14,7 +14,7 @@ use crate::acp::dispatch::PromptDispatch;
 use crate::daemon::{CreateSessionBody, SessionResponse};
 use crate::server::api::sessions::{
     capture_terminal_output, create_session_with, send_terminal_message, CaptureError,
-    SendKeysError,
+    CreateOrigin, SendKeysError,
 };
 use crate::server::api::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 use crate::server::session_service::{SendTurnError, SessionCaller};
@@ -237,8 +237,10 @@ impl McpServer {
             &reference,
             wait_ready,
             body,
-            initial_turn,
-            crate::daemon::PromptOrigin::Mcp,
+            CreateOrigin {
+                initial_turn,
+                ..CreateOrigin::wizard(crate::daemon::PromptOrigin::Mcp)
+            },
         )
         .await;
         let (session, fresh) = success_body(response).await.map_err(|e| *e)?;
@@ -938,8 +940,10 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
         | PromptSubmitError::Turn(SendTurnError::ModeApplication(e)) => {
             tool_error("send_failed", e.to_string())
         }
-        // Unreachable for a user caller that names no queue row and allows revival.
-        PromptSubmitError::RevivalRefused
+        // Unreachable for a user caller that names no queue row and allows revival, and
+        // `StopFenced` only follows a foreground-origin prompt.
+        PromptSubmitError::StopFenced
+        | PromptSubmitError::RevivalRefused
         | PromptSubmitError::Turn(SendTurnError::RevivalRefused)
         | PromptSubmitError::Turn(SendTurnError::NotOwner)
         | PromptSubmitError::Turn(SendTurnError::LoginRequired(_))

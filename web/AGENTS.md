@@ -23,6 +23,22 @@ isolation contract using `scripts/check-env-isolation.mjs`. The source-inventory
 test in `isolatedEnv.test.ts` invokes the same guard with a 30-second budget;
 the remaining Vitest cases exercise actual hostile-value isolation.
 
+## Where state lives
+
+The Daemon owns persistent state; see "Daemon and Clients" in `../AGENTS.md`.
+
+- A preference, or anything that should survive a reload or follow the user
+  to another browser, is a Daemon setting (`#[setting(web_only)]` for one only
+  the dashboard reads; see `docs/development/adding-settings.md`) or an
+  `app_state` field for bookkeeping such as "already shown". Read it from
+  `/api/settings` and write it through the settings API or a dedicated
+  endpoint.
+- `localStorage` is for per-browser view state (sizes, scroll, a folded
+  section, a draft) and caches of Daemon state. Comment why where the key is
+  defined. Do not add preferences to the `aoe-web-settings` blob or the
+  `webUiSync.ts` mirror.
+- Remove per-Session keys when the Session is gone (`useOrphanSweep`).
+
 ## Tests
 
 - Vitest with RTL and MSW: component logic and request payloads.

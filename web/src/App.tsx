@@ -1,15 +1,14 @@
 import {
-  lazy,
-  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type ComponentProps,
   type ReactNode,
 } from "react";
-import { Puzzle } from "lucide-react";
+import { Puzzle, Sparkles } from "lucide-react";
 import {
   confirmFileEditNavigation,
   confirmFileEditPanes,
@@ -21,9 +20,12 @@ import type { NavigateOptions, To } from "react-router-dom";
 import { Navigate, useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
+import { lazyView } from "./lib/lazyView";
+import { CloseOnEscape } from "./components/diff/comments/CloseOnEscape";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
+import { onSoundBlocked } from "./lib/soundPlayer";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { useWizardReopen } from "./hooks/app/useWizardReopen";
@@ -63,8 +65,8 @@ import { getAttentionBadgeColors } from "./lib/attentionBadgeColors";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
+import { usePrefetchWhen } from "./hooks/usePrefetchWhen";
 import { clearStoredComments } from "./components/diff/comments/storage";
-import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
 import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
@@ -77,8 +79,8 @@ import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed, renderedG
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
+import { SuggestionsView } from "./components/SuggestionsView";
 import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
-import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
   restoreSessions,
@@ -119,6 +121,7 @@ import {
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
 import { reportFeatureUse, type FeatureUse } from "./lib/featureUse";
 import { autoResumeSettingsHref } from "./lib/autoResumeSettingsHref";
+import { agentDefaultsHref } from "./lib/agentModelDefault";
 import { getClientCapabilities } from "./lib/clientCapabilities";
 import { onServerDownChange } from "./lib/connectionState";
 import { createAboutRequests } from "./lib/aboutRequests";
@@ -127,7 +130,7 @@ import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
-import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
+import { PanelDefaultsContext, parsePanelDefaults, usePanelDefaults, type PanelDefaults } from "./lib/panelDefaults";
 import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
@@ -135,7 +138,13 @@ import { toastBus, reportError } from "./lib/toastBus";
 import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
-import { NAVIGATE_EVENT, OPEN_SESSION_EVENT, openFocusWindow, replaceDocument } from "./lib/sessionRoute";
+import {
+  NAVIGATE_EVENT,
+  OPEN_SESSION_EVENT,
+  openFocusWindow,
+  replaceDocument,
+  requestNavigate,
+} from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
   bindHiddenInput,
@@ -157,19 +166,41 @@ import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the acp surface so non-acp users never download
 // the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
 // dependency tree. Cuts ~hundreds of KB off the cold-start bundle
-// for the (currently default) tmux-only flow. The Suspense fallback
-// below covers the brief load while the chunk arrives.
-const StructuredView = lazy(() =>
-  import("./components/acp/StructuredView").then((m) => ({
-    default: m.StructuredView,
-  })),
+// for the (currently default) tmux-only flow. The fallback covers the brief
+// load while the chunk arrives.
+const StructuredView = lazyView(
+  () => import("./components/acp/StructuredView").then((m) => m.StructuredView),
+  <LazyFallback label="Loading acp…" />,
 );
+const BackgroundAgentsPanel = lazyView(
+  () => import("./components/acp/BackgroundAgentsPanel").then((m) => m.BackgroundAgentsPanel),
+  <LazyFallback label="Loading agents…" />,
+);
+const DiffFileViewer = lazyView(
+  () => import("./components/diff/DiffFileViewer").then((m) => m.DiffFileViewer),
+  <LazyFallback label="Loading diff…" />,
+);
+const SettingsView = lazyView(
+  () => import("./components/SettingsView").then((m) => m.SettingsView),
+  <LazyFallback label="Loading settings…" />,
+);
+const loadSendCommentsDialog = () => import("./components/diff/comments/SendCommentsDialog");
+const SendCommentsDialog = lazyView(
+  () => loadSendCommentsDialog().then((m) => m.SendCommentsDialog),
+  (p) => <CloseOnEscape onClose={p.onClose} />,
+);
+const loadCommandPalette = () => import("./components/command-palette/CommandPalette");
+const LazyCommandPalette = lazyView(() => loadCommandPalette().then((m) => m.CommandPalette), null);
+// Mounted only while open; the chunk is prefetched 2 s after mount.
+function CommandPalette(props: ComponentProps<typeof LazyCommandPalette>) {
+  return props.open ? <LazyCommandPalette {...props} /> : null;
+}
 import { type PaneDisplay } from "./components/Dock";
 import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
-import { BackgroundAgentsPanel, type AgentFocus } from "./components/acp/BackgroundAgentsPanel";
+import type { AgentFocus } from "./components/acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
@@ -181,8 +212,6 @@ import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type Do
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
-import { DiffFileViewer } from "./components/diff/DiffFileViewer";
-import { SettingsView } from "./components/SettingsView";
 import { ProjectFormModal } from "./components/ProjectFormModal";
 import { ScratchOverridesModal } from "./components/ScratchOverridesModal";
 import { HelpOverlay } from "./components/HelpOverlay";
@@ -203,7 +232,7 @@ import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./
 import { AboutModal } from "./components/AboutModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
-import { CommandPalette } from "./components/command-palette/CommandPalette";
+import type { CommandAction } from "./components/command-palette/types";
 import { useConversationSearch } from "./hooks/useConversationSearch";
 import { BannerStack } from "./components/BannerStack";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -226,15 +255,15 @@ export default function App() {
   const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
-  const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
   const [systemHealthEnabled, setSystemHealthEnabled] = useState(false);
+  const [panelDefaults, setPanelDefaults] = useState<PanelDefaults>(() => parsePanelDefaults(null));
 
   const applyAppSettings = useCallback((settings: SettingsResponse | null | undefined) => {
     setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
-    setSessionColorsEnabled(parseSessionColorsEnabled(settings));
     setSystemHealthEnabled(parseSystemHealthEnabled(settings));
+    setPanelDefaults(parsePanelDefaults(settings));
   }, []);
 
   // A save can land while an earlier read is in flight; only the latest applies.
@@ -325,17 +354,17 @@ export default function App() {
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
         <SessionRowTagContext.Provider value={sessionRowTagMode}>
-          <SessionColorsContext.Provider value={sessionColorsEnabled}>
-            <SystemHealthEnabledContext.Provider value={systemHealthEnabled}>
+          <SystemHealthEnabledContext.Provider value={systemHealthEnabled}>
+            <PanelDefaultsContext.Provider value={panelDefaults}>
               {/* PluginUiProvider must sit above AppContent: AppContent itself reads
-                the plugin UI snapshot (usePluginPanes), so the provider can't live
-                inside its own return. */}
+                  the plugin UI snapshot (usePluginPanes), so the provider can't live
+                  inside its own return. */}
               <PluginUiProvider>
                 <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
               </PluginUiProvider>
               <ElevationPrompt />
-            </SystemHealthEnabledContext.Provider>
-          </SessionColorsContext.Provider>
+            </PanelDefaultsContext.Provider>
+          </SystemHealthEnabledContext.Provider>
         </SessionRowTagContext.Provider>
       </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>
@@ -403,6 +432,7 @@ function AppContent({
   useEffect(rememberFileEditLocation, [location]);
   const [searchParams, setSearchParams] = useSearchParams();
   const { settings: webSettings } = useWebSettings();
+  const panelDefaults = usePanelDefaults();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
@@ -413,6 +443,7 @@ function AppContent({
   const { focusSessionId, enterFocusMode, exitFocusMode } = useFocusMode(sessionMatch?.params.sessionId ?? null);
   const focusMode = focusSessionId !== null;
   useDashboardPresence(focusSessionId);
+  const suggestionsMatch = useMatch("/suggestions");
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
   const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
   const selectPluginPageSession = useCallback(
@@ -440,7 +471,7 @@ function AppContent({
   }, [focusMode, onPluginPage, selectPluginPageSession, navigate]);
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   // Settings and plugin pages take the full width, sidebar and session panels hidden.
-  const fullPageView = showSettings || pluginPageMatch !== null;
+  const fullPageView = showSettings || pluginPageMatch !== null || suggestionsMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -518,6 +549,8 @@ function AppContent({
     [cancelCue, applyPushedStatus],
   );
   useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
+  // Shown in focus mode too: the focused session's sounds are blocked like any other.
+  useEffect(() => onSoundBlocked(() => toastBus.handler?.info("Click anywhere on this page to turn on sounds.")), []);
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103). A focus window is not the main window.
@@ -544,6 +577,17 @@ function AppContent({
   const pluginUiEntries = usePluginUiEntries();
   const pluginPages = usePluginPages();
   const pluginPageActions = useMemo(() => buildPluginPageActions(pluginPages ?? []), [pluginPages]);
+  const suggestionsAction = useMemo<CommandAction>(
+    () => ({
+      id: "page:suggestions",
+      title: "Suggested sessions",
+      group: "Pages",
+      keywords: ["page", "suggestions", "suggested", "start"],
+      icon: <Sparkles className="h-4 w-4" />,
+      perform: () => requestNavigate("/suggestions"),
+    }),
+    [],
+  );
   const pluginAttention = usePluginAttention();
   const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
   const activePluginSort = useMemo(() => {
@@ -586,7 +630,6 @@ function AppContent({
     groups: repoGroups,
     savedProjects,
     toggleRepoCollapsed,
-    updateRepoAppearance,
     reorderRepoGroups,
   } = useRepoGroups(
     workspaces,
@@ -612,7 +655,7 @@ function AppContent({
     pluginAttention,
   );
   // The nested `repo+group` axis reuses the already-built repo groups for
-  // its top level (so repo collapse, appearance, and ordering are shared
+  // its top level (so repo collapse and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
   // See #1720.
   const { groups: nestedGroups, toggleSubgroupCollapsed } = useNestedSidebarGroups(
@@ -687,9 +730,9 @@ function AppContent({
   const selectedFileLine = selectedFile?.line;
   // Dock panes render as tabbed groups (#2437): each dock holds an ordered set
   // of tabs (diff, one-or-more terminals, plugin panes) with one active body.
-  // The tab membership + active tab + terminal count are persisted per session;
-  // dock sizes stay global (Dock/BottomDock own those localStorage keys).
-  // Null until the active Session's row loads, so nothing is seeded from a guess.
+  // A Session shows the Daemon's panel defaults until the user changes its tabs,
+  // which this browser then keeps; dock sizes are per browser (Dock/BottomDock).
+  // Null until the active Session's row loads, so Diff is never seeded from a guess.
   const activeRow = sessions.find((s) => s.id === activeSessionId);
   const activeOutsideRepository = activeRow ? Boolean(activeRow.outside_repository) : null;
   const pluginPanes = usePluginPanes(activeSessionId);
@@ -698,6 +741,11 @@ function AppContent({
     for (const p of pluginPanes) m.set(p.id, p);
     return m;
   }, [pluginPanes]);
+  // With plugin auto-open on, loaded plugin panes show as tabs unless the user closed them.
+  const autoPlugins = useMemo(
+    () => (panelDefaults.plugins ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : []),
+    [panelDefaults.plugins, pluginPanes],
+  );
   // A persisted tab is visible only if its backing pane currently exists: diff
   // and terminals always do; a plugin tab does only while its plugin is loaded.
   const tabAvailable = useCallback(
@@ -714,20 +762,8 @@ function AppContent({
     placeTab,
     toggleKind,
     togglePlugin,
-    syncPlugins,
     setDockCollapsed,
-  } = usePaneLayout(activeSessionId, activeOutsideRepository, tabAvailable);
-
-  // Auto-add newly available plugin panes as tabs in their default dock; the
-  // layout suppresses any the user explicitly closed. With plugin auto-open
-  // off (#3035) an empty list still pins the seeded diff/terminal defaults,
-  // which waits for the Session row so a non-git seed never keeps Diff (#4574).
-  useEffect(() => {
-    if (activeOutsideRepository === null) return;
-    syncPlugins(
-      webSettings.autoOpenPluginPanes ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : [],
-    );
-  }, [pluginPanes, syncPlugins, webSettings.autoOpenPluginPanes, activeOutsideRepository]);
+  } = usePaneLayout(activeSessionId, activeOutsideRepository, panelDefaults, autoPlugins, tabAvailable);
 
   // One-shot lookup from plugin id to its manifest identity (icon name +
   // icon_asset URL), so a pane gets a real identity glyph, up to the plugin's
@@ -901,6 +937,11 @@ function AppContent({
   // unit-tested directly.
   const tips = useTips();
   const [showPalette, setShowPalette] = useState(false);
+  // Warm the palette chunk 2 s after mount so the first shortcut press opens it at once.
+  useEffect(() => {
+    const id = window.setTimeout(() => void loadCommandPalette().catch(() => {}), 2000);
+    return () => window.clearTimeout(id);
+  }, []);
   // Palette content-search query (#2515); declared here so the keyboard
   // handlers below can clear it on close/toggle. Consumed lower down by
   // useConversationSearch.
@@ -958,11 +999,15 @@ function AppContent({
     revision,
     refresh: refreshDiffFiles,
   } = useDiffFiles(activeSessionId, diffPanelActive);
+  // Fetched once per Session even while Diff is closed, so the count is as of opening it.
+  const diffBadge = useCallback((id: string) => (id === "diff" ? diffFiles.length : 0), [diffFiles]);
 
   // Diff-viewer comments (#928). Session-scoped. The
   // banner lives in the diff pane while the inline UI lives inside
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
+  // Load the dialog chunk before it can be opened, so Escape works the moment it appears.
+  usePrefetchWhen(diffComments.count > 0, loadSendCommentsDialog);
   const commentsEnabled = !!activeSession;
   // A dormant structured worker wakes on send; archived and trashed sessions cannot start.
   const commentSendEnabled =
@@ -1566,10 +1611,10 @@ function AppContent({
     (session: SessionResponse): NewSessionLike | undefined => {
       if (caps.readOnly) return undefined;
       const repoPath = session.main_repo_path || session.project_path;
-      // Named as its sidebar header is: the alias, else the folder name.
+      // Named as its sidebar header is: the folder name.
       const groupId = (session.main_repo_path ?? session.project_path).replace(/\/+$/, "");
       return {
-        project: repoGroups.find((group) => group.id === groupId)?.displayName ?? (groupId.split("/").pop() || groupId),
+        project: groupId.split("/").pop() || groupId,
         open: () => {
           const profile = session.profile || requireProjectProfile();
           if (!profile) return;
@@ -1587,7 +1632,7 @@ function AppContent({
         },
       };
     },
-    [caps.readOnly, projects, repoGroups, requireProjectProfile],
+    [caps.readOnly, projects, requireProjectProfile],
   );
 
   const handlePinProject = useCallback(
@@ -2079,13 +2124,11 @@ function AppContent({
     onExitFocusMode: exitFocusMode,
   });
 
-  const openSettingsTab = useCallback(
-    (tab: string) =>
-      focusNavigation(focusSessionId) === "new-window"
-        ? window.open(`/settings/${tab}`, "_blank")
-        : navigate(`/settings/${tab}`),
+  const openSettings = useCallback(
+    (href: string) => (focusNavigation(focusSessionId) === "new-window" ? window.open(href, "_blank") : navigate(href)),
     [navigate, focusSessionId],
   );
+  const openSettingsTab = useCallback((tab: string) => openSettings(`/settings/${tab}`), [openSettings]);
   const settingsCommands = useSettingsCommands({
     open: showPalette,
     readOnly: caps.readOnly,
@@ -2191,48 +2234,48 @@ function AppContent({
                       persistent={webSettings.persistentStructuredViews}
                       maxPersistentViews={webSettings.maxPersistentStructuredViews}
                       renderSession={(session, active, selected) => (
-                        <Suspense fallback={<AcpLoadingFallback />}>
-                          <StructuredView
-                            active={active}
-                            selected={selected}
-                            sessionId={session.id}
-                            acpWorkerState={session.acp_worker_state ?? "absent"}
-                            rateLimitAutoResume={session.rate_limit_auto_resume}
-                            rateLimitFailoverTo={session.rate_limit_failover_to}
-                            settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
-                            tool={session.tool}
-                            acpAgent={session.acp_agent ?? null}
-                            startedBefore={hasStartedBefore(session)}
-                            acpProvider={session.acp_provider ?? null}
-                            clearAliases={session.clear_aliases}
-                            compactAliases={session.compact_aliases}
-                            onStartSession={() => void handleStartSession(session.id)}
-                            archivedAt={session.archived_at ?? null}
-                            snoozedUntil={session.snoozed_until ?? null}
-                            queuedCount={session.queued_count}
-                            trashedAt={session.trashed_at ?? null}
-                            onRestore={
-                              session.trashed_at
-                                ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
-                                : undefined
-                            }
-                            onOpenFileRef={handleOpenFileRef}
-                            fileRefSession={session}
-                            onOpenAgentsPane={openAgentsPane}
-                            serverReadOnly={caps.readOnly}
-                            isSandboxed={session.is_sandboxed}
-                            recreateContainerTitle={recreateContainerTitle(session)}
-                            recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
-                            onSwitchToTerminal={
-                              canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
-                            }
-                            onOpenTerminal={
-                              canSwitchToTerminal ? (mode) => handleOpenPairedTerminal(session.id, mode) : undefined
-                            }
-                            canRestartAgent={canRestartAgent}
-                            newSessionLike={newSessionLike(session)}
-                          />
-                        </Suspense>
+                        <StructuredView
+                          active={active}
+                          selected={selected}
+                          sessionId={session.id}
+                          acpWorkerState={session.acp_worker_state ?? "absent"}
+                          rateLimitAutoResume={session.rate_limit_auto_resume}
+                          rateLimitFailoverTo={session.rate_limit_failover_to}
+                          settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
+                          agentDefaultsHref={agentDefaultsHref(session.profile, serverAbout)}
+                          onOpenSettings={openSettings}
+                          tool={session.tool}
+                          acpAgent={session.acp_agent ?? null}
+                          startedBefore={hasStartedBefore(session)}
+                          acpProvider={session.acp_provider ?? null}
+                          clearAliases={session.clear_aliases}
+                          compactAliases={session.compact_aliases}
+                          onStartSession={() => void handleStartSession(session.id)}
+                          archivedAt={session.archived_at ?? null}
+                          snoozedUntil={session.snoozed_until ?? null}
+                          queuedCount={session.queued_count}
+                          trashedAt={session.trashed_at ?? null}
+                          onRestore={
+                            session.trashed_at
+                              ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, session.id))
+                              : undefined
+                          }
+                          onOpenFileRef={handleOpenFileRef}
+                          fileRefSession={session}
+                          onOpenAgentsPane={openAgentsPane}
+                          serverReadOnly={caps.readOnly}
+                          isSandboxed={session.is_sandboxed}
+                          recreateContainerTitle={recreateContainerTitle(session)}
+                          recreateContainerBlock={recreateContainerBlock(session, !!session.archived_at)}
+                          onSwitchToTerminal={
+                            canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
+                          }
+                          onOpenTerminal={
+                            canSwitchToTerminal ? (mode) => handleOpenPairedTerminal(session.id, mode) : undefined
+                          }
+                          canRestartAgent={canRestartAgent}
+                          newSessionLike={newSessionLike(session)}
+                        />
                       )}
                     />
                   ) : (
@@ -2270,7 +2313,7 @@ function AppContent({
               </div>
             }
             right={
-              <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
+              <div className="flex min-h-0 min-w-0 flex-1">
                 <DockGroups
                   location="right"
                   groups={rightGroups}
@@ -2369,6 +2412,38 @@ function AppContent({
         />
       );
     }
+    if (suggestionsMatch) {
+      return (
+        <div className="flex-1 min-h-0 flex flex-col">
+          <div className="px-4 pt-3 md:px-8">
+            <button onClick={handleClosePluginPage} className="text-brand-500 cursor-pointer text-sm">
+              &larr; Back
+            </button>
+          </div>
+          <SuggestionsView
+            readOnly={caps.readOnly || !caps.canManageSuggestions}
+            cityhall={caps.cityhall}
+            onOpenMarketplace={
+              caps.canManageProjects ? () => requestNavigate("/settings/plugins?marketplace=suggestions") : undefined
+            }
+            initialDismissed={searchParams.get("dismissed") === "1"}
+            onPrepare={(prefill) => {
+              setWizardPrefill(prefill);
+              setShowSessionWizard(true);
+            }}
+            onOpenSession={(id) => requestNavigate(`/session/${encodeURIComponent(id)}`)}
+            onOpenSettings={caps.canManageSuggestions ? () => requestNavigate("/settings/suggestions") : undefined}
+            sessions={sessions}
+            canLink={!caps.nameOnlyWizard}
+            onEditPreset={(providerId, criterion) =>
+              requestNavigate(
+                `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
+              )
+            }
+          />
+        </div>
+      );
+    }
     if (showSettings) {
       return (
         <SettingsView
@@ -2394,6 +2469,16 @@ function AppContent({
             await refreshProjects();
           }}
           profile={searchParams.get("profile")}
+          onOpenSuggestions={(dismissed) => navigate(dismissed ? "/suggestions?dismissed=1" : "/suggestions")}
+          presetFocus={
+            searchParams.get("preset_provider") && searchParams.get("preset_criterion")
+              ? {
+                  providerId: searchParams.get("preset_provider")!,
+                  criterion: searchParams.get("preset_criterion")!,
+                  returnToSuggestions: searchParams.get("from") === "suggestions",
+                }
+              : undefined
+          }
           field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
@@ -2452,6 +2537,23 @@ function AppContent({
               />
             )
           }
+          canLinkSuggestions={!caps.nameOnlyWizard}
+          canManageSuggestions={caps.canManageSuggestions}
+          onEditSuggestionPreset={
+            caps.canManageSuggestions
+              ? (providerId, criterion) =>
+                  requestNavigate(
+                    `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
+                  )
+              : undefined
+          }
+          onPrepareSuggestion={(prefill) => {
+            setWizardPrefill(prefill);
+            setShowSessionWizard(true);
+          }}
+          onViewAllSuggestions={() => requestNavigate("/suggestions")}
+          onOpenSuggestionsMarketplace={() => requestNavigate("/settings/plugins?marketplace=suggestions")}
+          tourActive={tour.isTourActive}
         />
       );
     }
@@ -2511,6 +2613,7 @@ function AppContent({
           onCloseSendDialog={() => setSendDialogOpen(false)}
           onClearSelectedFile={handleCloseFile}
           serverAbout={serverAbout}
+          onOpenSettings={openSettings}
         />
       );
     }
@@ -2739,6 +2842,7 @@ function AppContent({
               paneDescriptor={paneDescriptor}
               isPaneOpen={isPaneOpen}
               onTogglePane={togglePaneAny}
+              closedPaneBadge={diffBadge}
               onOpenHelp={handleOpenHelp}
               onOpenAbout={handleOpenAbout}
               onStartTutorial={tour.startTour}
@@ -2759,7 +2863,10 @@ function AppContent({
             />
           </CollapsibleRegion>
 
-          <BannerStack onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()} />
+          <BannerStack
+            onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
+            tourActive={tour.isTourActive}
+          />
           {focusMode && focusSession.title !== null && !focusSession.gone && (
             <FocusModeNote title={focusSession.title} />
           )}
@@ -2801,10 +2908,9 @@ function AppContent({
                 activeId={activeWorkspace?.id ?? null}
                 activeSessionId={activeSessionId}
                 open={sidebarOpen}
-                onToggle={() => setSidebarOpen(false)}
+                onOpenChange={setSidebarOpen}
                 onSelect={handleSelectWorkspace}
                 onToggleGroup={toggleSidebarGroup}
-                onUpdateRepoAppearance={updateRepoAppearance}
                 onNew={(prefill) => {
                   setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
                   setShowSessionWizard(true);
@@ -2834,6 +2940,22 @@ function AppContent({
                 onPluginSortChange={selectPluginSort}
                 axis={sidebarAxis}
                 onAxisChange={setSidebarAxis}
+                suggestions={{
+                  readOnly: caps.readOnly || !caps.canManageSuggestions,
+                  cityhall: caps.cityhall,
+                  onEditPreset: caps.canManageSuggestions
+                    ? (providerId, criterion) =>
+                        requestNavigate(
+                          `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion })}`,
+                        )
+                    : undefined,
+                  onPrepare: (prefill) => {
+                    setWizardPrefill(prefill);
+                    setShowSessionWizard(true);
+                  },
+                  onOpenSession: (id) => requestNavigate(`/session/${encodeURIComponent(id)}`),
+                  onViewAll: () => requestNavigate("/suggestions"),
+                }}
               />
             )}
 
@@ -2851,6 +2973,7 @@ function AppContent({
                 setWizardPrefill(undefined);
                 clearRestore();
               }}
+              onOpenSettingsTab={openSettingsTab}
               onCreated={(session?: SessionResponse) => {
                 if (session) {
                   injectSession(session);
@@ -2868,6 +2991,20 @@ function AppContent({
               }}
               prefill={wizardPrefill}
               nameOnly={caps.nameOnlyWizard}
+              onEditPreset={
+                caps.canManageSuggestions
+                  ? ({ providerId, criterion }) => {
+                      setShowSessionWizard(false);
+                      setWizardPrefill(undefined);
+                      const q = new URLSearchParams({
+                        preset_provider: providerId,
+                        preset_criterion: criterion,
+                        from: "suggestions",
+                      });
+                      navigate(`/settings/suggestions?${q}`);
+                    }
+                  : undefined
+              }
             />
           )}
 
@@ -2950,6 +3087,7 @@ function AppContent({
               ...commandActions,
               ...conversationActions,
               ...pluginPageActions,
+              suggestionsAction,
               ...settingsCommands,
               ...pluginCommandActions,
             ]}
@@ -3019,10 +3157,10 @@ function AppContent({
   );
 }
 
-function AcpLoadingFallback() {
+function LazyFallback({ label }: { label: string }) {
   return (
     <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
-      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
+      <div className="text-xs font-mono uppercase tracking-wide">{label}</div>
     </div>
   );
 }

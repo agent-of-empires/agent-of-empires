@@ -97,6 +97,8 @@ export interface AcpContext {
   loadingEarlierHistory: boolean;
 }
 
+const identityMessage: ExternalStoreAdapter<ThreadMessageLike>["convertMessage"] = (m) => m;
+
 /** Owns the external store so a new `key` builds a fresh runtime. A `/clear`
  *  shortens a kept message's parts, and assistant-ui's store would otherwise read
  *  a stale part index and crash the view (assistant-ui#5708). */
@@ -222,7 +224,7 @@ export function AcpRuntime({
     // gate, or a background sub-agent with an idle main turn silently eats
     // every keystroke.
     isRunning: acp.state.turnActive,
-    convertMessage: (m) => m,
+    convertMessage: identityMessage,
     // The idle Enter path: text comes from the message, attachments from our staging.
     onNew: async (msg) => {
       const text = msg.content

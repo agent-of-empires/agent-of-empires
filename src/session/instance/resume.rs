@@ -400,7 +400,7 @@ impl Instance {
         }
         if self.status == Status::Error {
             self.status = Status::Idle;
-            self.last_error = None;
+            self.last_error.clear();
             self.last_error_check = None;
         }
         let generation = self.acquire_lifecycle_reservation(
@@ -825,7 +825,7 @@ impl Instance {
         self.release_scope()?;
         killed.with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
         self.status = Status::Error;
-        self.last_error = Some(format!(
+        self.last_error.set(format!(
             "resume failed for sid {}; preserved for explicit retry",
             stale_sid
         ));
@@ -1845,10 +1845,11 @@ mod tests {
             assert_eq!(inst.resume_probe_failed_sid.as_deref(), Some(stale_sid));
             assert_eq!(inst.status, Status::Error);
             assert_eq!(
-                inst.last_error,
-                Some(format!(
-                    "resume failed for sid {stale_sid}; preserved for explicit retry"
-                ))
+                inst.last_error.as_deref(),
+                Some(
+                    format!("resume failed for sid {stale_sid}; preserved for explicit retry")
+                        .as_str()
+                )
             );
             assert!(inst.last_error_check.is_some());
             let loaded = storage.load().unwrap();

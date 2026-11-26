@@ -181,7 +181,6 @@ const requestCases: RequestCase[] = [
   ["GET /api/themes", () => api.fetchThemes(), { respond: json(["empire"]), result: ["empire"] }],
   ["GET /api/themes/My%20Theme", () => api.fetchResolvedTheme("My Theme")],
   ["GET /api/theme/current", () => api.fetchCurrentTheme()],
-  ["GET /api/sounds", () => api.fetchSounds(), { respond: json(["chime.wav"]), result: ["chime.wav"] }],
   [
     "GET /api/about",
     () => api.fetchAbout(),
@@ -765,6 +764,52 @@ describe("settings saves", () => {
     expect(await api.updateSettings({ a: 1 })).toBe("rejected");
   });
 
+  it("reads a Session's default model from the Daemon, and gives null when it can't", async () => {
+    const reply = { profile: "my work", agent_key: "cursor", model: "opus", pinned: false };
+    fetchSpy.mockResolvedValueOnce(json(reply)).mockResolvedValueOnce(json({ error: "not_found" }, 404));
+    expect(await api.fetchSessionModelDefault("s/1")).toEqual(reply);
+    expect(fetchSpy.mock.calls[0][0]).toBe("/api/sessions/s%2F1/acp-default-model");
+    expect(await api.fetchSessionModelDefault("s/1")).toBeNull();
+  });
+
+  it.each([
+    ["a saved model", () => json({ agent_key: "claude", model: "opus", pinned: false }), "committed", true],
+    ["a pin", () => json({ error: "model_pinned", message: "" }, 409), "pinned", false],
+    ["another conflict", () => json({ error: "read_only", message: "" }, 409), "rejected", false],
+    ["an unknown Agent", () => json({ error: "unknown_agent", message: "" }, 400), "rejected", false],
+    ["a server error", () => json({ error: "internal", message: "" }, 500), "uncertain", true],
+    ["no reply", () => Promise.reject(new Error("offline")), "uncertain", true],
+  ])("PUTs only the model, and maps %s", async (_name, reply, outcome, announced) => {
+    const listener = vi.fn();
+    const off = onSettingsChanged(listener);
+    try {
+      fetchSpy.mockImplementationOnce(async () => reply());
+      expect(await api.putAgentModelDefault("work", "claude", "opus")).toBe(outcome);
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toBe("/api/profiles/work/acp-defaults/claude/model");
+      expect(init?.method).toBe("PUT");
+      expect(JSON.parse(String(init?.body))).toEqual({ model: "opus" });
+      expect(listener).toHaveBeenCalledTimes(announced ? 1 : 0);
+    } finally {
+      off();
+    }
+  });
+
+  it("sends a default model PUT only after the one before it has answered", async () => {
+    let answerFirst: (r: Response) => void = () => {};
+    fetchSpy
+      .mockImplementationOnce(() => new Promise<Response>((r) => (answerFirst = r)))
+      .mockResolvedValueOnce(json({}));
+    const first = api.putAgentModelDefault("work", "claude", "opus");
+    const second = api.putAgentModelDefault("work", "claude", "sonnet");
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    answerFirst(json({}));
+    expect([await first, await second]).toEqual(["committed", "committed"]);
+    expect(fetchSpy.mock.calls.map(([, init]) => JSON.parse(String(init?.body)).model)).toEqual(["opus", "sonnet"]);
+  });
+
   it("setDefaultProfile announces a landed save and stays quiet on a rejected one", async () => {
     const listener = vi.fn();
     const off = onSettingsChanged(listener);
@@ -809,7 +854,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["resolveMcpConflict", () => api.resolveMcpConflict("n", "a", "aoe", "fp"), "error"],
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
-  ["fetchSoundBlob", () => api.fetchSoundBlob("x.wav"), null],
+  ["fetchSound", () => api.fetchSound("idle"), null],
   ["fetchProfileAgents", () => api.fetchProfileAgents("work"), null],
   ["pullSandboxImage", () => api.pullSandboxImage(), { ok: false }],
   ["dismissSandboxImage", () => api.dismissSandboxImage("sha256:new"), false],
@@ -1094,10 +1139,10 @@ it("keeps a dispatched image upload result after write policy is revoked", async
   expect(fetchSpy).toHaveBeenCalledTimes(1);
 });
 
-it("fetchSoundBlob returns the file as a Blob", async () => {
+it("fetchSound returns the event's bytes", async () => {
   fetchSpy.mockResolvedValueOnce(new Response("bytes"));
-  expect(await (await api.fetchSoundBlob("my sound.wav"))!.text()).toBe("bytes");
-  expect(lastCall().url).toBe("/api/sounds/file/my%20sound.wav");
+  expect(new TextDecoder().decode((await api.fetchSound("idle"))!)).toBe("bytes");
+  expect(lastCall().url).toBe("/api/sounds/idle");
 });
 
 describe("fetchCityHallBundle", () => {
@@ -1358,6 +1403,85 @@ describe("createSession errors", () => {
     expect(await api.createSession(body)).toEqual({ ok: false, error: "restarted", outcomeUnknown: true });
     offline();
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline", network: true });
+  });
+
+  it("resets a preset by query, without a DELETE body", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    expect(await api.resetSuggestionPreset("acme.sugg", "assigned")).toEqual({ ok: true, data: undefined });
+    const [url, init] = fetchSpy.mock.calls.at(-1)!;
+    expect(url).toBe("/api/suggestions/presets?provider_id=acme.sugg&criterion=assigned");
+    expect(init?.method).toBe("DELETE");
+    expect(init?.body).toBeUndefined();
+  });
+
+  describe("startSuggestion", () => {
+    const reply = (status: number, body: object) =>
+      fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify(body), { status }));
+
+    it("posts the item and options, and reads the 201 answer", async () => {
+      reply(201, { session_id: "s1", title: "Fix it" });
+      expect(await api.startSuggestion("acme.sugg", "i1", { project: { path: "/p" } })).toEqual({
+        kind: "started",
+        sessionId: "s1",
+        title: "Fix it",
+      });
+      const [url, init] = fetchSpy.mock.calls.at(-1)!;
+      expect(url).toBe("/api/suggestions/start");
+      expect(JSON.parse(init?.body as string)).toEqual({ provider_id: "acme.sugg", id: "i1", project: { path: "/p" } });
+    });
+
+    it.each([
+      [
+        "409 already_started",
+        409,
+        { error: "already_started", session_id: "s9" },
+        { kind: "already_started", sessionId: "s9" },
+      ],
+      [
+        "409 hooks_need_trust",
+        409,
+        { error: "hooks_need_trust", commands: { on_create: ["npm ci"] }, review_fingerprint: "fp" },
+        {
+          kind: "hooks_need_trust",
+          review: { error: "hooks_need_trust", commands: { on_create: ["npm ci"] }, review_fingerprint: "fp" },
+        },
+      ],
+      [
+        "422 start_failed",
+        422,
+        { error: "start_failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
+        { kind: "failed", reason: "Docker isn't running", hint: "Start it.", retryable: true },
+      ],
+      ["409 trust_changed", 409, { error: "trust_changed" }, { kind: "trust_changed" }],
+      ["409 stale_suggestion", 409, { error: "stale_suggestion", message: "gone" }, { kind: "stale" }],
+      ["400 no_project", 400, { error: "no_project", hint: "link_project" }, { kind: "no_project" }],
+    ])("maps %s", async (_name, status, body, expected) => {
+      reply(status, body);
+      expect(await api.startSuggestion("acme.sugg", "i1")).toEqual(expected);
+    });
+
+    it("reports anything else as an error, including no answer", async () => {
+      reply(500, { error: "boom", message: "server broke" });
+      expect(await api.startSuggestion("acme.sugg", "i1")).toMatchObject({ kind: "error" });
+      offline();
+      expect(await api.startSuggestion("acme.sugg", "i1")).toMatchObject({
+        kind: "error",
+        error: "Network error: offline",
+      });
+    });
+  });
+
+  it("tells a 2xx with an unreadable body apart from a network error on suggestion requests", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("<html>proxy</html>", { status: 200 }));
+    expect(await api.refreshSuggestions()).toEqual({
+      ok: false,
+      error: "Unexpected response from the server. Reload to see the current state.",
+      stale: false,
+    });
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
+    expect(await api.refreshSuggestions()).toEqual({ ok: true, data: undefined });
+    offline();
+    expect(await api.refreshSuggestions()).toMatchObject({ ok: false, error: "Network error: offline" });
   });
 
   it("reads create progress, null once the create has finished", async () => {
@@ -1787,41 +1911,33 @@ describe("runtime snapshots and cancellation", () => {
     ["zero revision", { "aoe-runtime-epoch": "boot", "aoe-runtime-revision": "0" }],
     ["another epoch", { "aoe-runtime-epoch": "successor", "aoe-runtime-revision": "1" }],
   ])("does not claim a setting committed without its original runtime receipt (%s)", async (_name, headers) => {
-    for (const call of [
-      () => api.setSessionColor("s1", null, "boot"),
-      () => api.setSessionNotifications("s1", "default", "boot"),
-    ]) {
-      fetchSpy.mockResolvedValueOnce(
-        new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
-      );
-      expect(await call()).toEqual({ outcome: "uncertain" });
-    }
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify(session), { headers: headers as Record<string, string> }),
+    );
+    expect(await api.setSessionNotifications("s1", "default", "boot")).toEqual({ outcome: "uncertain" });
   });
 
   it.each([400, 401, 403, 409, 500, 503])(
     "distinguishes setting rejection from unconfirmed writes (%s)",
     async (status) => {
-      for (const call of [
-        () => api.setSessionColor("s1", null, "boot"),
-        () => api.setSessionNotifications("s1", "all", "boot"),
-      ]) {
-        fetchSpy.mockResolvedValueOnce(empty(status));
-        expect(await call()).toEqual({ outcome: status >= 500 ? "uncertain" : "rejected" });
-      }
+      fetchSpy.mockResolvedValueOnce(empty(status));
+      expect(await api.setSessionNotifications("s1", "all", "boot")).toEqual({
+        outcome: status >= 500 ? "uncertain" : "rejected",
+      });
     },
   );
 
   it("does not attest another session or a missing canonical row", async () => {
     for (const body of [null, {}, { ...session, id: "replacement" }]) {
       fetchSpy.mockResolvedValueOnce(runtimeJson(body));
-      expect(await api.setSessionColor("s1", null, "boot")).toEqual({ outcome: "uncertain" });
+      expect(await api.setSessionNotifications("s1", "off", "boot")).toEqual({ outcome: "uncertain" });
     }
   });
 
   it("preserves u64 revision precision and the canonical returned fields, including optional outcome", async () => {
-    const canonical = { ...session, color: "green", outcome: { acknowledged: true } };
+    const canonical = { ...session, notify_on_idle: true, outcome: { acknowledged: true } };
     fetchSpy.mockResolvedValueOnce(runtimeJson(canonical));
-    expect(await api.setSessionColor("s1", null, "boot")).toEqual({
+    expect(await api.setSessionNotifications("s1", "all", "boot")).toEqual({
       outcome: "committed",
       mutation: { session: canonical, cursor },
     });

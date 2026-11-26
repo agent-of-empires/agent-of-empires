@@ -416,6 +416,7 @@ mod tests {
             detect_cursor_status,
             Status::Idle,
             &[
+                "  changes were allowed, shallow copy approved\n\n  \u{2192} Add a follow-up",
                 "\
   → Add a follow-up
 
@@ -814,7 +815,7 @@ To continue this session, run codex resume 019e270b-5139-7752-ac61-86fe4bb5170c
             Status::Waiting,
             &[
                 "run this command? (y/n)",
-                "approve changes?",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
                 "execute this action? [y/n]",
                 r#"
 ■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
@@ -962,7 +963,7 @@ run this command? (y/n)
             Status::Waiting,
             &[
                 "run this command? (y/n)",
-                "approve changes?",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
                 "execute this action? [y/n]",
                 "ready\n>",
             ],
@@ -989,6 +990,9 @@ run this command? (y/n)
             &[
                 "run command? (y/n)",
                 "Allow this tool to run?",
+                "Do you want to run this command?\n\u{276f} 1. Yes\n  \
+                    2. Yes, and approve `ls` for the rest of the running session\n  \
+                    3. No, and tell Copilot what to do differently (Esc)",
                 "pick an option\nenter to select",
                 "done\n>",
                 "done\ncopilot>",
@@ -1015,6 +1019,7 @@ run this command? (y/n)
                 "file saved",
                 "random output text",
                 "need more? help is available; use tab next tab to switch",
+                "You can approve it for the rest of the running session, or tell Copilot what to do differently.",
             ],
         );
         assert_all(
@@ -1059,8 +1064,10 @@ run this command? (y/n)
             Status::Waiting,
             &[
                 "run this command? (y/n)",
-                "approve changes?",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
                 "execute this action? [y/n]",
+                "Command to approve\n  ls -la\n\n\u{276f} Yes, allow\n  Yes, and always allow low\n  \
+                    No, cancel\n\n\u{2191}\u{2193} navigate \u{b7} Enter select \u{b7} Esc cancel",
                 "ready\ndroid>",
                 "done\n>",
             ],
@@ -1068,7 +1075,11 @@ run this command? (y/n)
         assert_all(
             detect_droid_status,
             Status::Idle,
-            &["file saved", "random output text"],
+            &[
+                "file saved",
+                "random output text",
+                "Yes, allow it only after review\nNo, cancel the job if it hangs",
+            ],
         );
         assert_all(
             detect_hermes_status,
@@ -1094,6 +1105,8 @@ run this command? (y/n)
                 "some output\n❯",
                 "some output\n❯ ",
                 "some output\n⚡",
+                // No prompt: `ready_prompt` would outrank the approval rule.
+                "changes were allowed, shallow copy approved",
                 "pondering the question\ntask complete\n❯",
                 "anything",
                 "",
@@ -1117,7 +1130,7 @@ run this command? (y/n)
             Status::Waiting,
             &[
                 "run command? (y/n)",
-                "Allow this tool to run?",
+                "Allow execution of: 'ls'?\n\u{25cf} 1. Yes, allow once",
                 "pick an option\nenter to select",
                 "done\n>",
                 "done\nqwen>",
@@ -1166,6 +1179,11 @@ path: /workspace/secrets.env
   Yes, allow always
   No, deny access",
                 "I'll read that file now.\n awaiting user approval.",
+                "\
+\u{2503} self needs approval for Bash
+\u{2503} \u{25cf} Bash(free -m)
+\u{2503}
+\u{2503} ctrl+k approve \u{b7} alt+j manage",
             ],
         );
         assert_all(
@@ -2222,6 +2240,20 @@ Tips for getting started:
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
  >   Type your message or @path/to/file
 ";
+        let gemini_quoting_wrapped = gemini_quoting.replace(
+            "offers 1. Trust folder (proj),",
+            "offers 1. Trust folder\n  (proj),",
+        );
+        let gemini_trust_unnumbered =
+            GEMINI_FOLDER_TRUST_PROMPT.replace("1. Trust folder (", "Trust folder (");
+        let gemini_after_trust_unnumbered =
+            GEMINI_AFTER_TRUST.replace("1. Trust folder (", "Trust folder (");
+        // A composer repeating the choice label must not stand in for the dialog's row.
+        let composer = " >   Type your message or @path/to/file";
+        let gemini_composer_repeats =
+            GEMINI_AFTER_TRUST.replace(composer, " > explain 1. Trust folder (proj)");
+        let gemini_composer_repeats_wrapped =
+            GEMINI_AFTER_TRUST.replace(composer, " > explain 1. Trust folder\n   (proj)");
         // (agent, screen, deciding rule, status)
         let cases = [
             (
@@ -2258,17 +2290,47 @@ Tips for getting started:
             (
                 "gemini",
                 GEMINI_APPROVAL_PROMPT,
-                "approval_prompt",
+                "approval_choice",
                 Status::Waiting,
             ),
             (
                 "gemini",
                 GEMINI_APPROVAL_AFTER_TRUST,
-                "approval_prompt",
+                "approval_choice",
                 Status::Waiting,
             ),
             ("gemini", GEMINI_AFTER_TRUST, "no_rule", Status::Idle),
             ("gemini", gemini_quoting, "no_rule", Status::Idle),
+            (
+                "gemini",
+                gemini_quoting_wrapped.as_str(),
+                "no_rule",
+                Status::Idle,
+            ),
+            (
+                "gemini",
+                gemini_trust_unnumbered.as_str(),
+                "folder_trust_prompt",
+                Status::Waiting,
+            ),
+            (
+                "gemini",
+                gemini_after_trust_unnumbered.as_str(),
+                "no_rule",
+                Status::Idle,
+            ),
+            (
+                "gemini",
+                gemini_composer_repeats.as_str(),
+                "no_rule",
+                Status::Idle,
+            ),
+            (
+                "gemini",
+                gemini_composer_repeats_wrapped.as_str(),
+                "no_rule",
+                Status::Idle,
+            ),
         ];
         for (agent, screen, rule, status) in cases {
             assert_eq!(detected(agent, screen), (rule, status), "{agent}: {screen}");
@@ -2281,6 +2343,65 @@ Tips for getting started:
             "",
             None
         ));
+    }
+
+    #[test]
+    fn approval_prompt_ignores_allow_and_approve_in_prose() {
+        let prose = "\
+The flag allows three retries, and the reviewer approved the plan.
+Writes are allowed once the lock is released.
+The policy will allow once the lock is released, and admins allow always.
+Allow once the lock is released.
+Allow once
+\u{203a} Allow always
+> Allow once
+\u{276f} Allow always
+";
+        for agent in [
+            "antigravity",
+            "claude",
+            "codex",
+            "copilot",
+            "droid",
+            "gemini",
+            "qwen",
+        ] {
+            for rule in ["approval_prompt", "approval_choice"] {
+                assert!(
+                    !super::super::detect::rule_matches(agent, rule, prose, "", None),
+                    "{agent} {rule}"
+                );
+            }
+        }
+        let droid_dialog = "Command to approve\n  ls -la\n\n\u{276f} Yes, allow\n  \
+            Yes, and always allow low\n  No, cancel\n\n\u{2191}\u{2193} navigate \u{b7} \
+            Enter select \u{b7} Esc cancel";
+        for (screen, want) in [
+            (droid_dialog, true),
+            ("Pick Yes, allow to run it, or No, cancel to stop.", false),
+            (
+                "Yes, allow it only after review\nNo, cancel the job if it hangs",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                super::super::detect::rule_matches("droid", "permission_choice", screen, "", None),
+                want,
+                "{screen}"
+            );
+        }
+        let prompt_above_dialog =
+            format!(" > summarize the readme\n\n{GEMINI_FOLDER_TRUST_PROMPT}");
+        let d = super::super::detect::detect(
+            "gemini",
+            &prompt_above_dialog,
+            &Observation::new("", None, true),
+        )
+        .expect("gemini has a manifest");
+        assert_eq!(
+            (d.rule, d.status),
+            ("folder_trust_prompt", Some(Status::Waiting))
+        );
     }
 
     #[test]
@@ -2306,6 +2427,12 @@ Tips for getting started:
   \u{203a} 1. Yes
     2. No
 \u{2736} Herding\u{2026} (53s \u{b7} \u{2193} 7.0k tokens)",
+            "\
+ The tool's permission menu offers:
+ 1. Allow once
+ 2. Allow always
+ 3. Deny
+ \u{2733} Puttering\u{2026} (26s \u{b7} thinking more with high effort)",
         ];
         for content in cases {
             assert!(
@@ -2431,10 +2558,22 @@ Tips for getting started:
         let cursor_prompt = "Run this command?\n\n> Allow this command\n  Deny\n\n\
 enter to select · esc to cancel";
         for (agent, cleared, kept) in [
-            ("codex", "file saved", "approve changes?"),
+            (
+                "codex",
+                "file saved",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
+            ),
             ("cursor", "→ add a follow-up", cursor_prompt),
-            ("qwen", "random output text", "Allow this tool to run?"),
-            ("gemini", "file saved", "approve changes?"),
+            (
+                "qwen",
+                "random output text",
+                "Allow execution of: 'ls'?\n\u{25cf} 1. Yes, allow once",
+            ),
+            (
+                "gemini",
+                "file saved",
+                "\u{25cf} 1. Allow once\n  2. Allow always",
+            ),
         ] {
             assert_hook_all(agent, stale_wait(), Status::Idle, &[cleared]);
             assert_hook_all(agent, stale_wait(), Status::Waiting, &[kept]);
@@ -2682,6 +2821,15 @@ enter to select · esc to cancel";
             detect_via_manifest("claude", &parked, "", stale),
             Status::Idle
         );
+
+        for line in ["❯ Allow once", "❯ 1. Allow once"] {
+            let draft = format!("✻ Cooked for 49s\n{box_}\n{line}\n{box_}");
+            assert_eq!(
+                detect_via_manifest("claude", &draft, "", stale),
+                Status::Idle,
+                "{line}"
+            );
+        }
 
         let interrupted = "\
 ⎿  Interrupted · What should Claude do instead?\n\

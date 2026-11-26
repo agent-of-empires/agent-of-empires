@@ -15,7 +15,6 @@ async function readList(baseUrl: string) {
   const body = (await response.json()) as {
     sessions: Array<{
       id: string;
-      color: string | null;
       notify_on_waiting: boolean | null;
       notify_on_idle: boolean | null;
       notify_on_error: boolean | null;
@@ -24,7 +23,7 @@ async function readList(baseUrl: string) {
   return { ...current, sessions: body.sessions };
 }
 
-test("isolated serve publishes advancing native epoch revision receipts for color and notifications", async ({
+test("isolated serve publishes advancing native epoch revision receipts for notifications", async ({
   page,
   spawnServe,
 }) => {
@@ -36,58 +35,42 @@ test("isolated serve publishes advancing native epoch revision receipts for colo
   const row = page.getByTestId("sidebar-session-row").filter({ hasText: "native-receipts" });
   await expect(row).toBeVisible({ timeout: 10_000 });
   await row.click({ button: "right" });
-  const colorResponse = page.waitForResponse(
-    (r) => new URL(r.url()).pathname === "/api/sessions/" + id + "/color" && r.request().method() === "PATCH",
-  );
-  await page.getByTestId("sidebar-context-menu-color-red").click();
-  const color = await colorResponse;
-  expect(color.ok()).toBe(true);
-  expect(color.request().postDataJSON()).toEqual({ color: "red" });
-  const colorCursor = cursor(await color.allHeaders());
-  expect(colorCursor.epoch).toBe(before.epoch);
-  expect(colorCursor.revision > before.revision).toBe(true);
-  expect(await color.json()).toMatchObject({ id, color: "red" });
-  await expect(row.getByTestId("sidebar-session-color-dot")).toHaveAttribute("data-color", "red");
-  const notifyResponse = page.waitForResponse(
-    (r) => new URL(r.url()).pathname === "/api/sessions/" + id + "/notifications" && r.request().method() === "PATCH",
-  );
-  await page.getByTestId("sidebar-context-menu-notify-all").click();
-  const notify = await notifyResponse;
-  expect(notify.ok()).toBe(true);
-  expect(notify.request().postDataJSON()).toEqual({
-    notify_on_waiting: true,
-    notify_on_idle: true,
-    notify_on_error: true,
-  });
-  const notifyCursor = cursor(await notify.allHeaders());
-  expect(notifyCursor.epoch).toBe(colorCursor.epoch);
-  expect(notifyCursor.revision > colorCursor.revision).toBe(true);
-  expect(await notify.json()).toMatchObject({
-    id,
-    color: "red",
-    notify_on_waiting: true,
-    notify_on_idle: true,
-    notify_on_error: true,
-  });
-  await expect(page.getByTestId("sidebar-context-menu-notify-all")).toHaveAttribute("aria-pressed", "true");
+  const pick = async (preset: "all" | "off") => {
+    const response = page.waitForResponse(
+      (r) => new URL(r.url()).pathname === "/api/sessions/" + id + "/notifications" && r.request().method() === "PATCH",
+    );
+    await page.getByTestId("sidebar-context-menu-notify-" + preset).click();
+    const settled = await response;
+    expect(settled.ok()).toBe(true);
+    const on = preset === "all";
+    const values = { notify_on_waiting: on, notify_on_idle: on, notify_on_error: on };
+    expect(settled.request().postDataJSON()).toEqual(values);
+    expect(await settled.json()).toMatchObject({ id, ...values });
+    await expect(page.getByTestId("sidebar-context-menu-notify-" + preset)).toHaveAttribute("aria-pressed", "true");
+    return cursor(await settled.allHeaders());
+  };
+  const all = await pick("all");
+  expect(all.epoch).toBe(before.epoch);
+  expect(all.revision > before.revision).toBe(true);
+  const off = await pick("off");
+  expect(off.epoch).toBe(all.epoch);
+  expect(off.revision > all.revision).toBe(true);
   await expect
     .poll(async () => {
       const list = await readList(serve.baseUrl);
       const saved = list.sessions.find((session) => session.id === id);
       return (
-        list.epoch === notifyCursor.epoch &&
-        list.revision >= notifyCursor.revision &&
-        saved?.color === "red" &&
-        saved.notify_on_waiting === true &&
-        saved.notify_on_idle === true &&
-        saved.notify_on_error === true
+        list.epoch === off.epoch &&
+        list.revision >= off.revision &&
+        saved?.notify_on_waiting === false &&
+        saved.notify_on_idle === false &&
+        saved.notify_on_error === false
       );
     })
     .toBe(true);
-  // A fresh browser mount must derive the choices from the backend, not the pending overlay.
+  // A fresh browser mount must derive the choice from the backend, not the pending overlay.
   await page.reload();
   await expect(row).toBeVisible({ timeout: 10_000 });
   await row.click({ button: "right" });
-  await expect(page.getByTestId("sidebar-context-menu-color-red")).toHaveAttribute("aria-pressed", "true");
-  await expect(page.getByTestId("sidebar-context-menu-notify-all")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("sidebar-context-menu-notify-off")).toHaveAttribute("aria-pressed", "true");
 });

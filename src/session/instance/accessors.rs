@@ -11,7 +11,7 @@ pub(crate) const UNBOUND_STORE_HINT: &str = "ACP does not prove a native convers
 #[error("Cannot create sub-session of a sub-session (single level only)")]
 pub struct NestedSubSession;
 
-fn generate_id() -> String {
+pub(crate) fn generate_id() -> String {
     Uuid::new_v4().to_string().replace("-", "")[..16].to_string()
 }
 
@@ -53,6 +53,7 @@ impl Instance {
             plugin_meta: std::collections::BTreeMap::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            suggestion: None,
             plugin_revival_pending: false,
             pending_initial_turn: None,
             queued_prompts: Vec::new(),
@@ -87,7 +88,6 @@ impl Instance {
             callback_url: None,
             idempotency_key: None,
             base_branch_override: None,
-            color: None,
             view: View::Terminal,
             agent_name: None,
             agent_model: None,
@@ -115,7 +115,7 @@ impl Instance {
             pi_extension_launched: false,
             identity_publisher_launched: false,
             pi_session_path: None,
-            last_error: None,
+            last_error: LastError::default(),
             capture_poller: Default::default(),
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
@@ -1339,7 +1339,7 @@ mod tests {
             .insert(ConversationBinding::unknown("stale-sid"));
         inst.last_error_check = Some(std::time::Instant::now());
         inst.last_start_time = Some(std::time::Instant::now());
-        inst.last_error = Some("test error".to_string());
+        inst.last_error.set("test error".to_string());
         inst.acp_load_session_capable = Some(true);
 
         let json = serde_json::to_string(&inst).unwrap();

@@ -1,4 +1,4 @@
-//! Pin, color, archive, trash/restore, rename/summarize triggers, and
+//! Pin, archive, trash/restore, rename/summarize triggers, and
 //! stop/start/snooze/unread endpoints.
 
 use super::*;
@@ -272,73 +272,6 @@ pub async fn reclaim_session_ownership(
     }
     tracing::info!(target: "session.sync", session = %id, field = "ownership", value = "reclaimed", "session updated");
     drop(guard);
-    drop(namespace);
-    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
-}
-
-pub async fn update_session_color(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    body: Result<Json<UpdateColorBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if state.read_only {
-        return crate::server::api::read_only_response();
-    }
-    let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
-    };
-
-    // Validate up front so an unknown color never reaches disk; `None` clears
-    // the label. Mirrors the CLI's palette check.
-    let new_color = body.color.map(|c| c.trim().to_lowercase());
-    if let Some(c) = &new_color {
-        if !crate::session::is_valid_session_color(c) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("invalid color {c:?}; expected one of: red, amber, green, or null"),
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    let namespace = state.profile_namespace.read().await;
-    let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
-    }
-
-    let profile = {
-        let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
-        };
-        inst.source_profile.clone()
-    };
-
-    let color = new_color.clone();
-    let persist_id = id.clone();
-    let committed = commit_profile_update(
-        &state,
-        profile,
-        "color update",
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                // Pre-validated above, so this cannot fail.
-                let _ = inst.set_color(new_color);
-            }
-        },
-        None,
-    )
-    .await;
-    if let Err(response) = committed {
-        return response;
-    }
-    tracing::info!(target: "session.sync", session = %id, field = "color", value = ?color, "session updated");
-    drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
@@ -755,7 +688,7 @@ pub async fn update_session_archive(
             if !row.finish_lifecycle_status(LifecycleOperation::Stop, generation, status) {
                 return Err(LifecycleTargetError::Busy.into());
             }
-            if let Err(error) = &stopped { row.last_error = Some(error.to_string()); }
+            if let Err(error) = &stopped { row.last_error.set(error.to_string()); }
             Ok(())
         });
         if let Err(error) = finalized {
@@ -1034,7 +967,7 @@ pub async fn trash_session(
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(LifecycleTargetError::Missing)?;
                 row.status = Status::Error;
-                row.last_error = Some(error.to_string());
+                row.last_error.set(error.to_string());
             }
             Ok(())
         });
@@ -2106,7 +2039,7 @@ async fn stop_with_commit(
                 pi.apply(row);
             }
             if !stopped {
-                row.last_error = Some("Failed to stop session resources".into());
+                row.last_error.set("Failed to stop session resources");
             }
             Ok(())
         });
@@ -2536,7 +2469,7 @@ fn admit_restart(
     row.touch_last_accessed();
     row.idle_dormant_since = None;
     row.idle_entered_at = None;
-    row.last_error = None;
+    row.last_error.clear();
     row.last_error_check = None;
     row.status = Status::Starting;
     Ok(())
@@ -3900,7 +3833,7 @@ async fn prepare_agent_session_inner(
                 )?;
                 row.idle_dormant_since = None;
                 row.idle_entered_at = None;
-                row.last_error = None;
+                row.last_error.clear();
                 if row.is_structured() {
                     row.status = Status::Idle;
                     row.release_lifecycle_reservation_if_owned(
@@ -4672,7 +4605,7 @@ mod durable_stop_tests {
                     Status::Error
                 }
             );
-            assert!(current.last_error.as_ref().is_none_or(|message| {
+            assert!(current.last_error.as_deref().is_none_or(|message| {
                 !message.contains(source.to_str().unwrap())
                     && !message.contains("private-content")
                     && cause.as_ref().is_none_or(|cause| !message.contains(cause))
@@ -5098,7 +5031,11 @@ mod durable_stop_tests {
             let log = std::fs::read_to_string(&calls).unwrap_or_default();
             assert_eq!(
                 log.trim(),
-                if superseded { "" } else { "stop c1" },
+                if superseded {
+                    ""
+                } else {
+                    "inspect --format {{json .Config.Entrypoint}}|{{json .HostConfig.Init}}|{{json .Config.StopTimeout}}|{{json .State.Pid}} c1\nstop c1"
+                },
                 "superseded={superseded}"
             );
         }

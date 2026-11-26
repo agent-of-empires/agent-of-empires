@@ -26,6 +26,7 @@ import { SchemaSection } from "./settings/SchemaSection";
 import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { PanelsSettings } from "./settings/PanelsSettings";
+import { PANEL_SETTING_FIELDS } from "../lib/panelDefaults";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { CityHallSettings } from "./settings/CityHallSettings";
 import { PluginsSettings } from "./settings/PluginsSettings";
@@ -41,12 +42,15 @@ import {
 } from "../lib/settingsIntros";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { LogsSettings } from "./settings/LogsSettings";
+import { SuggestionsSettings } from "./settings/SuggestionsSettings";
+import type { PresetFocus } from "./settings/SuggestionPresetEditor";
+import { useSuggestionsSnapshot } from "./settings/useSuggestionsSnapshot";
 import { SettingsHeader } from "./settings/SettingsHeader";
 import { StructuredViewDisplaySettings } from "./settings/StructuredViewDisplaySettings";
 import { ProfilesSection } from "./profiles/ProfilesSection";
 import { ProfileSelector } from "./settings/ProfileSelector";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
-import { SECTION_TO_TAB, type SettingsSearchHit } from "./settings/settingsSearchIndex";
+import { tabOf, type SettingsSearchHit } from "./settings/settingsSearchIndex";
 
 export type TabId =
   | "profiles"
@@ -68,6 +72,7 @@ export type TabId =
   | "structured-view"
   | "mcp"
   | "skills"
+  | "suggestions"
   | "logging"
   | "logs"
   | "plugins"
@@ -100,7 +105,7 @@ const PROFILES_ICON = (
 // Dashboard settings lead, since the web is where they apply; tabs that only
 // tune the daemon, TUI, or host follow. Exported to test the order without the
 // duplicated list and sidebar in the DOM.
-export function buildSidebar(readOnly = false): SidebarItem[] {
+export function buildSidebar(readOnly = false, suggestions = false): SidebarItem[] {
   const items: SidebarItem[] = [
     { kind: "divider", label: "Dashboard" },
     { kind: "tab", id: "theme", label: "Theme" },
@@ -116,6 +121,7 @@ export function buildSidebar(readOnly = false): SidebarItem[] {
     { kind: "tab", id: "structured-view", label: "Structured view" },
     { kind: "tab", id: "mcp", label: "MCP servers" },
     { kind: "tab", id: "skills", label: "Skills" },
+    ...(suggestions ? [{ kind: "tab" as const, id: "suggestions" as const, label: "Suggestions" }] : []),
     { kind: "divider", label: "Environment" },
     { kind: "tab", id: "sandbox", label: "Sandbox" },
     { kind: "tab", id: "worktree", label: "Worktree" },
@@ -158,7 +164,7 @@ const CITYHALL_THEME_HIDDEN = ["color_mode", "idle_decay_minutes"];
 // and jumping to a hit lands on Theme because `activeTab` silently clamps. #7.
 function curateCityhallSchema(schema: SettingsFieldDescriptor[]): SettingsFieldDescriptor[] {
   return schema.filter((d) => {
-    const tab = SECTION_TO_TAB[d.section];
+    const tab = tabOf(d);
     if (!tab || !CITYHALL_TAB_IDS.has(tab)) return false;
     if (d.section === "theme") return !CITYHALL_THEME_HIDDEN.includes(d.field);
     if (d.section === "session") return CITYHALL_SESSION_FIELDS.includes(d.field);
@@ -190,6 +196,10 @@ interface Props {
    *  advanced settings PATCH is closed server-side in this mode; theme and the
    *  surfaced fields write through their own endpoints. See #7. */
   cityhall?: boolean;
+  /** Opens the full Suggested sessions view, optionally on its Dismissed filter. */
+  onOpenSuggestions?: (dismissed: boolean) => void;
+  /** Opens Settings > Suggestions on one kind's preset editor. */
+  presetFocus?: PresetFocus;
 }
 
 const LAST_TAB_KEY = "aoe-settings-last-tab";
@@ -214,6 +224,7 @@ const ALL_TAB_IDS = new Set<TabId>([
   "structured-view",
   "mcp",
   "skills",
+  "suggestions",
   "logging",
   "logs",
   "plugins",
@@ -268,8 +279,13 @@ export function SettingsView({
   field,
   readOnly,
   cityhall = false,
+  onOpenSuggestions,
+  presetFocus,
 }: Props) {
   const offline = useServerDown();
+  const suggestions = useSuggestionsSnapshot();
+  // A failed load keeps the tab, so its error and Retry stay reachable.
+  const hasSuggestionProviders = (suggestions.snapshot?.providers.length ?? 0) > 0 || suggestions.failed;
   // Seed empty rather than "default" so the initial
   // useEffect-gated loadSettings doesn't fire a wasted
   // fetchSettings("default") against a profile that may not exist.
@@ -302,7 +318,7 @@ export function SettingsView({
     },
     [onSelectProfile],
   );
-  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(readOnly);
+  const sidebar: SidebarItem[] = cityhall ? CITYHALL_SIDEBAR : buildSidebar(readOnly, hasSuggestionProviders);
   const tabs = sidebar.filter((s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab");
   const allowedTab = (t: unknown): t is TabId =>
     isTabId(t) && (cityhall ? CITYHALL_TAB_IDS.has(t) : sidebar.some((s) => s.kind === "tab" && s.id === t));
@@ -333,7 +349,7 @@ export function SettingsView({
       new Set(
         schema
           .filter((d) => d.profile_overridable && d.web_write.policy !== "local_only")
-          .map((d) => SECTION_TO_TAB[d.section])
+          .map((d) => tabOf(d))
           .filter(Boolean),
       ),
     [schema],
@@ -358,10 +374,7 @@ export function SettingsView({
   if (field && field !== deepLinked && !schemaLoading && !schemaError) {
     setDeepLinked(field);
     const d = searchSchema.find(
-      (x) =>
-        `${x.section}.${x.field}` === field &&
-        x.web_write.policy !== "local_only" &&
-        SECTION_TO_TAB[x.section] === activeTab,
+      (x) => `${x.section}.${x.field}` === field && x.web_write.policy !== "local_only" && tabOf(x) === activeTab,
     );
     if (d) setFocusRequest((prev) => ({ section: d.section, field: d.field, nonce: (prev?.nonce ?? 0) + 1 }));
   }
@@ -527,6 +540,7 @@ export function SettingsView({
       activeTab !== "structured-view" &&
       activeTab !== "mcp" &&
       activeTab !== "skills" &&
+      activeTab !== "suggestions" &&
       activeTab !== "plugins" &&
       activeTab !== "telemetry" &&
       activeTab !== "cityhall" &&
@@ -658,7 +672,22 @@ export function SettingsView({
       case "diff":
         return <DiffSettings />;
       case "panels":
-        return <PanelsSettings />;
+        return (
+          <div className="space-y-4">
+            {schemaGuard() ??
+              (settings && (
+                <SchemaSection
+                  section="web"
+                  schema={schema}
+                  focusRequest={focusRequest}
+                  values={web}
+                  onSaveField={sendSave}
+                  onlyFields={PANEL_SETTING_FIELDS}
+                />
+              ))}
+            <PanelsSettings />
+          </div>
+        );
       case "sound":
         return (
           <SchemaSection
@@ -733,7 +762,14 @@ export function SettingsView({
       case "plugins":
         return (
           <div className="space-y-6">
-            <PluginsSettings readOnly={cityhall} />
+            <PluginsSettings
+              readOnly={cityhall}
+              initialMarketplaceFilter={
+                new URLSearchParams(window.location.search).get("marketplace") === "suggestions"
+                  ? "suggestions"
+                  : undefined
+              }
+            />
             {!cityhall &&
               (schemaGuard() ?? <PluginSettingsSections schema={schema} settings={settings} onSaveField={sendSave} />)}
           </div>
@@ -757,6 +793,7 @@ export function SettingsView({
                     focusRequest={focusRequest}
                     values={web}
                     onSaveField={sendSave}
+                    hideFields={PANEL_SETTING_FIELDS}
                   />
                 ))}
             </div>
@@ -778,6 +815,18 @@ export function SettingsView({
         return <McpServers readOnly={cityhall} />;
       case "skills":
         return <SkillsManager readOnly={readOnly || cityhall} />;
+      case "suggestions":
+        return (
+          <SuggestionsSettings
+            snapshot={suggestions.snapshot}
+            failed={suggestions.failed}
+            reload={suggestions.reload}
+            readOnly={readOnly ?? false}
+            onOpenSuggestions={onOpenSuggestions}
+            presetFocus={presetFocus}
+            pluginSettings={cityhall ? undefined : { schema, settings, onSaveField: sendSave, notice: schemaGuard() }}
+          />
+        );
       case "structured-view": {
         if (!settings) {
           return <div className="text-sm text-text-dim">Loading settings...</div>;

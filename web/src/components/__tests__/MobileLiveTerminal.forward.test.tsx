@@ -264,7 +264,7 @@ describe("MobileLiveTerminal forward-mode taps", () => {
     const armAgentClipboard = vi.fn();
     const view = renderLiveTerminal({ frame: frame({ ...alt, mouseSgr: sgr, pane0 }), armAgentClipboard });
     const button = view.props.forwardButton as Mock;
-    // jsdom rects sit at the origin: column floor(100 / 8.4) + 1, row floor(40 / 16.8) + 1.
+    // jsdom rects sit at the origin: column floor(100 / 8.4) + 1, row floor(40 / 17) + 1.
     expect(tap(view.scroller)).toBe(false);
     expect(button.mock.calls).toEqual([
       [0, false, false, sgr, 12, 3],

@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { AnsiSegment } from "../lib/ansi";
-import { LineParseCache, linkifyLine, lineText, textWidth, wrapLine } from "../lib/liveTermLines";
+import {
+  LineParseCache,
+  linkifyLine,
+  linkifyWrappedRuns,
+  lineText,
+  textWidth,
+  wrapLine,
+  type WrappedRunCache,
+} from "../lib/liveTermLines";
 import { cursorLineIndex, pointerPaneCell, unwrapPointer } from "../lib/liveMouse";
 import type { LiveFrame, LiveStats } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -19,6 +27,8 @@ import { FORWARD_TOUCH_GAIN, useForwardInput } from "./live-terminal/useForwardI
 import { ForwardScrollbar } from "./live-terminal/ForwardScrollbar";
 import { FORWARD_SCROLLBAR_WIDTH_PX, forwardPageNotches } from "../lib/forwardScrollbar";
 import { Row } from "./live-terminal/TermRow";
+import { rowHeight } from "./live-terminal/rowHeight";
+import { DEFAULT_TERMINAL_FONT_NAME, terminalFontStack, terminalLineRatio } from "../lib/terminalFonts";
 import { LIVE_WINDOW_SCREENS, useLiveEdgeScroll } from "./live-terminal/useLiveEdgeScroll";
 import { useTerminalInput } from "./live-terminal/useTerminalInput";
 import { InputTraceOverlay } from "./live-terminal/InputTraceOverlay";
@@ -29,7 +39,6 @@ import { StrokeIcon } from "./icons";
 
 const MIN_FONT_SIZE = 6;
 const MAX_FONT_SIZE = 28;
-const LINE_RATIO = 1.2;
 const RESIZE_DEBOUNCE_MS = 150;
 /** How long the trimmed row count must stay lower before shrinking; outlasts a stalled stream's spinner gaps. */
 const SHRINK_DELAY_MS = 1500;
@@ -148,9 +157,7 @@ export function MobileLiveTerminal({
   const coarse = useIsCoarsePointer();
   const fontKey = coarse ? "mobileFontSize" : "desktopFontSize";
   const configuredFontSize = settings[fontKey];
-  // Quotes are stripped so a stray `"` cannot produce an ignored font-family.
-  const termFontFamily = (settings.terminalFontFamily ?? "").trim().replace(/"/g, "");
-  const fontFamily = termFontFamily ? `"${termFontFamily}", var(--font-mono)` : undefined;
+  const fontFamily = terminalFontStack(settings.terminalFontFamily);
   const [focused, setFocused] = useState(false);
   const [fontSize, setFontSize] = useState(() => configuredFontSize);
   // Adopt a changed setting during render; a pinch drives fontSize live without touching the setting.
@@ -170,13 +177,14 @@ export function MobileLiveTerminal({
       const older = held.history - heldLines.length - (next.history - nextLines.length);
       // A frame too short for the whole prefix (scrollback cleared mid-selection) would refold forever.
       if (older <= 0 || older > nextLines.length) return null;
-      return { ...held, lines: nextLines.slice(0, older).concat(heldLines) };
+      const wrapped = (next.wrapped ?? []).filter((i) => i < older).concat((held.wrapped ?? []).map((i) => i + older));
+      return { ...held, lines: nextLines.slice(0, older).concat(heldLines), wrapped };
     },
     [reading],
   );
   const { value: frame, held: selectionHeld } = useSelectionHold(streamFrame, scrollerRef, absorbExposedHistory);
 
-  const lineH = fontSize * LINE_RATIO;
+  const lineH = rowHeight(fontSize, terminalLineRatio(settings.terminalFontFamily));
   // Glyph advance measured in the scroller after fonts load, so cols sent to tmux match the real font.
   const measureRef = useRef<HTMLSpanElement>(null);
   const [charW, setCharW] = useState(() => fontSize * 0.6);
@@ -188,10 +196,25 @@ export function MobileLiveTerminal({
     remeasure();
   }, [remeasure, fontSize, fontFamily]);
   useEffect(() => {
-    const fonts = (document as Document & { fonts?: { ready: Promise<unknown> } }).fonts;
-    // No FontFaceSet in jsdom; the layout-effect measure stands.
-    fonts?.ready?.then(() => remeasure()).catch(() => {});
-  }, [remeasure]);
+    const fonts = (document as Document & { fonts?: FontFaceSet }).fonts;
+    // No FontFaceSet in jsdom; the layout-effect measure stands. A bundled face only starts loading once used, after
+    // the layout-effect measure, so wait for that face rather than `ready`, which may already have settled.
+    if (!fonts?.load) return;
+    let live = true;
+    const family = settings.terminalFontFamily || DEFAULT_TERMINAL_FONT_NAME;
+    void fonts
+      .load(`16px "${family}"`)
+      // A failed face still renders the fallback, which needs measuring too.
+      .catch(() => undefined)
+      .then(() => fonts.ready)
+      .then(() => {
+        if (live) remeasure();
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [remeasure, settings.terminalFontFamily]);
 
   const rowsRef = useRef(0);
   const readingRef = useRef(reading);
@@ -206,19 +229,24 @@ export function MobileLiveTerminal({
   const [wrapCache] = useState(
     () => new WeakMap<AnsiSegment[], { cols: number; rows: AnsiSegment[][]; key: string }>(),
   );
+  const [runCache] = useState((): WrappedRunCache => new WeakMap());
   const visual = useMemo(() => {
     const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
     const rows: AnsiSegment[][] = [];
     const lineStartRow: number[] = new Array(lines.length);
     const keys: string[] = new Array(lines.length);
     const source: Array<{ line: number; wrap: number }> = [];
+    // Soft-wrapped runs link as one line; a run's rows keep their identity while its lines do.
+    const runs = linkifyWrappedRuns(lines, frame?.wrapped, runCache);
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!;
-      let wrapped = wrapCache.get(line);
+      const run = runs.get(i);
+      const unwrapped = run ?? line;
+      let wrapped = wrapCache.get(unwrapped);
       if (!wrapped || wrapped.cols !== cols) {
         // Plain text, so the anchor matches a line whichever producer encoded its style.
-        wrapped = { cols, rows: wrapLine(linkifyLine(line), cols), key: lineText(line).trimEnd() };
-        wrapCache.set(line, wrapped);
+        wrapped = { cols, rows: wrapLine(run ?? linkifyLine(line), cols), key: lineText(line).trimEnd() };
+        wrapCache.set(unwrapped, wrapped);
       }
       lineStartRow[i] = rows.length;
       keys[i] = wrapped.key;
@@ -229,7 +257,7 @@ export function MobileLiveTerminal({
     }
     const screenStart = Math.max(0, lines.length - (frame?.rows ?? 0));
     return { keys, rows, lineStartRow, source, screenStart };
-  }, [lines, frame?.rows, renderCols, wrapCache]);
+  }, [lines, frame?.rows, frame?.wrapped, renderCols, wrapCache, runCache]);
   const screenRows = frame?.rows ?? 0;
   const spacerLines = Math.max(0, (frame?.history ?? 0) - Math.max(0, lines.length - screenRows));
   // A full-screen mouse app's scrollback is not capturable: no spacer, no native scroll, wheels go to the app.
@@ -264,8 +292,10 @@ export function MobileLiveTerminal({
   // blanks for bottom alignment does not bounce with a spinner on the last row.
   const [renderRowCount, setRenderRowCount] = useState(0);
   const shrinkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rowTargetRef = useRef(0);
   useEffect(() => {
     const target = Math.max(0, lastNonBlankRow + 1);
+    rowTargetRef.current = target;
     setRenderRowCount((current) => {
       if (target >= current) {
         if (shrinkTimerRef.current) clearTimeout(shrinkTimerRef.current);
@@ -274,7 +304,8 @@ export function MobileLiveTerminal({
       }
       shrinkTimerRef.current ??= setTimeout(() => {
         shrinkTimerRef.current = null;
-        setRenderRowCount(Math.max(0, lastNonBlankRow + 1));
+        // Rows may have arrived since this was scheduled; trim to the rows there now.
+        setRenderRowCount(rowTargetRef.current);
       }, SHRINK_DELAY_MS);
       return current;
     });

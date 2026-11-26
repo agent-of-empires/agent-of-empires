@@ -1,0 +1,82 @@
+import { startMenuFor } from "../lib/suggestionPlan";
+import { suggestionKey, type useSuggestions } from "../hooks/useSuggestions";
+import type { SuggestionItem, SuggestionPresetEntry, SuggestionsSnapshot } from "../lib/types";
+import { SuggestionActions } from "./SuggestionRow";
+
+interface Props {
+  item: SuggestionItem;
+  snapshot: SuggestionsSnapshot;
+  ctrl: ReturnType<typeof useSuggestions>;
+  readOnly: boolean;
+  cityhall?: boolean;
+  agentName: (id: string) => string;
+  presetOf: (providerId: string, criterion: string) => SuggestionPresetEntry | undefined;
+  onOpenSession: (sessionId: string) => void;
+  onToggleDismiss: () => void;
+  /** Opens Settings › Suggestions on this kind's preset; absent where Settings is out of reach. */
+  onEditPreset?: (providerId: string, criterion: string) => void;
+  /** A CityHall client cannot save the repo-to-Project link that "Start in…" makes. */
+  canLink?: boolean;
+}
+
+/** Start, ▾, Start in… and the started row's menu for one suggestion. */
+export function SuggestionItemActions({
+  item,
+  snapshot,
+  ctrl,
+  readOnly,
+  cityhall,
+  agentName,
+  presetOf,
+  onOpenSession,
+  onToggleDismiss,
+  onEditPreset,
+  canLink = true,
+}: Props) {
+  const key = suggestionKey(item);
+  const provider = snapshot.providers.find((p) => p.id === item.provider_id);
+  const providerName = provider?.name ?? item.provider_id;
+  const linked = !!item.resolved_project;
+  return (
+    <SuggestionActions
+      dismissed={item.dismissed}
+      readOnly={readOnly}
+      cityhall={cityhall}
+      offline={ctrl.offline}
+      busy={ctrl.busy !== null}
+      starting={ctrl.starting.includes(key)}
+      onStart={() => void ctrl.start(item)}
+      stale={item.stale}
+      failed={key in ctrl.failures}
+      retryable={ctrl.failures[key]?.retryable !== false}
+      onToggleDismiss={onToggleDismiss}
+      startIn={
+        !linked && item.mapping_key
+          ? {
+              onPick: (path) => void ctrl.start(item, { project: { path } }),
+              disabled: !canLink,
+              title: canLink ? undefined : "This dashboard can't save the link to a Project",
+            }
+          : undefined
+      }
+      menu={
+        item.dismissed
+          ? undefined
+          : startMenuFor(item, snapshot, {
+              startWithChanges: (it) => void ctrl.startWithChanges(it),
+              agentName,
+              presetOf,
+              onEditPreset,
+            })
+      }
+      started={
+        item.started_session && {
+          onOpen: () => onOpenSession(item.started_session!.id),
+          onStartAnother: () => void ctrl.startWithChanges(item, true),
+          providerName,
+          sourceUrl: item.source_url,
+        }
+      }
+    />
+  );
+}

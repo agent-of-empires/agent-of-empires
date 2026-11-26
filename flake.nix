@@ -41,6 +41,7 @@
             # in-tree agent and the acp::node test reads to pin `engines.node`
             # to the Node floor (the aoe-test and aoe-clippy checks compile
             # test code, so they need these even though the packages do not).
+            # bundled_sounds holds the built-in sounds src/sound embeds.
             # `scripts/check-nix-embedded-assets.py` fails CI if a new embedded
             # asset lands without being added here.
             src = pkgs.lib.fileset.toSource {
@@ -53,6 +54,7 @@
                 ./acp-worker/aoe-agent/src
                 ./acp-worker/test-shim/shim.mjs
                 ./assets
+                ./bundled_sounds
                 ./docker
                 ./tests/fixtures/cli-read
                 ./tests/fixtures/pull-progress
@@ -107,7 +109,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-IxD/dCMYudp6oWUUvyHGwqA/jscs4TG1yzcWR61yuwE=";
+            npmDepsHash = "sha256-a2zKOyObhPmGkzpoN+ifH8ZcDMZeTMXm+XE9M5zDaXs=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out

@@ -1147,6 +1147,13 @@ impl IntroDialog {
                 Span::styled("command palette", Style::default().fg(theme.text)),
             ]),
             Line::from(vec![
+                Span::styled("  S        ", Style::default().fg(theme.accent).bold()),
+                Span::styled(
+                    "suggested sessions from your plugins",
+                    Style::default().fg(theme.text),
+                ),
+            ]),
+            Line::from(vec![
                 Span::styled("  q        ", Style::default().fg(theme.accent).bold()),
                 Span::styled(
                     "quit (sessions keep running)",
@@ -1386,6 +1393,26 @@ mod tests {
 
         // Skipping the wizard writes nothing.
         assert_eq!(fresh().outcome().acp_default_model, None);
+    }
+
+    #[test]
+    fn the_last_page_points_at_suggested_sessions() {
+        let mut dialog = on_page(Page::Done);
+        let theme = Theme::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| dialog.render(f, f.area(), &theme))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("suggested sessions from your plugins"));
+        assert!(text.contains("Press Enter to dive in."), "the line fits");
     }
 
     fn row_rect() -> Rect {

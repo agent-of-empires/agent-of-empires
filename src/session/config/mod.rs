@@ -1081,7 +1081,7 @@ pub struct AppStateConfig {
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
     /// browser stored). Single-tenant: there is one user, so these prefs
-    /// (sidebar sort/axis, tool density, repo appearance/order, group collapse,
+    /// (sidebar sort/axis, tool density, repo order, group collapse,
     /// last-used tool, welcome-seen, etc.) live here so they follow the user
     /// across browsers and devices instead of being trapped in per-browser
     /// localStorage. The server never interprets the values; the web owns the
@@ -1168,6 +1168,21 @@ pub struct SessionConfig {
         summary = "Pre-trusts each host Session's folder when it starts, worktree or not. This also turns on the repository's own Agent settings file."
     )]
     pub pre_trust_agent_folders: bool,
+
+    /// Require native OS sandbox enforcement for remote plugin staging. Disabled
+    /// by default; enabling requires native OS sandbox support and tools and fails
+    /// closed when unavailable. Default streamed byte, archive-entry, and source
+    /// snapshot accounting cannot hard-limit Git/helper filesystem writes.
+    #[serde(default)]
+    #[setting(
+        label = "Strict plugin staging",
+        widget = "toggle",
+        advanced,
+        global_only,
+        repo = "deny",
+        web = "elevation:changes the machine-wide plugin staging filesystem security boundary"
+    )]
+    pub plugin_staging_sandbox: bool,
 
     /// Show the compact system-health strip below the session list. It reports
     /// CPU, memory pressure, and running agent and process counts. Off by
@@ -1802,6 +1817,18 @@ pub struct SessionConfig {
     )]
     pub show_structured_badge: bool,
 
+    /// Count snoozed Sessions among the stopped rows the TUI's `y` filter hides.
+    /// Off by default: snoozing defers a Session without stopping it, so it stays
+    /// visible while stopped ones are hidden.
+    #[serde(default)]
+    #[setting(
+        label = "Hide snoozed Sessions too",
+        widget = "toggle",
+        tui_only,
+        summary = "While stopped Sessions are hidden with y, drop snoozed ones out of groups as well."
+    )]
+    pub hide_snoozed_with_stopped: bool,
+
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
     /// mode. Default `C-q` works in every terminal we ship to; add entries for
@@ -1927,27 +1954,6 @@ pub struct SessionConfig {
     )]
     pub unread_indicator: bool,
 
-    /// Show per-session color labels: the colored dot on sidebar rows and the
-    /// `Color` section in the session context menu. Turning this off hides
-    /// them without forbidding anything, `aoe session color` and the REST
-    /// endpoint keep working and stored values are preserved, so flipping back
-    /// reveals them again.
-    ///
-    /// `global_only`: the dashboard resolves one settings object for the whole
-    /// client, not one per workspace, and the sidebar mixes sessions from
-    /// several profiles in the all-profiles view. A per-profile override would
-    /// advertise semantics the web cannot honor.
-    #[serde(default = "default_true")]
-    #[setting(
-        label = "Session colors",
-        widget = "toggle",
-        web_only,
-        category = "Interaction",
-        global_only,
-        summary = "A colored dot on each row, and Color in the Session menu."
-    )]
-    pub show_session_colors: bool,
-
     /// Pin favorited sessions to the top of their sibling scope in every sort
     /// order of the TUI session list, not just Attention. A group holding a
     /// favorited session is pinned the same way. When on (default), favoriting
@@ -2045,9 +2051,10 @@ pub struct AcpAgentDefaults {
     /// agent runs on `model`: [`resolve_spawn_model_effort`] replaces any
     /// other value at creation and respawn, plugin `sessions.create` refuses
     /// one (`model_pinned`), and the plugin settings model picker offers only
-    /// the pin. A running session's live model switch is separate. Meaningless
-    /// without a non-empty `model`; global/profile only, like the rest of
-    /// `acp`.
+    /// the pin. A running session's live model switch is separate. Pins
+    /// nothing at spawn without a non-empty `model`, though the Agent default
+    /// model API still reports it as pinned and refuses to set a model;
+    /// global/profile only, like the rest of `acp`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pin_model: bool,
 
@@ -2133,13 +2140,21 @@ impl AcpConfig {
     }
 
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
-        let non_empty = |key: &str| self.acp_defaults.get(key).filter(|d| !d.is_empty());
-        non_empty(agent).or_else(|| {
-            // `claude-code` is the legacy alias stored by older session records.
-            (agent == "claude-code")
-                .then(|| non_empty("claude"))
-                .flatten()
-        })
+        self.acp_defaults
+            .get(self.acp_defaults_key_for(agent))
+            .filter(|d| !d.is_empty())
+    }
+
+    /// The `acp_defaults` key `agent` reads from, and so the one a write for it
+    /// changes: its own entry, or `claude` for the legacy `claude-code` alias
+    /// stored by older session records when only `claude` is set.
+    pub fn acp_defaults_key_for<'a>(&self, agent: &'a str) -> &'a str {
+        let set = |key: &str| self.acp_defaults.get(key).is_some_and(|d| !d.is_empty());
+        if agent == "claude-code" && !set(agent) && set("claude") {
+            "claude"
+        } else {
+            agent
+        }
     }
 
     /// The model `agent` is pinned to (`pin_model` with a non-empty `model`).
@@ -2331,6 +2346,7 @@ impl Default for SessionConfig {
             default_tool: None,
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
+            plugin_staging_sandbox: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
             narrow_layout: NarrowLayout::default(),
@@ -2373,6 +2389,7 @@ impl Default for SessionConfig {
             row_tag: RowTagMode::default(),
             show_activity_age: true,
             show_structured_badge: true,
+            hide_snoozed_with_stopped: false,
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),
@@ -2381,7 +2398,6 @@ impl Default for SessionConfig {
             click_action: ClickAction::default(),
             confirm_before_quit: true,
             unread_indicator: true,
-            show_session_colors: true,
             favorites_first: true,
             show_tips: true,
             show_shortcut_bar: true,
@@ -2775,6 +2791,41 @@ pub struct WebConfig {
         summary = "Apps like Claude Code can list, create and send to your Sessions, read their output, wait on them and approve requests. Works when aoe serve uses the access link without a passphrase, or --auth none."
     )]
     pub mcp_enabled: bool,
+
+    /// Show the diff pane when a Session opens whose pane layout the user has
+    /// not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open the diff panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show the changed files beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_diff_pane: bool,
+
+    /// Show a terminal pane when a Session opens whose pane layout the user
+    /// has not changed in this browser.
+    #[serde(default)]
+    #[setting(
+        label = "Open a terminal panel in Sessions",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Show a shell beside every Session you haven't arranged yourself."
+    )]
+    pub auto_open_terminal_pane: bool,
+
+    /// Add panes contributed by installed plugins as tabs when they load.
+    #[serde(default)]
+    #[setting(
+        label = "Open plugin panels automatically",
+        widget = "toggle",
+        web_only,
+        global_only,
+        summary = "Add panes from installed plugins, such as the GitHub pull-request pane, as they load."
+    )]
+    pub auto_open_plugin_panes: bool,
 }
 
 impl Default for WebConfig {
@@ -2786,6 +2837,9 @@ impl Default for WebConfig {
             notify_on_error: true,
             notify_on_wake_fire: true,
             mcp_enabled: false,
+            auto_open_diff_pane: false,
+            auto_open_terminal_pane: false,
+            auto_open_plugin_panes: false,
         }
     }
 }
@@ -5453,19 +5507,28 @@ mod tests {
             pin_model: model.is_some(),
             ..Default::default()
         };
-        let cases: [(&[(&str, Option<&str>)], Option<&str>); 4] = [
-            (&[("claude", Some("canon"))], Some("canon")),
-            (&[("claude-code", Some("alias"))], Some("alias")),
+        // The key is where a write for `claude-code` lands, so it reads back.
+        type Entries<'a> = &'a [(&'a str, Option<&'a str>)];
+        let cases: [(Entries, Option<&str>, &str); 5] = [
+            (&[("claude", Some("canon"))], Some("canon"), "claude"),
+            (
+                &[("claude-code", Some("alias"))],
+                Some("alias"),
+                "claude-code",
+            ),
             (
                 &[("claude", Some("canon")), ("claude-code", Some("alias"))],
                 Some("alias"),
+                "claude-code",
             ),
             (
                 &[("claude", Some("canon")), ("claude-code", None)],
                 Some("canon"),
+                "claude",
             ),
+            (&[], None, "claude-code"),
         ];
-        for (entries, want) in cases {
+        for (entries, want, key) in cases {
             let mut config = AcpConfig::default();
             for (key, model) in entries {
                 config.acp_defaults.insert(key.to_string(), entry(*model));
@@ -5482,6 +5545,12 @@ mod tests {
                 want,
                 "{entries:?}"
             );
+            assert_eq!(
+                config.acp_defaults_key_for("claude-code"),
+                key,
+                "{entries:?}"
+            );
+            assert_eq!(config.acp_defaults_key_for("codex"), "codex", "{entries:?}");
         }
     }
 

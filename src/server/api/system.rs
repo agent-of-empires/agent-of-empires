@@ -1443,10 +1443,29 @@ pub struct TipsResponse {
 /// shared `crate::tips` catalog plus `app_state.tips_seen` and
 /// `session.show_tips`. A read projection, so it stays a plain GET behind the
 /// token wall like [`get_web_ui_state`]; the TUI-only tips never appear here.
-pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let result = tokio::task::spawn_blocking(|| {
+pub async fn get_tips(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let host = state.plugin_host.clone();
+    let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::Config::load()?;
-        let signals = crate::tips::TipSignals::from(&config);
+        let mut signals = crate::tips::TipSignals::from(&config);
+        // The same providers and switches GET /api/suggestions reports. A store
+        // error only drops this tip.
+        let snapshot = host.as_ref().and_then(|host| {
+            let providers = crate::plugin::suggestions::providers();
+            host.with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::snapshot(conn, profile, &providers)
+            })
+            .ok()
+        });
+        signals.suggestions_setup_available = snapshot.is_some_and(|snapshot| {
+            let enabled: Vec<bool> = snapshot["providers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|p| p["enabled"].as_bool().unwrap_or(false))
+                .collect();
+            crate::tips::suggestions_setup_available(&enabled)
+        });
         let seen = &config.app_state.tips_seen;
         let tips = crate::tips::eligible(crate::tips::TipSurface::Web, &signals)
             .into_iter()
@@ -2501,6 +2520,31 @@ struct ProfileCommitPause {
 static PROFILE_COMMIT_PAUSE: std::sync::Mutex<Option<ProfileCommitPause>> =
     std::sync::Mutex::new(None);
 
+/// Pauses an Agent default model PUT for `profile` after its profile check, before its write.
+#[cfg(test)]
+static AGENT_DEFAULT_MODEL_CHECKED: std::sync::Mutex<Option<ProfileCommitPause>> =
+    std::sync::Mutex::new(None);
+
+/// Pauses an Agent default model PUT for `profile` after it reads the machine config.
+#[cfg(test)]
+static AGENT_DEFAULT_MODEL_READ: std::sync::Mutex<Option<ProfileCommitPause>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn agent_default_model_pause(slot: &std::sync::Mutex<Option<ProfileCommitPause>>, profile: &str) {
+    let pause = slot
+        .lock()
+        .unwrap()
+        .take_if(|pause| pause.profile == profile);
+    if let Some(pause) = pause {
+        let _ = pause.entered.send(());
+        pause
+            .resume
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+}
+
 async fn commit_profile(
     state: Arc<AppState>,
     mutation: crate::daemon::ProfileMutation,
@@ -3007,60 +3051,263 @@ pub async fn update_profile_settings(
 
 // --- Sounds ---
 
-pub async fn list_sounds() -> Json<Vec<String>> {
-    Json(crate::sound::list_available_sounds())
-}
-
-/// Serve a sound file by name so the acp's browser-side approval
-/// player can fetch it from the same origin as the dashboard. The name
-/// is validated against `list_available_sounds()` to block path
-/// traversal: an attacker who can hit `/api/sounds/file/<x>` cannot
-/// read arbitrary disk paths, only files already present in the user's
-/// `sounds/` directory.
-pub async fn serve_sound_file(
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    // `list_available_sounds` does a sync `read_dir`, so validation stays on
-    // the blocking pool; the file read uses `tokio::fs::read`.
-    let lookup_name = name.clone();
-    let validated = tokio::task::spawn_blocking(move || {
-        if !crate::sound::list_available_sounds().contains(&lookup_name) {
-            return None;
-        }
-        crate::sound::get_sounds_dir().map(|dir| dir.join(&lookup_name))
-    })
-    .await;
-
-    let path = match validated {
-        Ok(Some(p)) => p,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+/// `GET /api/sounds/{event}`: a built-in sound for the dashboard to play. The
+/// bytes are fixed per build, so the browser may cache them.
+pub async fn serve_sound(
+    axum::extract::Path(event): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(event) = crate::sound::SoundEvent::parse(&event) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let content_type = match std::path::Path::new(&name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("ogg") => "audio/ogg",
-        _ => "audio/wav",
-    };
-
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, content_type),
-            (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
+            (axum::http::header::CONTENT_TYPE, "audio/wav"),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=86400"),
         ],
-        bytes,
+        event.wav(),
     )
         .into_response()
+}
+
+// --- One Agent's default model in a profile ---
+
+/// The default an Agent's new Structured view Sessions in a profile start on.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AgentDefaultModel {
+    profile: String,
+    /// The `acp_defaults` key the Agent reads from (`claude` for a legacy `claude-code`).
+    agent_key: String,
+    model: Option<String>,
+    /// `pin_model` is on, with or without a model: a write would set the pin.
+    pinned: bool,
+}
+
+impl AgentDefaultModel {
+    fn of(acp: &crate::session::config::AcpConfig, profile: &str, agent: &str) -> Self {
+        let defaults = acp.acp_defaults_for(agent);
+        Self {
+            profile: profile.to_string(),
+            agent_key: acp.acp_defaults_key_for(agent).to_string(),
+            model: defaults.and_then(|d| d.model()),
+            pinned: defaults.is_some_and(|d| d.pin_model),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentDefaultModelBody {
+    model: String,
+}
+
+/// A write the profile lock refused; carried out of `update_profile_config` so nothing is saved.
+#[derive(Debug)]
+struct DefaultModelRefused(crate::daemon::ApiErrorCode, String);
+
+impl std::fmt::Display for DefaultModelRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+
+impl std::error::Error for DefaultModelRefused {}
+
+fn agent_display(agent: &str) -> &str {
+    crate::acp::agent_registry::display_name_for(agent).unwrap_or(agent)
+}
+
+/// 404 unless `name` is an existing profile, even on a first run with none, so a write
+/// can't mint `profiles/<name>`.
+fn require_listed_profile(name: &str) -> Result<(), axum::response::Response> {
+    match crate::session::list_profiles() {
+        Ok(known) if known.iter().any(|p| p == name) => Ok(()),
+        Ok(_) => Err(api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("Profile '{}' does not exist", name.escape_debug()),
+        )),
+        Err(e) => Err(api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "load_failed",
+            e.to_string(),
+        )),
+    }
+}
+
+/// `GET /api/sessions/{id}/acp-default-model`: the default this Session's structured spawn
+/// reads, under the profile and Agent key the spawn uses.
+pub async fn get_session_agent_default_model(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(instance) = super::find_instance(&state, &id).await else {
+        return super::session_not_found();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let (agent, config) = crate::server::session_spawn::spawn_defaults_agent(&instance);
+        AgentDefaultModel::of(&config.acp, &instance.effective_profile(), &agent)
+    })
+    .await;
+    match result {
+        Ok(model) => Json(model).into_response(),
+        Err(e) => {
+            tracing::error!(target: "http.api.system", error = %e, "Session Agent default model read panicked");
+            internal_error()
+        }
+    }
+}
+
+/// `GET /api/profiles/{name}/acp-defaults/{agent}/model`: the Agent's resolved default model.
+pub async fn get_agent_default_model(
+    axum::extract::Path((name, agent)): axum::extract::Path<(String, String)>,
+) -> axum::response::Response {
+    if let Err(e) = validate_profile_name(&name) {
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        require_listed_profile(&name)?;
+        crate::session::resolve_config(&name)
+            .map(|resolved| AgentDefaultModel::of(&resolved.acp, &name, &agent))
+            .map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "load_failed",
+                    e.to_string(),
+                )
+            })
+    })
+    .await;
+    match result {
+        Ok(Ok(model)) => Json(model).into_response(),
+        Ok(Err(resp)) => resp,
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+/// `PUT /api/profiles/{name}/acp-defaults/{agent}/model`: set only this Agent's default
+/// model in the profile, refusing while the profile's resolved settings turn its pin on,
+/// even with no model yet, since the write would then make the model a pin.
+///
+/// The check and the write share the profile's lock and the settings write gate, so a
+/// pin saved through this Daemon after the caller read the default is honoured. The
+/// machine layer is read without its lock: a pin written there by another process at
+/// the same instant can still be overwritten.
+pub async fn set_agent_default_model(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((name, agent)): axum::extract::Path<(String, String)>,
+    body: Result<Json<AgentDefaultModelBody>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if let Err(e) = validate_profile_name(&name) {
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
+    }
+    let model = body.model.trim().to_string();
+    if model.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "model is empty",
+        );
+    }
+    // Owned by the write, which outlives a cancelled handler, so a rename or delete can't move
+    // the profile after the check and leave `update_profile_config` to recreate it.
+    let namespace = state.profile_namespace.clone().read_owned().await;
+    let gate = write_gate().await;
+    let result = tokio::task::spawn_blocking(move || {
+        let _guards = (namespace, gate);
+        require_listed_profile(&name)?;
+        #[cfg(test)]
+        agent_default_model_pause(&AGENT_DEFAULT_MODEL_CHECKED, &name);
+        crate::session::update_profile_config(&name, |profile| {
+            let global = crate::session::Config::load()?;
+            #[cfg(test)]
+            agent_default_model_pause(&AGENT_DEFAULT_MODEL_READ, &name);
+            let resolved = crate::session::merge_configs(global.clone(), profile);
+            // Only a name a spawn reads defaults under: the spawn's registry or a valid command.
+            let registered = crate::acp::AgentRegistry::with_defaults()
+                .get(&agent)
+                .is_some();
+            let own_cmd = resolved
+                .session
+                .agent_acp_cmd
+                .get(&agent)
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&agent, cmd).is_ok());
+            if !registered && !own_cmd {
+                let message =
+                    match crate::acp::inherited_acp_base(&agent, &resolved.session.agent_detect_as)
+                    {
+                        Some(base) => {
+                            let base = agent_display(&base);
+                            format!("{agent} runs as {base} in Structured view, so it uses {base}'s Agent defaults.")
+                        }
+                        None => format!("unknown Agent '{agent}'"),
+                    };
+                return Err(DefaultModelRefused(
+                    crate::daemon::ApiErrorCode::UnknownAgent,
+                    message,
+                )
+                .into());
+            }
+            if resolved.acp.acp_defaults_for(&agent).is_some_and(|d| d.pin_model) {
+                return Err(DefaultModelRefused(
+                    crate::daemon::ApiErrorCode::ModelPinned,
+                    format!(
+                        "{}'s model is pinned in Agent defaults; change it there.",
+                        agent_display(&agent)
+                    ),
+                )
+                .into());
+            }
+            let key = resolved.acp.acp_defaults_key_for(&agent).to_string();
+            let entry = profile
+                .overrides
+                .entry("acp")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("acp override is not a table"))?
+                .entry("acp_defaults")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("acp_defaults override is not a table"))?
+                .entry(key)
+                .or_insert_with(|| serde_json::json!({}));
+            entry
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("Agent defaults entry is not a table"))?
+                .insert("model".to_string(), serde_json::json!(model));
+            // The machine config the checks ran against, not a later read.
+            Ok(AgentDefaultModel::of(
+                &crate::session::merge_configs(global, profile).acp,
+                &name,
+                &agent,
+            ))
+        })
+        .map_err(|e| match e.downcast_ref::<DefaultModelRefused>() {
+            Some(refused) => super::api_error_with_code_header(refused.0, refused.1.clone()),
+            None => {
+                tracing::warn!(target: "http.api.system", error = %e, "Agent default model update failed");
+                api_error(StatusCode::BAD_REQUEST, "save_failed", e.to_string())
+            }
+        })
+    })
+    .await;
+    match result {
+        Ok(Ok(model)) => Json(model).into_response(),
+        Ok(Err(resp)) => resp,
+        Err(e) => {
+            tracing::error!(target: "http.api.system", error = %e, "Agent default model update panicked");
+            internal_error()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4386,24 +4633,18 @@ command = "zzzeta"
     }
 
     #[tokio::test]
-    async fn serve_sound_file_rejects_unknown_name() {
-        let resp = serve_sound_file(axum::extract::Path("does-not-exist-xyz.wav".to_string()))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
+    async fn serve_sound_serves_events_and_refuses_anything_else() {
+        let resp = serve_sound(axum::extract::Path("idle".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&body[..], crate::sound::SoundEvent::Idle.wav());
 
-    #[tokio::test]
-    async fn serve_sound_file_rejects_path_traversal() {
-        let resp = serve_sound_file(axum::extract::Path("../../../etc/passwd".to_string()))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        // A NOT_FOUND that somehow still streamed a body would be a
-        // worse failure than the wrong status, so assert the body is
-        // empty rather than just "not /etc/passwd".
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert!(body.is_empty(), "unexpected body bytes: {body:?}");
+        for name in ["idle.wav", "../../../etc/passwd", "IDLE "] {
+            let resp = serve_sound(axum::extract::Path(name.to_string())).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            assert!(body.is_empty(), "{name}: unexpected body bytes");
+        }
     }
     /// A PATCH whose connection dropped can commit after the client's newer edit of the
     /// same leaf; the stamp makes the server drop it instead of restoring the old value.
@@ -4525,5 +4766,575 @@ command = "zzzeta"
         let theme = crate::session::Config::load().unwrap().theme;
         assert_eq!(theme.name, name);
         assert_eq!(theme.color_mode, ColorMode::Palette);
+    }
+
+    async fn put_default_model(
+        state: &Arc<AppState>,
+        profile: &str,
+        agent: &str,
+        model: &str,
+    ) -> (StatusCode, Option<String>, serde_json::Value) {
+        let resp = set_agent_default_model(
+            State(state.clone()),
+            axum::extract::Path((profile.to_string(), agent.to_string())),
+            Ok(Json(AgentDefaultModelBody {
+                model: model.to_string(),
+            })),
+        )
+        .await;
+        let status = resp.status();
+        let code = resp
+            .headers()
+            .get(crate::daemon::ERROR_CODE_HEADER)
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, code, serde_json::from_slice(&body).unwrap())
+    }
+
+    async fn get_default_model(profile: &str, agent: &str) -> serde_json::Value {
+        let resp = get_agent_default_model(axum::extract::Path((
+            profile.to_string(),
+            agent.to_string(),
+        )))
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn set_profile_acp_defaults(profile: &str, defaults: serde_json::Value) {
+        crate::session::update_profile_config(profile, |p| {
+            p.overrides.remove("acp");
+            if defaults.as_object().is_some_and(|d| !d.is_empty()) {
+                p.overrides.insert(
+                    "acp".to_string(),
+                    serde_json::json!({ "acp_defaults": defaults }),
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn set_machine_acp_defaults(defaults: serde_json::Value) {
+        crate::session::update_config(|c| {
+            c.acp.acp_defaults = serde_json::from_value(defaults).unwrap();
+        })
+        .unwrap();
+    }
+
+    fn profile_acp(profile: &str) -> serde_json::Value {
+        let config = crate::session::load_profile_config(profile).unwrap();
+        config.overrides.get("acp").cloned().unwrap_or_default()
+    }
+
+    /// The PUT changes only the Agent's `model`, in the key its reads resolve to, and copies
+    /// nothing down from the machine layer.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_default_model_put_writes_only_that_model() {
+        use serde_json::json;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        set_machine_acp_defaults(json!({"claude": {"effort": "high"}}));
+        let kept = json!({"mode": "plan", "effort": "low", "effort_by_model": {"x": "max"}});
+        for (name, before, agent, key, after) in [
+            (
+                "no entry",
+                json!({}),
+                "claude",
+                "claude",
+                json!({"claude": {"model": "m"}}),
+            ),
+            (
+                "entry with other fields",
+                json!({"claude": kept}),
+                "claude",
+                "claude",
+                json!({"claude": {"mode": "plan", "effort": "low", "effort_by_model": {"x": "max"}, "model": "m"}}),
+            ),
+            (
+                "another Agent's entry",
+                json!({"opencode": {"model": "o", "pin_model": true}}),
+                "claude",
+                "claude",
+                json!({"opencode": {"model": "o", "pin_model": true}, "claude": {"model": "m"}}),
+            ),
+            (
+                "legacy alias with only claude set",
+                json!({"claude": {"model": "old"}}),
+                "claude-code",
+                "claude",
+                json!({"claude": {"model": "m"}}),
+            ),
+            (
+                "legacy alias with its own entry",
+                json!({"claude": {"model": "c"}, "claude-code": {"model": "own"}}),
+                "claude-code",
+                "claude-code",
+                json!({"claude": {"model": "c"}, "claude-code": {"model": "m"}}),
+            ),
+        ] {
+            set_profile_acp_defaults("work", before);
+            let (status, _, body) = put_default_model(&state, "work", agent, " m ").await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            assert_eq!(
+                body,
+                json!({"profile": "work", "agent_key": key, "model": "m", "pinned": false}),
+                "{name}"
+            );
+            assert_eq!(
+                profile_acp("work"),
+                json!({"acp_defaults": after}),
+                "{name}"
+            );
+            assert_eq!(get_default_model("work", agent).await, body, "{name}");
+        }
+        set_profile_acp_defaults("work", json!({}));
+        put_default_model(&state, "work", "claude", "m").await;
+        let resolved = crate::session::resolve_config("work").unwrap();
+        assert_eq!(
+            resolved
+                .acp
+                .acp_defaults_for("claude")
+                .unwrap()
+                .effort
+                .as_deref(),
+            Some("high"),
+            "a machine-level effort stays inherited"
+        );
+    }
+
+    /// A pin the profile resolves, from either layer, refuses the write and leaves the profile
+    /// file untouched, including a pin saved after the caller last read the default and a
+    /// pin with no model yet, which the write would make a pin.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_default_model_put_refuses_a_pin_in_either_layer() {
+        use serde_json::json;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let pin = |model: &str| json!({"claude": {"model": model, "pin_model": true}});
+        for (name, profile, machine, requested) in [
+            ("pinned in the profile", pin("p"), json!({}), "m"),
+            ("pinned on the machine", json!({}), pin("p"), "m"),
+            ("pinned to the requested model", pin("m"), json!({}), "m"),
+            (
+                "a pin with no model in the profile",
+                json!({"claude": {"pin_model": true}}),
+                json!({}),
+                "m",
+            ),
+            (
+                "a pin with no model on the machine",
+                json!({}),
+                json!({"claude": {"pin_model": true}}),
+                "m",
+            ),
+        ] {
+            set_machine_acp_defaults(json!({}));
+            set_profile_acp_defaults("work", json!({}));
+            assert_eq!(
+                get_default_model("work", "claude").await["pinned"],
+                false,
+                "{name}"
+            );
+            set_machine_acp_defaults(machine);
+            set_profile_acp_defaults("work", profile);
+            assert_eq!(
+                get_default_model("work", "claude").await["pinned"],
+                true,
+                "{name}"
+            );
+            let path =
+                crate::session::config::profile_config::get_profile_config_path("work").unwrap();
+            let file = std::fs::read(&path).unwrap_or_default();
+            let (status, code, body) = put_default_model(&state, "work", "claude", requested).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{name}: {body}");
+            assert_eq!(code.as_deref(), Some("model_pinned"), "{name}");
+            assert_eq!(body["error"], "model_pinned", "{name}");
+            assert_eq!(std::fs::read(&path).unwrap_or_default(), file, "{name}");
+        }
+        // The profile's `pin_model` overrides the machine's, as a spawn resolves it.
+        set_machine_acp_defaults(pin("p"));
+        set_profile_acp_defaults("work", json!({"claude": {"pin_model": false}}));
+        assert_eq!(get_default_model("work", "claude").await["pinned"], false);
+        let (status, _, body) = put_default_model(&state, "work", "claude", "m").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "machine pins, profile unpins: {body}"
+        );
+    }
+
+    /// A rename or delete reaching the profile between the PUT's check and its write waits for
+    /// the write, even when the request is cancelled, so nothing recreates the old name and a
+    /// rename carries the new default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn agent_default_model_put_holds_the_profile_against_a_rename_or_delete(
+    ) -> anyhow::Result<()> {
+        use crate::daemon::ProfileMutation;
+        let mutation = |rename: bool| {
+            if rename {
+                ProfileMutation::Rename {
+                    name: "work".into(),
+                    body: crate::daemon::RenameProfileBody {
+                        new_name: "renamed".into(),
+                    },
+                }
+            } else {
+                ProfileMutation::Delete {
+                    name: "work".into(),
+                    query: Default::default(),
+                }
+            }
+        };
+        for (rename, cancelled) in [(true, false), (false, false), (true, true), (false, true)] {
+            let name = format!(
+                "{}{}",
+                if rename { "rename" } else { "delete" },
+                if cancelled { ", cancelled" } else { "" }
+            );
+            // A fresh app dir per row, so no row sees another's profiles.
+            let _home = crate::session::test_support::isolate_app_dir();
+            let root = crate::session::get_app_dir()?;
+            crate::session::purge_owners::initialize(&root)?;
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let carried_to = rename.then_some("renamed");
+            // A delete must leave a profile behind.
+            crate::session::create_profile("other")?;
+            crate::session::create_profile("work")?;
+            assert!(
+                root.join("profiles/work").exists() && !root.join("profiles/renamed").exists(),
+                "{name}: the row's fixture"
+            );
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let (entered, checked) = tokio::sync::oneshot::channel();
+            let (resume, paused) = std::sync::mpsc::channel();
+            *AGENT_DEFAULT_MODEL_CHECKED.lock().unwrap() = Some(ProfileCommitPause {
+                profile: "work".into(),
+                entered,
+                resume: paused,
+            });
+            let put = tokio::spawn({
+                let state = state.clone();
+                async move { put_default_model(&state, "work", "claude", "m").await }
+            });
+            checked.await?;
+            let put = if cancelled {
+                put.abort();
+                assert!(put.await.unwrap_err().is_cancelled(), "{name}");
+                None
+            } else {
+                Some(put)
+            };
+            assert!(
+                state.profile_namespace.try_write().is_err(),
+                "{name}: the PUT must hold the namespace between its check and its write"
+            );
+            let commit = tokio::spawn(commit_profile(state.clone(), mutation(rename)));
+            // With the namespace held, a failed read means the mutation is queued for it.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while state.profile_namespace.try_read().is_ok() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{name} never queued"
+                );
+                tokio::task::yield_now().await;
+            }
+            assert!(!commit.is_finished(), "{name}");
+            resume.send(())?;
+            if let Some(put) = put {
+                let (status, _, body) = put.await?;
+                assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            }
+            // The mutation gets the namespace only once the write releases it.
+            assert_eq!(commit.await?.status(), StatusCode::OK, "{name}");
+            assert!(
+                !root.join("profiles/work").exists(),
+                "{name}: the PUT recreated the profile"
+            );
+            if let Some(carried_to) = carried_to {
+                assert_eq!(
+                    profile_acp(carried_to)["acp_defaults"]["claude"]["model"],
+                    "m",
+                    "{name}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The PUT answers from the machine config its pin check read, so a machine pin saved
+    /// during the write can't make a successful save report the pin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn agent_default_model_put_answers_from_the_machine_config_it_checked(
+    ) -> anyhow::Result<()> {
+        use serde_json::json;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work")?;
+        set_machine_acp_defaults(json!({}));
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let (entered, read) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        *AGENT_DEFAULT_MODEL_READ.lock().unwrap() = Some(ProfileCommitPause {
+            profile: "work".into(),
+            entered,
+            resume: paused,
+        });
+        let put = tokio::spawn({
+            let state = state.clone();
+            async move { put_default_model(&state, "work", "claude", "m").await }
+        });
+        read.await?;
+        set_machine_acp_defaults(json!({"claude": {"model": "p", "pin_model": true}}));
+        resume.send(())?;
+        let (status, _, body) = put.await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body,
+            json!({"profile": "work", "agent_key": "claude", "model": "m", "pinned": false})
+        );
+        Ok(())
+    }
+
+    /// A read-only Daemon refuses the PUT without reading its body, and still answers the GET.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_default_model_route_refuses_read_only_before_the_body() {
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.read_only = true,
+        );
+        let app = crate::server::test_support::build_router_for_test(state);
+        let never_ends = || {
+            axum::body::Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >())
+        };
+        for (method, body, status) in [
+            (Method::PUT, never_ends(), StatusCode::FORBIDDEN),
+            (Method::GET, axum::body::Body::empty(), StatusCode::OK),
+        ] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri("/api/profiles/work/acp-defaults/claude/model")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::UnixOwner {
+                    uid: nix::unistd::geteuid().as_raw(),
+                },
+            ));
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                app.clone().oneshot(request),
+            )
+            .await
+            .expect("answered without reading the body")
+            .unwrap();
+            assert_eq!(response.status(), status, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_default_model_put_rejects_requests_it_cannot_apply() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        crate::session::update_profile_config("work", |p| {
+            p.overrides.insert(
+                "session".to_string(),
+                serde_json::json!({
+                    "agent_acp_cmd": {"mine": "my-agent --acp", "broken": "my-agent 'unclosed"},
+                    "agent_detect_as": {"corp-claude": "claude"},
+                }),
+            );
+            Ok(())
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let read_only =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.read_only = true
+            });
+        let cityhall = crate::server::test_support::build_test_app_state_cityhall(Vec::new());
+        for (name, state, profile, agent, model, status, code) in [
+            (
+                "read-only",
+                &read_only,
+                "work",
+                "claude",
+                "m",
+                StatusCode::FORBIDDEN,
+                "read_only",
+            ),
+            (
+                "CityHall",
+                &cityhall,
+                "work",
+                "claude",
+                "m",
+                StatusCode::FORBIDDEN,
+                "cityhall_mode",
+            ),
+            (
+                "unknown profile",
+                &state,
+                "nope",
+                "claude",
+                "m",
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                "empty model",
+                &state,
+                "work",
+                "claude",
+                "  ",
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+            ),
+            (
+                "unknown Agent",
+                &state,
+                "work",
+                "no-such-agent",
+                "m",
+                StatusCode::BAD_REQUEST,
+                "unknown_agent",
+            ),
+            // The spawn reads a detect-as Agent's defaults under its base, never this name.
+            (
+                "detect-as only",
+                &state,
+                "work",
+                "corp-claude",
+                "m",
+                StatusCode::BAD_REQUEST,
+                "unknown_agent",
+            ),
+            (
+                "invalid command",
+                &state,
+                "work",
+                "broken",
+                "m",
+                StatusCode::BAD_REQUEST,
+                "unknown_agent",
+            ),
+            (
+                "custom Agent",
+                &state,
+                "work",
+                "mine",
+                "m",
+                StatusCode::OK,
+                "",
+            ),
+        ] {
+            let before = profile_acp("work");
+            let (got, _, body) = put_default_model(state, profile, agent, model).await;
+            assert_eq!(got, status, "{name}: {body}");
+            if status == StatusCode::OK {
+                assert_eq!(profile_acp("work")["acp_defaults"]["mine"]["model"], "m");
+            } else {
+                assert_eq!(body["error"], code, "{name}");
+                assert_eq!(profile_acp("work"), before, "{name}");
+            }
+            if name == "detect-as only" {
+                assert_eq!(
+                    body["message"],
+                    "corp-claude runs as Claude Code in Structured view, so it uses Claude Code's Agent defaults."
+                );
+            }
+        }
+
+        // A first run with no profiles has none to write to, and mints none.
+        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+        std::fs::remove_dir_all(&profiles).unwrap();
+        let (got, _, body) = put_default_model(&state, "fresh", "claude", "m").await;
+        assert_eq!(got, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"], "not_found");
+        assert!(!profiles.join("fresh").exists());
+    }
+
+    /// The Session route answers under the profile and Agent key the Session's structured spawn
+    /// reads its defaults from, so a detect-as Session reads its base's default and pin.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_agent_default_model_reads_the_key_the_spawn_reads() {
+        use serde_json::json;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        crate::session::update_config(|c| {
+            c.session
+                .agent_acp_cmd
+                .insert("mine".into(), "my-agent --acp".into());
+            c.session
+                .agent_detect_as
+                .insert("corp-claude".into(), "claude".into());
+        })
+        .unwrap();
+        set_machine_acp_defaults(json!({
+            "claude": {"model": "c", "pin_model": true},
+            "corp-claude": {"model": "never-read"},
+            "mine": {"model": "x"},
+            "codex": {"model": "o"},
+        }));
+        let project = tempfile::tempdir().unwrap();
+        let session = |id: &str, tool: &str, agent_name: Option<&str>| {
+            let mut row = crate::session::Instance::new(id, project.path().to_str().unwrap());
+            row.id = id.into();
+            row.tool = tool.into();
+            row.source_profile = "work".into();
+            row.agent_name = agent_name.map(str::to_string);
+            row
+        };
+        let state = crate::server::test_support::build_test_app_state(vec![
+            session("registry", "claude", None),
+            session("detect-as", "corp-claude", None),
+            session("custom", "mine", None),
+            session("switched", "claude", Some("codex")),
+        ]);
+        for (id, key, model, pinned) in [
+            ("registry", "claude", "c", true),
+            ("detect-as", "claude", "c", true),
+            ("custom", "mine", "x", false),
+            ("switched", "codex", "o", false),
+        ] {
+            let resp = get_session_agent_default_model(
+                State(state.clone()),
+                axum::extract::Path(id.into()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{id}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                body,
+                json!({"profile": "work", "agent_key": key, "model": model, "pinned": pinned}),
+                "{id}"
+            );
+        }
+        let resp =
+            get_session_agent_default_model(State(state), axum::extract::Path("missing".into()))
+                .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
