@@ -1650,9 +1650,9 @@ async fn an_edited_plugin_row_delivers_as_a_user_turn() {
         let state = structured_state(&id, true).await;
         let _cmds = state
             .acp_supervisor
-            .test_insert_worker_cmd_recording(&id)
+            .test_insert_classified_worker(&id, "claude")
             .await;
-        let _live = crate::acp::supervisor::test_support::save_agent_record(&id, "claude", true);
+        state.acp_supervisor.test_observe_native_ready(&id).await;
         state
             .session_service
             .enqueue_prompt(

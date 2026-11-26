@@ -1546,6 +1546,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             Err(()) => return Err(self.cancelled_spawn(reservation.lease()).await),
         };
 
+        // Install unavailable clients only while their retained owner can still
+        // recover. A dead runner must reach the caller's settlement path.
+        if client.control_loss().is_some()
+            && !worker_registry::retained_process_may_be_alive(&record)
+        {
+            return Err(AcpError::NotRunning.into());
+        }
+
         let inbound = client
             .take_inbound()
             .expect("freshly attached AcpClient always has inbound receiver");

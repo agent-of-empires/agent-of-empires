@@ -2127,8 +2127,8 @@ mod tests {
     use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor};
     use crate::daemon::Source;
 
-    struct NativeInputFixture {
-        view: StructuredViewState,
+    pub(super) struct NativeInputFixture {
+        pub(super) view: StructuredViewState,
         wire: tokio::sync::broadcast::Sender<String>,
         requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
         server: tokio::task::JoinHandle<()>,
@@ -2141,6 +2141,12 @@ mod tests {
     }
 
     impl NativeInputFixture {
+        pub(super) async fn ready() -> Self {
+            let mut fixture = Self::new().await;
+            fixture.snapshot(0, native_snapshot(true, None), None).await;
+            fixture
+        }
+
         async fn new() -> Self {
             use axum::extract::ws::{Message, WebSocketUpgrade};
             use axum::response::IntoResponse;
