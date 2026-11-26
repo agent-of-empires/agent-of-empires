@@ -146,6 +146,8 @@ Without that build, run without `SHOW_TITLES=1`.
 
 The script auto-rounds cell width/height to even numbers (libx264 requirement).
 
+Specs that create their own context with `browser.newContext` without `recordVideo` (for example the telemetry test in `tests/live/onboarding.spec.ts` and the `openPhones` tests in `tests/live/live-terminal.spec.ts`) produce no footage, so a full run yields fewer videos than specs (729 specs, 679 videos).
+
 ### Quality vs file size
 
 The defaults (`CRF=14`, `PRESET=slow`) are tuned for screen-recording content: lots of crisp text, sharp UI edges, low motion. Measured: 679 clips in a 180s (`MAX_SECONDS=180`) grid at the defaults came to about 26 MB. Dense grids of fast-moving UI compress far better than the rough figures below suggest, so treat them as upper bounds.
