@@ -225,7 +225,7 @@ A program that pilots a Daemon: the TUI, the CLI or the Web dashboard. Target (#
 _Avoid_: surface, frontend
 
 **Client-only build**:
-An `aoe` build without the Daemon. It can only pilot a Remote Daemon. Target (#4504): what Windows ships.
+An `aoe` build without the Daemon. It cannot start one, so it only pilots a Daemon that is already running. Target (#4504): what Windows ships.
 
 **Pane lifecycle**:
 Creating, respawning and killing the tmux sessions that host a Session's panes, and syncing their environment. Target (#3840): owned by the Daemon.
