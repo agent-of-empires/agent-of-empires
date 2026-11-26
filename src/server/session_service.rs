@@ -3700,6 +3700,7 @@ mod tests {
             profile: "default".to_string(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            suggestion: None,
             pending_initial_turn: None,
             parent_session_id: None,
             acp_mode_id: None,
@@ -3710,6 +3711,7 @@ mod tests {
             import_acp_session_id: None,
             import_binding: None,
             fork_seed: None,
+            session_id: None,
             progress: None,
             cli: None,
         }

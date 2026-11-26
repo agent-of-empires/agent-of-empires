@@ -23,8 +23,12 @@ impl HomeView {
 
     /// Rebuild `flat_items` and move the cursor back onto the selected session or group.
     pub(super) fn rebuild_flat_items_keeping_cursor(&mut self) {
+        let on_suggested = self.on_suggested_row();
         self.rebuild_flat_items();
         let restored = match (&self.selected_session, &self.selected_group) {
+            // The Suggested row carries neither selection; once it is gone the cursor
+            // stays on the index, which now holds its neighbour.
+            _ if on_suggested => self.suggested_row(),
             (Some(sid), _) => self.session_row(sid),
             (None, Some(gpath)) => {
                 // Two profiles can hold the same group path in the all-profiles list, and
