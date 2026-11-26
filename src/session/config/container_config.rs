@@ -7771,6 +7771,12 @@ sandbox = "SANDBOX"
         };
         mode(0o500).unwrap();
         crate::hooks::cleanup_hook_status_dir("declared-stale");
+        if !locked.exists() {
+            // A privileged process removes even a read-only directory, so no stale
+            // content survived and recovery would go unexercised.
+            eprintln!("cleanup removed the stale content; recovery not exercised");
+            return;
+        }
         let config = launch("declared-stale", false);
         mode(0o700).ok();
         assert!(mount_of(&config, "/opt/example").is_some());
