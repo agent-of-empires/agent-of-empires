@@ -104,10 +104,11 @@ impl StatusChange {
         self.old == self.new
     }
 
-    /// A resume moves a Stopped row to Idle without a turn ending, so it is no idle cue: a Retry
-    /// sits there while its launch prepares, the sandbox container included (#5977).
+    /// An Idle entered from Stopped (a resume) or Starting (a launch reaching its prompt, or a
+    /// cancelled Retry's rollback) ended no turn, so it is no idle cue (#5977). The browser's
+    /// list-based tracker applies the same rule (web/src/lib/statusSounds.ts).
     pub fn resumes_a_stop(&self) -> bool {
-        self.old == Status::Stopped && self.new == Status::Idle
+        self.new == Status::Idle && matches!(self.old, Status::Stopped | Status::Starting)
     }
 }
 
@@ -1952,25 +1953,27 @@ mod tests {
         assert!(dwell.get(&id).unwrap().waiting_since.is_none());
     }
 
-    /// #5977: a resumed stop's Idle never pushes, however long the Retry's launch prepares;
-    /// a turn that ends Idle does.
+    /// #5977: an Idle entered from Stopped or Starting never pushes, however long a Retry's
+    /// launch prepares; a turn that ends Idle does.
     #[test]
     fn a_resumed_stop_is_no_idle_push() {
-        let got: Vec<_> = [Status::Running, Status::Stopped]
-            .into_iter()
-            .map(|old| {
-                pushes_for_test(vec![StatusChange {
-                    instance_id: "sess-5977".into(),
-                    instance_title: "retry".into(),
-                    effective_profile: "default".into(),
-                    old,
-                    new: Status::Idle,
-                    at: Timestamp::now(),
-                    restores_prior: false,
-                }])
-            })
-            .collect();
-        assert_eq!(got, [1, 0]);
+        for (case, old, restores_prior, want) in [
+            ("turn-ended", Status::Running, false, 1),
+            ("resumed-stop", Status::Stopped, false, 0),
+            ("rolled-back-resume", Status::Starting, true, 0),
+            ("launched-then-idle", Status::Starting, false, 0),
+        ] {
+            let got = pushes_for_test(vec![StatusChange {
+                instance_id: "sess-5977".into(),
+                instance_title: "retry".into(),
+                effective_profile: "default".into(),
+                old,
+                new: Status::Idle,
+                at: Timestamp::now(),
+                restores_prior,
+            }]);
+            assert_eq!(got, want, "{case}");
+        }
     }
 
     /// #5671: a Retry's rollback to Error resumes the earlier error instead of arming a second

@@ -252,24 +252,36 @@ mod tests {
         }
     }
 
-    /// #5977: a resumed stop's Idle is no cue, however long the Retry's launch prepares.
+    /// #5977: an Idle entered from Stopped or Starting is no cue, however long a Retry's launch
+    /// prepares; a turn that ends Idle cues.
     #[test]
     fn a_resumed_stop_cues_nothing() {
         let t0 = Instant::now();
-        let mut dwells = Dwells::default();
-        for (id, old) in [("finished", Status::Running), ("resumed", Status::Stopped)] {
+        for (case, old, restores_prior, cues) in [
+            ("turn-ended", Status::Running, false, true),
+            ("resumed-stop", Status::Stopped, false, false),
+            ("rolled-back-resume", Status::Starting, true, false),
+            ("launched-then-idle", Status::Starting, false, false),
+        ] {
+            let mut dwells = Dwells::default();
             dwells.on_change(
                 &StatusChange {
                     old,
-                    ..change(id, Status::Idle)
+                    restores_prior,
+                    ..change(case, Status::Idle)
                 },
                 t0,
             );
+            assert_eq!(
+                dwells.take_due(t0 + Duration::from_secs(60)),
+                if cues {
+                    vec![(case.to_string(), NotificationEvent::Idle)]
+                } else {
+                    Vec::new()
+                },
+                "{case}"
+            );
         }
-        assert_eq!(
-            dwells.take_due(t0 + Duration::from_secs(60)),
-            vec![("finished".to_string(), NotificationEvent::Idle)]
-        );
     }
 
     #[test]

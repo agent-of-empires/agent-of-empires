@@ -1143,12 +1143,8 @@ async fn revert_retry_starting(
             restored = restored.is_some(),
             "Retry launch failed; rolled back its Starting"
         );
-        match restored {
-            Some(prev) if origin == RetryOrigin::Error => {
-                crate::server::push::publish_retry_rollback(&state.status_tx, inst, prev);
-            }
-            Some(prev) => publish_status_change(&state.status_tx, inst, prev),
-            None => {}
+        if let Some(prev) = restored {
+            crate::server::push::publish_retry_rollback(&state.status_tx, inst, prev);
         }
         state.note_row_mutation();
         drop(instances);
@@ -3020,7 +3016,7 @@ mod tests {
 
     /// #5977: a failed Retry from a resumed stop publishes the Agent's startup error, and a
     /// launch that was cancelled or that another worker won publishes nothing and puts back the
-    /// `Idle` the resume saved.
+    /// `Idle` the resume saved, as a rollback rather than a turn ending.
     #[tokio::test]
     #[serial_test::serial]
     async fn only_a_resumed_stops_own_failure_is_published() {
@@ -3037,22 +3033,35 @@ mod tests {
             inst.status = Status::Idle;
             let id = inst.id.clone();
             let state = test_support::build_test_app_state(vec![inst]);
+            let mut changes = state.status_tx.subscribe();
             let guard = RetryStartingGuard::begin(&state, &id, RetryOrigin::ResumedStop, NO_LAUNCH)
                 .await
                 .expect("a resumed stop starts");
             guard.fail("codex", &error);
             drained(&state).await;
+            let mut rolled_back = false;
+            while let Ok(change) = changes.try_recv() {
+                rolled_back |= change.new == Status::Idle && change.restores_prior;
+            }
             let published = state
                 .acp_event_store
                 .replay_from(&id, 0)
                 .into_iter()
                 .filter(|(_, event)| matches!(event, crate::acp::Event::AgentStartupError { .. }))
                 .count();
-            got.push((published, state.instances.read().await[0].status));
+            got.push((
+                published,
+                state.instances.read().await[0].status,
+                rolled_back,
+            ));
         }
         assert_eq!(
             got,
-            [(1, Status::Starting), (0, Status::Idle), (0, Status::Idle)]
+            [
+                (1, Status::Starting, false),
+                (0, Status::Idle, true),
+                (0, Status::Idle, true)
+            ]
         );
     }
 
