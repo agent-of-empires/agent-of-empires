@@ -39,7 +39,7 @@ if [[ "${YOUTUBE}" == "1" ]]; then
   d_crf=12 d_w=3840 d_h=2160 d_font=40 d_border=18 d_margin=40
   # x264-params carries the primaries/transfer tags that -color_* alone drops.
   color_filter="scale=out_color_matrix=bt709:out_range=tv,"
-  color_args=(-profile:v high -pix_fmt yuv420p
+  color_args=(-pix_fmt yuv420p
     -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv
     -x264-params colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv)
 else

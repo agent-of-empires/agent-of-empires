@@ -142,7 +142,7 @@ YOUTUBE=1 GRID=2x2 SHOW_TITLES=1 MAX_SECONDS=180 ./scripts/combine-showcase-vide
 
 - `TARGET_W`/`TARGET_H` become `3840`/`2160`, `CRF` becomes `12`.
 - Title text grows to `TITLE_FONTSIZE=40`, `TITLE_BORDER=18`, `TITLE_MARGIN=40`, so it stays readable in a 1920x1080 cell.
-- Every encode gets `-profile:v high -pix_fmt yuv420p`, BT.709 limited-range color tags (matrix, primaries, transfer, range) and `+faststart`. The filter chain converts with `out_color_matrix=bt709:out_range=tv` so the pixels match the tags. The primaries and transfer tags only land in the file through `-x264-params`, so the preset passes them there too.
+- Every encode gets `-pix_fmt yuv420p` (x264 then selects the High profile at CRF above 0), BT.709 limited-range color tags (matrix, primaries, transfer, range) and `+faststart`. The filter chain converts with `out_color_matrix=bt709:out_range=tv` so the pixels match the tags. The primaries and transfer tags only land in the file through `-x264-params`, so the preset passes them there too.
 
 Why a 4K canvas: a 2x2 grid on 3840x2160 gives 1920x1080 cells, and YouTube serves its high-bitrate 4K encode for 4K uploads. The sources are 1440x900, so cells are upscaled slightly and gain no detail.
 
