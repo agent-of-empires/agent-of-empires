@@ -3643,13 +3643,25 @@ export function fetchSuggestions(): Promise<SuggestionsSnapshot | null> {
   return fetchJson<SuggestionsSnapshot>("/api/suggestions");
 }
 
-async function suggestionRequest<T>(url: string, method: string, body?: unknown): Promise<SuggestionResult<T>> {
+/** A save the server may take a while on, such as one mapping among many; past this the caller reloads to see what stuck. */
+const SUGGESTION_SAVE_TIMEOUT_MS = 15_000;
+
+async function suggestionRequest<T>(
+  url: string,
+  method: string,
+  body?: unknown,
+  timeoutMs?: number,
+): Promise<SuggestionResult<T>> {
   let res: Response;
   let text: string;
   try {
-    res = await fetch(url, jsonInit(method, body));
+    const init = jsonInit(method, body);
+    res = await fetch(url, timeoutMs ? { ...init, signal: AbortSignal.timeout(timeoutMs) } : init);
     text = await res.text();
   } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      return { ok: false, error: "Timed out. It may have saved; reload to check.", stale: false };
+    }
     return {
       ok: false,
       error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
@@ -3802,11 +3814,16 @@ export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | n
 }
 
 export const putSuggestionMapping = (providerId: string, mappingKey: string, projects: string[]) =>
-  suggestionRequest("/api/suggestions/mappings", "PUT", {
-    provider_id: providerId,
-    mapping_key: mappingKey,
-    projects,
-  });
+  suggestionRequest(
+    "/api/suggestions/mappings",
+    "PUT",
+    {
+      provider_id: providerId,
+      mapping_key: mappingKey,
+      projects,
+    },
+    SUGGESTION_SAVE_TIMEOUT_MS,
+  );
 
 export async function fetchSuggestionProjects(): Promise<SuggestionProject[] | null> {
   const body = await fetchJson<{ projects: SuggestionProject[] }>("/api/suggestions/projects");
