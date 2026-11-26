@@ -1062,7 +1062,7 @@ pub(crate) fn run_status_with_timeout_process_group(
                 let _ = child.wait();
             })
         {
-            tracing::warn!(%error, "could not start status child reaper");
+            tracing::warn!(target: "process.reap", %error, "could not start status child reaper");
         }
     }
     result
