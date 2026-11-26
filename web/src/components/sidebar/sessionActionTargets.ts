@@ -62,6 +62,10 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
   openOwnWindow: (s) => !s.trashed_at,
 };
 
+/** Whether one Session may take `action`, as its sidebar row menu decides. */
+export const sessionActionEligible = (action: SessionAction, s: SessionResponse) =>
+  ELIGIBLE[action](s, !!s.archived_at);
+
 export type SessionActionTargets = Record<SessionAction, SessionResponse[]>;
 
 /** The siblings each action may act on, in row order. */

@@ -53,7 +53,11 @@ import { clearDraft } from "./lib/acpDrafts";
 import { useOrphanSweep } from "./hooks/useOrphanSweep";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { SessionActionProvider } from "./components/sidebar/SessionActionProvider";
-import { recreateContainerBlock, recreateContainerTitle } from "./components/sidebar/sessionActionTargets";
+import {
+  recreateContainerBlock,
+  recreateContainerTitle,
+  sessionActionEligible,
+} from "./components/sidebar/sessionActionTargets";
 import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
@@ -954,13 +958,6 @@ function AppContent({
   const [rightMaximized, setRightMaximized] = useState(false);
   const [rightPanelView, setRightPanelView] = useState<RightPanelView>("agent");
   const [pickerOpen, setPickerOpen] = useState(false);
-  // Reading mode for the phone conversation view: the top bar folds away so the
-  // transcript gets its 48px back (the composer has its own, independent
-  // handle inside StructuredView). Kept here rather than in the structured view
-  // because the top bar is the App shell's own child. State is App-level, so it
-  // survives switching sessions; the collapse only *applies* on the mobile
-  // conversation view, so leaving it on and navigating to settings or the
-  // dashboard shows the bar again.
   // The paired shell mounts lazily on first activation, then stays mounted
   // (kept alive but hidden) so its PTY, scrollback, and focus survive view
   // switches. Mounting it eagerly would spawn a shell for every mobile
@@ -2353,10 +2350,12 @@ function AppContent({
         ? { label: "Unarchive", icon: ArchiveRestore, onClick: () => void handleSessionStateAction(s.id, "unarchive") }
         : { label: "Archive", icon: Archive, onClick: () => void handleSessionStateAction(s.id, "archive") },
     );
-    if (s.status !== "Stopped" && s.status !== "Error") {
+    if (sessionActionEligible("stop", s)) {
       items.push({ label: "Stop", icon: Square, onClick: () => handleStopSession(s.id) });
     }
-    items.push({ label: "Move to Trash", icon: Trash2, onClick: () => void handleSessionStateAction(s.id, "trash") });
+    if (!s.trashed_at) {
+      items.push({ label: "Move to Trash", icon: Trash2, onClick: () => void handleSessionStateAction(s.id, "trash") });
+    }
     return items;
   }, [singlePane, activeSession, caps.readOnly, handleSessionStateAction, handleStopSession]);
 
@@ -3086,9 +3085,6 @@ function AppContent({
     return <Navigate to="/setup" replace />;
   }
 
-  // The header collapse is a phone affordance for the conversation view only:
-  // at md and up there is room for both the bar and the transcript, and on the
-  // dashboard / settings / diff panes the bar is the only navigation there is.
   // A phone is a two-screen stack, as Claude's app is: the session list is home, and a Session opens over it.
   const phoneHome = singlePane && !activeSession && !fullPageView && !focusMode;
   // With a Session open, a phone's session list is a drawer that pushes the Session aside as a card.

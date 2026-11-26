@@ -723,8 +723,9 @@ export function MobileLiveTerminal({
     uploadPastedImage,
     captureWriteAdmission,
     onTabEscape,
-    // Sending a line puts the soft keyboard away so the reply has the screen, as in a chat app.
-    onSubmit: coarse ? dismissSoftKeyboard : undefined,
+    // Sending a line puts the soft keyboard away so the reply has the screen, as in a chat app. A hardware
+    // keyboard never occludes, so it keeps focus for the next line.
+    onSubmit: coarse && keyboardOpen ? dismissSoftKeyboard : undefined,
   });
 
   const cursorRow = connected && !reading ? live.row : -1;

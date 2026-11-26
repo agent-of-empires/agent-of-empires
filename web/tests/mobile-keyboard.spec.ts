@@ -165,8 +165,8 @@ test.describe("Mobile proxy input keydown handling", () => {
     const handle = await setupProxySession(page);
     await sendProxyKey(page, "Enter", "Enter");
     await expect.poll(() => handle.liveInput.map((input) => input.toString())).toContain("\r");
-    // Enter put the keyboard away; bring it back. A plain Backspace edits the proxy natively and reaches the pane.
-    await page.locator("[data-keyboard-proxy]").focus();
+    // No soft keyboard occludes the page here, so Enter keeps focus. A plain Backspace edits the proxy natively and
+    // reaches the pane as its diff.
     await page.keyboard.press("Backspace");
     await expect.poll(() => handle.liveInput.map((input) => input.toString())).toContain("\x7f");
   });

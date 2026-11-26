@@ -60,10 +60,19 @@ test.describe("Live terminal mobile controls", () => {
     });
   }
 
-  test("Enter sends the line and puts the keyboard away; Shift+Enter keeps it up", async ({ page }) => {
+  test("Enter sends the line and puts the soft keyboard away; Shift+Enter keeps it up", async ({ page }) => {
     const handle = await openLiveTerminal(page, { mobile: true });
     const input = page.getByLabel("Live terminal input");
     await input.focus();
+    // The soft keyboard occludes the bottom of the visual viewport.
+    await page.evaluate(async () => {
+      const vv = window.visualViewport!;
+      const height = window.innerHeight - 300;
+      Object.defineProperty(vv, "height", { get: () => height, configurable: true });
+      vv.dispatchEvent(new Event("resize"));
+      // Two frames, so the keyboard state the resize set has rendered.
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
     await page.keyboard.press("Shift+Enter");
     await expect(input).toBeFocused();
     await page.keyboard.press("Enter");
