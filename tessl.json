@@ -181,7 +181,7 @@
         "GITHUB_AUTHOR_IDS": "{{ github.tesslApp.userId }}",
         "GITHUB_ISSUE_LABEL": "tessl"
       },
-      "description": "After a push to main, wake shepherd for each tessl/ PR that now conflicts."
+      "description": "Every 6 hours, wake shepherd for each tessl/ PR that conflicts with main."
     },
     "aoe-triage": {
       "skill": "file:./tessl-plugins/aoe-maintainer#aoe-triage",
@@ -670,25 +670,6 @@
         "debounce": "15m",
         "mode": "queue"
       }
-    },
-    "merge-conflict-sweep": {
-      "on": [
-        "github:push"
-      ],
-      "when": {
-        "event.repository.id": 1131238324,
-        "event.ref": "refs/heads/main"
-      },
-      "concurrency": {
-        "keys": [
-          {
-            "key": "merge-conflict-sweep:{{ event.repository.id }}",
-            "limit": 1
-          }
-        ],
-        "debounce": "5m"
-      },
-      "action": "merge-conflict-sweep"
     }
   },
   "schedules": {
@@ -725,6 +706,11 @@
     "review-miner-monthly": {
       "action": "review-miner",
       "schedule": "monthly on 1st at 06:00",
+      "timezone": "UTC"
+    },
+    "merge-conflict-sweep-6h": {
+      "action": "merge-conflict-sweep",
+      "schedule": "0 */6 * * *",
       "timezone": "UTC"
     }
   },
