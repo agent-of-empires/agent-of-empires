@@ -2385,20 +2385,31 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
             std::fs::create_dir_all(file.parent().expect("staged under home"))?;
             // Bind-mounted into the container, which can plant a link here, and kept on
             // one inode, which a reused container may still mount.
-            crate::hooks::write_declared_trust_in_place(&file, &trust, container_workspace_path)
-        });
-        match result {
-            // A running container may still mount the old record, so a launch that
-            // could not update it must not go on to reuse that container.
-            Err(e) => {
-                let action = if applies { "update" } else { "revoke" };
-                return Err(e.context(format!(
-                    "cannot {action} the staged sandbox trust file for {tool}; refusing to reuse the container; make the file writable or remove the session's container and relaunch"
-                )));
+            // The sidecar is never mounted. A changed declaration blanks the file first,
+            // so the entry an earlier one wrote does not outlive it; the sidecar is
+            // written last, so a crash blanks again on the next launch.
+            let marker = stage.join("trust-applied.json");
+            let applied = serde_json::json!([
+                &trust.file,
+                &trust.pointer,
+                &trust.value,
+                container_workspace_path
+            ])
+            .to_string();
+            if std::fs::read_to_string(&marker).ok().as_deref() != Some(applied.as_str()) {
+                blank_staged_file(&file)?;
             }
-            Ok(()) => {}
-        }
-        return Ok(());
+            crate::hooks::write_declared_trust_in_place(&file, &trust, container_workspace_path)?;
+            Ok(std::fs::write(&marker, applied)?)
+        });
+        // A running container may still mount the old record, so a launch that
+        // could not update it must not go on to reuse that container.
+        return result.map_err(|e| {
+            let action = if applies { "update" } else { "revoke" };
+            e.context(format!(
+                "cannot {action} the staged sandbox trust file for {tool}; refusing to reuse the container; make the file writable or remove the session's container and relaunch"
+            ))
+        });
     }
 
     // A declaration dropped since an earlier launch leaves its record staged, and a
@@ -8153,6 +8164,107 @@ sandbox = "SANDBOX"
         ensure(false).unwrap();
         assert_eq!(fs::metadata(&file).unwrap().ino(), inode);
         assert_eq!(held(), serde_json::json!({}));
+    }
+
+    // A changed declaration retires the entry the earlier one wrote, through the
+    // mounted inode; an unchanged one leaves the agent's own content alone.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_changed_declaration_retires_the_previous_staged_entry() {
+        use std::io::{Read, Seek};
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let install = |leaf: &str| {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN
+                    .replace("SANDBOX", "always")
+                    .replace("/trusted", &format!("/{leaf}")),
+            )
+        };
+        let ensure = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-retire",
+                "/workspace/project",
+                false,
+            )
+        };
+        let file = crate::hooks::declared_sandbox_dir("declared-retire")
+            .unwrap()
+            .join("home/.example.json");
+        let add_agent_json = || {
+            let mut record: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+            record["agent"] = serde_json::json!("own");
+            fs::write(&file, record.to_string()).unwrap();
+        };
+
+        install("trusted");
+        ensure().unwrap();
+        add_agent_json();
+        install("trusted");
+        ensure().unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(record["agent"], "own", "an unchanged declaration merges");
+
+        let mut mount = fs::File::open(&file).unwrap();
+        let inode = fs::metadata(&file).unwrap().ino();
+        install("ok");
+        ensure().unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().ino(), inode);
+        let mut text = String::new();
+        mount.rewind().unwrap();
+        mount.read_to_string(&mut text).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(record.get("agent").is_none(), "{record}");
+        assert!(record["projects"]["/workspace/project"]
+            .get("trusted")
+            .is_none());
+        assert_eq!(record["projects"]["/workspace/project"]["ok"], true);
+    }
+
+    // A changed declaration cannot retire the old entry in a hardlinked file, so
+    // reuse refuses.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_changed_declaration_refuses_a_hardlinked_staged_file() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "always"),
+        );
+        let stage = crate::hooks::declared_sandbox_dir("declared-retire-link").unwrap();
+        let file = stage.join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let other = temp_home.path().join("other");
+        fs::write(&other, r#"{"old":true}"#).unwrap();
+        fs::hard_link(&other, &file).unwrap();
+        fs::write(stage.join("trust-applied.json"), "[\"stale\"]").unwrap();
+
+        ensure_folder_trust_config_for_active_agent(
+            "example-helper",
+            Some("example-helper"),
+            &super::super::SessionConfig::default(),
+            "declared-retire-link",
+            "/workspace/project",
+            false,
+        )
+        .expect_err("a hardlinked file cannot be blanked in place");
+
+        assert_eq!(fs::read_to_string(&other).unwrap(), r#"{"old":true}"#);
+        assert_eq!(fs::read_to_string(&file).unwrap(), r#"{"old":true}"#);
     }
 
     // A hardlinked staged file cannot be updated in place, so reuse refuses.
