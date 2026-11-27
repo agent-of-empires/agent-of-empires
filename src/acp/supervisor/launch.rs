@@ -3297,7 +3297,9 @@ pub(super) mod tests {
                 tokio::pin!(install);
                 {
                     let _snapshot = lock_recover(&supervisor.lifecycle);
-                    assert!(futures_util::poll!(&mut install).is_pending());
+                    let mut cx =
+                        std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+                    assert!(std::future::Future::poll(install.as_mut(), &mut cx).is_pending());
                     assert!(!proposal
                         .admission
                         .store
