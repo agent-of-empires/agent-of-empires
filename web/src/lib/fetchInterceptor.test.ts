@@ -82,7 +82,7 @@ describe("installFetchErrorToasts", () => {
   }
 
   const sentHeaders = (call = 0) => new Headers((original.mock.calls[call]![1] as RequestInit).headers);
-  const networkToast = "Network error contacting /api/sessions. Check your connection.";
+  const networkToast = "Network error contacting /api/projects. Check your connection.";
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -316,8 +316,8 @@ describe("installFetchErrorToasts", () => {
   });
 
   it.each<[string, Response, string, RequestInit | undefined, boolean, string | null]>([
-    ["an /api 5xx", json(503, {}), "/api/sessions", undefined, false, "Server error 503 from /api/sessions"],
-    ["a 5xx while the server is known down", json(500, {}), "/api/sessions", undefined, true, null],
+    ["an /api 5xx", json(503, {}), "/api/projects", undefined, false, "Server error 503 from /api/projects"],
+    ["a 5xx while the server is known down", json(500, {}), "/api/projects", undefined, true, null],
     ["a non-/api 5xx", json(500, {}), "/static", undefined, false, null],
     // Every view that loads suggestions shows its own error.
     ["the suggestions snapshot", json(500, {}), "/api/suggestions", undefined, false, null],
@@ -364,8 +364,9 @@ describe("installFetchErrorToasts", () => {
   });
 
   it.each<[string, Error, string, boolean, string | null]>([
-    ["an /api failure", new TypeError("Failed to fetch"), "/api/sessions", false, networkToast],
-    ["a known-down server", new TypeError("Failed to fetch"), "/api/sessions", true, null],
+    ["an /api failure", new TypeError("Failed to fetch"), "/api/projects", false, networkToast],
+    ["a known-down server", new TypeError("Failed to fetch"), "/api/projects", true, null],
+    ["the sessions poll, which raises the banner", new TypeError("Failed to fetch"), "/api/sessions", false, null],
     ["the suggestions snapshot", new TypeError("Failed to fetch"), "/api/suggestions", false, null],
     ["AbortError", new DOMException("aborted", "AbortError"), "/api/sessions", false, null],
     ["TimeoutError", new DOMException("timed out", "TimeoutError"), "/api/sessions", false, null],
@@ -379,12 +380,21 @@ describe("installFetchErrorToasts", () => {
     else expect(reportError).not.toHaveBeenCalled();
   });
 
+  it("suppresses network toasts on a device with no network", async () => {
+    await install();
+    original.mockRejectedValue(new TypeError("Failed to fetch"));
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    await expect(window.fetch("/api/projects")).rejects.toThrow();
+    expect(reportError).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+
   it("suppresses network toasts while hidden", async () => {
     await install();
     original.mockRejectedValue(new TypeError("Failed to fetch"));
     Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
     document.dispatchEvent(new Event("visibilitychange"));
-    await expect(window.fetch("/api/sessions")).rejects.toThrow();
+    await expect(window.fetch("/api/projects")).rejects.toThrow();
     expect(reportError).not.toHaveBeenCalled();
   });
 
@@ -394,10 +404,10 @@ describe("installFetchErrorToasts", () => {
     await install();
     original.mockRejectedValue(new TypeError("Failed to fetch"));
     window.dispatchEvent(new Event("focus"));
-    await expect(window.fetch("/api/sessions")).rejects.toThrow();
+    await expect(window.fetch("/api/projects")).rejects.toThrow();
     expect(reportError).not.toHaveBeenCalled();
     vi.setSystemTime(13_000);
-    await expect(window.fetch("/api/sessions")).rejects.toThrow();
+    await expect(window.fetch("/api/projects")).rejects.toThrow();
     expect(reportError).toHaveBeenCalledWith(networkToast);
   });
 });

@@ -58,18 +58,26 @@ test.describe("Command palette", () => {
     await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await page.getByLabel("New project session").first().click();
+    await page.getByTestId("sidebar-new-session").first().click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
     await page.getByPlaceholder("Type to filter...").click();
     await page.keyboard.press("ControlOrMeta+k");
     await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
   });
 
-  test("mobile: palette icon button opens palette", async ({ page }) => {
+  test("mobile: the session list's search pill opens the palette", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
-    await page.getByRole("button", { name: "Open command palette" }).first().click();
-    await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
+    await page.getByTestId("topbar-menu").click();
+    await expect(page.getByTestId("sidebar-search-pill")).toBeInViewport();
+    await page.getByTestId("sidebar-search-pill").click();
+    const search = page.getByPlaceholder("Search actions, sessions, settings…");
+    // Focused, so a phone's keyboard comes up with it.
+    await expect(search).toBeFocused();
+    // Closing leaves nothing focused, so the keyboard goes away rather than coming back for a hidden input.
+    await page.keyboard.press("Escape");
+    await expect(search).toHaveCount(0);
+    expect(await page.evaluate(() => document.activeElement?.hasAttribute("data-focus-primer") ?? false)).toBe(false);
   });
 
   test("cheat code fires a toast and clears the input", async ({ page }) => {

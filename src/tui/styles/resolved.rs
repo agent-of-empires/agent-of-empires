@@ -356,15 +356,25 @@ fn terminal_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProj
     };
     let lift_amt = 0.2;
 
+    // A light background flips black and white: programs written for dark terminals print their text in white, so
+    // white and bright white become mid greys and black the text colour, as light terminal palettes do.
+    let (black, white, bright_white) = match appearance {
+        ThemeAppearance::Dark => (theme.background, theme.text, theme.title),
+        ThemeAppearance::Light => (
+            theme.text,
+            mix(theme.text, theme.background, 0.2),
+            mix(theme.text, theme.background, 0.3),
+        ),
+    };
     let base = [
-        ("--term-color-0", theme.background),
+        ("--term-color-0", black),
         ("--term-color-1", theme.error),
         ("--term-color-2", theme.running),
         ("--term-color-3", theme.waiting),
         ("--term-color-4", theme.branch),
         ("--term-color-5", theme.accent),
         ("--term-color-6", theme.terminal_active),
-        ("--term-color-7", theme.text),
+        ("--term-color-7", white),
     ];
     for (name, color) in base {
         css.insert(name.into(), hex(color));
@@ -381,7 +391,7 @@ fn terminal_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProj
     for (name, color) in bright {
         css.insert(name.into(), hex(mix(color, lift, lift_amt)));
     }
-    css.insert("--term-color-15".into(), hex(theme.title));
+    css.insert("--term-color-15".into(), hex(bright_white));
 
     CssVarProjection { css_vars: css }
 }
@@ -838,6 +848,36 @@ mod tests {
         let g = u8::from_str_radix(&s[2..4], 16).unwrap();
         let b = u8::from_str_radix(&s[4..6], 16).unwrap();
         relative_luminance(Color::Rgb(r, g, b))
+    }
+
+    #[test]
+    fn a_light_terminal_keeps_text_written_for_dark_terminals_readable() {
+        for name in builtin_theme_names() {
+            let r = resolve_theme(name);
+            let term = |k: &str| color_from_hex(&r.terminal.css_vars[k]);
+            let (bg, fg) = (term("--term-bg"), term("--term-fg"));
+            match r.appearance {
+                ThemeAppearance::Dark => {
+                    assert_eq!(
+                        term("--term-color-0"),
+                        bg,
+                        "{name}: black is the background"
+                    );
+                    assert_eq!(term("--term-color-7"), fg, "{name}: white is the text");
+                }
+                ThemeAppearance::Light => {
+                    // Black is the text, and the whites programs print text in stay legible on the page.
+                    assert_eq!(term("--term-color-0"), fg, "{name}: black is the text");
+                    for white in ["--term-color-7", "--term-color-15"] {
+                        let ratio = contrast_ratio(term(white), bg);
+                        assert!(
+                            ratio >= 3.0,
+                            "{name}: {white} on the background is {ratio:.2}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn color_from_hex(hex: &str) -> Color {

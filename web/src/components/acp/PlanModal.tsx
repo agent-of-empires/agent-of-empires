@@ -9,7 +9,8 @@ import { tabStops, useFocusTrap } from "../../hooks/useFocusTrap";
 import type { ApprovalDecision, ApprovalOption } from "../../lib/acpTypes";
 import { OFFLINE_TITLE } from "../../lib/connectionState";
 import type { FileRef } from "../../lib/fileRef";
-import { BRAND_BUTTON, Dialog } from "../Dialog";
+import { BUTTON_GHOST, BUTTON_PRIMARY, BUTTON_SECONDARY } from "../../lib/surfaces";
+import { Dialog } from "../Dialog";
 import { AcpFileRefContext, useAcpFileRef } from "./AcpFileRefContext";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
 import { Markdown } from "./Markdown";
@@ -60,9 +61,6 @@ function useModalFocus(onClose: () => void) {
   return marker;
 }
 
-const SECONDARY_BUTTON = "border border-surface-700 text-text-secondary hover:bg-surface-700";
-const FOOTER_BUTTON = "px-3 py-1.5 text-sm rounded-md cursor-pointer transition-colors disabled:opacity-50";
-
 const VIEWS = ["rendered", "raw"] as const;
 type View = (typeof VIEWS)[number];
 
@@ -106,7 +104,7 @@ export function PlanModal({ plan, canDecide, submitting, offline, options, onDec
     <button
       key={optionId ?? decision}
       type="button"
-      className={`${FOOTER_BUTTON} ${className}`}
+      className={className}
       disabled={blocked}
       title={offline ? OFFLINE_TITLE : undefined}
       onClick={() => {
@@ -121,30 +119,26 @@ export function PlanModal({ plan, canDecide, submitting, offline, options, onDec
     <Dialog
       id="plan-modal"
       title="Plan"
-      panelClassName="w-[min(900px,94vw)] max-h-[90vh] flex flex-col"
-      bodyClassName="min-h-0 flex-1 overflow-y-auto px-5 py-4"
+      panelClassName="md:w-[min(900px,94vw)] md:max-h-[90vh]"
       describedBy={false}
       onDismiss={onClose}
       footer={
         <>
-          <button
-            type="button"
-            className={`${FOOTER_BUTTON} mr-auto text-text-secondary hover:text-text-primary hover:bg-surface-700/50`}
-            onClick={onClose}
-          >
+          <button type="button" className={`${BUTTON_GHOST} mr-auto`} onClick={onClose}>
             Close
           </button>
           {/* Same order as the card: answers or Allow first, then Always, then the way out. */}
           {options ? (
             <>
-              {options.map((o) => decide(o.name, "Allow", BRAND_BUTTON, o.option_id))}
-              {decide("Dismiss", "Cancelled", SECONDARY_BUTTON)}
+              {/* A list of answers stacks full width on a phone rather than sharing rows. */}
+              {options.map((o) => decide(o.name, "Allow", `${BUTTON_PRIMARY} max-md:!basis-full`, o.option_id))}
+              {decide("Dismiss", "Cancelled", `${BUTTON_SECONDARY} max-md:!basis-full`)}
             </>
           ) : (
             <>
-              {decide("Allow", "Allow", BRAND_BUTTON)}
-              {decide("Always", "AllowAlways", SECONDARY_BUTTON)}
-              {decide("Deny", "Deny", SECONDARY_BUTTON)}
+              {decide("Allow", "Allow", BUTTON_PRIMARY)}
+              {decide("Always", "AllowAlways", BUTTON_SECONDARY)}
+              {decide("Deny", "Deny", BUTTON_SECONDARY)}
             </>
           )}
         </>
@@ -163,7 +157,7 @@ export function PlanModal({ plan, canDecide, submitting, offline, options, onDec
             tabIndex={view === v ? 0 : -1}
             onKeyDown={(e) => onTabKey(e, v)}
             className={[
-              "rounded px-2 py-1 text-xs",
+              "rounded-md px-2.5 py-1 max-md:py-2 text-[13px] md:text-xs transition-colors",
               view === v ? "bg-surface-700 text-text-primary" : "text-text-dim hover:text-text-secondary",
             ].join(" ")}
             onClick={() => setView(v)}

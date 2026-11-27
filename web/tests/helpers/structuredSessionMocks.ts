@@ -59,8 +59,7 @@ export async function mockStructuredSessionApis(page: Page, opts: { id: string; 
 /** Open the session from the mobile sidebar and wait for the structured view. */
 export async function openStructuredViewFor(page: Page, title: string) {
   await page.goto("/");
-  await expect(page.locator("header")).toBeVisible();
-  // On a mobile viewport the sidebar is collapsed behind a toggle.
+  // A phone's home is the session list itself.
   await openMobileSidebar(page);
   await clickSidebarSession(page, title);
   await expect(page.getByTestId("structured-view-root")).toBeVisible({ timeout: 10_000 });

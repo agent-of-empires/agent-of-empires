@@ -7,6 +7,7 @@ import { RecreateContainerDialog } from "../sidebar/RecreateContainerDialog";
 import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { containerGoneRemedy, REMEDY_LINE } from "./containerGone";
 import { RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
+import { BUTTON_INLINE } from "../../lib/surfaces";
 
 export interface NewSessionLike {
   /** The Project, as the button names it. */
@@ -79,6 +80,7 @@ export function ContainerGoneBanner({
                 label: restoring ? "Restoring…" : "Restore",
                 onClick: restore,
                 disabled: restoring,
+                busy: restoring,
                 testId: "container-gone-restore",
               },
             ]
@@ -115,7 +117,7 @@ export function ContainerGoneBanner({
           data-testid="container-gone-details"
           aria-expanded={detailsOpen}
           onClick={() => setDetailsOpen(!detailsOpen)}
-          className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+          className={BUTTON_INLINE}
         >
           Details
         </button>
@@ -125,7 +127,7 @@ export function ContainerGoneBanner({
             <button
               type="button"
               onClick={() => void writeClipboard(message).then(setCopied)}
-              className="mt-1 text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+              className={`${BUTTON_INLINE} mt-1`}
             >
               {copied ? "Copied" : "Copy"}
             </button>

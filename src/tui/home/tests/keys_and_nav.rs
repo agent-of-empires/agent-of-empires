@@ -1571,6 +1571,7 @@ fn start_for_test(path: &str) -> crate::tui::suggestions::Start {
         reason: "review requested".to_string(),
         source_text: None,
         path: Some(path.to_string()),
+        extra_paths: Vec::new(),
         title: "Review PR 7".to_string(),
         initial_prompt: "Inspect the diff".to_string(),
         tool: "claude".to_string(),

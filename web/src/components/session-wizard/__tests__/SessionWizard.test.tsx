@@ -2477,6 +2477,20 @@ describe("SessionWizard initial prompt", () => {
 });
 
 describe("SessionWizard suggestion link", () => {
+  it("keeps the prefill it opened with when a later one arrives", async () => {
+    const props = { servedProfile: "default", onClose: vi.fn(), onCreated: vi.fn() };
+    const { rerender } = render(<SessionWizard {...props} prefill={{ path: "/tmp/proj", tool: "claude" }} />);
+    rerender(
+      <SessionWizard
+        {...props}
+        prefill={{ path: "/tmp/other", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } }}
+      />,
+    );
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().suggestion).toBeUndefined();
+  });
+
   it("sends the suggestion reference, and nothing when the prefill has none", async () => {
     renderWizard({ path: "/tmp/proj", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } });
     await launch();
@@ -2529,6 +2543,23 @@ describe("SessionWizard suggestion source", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(payload()).toMatchObject({ worktree_enabled: true });
+  });
+
+  it("keeps the preset's sandbox over the Project's override", async () => {
+    const prepared = { title: "t", initial_prompt: "p", project: null, sandbox: true } as unknown as SuggestionPrepared;
+    expect(toWizardPrefill(prepared, { label: "G", title: "t", url: "" }).useSandbox).toBe(true);
+    vi.mocked(fetchProjects).mockResolvedValue([
+      { name: "proj", path: "/tmp/proj", scope: "global", pinned: false, overrides: { sandbox_enabled: false } },
+    ] as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", useSandbox: true });
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalled());
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    // Both seeds have resolved; let their state updates commit before looking at the switch.
+    await act(async () => {
+      await Promise.all(vi.mocked(fetchProjects).mock.results.map((r) => r.value));
+      await Promise.all(vi.mocked(fetchSettings).mock.results.map((r) => r.value));
+    });
+    expect(screen.getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("true");
   });
 
   it("drops the preset's worktree when the profile changes", async () => {

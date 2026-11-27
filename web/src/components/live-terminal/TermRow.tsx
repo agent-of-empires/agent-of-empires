@@ -19,7 +19,7 @@ function runSpan(key: string | number, text: string, fixed: boolean, cells: numb
 // The cursor is a cell in the text flow: filled while the input is focused, a hollow outline otherwise.
 const CURSOR_FOCUSED: CSSProperties = {
   backgroundColor: "var(--term-cursor, #f59e0b)",
-  color: "var(--term-bg, #1c1c1f)",
+  color: "var(--term-bg, #1f1f1f)",
 };
 const CURSOR_BLURRED: CSSProperties = { outline: "1px solid var(--term-cursor, #f59e0b)", outlineOffset: "-1px" };
 

@@ -74,6 +74,12 @@ export function MenuPopover({
     const el = menu.current;
     if (!el) focused.current = false;
     if (!el || focused.current) return;
+    // Focus moved elsewhere while the items loaded: leave it there.
+    const holder = document.activeElement;
+    if (holder && holder !== document.body && !box.current?.contains(holder) && !el.contains(holder)) {
+      focused.current = true;
+      return;
+    }
     const first = el.querySelector<HTMLElement>(ENABLED_ITEMS);
     if (first) {
       first.focus();

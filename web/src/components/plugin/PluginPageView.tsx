@@ -24,10 +24,11 @@ import { usePluginPages } from "../../lib/pluginUiContext";
 import type { SessionMenuRequest } from "./PluginSessionMenu";
 import { requestOpenSession } from "../../lib/sessionRoute";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
-import { THEME_CHANGED_EVENT, type ResolvedTheme } from "../../lib/theme";
-import { listen } from "../../hooks/domEvents";
+import { getResolvedTheme, subscribeTheme, type ResolvedTheme } from "../../lib/theme";
 import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { usePersistedFlag } from "../usePersistedFlag";
+import { BUTTON_SECONDARY } from "../../lib/surfaces";
+import { BUTTON_GHOST_SM } from "../../lib/surfaces";
 
 interface Props {
   pluginId: string;
@@ -306,11 +307,10 @@ export function PluginPageView({
 
   useEffect(
     () =>
-      listen(
-        (event) =>
-          port.current?.postMessage(bridgePush("theme", themePayload((event as CustomEvent<ResolvedTheme>).detail))),
-        [window, THEME_CHANGED_EVENT],
-      ),
+      subscribeTheme(() => {
+        const next = getResolvedTheme();
+        if (next) port.current?.postMessage(bridgePush("theme", themePayload(next)));
+      }),
     [],
   );
 
@@ -337,7 +337,7 @@ export function PluginPageView({
   } else if (lost) {
     body = (
       <Empty title="This page reloaded itself" detail="Its connection to the dashboard was closed.">
-        <button onClick={reopen} className="mt-3 text-brand-500 cursor-pointer text-sm">
+        <button onClick={reopen} className={`mt-3 ${BUTTON_SECONDARY}`}>
           Reopen
         </button>
       </Empty>
@@ -382,7 +382,7 @@ export function PluginPageView({
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-surface-900" data-testid="plugin-page-view">
       <div className="bg-surface-850 border-b border-surface-700 shrink-0 flex items-center gap-3 px-4 h-12">
-        <button onClick={onBack} className="text-brand-500 cursor-pointer text-sm shrink-0">
+        <button onClick={onBack} className={`${BUTTON_GHOST_SM} shrink-0`}>
           &larr; Back
         </button>
         <span className="flex-1 text-xs font-mono text-text-bright truncate">{page?.title ?? pageId}</span>
