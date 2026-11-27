@@ -76,7 +76,7 @@ jobs:
   cachix:
     name: Build and push (${{ matrix.system }})
     needs: plan
-    runs-on: ${{ matrix.system == 'macos' && 'macos-latest' || (vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt)) }}
+    runs-on: ${{ matrix.system == 'macos' && 'macos-latest' || (vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-{1}/runner=4cpu-linux-x64/family=m8a+m8i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt)) }}
     permissions:
       contents: read
     strategy:
@@ -85,8 +85,9 @@ jobs:
         system: ${{ fromJSON(needs.plan.outputs.systems) }}
 
     steps:
-      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache).
+      - if: matrix.system == 'linux'
+        uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/install-nix
