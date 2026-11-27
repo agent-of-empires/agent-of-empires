@@ -60,6 +60,26 @@ test.describe("Live terminal mobile controls", () => {
     });
   }
 
+  test("Enter sends the line and puts the soft keyboard away; Shift+Enter keeps it up", async ({ page }) => {
+    const handle = await openLiveTerminal(page, { mobile: true });
+    const input = page.getByLabel("Live terminal input");
+    await input.focus();
+    // The soft keyboard occludes the bottom of the visual viewport.
+    await page.evaluate(async () => {
+      const vv = window.visualViewport!;
+      const height = window.innerHeight - 300;
+      Object.defineProperty(vv, "height", { get: () => height, configurable: true });
+      vv.dispatchEvent(new Event("resize"));
+      // Two frames, so the keyboard state the resize set has rendered.
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    await page.keyboard.press("Shift+Enter");
+    await expect(input).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect.poll(() => handle.liveInput.map((b) => b.toString())).toContain("\r");
+    await expect(input).not.toBeFocused();
+  });
+
   test("the default key row fits one line, and an eight-key row still does not scroll", async ({ page }) => {
     const handle = await openLiveTerminal(page, { mobile: true });
     const row = ["Escape", "Tab", "Ctrl", "Paste from clipboard", "Compose"];
@@ -126,11 +146,7 @@ test.describe("Live terminal mobile controls", () => {
     await expect.poll(() => handle.liveInput.slice(typedBefore).map((b) => b.toString())).toContain("\x1b[D");
 
     // A swipe this long opens the sidebar from the terminal, but not when it runs over the joystick.
-    const sidebarOpen = () =>
-      page.evaluate(() => {
-        const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();
-        return !!r && r.x >= 0 && r.width > 0;
-      });
+    const sidebarOpen = () => page.getByTestId("sidebar-session-row").first().isVisible();
     const swipeRight = (selector: string) =>
       page.evaluate((selector) => {
         const target = document.querySelector<HTMLElement>(selector)!;

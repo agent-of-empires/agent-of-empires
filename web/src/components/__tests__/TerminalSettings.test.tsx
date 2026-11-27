@@ -30,7 +30,6 @@ describe("TerminalSettings localStorage contract", () => {
     ["desktop font slider", "input[type=range]", 1, "18", "desktopFontSize", 18],
     ["desktop font select", "select", 1, "20", "desktopFontSize", 20],
     ["font family select", "#terminal-font-family", 0, "JetBrains Mono", "terminalFontFamily", "JetBrains Mono"],
-    ["sidebar side select", "#sidebar-side", 0, "right", "sidebarSide", "right"],
   ] as [string, string, number, string, string, unknown][])("%s writes %s", (_n, selector, i, value, key, expected) => {
     const { container } = render(<TerminalSettings />);
     fireEvent.change(container.querySelectorAll(selector)[i]!, { target: { value } });
@@ -109,7 +108,6 @@ describe("TerminalSettings localStorage contract", () => {
       persistentTerminals: true,
       maxPersistentTerminals: 42,
       terminalFontFamily: "menlo",
-      sidebarSide: "right",
     });
     const { container } = render(<TerminalSettings />);
     const selects = container.querySelectorAll("select");
@@ -120,7 +118,6 @@ describe("TerminalSettings localStorage contract", () => {
     expect((checkboxes[1] as HTMLInputElement).checked).toBe(true);
     expect((container.querySelector("input[type=number]") as HTMLInputElement).value).toBe("42");
     expect((container.querySelector("#terminal-font-family") as HTMLSelectElement).value).toBe("Menlo");
-    expect((container.querySelector("#sidebar-side") as HTMLSelectElement).value).toBe("right");
   });
 
   it("normalizes malformed or out-of-range persistent terminal settings on read", () => {

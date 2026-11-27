@@ -1,15 +1,17 @@
 import { useEffect, type ReactNode } from "react";
-import { Sparkles, SquareTerminal, type LucideIcon } from "lucide-react";
+import { SquareTerminal } from "lucide-react";
+import type { PairedShell, PairedShellGroup } from "../lib/pairedShells";
 import type { RightPanelView } from "../lib/rightPanelView";
 import { sessionRowChromeClass } from "../lib/sessionRowChrome";
+import { BACKDROP, SHEET, SHEET_HANDLE } from "../lib/surfaces";
 import type { PaneDisplay } from "./Dock";
 import { PaneIcon } from "./PaneIcon";
 
-// Mobile-only pseudo-views with no desktop dock equivalent; always offered.
-const SESSION_VIEWS: { view: RightPanelView; title: string; icon: LucideIcon }[] = [
-  { view: "agent", title: "Agent", icon: Sparkles },
-  { view: "paired", title: "Paired terminal", icon: SquareTerminal },
-];
+/** Views the phone's ⋯ menu lists itself, so More panes leaves them out. */
+const TAB_VIEWS = new Set<string>(["agent", "paired", "diff", "files"]);
+
+/** The sheet moves on the iOS sheet curve; reduced motion skips it. */
+const SHEET_MOTION = "duration-[400ms] ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
 
 interface Props {
   open: boolean;
@@ -19,6 +21,11 @@ interface Props {
   // follows the desktop dock's capability and session gating.
   availablePanes: string[];
   describePane: (id: string) => PaneDisplay;
+  /** Every live paired shell, so the paired view can show another Session's. */
+  shellGroups: PairedShellGroup[];
+  onPickShell: (shell: PairedShell) => void;
+  /** The shell the paired view shows, while it is the current view. */
+  shownShell: Pick<PairedShell, "sessionId" | "index" | "mode"> | null;
   onSelect: (view: RightPanelView) => void;
   onClose: () => void;
 }
@@ -26,7 +33,7 @@ interface Props {
 function Section({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="pt-2">
-      <div className="px-3 pb-1 text-[11px] font-mono uppercase tracking-wider text-text-dim">{label}</div>
+      <div className="px-3 pb-1 text-[12px] font-medium text-text-dim">{label}</div>
       <ul>{children}</ul>
     </div>
   );
@@ -73,6 +80,9 @@ export function MobileRightPanelPicker({
   sessionTitle,
   availablePanes,
   describePane,
+  shellGroups,
+  onPickShell,
+  shownShell,
   onSelect,
   onClose,
 }: Props) {
@@ -86,40 +96,37 @@ export function MobileRightPanelPicker({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
-  // Stays mounted so it can slide out; `invisible` flips after the transform
-  // finishes, which also takes the closed drawer out of focus and the a11y tree.
+  const panes = availablePanes.filter((id) => !TAB_VIEWS.has(id));
+
+  // The ⋯ menu's More panes: a bottom sheet with what the menu leaves out. Stays mounted so it can slide out;
+  // `invisible` flips after the transform finishes, which also takes the closed sheet out of focus and the a11y tree.
   return (
     <div className="md:hidden">
       <div
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] inset-x-0 bottom-0 z-40 bg-black/50 transition-[opacity,visibility] duration-300 motion-reduce:transition-none ${
+        className={`fixed inset-0 z-40 ${BACKDROP} transition-[opacity,visibility] ${SHEET_MOTION} ${
           open ? "opacity-100" : "opacity-0 invisible"
         }`}
         onClick={onClose}
         data-testid="mobile-right-panel-picker-backdrop"
       />
       <div
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] right-0 bottom-0 z-50 w-[280px] max-w-[85vw] bg-surface-800 border-l border-surface-700/60 flex flex-col pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] transition-[translate,visibility] duration-300 ease-in-out motion-reduce:transition-none ${
-          open ? "translate-x-0" : "translate-x-full invisible"
+        className={`fixed inset-x-0 bottom-0 z-50 max-h-[75dvh] ${SHEET} flex flex-col px-[env(safe-area-inset-left)] pb-[env(safe-area-inset-bottom)] transition-[translate,visibility] ${SHEET_MOTION} ${
+          open ? "translate-y-0" : "translate-y-full invisible"
         }`}
         role="dialog"
         aria-modal="true"
-        aria-label="Panels"
+        aria-label="More"
         data-testid="mobile-right-panel-picker"
       >
-        <div className="px-3 pt-3 pb-2 border-b border-surface-700/60">
-          <div className="text-sm text-text-muted">Panels</div>
-          <div className="mt-0.5 truncate font-mono text-[12px] text-text-dim">{sessionTitle}</div>
+        <div className={SHEET_HANDLE} aria-hidden />
+        <div className="px-4 pt-2 pb-2 flex items-baseline gap-2">
+          <div className="text-[15px] font-medium text-text-primary">More</div>
+          <div className="min-w-0 truncate text-[12px] text-text-dim">{sessionTitle}</div>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto flex flex-col pb-2">
-          <div className="mt-auto" />
-          <Section label="Session">
-            {SESSION_VIEWS.map(({ view, title, icon }) => (
-              <Row key={view} display={{ title, icon }} view={view} active={view === active} onSelect={onSelect} />
-            ))}
-          </Section>
-          {availablePanes.length > 0 && (
+          {panes.length > 0 && (
             <Section label="Panes">
-              {availablePanes.map((id) => (
+              {panes.map((id) => (
                 <Row
                   key={id}
                   display={describePane(id)}
@@ -128,6 +135,38 @@ export function MobileRightPanelPicker({
                   onSelect={onSelect}
                 />
               ))}
+            </Section>
+          )}
+          {shellGroups.length > 0 && (
+            <Section label="Paired terminals">
+              {shellGroups.flatMap(({ session, shells }) =>
+                shells.map((shell) => {
+                  const current =
+                    shownShell?.sessionId === shell.sessionId &&
+                    shownShell.index === shell.index &&
+                    shownShell.mode === shell.mode;
+                  return (
+                    <li key={`${shell.sessionId}:${shell.index}:${shell.mode}`}>
+                      <button
+                        onClick={() => onPickShell(shell)}
+                        aria-current={current ? "true" : undefined}
+                        data-testid={`mobile-shell-pick-${shell.sessionId}-${shell.index}-${shell.mode}`}
+                        className={`w-full h-11 flex items-center gap-3 px-3 text-left text-[14px] cursor-pointer transition-colors duration-75 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-600 text-text-secondary ${sessionRowChromeClass(current, false)}`}
+                      >
+                        <SquareTerminal className="h-4 w-4 shrink-0 text-text-dim" />
+                        <span className="truncate">
+                          {session.title} · {shell.index + 1}
+                        </span>
+                        {session.is_sandboxed && (
+                          <span className="ml-auto shrink-0 font-mono text-[11px] text-text-dim">
+                            {shell.mode === "container" ? "Container" : "Host"}
+                          </span>
+                        )}
+                      </button>
+                    </li>
+                  );
+                }),
+              )}
             </Section>
           )}
         </div>

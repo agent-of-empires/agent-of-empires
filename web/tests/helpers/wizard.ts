@@ -12,7 +12,13 @@ export async function openWizard(page: Page) {
   // Navigation/body actionability can precede AppContent mounting past the
   // login-status gate. Match the scratch-shortcut readiness guard before
   // sending a one-shot key event that would otherwise be lost during startup.
-  await expect(page.getByRole("button", { name: /New session/ }).first()).toBeVisible();
+  // A phone's drawer holds a New session too, hidden until ☰ opens it.
+  await expect(
+    page
+      .getByRole("button", { name: /New session/ })
+      .filter({ visible: true })
+      .first(),
+  ).toBeVisible();
   // Blur rather than click the body: a centre click lands on the empty dashboard's New session card,
   // which opens the wizard early and the "n" then types into its autofocused search.
   await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());

@@ -17,7 +17,7 @@ import { workspaceQueuedReason } from "./sessionQueuedReason";
 import { formatDurationSecondsShort, formatSnoozeRemainingShort } from "./format";
 import type { RowModel } from "./rowModel";
 
-const CHIP = "inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px]";
+const CHIP = "inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px] max-md:text-[12px]";
 const MUTED = "border-surface-700/40 bg-surface-800/40 font-mono font-medium text-text-dim";
 const AMBER = "border-amber-700/40 bg-amber-950/30 font-medium text-amber-300";
 

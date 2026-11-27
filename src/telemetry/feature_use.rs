@@ -56,6 +56,30 @@ feature_uses! {
     NewFromSelection => "new_from_selection",
     TrashRestore => "trash_restore",
     TrashEmpty => "trash_empty",
+    SuggestTipShown => "suggest_tip_shown",
+    SuggestTipDismissed => "suggest_tip_dismissed",
+    SuggestTipClicked => "suggest_tip_clicked",
+    SuggestSetupOpened => "suggest_setup_opened",
+    SuggestSetupFinished => "suggest_setup_finished",
+    SuggestSetupLater => "suggest_setup_later",
+    SuggestStart => "suggest_start",
+    SuggestStartChanges => "suggest_start_changes",
+    SuggestStartIn => "suggest_start_in",
+    SuggestStartAnother => "suggest_start_another",
+    SuggestDismiss => "suggest_dismiss",
+    SuggestRestore => "suggest_restore",
+    SuggestStopKind => "suggest_stop_kind",
+    SuggestPresetEdit => "suggest_preset_edit",
+    SuggestPresetReset => "suggest_preset_reset",
+    SuggestMappingAdd => "suggest_mapping_add",
+    SuggestFromHome => "suggest_from_home",
+    SuggestFromPage => "suggest_from_page",
+    SuggestFromSidebar => "suggest_from_sidebar",
+    SuggestFromTui => "suggest_from_tui",
+    SuggestFailSandbox => "suggest_fail_sandbox",
+    SuggestFailTrust => "suggest_fail_trust",
+    SuggestFailHooks => "suggest_fail_hooks",
+    SuggestFailOther => "suggest_fail_other",
 }
 
 /// Web dashboard uses with no TUI counterpart; the shared ones go through [`FeatureUse`] names.
@@ -103,6 +127,11 @@ impl From<GroupByMode> for FeatureUse {
 static COUNTS: LazyLock<UsageSeenCounters> = LazyLock::new(|| {
     UsageSeenCounters::with_names(FeatureUse::NAMES.iter().chain(WEB_ONLY).copied())
 });
+
+/// Counts one use the Daemon itself observed.
+pub fn record(feature: FeatureUse) {
+    COUNTS.record(feature.as_str());
+}
 
 /// For names a client reports to the Daemon; false when off the registry.
 pub fn record_name(name: &str) -> bool {

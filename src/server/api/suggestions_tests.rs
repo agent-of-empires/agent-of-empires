@@ -36,6 +36,7 @@ variables = ["number"]
 
 struct Fixture {
     app: axum::Router,
+    state: Arc<crate::server::state::AppState>,
     host: Arc<PluginHost>,
     repo: PathBuf,
     // Field order is drop order: restore the env, then reload the registry
@@ -113,7 +114,8 @@ fn fixture_with(prior: Vec<crate::session::Instance>, cityhall: bool) -> Fixture
         },
     );
     Fixture {
-        app: crate::server::test_support::build_router_for_test(state),
+        app: crate::server::test_support::build_router_for_test(state.clone()),
+        state,
         host,
         repo,
         _env: env,
@@ -226,6 +228,10 @@ async fn snapshot_and_refresh() {
     assert_eq!(body["items"][0]["dismissed"], false);
     assert_eq!(body["prefs"]["refresh_minutes"], 15);
     assert!(
+        body["setup_offered"].is_boolean(),
+        "the TUI takes the featured index from the daemon"
+    );
+    assert!(
         body["profile"].is_string(),
         "clients check it against their own"
     );
@@ -235,6 +241,41 @@ async fn snapshot_and_refresh() {
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert_eq!(body, json!({ "ok": true, "notified": 0 }), "{uri}");
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn an_agent_can_push_a_suggestion_without_a_plugin() {
+    let f = fixture();
+    let (status, _, body) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/push",
+            json!({ "title": "Fix flaky test", "prompt": "Fix it", "reason": "Fails on CI" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    let item = snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == id)
+        .expect("pushed item is listed");
+    assert_eq!(item["provider_id"], "builtin.agent");
+    assert_eq!(item["draft"]["prompt"], "Fix it");
+
+    let (status, code, _) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/push",
+            json!({ "title": " ", "prompt": "x" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(code, "validation_failed");
 }
 
 /// `started_session` follows the link table joined to live Sessions, not a scan
@@ -590,6 +631,11 @@ async fn a_suggestion_request_for_another_profile_is_refused_untouched() {
             Method::POST,
             "/api/suggestions/start".to_string(),
             item(other.clone()),
+        ),
+        (
+            Method::POST,
+            "/api/suggestions/start-batch".to_string(),
+            json!({ "items": [{ "provider_id": PROVIDER, "id": "a" }], "expected_profile": "other" }),
         ),
         (
             Method::POST,
@@ -1062,6 +1108,70 @@ async fn start_refuses_an_unlinked_repo_and_shows_hooks_before_approval() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn start_batch_answers_each_item_and_one_refusal_never_stops_the_rest() {
+    let f = fixture();
+    f.seed_item("hooks", Some("acme/web"), "1");
+    f.seed_item("unlinked", Some("acme/other"), "2");
+    let repo = f.repo.to_string_lossy().into_owned();
+    f.call(
+        Method::PUT,
+        "/api/suggestions/mappings",
+        json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo] }),
+    )
+    .await;
+    std::fs::create_dir_all(f.repo.join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        f.repo.join(".agent-of-empires/config.toml"),
+        "[hooks]\non_create = [\"npm ci\"]\n",
+    )
+    .unwrap();
+    let item = |id: &str| json!({ "provider_id": PROVIDER, "id": id });
+    let (status, _, body) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/start-batch",
+            json!({ "items": [item("hooks"), item("unlinked"), item("gone")] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results: Vec<(String, u64, Value)> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().to_string(),
+                r["status"].as_u64().unwrap(),
+                r["body"]["error"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            ("hooks".to_string(), 409, json!("hooks_need_trust")),
+            ("unlinked".to_string(), 400, json!("no_project")),
+            ("gone".to_string(), 409, json!("stale_suggestion")),
+        ]
+    );
+
+    for items in [json!([]), json!(vec![item("x"); 26])] {
+        let (status, code, _) = f
+            .call(
+                Method::POST,
+                "/api/suggestions/start-batch",
+                json!({ "items": items }),
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::BAD_REQUEST, "validation_failed")
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn mappings_validate_list_and_delete_by_query() {
     let f = fixture();
     let repo = f.repo.to_string_lossy().into_owned();
@@ -1211,4 +1321,288 @@ async fn projects_list_each_registered_project_with_its_origin_slug() {
         rows,
         [("repo", Value::Null), ("web-app", json!("Acme/Web"))]
     );
+}
+
+fn items_by_id(snapshot: &Value) -> std::collections::HashMap<String, Value> {
+    snapshot["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| (item["id"].as_str().unwrap().to_string(), item.clone()))
+        .collect()
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auto_start_is_validated_and_leaves_what_needs_the_user_with_a_note() {
+    let f = fixture();
+    let put = |body: Value| f.call(Method::PUT, "/api/suggestions/auto-start", body);
+    let on = json!({ "provider_id": PROVIDER, "criterion": "assigned", "enabled": true });
+    for (what, mut body) in [
+        ("cap 0", on.clone()),
+        ("cap 11", on.clone()),
+        ("unknown kind", on.clone()),
+    ] {
+        match what {
+            "cap 0" => body["cap"] = json!(0),
+            "cap 11" => body["cap"] = json!(11),
+            _ => body["criterion"] = json!("nope"),
+        }
+        let (status, code, _) = put(body).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::BAD_REQUEST, "validation_failed"),
+            "{what}"
+        );
+    }
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    assert_eq!(
+        snapshot["providers"][0]["sources"][0]["auto_start"],
+        Value::Null
+    );
+
+    let (status, _, body) = put(on).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["auto_start"], json!({ "cap": 3 }));
+
+    // No project is linked to the repo: it stays a suggestion and says why.
+    f.seed_item("a", Some("acme/web"), "42");
+    super::suggestions::sweep_auto_start(&f.state).await;
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    assert_eq!(
+        snapshot["providers"][0]["sources"][0]["auto_start"],
+        json!({ "cap": 3 })
+    );
+    let note = items_by_id(&snapshot)["a"]["auto_note"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        note.starts_with("Not auto started: ") && note.contains("not linked"),
+        "{note}"
+    );
+
+    // Linked, but the repo's hooks need a review.
+    let repo = f.repo.to_string_lossy().into_owned();
+    f.call(
+        Method::PUT,
+        "/api/suggestions/mappings",
+        json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo] }),
+    )
+    .await;
+    std::fs::create_dir_all(f.repo.join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        f.repo.join(".agent-of-empires/config.toml"),
+        "[hooks]\non_create = [\"npm ci\"]\n",
+    )
+    .unwrap();
+    super::suggestions::sweep_auto_start(&f.state).await;
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    let note = items_by_id(&snapshot)["a"]["auto_note"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(note.contains("hooks"), "{note}");
+    let attempted: i64 = f.host.with_suggestions_db(|conn, _| {
+        conn.query_row("SELECT COUNT(*) FROM suggestion_auto_started", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert_eq!(
+        attempted, 0,
+        "an item that needs the user is never attempted"
+    );
+
+    // Turned off, the note goes away.
+    put(json!({ "provider_id": PROVIDER, "criterion": "assigned", "enabled": false })).await;
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    assert!(items_by_id(&snapshot)["a"].get("auto_note").is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auto_start_is_refused_for_the_agent_provider() {
+    let f = fixture();
+    let agent = crate::plugin::suggestions::AGENT_PROVIDER_ID;
+    let (status, code, _) = f
+        .call(
+            Method::PUT,
+            "/api/suggestions/auto-start",
+            json!({ "provider_id": agent, "criterion": "agent", "enabled": true }),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::BAD_REQUEST, "validation_failed")
+    );
+    // A stored switch is ignored by the sweep: the item gets no note at all.
+    f.host.with_suggestions_db(|conn, profile| {
+        crate::plugin::suggestions::set_auto_start(conn, profile, agent, "agent", Some(3)).unwrap();
+    });
+    let (status, _, _) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/push",
+            json!({ "title": "Look", "prompt": "do it" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    super::suggestions::sweep_auto_start(&f.state).await;
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    let items = snapshot["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].get("auto_note").is_none(), "{items:?}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auto_start_waits_for_the_provider_switch_and_stays_out_of_cityhall() {
+    for (cityhall, switch_off) in [(false, true), (true, false)] {
+        let f = fixture_with(Vec::new(), cityhall);
+        f.seed_item("a", Some("acme/web"), "42");
+        let repo = f.repo.to_string_lossy().into_owned();
+        f.call(
+            Method::PUT,
+            "/api/suggestions/mappings",
+            json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo] }),
+        )
+        .await;
+        f.host.with_suggestions_db(|conn, profile| {
+            crate::plugin::suggestions::set_auto_start(
+                conn,
+                profile,
+                PROVIDER,
+                "assigned",
+                Some(3),
+            )
+            .unwrap();
+            if switch_off {
+                conn.execute("UPDATE suggestion_provider_prefs SET enabled = 0", [])
+                    .unwrap();
+            }
+        });
+        super::suggestions::sweep_auto_start(&f.state).await;
+        let attempted: i64 = f.host.with_suggestions_db(|conn, _| {
+            conn.query_row("SELECT COUNT(*) FROM suggestion_auto_started", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        });
+        assert_eq!(attempted, 0, "cityhall={cityhall} switch_off={switch_off}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auto_start_never_starts_a_yolo_preset() {
+    let f = fixture();
+    f.seed_item("a", Some("acme/web"), "42");
+    let repo = f.repo.to_string_lossy().into_owned();
+    f.call(
+        Method::PUT,
+        "/api/suggestions/mappings",
+        json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo] }),
+    )
+    .await;
+    f.host.with_suggestions_db(|conn, profile| {
+        let mut preset = crate::plugin::suggestions::default_preset(
+            &crate::session::config::profile_config::resolve_config_or_warn(profile),
+        );
+        preset.yolo = true;
+        crate::plugin::suggestions::set_preset(conn, profile, PROVIDER, "assigned", &preset)
+            .unwrap();
+    });
+    f.call(
+        Method::PUT,
+        "/api/suggestions/auto-start",
+        json!({ "provider_id": PROVIDER, "criterion": "assigned", "enabled": true }),
+    )
+    .await;
+    super::suggestions::sweep_auto_start(&f.state).await;
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    let note = items_by_id(&snapshot)["a"]["auto_note"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(note.contains("YOLO"), "{note}");
+    let attempted: i64 = f.host.with_suggestions_db(|conn, _| {
+        conn.query_row("SELECT COUNT(*) FROM suggestion_auto_started", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert_eq!(attempted, 0);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn auto_start_attempts_each_item_once_and_stops_at_the_cap() {
+    let f = fixture();
+    for id in ["a", "b", "c"] {
+        f.seed_item(id, Some("acme/web"), "42");
+    }
+    let repo = f.repo.to_string_lossy().into_owned();
+    f.call(
+        Method::PUT,
+        "/api/suggestions/mappings",
+        json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo] }),
+    )
+    .await;
+    // An agent that does not exist makes every create fail the same way.
+    f.host.with_suggestions_db(|conn, profile| {
+        let mut preset = crate::plugin::suggestions::default_preset(
+            &crate::session::config::profile_config::resolve_config_or_warn(profile),
+        );
+        preset.agent = "no-such-agent".into();
+        crate::plugin::suggestions::set_preset(conn, profile, PROVIDER, "assigned", &preset)
+            .unwrap();
+    });
+    f.call(
+        Method::PUT,
+        "/api/suggestions/auto-start",
+        json!({ "provider_id": PROVIDER, "criterion": "assigned", "enabled": true, "cap": 2 }),
+    )
+    .await;
+    let notes = |snapshot: &Value| -> Vec<String> {
+        let mut notes: Vec<String> = items_by_id(snapshot)
+            .values()
+            .map(|item| item["auto_note"].as_str().unwrap_or_default().to_string())
+            .collect();
+        notes.sort();
+        notes
+    };
+
+    super::suggestions::sweep_auto_start(&f.state).await;
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    let notes_now = notes(&snapshot);
+    let failed = notes_now
+        .iter()
+        .filter(|n| n.starts_with("Auto start failed: "))
+        .count();
+    let capped = notes_now
+        .iter()
+        .filter(|n| n.contains("limit of 2"))
+        .count();
+    assert_eq!((failed, capped), (2, 1), "{notes_now:?}");
+    assert!(notes_now
+        .iter()
+        .all(|n| n.is_empty() || n.ends_with("Start it by hand.") || n.contains("limit")));
+
+    // The next pass takes the one the cap held back, and never retries a failure.
+    super::suggestions::sweep_auto_start(&f.state).await;
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    let notes_now = notes(&snapshot);
+    let failed = notes_now
+        .iter()
+        .filter(|n| n.starts_with("Auto start failed: "))
+        .count();
+    assert_eq!(failed, 3, "{notes_now:?}");
+    let attempted: i64 = f.host.with_suggestions_db(|conn, _| {
+        conn.query_row("SELECT COUNT(*) FROM suggestion_auto_started", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert_eq!(attempted, 3);
 }

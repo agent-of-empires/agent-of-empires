@@ -76,6 +76,7 @@ describe("SessionErrorPanel", () => {
     fireEvent.click(restart);
     expect(restart.disabled).toBe(true);
     expect(restart.textContent).toBe("Restarting…");
+    expect(restart.querySelector(".animate-spin")).not.toBeNull();
     fireEvent.click(restart);
     expect(restartSession).toHaveBeenCalledTimes(1);
     expect(restartSession).toHaveBeenCalledWith("e1");

@@ -1,6 +1,6 @@
 import { useState } from "react";
+import { BUTTON_GHOST, BUTTON_PRIMARY, INPUT } from "../../lib/surfaces";
 import { SidebarModal } from "./SidebarModal";
-import { MODAL_CANCEL, MODAL_INPUT, MODAL_PRIMARY } from "./styles";
 import { isImeComposing } from "../../lib/ime";
 
 /** Renames the worktree directory and, when opted in, the git branch. */
@@ -64,7 +64,7 @@ export function WorkdirNameModal({
           }}
           placeholder="new-workdir-name"
           data-testid="workdir-modal-name"
-          className={MODAL_INPUT}
+          className={`${INPUT} font-mono`}
         />
         <label className="flex items-center gap-2 text-sm text-text-secondary cursor-pointer">
           <input
@@ -83,14 +83,14 @@ export function WorkdirNameModal({
         )}
       </div>
       <div className="px-4 py-3 border-t border-surface-700/40 flex justify-end gap-2">
-        <button onClick={onCancel} className={MODAL_CANCEL}>
+        <button onClick={onCancel} className={BUTTON_GHOST}>
           Cancel
         </button>
         <button
           onClick={() => void submit()}
           disabled={busy}
           data-testid="workdir-modal-save"
-          className={`${MODAL_PRIMARY} disabled:opacity-50`}
+          className={BUTTON_PRIMARY}
         >
           {busy ? "Saving…" : "Save"}
         </button>

@@ -1,7 +1,13 @@
 import { useId, useRef, type ReactNode, type Ref } from "react";
+import { MENU } from "../../lib/surfaces";
+import { INSET_CARD } from "../../lib/surfaces";
 import { Toggle } from "./steps/Toggle";
 
-const ROW = "flex items-center gap-3 min-h-[44px] md:min-h-[36px] px-3 border-b border-surface-700/30 last:border-b-0";
+// The card's radius, so a row's hover fill and outline follow its corners.
+const ROUNDED = "first:rounded-t-xl last:rounded-b-xl max-md:first:rounded-t-2xl max-md:last:rounded-b-2xl";
+const ROW_EDGE = `min-h-12 md:min-h-9 px-4 md:px-3 border-b border-surface-700/40 last:border-b-0 ${ROUNDED}`;
+const ROW = `flex items-center gap-3 ${ROW_EDGE}`;
+const LABEL = "w-24 shrink-0 text-[15px] md:text-sm text-text-secondary";
 
 function Chevron() {
   return (
@@ -20,16 +26,16 @@ function Chevron() {
 
 function Label({ children, info }: { children: ReactNode; info?: ReactNode }) {
   return (
-    <span className="w-24 shrink-0 inline-flex items-center gap-0.5 text-sm text-text-secondary">
+    <span className={`${LABEL} inline-flex items-center gap-0.5`}>
       {children}
       {info}
     </span>
   );
 }
 
-/** Bordered group holding one-line wizard rows. */
+/** A card of one-line wizard rows, inset darker than the dialog it sits in. */
 export function RowGroup({ children }: { children: ReactNode }) {
-  return <div className="bg-surface-900 border border-surface-700/60 rounded-lg">{children}</div>;
+  return <div className={INSET_CARD}>{children}</div>;
 }
 
 /** A row whose value is edited in a sub-panel, like a TUI Ctrl+P overlay. */
@@ -55,12 +61,12 @@ export function NavRow({
       type="button"
       onClick={onOpen}
       data-testid={testId}
-      className={`${ROW} w-full text-left cursor-pointer hover:bg-surface-850 transition-colors first:rounded-t-lg last:rounded-b-lg ${highlightClass(
+      className={`${ROW} w-full text-left cursor-pointer hover:bg-surface-800 transition-colors ${highlightClass(
         highlight,
       )}`}
     >
       <Label>{label}</Label>
-      <span className="flex-1 min-w-0 truncate text-sm font-mono text-text-primary">
+      <span className="flex-1 min-w-0 truncate text-[15px] md:text-sm font-mono text-text-primary">
         {value || <span className="text-text-dim">{placeholder}</span>}
       </span>
       <Chevron />
@@ -94,7 +100,7 @@ export function SwitchRow({
   /** Sits after the label, such as an info popover's icon. */
   info?: ReactNode;
 }) {
-  const summaryText = <span className="flex-1 min-w-0 truncate text-xs text-text-dim">{summary}</span>;
+  const summaryText = <span className="flex-1 min-w-0 truncate text-[13px] md:text-xs text-text-dim">{summary}</span>;
   return (
     <div className={`${ROW} ${highlightClass(highlight)}`} data-testid={testId}>
       <Label info={info}>{label}</Label>
@@ -161,14 +167,14 @@ export function SegmentedRow<T extends string>({
   };
   return (
     <div
-      className="flex flex-wrap items-center gap-x-2 gap-y-1 min-h-[44px] md:min-h-[36px] md:flex-nowrap px-3 py-1.5 md:py-0 border-b border-surface-700/30 last:border-b-0"
+      className={`flex flex-wrap items-center gap-x-2 gap-y-1 md:flex-nowrap py-2 md:py-0 ${ROW_EDGE}`}
       data-testid={testId}
     >
       <Label>{label}</Label>
       <span
         id={summaryId}
         title={typeof summary === "string" ? summary : undefined}
-        className="order-last basis-full text-xs text-text-dim md:order-none md:basis-auto md:flex-1 md:min-w-0 md:truncate"
+        className="order-last basis-full text-[13px] md:text-xs text-text-dim md:order-none md:basis-auto md:flex-1 md:min-w-0 md:truncate"
       >
         {summary}
       </span>
@@ -177,7 +183,7 @@ export function SegmentedRow<T extends string>({
         role="radiogroup"
         aria-label={label}
         aria-describedby={summaryId}
-        className="ml-auto flex shrink-0 rounded-md border border-surface-700 bg-surface-950 p-0.5"
+        className="ml-auto flex shrink-0 rounded-lg border border-surface-700 bg-surface-950 p-0.5"
         onKeyDown={(e) => {
           if (e.key === "ArrowRight" || e.key === "ArrowDown") {
             e.preventDefault();
@@ -204,7 +210,7 @@ export function SegmentedRow<T extends string>({
               tabIndex={selected ? 0 : -1}
               // Re-picking the selected option must not overwrite a choice the row is overriding.
               onClick={() => option.value !== value && onChange(option.value)}
-              className={`min-h-8 rounded px-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+              className={`min-h-10 md:min-h-7 rounded-md px-3 md:px-2 text-[13px] md:text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                 selected ? "bg-brand-600 text-text-on-brand" : "text-text-primary hover:bg-surface-800"
               }`}
             >
@@ -221,7 +227,7 @@ export function SegmentedRow<T extends string>({
 export function FieldRow({ label, htmlFor, children }: { label: string; htmlFor?: string; children: ReactNode }) {
   return (
     <div className={ROW}>
-      <label htmlFor={htmlFor} className="w-24 shrink-0 text-sm text-text-secondary">
+      <label htmlFor={htmlFor} className={LABEL}>
         {label}
       </label>
       <div className="flex-1 min-w-0">{children}</div>
@@ -240,7 +246,7 @@ export function PanelHeader({ title, onBack }: { title: string; onBack: () => vo
       <button
         type="button"
         onClick={onBack}
-        className="flex items-center gap-1 text-sm text-brand-500 hover:text-brand-400 cursor-pointer -ml-1 px-1 py-1"
+        className="flex items-center gap-1 min-h-11 md:min-h-8 -ml-1 px-1 text-[15px] md:text-sm text-brand-500 hover:text-brand-400 cursor-pointer"
       >
         <svg className="w-3 h-3 rotate-180" viewBox="0 0 12 12" aria-hidden="true">
           <path
@@ -254,7 +260,15 @@ export function PanelHeader({ title, onBack }: { title: string; onBack: () => vo
         </svg>
         Back
       </button>
-      <h2 className="text-sm font-semibold text-text-primary">{title}</h2>
+      <h2 className="text-[15px] md:text-sm font-semibold text-text-primary">{title}</h2>
     </div>
   );
 }
+
+/** A suggestion list dropping under a field; the caller positions it. */
+export const LISTBOX = `${MENU} overflow-y-auto`;
+
+/** One suggestion; LISTBOX_OPTION_ACTIVE is the keyboard or hover highlight. */
+export const LISTBOX_OPTION =
+  "flex items-center justify-between gap-2 px-3 py-1.5 max-md:py-3 text-[13px] max-md:text-[15px] font-mono cursor-pointer text-text-secondary hover:bg-surface-700/60 hover:text-text-primary";
+export const LISTBOX_OPTION_ACTIVE = `${LISTBOX_OPTION} bg-surface-700/60 text-text-primary`;

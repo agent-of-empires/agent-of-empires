@@ -666,6 +666,11 @@ fn enter_on_a_suggestion_with_no_linked_project_opens_the_prefilled_dialog() {
     assert_eq!(data.initial_prompt.as_deref(), Some("Prepared prompt"));
     assert!(data.worktree_enabled, "the preset's worktree row");
     assert!(data.yolo_mode, "the preset's yolo row");
+    assert_eq!(
+        data.extra_repo_paths,
+        ["/tmp/extra"],
+        "the repo's other mapped Projects"
+    );
 }
 
 #[test]
@@ -1632,4 +1637,139 @@ fn a_prepare_answer_is_applied_when_a_prompt_error_changes_in_the_same_poll() {
         assert!(Instant::now() < deadline, "the prepare answer was dropped");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+#[serial]
+fn marked_suggestions_start_in_one_daemon_call_and_say_how_many_started() {
+    let (mut env, requests) = expanded_env(3);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char(' ')), None);
+        view.handle_key(key(KeyCode::Char('j')), None);
+        view.handle_key(key(KeyCode::Char(' ')), None);
+        assert_eq!(
+            view.suggestions_view.as_ref().unwrap().notice.as_deref(),
+            Some("2 marked. Enter starts them.")
+        );
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    poll_until(&mut env, |env| {
+        pane_notice(env).is_some_and(|text| text == "Started 2.")
+    });
+    let starts: Vec<String> = requests
+        .try_iter()
+        .filter(|r| r.starts_with("start"))
+        .collect();
+    assert_eq!(
+        starts,
+        ["start-batch gh/i0 gh/i1"],
+        "one daemon call, and the unmarked one stays a suggestion"
+    );
+}
+
+#[test]
+#[serial]
+fn a_failed_start_in_a_batch_does_not_stop_the_rest() {
+    let (mut env, requests) = expanded_env_answering(3, StartAnswer::Failed("no sandbox".into()));
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char(' ')), None);
+        view.handle_key(key(KeyCode::Char('j')), None);
+        view.handle_key(key(KeyCode::Char(' ')), None);
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    poll_until(&mut env, |env| {
+        pane_notice(env).is_some_and(|text| text == "2 could not start: no sandbox.")
+    });
+    let starts: Vec<String> = requests
+        .try_iter()
+        .filter(|r| r.starts_with("start"))
+        .collect();
+    assert_eq!(starts, ["start-batch gh/i0 gh/i1"]);
+}
+
+#[test]
+#[serial]
+fn a_batch_leaves_a_hooks_review_for_the_row_instead_of_opening_dialogs() {
+    let needs = StartAnswer::NeedsTrust {
+        commands: vec!["on create: npm ci".into()],
+        mcp_summaries: vec![],
+        fingerprint: serde_json::json!({ "hooks": "x" }),
+    };
+    let (mut env, _requests) = expanded_env_answering(2, needs);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char(' ')), None);
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    poll_until(&mut env, |env| {
+        pane_notice(env).is_some_and(|text| text.contains("need a hooks review"))
+    });
+    assert!(
+        env.view.confirm_dialog.is_none(),
+        "no review dialog from a batch"
+    );
+}
+
+fn auto_start_snapshot(auto_start: serde_json::Value) -> serde_json::Value {
+    let mut snap = snapshot(1, &[]);
+    snap["providers"][0]["sources"] =
+        serde_json::json!([{ "criterion": "assigned", "auto_start": auto_start }]);
+    snap["items"][0]["criterion"] = "assigned".into();
+    snap["items"][0]["start"] =
+        serde_json::json!({ "agent": "claude", "view": "terminal", "yolo": true });
+    snap
+}
+
+#[test]
+#[serial]
+fn auto_start_asks_first_says_who_wrote_the_text_and_mentions_yolo() {
+    let (mut env, requests) = expanded_env(1);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(auto_start_snapshot(serde_json::Value::Null));
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('a')), None);
+    });
+    let text = render_home_to_string(&mut env.view, 140, 50);
+    assert!(text.contains("Turn on auto start"), "{text}");
+    // The dialog wraps its text, so each phrase stays within one line.
+    assert!(text.contains("Auto start launches an agent"), "{text}");
+    assert!(text.contains("written"), "{text}");
+    assert!(text.contains("by others (issue and PR content)"), "{text}");
+    assert!(text.contains("no human"), "{text}");
+    assert!(text.contains("YOLO mode"), "{text}");
+    assert!(
+        !requests.try_iter().any(|r| r.starts_with("auto-start")),
+        "nothing is sent before the answer"
+    );
+    env.view.handle_key(key(KeyCode::Char('y')), None);
+    assert_eq!(next_request(&requests), "auto-start gh/assigned true");
+}
+
+#[test]
+#[serial]
+fn the_agent_kind_has_no_auto_start_key() {
+    let (mut env, requests) = expanded_env(1);
+    let mut snap = auto_start_snapshot(serde_json::Value::Null);
+    snap["providers"][0]["id"] = crate::plugin::suggestions::AGENT_PROVIDER_ID.into();
+    snap["items"][0]["provider_id"] = crate::plugin::suggestions::AGENT_PROVIDER_ID.into();
+    env.view.suggestions_feed.set_snapshot_for_test(snap);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('a')), None);
+    });
+    assert!(env.view.confirm_dialog.is_none());
+    assert!(requests.try_iter().next().is_none());
+}
+
+#[test]
+#[serial]
+fn auto_start_turns_off_without_asking() {
+    let (mut env, requests) = expanded_env(1);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(auto_start_snapshot(serde_json::json!({ "cap": 3 })));
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('a')), None);
+    });
+    assert!(env.view.confirm_dialog.is_none());
+    assert_eq!(next_request(&requests), "auto-start gh/assigned false");
 }

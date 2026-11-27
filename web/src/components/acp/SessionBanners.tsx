@@ -5,7 +5,9 @@ import type { AcpState } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
 import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ContainerGoneBanner, type NewSessionLike } from "./ContainerGoneBanner";
-import { SECONDARY_BUTTON } from "./RecoveryActionRow";
+import { BUTTON_SECONDARY_SM, BUTTON_WARNING_SM } from "../../lib/surfaces";
+import { Spinner } from "../Dialog";
+import { WarningStrip } from "../panelParts";
 import { StartupErrorBanner } from "./StartupErrorBanner";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 
@@ -257,8 +259,10 @@ export function StartupWaitLine({
           onClick={() => void restart()}
           disabled={restartState === "retrying"}
           aria-describedby={cost ? costId : undefined}
-          className={`${SECONDARY_BUTTON} shrink-0`}
+          aria-busy={restartState === "retrying"}
+          className={`${BUTTON_SECONDARY_SM} shrink-0`}
         >
+          {restartState === "retrying" && <Spinner />}
           {restartState === "retrying" ? "Restarting…" : `Restart ${agent}`}
         </button>
       )}
@@ -323,19 +327,9 @@ function ChipBanner({
 
 function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
   return (
-    <div className="flex items-start justify-between gap-3 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-status-warning">
-      <div className="flex-1 min-w-0">
-        <div className="text-xs font-medium">Action did not complete</div>
-        <div className="mt-0.5 text-xs text-status-warning/90 break-words">{message}</div>
-      </div>
-      <button
-        type="button"
-        onClick={onDismiss}
-        className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-status-warning hover:bg-status-warning/30"
-      >
-        Dismiss
-      </button>
-    </div>
+    <WarningStrip title="Action did not complete." onDismiss={onDismiss}>
+      {message}
+    </WarningStrip>
   );
 }
 
@@ -409,8 +403,7 @@ export function ScheduledWakeupBanner({ wakeAt, reason }: { wakeAt: string; reas
   );
 }
 
-const WARNING_BUTTON =
-  "shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-3 py-1 text-xs font-medium text-status-warning hover:bg-status-warning/30 disabled:cursor-not-allowed disabled:opacity-60";
+const WARNING_BUTTON = `${BUTTON_WARNING_SM} shrink-0`;
 
 function StoppedPanel({
   testId,
@@ -469,7 +462,7 @@ function WorkerStoppedBanner({
             </div>
           )}
           {retryState === "ok" && (
-            <div className="mt-2 text-xs text-emerald-200/90">
+            <div className="mt-2 text-xs text-status-running">
               Spawn requested. The composer will re-enable when the agent is back online.
             </div>
           )}

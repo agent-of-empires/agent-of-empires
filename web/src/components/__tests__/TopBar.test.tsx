@@ -7,6 +7,8 @@ import { MemoryRouter } from "react-router-dom";
 import { useSessions } from "../../hooks/useSessions";
 import { setServerDown } from "../../lib/connectionState";
 import { TopBar } from "../TopBar";
+import { DisconnectBanner } from "../DisconnectBanner";
+import { useConnectionBanner } from "../../hooks/useConnectionBanner";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import type { AttentionBadgeColors } from "../../lib/attentionBadgeColors";
 
@@ -27,10 +29,8 @@ afterEach(() => {
 
 type TopBarOverrides = {
   isDevBuild?: boolean;
-  isOffline?: boolean;
   activeWorkspace?: Workspace;
   activeSession?: SessionResponse | null;
-  onOpenTips?: () => void;
   onToggleSidebar?: () => void;
   unreadCount?: number;
   waitingCount?: number;
@@ -43,22 +43,15 @@ function topBarProps(overrides: TopBarOverrides = {}) {
     activeSession: overrides.activeSession ?? null,
     onToggleSidebar: overrides.onToggleSidebar ?? vi.fn(),
     onOpenPalette: vi.fn(),
-    onToggleDiff: vi.fn(),
     paneIds: ["diff", "terminal"],
     paneDescriptor: (id: string) => ({ title: id, icon: (() => null) as never }),
     isPaneOpen: () => true,
     onTogglePane: vi.fn(),
-    onOpenHelp: vi.fn(),
-    onOpenAbout: vi.fn(),
-    onStartTutorial: vi.fn(),
     unreadCount: overrides.unreadCount ?? 0,
     waitingCount: overrides.waitingCount ?? 0,
     attentionBadgeColors: overrides.attentionBadgeColors ?? DEFAULT_ATTENTION_BADGE_COLORS,
-    onLogout: vi.fn(),
-    loginRequired: false,
-    isOffline: overrides.isOffline ?? false,
     isDevBuild: overrides.isDevBuild ?? false,
-    onOpenTips: overrides.onOpenTips ?? vi.fn(),
+    appMenu: [],
     onGoDashboard: vi.fn(),
     sidebarColumnVisible: false,
     rightColumnVisible: false,
@@ -70,15 +63,14 @@ function renderTopBar(overrides: TopBarOverrides = {}) {
 }
 
 describe("TopBar", () => {
-  it("renders the DEV and offline badges independently", () => {
+  it("renders the DEV badge only on a debug build", () => {
     const off = renderTopBar({ isDevBuild: false });
     expect(off.queryByLabelText("Debug build")).toBeNull();
     expect(off.queryByText("DEV")).toBeNull();
     off.unmount();
-    const { getByText, getByLabelText } = renderTopBar({ isDevBuild: true, isOffline: true });
+    const { getByText, getByLabelText } = renderTopBar({ isDevBuild: true });
     expect(getByText("DEV")).toBeTruthy();
     expect(getByLabelText("Debug build")).toBeTruthy();
-    expect(getByText("offline")).toBeTruthy();
   });
 
   it("bounds the header-start group: hidden below md, capped above, and hidden on the compact rail", () => {
@@ -98,7 +90,7 @@ describe("TopBar", () => {
     }
   });
 
-  it("does not render the workspace/repo breadcrumb even with an active workspace and session", () => {
+  it("heads an open session with its project and title, as Claude Code desktop does", () => {
     const workspace = {
       id: "ws-1",
       branch: null,
@@ -109,14 +101,13 @@ describe("TopBar", () => {
       status: "idle",
       sessions: [],
     } as unknown as Workspace;
-    const { queryByText } = renderTopBar({
+    const { getByTestId, rerender } = renderTopBar({
       activeWorkspace: workspace,
-      activeSession: {} as SessionResponse,
+      activeSession: { title: "Fix the cart", project_path: "/home/user/breadcrumb-repo/" } as SessionResponse,
     });
-    // The old breadcrumb rendered the repo name (last path segment) and the
-    // workspace display name; both must be gone now that #1456 removed it.
-    expect(queryByText("breadcrumb-repo")).toBeNull();
-    expect(queryByText("breadcrumb-feature")).toBeNull();
+    expect(getByTestId("session-breadcrumb").textContent).toBe("breadcrumb-repo/Fix the cart");
+    rerender(<TopBar {...topBarProps({ activeWorkspace: undefined, activeSession: null })} />);
+    expect(() => getByTestId("session-breadcrumb")).toThrow();
   });
 
   it("replaces the sidebar toggle and dashboard link with an All Sessions button in focus mode", () => {
@@ -135,14 +126,6 @@ describe("TopBar", () => {
     fireEvent.click(exit);
     expect(onExitFocusMode).toHaveBeenCalledTimes(1);
     expect(onToggleSidebar).not.toHaveBeenCalled();
-  });
-
-  it("exposes a Tips entry in the overflow menu that fires onOpenTips", () => {
-    const onOpenTips = vi.fn();
-    const { getByRole } = renderTopBar({ onOpenTips });
-    fireEvent.click(getByRole("button", { name: "More options" }));
-    fireEvent.click(getByRole("menuitem", { name: "Tips" }));
-    expect(onOpenTips).toHaveBeenCalledTimes(1);
   });
 
   it("shows counts on the sidebar toggle's badges and accessible name, and nothing extra at zero", () => {
@@ -193,7 +176,7 @@ describe("TopBar", () => {
 });
 
 describe("polling connectivity consumer", () => {
-  it("shows offline on an unanswered first poll, then clears it when the replacement succeeds", async () => {
+  it("says the Daemon is unreachable on an unanswered first poll, then clears it when the replacement succeeds", async () => {
     vi.useFakeTimers();
     const signals: AbortSignal[] = [];
     vi.stubGlobal(
@@ -224,24 +207,27 @@ describe("polling connectivity consumer", () => {
             }),
         ),
     );
+    // The app's one statement of it: the Daemon banner, which the header no longer repeats.
     function Header() {
-      const sessions = useSessions();
-      return <TopBar {...topBarProps({ isOffline: sessions.error })} />;
+      useSessions();
+      const connection = useConnectionBanner();
+      return connection === "down" ? <DisconnectBanner state="down" /> : null;
     }
     const view = render(
       <MemoryRouter>
         <Header />
       </MemoryRouter>,
     );
-    expect(view.queryByText("offline")).toBeNull();
+    const down = () => view.queryByText("Daemon unreachable. Reconnecting…");
+    expect(down()).toBeNull();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(15000);
     });
     expect(signals[0]!.aborted).toBe(true);
-    expect(view.getByText("offline")).toBeTruthy();
+    expect(down()).toBeTruthy();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
-    expect(view.queryByText("offline")).toBeNull();
+    expect(down()).toBeNull();
   });
 });

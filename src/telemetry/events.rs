@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 /// Bump on any wire shape change, including additive optional fields. v14 excludes trashed
-/// sessions from every census, so v13 and v14 series must not be averaged together.
-pub const SCHEMA_VERSION: u32 = 15;
+/// sessions from every census, so v13 and v14 series must not be averaged together. v16 adds
+/// the suggested-sessions fields.
+pub const SCHEMA_VERSION: u32 = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -117,6 +118,11 @@ pub struct UsageSnapshot {
 
     pub usage_seen: BTreeMap<String, u32>,
 
+    /// Sessions started from suggestions since the last confirmed snapshot, by `provider/kind`
+    /// for builtin and featured plugins and `other` for the rest.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub suggestion_kind_uses: BTreeMap<String, u32>,
+
     /// Was-seen per client form factor, not a count. Empty on surfaces with no web client.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub web_clients_seen: BTreeMap<String, bool>,
@@ -153,6 +159,7 @@ impl UsageSnapshot {
         self.feature_uses
             .values()
             .chain(self.usage_seen.values())
+            .chain(self.suggestion_kind_uses.values())
             .any(|&n| n > 0)
             || self
                 .web_clients_seen
@@ -170,6 +177,7 @@ impl UsageSnapshot {
     pub fn clear_deltas(&mut self) {
         self.feature_uses.values_mut().for_each(|n| *n = 0);
         self.usage_seen.values_mut().for_each(|n| *n = 0);
+        self.suggestion_kind_uses.clear();
         self.web_clients_seen
             .values_mut()
             .for_each(|seen| *seen = false);

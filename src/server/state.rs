@@ -272,7 +272,7 @@ pub struct AppState {
     /// stays the plain owner for display.
     pub remote_owner_cache: RwLock<std::collections::HashMap<String, Option<(String, String)>>>,
     /// Short-TTL cache of `compute_changed_files` keyed by `(repo_path,
-    /// base_branch)`, shared by the file-list and per-file diff endpoints so a
+    /// diff base)`, shared by the file-list and per-file diff endpoints so a
     /// burst of file switches reuses one branch scan. See `ChangedFilesEntry`.
     pub(super) changed_files_cache:
         std::sync::RwLock<std::collections::HashMap<(String, String), ChangedFilesEntry>>,
@@ -434,11 +434,15 @@ impl AppState {
     pub fn changed_files_cached(
         &self,
         repo_path: &std::path::Path,
-        base_branch: &str,
+        base: crate::git::diff::DiffBase<'_>,
     ) -> crate::git::error::Result<Vec<crate::git::diff::DiffFile>> {
+        use crate::git::diff::DiffBase;
         let key = (
             repo_path.to_string_lossy().into_owned(),
-            base_branch.to_string(),
+            match base {
+                DiffBase::Branch(branch) => format!("branch:{branch}"),
+                DiffBase::Head => "head".to_string(),
+            },
         );
         if let Ok(cache) = self.changed_files_cache.read() {
             if let Some(entry) = cache.get(&key) {
@@ -447,7 +451,7 @@ impl AppState {
                 }
             }
         }
-        let files = crate::git::diff::compute_changed_files(repo_path, base_branch)?;
+        let files = crate::git::diff::compute_changed_files_against(repo_path, base)?;
         if let Ok(mut cache) = self.changed_files_cache.write() {
             // Drop expired entries while we hold the write lock so the map can't
             // grow without bound across stale (repo, base) combinations.

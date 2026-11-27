@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { RotateCcw } from "lucide-react";
 import { fetchBranches, setSessionDiffBase, type BranchInfo } from "../../lib/api";
 import { isImeComposing } from "../../lib/ime";
+import { INPUT, MENU, MENU_ITEM } from "../../lib/surfaces";
+import { MenuItem } from "../ContextMenu";
+
+const OPTION = MENU_ITEM.replace("text-[13px]", "font-mono text-[12px]");
+const OPTION_HIGHLIGHTED = `${OPTION.replace("text-text-secondary", "text-text-primary")} bg-surface-700/60`;
 
 interface BasePickerProps {
   sessionId: string;
@@ -74,48 +80,45 @@ export function BasePicker({ sessionId, repoPath, currentBase, hasOverride, repo
         vs {currentBase}
       </button>
       {open && (
-        <div className="absolute left-0 top-full z-20 mt-1 w-64 bg-surface-900 border border-surface-700/60 rounded-lg shadow-lg p-2">
-          <input
-            type="text"
-            autoFocus
-            value={query}
-            placeholder="Search branches..."
-            onChange={(e) => {
-              setQuery(e.target.value);
-              setHighlightIdx(0);
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "ArrowDown") {
-                e.preventDefault();
-                setHighlightIdx((i) => Math.min(i + 1, suggestions.length - 1));
-              } else if (e.key === "ArrowUp") {
-                e.preventDefault();
-                setHighlightIdx((i) => Math.max(i - 1, 0));
-              } else if (e.key === "Enter" && !isImeComposing(e)) {
-                e.preventDefault();
-                const pick = suggestions[highlightIdx];
-                if (pick) void apply(pick.name);
-                else if (query.trim()) void apply(query.trim());
-              } else if (e.key === "Escape") {
-                setOpen(false);
-              }
-            }}
-            disabled={busy}
-            className="w-full bg-surface-950 border border-surface-700/60 rounded px-2 py-1.5 text-xs font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
-          />
-          {hasOverride && (
-            <button
-              type="button"
-              onClick={() => void apply(null)}
+        <div className={`absolute left-0 top-full z-20 mt-1 w-72 ${MENU}`}>
+          <div className="px-2 pt-1 pb-1.5">
+            <input
+              type="text"
+              autoFocus
+              value={query}
+              placeholder="Search branches..."
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setHighlightIdx(0);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setHighlightIdx((i) => Math.min(i + 1, suggestions.length - 1));
+                } else if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setHighlightIdx((i) => Math.max(i - 1, 0));
+                } else if (e.key === "Enter" && !isImeComposing(e)) {
+                  e.preventDefault();
+                  const pick = suggestions[highlightIdx];
+                  if (pick) void apply(pick.name);
+                  else if (query.trim()) void apply(query.trim());
+                } else if (e.key === "Escape") {
+                  setOpen(false);
+                }
+              }}
               disabled={busy}
-              className="mt-1.5 w-full text-left px-2 py-1 rounded text-[11px] text-text-dim hover:bg-surface-800 hover:text-text-secondary cursor-pointer"
-            >
-              ↺ Reset to auto-detected
-            </button>
+              className={`${INPUT} font-mono`}
+            />
+          </div>
+          {hasOverride && (
+            <MenuItem onClick={() => void apply(null)} disabled={busy} icon={<RotateCcw />}>
+              Reset to auto-detected
+            </MenuItem>
           )}
-          <ul role="listbox" aria-label="Branch suggestions" className="mt-1 max-h-56 overflow-y-auto">
+          <ul role="listbox" aria-label="Branch suggestions" className="max-h-56 overflow-y-auto">
             {suggestions.length === 0 && (
-              <li className="px-2 py-1 text-[11px] text-text-dim italic">
+              <li className="px-3 py-1.5 text-[12px] text-text-dim">
                 {branches === null ? "Loading branches..." : "No matches."}
               </li>
             )}
@@ -129,12 +132,10 @@ export function BasePicker({ sessionId, repoPath, currentBase, hasOverride, repo
                   e.preventDefault();
                   void apply(b.name);
                 }}
-                className={`flex items-center justify-between gap-2 px-2 py-1 text-xs font-mono cursor-pointer rounded ${
-                  i === highlightIdx ? "bg-surface-800 text-text-primary" : "text-text-secondary"
-                }`}
+                className={i === highlightIdx ? OPTION_HIGHLIGHTED : OPTION}
               >
-                <span className="truncate">{b.name}</span>
-                <span className="text-[10px] uppercase tracking-wider text-text-dim shrink-0">
+                <span className="min-w-0 truncate">{b.name}</span>
+                <span className="ml-auto shrink-0 text-[11px] text-text-dim">
                   {b.is_current ? "current" : b.remote_only ? "remote" : "local"}
                 </span>
               </li>
