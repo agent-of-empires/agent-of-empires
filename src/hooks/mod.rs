@@ -63,7 +63,7 @@ pub(crate) use targets::{
     has_aoe_marker, is_other_builtin_hook_path, iter_hook_targets, iter_hook_targets_in,
     HookTarget, HookTargetKind,
 };
-pub(crate) use trust::write_in_place;
+pub(crate) use trust::open_regular_for_write;
 pub use trust::{
     declared_sandbox_dir, declared_trust_applies_in_sandbox, declared_trust_path,
     disable_gemini_folder_trust, is_other_builtin_trust_file, trust_claude_project,

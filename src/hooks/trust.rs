@@ -17,7 +17,7 @@ use super::resolve_config_dir_override;
 /// Opens `path` for an in-place write when it is a regular file with one link, else
 /// `None`. The open never blocks (a planted FIFO with no reader fails instead of
 /// hanging the launch) and never follows a link.
-fn open_regular_for_write(path: &Path) -> Result<Option<std::fs::File>> {
+pub(crate) fn open_regular_for_write(path: &Path) -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let opened = std::fs::OpenOptions::new()
         .write(true)
@@ -42,7 +42,7 @@ fn open_regular_for_write(path: &Path) -> Result<Option<std::fs::File>> {
 ///
 /// The payload is one `write_all` after `set_len(0)`; a crash between the two leaves
 /// an empty file, which the declared-trust reader treats as absent.
-pub(crate) fn write_in_place(path: &Path, content: &[u8]) -> Result<()> {
+fn write_in_place(path: &Path, content: &[u8]) -> Result<()> {
     use std::io::Write;
     for _ in 0..2 {
         if let Some(mut file) = open_regular_for_write(path)? {

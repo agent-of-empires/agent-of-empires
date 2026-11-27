@@ -3130,12 +3130,23 @@ pub(crate) fn discard_staged_declared_trust(
     }
 }
 
-/// Blanks a staged file to `{}` through the same inode, never writing through a link.
+/// Blanks a staged file to `{}` through the same inode. A link, FIFO or hardlinked file
+/// is refused, not replaced: a reused container may still mount the old inode.
 fn blank_staged_file(file: &Path) -> Result<()> {
     match std::fs::symlink_metadata(file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        _ => crate::hooks::write_in_place(file, b"{}")
-            .with_context(|| format!("blanking {}", file.display())),
+        _ => {
+            use std::io::Write;
+            let mut open = crate::hooks::open_regular_for_write(file)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "staged trust file {} is not a lone regular file; remove the session's container and relaunch",
+                    file.display()
+                )
+            })?;
+            open.set_len(0)?;
+            open.write_all(b"{}")
+                .with_context(|| format!("blanking {}", file.display()))
+        }
     }
 }
 
@@ -7993,11 +8004,12 @@ sandbox = "SANDBOX"
     }
 
     // A staged trust file the container replaced with a FIFO must neither hang the
-    // revocation nor stay a FIFO.
+    // revocation nor be replaced, since a reused container may still mount it.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn revoking_staged_trust_replaces_a_planted_fifo() {
+    fn revoking_staged_trust_refuses_a_planted_fifo() {
+        use std::os::unix::fs::FileTypeExt;
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let temp_home = TempDir::new().unwrap();
@@ -8031,16 +8043,17 @@ sandbox = "SANDBOX"
         result
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("revocation hung on the FIFO")
-            .unwrap();
-        assert!(fs::symlink_metadata(&file).unwrap().is_file());
-        assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
+            .expect_err("a FIFO cannot be blanked in place");
+        assert!(fs::symlink_metadata(&file).unwrap().file_type().is_fifo());
     }
 
-    // A hardlink planted at the staged path must not carry the blank to its target.
+    // A hardlink planted at the staged path must neither carry the blank to its target
+    // nor be replaced, since a reused container may still mount the staged inode.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn revoking_staged_trust_leaves_a_hardlink_target_alone() {
+        use std::os::unix::fs::MetadataExt;
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let temp_home = TempDir::new().unwrap();
@@ -8056,6 +8069,7 @@ sandbox = "SANDBOX"
         let other = temp_home.path().join("other");
         fs::write(&other, "precious").unwrap();
         fs::hard_link(&other, &file).unwrap();
+        let mounted = fs::metadata(&file).unwrap().ino();
 
         ensure_folder_trust_config_for_active_agent(
             "example-helper",
@@ -8065,10 +8079,10 @@ sandbox = "SANDBOX"
             "/workspace/project",
             false,
         )
-        .unwrap();
+        .expect_err("a hardlinked file cannot be blanked in place");
 
         assert_eq!(fs::read_to_string(&other).unwrap(), "precious");
-        assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
+        assert_eq!(fs::metadata(&file).unwrap().ino(), mounted);
     }
 
     // Dropping a plugin's trust declaration must revoke the record it staged, in
