@@ -692,9 +692,11 @@ impl SettingsView {
         }
     }
 
-    /// Pull the offset back into range after the selected field shrinks.
+    /// Bring the selected field back into view after it shrinks, keeping the
+    /// offset in range.
     pub(super) fn clamp_fields_scroll(&mut self) {
         self.fields_scroll_offset = self.fields_scroll_offset.min(self.max_fields_scroll());
+        self.ensure_field_visible(self.fields_viewport_height);
     }
 
     /// Total height of all field rows plus inter-row spacing, in the same

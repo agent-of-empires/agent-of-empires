@@ -1893,9 +1893,26 @@ mod status_message_tests {
         press(&mut view, KeyCode::Esc);
         assert!(view.list_edit_state.is_none());
         let height = view.field_height(&view.fields[0], 0);
+        assert_eq!(
+            view.fields_scroll_offset, 0,
+            "a sole field returns to the top"
+        );
+
+        // With a long field below the list keeping the offset valid, Esc still
+        // brings the collapsed list back into view.
+        view.fields.push(bool_field("Below", &"word ".repeat(60)));
+        press(&mut view, KeyCode::Enter);
+        for _ in 0..8 {
+            press(&mut view, KeyCode::Char('j'));
+        }
         assert!(
-            view.fields_scroll_offset + view.fields_viewport_height >= height,
-            "the collapsed field stays on screen"
+            view.fields_scroll_offset > height,
+            "the cursor scrolled past"
+        );
+        press(&mut view, KeyCode::Esc);
+        assert_eq!(
+            view.fields_scroll_offset, 0,
+            "the collapsed list is back in view at its label"
         );
     }
 
