@@ -272,9 +272,8 @@ fn pull_blocked(state: &AppState, configured: &Configured) -> Option<&'static st
 }
 
 fn pull_disabled() -> Response {
-    api_error(
-        StatusCode::FORBIDDEN,
-        "pull_disabled",
+    api_error_with_code_header(
+        ApiErrorCode::PullDisabled,
         "Pulling sandbox images from the web is off. Enable sandbox.allow_image_pull (Settings, local only).",
     )
 }
@@ -1309,7 +1308,15 @@ mod tests {
         );
 
         crate::session::update_config(|c| c.sandbox.allow_image_pull = false).unwrap();
-        let (code, body) = json(cancel(state.clone()).await).await;
+        let resp = cancel(state.clone()).await;
+        assert_eq!(
+            resp.headers()
+                .get(crate::daemon::ERROR_CODE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("pull_disabled"),
+            "a pull_disabled refusal didn't set the code header"
+        );
+        let (code, body) = json(resp).await;
         assert_eq!(
             (code, body["error"].as_str()),
             (StatusCode::FORBIDDEN, Some("pull_disabled"))
@@ -1424,7 +1431,15 @@ mod tests {
                 axum::body::Bytes::new(),
             )
         };
-        let (code, body) = json(pull(state.clone()).await).await;
+        let resp = pull(state.clone()).await;
+        assert_eq!(
+            resp.headers()
+                .get(crate::daemon::ERROR_CODE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("pull_disabled"),
+            "a pull_disabled refusal didn't set the code header"
+        );
+        let (code, body) = json(resp).await;
         assert_eq!(
             (code, body["error"].as_str()),
             (StatusCode::FORBIDDEN, Some("pull_disabled"))

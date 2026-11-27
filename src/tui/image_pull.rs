@@ -27,9 +27,10 @@ pub(crate) enum PullRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PullReport {
     State(PullState),
-    /// The Daemon won't pull; `command` is what to run instead.
+    /// The Daemon won't pull. `command` is what to run instead, from the last poll of the
+    /// image; a refusal itself doesn't carry it.
     Gated {
-        command: String,
+        command: Option<String>,
     },
     /// The Daemon no longer has this image configured.
     UnknownImage,
@@ -47,6 +48,8 @@ pub(crate) struct PullAnswer {
     pub(crate) image: Option<String>,
     /// The running pull's id, for a cancel to name.
     pub(crate) flight: Option<u64>,
+    /// Only a poll carries it: what to run instead of a Daemon pull of `image`.
+    pub(crate) pull_command: Option<String>,
 }
 
 impl From<PullReport> for PullAnswer {
@@ -56,6 +59,7 @@ impl From<PullReport> for PullAnswer {
             offer: None,
             image: None,
             flight: None,
+            pull_command: None,
         }
     }
 }
@@ -142,7 +146,8 @@ async fn daemon(
             .await
             .map(|status| {
                 let offer = ImageOffer::from_status(&status);
-                (Some((offer, status.image)), status.pull, status.flight)
+                let polled = (offer, status.image, status.pull_command);
+                (Some(polled), status.pull, status.flight)
             }),
         PullRequest::Start => client
             .sandbox_image_pull(image)
@@ -155,36 +160,35 @@ async fn daemon(
     };
     match answer {
         Ok((polled, pull, flight)) => {
-            let (offer, image) = polled.unzip();
+            let (offer, image, pull_command) = match polled {
+                Some((offer, image, command)) => (Some(offer), Some(image), Some(command)),
+                None => (None, None, None),
+            };
             PullAnswer {
                 report: PullReport::State(pull),
                 offer,
                 image,
                 flight,
+                pull_command,
             }
         }
         Err(error) if is_unknown_image(&error) => PullReport::UnknownImage.into(),
         Err(error) if is_code(&error, crate::daemon::ApiErrorCode::PullReplaced) => {
             PullReport::Replaced.into()
         }
-        // A 403 is a pull refusal only when the Daemon's own status says it blocks pulls; one from
-        // anything else in the way reads as no answer.
-        Err(error) if is_refusal(&error) => match client.sandbox_image_status(false, image).await {
-            Ok(status) if status.pull_blocked.is_some() => PullReport::Gated {
-                command: status.pull_command,
-            }
-            .into(),
-            _ => PullReport::Unavailable.into(),
-        },
+        Err(error) if is_refusal(&error) => PullReport::Gated { command: None }.into(),
         Err(_) => PullReport::Unavailable.into(),
     }
 }
 
 /// The Daemon refuses a pull or cancel when it is read-only, a CityHall client, or has
-/// dashboard pulls turned off.
+/// pulls turned off; its code says which. A 403 without one of those codes came from
+/// something else in the way, so it reads as no answer.
 fn is_refusal(error: &HttpError) -> bool {
+    use crate::daemon::ApiErrorCode;
     matches!(error, HttpError::ReadOnly)
-        || matches!(error, HttpError::Server { status, .. } if *status == reqwest::StatusCode::FORBIDDEN)
+        || is_code(error, ApiErrorCode::CityhallMode)
+        || is_code(error, ApiErrorCode::PullDisabled)
 }
 
 fn is_unknown_image(error: &HttpError) -> bool {
@@ -585,7 +589,7 @@ mod tests {
         let cancelled = || PullReport::State(PullState::Cancelled);
         let idle = || PullReport::State(PullState::Idle);
         let gated = || PullReport::Gated {
-            command: "docker pull img".into(),
+            command: Some("docker pull img".into()),
         };
         let shown = |line: PullLine| Some(line);
         // (case, started here, reports in order, line after, applied by the last report)
@@ -651,7 +655,7 @@ mod tests {
                 true,
                 vec![(Start, gated())],
                 shown(PullLine::Gated {
-                    command: "docker pull img".into(),
+                    command: Some("docker pull img".into()),
                 }),
                 Applied::Changed,
             ),
@@ -880,7 +884,7 @@ mod tests {
         watch.apply(PullRequest::Poll, running(5));
         assert_eq!(watch.line(), None, "a new reading unhid the pull");
         let gated = PullReport::Gated {
-            command: "docker pull img".into(),
+            command: Some("docker pull img".into()),
         };
         assert_eq!(
             watch.apply(PullRequest::Cancel, gated),
@@ -1091,23 +1095,30 @@ mod tests {
     #[serial_test::serial]
     async fn a_refused_daemon_pull_is_gated_and_never_pulls_locally() {
         let _app = crate::session::test_support::isolate_app_dir();
-        crate::session::update_config(|c| {
-            c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
-            c.sandbox.allow_image_pull = true;
-            c.sandbox.default_image = Some(IMAGE.into());
-        })
-        .unwrap();
-        for read_only in [true, false] {
+        let forbidden = || async { axum::http::StatusCode::FORBIDDEN };
+        // (case, read-only, CityHall, pulls allowed, the Daemon's own routes answer the pull)
+        for (case, read_only, cityhall, allowed, daemon_routes) in [
+            ("read-only", true, false, true, true),
+            ("CityHall", false, true, true, true),
+            ("pulls off", false, false, false, true),
+            ("a 403 with no code", false, false, true, false),
+        ] {
+            crate::session::update_config(|c| {
+                c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
+                c.sandbox.allow_image_pull = allowed;
+                c.sandbox.default_image = Some(IMAGE.into());
+            })
+            .unwrap();
             let state = test_support::build_test_app_state_configured(Vec::new(), |s| {
-                s.read_only = read_only
+                s.read_only = read_only;
+                s.cityhall_mode = cityhall;
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let daemon = test_support::build_router_for_test(state.clone());
-            let app = if read_only {
+            let app = if daemon_routes {
                 daemon
             } else {
-                let forbidden = || async { axum::http::StatusCode::FORBIDDEN };
                 axum::Router::new()
                     .route("/api/sandbox/image-pull", axum::routing::post(forbidden))
                     .route(
@@ -1116,6 +1127,16 @@ mod tests {
                     )
                     .fallback_service(daemon)
             };
+            let status_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let reads = status_reads.clone();
+            let app = app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    if request.uri().path() == "/api/sandbox/image-status" {
+                        reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    next.run(request)
+                },
+            ));
             let shutdown = state.shutdown.clone();
             let server = tokio::spawn(async move {
                 axum::serve(
@@ -1129,31 +1150,41 @@ mod tests {
             let endpoint = DaemonEndpoint::new(base, None, crate::daemon::Source::Env);
             let source = PullSource::Daemon(HttpClient::new(endpoint).unwrap());
 
+            let polled = source.run(IMAGE, PullRequest::Poll, None).await;
             assert_eq!(
-                source.run(IMAGE, PullRequest::Poll, None).await,
-                PullAnswer {
-                    report: PullReport::State(PullState::Idle),
-                    offer: Some(ImageOffer::NoUpdate),
-                    image: Some(IMAGE.into()),
-                    flight: None,
-                },
-                "checks are off, so the Daemon offers nothing"
+                (polled.report, polled.offer, polled.image),
+                (
+                    PullReport::State(PullState::Idle),
+                    Some(ImageOffer::NoUpdate),
+                    Some(IMAGE.into())
+                ),
+                "{case}: checks are off, so the Daemon offers nothing"
+            );
+            assert!(
+                polled.pull_command.is_some_and(|c| c.contains(IMAGE)),
+                "{case}: the poll didn't carry the pull command"
             );
             for request in [PullRequest::Start, PullRequest::Cancel] {
                 let report = source.run(IMAGE, request, None).await.report;
-                if read_only {
-                    let PullReport::Gated { command } = report else {
-                        panic!("{request:?} should be gated");
-                    };
-                    assert!(command.contains(IMAGE), "{command}");
+                if daemon_routes {
+                    assert_eq!(
+                        report,
+                        PullReport::Gated { command: None },
+                        "{case} {request:?}: a coded refusal wasn't gated"
+                    );
                 } else {
                     assert_eq!(
                         report,
                         PullReport::Unavailable,
-                        "{request:?}: a 403 the Daemon's status doesn't explain was gated"
+                        "{case} {request:?}: a 403 with no refusal code was gated"
                     );
                 }
             }
+            assert_eq!(
+                status_reads.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{case}: a refusal re-read the status"
+            );
             state.shutdown.cancel();
             server.await.unwrap();
         }

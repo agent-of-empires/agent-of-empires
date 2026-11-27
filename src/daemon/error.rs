@@ -59,6 +59,8 @@ pub enum ApiErrorCode {
     UnknownAgent,
     /// A sandbox image cancel named a pull that has ended; another pull of the image runs.
     PullReplaced,
+    /// `sandbox.allow_image_pull` is off, so the Daemon won't pull a sandbox image for a client.
+    PullDisabled,
     TerminalSwitchRefused(TerminalSwitchReason),
 }
 
@@ -110,6 +112,7 @@ impl ApiErrorCode {
             Self::ModelPinned => "model_pinned",
             Self::UnknownAgent => "unknown_agent",
             Self::PullReplaced => "pull_replaced",
+            Self::PullDisabled => "pull_disabled",
             Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
@@ -120,7 +123,8 @@ impl ApiErrorCode {
             | Self::ElevationRequired
             | Self::AccessPolicyDenied
             | Self::LocalPluginSourceRequired
-            | Self::CityhallMode => StatusCode::FORBIDDEN,
+            | Self::CityhallMode
+            | Self::PullDisabled => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
             | Self::TrashIncomplete
             | Self::LifecycleSuperseded
@@ -239,6 +243,7 @@ impl ApiErrorCode {
             b"model_pinned" => Self::ModelPinned,
             b"unknown_agent" => Self::UnknownAgent,
             b"pull_replaced" => Self::PullReplaced,
+            b"pull_disabled" => Self::PullDisabled,
             other => Self::TerminalSwitchRefused(
                 TerminalSwitchReason::ALL
                     .into_iter()
@@ -432,6 +437,13 @@ mod tests {
                 Some(ApiErrorCode::PullReplaced),
             ),
             (StatusCode::BAD_REQUEST, "pull_replaced", false, None),
+            (
+                StatusCode::FORBIDDEN,
+                "pull_disabled",
+                false,
+                Some(ApiErrorCode::PullDisabled),
+            ),
+            (StatusCode::CONFLICT, "pull_disabled", false, None),
             (
                 StatusCode::BAD_REQUEST,
                 "unknown_agent",

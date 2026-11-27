@@ -779,11 +779,13 @@ When `profile` is omitted, creation uses the server's selected profile or the co
 
 ## Sandbox image
 
-These endpoints back the dashboard's sandbox image banner (see
-[Available images](guides/sandbox.md#available-images)). They act only on a
-configured image: the global or a profile's `sandbox.default_image`. Any other
-image is refused with `400 unknown_image`, and an omitted one means the global
-`sandbox.default_image`. Images are checked and pulled with the configured
+These endpoints back the dashboard's sandbox image banner and the TUI's pull
+line (see [Available images](guides/sandbox.md#available-images)). They act only
+on a configured image: the global or a profile's `sandbox.default_image`. Any
+other image is refused with `400 unknown_image`, and an omitted one means the
+global `sandbox.default_image`. `unknown_image`, `pull_replaced` and the pull
+gate's three refusals set `AoE-Error-Code` to their code, so a client tells them
+apart without reading the body. Images are checked and pulled with the configured
 `container_runtime`. When the configuration can't be read, every endpoint except
 `image-dismiss` answers `500 config_unreadable` rather than fall back to defaults.
 

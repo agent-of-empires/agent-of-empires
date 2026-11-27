@@ -152,6 +152,9 @@ pub struct App {
     /// The update a pull this TUI watched just installed, so a stale offer of it stays away. It
     /// keeps the image: another tag can share the digest and still be out of date.
     pulled_image: Option<ImageUpdate>,
+    /// The last poll's image and the command it says to run instead of a Daemon pull, for the
+    /// gated line: a refusal doesn't carry it.
+    pull_command: Option<(String, String)>,
     pull_runner: PullRunner,
     next_pull_poll: std::time::Instant,
     /// Hidden with Ctrl+X this session. The Daemon keeps the dismissal and offers it no more.
@@ -420,6 +423,7 @@ impl App {
             pull: PullWatch::default(),
             pull_rx: None,
             pulled_image: None,
+            pull_command: None,
             pull_runner: Box::new(run_pull_request),
             next_pull_poll: std::time::Instant::now(),
             dismissed_image_digest: None,
@@ -1887,6 +1891,7 @@ impl App {
             offer,
             image,
             flight,
+            pull_command,
         } = match rx.try_recv() {
             Ok(answer) => answer,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
@@ -1896,6 +1901,19 @@ impl App {
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                 PullReport::Unavailable.into()
             }
+        };
+        if let (Some(polled), Some(command)) = (&image, pull_command) {
+            self.pull_command = Some((polled.clone(), command));
+        }
+        let report = match report {
+            PullReport::Gated { command: None } => PullReport::Gated {
+                command: self
+                    .pull_command
+                    .as_ref()
+                    .filter(|(polled, _)| self.pull_image.is_empty() || *polled == self.pull_image)
+                    .map(|(_, command)| command.clone()),
+            },
+            report => report,
         };
         let applied = self.pull.apply(request, report);
         // A new id is another pull: a cancel prompt for the one shown ends, and repaints.
@@ -5036,6 +5054,7 @@ mod tests {
             offer: Some(offer),
             image: None,
             flight: None,
+            pull_command: None,
         };
         let offered =
             |update: &ImageUpdate| answer(PullState::Idle, ImageOffer::Update(update.clone()));
@@ -5431,6 +5450,7 @@ mod tests {
             offer: Some(ImageOffer::Update(update.clone())),
             image: Some(update.image.clone()),
             flight: None,
+            pull_command: None,
         };
         let running = || PullState::Running(Default::default());
 
@@ -5680,6 +5700,7 @@ mod tests {
                         ),
                         image: Some(a.image.clone()),
                         flight: None,
+                        pull_command: None,
                     },
                 );
             }
@@ -5712,6 +5733,7 @@ mod tests {
             offer: Some(offer),
             image: Some(a.image.clone()),
             flight: Some(5),
+            pull_command: None,
         };
         answer_pull(
             &mut app,
@@ -5917,6 +5939,54 @@ mod tests {
         let sent = record_pull_requests(&mut app);
         app.schedule_pull_poll(app.next_pull_poll);
         assert_eq!(*sent.lock().unwrap(), [PullRequest::Poll]);
+    }
+
+    /// A refusal carries no command, so the gated line takes the last poll's for the image it
+    /// pulled, and before any poll named one it says only that pulls are off.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_pull_shows_the_command_the_last_poll_named() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, _terminal) = key_app();
+        let image = image_update().image;
+        let command = format!("docker pull {image}");
+        let refused = |app: &mut App, pulled: &str| {
+            app.pull = PullWatch::default();
+            app.pull_image = pulled.to_string();
+            app.pull.start();
+            answer_pull(app, PullRequest::Start, PullReport::Gated { command: None });
+            app.pull.line().cloned()
+        };
+        let gated = |command: Option<&str>| {
+            Some(PullLine::Gated {
+                command: command.map(str::to_string),
+            })
+        };
+        assert_eq!(refused(&mut app, &image), gated(None), "before any poll");
+
+        app.pull = PullWatch::default();
+        answer_pull(
+            &mut app,
+            PullRequest::Poll,
+            PullAnswer {
+                report: PullReport::State(PullState::Idle),
+                offer: Some(ImageOffer::NoUpdate),
+                image: Some(image.clone()),
+                flight: None,
+                pull_command: Some(command.clone()),
+            },
+        );
+        assert_eq!(
+            refused(&mut app, &image),
+            gated(Some(&command)),
+            "the gated line didn't show the last poll's command"
+        );
+        assert_eq!(
+            refused(&mut app, "ghcr.io/example/other:1"),
+            gated(None),
+            "another image's command was shown"
+        );
     }
 
     /// Ctrl+E's prompt draws over the bar and leaves the status it covers, so the lasting

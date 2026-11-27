@@ -101,8 +101,9 @@ pub(crate) enum PullLine {
     Cancelled,
     Failed(PullFailureReason),
     /// The Daemon refuses pulls here; `command` pulls by hand.
+    /// `command` is what to run instead, when the TUI knows it.
     Gated {
-        command: String,
+        command: Option<String>,
     },
 }
 
@@ -188,7 +189,9 @@ impl PullLine {
                     )
                 }
             }
-            Self::Gated { command } => gated(command, &format!("  [{hide}] dismiss"), width),
+            Self::Gated { command } => {
+                gated(command.as_deref(), &format!("  [{hide}] dismiss"), width)
+            }
         }
     }
 }
@@ -229,9 +232,17 @@ fn meter(done: u32, known: u32) -> String {
 
 /// The manual command is the line's only remedy, so it stays whole while it fits: the
 /// prefix shortens first, then the dismiss hint goes (its key still works).
-fn gated(command: &str, keys: &str, width: usize) -> String {
-    let long = format!(" Sandbox image pulls are off here. Run: {command}");
-    let short = format!(" Pulls are off. Run: {command}");
+fn gated(command: Option<&str>, keys: &str, width: usize) -> String {
+    let (long, short) = match command {
+        Some(command) => (
+            format!(" Sandbox image pulls are off here. Run: {command}"),
+            format!(" Pulls are off. Run: {command}"),
+        ),
+        None => (
+            " Sandbox image pulls are off on this Daemon.".to_string(),
+            " Pulls are off here.".to_string(),
+        ),
+    };
     for (message, keys) in [(&long, keys), (&short, keys), (&short, "")] {
         if message.width() + keys.width() <= width {
             return format!("{message}{keys}");
@@ -342,11 +353,12 @@ mod tests {
         let downloading = snapshot(Some(PullPhase::Downloading), Some(3), Some(7));
         let unpacking = snapshot(Some(PullPhase::Unpacking), Some(7), Some(7));
         let gated = PullLine::Gated {
-            command: "docker pull ghcr.io/example/sandbox:latest".into(),
+            command: Some("docker pull ghcr.io/example/sandbox:latest".into()),
         };
         let default_gated = PullLine::Gated {
-            command: "docker pull ghcr.io/agent-of-empires/aoe-sandbox:1.19.0".into(),
+            command: Some("docker pull ghcr.io/agent-of-empires/aoe-sandbox:1.19.0".into()),
         };
+        let unknown_gated = PullLine::Gated { command: None };
         for strict in [false, true] {
             let label = |id| bindings::label(id, strict);
             let hide = format!("[{}] hide", label(ActionId::DismissUpdateBanner));
@@ -462,6 +474,14 @@ mod tests {
                     vec![" Pulls are off. Run: docker pull ghcr.io/agent-of-empires/aoe-sandbox:1.19.0"],
                     vec!["…", dismiss.as_str()],
                 ),
+                // No command known: the line says only that pulls are off.
+                (
+                    unknown_gated.clone(),
+                    80,
+                    vec!["Sandbox image pulls are off on this Daemon.", dismiss.as_str()],
+                    vec!["Run:"],
+                ),
+                (unknown_gated.clone(), 40, vec!["Pulls are off here."], vec!["Run:"]),
                 // Only a command wider than the row is cut.
                 (default_gated.clone(), 40, vec![" Pulls are off. Run: docker pull", "…"], vec![]),
                 // Narrower than the keys: the whole line is cut to the width.
