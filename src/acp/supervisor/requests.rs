@@ -861,10 +861,28 @@ mod tests {
                 client.ready().await;
                 let state = client.app_state();
                 let supervisor = &state.acp_supervisor;
-                supervisor
-                    .reset_session_context(&client.id, "/new", None, false)
-                    .await
-                    .expect("genuine reset");
+                let (prepared, preparation) = tokio::sync::oneshot::channel();
+                let (validate, validation) = tokio::sync::oneshot::channel();
+                assert!(super::super::launch::LIVE_FRESH_VALIDATION_GATE
+                    .lock()
+                    .unwrap()
+                    .replace(super::super::launch::LiveFreshValidationGate {
+                        session_id: client.id.clone(),
+                        prepared,
+                        validate: validation,
+                    })
+                    .is_none());
+                let reset = supervisor.reset_session_context(&client.id, "/new", None, false);
+                tokio::pin!(reset);
+                tokio::select! {
+                    result = reset.as_mut() => panic!("reset settled before validation: {result:?}"),
+                    signal = preparation => signal.unwrap(),
+                }
+                let workers = supervisor.workers.lock().await;
+                validate.send(()).unwrap();
+                assert!(futures_util::poll!(reset.as_mut()).is_pending());
+                drop(workers);
+                reset.await.expect("genuine reset after worker-table contention");
                 assert_eq!(
                     native.requests(),
                     ["initialize", "session/new", "session/new"],
