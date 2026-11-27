@@ -38,7 +38,6 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      pull-requests: read
     outputs:
       web: ${{ steps.decide.outputs.web }}
       live: ${{ steps.decide.outputs.live }}
@@ -51,10 +50,13 @@ jobs:
           sparse-checkout: .github/scripts
       - id: decide
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          # The release-PR rule every job here uses, so the stubs match it.
+          RELEASE: ${{ github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-') }}
         with:
           script: |
             const gate = require('./.github/scripts/change-gate.cjs');
-            await gate({ github, context, core });
+            await gate({ github, context, core, release: process.env.RELEASE === 'true' });
 
   cargo-linux:
     # Each leg builds its own feature set on its own runner and cache key. The
@@ -298,16 +300,17 @@ jobs:
 
   cargo-linux-skipped:
     # A matrix job skipped at job level posts one unexpanded context, so this
-    # reports each required cargo-linux context the change gate skipped. The
-    # merge queue runs every leg.
+    # reports each required cargo-linux context the change gate skipped, and
+    # every one on a release PR whose gate failed. The merge queue runs every
+    # leg.
     name: Cargo Test (linux, ${{ matrix.leg }})
     needs: changes
-    if: needs.changes.outputs.skipped_legs != '[]'
+    if: ${{ !cancelled() && ((needs.changes.result == 'success' && needs.changes.outputs.skipped_legs != '[]') || (needs.changes.result != 'success' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-'))) }}
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-cargo-skip-{1}-{2}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, matrix.leg, github.run_attempt) }}
     permissions: {}
     strategy:
       matrix:
-        leg: ${{ fromJSON(needs.changes.outputs.skipped_legs) }}
+        leg: ${{ fromJSON(needs.changes.result == 'success' && needs.changes.outputs.skipped_legs || '["web-e2e","core-rest","bare-core"]') }}
     steps:
       - run: echo "The change gate skipped this leg; the merge queue runs it."
 
