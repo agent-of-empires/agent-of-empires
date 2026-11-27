@@ -482,9 +482,15 @@ export function SessionWizard({
           if (agentsProfile === servedProfile) setAgentNames(list);
           const stored = storedToolRef.current;
           storedToolRef.current = null;
-          if (stored && dataRef.current.tool === stored && !list.some((a) => a.name === stored))
-            dispatch({ type: "SET_FIELD", field: "tool", value: "claude" });
-          return dispatch({ type: "SET_AGENTS", agents: list, agentsFor: agentsKey, agentsProject: fetchProjectKey });
+          const resetTool =
+            stored && dataRef.current.tool === stored && !list.some((a) => a.name === stored) ? "claude" : undefined;
+          return dispatch({
+            type: "SET_AGENTS",
+            agents: list,
+            agentsFor: agentsKey,
+            agentsProject: fetchProjectKey,
+            resetTool,
+          });
         }
         const missing = list === "profile_not_found";
         dispatch({ type: "AGENTS_FAILED", agentsFor: agentsKey, missing });

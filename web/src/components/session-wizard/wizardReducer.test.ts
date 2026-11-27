@@ -88,6 +88,20 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
     expect(late.data).toMatchObject({ yoloMode: true, profileWorktreeDefault: true, useWorktree: true });
   });
 
+  it("a remembered tool the list drops is reset without blocking a late defaults apply", () => {
+    const state = makeState();
+    state.data.tool = "gone";
+    const reset = reducer(state, {
+      type: "SET_AGENTS",
+      agents: [],
+      agentsFor: "",
+      agentsProject: "",
+      resetTool: "claude",
+    });
+    expect(reset.data).toMatchObject({ tool: "claude", profileDirty: false });
+    expect(reducer(reset, defaults({ yoloMode: true })).data.yoloMode).toBe(true);
+  });
+
   it("a late skipIfDirty apply keeps a manual worktree toggle", () => {
     const edited = reducer(makeState(), set("useWorktree", true));
     expect(edited.data).toMatchObject({ profileDirty: true, worktreeDirty: true });
