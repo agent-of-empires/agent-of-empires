@@ -325,6 +325,17 @@ export function WorkspaceSidebar(props: Props) {
     if (!filterOpen) requestAnimationFrame(() => filterRef.current?.focus());
   };
 
+  // A row the arrow keys focus scrolls into view clear of the pinned title row, which grows with the filter and facets.
+  const padScrollerForPinnedRow = useCallback((el: HTMLDivElement | null) => {
+    const scroller = el?.parentElement;
+    if (!el || !scroller) return;
+    const observer = new ResizeObserver(() => {
+      scroller.style.scrollPaddingTop = `${el.offsetHeight}px`;
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   const searchPrimerRef = useRef<HTMLInputElement>(null);
   const openSearch = () => {
     searchPrimerRef.current?.focus();
@@ -358,7 +369,10 @@ export function WorkspaceSidebar(props: Props) {
         <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
           <SidebarNav compact={compact} offline={offline} onNew={() => props.onNew()} onSearch={props.onOpenPalette} />
           {/* The canvas gradient, fixed to the viewport, so the pinned row matches what it scrolls over. */}
-          <div className="sticky top-0 z-10 md:chrome-canvas md:bg-fixed md:border-b md:border-surface-700/40">
+          <div
+            ref={padScrollerForPinnedRow}
+            className="sticky top-0 z-10 max-md:bg-surface-950 md:chrome-canvas md:bg-fixed md:border-b md:border-surface-700/40"
+          >
             <SidebarToolbar
               compact={compact}
               axis={axis}

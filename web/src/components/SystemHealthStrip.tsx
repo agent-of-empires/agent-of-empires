@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import type { SystemHealth } from "../lib/api";
 import { useSystemHealth } from "../hooks/useSystemHealth";
 import { useSidebarCompact } from "../lib/sidebarCompact";
+import { useOutsideDismiss } from "./useOutsideDismiss";
 import { formatBytes, formatPercent, useSystemHealthEnabled } from "../lib/systemHealth";
 
 /** Band colors mirror the TUI strip: calm reads as running green, warn as the
@@ -49,6 +50,9 @@ export function SystemHealthStrip({
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const ref = useRef<HTMLDivElement>(null);
+  // The drill-down floats over the list, so a click elsewhere or Escape closes it.
+  useOutsideDismiss(expanded, [ref], () => onToggle());
   if (!health) return null;
 
   const memoryKnown = health.memory_total_bytes > 0;
@@ -61,7 +65,8 @@ export function SystemHealthStrip({
       : "none";
 
   return (
-    <div className="relative flex-1 min-w-0 text-[11px]" data-testid="system-health-strip">
+    // Not positioned: the drill-down opens across the whole footer row above, not just this strip's width.
+    <div ref={ref} className="flex-1 min-w-0 text-[11px]" data-testid="system-health-strip">
       <button
         onClick={() => onToggle()}
         aria-expanded={expanded}
@@ -84,7 +89,7 @@ export function SystemHealthStrip({
 
       {expanded && (
         <div
-          className="absolute bottom-full left-0 right-0 z-20 mb-1 p-2 space-y-2 rounded-lg border border-surface-700/60 bg-surface-850 shadow-xl"
+          className="absolute bottom-full left-2 right-2 z-20 mb-1 p-2 space-y-2 rounded-lg border border-surface-700/60 bg-surface-850 shadow-xl"
           data-testid="system-health-detail"
         >
           <div className="space-y-0.5">

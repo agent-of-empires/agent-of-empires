@@ -118,8 +118,8 @@
   --color-text-primary: #e5e5e5;
   --color-text-secondary: #a3a3a3;
   --color-text-muted: #737373;
-  --color-text-dim: #97979f;
-  --color-text-subtle: #97979f;
+  --color-text-dim: #9a9a9a;
+  --color-text-subtle: #9a9a9a;
   --color-text-bright: #fafafa;
 
   /* Semantic Status */
@@ -180,7 +180,7 @@
   --term-bg: #1f1f1f;
   --term-fg: #e5e5e5;
   --term-cursor: #f59e0b;
-  --term-selection-bg: rgba(161, 161, 170, 0.35);
+  --term-selection-bg: rgba(163, 163, 163, 0.35);
   --term-color-0: #1f1f1f;
   --term-color-1: #ef4444;
   --term-color-2: #22c55e;

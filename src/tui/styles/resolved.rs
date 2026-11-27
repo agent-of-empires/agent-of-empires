@@ -362,8 +362,8 @@ fn terminal_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProj
         ThemeAppearance::Dark => (theme.background, theme.text, theme.title),
         ThemeAppearance::Light => (
             theme.text,
+            mix(theme.text, theme.background, 0.2),
             mix(theme.text, theme.background, 0.3),
-            mix(theme.text, theme.background, 0.45),
         ),
     };
     let base = [
@@ -848,6 +848,36 @@ mod tests {
         let g = u8::from_str_radix(&s[2..4], 16).unwrap();
         let b = u8::from_str_radix(&s[4..6], 16).unwrap();
         relative_luminance(Color::Rgb(r, g, b))
+    }
+
+    #[test]
+    fn a_light_terminal_keeps_text_written_for_dark_terminals_readable() {
+        for name in builtin_theme_names() {
+            let r = resolve_theme(name);
+            let term = |k: &str| color_from_hex(&r.terminal.css_vars[k]);
+            let (bg, fg) = (term("--term-bg"), term("--term-fg"));
+            match r.appearance {
+                ThemeAppearance::Dark => {
+                    assert_eq!(
+                        term("--term-color-0"),
+                        bg,
+                        "{name}: black is the background"
+                    );
+                    assert_eq!(term("--term-color-7"), fg, "{name}: white is the text");
+                }
+                ThemeAppearance::Light => {
+                    // Black is the text, and the whites programs print text in stay legible on the page.
+                    assert_eq!(term("--term-color-0"), fg, "{name}: black is the text");
+                    for white in ["--term-color-7", "--term-color-15"] {
+                        let ratio = contrast_ratio(term(white), bg);
+                        assert!(
+                            ratio >= 3.0,
+                            "{name}: {white} on the background is {ratio:.2}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn color_from_hex(hex: &str) -> Color {
