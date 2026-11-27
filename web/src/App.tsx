@@ -63,20 +63,12 @@ import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
-import { SCRATCH_GROUP_ID, useRepoGroups } from "./hooks/useRepoGroups";
-import { useSessionGroups } from "./hooks/useSessionGroups";
-import { useStatusGroups } from "./hooks/useStatusGroups";
-import { useAttentionJump } from "./hooks/useAttentionJump";
-import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
-import { useOrgGroups } from "./hooks/useOrgGroups";
-import { PluginUiProvider, usePluginAttention, usePluginPages, usePluginUiEntries } from "./lib/pluginUiContext";
+import { SCRATCH_GROUP_ID } from "./hooks/useRepoGroups";
+import { useSidebarModel } from "./hooks/app/useSidebarModel";
+import { PluginUiProvider, usePluginPages, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildPluginPageActions } from "./lib/pluginPages";
-import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
-import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
 import { nextAttentionSessionId } from "./lib/sidebarSort";
-import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
-import { axisDrawsRepoHeaders } from "./lib/sidebarAxis";
-import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
+import type { SidebarGroup } from "./lib/sidebarGroups";
 import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
@@ -134,7 +126,6 @@ import {
   reportTelemetrySeen,
   isDebugBuild,
   markWebTourSeen,
-  updateWorkspaceOrdering,
   createProject,
   updateProject,
   projectTarget,
@@ -534,8 +525,14 @@ function AppContent({
   const {
     sessions,
     workspaceOrdering,
-    setWorkspaceOrdering,
-    markLocalOrderingUpdate,
+    repositoryOrder,
+    sidebarView,
+    groupOrder,
+    moveGroup,
+    changeOrdering,
+    orderingSaving,
+    changeSidebarView,
+    onSharedRead,
     error,
     loaded: sessionsLoaded,
     trashedCount,
@@ -622,15 +619,6 @@ function AppContent({
 
   useOrphanSweep(sessions, sessionsLoaded && !error, trashedCount);
 
-  const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
-  const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
-
-  // Active plugin sort (#2401): an ephemeral selection of a live `sort-key`
-  // entry. Not persisted (plugin entries die with the daemon). The ref is only
-  // ever read by resolving it against the live snapshot, so a stale ref (entry
-  // gone after a daemon restart) is inert and the sidebar falls back to the
-  // built-in sort; if the entry reappears on a later poll the selection
-  // resumes. Selecting a built-in mode clears it via `selectSidebarSortMode`.
   const pluginUiEntries = usePluginUiEntries();
   const pluginPages = usePluginPages();
   const pluginPageActions = useMemo(() => buildPluginPageActions(pluginPages ?? []), [pluginPages]);
@@ -645,37 +633,6 @@ function AppContent({
     }),
     [],
   );
-  const pluginAttention = usePluginAttention();
-  const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
-  const activePluginSort = useMemo(() => {
-    if (!pluginSortRef) return null;
-    return (
-      pluginSortSpecs(pluginUiEntries).find(
-        (s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId,
-      ) ?? null
-    );
-  }, [pluginUiEntries, pluginSortRef]);
-  const pluginSort = useMemo<PluginSortContext | undefined>(
-    () =>
-      activePluginSort
-        ? {
-            direction: activePluginSort.direction,
-            values: buildSortValueMap(pluginUiEntries, activePluginSort.pluginId, activePluginSort.column),
-          }
-        : undefined,
-    [activePluginSort, pluginUiEntries],
-  );
-  const selectPluginSort = useCallback((ref: { pluginId: string; entryId: string }) => {
-    reportFeatureUse("sort_plugin");
-    setPluginSortRef(ref);
-  }, []);
-  const selectSidebarSortMode = useCallback(
-    (mode: SidebarSortMode) => {
-      setPluginSortRef(null);
-      setSidebarSortMode(mode);
-    },
-    [setSidebarSortMode],
-  );
 
   const { projects, profile: projectProfile, ready: projectsReady, refresh: refreshProjects } = useProjects();
   const requireProjectProfile = useCallback(() => {
@@ -683,81 +640,20 @@ function AppContent({
     toastBus.handler?.error("Projects are not ready. Refresh before changing the registry.");
     return undefined;
   }, [projectProfile, projectsReady]);
-  const {
-    groups: repoGroups,
-    savedProjects,
-    toggleRepoCollapsed,
-    reorderRepoGroups,
-  } = useRepoGroups(
+  const sidebar = useSidebarModel({
     workspaces,
-    workspaceOrdering,
-    sidebarSortMode,
     projects,
-    pluginSort,
-    pluginAttention,
-    axisDrawsRepoHeaders(sidebarAxis),
-  );
-  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(
-    workspaces,
-    sidebarSortMode,
-    pluginSort,
-    pluginAttention,
-  );
-  // The status axis groups by execution status instead of by where a session
-  // lives, so it owns its own grouping and collapse state.
-  const { groups: statusGroups, toggleGroupCollapsed: toggleStatusGroupCollapsed } = useStatusGroups(
-    workspaces,
-    sidebarSortMode,
-    pluginSort,
-    pluginAttention,
-  );
-  // The nested `repo+group` axis reuses the already-built repo groups for
-  // its top level (so repo collapse and ordering are shared
-  // with the repo axis) and splits each repo by `group_path` underneath.
-  // See #1720.
-  const { groups: nestedGroups, toggleSubgroupCollapsed } = useNestedSidebarGroups(
-    repoGroups,
-    sidebarSortMode,
-    pluginSort,
-    pluginAttention,
-  );
-  // The org axis (#3283) partitions the same repo groups by remote owner;
-  // it needs no sort/plugin-sort input of its own since it reuses each
-  // repo's already-ordered workspace list verbatim, just like the nested
-  // axis's repo header.
-  const {
-    groups: orgGroups,
-    toggleOrgCollapsed,
-    toggleRepoCollapsed: toggleOrgRepoCollapsed,
-  } = useOrgGroups(repoGroups);
-
-  // Collapse state is independent for each grouping axis.
-  const sidebarGroups = useMemo(() => {
-    if (sidebarAxis === "status") return statusGroups;
-    if (sidebarAxis === "group") return sessionGroups;
-    return repoGroups.map(repoGroupToSidebarGroup);
-  }, [sidebarAxis, statusGroups, sessionGroups, repoGroups]);
-  const toggleSidebarGroup =
-    sidebarAxis === "status"
-      ? toggleStatusGroupCollapsed
-      : sidebarAxis === "group"
-        ? toggleGroupCollapsed
-        : toggleRepoCollapsed;
-
-  // Drag-end handler for the sidebar. Optimistically applies the new
-  // order locally so the row snaps into place, then persists to the
-  // server. `markLocalOrderingUpdate` opens a short window during
-  // which polled responses do not clobber our just-applied state, so a
-  // poll firing mid-PUT can't revert the drag.
-  const handleReorderWorkspaces = useCallback(
-    (newOrder: string[]) => {
-      reportFeatureUse("row_reorder");
-      setWorkspaceOrdering(newOrder);
-      markLocalOrderingUpdate();
-      void updateWorkspaceOrdering(newOrder);
-    },
-    [setWorkspaceOrdering, markLocalOrderingUpdate],
-  );
+    view: sidebarView,
+    workspaceOrdering,
+    repositoryOrder,
+    groupOrder,
+    moveGroup,
+    changeOrdering,
+    orderingSaving,
+    changeSidebarView,
+    onSharedRead,
+    refresh: refreshSessions,
+  });
 
   // Selected diff-file identity. `repoName` is undefined for single-repo
   // sessions and the workspace member name for multi-repo workspaces.
@@ -2195,10 +2091,7 @@ function AppContent({
     dispatchFocusTerminal(target);
   }, [activeSessionId, singlePane, fileShown, selectedFile, showPairedTerminal]);
 
-  // Flattened, display-ordered session ids plus the subset needing attention,
-  // sourced from the same sidebar model the user sees so jump-to-next follows
-  // the visible order under any sort or axis.
-  const attentionJump = useAttentionJump(sidebarGroups);
+  const { attentionJump } = sidebar;
 
   const handleJumpToAttention = useCallback(() => {
     reportFeatureUse("attention_jump");
@@ -3296,24 +3189,27 @@ function AppContent({
                   observedById={observedById}
                   runtimeEpoch={runtimeEpoch}
                   onSessionMutation={applySessionMutation}
-                  groups={sidebarGroups}
-                  nestedGroups={nestedGroups}
-                  orgGroups={orgGroups}
+                  groupBy={sidebar.groupBy}
+                  sort={sidebar.sort}
+                  onGroupByChange={sidebar.selectGroupBy}
+                  onSortChange={sidebar.selectSort}
+                  groups={sidebar.groups}
+                  nestedGroups={sidebar.nestedGroups}
                   trashedWorkspaces={trashedWorkspaces}
                   trashedCount={trashedCount}
                   trashLoaded={trashLoaded}
                   onLoadTrash={loadTrash}
-                  onToggleSubgroup={toggleSubgroupCollapsed}
-                  onToggleOrg={toggleOrgCollapsed}
-                  onToggleOrgRepo={toggleOrgRepoCollapsed}
-                  onReorderWorkspaces={handleReorderWorkspaces}
-                  onReorderGroups={reorderRepoGroups}
+                  onToggleSubgroup={sidebar.toggleSubgroupCollapsed}
+                  onMoveWorkspace={sidebar.moveWorkspace}
+                  onMoveRepository={sidebar.moveRepository}
+                  onMoveGroup={sidebar.moveGroupHeader}
                   activeId={activeWorkspace?.id ?? null}
                   activeSessionId={activeSessionId}
                   open={sidebarOpen}
                   onOpenChange={setSidebarOpen}
                   onSelect={handleSelectWorkspace}
-                  onToggleGroup={toggleSidebarGroup}
+                  onToggleRepo={sidebar.toggleRepoCollapsed}
+                  onToggleGroup={sidebar.toggleGroupCollapsed}
                   onNew={(prefill) => {
                     setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
                     setShowSessionWizard(true);
@@ -3323,7 +3219,7 @@ function AppContent({
                   onPinProject={projectsReady ? handlePinProject : undefined}
                   onUnpinProject={projectsReady ? handleUnpinProject : undefined}
                   onEditProjectSettings={handleEditProjectSettings}
-                  savedProjects={savedProjects}
+                  savedProjects={sidebar.savedProjects}
                   onAddProject={handleAddProject}
                   onEditProject={handleEditProject}
                   onRemoveProject={handleRemoveProject}
@@ -3336,13 +3232,10 @@ function AppContent({
                   onStartSession={handleStartSession}
                   onSwitchView={handleSwitchView}
                   readOnly={caps.readOnly}
+                  canArrangeView={!caps.cityhall}
                   canManageProjects={caps.canManageProjects}
-                  sortMode={sidebarSortMode}
-                  onSortModeChange={selectSidebarSortMode}
-                  pluginSortRef={pluginSortRef}
-                  onPluginSortChange={selectPluginSort}
-                  axis={sidebarAxis}
-                  onAxisChange={setSidebarAxis}
+                  pluginSortRef={sidebar.pluginSortRef}
+                  onPluginSortChange={sidebar.selectPluginSort}
                   suggestions={{
                     readOnly: caps.readOnly || !caps.canManageSuggestions,
                     cityhall: caps.cityhall,

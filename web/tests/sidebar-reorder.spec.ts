@@ -104,8 +104,8 @@ test.describe("desktop rows", () => {
       await openDesktop(page, sessions, {
         ordering: order.map((title) => workspaceId(sessions.find((s) => s.title === title)!)),
       });
-      // #1418: drag needs manual sort, which must stay the default.
-      await expect(page.locator("[data-testid='sidebar-view-toggle']")).toHaveAttribute("data-sort-mode", "manual");
+      // #1418: Custom, where a drag lands where it is dropped, must stay the default.
+      await expect(page.locator("[data-testid='sidebar-view-toggle']")).toHaveAttribute("data-sort", "custom");
       await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(order);
     }
   });
@@ -200,7 +200,10 @@ test.describe("desktop rows", () => {
       { id: "b1", title: "alpha-b", project_path: "/tmp/repo-b", branch: "feat/1" },
       { id: "b2", title: "beta-b", project_path: "/tmp/repo-b", branch: "feat/2" },
     ];
-    const handle = await openDesktop(page, sessions, { ordering: sessions.map(workspaceId) });
+    const handle = await openDesktop(page, sessions, {
+      ordering: sessions.map(workspaceId),
+      repositoryOrder: ["/tmp/repo-a", "/tmp/repo-b"],
+    });
     const wrappers = page.locator(WRAPPERS);
     await expect(wrappers).toHaveCount(4);
     await dragRow(page, wrappers.nth(0), wrappers.nth(2));
@@ -286,7 +289,7 @@ test.describe("touch rows", () => {
   });
 });
 
-// Group order is client-only (localStorage); the whole real header is the drag activator (#2207).
+// Repository header order is the shared Custom order (#5896); the whole real header is the drag activator (#2207).
 test.describe("group headers", () => {
   const twoRepos: MockSessionInput[] = [
     { id: "s-a", title: "alpha-session", project_path: "/tmp/repo-alpha", branch: "feat/a" },
@@ -337,7 +340,7 @@ test.describe("group headers", () => {
   });
 
   test("drag a group header to reorder, order persists across reload", async ({ page }) => {
-    await openDesktop(page, twoRepos);
+    const handle = await openDesktop(page, twoRepos, { persistPutOrdering: true });
     await expect(draggable(page)).toHaveCount(2);
     const before = await groupNames(page);
     expect(before).toHaveLength(2);
@@ -352,6 +355,7 @@ test.describe("group headers", () => {
 
     const expected = [before[1], before[0]];
     await expect.poll(() => groupNames(page), { timeout: 4_000 }).toEqual(expected);
+    expect(handle.puts).toEqual([{ repositories: ["/tmp/repo-alpha", "/tmp/repo-beta"] }]);
     await page.reload();
     await expect(draggable(page)).toHaveCount(2);
     await expect.poll(() => groupNames(page), { timeout: 4_000 }).toEqual(expected);

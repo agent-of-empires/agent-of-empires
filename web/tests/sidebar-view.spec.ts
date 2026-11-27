@@ -1,6 +1,6 @@
 // The shared sidebar view (#5896): one grouping and one sort every Client shows, the Daemon's to keep. The view
 // payloads, poll adoption and the order arithmetic are unit-tested in src/hooks/__tests__/useSidebarModel.test.tsx;
-// these cover the browser-only parts: dragging, polling and the toolbar layout.
+// these cover the browser-only parts: dragging and polling.
 
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
@@ -15,6 +15,12 @@ const sessions: MockSessionInput[] = [
   { id: "s-a", title: "alpha", project_path: "/tmp/repo-b", branch: "feat/a" },
   { id: "s-m", title: "mike", project_path: "/tmp/repo-a", branch: "feat/m" },
 ];
+
+/** The View options trigger names the shared grouping and sort it shows. */
+async function expectView(page: Page, groupBy: string, sort: string, timeout?: number) {
+  await expect(page.locator(TOGGLE)).toHaveAttribute("data-group-by", groupBy, { timeout });
+  await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort", sort, { timeout });
+}
 
 async function open(page: Page, opts: Partial<Parameters<typeof installSidebarMocks>[1]> = {}) {
   const handle = await installSidebarMocks(page, {
@@ -33,7 +39,7 @@ test.describe("shared sidebar view (#5896)", () => {
     page,
   }) => {
     const handle = await open(page, { view: { group_by: "project", sort: "name" } });
-    await expect(page.locator(TOGGLE)).toHaveText(/Repository.*Name/);
+    await expectView(page, "project", "name");
     // Headers and rows A to Z.
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(["mike", "alpha", "zulu"]);
     // Rows stay draggable and nothing asks to switch first.
@@ -51,7 +57,7 @@ test.describe("shared sidebar view (#5896)", () => {
         repositories: ["/tmp/repo-a", "/tmp/repo-b"],
       },
     ]);
-    await expect(page.locator(TOGGLE)).toHaveText(/Repository.*Custom/);
+    await expectView(page, "project", "custom");
     await expect.poll(() => readVisibleSessionTitles(page)).toEqual(["mike", "zulu", "alpha"]);
     // Reloading reads the same order back from the Daemon.
     await page.reload();
@@ -61,25 +67,11 @@ test.describe("shared sidebar view (#5896)", () => {
 
   test("another Client's pick shows up on the next poll, without a reload", async ({ page }) => {
     const handle = await open(page);
-    await expect(page.locator(TOGGLE)).toHaveText(/Repository.*Custom/);
+    await expectView(page, "project", "custom");
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(["zulu", "alpha", "mike"]);
     handle.view = { group_by: "group", sort: "name" };
-    await expect(page.locator(TOGGLE)).toHaveText(/Groups.*Name/, { timeout: 8_000 });
+    await expectView(page, "group", "name", 8_000);
     await expect.poll(() => readVisibleSessionTitles(page)).toEqual(["alpha", "mike", "zulu"]);
     expect(handle.viewPatches).toEqual([]);
-  });
-
-  // #1836: the list keeps its single separator under the toolbar.
-  test("the view button replaces the old heading and keeps the toolbar on one row", async ({ page }) => {
-    await open(page);
-    const toggle = page.locator(TOGGLE);
-    await expect(toggle).toBeVisible({ timeout: 8_000 });
-    await expect(page.getByTestId("sidebar-axis-heading")).toHaveCount(0);
-    const row = (await toggle.boundingBox())!;
-    for (const name of ["Filter sessions", "New project session"]) {
-      const box = (await page.getByRole("button", { name, exact: true }).boundingBox())!;
-      expect(Math.abs(box.y + box.height / 2 - (row.y + row.height / 2))).toBeLessThan(2);
-    }
-    await expect(page.locator("div.overflow-y-auto.border-t")).toHaveCount(1);
   });
 });

@@ -33,7 +33,12 @@ function renderSidebar(workspaces: Workspace[], over: Partial<Props> = {}) {
 const toggle = () => screen.getByTestId("sidebar-view-toggle");
 const openMenu = () => {
   fireEvent.click(toggle());
-  return screen.getByRole("menu", { name: "Sidebar view" });
+  return screen.getByRole("menu", { name: "View options" });
+};
+/** The filter row opens from the View options menu. */
+const toggleFilter = () => {
+  fireEvent.click(toggle());
+  fireEvent.click(screen.getByTestId("sidebar-filter-toggle"));
 };
 const titles = () => screen.queryAllByTestId("sidebar-session-row").map((r) => r.textContent ?? "");
 
@@ -46,14 +51,13 @@ afterEach(() => {
 });
 
 describe("the sidebar view button", () => {
-  it.each<[Partial<Props>, string]>([
-    [{ groupBy: "project", sort: "custom" }, "Repository · Custom"],
-    [{ groupBy: "group", sort: "name" }, "Groups · Name"],
-    [{ groupBy: "project", sort: "newest" }, "Repository · Newest first"],
-  ])("reads the grouping and sort %j", (over, label) => {
+  it.each<[Partial<Props>, string, string]>([
+    [{ groupBy: "project", sort: "custom" }, "project", "custom"],
+    [{ groupBy: "group", sort: "name" }, "group", "name"],
+    [{ groupBy: "project", sort: "newest" }, "project", "newest"],
+  ])("marks the grouping and sort on the trigger %j", (over, groupBy, sort) => {
     renderSidebar([ws("a")], over);
-    expect(toggle().getAttribute("aria-label")).toBe(`Sidebar view: ${label}`);
-    expect(toggle().textContent?.replace("·", " · ").replace(/\s+/g, " ")).toBe(label);
+    expect([toggle().getAttribute("data-group-by"), toggle().getAttribute("data-sort")]).toEqual([groupBy, sort]);
   });
 
   it("offers both groupings and the three sorts as radios and reports a pick", () => {
@@ -66,9 +70,9 @@ describe("the sidebar view button", () => {
       ["Repository", "true"],
       ["Groups", "false"],
     ]);
-    const sort = within(within(menu).getByRole("group", { name: "Sort" })).getAllByRole("menuitemradio");
+    const sort = within(within(menu).getByRole("group", { name: "Sort by" })).getAllByRole("menuitemradio");
     expect(sort.map((r) => [r.textContent, r.getAttribute("aria-checked")])).toEqual([
-      ["Customdrag to reorder", "true"],
+      ["Custom · drag to reorder", "true"],
       ["Newest first", "false"],
       ["Name", "false"],
     ]);
@@ -112,7 +116,7 @@ describe("the Needs you filter", () => {
     ];
     renderSidebar(workspaces);
     expect(screen.getByTestId("sidebar-sunk-section")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Filter sessions" }));
+    toggleFilter();
     const needsYou = screen.getByTestId("sidebar-filter-needs-you");
     fireEvent.click(needsYou);
     expect(needsYou.getAttribute("aria-pressed")).toBe("true");
@@ -121,13 +125,13 @@ describe("the Needs you filter", () => {
     expect(screen.queryByTestId("sidebar-sunk-section")).toBeNull();
 
     // Closing the filter clears it.
-    fireEvent.click(screen.getByRole("button", { name: "Filter sessions" }));
+    toggleFilter();
     expect(titles()).toHaveLength(3);
   });
 
   it("says so when nothing needs you", () => {
     renderSidebar([ws("calm")]);
-    fireEvent.click(screen.getByRole("button", { name: "Filter sessions" }));
+    toggleFilter();
     fireEvent.click(screen.getByTestId("sidebar-filter-needs-you"));
     expect(screen.getByText("Nothing needs you")).toBeTruthy();
   });

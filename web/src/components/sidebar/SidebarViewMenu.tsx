@@ -1,9 +1,14 @@
 import { useRef, useState } from "react";
 import { SlidersHorizontal } from "lucide-react";
 
-import type { SidebarAxis } from "../../lib/sidebarAxis";
-import type { SidebarSortMode } from "../../lib/sidebarSort";
 import type { PluginSortSpec } from "../../lib/pluginUi";
+import {
+  DEFAULT_SIDEBAR_VIEW,
+  GROUP_BY_LABEL,
+  SORT_LABEL,
+  type SidebarGroupBy,
+  type SidebarSort,
+} from "../../lib/sidebarView";
 import { DropdownMenu, MenuHeading, MenuItem, MenuSeparator } from "../ContextMenu";
 import { moveMenuFocus } from "../menuFocus";
 import { Tooltip } from "../Tooltip";
@@ -12,19 +17,8 @@ import { TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
 
 type PluginSortRef = { pluginId: string; entryId: string };
 
-const AXES: readonly { axis: SidebarAxis; label: string }[] = [
-  { axis: "repo", label: "Repository" },
-  { axis: "org", label: "Organization" },
-  { axis: "group", label: "Group" },
-  { axis: "repo+group", label: "Repository, then group" },
-  { axis: "status", label: "Session status" },
-];
-
-const SORTS: readonly { mode: SidebarSortMode; label: string; hint?: string }[] = [
-  { mode: "manual", label: "Manual", hint: "drag to reorder" },
-  { mode: "lastActivity", label: "Last activity" },
-  { mode: "attention", label: "Attention" },
-];
+const GROUPINGS: readonly SidebarGroupBy[] = ["project", "group"];
+const SORTS: readonly SidebarSort[] = ["custom", "newest", "name"];
 
 function Option({
   role,
@@ -32,6 +26,7 @@ function Option({
   testId,
   label,
   hint,
+  disabled,
   onSelect,
 }: {
   role: "menuitemradio" | "menuitemcheckbox";
@@ -39,6 +34,7 @@ function Option({
   testId: string;
   label: string;
   hint?: string;
+  disabled?: boolean;
   /** `keyboard` when Enter or Space picked it, not a pointer. */
   onSelect: (keyboard: boolean) => void;
 }) {
@@ -46,6 +42,7 @@ function Option({
     <MenuItem
       role={role}
       checked={checked}
+      disabled={disabled}
       tabIndex={-1}
       testId={testId}
       // A keyboard click carries no pointer detail.
@@ -57,31 +54,38 @@ function Option({
   );
 }
 
-/** The sidebar's one view control, as Claude Code desktop keeps a single icon by its list: how sessions are
- *  grouped and sorted, and whether the filter and plugin facets show. A dot marks a view other than the default. */
+/** The sidebar's one view control, as Claude Code desktop keeps a single icon by its list: the grouping and sort
+ *  every Client shares, this browser's plugin sorts, and whether the filter and plugin facets show. A dot marks a
+ *  view other than the default. */
 export function SidebarViewMenu({
-  axis,
-  onAxisChange,
-  sortMode,
-  onSortModeChange,
+  groupBy,
+  onGroupByChange,
+  sort,
+  onSortChange,
   pluginSorts,
   pluginSortRef,
   onPluginSortChange,
+  locked = false,
   filterOpen,
+  filterActive = false,
   onToggleFilter,
   hasFacets,
   facetsActive,
   facetOpen,
   onToggleFacets,
 }: {
-  axis: SidebarAxis;
-  onAxisChange: (axis: SidebarAxis) => void;
-  sortMode: SidebarSortMode;
-  onSortModeChange: (mode: SidebarSortMode) => void;
+  groupBy: SidebarGroupBy;
+  onGroupByChange: (groupBy: SidebarGroupBy) => void;
+  sort: SidebarSort;
+  onSortChange: (sort: SidebarSort) => void;
   pluginSorts: PluginSortSpec[];
   pluginSortRef: PluginSortRef | null;
   onPluginSortChange: (ref: PluginSortRef) => void;
+  /** The shared view is the Daemon's, which a read-only viewer or a CityHall client cannot change. */
+  locked?: boolean;
   filterOpen: boolean;
+  /** A filter applies while its panel is closed, such as Needs you. */
+  filterActive?: boolean;
   onToggleFilter: () => void;
   hasFacets: boolean;
   facetsActive: boolean;
@@ -99,7 +103,13 @@ export function SidebarViewMenu({
   const activePlugin = pluginSortRef
     ? pluginSorts.find((s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId)
     : undefined;
-  const customized = axis !== "repo" || sortMode !== "manual" || !!activePlugin || filterOpen || facetsActive;
+  const customized =
+    groupBy !== DEFAULT_SIDEBAR_VIEW.group_by ||
+    sort !== DEFAULT_SIDEBAR_VIEW.sort ||
+    !!activePlugin ||
+    filterOpen ||
+    filterActive ||
+    facetsActive;
   // A keyboard choice hands focus back to the trigger, where a pointer's would only raise its tooltip; a
   // choice that opens the filter then moves it there.
   const choose = (keyboard: boolean, fn: () => void) => {
@@ -118,8 +128,8 @@ export function SidebarViewMenu({
           aria-expanded={open}
           aria-label="View options"
           data-testid="sidebar-view-toggle"
-          data-axis={axis}
-          data-sort-mode={activePlugin ? "plugin" : sortMode}
+          data-group-by={groupBy}
+          data-sort={activePlugin ? "plugin" : sort}
           // A phone shows it as a round button beside the title, as Claude's app does.
           className={`relative ${TOOLBAR_BUTTON} ${TOOLBAR_TINT(open)} max-md:w-10 max-md:h-10 max-md:rounded-full max-md:float-control`}
         >
@@ -147,29 +157,32 @@ export function SidebarViewMenu({
         >
           <MenuHeading decorative>Group by</MenuHeading>
           <div role="group" aria-label="Group by">
-            {AXES.map((a) => (
+            {GROUPINGS.map((value) => (
               <Option
-                key={a.axis}
+                key={value}
                 role="menuitemradio"
-                checked={a.axis === axis}
-                testId={`sidebar-axis-option-${a.axis}`}
-                label={a.label}
-                onSelect={(k) => choose(k, () => a.axis !== axis && onAxisChange(a.axis))}
+                checked={value === groupBy}
+                testId={`sidebar-view-group-${value}`}
+                label={GROUP_BY_LABEL[value]}
+                disabled={locked}
+                onSelect={(k) => choose(k, () => value !== groupBy && onGroupByChange(value))}
               />
             ))}
           </div>
           <MenuSeparator />
           <MenuHeading decorative>Sort by</MenuHeading>
           <div role="group" aria-label="Sort by">
-            {SORTS.map((s) => (
+            {SORTS.map((value) => (
               <Option
-                key={s.mode}
+                key={value}
                 role="menuitemradio"
-                checked={!activePlugin && s.mode === sortMode}
-                testId={`sidebar-sort-option-${s.mode}`}
-                label={s.label}
-                hint={s.hint}
-                onSelect={(k) => choose(k, () => (activePlugin || s.mode !== sortMode) && onSortModeChange(s.mode))}
+                checked={!activePlugin && value === sort}
+                testId={`sidebar-view-sort-${value}`}
+                label={SORT_LABEL[value]}
+                hint={value === "custom" ? "drag to reorder" : undefined}
+                // Picking the shared sort back only drops this browser's plugin sort, which writes nothing.
+                disabled={locked && !(activePlugin && value === sort)}
+                onSelect={(k) => choose(k, () => (activePlugin || value !== sort) && onSortChange(value))}
               />
             ))}
             {pluginSorts.map((spec) => {
@@ -181,6 +194,7 @@ export function SidebarViewMenu({
                   checked={checked}
                   testId={`sidebar-sort-option-plugin-${spec.entryId}`}
                   label={spec.label}
+                  hint="this browser"
                   onSelect={(k) =>
                     choose(k, () => !checked && onPluginSortChange({ pluginId: spec.pluginId, entryId: spec.entryId }))
                   }
@@ -193,7 +207,7 @@ export function SidebarViewMenu({
             role="menuitemcheckbox"
             checked={filterOpen}
             testId="sidebar-filter-toggle"
-            label="Filter sessions"
+            label={filterActive && !filterOpen ? "Filter sessions · active" : "Filter sessions"}
             onSelect={(k) => choose(k, onToggleFilter)}
           />
           {hasFacets && (

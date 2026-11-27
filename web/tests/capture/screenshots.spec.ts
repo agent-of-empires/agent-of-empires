@@ -106,7 +106,7 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
   }
 });
 
-base("sidebar grouped by session status", async ({ page }, testInfo) => {
+base("sidebar view menu", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
     workerIndex: testInfo.workerIndex,
@@ -131,10 +131,9 @@ base("sidebar grouped by session status", async ({ page }, testInfo) => {
     await page.goto(`${serve.baseUrl}/`);
     await page.getByRole("link").filter({ hasText: "api-server" }).first().waitFor({ timeout: 15_000 });
 
-    // Status grouping renders one bucket per execution status, each holding its own session.
+    // The one view menu: the shared grouping and sort, and plugin sorts.
     await page.getByTestId("sidebar-view-toggle").click();
-    await page.getByTestId("sidebar-axis-option-status").click();
-    await page.getByTestId("sidebar-group-header").first().waitFor({ timeout: 10_000 });
+    await page.getByTestId("sidebar-view-menu").waitFor({ timeout: 10_000 });
     await shot(page, "web/sidebar-grouping.png");
   } finally {
     await serve.stop();

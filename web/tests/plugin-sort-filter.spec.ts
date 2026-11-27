@@ -112,10 +112,10 @@ test.describe("Plugin sort-key and filter-facet slots (#2401)", () => {
 
     // Open the menu; the plugin option appears below the built-ins, marked as this browser's alone.
     await page.locator(TOGGLE).click();
-    await expect(page.getByRole("group", { name: "Plugin sorts, this browser only" })).toBeVisible();
-    await page.locator("[data-testid='sidebar-sort-option-plugin-by-metric']").click();
+    const option = page.locator("[data-testid='sidebar-sort-option-plugin-by-metric']");
+    await expect(option).toContainText("this browser");
+    await option.click();
     await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort", "plugin");
-    await expect(page.locator(TOGGLE)).toHaveText(/Repository.*Metric/);
 
     // Rows now order by sort_value descending: 100, 50, 1.
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["high-ws", "mid-ws", "low-ws"]);
@@ -145,29 +145,5 @@ test.describe("Plugin sort-key and filter-facet slots (#2401)", () => {
     await page.locator("[data-testid='sidebar-facet-option-by-status-failed']").click();
     await expect(page.getByText("No matching sessions")).toBeVisible();
     await expect(page.getByText("Nothing needs you")).toHaveCount(0);
-  });
-
-  test("a long plugin sort label gives way before the grouping in the 276px sidebar", async ({ page }) => {
-    const entries = UI_ENTRIES.map((e) =>
-      e.slot === "sort-key" ? { ...e, payload: { ...e.payload, label: "A very long plugin metric name" } } : e,
-    );
-    await mockApis(page, SESSIONS, ORDERING, entries);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await page.locator(TOGGLE).click();
-    await page.locator("[data-testid='sidebar-sort-option-plugin-by-metric']").click();
-
-    const toggle = page.locator(TOGGLE);
-    const [grouping, sort] = [toggle.locator("span").nth(0), toggle.locator("span").nth(1)];
-    const overflows = (el: HTMLElement) => el.scrollWidth > el.clientWidth;
-    await expect.poll(() => sort.evaluate(overflows)).toBe(true);
-    expect(await grouping.evaluate(overflows)).toBe(false);
-    // The row's other controls keep their place beside it.
-    for (const name of ["Filter sessions", "New project session"]) {
-      await expect(page.getByRole("button", { name, exact: true })).toBeInViewport();
-    }
-    const sidebar = (await page.getByRole("navigation", { name: "Sessions sidebar" }).boundingBox())!;
-    const newButton = (await page.getByRole("button", { name: "New project session" }).boundingBox())!;
-    expect(newButton.x + newButton.width).toBeLessThanOrEqual(sidebar.x + sidebar.width);
   });
 });
