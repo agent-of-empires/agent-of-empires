@@ -1517,6 +1517,11 @@ mod tests {
             run_id: "done".into(),
         });
         record(started("open"));
+        record(started("reused"));
+        record(Event::WorkflowRunFinished {
+            run_id: "reused".into(),
+        });
+        record(started("reused"));
         for _ in 0..150 {
             record(Event::AgentMessageChunk {
                 text: "x".into(),
@@ -1533,7 +1538,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(runs, [(true, "open".to_string())]);
+        // A reused id keeps only its open start; the closed pair ages out.
+        assert_eq!(
+            runs,
+            [(true, "open".to_string()), (true, "reused".to_string())]
+        );
     }
 
     /// Workflows share the task events but must not use up the shells' kept
@@ -1676,7 +1685,15 @@ mod tests {
         store
             .record("s-1", 4, &Event::WorkflowRunFinished { run_id: "b".into() })
             .unwrap();
-        assert_eq!(store.unresolved_workflow_run_ids("s-1"), ["a".to_string()]);
+        // A reused id: the last start is open, so it is listed exactly once.
+        store.record("s-1", 5, &started("c")).unwrap();
+        store
+            .record("s-1", 6, &Event::WorkflowRunFinished { run_id: "c".into() })
+            .unwrap();
+        store.record("s-1", 7, &started("c")).unwrap();
+        let mut open = store.unresolved_workflow_run_ids("s-1");
+        open.sort();
+        assert_eq!(open, ["a".to_string(), "c".to_string()]);
         assert!(store.unresolved_workflow_run_ids("s-2").is_empty());
     }
 
