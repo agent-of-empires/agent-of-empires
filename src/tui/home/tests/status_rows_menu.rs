@@ -2135,6 +2135,8 @@ fn a_hidden_pull_shows_its_progress_on_every_key_line() {
         // Other priority-0 hints wider than the row still leave the badge its room.
         ("paste, search and other TUIs", 40, true, false, ""),
         ("Live send", 100, true, true, "live send"),
+        // Too narrow for the leader hint, which gives way to the badge and exit chord.
+        ("Live send, narrow", 54, true, true, "live send"),
         // A title wide enough to fill the row still leaves the badge its room.
         (
             "Live send, long title",
@@ -2154,7 +2156,10 @@ fn a_hidden_pull_shows_its_progress_on_every_key_line() {
         }
         if live {
             env.view.enter_live_send_for_test();
-            env.view.live_send.as_mut().unwrap().title = title.into();
+            let state = env.view.live_send.as_mut().unwrap();
+            state.title = title.into();
+            state.leader =
+                super::super::live_send::parse_chord(super::super::live_send::DEFAULT_LEADER);
         }
         env.view.hidden_pull = Some(ProgressSnapshot {
             layers_done: Some(3),
@@ -2178,6 +2183,42 @@ fn a_hidden_pull_shows_its_progress_on_every_key_line() {
                 last.contains("to exit"),
                 "{case} lost its exit hint: {last:?}"
             );
+            assert_eq!(
+                last.contains("menu"),
+                width == 100,
+                "{case}: the leader hint: {last:?}"
+            );
         }
+    }
+}
+
+/// Live send's optional hints give way in order where even an empty title can't fit: the leader
+/// hint first, then the scroll indicator, so the exit chord and pull badge stay.
+#[test]
+fn live_send_drops_its_leader_hint_then_its_scroll_indicator() {
+    use super::super::render::live_hints_fit;
+    // (case, width, kept, scroll, leader, (scroll kept, leader kept))
+    for (case, width, kept, scroll, leader, want) in [
+        ("all fit", 70, 40, 8, 12, (true, true)),
+        ("all fit exactly", 60, 40, 8, 12, (true, true)),
+        ("no room for the leader hint", 59, 40, 8, 12, (true, false)),
+        (
+            "no room for the scroll indicator",
+            47,
+            40,
+            8,
+            12,
+            (false, false),
+        ),
+        (
+            "no scroll indicator: the leader hint fits",
+            52,
+            40,
+            0,
+            12,
+            (true, true),
+        ),
+    ] {
+        assert_eq!(live_hints_fit(width, kept, scroll, leader), want, "{case}");
     }
 }

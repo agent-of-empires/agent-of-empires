@@ -841,6 +841,18 @@ pub(super) fn format_snooze_remaining(delta: crate::time::Duration) -> String {
 /// one of left padding.
 const LAST_ACTIVITY_SLOT: usize = 6;
 
+/// Which of Live send's optional hints, `(scroll indicator, leader hint)`, fit beside the pieces
+/// it always draws (`kept`: chip, exit chord, pull badge). The title takes what is left; where
+/// even an empty title can't fit, the leader hint goes first, then the scroll indicator.
+pub(super) fn live_hints_fit(
+    width: usize,
+    kept: usize,
+    scroll: usize,
+    leader: usize,
+) -> (bool, bool) {
+    (kept + scroll <= width, kept + scroll + leader <= width)
+}
+
 /// Trailing gap between the activity slot (or terminal-mode badge) and the pane's right
 /// border, one cell, matching the breathing room other widgets leave around the border.
 const LAST_ACTIVITY_RIGHT_MARGIN: usize = 1;
@@ -4460,7 +4472,7 @@ impl HomeView {
             let suffix = " to exit ";
             // Compact reminder that the leader opens the command menu, so the palette
             // and sidebar toggle are discoverable. Empty when the leader is disabled.
-            let leader_hint = if flash_ctrl_c {
+            let mut leader_hint = if flash_ctrl_c {
                 String::new()
             } else {
                 state
@@ -4476,7 +4488,7 @@ impl HomeView {
             // Pull `captured_lines` from whichever cache is on screen: the Agent cache
             // would show a stale `[offset/max]` in Terminal/Tool live mode. Hidden while
             // the Ctrl+C flash needs the room.
-            let scroll = if flash_ctrl_c {
+            let mut scroll = if flash_ctrl_c {
                 String::new()
             } else {
                 format_scroll_indicator(
@@ -4494,15 +4506,26 @@ impl HomeView {
                 ""
             };
             let badge = self.hidden_pull_badge(theme);
-            // Spaces between chip, title and chord. The title gets what is left after
-            // the fixed pieces, reserved last so the exit chord and the pull badge never fall off.
-            let fixed_width = badge.as_ref().map_or(0, |badge| 2 + badge.width())
+            let kept_width = badge.as_ref().map_or(0, |badge| 2 + badge.width())
                 + unicode_width::UnicodeWidthStr::width(chip)
                 + 1 // single space after the chip
                 + 2 // double space before the chord
                 + unicode_width::UnicodeWidthStr::width(flash)
                 + unicode_width::UnicodeWidthStr::width(chord.as_str())
-                + unicode_width::UnicodeWidthStr::width(suffix)
+                + unicode_width::UnicodeWidthStr::width(suffix);
+            let (keep_scroll, keep_leader) = live_hints_fit(
+                area.width as usize,
+                kept_width,
+                unicode_width::UnicodeWidthStr::width(scroll.as_str()),
+                unicode_width::UnicodeWidthStr::width(leader_hint.as_str()),
+            );
+            if !keep_leader {
+                leader_hint.clear();
+            }
+            if !keep_scroll {
+                scroll.clear();
+            }
+            let fixed_width = kept_width
                 + unicode_width::UnicodeWidthStr::width(leader_hint.as_str())
                 + unicode_width::UnicodeWidthStr::width(scroll.as_str());
             let title_budget = (area.width as usize).saturating_sub(fixed_width);
