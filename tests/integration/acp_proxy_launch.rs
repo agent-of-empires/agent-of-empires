@@ -610,6 +610,7 @@ async fn killing_the_proxy_mid_turn_loses_the_integration() {
         artifact_dir: None,
         // The fake proxy is the adapter command here; in-process spawns launch no proxy.
         proxy: None,
+        mcp_credentials: Default::default(),
         degraded: None,
         sandbox_info: None,
         workspace_info: None,
