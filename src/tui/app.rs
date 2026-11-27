@@ -1822,19 +1822,10 @@ impl App {
     }
 
     fn start_pull(&mut self, image: String) {
-        self.pull.start(self.offered_digest(&image));
+        self.pull.start();
         self.pull_image = image.clone();
         self.cancel_after_start = false;
         self.request_pull(PullRequest::Start, image);
-    }
-
-    /// The digest on offer for `image`: another image's offer says nothing about this pull.
-    /// An offer names the image the Daemon resolved, the default's included.
-    fn offered_digest(&self, image: &str) -> Option<String> {
-        self.image_update
-            .as_ref()
-            .filter(|update| update.image == image)
-            .map(|update| update.remote_digest.clone())
     }
 
     /// A poll waits for the request in flight, and so does a cancel behind a start, which the
@@ -1935,12 +1926,10 @@ impl App {
             }
         };
         let offered = offer.is_some_and(|offer| self.offer_image_update(offer));
-        // A pull seen running elsewhere is of the image this poll reported on, and installs the
-        // update on offer now.
+        // A pull seen running elsewhere is of the image this poll reported on.
         if self.pull.running() && self.pull_image.is_empty() {
             self.pull_image = image.unwrap_or_default();
         }
-        self.pull.note_offer(self.offered_digest(&self.pull_image));
         if !self.pull.running() && !self.pull.holds_line() {
             self.pull_image.clear();
         }
@@ -5081,8 +5070,7 @@ mod tests {
 
         answer_pull(&mut app, PullRequest::Poll, offered(&image_update()));
         app.pull_image = image_update().image;
-        // Started here, as start_pull does, with the digest on offer at the click.
-        app.pull.start(Some(image_update().remote_digest));
+        app.pull.start();
         answer_pull(
             &mut app,
             PullRequest::Poll,
@@ -5109,8 +5097,7 @@ mod tests {
         app.update_info = Some(app_update());
         app.image_update = Some(image_update());
         app.pull_image = image_update().image;
-        // Started here, as start_pull does, with the digest on offer at the click.
-        app.pull.start(Some(image_update().remote_digest));
+        app.pull.start();
         let dismissed = || AppStateConfig::load().unwrap().dismissed_update_version;
 
         draw(&mut app);
@@ -5882,7 +5869,7 @@ mod tests {
         let (mut app, mut terminal) = key_app();
         let ctrl_e = bindings::key_event(bindings::ActionId::CancelImagePull, false).unwrap();
         app.update_status = Some(UpdateStatus::persistent(NOTICE.into()));
-        app.pull.start(None);
+        app.pull.start();
         let notice = Some(DrawnBar::Status(NOTICE.into()));
 
         app.handle_key(ctrl_e, &mut terminal).await.unwrap();
@@ -5942,7 +5929,7 @@ mod tests {
                     app.handle_key(ctrl_e, &mut terminal).await.unwrap();
                 }
                 "image no longer configured" => {
-                    app.pull.start(None);
+                    app.pull.start();
                     answer_pull(&mut app, PullRequest::Poll, PullReport::UnknownImage);
                 }
                 "dismissed" => app.set_pull_status(DISMISS_UNSAVED),
@@ -6015,7 +6002,7 @@ mod tests {
             };
             let (_, mut terminal) = key_app();
             let sent = record_pull_requests(&mut app);
-            app.pull.start(None);
+            app.pull.start();
             if case == "prompt" {
                 app.handle_key(ctrl_e, &mut terminal).await.unwrap();
                 assert!(app.pull.cancel_prompt(std::time::Instant::now()), "{path}");
@@ -6083,7 +6070,7 @@ mod tests {
             let help = bindings::key_event(bindings::ActionId::Help, strict).unwrap();
             let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
             let prompt = |app: &App| app.pull.cancel_prompt(std::time::Instant::now());
-            app.pull.start(None);
+            app.pull.start();
 
             app.handle_key(ctrl_e, &mut terminal).await.unwrap();
             assert!(prompt(&app), "strict={strict}: the first Ctrl+E didn't ask");
@@ -6152,7 +6139,7 @@ mod tests {
                 "strict={strict}: the key that cleared Done didn't act"
             );
 
-            app.pull.start(None);
+            app.pull.start();
             app.handle_key(ctrl_e, &mut terminal).await.unwrap();
             assert!(
                 !prompt(&app),
@@ -6199,7 +6186,7 @@ mod tests {
             assert!(app.home.search_active, "strict={strict}");
             let query = |app: &App| app.home.search_query.value().to_string();
 
-            app.pull.start(None);
+            app.pull.start();
             app.handle_key(ctrl_e, &mut terminal).await.unwrap();
             app.handle_key(ctrl_e, &mut terminal).await.unwrap();
             assert!(

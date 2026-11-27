@@ -221,25 +221,13 @@ pub(crate) struct PullWatch {
     /// Another client's pull found while an outcome waits to be acknowledged: it takes the line
     /// once the outcome is acknowledged, so the outcome isn't lost unread.
     behind: Option<PullLine>,
-    /// The running pull shown, and the one behind; a cancel names the shown one's id.
-    shown: Flight,
-    behind_flight: Flight,
+    /// The Daemon's ids for the running pull shown and the one behind, once an answer named
+    /// them; a cancel names the shown one's.
+    shown_flight: Option<u64>,
+    behind_flight: Option<u64>,
     /// Moves on whenever the line becomes another one, but not on a running pull's progress, so
     /// a key drawn against one outcome can't act on another that looks the same.
     line_id: u64,
-}
-
-/// One pull the Daemon ran, as this TUI knows it. The update it installs goes with it through a
-/// takeover and a promotion, so one pull's Done never records another's.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct Flight {
-    /// The Daemon's id, once an answer named it.
-    pub(crate) id: Option<u64>,
-    /// The update on offer when it was started here, or first seen running elsewhere.
-    pub(crate) digest: Option<String>,
-    /// Started by this TUI, so only the offer at its start names its digest: a later one may be
-    /// of a tag that moved since.
-    pub(crate) started_here: bool,
 }
 
 /// What [`PullWatch::apply`] changed, beyond the line.
@@ -298,17 +286,11 @@ impl PullWatch {
         }
     }
 
-    /// A pull this TUI asked for runs from now, before the first answer arrives. `digest` is the
-    /// update on offer at its start.
-    pub(crate) fn start(&mut self, digest: Option<String>) {
+    /// A pull this TUI asked for runs from now, before the first answer arrives.
+    pub(crate) fn start(&mut self) {
         self.behind = None;
-        self.behind_flight = Flight::default();
+        self.behind_flight = None;
         self.set_line(Some(PullLine::Running(ProgressSnapshot::default())));
-        self.shown = Flight {
-            id: None,
-            digest,
-            started_here: true,
-        };
         self.watched = true;
         self.seen_running = false;
         self.start_unanswered = false;
@@ -463,29 +445,19 @@ impl PullWatch {
         let Some(flight) = flight else {
             return false;
         };
-        // A new id is another pull, which installs what it is seen with, not what the one before
-        // it had. Our own pull's first id is the one it started.
         if self.showing_outcome() && self.behind.is_some() {
-            if self.behind_flight.id != Some(flight) {
-                self.behind_flight = Flight {
-                    id: Some(flight),
-                    ..Flight::default()
-                };
-            }
+            self.behind_flight = Some(flight);
             return false;
         }
         if !self.running() {
             return false;
         }
-        let replaced = self.shown.id.is_some_and(|shown| shown != flight);
+        // Our own pull's first id is the one it started.
+        let replaced = self.shown_flight.is_some_and(|shown| shown != flight);
+        self.shown_flight = Some(flight);
         if !replaced {
-            self.shown.id = Some(flight);
             return false;
         }
-        self.shown = Flight {
-            id: Some(flight),
-            ..Flight::default()
-        };
         self.line_id += 1;
         let unhid = std::mem::take(&mut self.hidden);
         self.cancel_armed.take().is_some() || unhid
@@ -493,22 +465,7 @@ impl PullWatch {
 
     /// The id of the running pull shown, for the cancel to name.
     pub(crate) fn cancel_flight(&self) -> Option<u64> {
-        self.shown.id
-    }
-
-    /// `offered` is the update on offer now for the pull's image. The live pull takes it if it
-    /// has none yet, unless this TUI started it.
-    pub(crate) fn note_offer(&mut self, offered: Option<String>) {
-        let flight = if self.behind_running() {
-            &mut self.behind_flight
-        } else if self.running() && !self.shown.started_here {
-            &mut self.shown
-        } else {
-            return;
-        };
-        if flight.digest.is_none() {
-            flight.digest = offered;
-        }
+        self.shown_flight
     }
 
     fn showing_outcome(&self) -> bool {
@@ -533,12 +490,12 @@ impl PullWatch {
             }
             PullReport::State(PullState::Done { digest }) if self.behind_running() => {
                 self.behind = Some(PullLine::Done);
-                self.behind_flight = Flight::default();
+                self.behind_flight = None;
                 return Some(Applied::Updated(digest.clone()));
             }
             PullReport::State(state) if self.behind.is_some() => {
-                // An ended or vanished pull's update goes with it.
-                self.behind_flight = Flight::default();
+                // An ended or vanished pull's id goes with it.
+                self.behind_flight = None;
                 self.behind = match state {
                     PullState::Done { .. } => Some(PullLine::Done),
                     PullState::Cancelled => Some(PullLine::Cancelled),
@@ -561,7 +518,7 @@ impl PullWatch {
         self.start_unanswered = false;
         self.set_line(next);
         if running {
-            self.shown = flight;
+            self.shown_flight = flight;
         }
     }
 
@@ -580,7 +537,7 @@ impl PullWatch {
         if !matches!(line, Some(PullLine::Running(_))) {
             self.hidden = false;
             self.cancel_armed = None;
-            self.shown = Flight::default();
+            self.shown_flight = None;
         }
         self.line = line;
     }
@@ -790,7 +747,7 @@ mod tests {
         for (case, started, reports, line, applied) in cases {
             let mut watch = PullWatch::default();
             if started {
-                watch.start(None);
+                watch.start();
             }
             let mut last = Applied::Unchanged;
             for (request, report) in reports {
@@ -855,7 +812,7 @@ mod tests {
         ];
         for (case, outcome, after, shown, acknowledged) in cases {
             let mut watch = PullWatch::default();
-            watch.start(None);
+            watch.start();
             watch.apply(PullRequest::Poll, outcome);
             for report in after {
                 let finished = report
@@ -887,10 +844,10 @@ mod tests {
 
         // A retry here is this TUI's own pull: it replaces the outcome and what waited behind it.
         let mut watch = PullWatch::default();
-        watch.start(None);
+        watch.start();
         watch.apply(PullRequest::Poll, failed());
         watch.apply(PullRequest::Poll, running(1));
-        watch.start(None);
+        watch.start();
         assert_eq!(
             watch.line(),
             Some(&PullLine::Running(ProgressSnapshot::default()))
@@ -938,11 +895,15 @@ mod tests {
         assert_eq!(watch.line(), None);
         assert!(!watch.holds_line());
 
-        // A hide is of one pull: another id that replaces it shows.
+        // A hide is of one pull: another id that replaces it shows, but its own first doesn't.
         watch.apply(PullRequest::Poll, running(1));
-        watch.note_flight(Some(1));
         let drawn = watch.drawn().unwrap();
         assert!(watch.dismiss(&drawn));
+        assert!(
+            !watch.note_flight(Some(1)),
+            "the pull's first id changed the bar"
+        );
+        assert_eq!(watch.line(), None, "the pull's first id unhid it");
         assert!(!watch.note_flight(Some(1)), "the same pull changed the bar");
         assert_eq!(watch.line(), None, "the same pull unhid");
         assert!(watch.note_flight(Some(2)), "another pull didn't repaint");
@@ -958,7 +919,7 @@ mod tests {
         assert!(!watch.arm_cancel(at), "nothing to cancel");
         let armed = watch.take_cancel_arm();
         assert!(!watch.confirms_cancel(armed, at), "no prompt to confirm");
-        watch.start(None);
+        watch.start();
         for (confirm, expected) in [
             (at + CANCEL_CONFIRM_TTL, true),
             (at + CANCEL_CONFIRM_TTL + Duration::from_millis(1), false),
@@ -976,7 +937,15 @@ mod tests {
             );
             assert!(!watch.cancel_prompt(at), "the prompt outlived its answer");
         }
-        watch.arm_cancel(at);
+        assert!(watch.arm_cancel(at));
+        assert!(
+            !watch.note_flight(Some(3)),
+            "our pull's first id changed the bar"
+        );
+        assert!(
+            watch.cancel_prompt(at),
+            "our pull's first id ended the prompt"
+        );
         assert!(
             !watch.other_key(watch.drawn().as_ref()),
             "a running pull's line changed on a key"
@@ -995,7 +964,7 @@ mod tests {
 
         // A Start with no reply ends the prompt, so a poll then showing a pull running, under
         // an id this TUI never saw and maybe another client's, doesn't bring it back.
-        watch.start(None);
+        watch.start();
         assert!(watch.arm_cancel(at));
         watch.apply(PullRequest::Start, PullReport::Unavailable);
         watch.apply(PullRequest::Poll, running(1));
