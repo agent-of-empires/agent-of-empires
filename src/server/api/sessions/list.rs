@@ -49,6 +49,21 @@ fn rows_on_same_store(
         .collect()
 }
 
+/// Longest a list projection waits on the own-command store probe.
+const OWN_CMD_STORE_PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Runs the probe off the runtime; a stall or panic past `bound` counts as no match.
+async fn probe_within(
+    bound: std::time::Duration,
+    rows: Vec<(usize, crate::session::capture::OwnCmdStoreProbe)>,
+    admits: impl FnMut(&crate::session::capture::OwnCmdStoreProbe) -> bool + Send + 'static,
+) -> Vec<usize> {
+    let probe = tokio::task::spawn_blocking(move || rows_on_same_store(rows, admits));
+    tokio::time::timeout(bound, probe)
+        .await
+        .map_or_else(|_| Vec::new(), Result::unwrap_or_default)
+}
+
 pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionResponse> {
     let instances = state.instances.read().await;
     let probes = crate::json_probe::Memo::default();
@@ -401,11 +416,10 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     drop(scoped_instances);
     drop(instances);
     if !own_cmd_stores.is_empty() {
-        let matching = tokio::task::spawn_blocking(move || {
-            rows_on_same_store(own_cmd_stores, |probe| probe.launches_bound_store())
+        let matching = probe_within(OWN_CMD_STORE_PROBE_BOUND, own_cmd_stores, |probe| {
+            probe.launches_bound_store()
         })
-        .await
-        .unwrap_or_default();
+        .await;
         for i in matching {
             sessions[i].keeps_context = true;
         }
@@ -875,6 +889,26 @@ mod own_cmd_store_tests {
         });
         assert_eq!(matching, vec![0, 2, 4]);
         assert_eq!(probes, 2);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_probe_is_bounded_and_matches_nothing() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let rows = vec![(0, probe("/w", None, "/w"))];
+        let call = probe_within(std::time::Duration::from_millis(50), rows, move |_| {
+            entered_tx.send(()).unwrap();
+            let _ = blocked.recv();
+            true
+        });
+        let matching = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+            .await
+            .expect("probe_within outlived its bound");
+        assert!(matching.is_empty());
+        entered
+            .try_recv()
+            .expect("the probe ran before the bound expired");
+        drop(release);
     }
 
     #[test]
