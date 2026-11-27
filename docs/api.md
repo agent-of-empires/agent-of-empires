@@ -470,8 +470,8 @@ which also lists workspaces never placed. An optional `base_sort` and
 `base_groups` (profile to Group paths) are refused alike once the sort differs
 or the paths both name stand among their siblings in another order.
 `PATCH /api/sidebar-view` takes the same `base_sort`, and a Group move on
-`POST /api/reorder` an optional `base` list of its profile's Group paths, which
-it answers `stale` on. The response holds the merged `order`
+`POST /api/reorder` an optional `base` list of its profile's Group paths and
+`base_sort`, which it answers `stale` on. The response holds the merged `order`
 and the stored `repositories`, so its `order` is not the next write's base.
 
 Clients written against the historical bare-array response must be updated to

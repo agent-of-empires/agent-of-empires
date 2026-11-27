@@ -445,6 +445,7 @@ pub(in crate::tui::home) async fn settle_reorder(
             siblings,
             freeze: None,
             base: None,
+            base_sort: None,
         }
     } else {
         let id = view.selected_session.clone().expect("selected session");
@@ -3471,7 +3472,7 @@ fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
     assert!(
         matches!(
             respond(Err("refused".into())),
-            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: Some(siblings), freeze: None, base: None }))
+            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: Some(siblings), freeze: None, base: None, base_sort: None }))
                 if group.profile == "test" && group.path == "beta" && siblings == ["zeta", "beta", "mid"]
         ),
         "a nested header moves its profile's Group among the shown siblings"

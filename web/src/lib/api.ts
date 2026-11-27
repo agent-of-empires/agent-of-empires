@@ -352,16 +352,17 @@ export function updateWorkspaceOrdering(patch: WorkspaceOrderingPatch): Promise<
 }
 
 /** Arranges a Group's siblings as `siblings` lists them, then moves it one slot; a Group that did not move, or whose
- *  profile's Group order no longer has `base`'s sibling order, is `rejected`. */
+ *  profile's Group order no longer has `base`'s sibling order, or whose sort is no longer `baseSort`, is `rejected`. */
 export async function reorderGroup(
   group: { profile: string; path: string },
   direction: "up" | "down",
   siblings: string[],
   base?: string[],
+  baseSort?: SidebarView["sort"],
 ): Promise<WriteResult> {
   try {
     const res = await fetch("/api/reorder", {
-      ...jsonInit("POST", { target: "group", group, direction, siblings, base }),
+      ...jsonInit("POST", { target: "group", group, direction, siblings, base, base_sort: baseSort }),
       signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS),
     });
     const result = writeResult(res);

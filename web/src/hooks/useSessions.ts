@@ -166,12 +166,19 @@ export function useSessions() {
   /** Applies a Group move at once and sends it after `after`, dropping it when that fails; the next poll then
    *  restores what the Daemon holds. The Daemon refuses it once the profile's Group order left `base`. */
   const moveGroup = useCallback(
-    async (profile: string, path: string, move: GroupMove, after?: Promise<WriteResult>, base?: string[]) => {
+    async (
+      profile: string,
+      path: string,
+      move: GroupMove,
+      after?: Promise<WriteResult>,
+      base?: string[],
+      baseSort?: SidebarView["sort"],
+    ) => {
       setGroupOrder((prev) => ({ ...prev, [profile]: move.order }));
       holdStarted(groupHold.current);
       const result = await groupWrites.current(async () =>
         !after || (await after).receipt
-          ? reorderGroup({ profile, path }, move.direction, move.siblings, base)
+          ? reorderGroup({ profile, path }, move.direction, move.siblings, base, baseSort)
           : NOT_SENT,
       );
       noteWriteEpoch(result.receipt);

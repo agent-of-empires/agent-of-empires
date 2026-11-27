@@ -998,6 +998,7 @@ impl HomeView {
                 siblings,
                 freeze,
                 base: None,
+                base_sort: None,
             }),
             NamespaceIntent::ReorderGroup { switch },
         )
@@ -1620,6 +1621,40 @@ mod tests {
             crate::session::load_workspace_ordering().unwrap().order,
             [one, two]
         );
+    }
+
+    /// A Group move conditioned on the sort is stale once the shared sort is another.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_group_move_on_another_sort_is_stale() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let rows: Vec<Instance> = [("one", "aaa"), ("two", "bbb")]
+            .into_iter()
+            .map(|(title, group)| {
+                let mut row = Instance::new(title, &format!("/tmp/{title}"));
+                row.group_path = group.into();
+                row
+            })
+            .collect();
+        storage
+            .update(|stored, groups| {
+                *stored = rows.clone();
+                *groups = ["aaa", "bbb"]
+                    .map(|path| crate::session::Group::new(path, path))
+                    .into();
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["reorder"]).await;
+        for (base_sort, expected) in [("name", "stale"), ("custom", "moved")] {
+            let body = serde_json::json!({"target":"group","group":{"profile":"reorder","path":"aaa"},
+                "direction":"down","base_sort":base_sort});
+            let (status, _, value) =
+                request_with_headers(&state, "POST", "/api/reorder", body).await;
+            assert!(status.is_success(), "{status}: {value}");
+            assert_eq!(value["status"], expected, "{base_sort}");
+        }
     }
 
     async fn native_move(group: bool, snapshot_first: bool) {

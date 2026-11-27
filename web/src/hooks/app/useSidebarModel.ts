@@ -43,6 +43,7 @@ interface Options {
     move: GroupMove,
     after?: Promise<WriteResult>,
     base?: string[],
+    baseSort?: SidebarSort,
   ) => Promise<WriteResult>;
   changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<WriteResult>;
   orderingSaving: () => boolean;
@@ -239,8 +240,8 @@ export function useSidebarModel({
 
   /**
    * Writes back what `change` replaced, with the Groups now `groups`. The orders go first, carrying the stored orders
-   * the change left, so the Daemon refuses them once another Client changed them and nothing else is sent. An Undo,
-   * which restores the sort, also has every write carry the sort and Group order it replaces.
+   * the change left, so the Daemon refuses them once another Client changed them and nothing else is sent. Every
+   * write carries the Group order it replaces, and an Undo, which restores the sort, also the sort.
    */
   const putBack = useCallback(
     (change: Undoable, groups: GroupOrder) => {
@@ -251,13 +252,12 @@ export function useSidebarModel({
         ...lists,
         base: change.base,
         ...(owned && { base_sort: "custom" }),
-        ...(owned &&
-          profiles.length > 0 && { base_groups: Object.fromEntries(profiles.map((p) => [p, groups[p] ?? []])) }),
+        ...(profiles.length > 0 && { base_groups: Object.fromEntries(profiles.map((p) => [p, groups[p] ?? []])) }),
       });
       const moves = Object.entries(previousGroups ?? {}).flatMap(([profile, paths]) => {
         let base = groups[profile] ?? [];
         return restoreGroups(base, paths, change.groups[profile] ?? []).map(({ path, move }) => {
-          const write = moveGroup(profile, path, move, ordered, owned ? base : undefined);
+          const write = moveGroup(profile, path, move, ordered, base, owned ? "custom" : undefined);
           base = move.order;
           return write;
         });
@@ -432,18 +432,25 @@ export function useSidebarModel({
             reportInfo("Couldn't switch to Custom, so nothing moved");
             return;
           }
-          return putBack({ ...change, previous: { ...previous, sort: undefined } }, wrote.groups ?? {}).then(
-            ({ failure }) => {
-              if (failure) refresh();
-              reportInfo(
-                !failure
-                  ? "Couldn't switch to Custom, so nothing moved"
-                  : failure === "conflict"
-                    ? "Couldn't switch to Custom; another Client's newer order stays"
-                    : "Couldn't switch to Custom; part of the move saved",
-              );
-            },
-          );
+          // Each profile's Groups as its moves that landed in turn left them.
+          const left: GroupOrder = {};
+          moves.forEach((m, i) => {
+            if (left[m.profile] === undefined) left[m.profile] = groupOrder[m.profile] ?? [];
+            const landed =
+              results[i + 1]?.receipt &&
+              moves.slice(0, i).every((p, j) => p.profile !== m.profile || results[j + 1]?.receipt);
+            if (landed) left[m.profile] = m.move.order;
+          });
+          return putBack({ ...change, previous: { ...previous, sort: undefined } }, left).then(({ failure }) => {
+            if (failure) refresh();
+            reportInfo(
+              !failure
+                ? "Couldn't switch to Custom, so nothing moved"
+                : failure === "conflict"
+                  ? "Couldn't switch to Custom; another Client's newer order stays"
+                  : "Couldn't switch to Custom; part of the move saved",
+            );
+          });
         })
         .finally(() => (switching.current = false));
     },

@@ -486,6 +486,10 @@ pub enum ReorderBody {
         /// their siblings in another order.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base: Option<Vec<String>>,
+        /// The sort the move was built under; the move is refused as stale once the shared
+        /// sort is another.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_sort: Option<crate::session::config::SortOrder>,
     },
 }
 

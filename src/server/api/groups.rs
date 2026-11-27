@@ -793,9 +793,21 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
     // A metadata-only transition may touch the entire live sibling set. Taking the
     // namespace write guard avoids selecting a partial set of per-session locks.
     let namespace = state.profile_namespace.write().await;
+    // A move conditioned on the sort holds the sort's lane, as an ordering write does, so
+    // the sort cannot change between the check and the commit.
+    let base_sort = match &body {
+        ReorderBody::Group { base_sort, .. } => *base_sort,
+        ReorderBody::Session { .. } => None,
+    };
+    let lane = match base_sort {
+        Some(_) => Some(state.sidebar_view_lane.lock().await),
+        None => None,
+    };
     if *state.canonical_health.read().await != RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    let stored_sort = state.canonical_metadata.read().await.sidebar_view.sort;
+    let sort_moved = base_sort.is_some_and(|sort| sort != stored_sort);
     let profile = match &body {
         ReorderBody::Session { profile, .. } => profile,
         ReorderBody::Group { group, .. } => &group.profile,
@@ -817,7 +829,7 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
         )),
         ReorderBody::Session { .. } => None,
     };
-    let result = if !exists {
+    let result = if !exists || sort_moved {
         Ok(ReorderOutcome::Stale)
     } else {
         let worker_state = state.clone();
@@ -903,6 +915,7 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
             Err(error) => Err(error.into()),
         }
     };
+    drop(lane);
     drop(namespace);
     match result {
         Ok(outcome) => {

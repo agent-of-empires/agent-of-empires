@@ -80,7 +80,10 @@ const server = setupServer(
   http.post("*/api/reorder", async ({ request }) => {
     const body = (await request.json()) as ReorderBody;
     writes.push({ method: "POST", body });
-    if (body.base && !sameSiblings(daemon.group_order[body.group.profile] ?? [], body.base)) {
+    if (
+      (body.base && !sameSiblings(daemon.group_order[body.group.profile] ?? [], body.base)) ||
+      (body.base_sort && body.base_sort !== daemon.sidebar_view.sort)
+    ) {
       return HttpResponse.json({ status: "stale" });
     }
     if (!reorder(body)) return HttpResponse.json({ status: "at_edge" });
@@ -94,6 +97,7 @@ interface ReorderBody {
   direction: "up" | "down";
   siblings?: string[];
   base?: string[];
+  base_sort?: string;
 }
 
 /** Arranges the listed siblings slot for slot, then swaps the Group with its neighbour, as the Daemon does. */
@@ -809,7 +813,7 @@ describe("Group headers", () => {
 
     await act(async () => void toasts.undo[0]!.run());
     await waitFor(() => expect(writes).toHaveLength(6));
-    expect(writes[4]).toMatchObject({ method: "POST", body: { group: { path: "zeta" } } });
+    expect(writes[4]).toMatchObject({ method: "POST", body: { group: { path: "zeta" }, base_sort: "custom" } });
     expect(daemon.group_order.default).toEqual(["zeta", "alpha", "alpha/inner", "mid", "loose"]);
     expect(writes[5]).toEqual({ method: "PATCH", body: { sort: "name", base_sort: "custom" } });
   });
@@ -851,6 +855,46 @@ describe("Group headers", () => {
       server.resetHandlers();
       unmount();
     }
+  });
+
+  it("are left alone by Undo once another Client picks a sort after its orders saved", async () => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+    await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    const arranged = [...daemon.group_order.default!];
+    const releases = heldWrites("put", "*/api/workspace-ordering");
+    act(() => void toasts.undo[0]!.run());
+    await waitFor(() => expect(writes).toHaveLength(4));
+    // The ordering write saw Custom; the sort changes before the Group move that follows it.
+    daemon.sidebar_view = { group_by: "group", sort: "newest" };
+    await act(async () => releases.shift()!());
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    expect(writes[4]).toMatchObject({ method: "POST", body: { base_sort: "custom" } });
+    expect(daemon.group_order.default).toEqual(arranged);
+    expect(daemon.sidebar_view.sort).toBe("newest");
+  });
+
+  it("are put back only from the order a switch's landed moves left, when the sort then fails", async () => {
+    daemon.sidebar_view = { group_by: "group", sort: "name" };
+    const before = [...daemon.group_order.default!];
+    const { result } = mount();
+    await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+    const releases = heldWrites("put", "*/api/workspace-ordering");
+    act(() => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    daemon.sidebar_view = { group_by: "group", sort: "newest" };
+    await act(async () => releases.shift()!());
+    await waitFor(() => expect(writes.map((w) => w.method)).toEqual(["PUT", "POST", "PATCH", "PUT"]));
+    const arranged = [...daemon.group_order.default!];
+    expect(writes[3]!.body).toMatchObject({ base_groups: { default: arranged } });
+    await act(async () => releases.shift()!());
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    expect(writes[4]).toMatchObject({ method: "POST", body: { base: arranged } });
+    expect(daemon.group_order.default).toEqual([...before, "loose"]);
+    expect(daemon.sidebar_view.sort).toBe("newest");
   });
 
   it("keep a Group another Client placed when Undo puts their order back", async () => {
@@ -913,7 +957,9 @@ describe("Group headers", () => {
     await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
     await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
     await waitFor(() => expect(toasts.info).toHaveBeenCalledWith("Couldn't switch to Custom, so nothing moved"));
-    expect(writes.map((w) => w.method)).toEqual(["PUT", "PUT", "POST"]);
+    // The failed move left the Groups as they were, so only the rows go back, conditioned on those Groups.
+    expect(writes.map((w) => w.method)).toEqual(["PUT", "PUT"]);
+    expect(writes[1]!.body).toMatchObject({ base_groups: { default: ["zeta", "alpha", "alpha/inner", "mid"] } });
     expect(daemon.workspace_ordering).toEqual(before);
     expect(toasts.undo).toEqual([]);
     await pollAt(result, daemon.revision);
