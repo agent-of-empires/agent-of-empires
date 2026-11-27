@@ -33,8 +33,8 @@
         "primitive_schema_version": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 1,
-          "maximum": 1
+          "minimum": 2,
+          "maximum": 2
         }
       },
       "additionalProperties": false,
@@ -51,8 +51,8 @@
         "v": {
           "type": "integer",
           "format": "uint32",
-          "minimum": 1,
-          "maximum": 1
+          "minimum": 2,
+          "maximum": 2
         },
         "key": {
           "type": "string",
@@ -123,6 +123,47 @@
           "anyOf": [
             {
               "$ref": "#/$defs/OptionPreview"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "background_task": {
+          "description": "The four lifecycle primitives are read on any update kind and are\nforbidden with `ephemeral: true`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackgroundTask"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workflow_run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowRun"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "wakeup": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Wakeup"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Monitor"
             },
             {
               "type": "null"
@@ -219,7 +260,7 @@
       ]
     },
     "ToolPresentation": {
-      "description": "A card header hint. Validated and carried in v1; no surface renders it yet.",
+      "description": "A card header hint. Validated and carried; no surface renders it yet.",
       "type": "object",
       "properties": {
         "icon": {
@@ -250,7 +291,7 @@
       "additionalProperties": false
     },
     "OptionPreview": {
-      "description": "Preview text for one option of a form elicitation. Validated and carried\nin v1.",
+      "description": "Preview text for one option of a form elicitation. Validated and carried.",
       "type": "object",
       "properties": {
         "option_id": {
@@ -265,6 +306,137 @@
         "option_id",
         "markdown"
       ]
+    },
+    "BackgroundTask": {
+      "description": "A background task. `started` is also the renewal and holds a task lease for\n`ttl_ms`; `ended` releases it and takes no `ttl_ms`.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
+        "ttl_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "maximum": 3600000
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "state"
+      ]
+    },
+    "RunState": {
+      "description": "Whether a background task or workflow run is live or over.",
+      "type": "string",
+      "enum": [
+        "started",
+        "ended"
+      ]
+    },
+    "WorkflowRun": {
+      "description": "A workflow run, with the lease rules of [`BackgroundTask`].",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
+        "ttl_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "maximum": 3600000
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunProgress"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "state"
+      ]
+    },
+    "RunProgress": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "completed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Wakeup": {
+      "description": "A wakeup at an absolute RFC 3339 time.",
+      "type": "object",
+      "properties": {
+        "at": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "at"
+      ]
+    },
+    "Monitor": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

@@ -1339,8 +1339,8 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
     let _ = tokio::join!(agent, connection);
 }
 
-const GOOD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}"#;
-const BAD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":9,"primitive_schema_version":1}}}"#;
+const GOOD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":2}}}"#;
+const BAD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":9,"primitive_schema_version":2}}}"#;
 
 const HELLO_WITH_INFO: &str = r#","agentInfo":{"name":"claude-x","version":"1.2.0"},"_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}"#;
 
@@ -1458,12 +1458,12 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
     let frames = [
         tool_call_frame("t1", ""),
         // Tailer-emitted: waits for adapter frame 3.
-        tool_call_frame("t2", r#"{"v":1,"key":"k2","after_adapter_sequence":3}"#),
-        tool_call_frame("t3", r#"{"v":1,"key":"k3","ephemeral":true}"#),
-        tool_call_frame("t4", r#"{"v":1,"key":"k4"}"#),
-        tool_call_frame("t4-again", r#"{"v":1,"key":"k4"}"#),
+        tool_call_frame("t2", r#"{"v":2,"key":"k2","after_adapter_sequence":3}"#),
+        tool_call_frame("t3", r#"{"v":2,"key":"k3","ephemeral":true}"#),
+        tool_call_frame("t4", r#"{"v":2,"key":"k4"}"#),
+        tool_call_frame("t4-again", r#"{"v":2,"key":"k4"}"#),
         tool_call_frame("t5", ""),
-        tool_call_frame("t6", r#"{"v":1}"#),
+        tool_call_frame("t6", r#"{"v":2}"#),
     ];
     for frame in &frames {
         write_line(&fake.agent_write, frame).await;

@@ -681,7 +681,7 @@ mod tests {
         assert!(ingress.route(notif("old"), None).unwrap().is_none());
         let mut tailer = notif("old");
         let anchored =
-            serde_json::json!({"aoe": {"v": 1, "key": "t", "after_adapter_sequence": 2}});
+            serde_json::json!({"aoe": {"v": 2, "key": "t", "after_adapter_sequence": 2}});
         if let agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(chunk) =
             &mut tailer.update
         {
