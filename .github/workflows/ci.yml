@@ -244,7 +244,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: node --test .github/scripts/cancel-obsolete-queue-runs.test.cjs
+      - run: node --test .github/scripts/cancel-obsolete-queue-runs.test.cjs .github/scripts/macos-gate.test.cjs
       - run: scripts/verify-shared-target.sh --self-test
       - run: python3 .github/scripts/select-internal-pr.py --self-test
       - run: python3 .github/scripts/check-dependabot-pr.py --self-test

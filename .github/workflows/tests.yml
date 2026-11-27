@@ -293,59 +293,18 @@ jobs:
     outputs:
       run: ${{ steps.decide.outputs.run }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
       - id: decide
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           QUEUE_REF: ${{ github.event.merge_group.head_ref }}
         with:
           script: |
-            const run = reason => { core.notice(`macOS runs: ${reason}`); core.setOutput('run', 'true'); };
-            const pr = context.payload.pull_request;
-            const queue = context.payload.merge_group;
-            // refs/heads/gh-readonly-queue/<base>/pr-<number>-<base sha>
-            const number = pr?.number ?? Number(/\/pr-(\d+)-[0-9a-f]+$/.exec(process.env.QUEUE_REF)?.[1]);
-            if (!number) return run(`no PR number in ${process.env.QUEUE_REF}`);
-            const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
-            if (current.labels.some(l => l.name === 'ci-macos')) return run('ci-macos label');
-
-            const prefixes = [
-              'src/process/', 'src/git/', 'src/migrations/', 'src/containers/',
-              'src/session/config/container_config/',
-              '.github/actions/rust-toolchain/',
-            ];
-            // Existing macOS-only bodies can change without touching their cfg.
-            const exact = [
-              'src/hooks/dir_guard.rs', 'src/server/api/system.rs',
-              'src/server/api/sessions/file_edit.rs', 'src/session/anchored_fs.rs',
-              'src/session/mod.rs', 'src/sound/playback.rs',
-              'src/tui/clipboard.rs', 'src/tui/open_url.rs',
-              'src/session/config/container_config.rs',
-              'src/session/instance/container.rs',
-              'src/session/sandbox_store_reclaim.rs',
-              'build.rs', 'rust-toolchain.toml',
-              // A PR lockfile bump runs post-merge; the queue still checks it.
-              ...(pr ? [] : ['Cargo.lock']),
-            ];
-            const cfg = /target_os\s*=\s*"macos"/;
-            const sensitive = path => !!path &&
-              (exact.includes(path) || prefixes.some(p => path.startsWith(p)));
-            // A queue entry is diffed whole, so every PR in the group counts.
-            const base = pr ? pr.base.sha : queue.base_sha;
-            const head = pr ? pr.head.sha : queue.head_sha;
-            const { data: diff } = await github.rest.repos.compareCommitsWithBasehead({
-              ...context.repo, basehead: `${base}...${head}`,
-            });
-            // The compare API lists at most 300 files.
-            if (diff.files.length >= 300) return run('diff too large to inspect');
-            const hit = diff.files.find(f =>
-              sensitive(f.filename) || sensitive(f.previous_filename) ||
-              // Only Rust and TOML hold the cfg; binaries have no patch.
-              (!f.patch && /\.(rs|toml)$/.test(f.filename)) ||
-              f.patch?.split('\n').some(line =>
-                /^[+-](?![+-]{2} )/.test(line) && cfg.test(line)));
-            if (hit) return run(`${hit.filename} is macOS-sensitive`);
-            core.notice('macOS skipped: runs post-merge on main. Add ci-macos and re-run this job to run it here.');
-            core.setOutput('run', 'false');
+            const gate = require('./.github/scripts/macos-gate.cjs');
+            await gate({ github, context, core, queueRef: process.env.QUEUE_REF });
 
   cargo-macos:
     # Push always runs; a failed gate also runs it rather than pass unchecked.
