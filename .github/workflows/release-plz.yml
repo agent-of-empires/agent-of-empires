@@ -35,8 +35,8 @@ jobs:
       actions: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
@@ -60,10 +60,10 @@ jobs:
           fi
 
       - name: Install Rust toolchain
-        uses: ./.github/actions/rust-toolchain
+        uses: $/.github/actions/rust-toolchain
 
       - name: Run release-plz
-        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        uses: release-plz/action@v0.5.148
         with:
           command: release
         env:
@@ -91,17 +91,17 @@ jobs:
       cancel-in-progress: false
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: ./.github/actions/rust-toolchain
+        uses: $/.github/actions/rust-toolchain
 
       - name: Run release-plz
-        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        uses: release-plz/action@v0.5.148
         with:
           command: release-pr
         env:
