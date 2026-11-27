@@ -108,7 +108,7 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await page.locator("header").getByRole("button", { name: "More options" }).click();
     await expect(page.getByRole("menuitem", { name: /Copy branch/ })).toBeVisible();
 
-    const items = page.locator('[role^="menuitem"]');
+    const items = page.getByRole("menu").locator('[role^="menuitem"]');
     const boxes = await items.evaluateAll((els) =>
       els.map((el) => {
         const r = el.getBoundingClientRect();
@@ -121,6 +121,9 @@ test.describe("Mobile session view tabs (#1452)", () => {
         .soft(box.right, `${box.label} right edge (viewport ${viewport.width})`)
         .toBeLessThanOrEqual(viewport.width);
     }
+    // The branch line is clipped to the capped width, not left to widen the menu.
+    const detail = page.getByRole("menu").getByText("feat/lifecycle-primitives", { exact: false });
+    expect(await detail.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
     const menu = await page.getByRole("menu").boundingBox();
     expect.soft(menu!.x, "menu left edge").toBeGreaterThanOrEqual(0);
     expect
