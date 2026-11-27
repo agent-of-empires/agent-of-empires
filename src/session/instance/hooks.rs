@@ -870,7 +870,13 @@ impl Instance {
                 &environment,
                 config_dir.as_deref(),
             );
-            if crate::hooks::is_other_builtin_trust_file(&path, agent.name, &home, &environment) {
+            if crate::hooks::is_other_builtin_trust_file(
+                &path,
+                agent.name,
+                &home,
+                &environment,
+                &config.session,
+            ) {
                 tracing::warn!(target: "session.store",
                     "Not pre-trusting {} for {}: {} is another agent's trust file",
                     project_path, agent.name, path.display());

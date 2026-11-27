@@ -222,13 +222,15 @@ pub fn declared_trust_applies_in_sandbox(trust: &AgentTrustDeclaration, yolo: bo
     }
 }
 
-/// Whether `path` is the trust file of a built-in agent other than `agent_name`, so a
-/// plugin cannot pre-trust folders for another agent.
+/// Whether `path` is the trust file of a built-in agent other than `agent_name`, at
+/// its default, environment or `session.agent_config_dir` location, so a plugin
+/// cannot pre-trust folders for another agent.
 pub fn is_other_builtin_trust_file(
     path: &Path,
     agent_name: &str,
     home: &Path,
     host_env: &[String],
+    session: &crate::session::config::SessionConfig,
 ) -> bool {
     let from_env = |var: &str| resolve_config_dir_override(var, host_env).map(PathBuf::from);
     let builtin = [
@@ -248,7 +250,12 @@ pub fn is_other_builtin_trust_file(
     builtin
         .iter()
         .filter(|(name, ..)| *name != agent_name)
-        .any(|(_, dir, file)| same(path, &dir.join(file)))
+        .any(|(name, dir, file)| {
+            same(path, &dir.join(file))
+                || session
+                    .agent_config_dir_for(name, home)
+                    .is_some_and(|dir| same(path, &dir.join(file)))
+        })
         || (agent_name != "gemini"
             && from_env("GEMINI_CLI_TRUSTED_FOLDERS_PATH").is_some_and(|file| same(path, &file)))
 }
@@ -714,11 +721,41 @@ mod tests {
             (home.join("alias/other.json"), &[][..], "example", false),
         ] {
             assert_eq!(
-                is_other_builtin_trust_file(&path, agent, home, env),
+                is_other_builtin_trust_file(&path, agent, home, env, &Default::default()),
                 refused,
                 "{} {agent}",
                 path.display()
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn declared_trust_never_targets_a_relocated_builtin_trust_file() {
+        let _guard = EnvGuard::unset(&[
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "GEMINI_CLI_TRUSTED_FOLDERS_PATH",
+        ]);
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut session = crate::session::config::SessionConfig::default();
+        for (agent, dir) in [("gemini", "shared"), ("claude", "claude-cfg")] {
+            session
+                .agent_config_dir
+                .insert(agent.into(), home.join(dir).to_string_lossy().into_owned());
+        }
+        let refused = |path: &str, agent: &str| {
+            is_other_builtin_trust_file(&home.join(path), agent, home, &[], &session)
+        };
+
+        assert!(refused("shared/trustedFolders.json", "example"));
+        assert!(refused("claude-cfg/.claude.json", "example"));
+        assert!(
+            !refused("shared/trustedFolders.json", "gemini"),
+            "its own file"
+        );
+        assert!(!refused("shared/other.json", "example"));
+        assert!(!refused(".example.json", "example"));
     }
 }
