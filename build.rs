@@ -145,6 +145,14 @@ fn build_frontend() {
 
     // Builds the bundle with inline sourcemaps for Playwright coverage.
     println!("cargo:rerun-if-env-changed=AOE_COVERAGE");
+
+    println!("cargo:rerun-if-env-changed=AOE_SKIP_WEB_BUILD");
+    // `cargo xtask dev`: Vite serves the dashboard, so keep web/dist as is.
+    if std::env::var_os("AOE_SKIP_WEB_BUILD").is_some() {
+        std::fs::create_dir_all("web/dist").expect("Failed to create web/dist");
+        return;
+    }
+
     if let Ok(dist_src) = std::env::var("AOE_WEB_DIST") {
         eprintln!("Using pre-built web frontend from AOE_WEB_DIST={dist_src}");
         let src = Path::new(&dist_src);

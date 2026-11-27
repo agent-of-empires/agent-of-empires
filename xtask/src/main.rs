@@ -66,22 +66,17 @@ fn run_dev(_args: DevArgs) {
     std::process::exit(1);
 }
 
-/// Vite serves the dashboard, so an empty `AOE_WEB_DIST` skips the npm bundle
+/// Vite serves the dashboard, so `AOE_SKIP_WEB_BUILD` skips the npm bundle
 /// while `web` keeps `aoe.web` registered.
 #[cfg(unix)]
-fn build_backend(target_dir: &Path) -> bool {
+fn build_backend() -> bool {
     use std::process::Command;
-    let empty_dist = target_dir.join("xtask-empty-web-dist");
-    if let Err(e) = fs::create_dir_all(&empty_dist) {
-        eprintln!("[xtask dev] failed to create {}: {e}", empty_dist.display());
-        return false;
-    }
     eprintln!(
         "[xtask dev] building aoe --features web (bundle skipped, Vite serves the dashboard)..."
     );
     Command::new("cargo")
         .args(["build", "--features", "web"])
-        .env("AOE_WEB_DIST", empty_dist)
+        .env("AOE_SKIP_WEB_BUILD", "1")
         .status()
         .map(|s| s.success())
         .unwrap_or_else(|e| {
@@ -171,7 +166,7 @@ fn run_dev(args: DevArgs) {
 
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let target_dir = Path::new(&target_dir);
-    if !build_backend(target_dir) {
+    if !build_backend() {
         std::process::exit(1);
     }
 
@@ -344,7 +339,7 @@ fn run_dev(args: DevArgs) {
                 if Instant::now() >= at {
                     rebuild_at = None;
                     eprintln!("[xtask dev] change detected; rebuilding aoe...");
-                    if build_backend(target_dir) {
+                    if build_backend() {
                         if let Some(mut old) = serve.take() {
                             terminate_group(&mut old, Duration::from_secs(2));
                         }

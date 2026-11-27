@@ -25,7 +25,7 @@ export PATH RUSTC_WRAPPER='' RUSTDOC=rustdoc HOST_CC=cc HOST_CXX=c++
 export CARGO_TARGET_DIR="$B/target"
 export GIT_AUTHOR_NAME=bench GIT_AUTHOR_EMAIL=bench@localhost \
   GIT_COMMITTER_NAME=bench GIT_COMMITTER_EMAIL=bench@localhost GIT_CONFIG_GLOBAL=/dev/null
-unset AOE_WEB_DIST
+unset AOE_WEB_DIST AOE_SKIP_WEB_BUILD
 
 cat > "$B/disk-ok" <<EOF
 #!/bin/sh
@@ -106,13 +106,12 @@ if [[ $RUN == *" 3 "* ]]; then
 echo "== 3. xtask dev rebuild"
 "$DISK"
 cargo build --features web -q
-mkdir -p "$B/empty-dist"
-# Toggling AOE_WEB_DIST reruns build.rs, so each row gets a warm-up run.
+# Toggling AOE_SKIP_WEB_BUILD reruns build.rs, so each row gets a warm-up run.
 hyperfine --runs 5 --warmup 1 --export-markdown "$OUT/3-xtask-dev.md" --export-json "$OUT/3-xtask-dev.json" \
   -n 'web, Rust edit' --prepare "\"$DISK\" && touch src/lib.rs" 'cargo build --features web -q' \
   -n 'web, Rust edit after a frontend edit' --prepare "\"$DISK\" && touch web/src/main.tsx src/lib.rs" 'cargo build --features web -q' \
-  -n 'web, empty bundle, Rust edit after a frontend edit' --prepare "\"$DISK\" && touch web/src/main.tsx src/lib.rs" \
-  "env AOE_WEB_DIST=\"$B/empty-dist\" cargo build --features web -q"
+  -n 'web, bundle skipped, Rust edit after a frontend edit' --prepare "\"$DISK\" && touch web/src/main.tsx src/lib.rs" \
+  'env AOE_SKIP_WEB_BUILD=1 cargo build --features web -q'
 fi
 
 for f in "$OUT"/*; do echo "--- $(basename "$f")"; cat "$f"; done
