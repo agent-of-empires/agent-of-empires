@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
-import { BRAND_BUTTON, CancelButton, ConfirmButton, Dialog, Spinner } from "../Dialog";
+import { CancelButton, ConfirmButton, Dialog, Spinner } from "../Dialog";
 import { useBusyAction, useConfirmKeys, useDialogFocus } from "../dialogHooks";
 import {
   nativeInputAvailable,
@@ -410,7 +410,6 @@ function StartupFreshDialog({
             buttonRef={confirmRef}
             onClick={confirm}
             busy={starting}
-            className={BRAND_BUTTON}
             testId="startup-fresh-confirm"
           >
             {starting ? "Starting fresh…" : "Start fresh"}
@@ -482,7 +481,7 @@ function InteractionErrorBanner({
 }) {
   return (
     <WarningStrip title={title} onDismiss={onDismiss}>
-      {message}
+      <span className="block">{message}</span>
     </WarningStrip>
   );
 }
