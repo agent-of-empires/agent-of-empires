@@ -42,7 +42,10 @@ struct PublicationFlockObservation {
     session_id: String,
     message: &'static str,
     before_lock: Option<(
-        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Sender<(
+            EventScope,
+            Option<crate::acp::state::NativeObservationScope>,
+        )>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
     contended: std::sync::mpsc::Sender<std::path::PathBuf>,
@@ -403,7 +406,7 @@ impl<S: BroadcastSink> Drain<S> {
                 .filter(|observer| observer.matches(&self.session_id, data.event.as_ref()))
                 .and_then(|observer| observer.before_lock.take());
             if let Some((entered, release)) = gate {
-                let _ = entered.send(());
+                let _ = entered.send((data.metadata.scope, self.history_scope.clone()));
                 let _ = release.await;
             }
         }
@@ -2985,51 +2988,48 @@ mod tests {
                         ).unwrap());
                     // Hold the real flocks only when the ordered drain reaches the actual
                     // diagnostic. Earlier SDK publications and completion routing must run freely.
-                    tokio::time::timeout(Duration::from_secs(10), at_diagnostic)
+                    let (diagnostic_scope, history) = tokio::time::timeout(Duration::from_secs(10), at_diagnostic)
                         .await.expect("the real completion reaches the ordered drain")
                         .expect("the ordered drain reaches the runtime diagnostic");
                     let storage = crate::session::Storage::open_reference("test").unwrap();
                     // The anchored path and this profile can spell the same lock
                     // differently on macOS (for example, /var versus /private/var).
                     let profile_dir = storage.sessions_path().parent().unwrap().canonicalize().unwrap();
-                    let lifecycle_path = profile_dir.join(format!(".instance-lifecycle-{}.lock", client.id));
-                    let mut preceding_lifecycle = if profile_writer {
-                        Some(storage.acquire_instance_lifecycle_lock(&client.id).unwrap())
-                    } else {
-                        None
-                    };
-                    let native = if profile_writer {
-                        crate::session::acquire_storage_flock(&profile_dir, crate::session::STORAGE_LOCK_FILENAME).unwrap()
-                    } else {
-                        storage.acquire_instance_lifecycle_lock(&client.id).unwrap()
-                    };
-                    if profile_writer {
+                    let (native, held_path) = if profile_writer {
+                        assert_eq!(diagnostic_scope, EventScope::HistoryOnly);
+                        let history = history.expect("the retained drain captured a physical Native fence");
+                        assert_eq!(history.context, completion.origin.context);
+                        drop(history.fence.lock_original_history()
+                            .expect("the exact retained fence can read its original row"));
+                        // Isolate the profile writer: holding a second lifecycle lock
+                        // could stall a competing reader before it releases the
+                        // fence's cache mutex and lets the diagnostic reach its wait.
+                        let native = crate::session::acquire_storage_flock(
+                            &profile_dir, crate::session::STORAGE_LOCK_FILENAME,
+                        ).unwrap();
                         // Force a revision change even on filesystems with coarse
                         // timestamps. The trailing whitespace leaves the Native row intact.
                         use std::io::Write as _;
                         std::fs::OpenOptions::new().append(true)
                             .open(storage.sessions_path()).unwrap().write_all(b"\n").unwrap();
-                    }
+                        assert!(history.fence.try_lock_original_history()
+                            .expect("the retained fence still binds the original row")
+                            .is_none(), "the profile writer physically excludes the exact retained fence");
+                        (native, profile_dir.join(crate::session::STORAGE_LOCK_FILENAME))
+                    } else {
+                        (storage.acquire_instance_lifecycle_lock(&client.id).unwrap(),
+                            profile_dir.join(format!(".instance-lifecycle-{}.lock", client.id)))
+                    };
                     assert_eq!(completion.origin.context,
                         crate::acp::state::NativeEventContext::capture(&original_row, &storage).unwrap());
                     resume_diagnostic.send(()).expect("resume actual diagnostic publication");
-                    let held_path = if profile_writer {
-                        profile_dir.join(crate::session::STORAGE_LOCK_FILENAME)
-                    } else {
-                        lifecycle_path.clone()
-                    };
+                    // Require the actual diagnostic to hit the physical lock,
+                    // independently of the retained fence preflight above.
                     tokio::task::spawn_blocking(move || {
                         loop {
                             let reported_path = contended_rx.recv_timeout(Duration::from_secs(10))?
                                 .canonicalize().expect("observed lock file still exists");
-                            if reported_path == lifecycle_path {
-                                drop(preceding_lifecycle.take());
-                            }
                             if reported_path == held_path {
-                                if profile_writer {
-                                    assert!(preceding_lifecycle.is_none(),
-                                        "profile contention follows the actual lifecycle wait");
-                                }
                                 break;
                             }
                         }
