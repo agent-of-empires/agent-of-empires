@@ -1457,6 +1457,44 @@ async fn auto_start_is_refused_for_the_agent_provider() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn auto_start_waits_for_the_provider_switch_and_stays_out_of_cityhall() {
+    for (cityhall, switch_off) in [(false, true), (true, false)] {
+        let f = fixture_with(Vec::new(), cityhall);
+        f.seed_item("a", Some("acme/web"), "42");
+        let repo = f.repo.to_string_lossy().into_owned();
+        f.call(
+            Method::PUT,
+            "/api/suggestions/mappings",
+            json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo] }),
+        )
+        .await;
+        f.host.with_suggestions_db(|conn, profile| {
+            crate::plugin::suggestions::set_auto_start(
+                conn,
+                profile,
+                PROVIDER,
+                "assigned",
+                Some(3),
+            )
+            .unwrap();
+            if switch_off {
+                conn.execute("UPDATE suggestion_provider_prefs SET enabled = 0", [])
+                    .unwrap();
+            }
+        });
+        super::suggestions::sweep_auto_start(&f.state).await;
+        let attempted: i64 = f.host.with_suggestions_db(|conn, _| {
+            conn.query_row("SELECT COUNT(*) FROM suggestion_auto_started", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        });
+        assert_eq!(attempted, 0, "cityhall={cityhall} switch_off={switch_off}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn auto_start_never_starts_a_yolo_preset() {
     let f = fixture();
     f.seed_item("a", Some("acme/web"), "42");

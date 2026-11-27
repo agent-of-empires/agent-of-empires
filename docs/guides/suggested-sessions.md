@@ -61,7 +61,7 @@ After each provider publish, AoE starts up to the cap of that kind's items that:
 - have exactly one linked Project, need no hooks or MCP review, and use a preset with Yolo off,
 - were never auto started before (each item is tried once, even if the start fails).
 
-Nothing runs when you turn the switch on, only after the next publish, and only when the daemon accepts changes (not on a read-only dashboard). Items left alone show a "Not auto started: <reason>" note while the switch is on. A failed start keeps "Auto start failed: <reason>. Start it by hand." on the row and is not retried.
+Nothing runs when you turn the switch on, only after the next publish, and only for a provider that is switched on, and only when the daemon accepts changes (not on a read-only dashboard or in CityHall mode). Items left alone show a "Not auto started: <reason>" note while the switch is on. A failed start keeps "Auto start failed: <reason>. Start it by hand." on the row and is not retried.
 
 ### After starting
 

@@ -100,7 +100,8 @@ async fn run<T: Send + 'static>(
 
 /// One pass over every provider with a criterion on auto start.
 pub(crate) async fn sweep(state: &Arc<AppState>) {
-    if state.read_only {
+    // CityHall refuses `/api/suggestions/start`, so the sweep must not start what that route would refuse.
+    if state.read_only || state.cityhall_mode {
         return;
     }
     let Some(host) = state.plugin_host.clone() else {
@@ -110,7 +111,17 @@ pub(crate) async fn sweep(state: &Arc<AppState>) {
     let Some(Ok(enabled)) = run(&host, suggestions::auto_starts).await else {
         return;
     };
+    let Some(Ok(switched_on)) = run(&host, suggestions::enabled_providers).await else {
+        return;
+    };
     for provider in suggestions::providers() {
+        if !switched_on.contains(&provider.id) {
+            tracing::debug!(
+                target: "plugin.suggestions",
+                provider = %provider.id, "auto start skipped: the provider is switched off"
+            );
+            continue;
+        }
         // Every push wakes a sweep and a started session can push again, so no cap would bind.
         if provider.id == suggestions::AGENT_PROVIDER_ID {
             continue;
