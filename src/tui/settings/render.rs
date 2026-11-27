@@ -859,6 +859,9 @@ impl SettingsView {
                     theme,
                 );
             }
+            FieldValue::ReadOnly(value) => {
+                self.render_text_field(canvas, value_area, value, index, is_selected, theme);
+            }
             FieldValue::SectionHeader => {
                 // Handled by the early return at the top of `render_field`.
             }

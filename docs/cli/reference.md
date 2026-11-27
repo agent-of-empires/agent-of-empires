@@ -220,7 +220,7 @@ Add a new session
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
 * `--tool <TOOL>` — Named built-in or configured custom agent to run
 * `-P`, `--parent <PARENT>` — Parent session (creates sub-session, inherits group, not worktree or path). Without `--worktree` or `--scratch`, opens at `<path>` (default: current directory) on its checked-out branch. `--scratch` uses a fresh directory
-* `--fork-from <FORK_FROM>` — Fork an existing session: resume its conversation context in a new, independent session that then diverges. Give the source session's id or title. Terminal fork; available for agents that support forking (claude, codex, opencode, pi)
+* `--fork-from <FORK_FROM>` — Fork an existing session: resume its conversation context in a new, independent session that then diverges. Give the source session's id or title. Terminal fork; available for agents that support forking (claude, codex, opencode, pi, prime-agent, omp)
 * `-l`, `--launch` — Launch the session immediately after creating
 * `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch
 * `-b`, `--new-branch` — Create a new branch (use with --worktree)
@@ -1906,7 +1906,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`, or `AOE_DAEMON_PASSPHRASE` against a `--auth=passphrase` daemon) to attach across machines without going through the home session list
 * `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
-* `switch-account` — Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt; otherwise it gets the usual restart wake message. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
+* `switch-account` — Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
 * `switch-provider` — Re-route a Claude session to a different LLM provider, keeping the transcript. Refused mid-turn; once idle the worker restarts and resumes the same conversation. Credentials are not provisioned by this: the target provider's own variables must already be set on the host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for vertex). The model resets to the new provider's default, because model ids differ between providers
 
 
@@ -2181,7 +2181,7 @@ Switch an agent session to a different ACP agent, keeping the transcript. Valid 
 
 ## `aoe acp switch-account`
 
-Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt; otherwise it gets the usual restart wake message. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
+Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
 
 **Usage:** `aoe acp switch-account <SESSION> <TOOL>`
 
