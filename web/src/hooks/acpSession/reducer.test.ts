@@ -645,6 +645,22 @@ describe("integration lost", () => {
     expect(state.sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable"]);
   });
 
+  it("later notices do not evict the degraded-proxy banner, and a turn keeps it", () => {
+    const notice = (seq: number, title: string, key?: string) =>
+      frame(seq, { SessionNotice: { severity: "warning", title, description: null, key } });
+    const state = run(
+      empty(),
+      notice(1, "Fake features unavailable", "proxy-degraded"),
+      notice(2, "a"),
+      notice(3, "b"),
+      notice(4, "c"),
+      notice(5, "d"),
+    );
+    expect(state.sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable", "c", "d"]);
+    const next = run(state, frame(6, { UserPromptSent: { text: "hi", prompt_id: "p" } }));
+    expect(next.sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable"]);
+  });
+
   it("a worker assignment retires the degraded-proxy banner until the notice is re-asserted", () => {
     const notice = (seq: number, title: string, key?: string) =>
       frame(seq, { SessionNotice: { severity: "warning", title, description: null, key } });

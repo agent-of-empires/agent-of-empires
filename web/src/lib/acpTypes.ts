@@ -1249,7 +1249,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.sessionNotices = next.sessionNotices.map((n) => (n.id === id ? entry : n));
       return next;
     }
-    next.sessionNotices = [...next.sessionNotices, entry].slice(-MAX_SESSION_NOTICES);
+    // The degraded-proxy banner outlives the cap, like the daemon's reducer.
+    const notices = [...next.sessionNotices, entry];
+    while (notices.length > MAX_SESSION_NOTICES) {
+      const oldest = notices.findIndex((n) => n.id !== PROXY_DEGRADED_NOTICE_ID);
+      if (oldest < 0) break;
+      notices.splice(oldest, 1);
+    }
+    next.sessionNotices = notices;
     return next;
   }
   if ("AuthStatusUpdated" in event) {

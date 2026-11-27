@@ -1290,11 +1290,15 @@ impl AcpState {
                     Some(existing) => *existing = notice,
                     None => self.session_notices.push(notice),
                 }
-                let excess = self
-                    .session_notices
-                    .len()
-                    .saturating_sub(Self::MAX_SESSION_NOTICES);
-                self.session_notices.drain(..excess);
+                // The degraded-proxy banner outlives the cap: it stays true
+                // until the proxy is back.
+                let degraded = notice_id(Some(PROXY_DEGRADED_NOTICE_KEY), 0);
+                while self.session_notices.len() > Self::MAX_SESSION_NOTICES {
+                    match self.session_notices.iter().position(|n| n.id != degraded) {
+                        Some(oldest) => self.session_notices.remove(oldest),
+                        None => break,
+                    };
+                }
             }
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
@@ -2064,6 +2068,17 @@ mod tests {
             titles(&applied([degraded(), assigned.clone(), degraded()])),
             ["Fake features unavailable"],
             "a degraded worker re-asserts the notice after assignment"
+        );
+        let flood = (0..AcpState::MAX_SESSION_NOTICES + 2).map(|i| notice(&format!("n{i}")));
+        let flooded = applied(
+            std::iter::once(degraded())
+                .chain(flood)
+                .chain([prompt("next")]),
+        );
+        assert_eq!(
+            titles(&flooded),
+            ["Fake features unavailable"],
+            "later notices do not evict the banner, and a turn keeps it"
         );
         assert!(
             titles(&applied([degraded(), assigned])).is_empty(),
