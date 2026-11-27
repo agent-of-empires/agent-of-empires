@@ -1500,6 +1500,7 @@
       "id": "sidebar.terminal-focus-handoff",
       "kind": "mocked-playwright",
       "risk": "medium",
+      "notes": "Ctrl+Q opens the closed mobile drawer and focuses the active session without sending a terminal control byte.",
       "specs": [
         "tests/terminal-focus-shortcut.spec.ts",
         "tests/acp-retained-focus-sidebar-nav.spec.ts",
