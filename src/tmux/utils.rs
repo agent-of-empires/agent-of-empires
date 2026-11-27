@@ -492,6 +492,17 @@ pub(crate) fn pane_current_command_at(target: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// How many rows the pane `target` shows.
+pub(crate) fn pane_height_at(target: &str) -> Option<usize> {
+    crate::tmux::tmux_query_command()
+        .args(["display-message", "-t", target, "-p", "#{pane_height}"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
 /// The terminal title the pane's program published over OSC, for callers
 /// outside the batched poll that reads it as part of [`crate::tmux::PaneMetadata`].
 ///

@@ -807,10 +807,9 @@ fn readiness_in(
     let Some(pane) = pane else {
         return (PaneReadiness::Unreadable, None);
     };
-    let readiness = readiness_of(
-        instance.detect_pane_now(&instance.source_profile, session, None, Some(&pane)),
-        instance.input_line_in(session, &pane),
-    );
+    let (detected, input_line) =
+        instance.detect_pane_and_input_line_now(&instance.source_profile, session, &pane);
+    let readiness = readiness_of(detected, input_line);
     #[cfg(test)]
     crate::tmux::test_helpers::after_input_check(&pane);
     (readiness, Some(pane))
@@ -1219,6 +1218,80 @@ mod tests {
             assert_eq!(readiness, want, "{case}");
             assert_eq!(checked, looked_up, "{case}");
         }
+    }
+
+    /// The status and the input box come from one capture: a screen that changes after it can't
+    /// pair the first frame's prompt box with the next frame's missing one.
+    #[test]
+    #[serial_test::serial]
+    fn readiness_reads_status_and_draft_from_one_capture() {
+        use crate::tmux::test_helpers::{only_pane_id, TmuxTestSession, INPUT_BOX_SCRIPT};
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let mut instance = Instance::new("mcp-one-capture", "/tmp/aoe-mcp-one-capture");
+        instance.source_profile = "default".into();
+        let session = instance.tmux_session().unwrap();
+        let mut args: Vec<String> = ["new-session", "-d", "-s", session.name(), "sh", "-c"]
+            .map(str::to_string)
+            .to_vec();
+        args.push(INPUT_BOX_SCRIPT.to_string());
+        crate::tmux::utils::append_pane_base_index_args(&mut args, session.name());
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
+        let _cleanup = TmuxTestSession::from_name(session.name());
+        let pane = only_pane_id(session.name());
+        let shows = |text: &str| {
+            session
+                .try_capture_pane_in(&pane, 0)
+                .is_ok_and(|screen| screen.contains(text))
+        };
+        let wait_until_shown = |text: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !shows(text) {
+                assert!(std::time::Instant::now() < deadline, "{text} shows");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        wait_until_shown("for shortcuts");
+        assert!(crate::tmux::tmux_command()
+            .args(["send-keys", "-t", &pane, "-l", "half typed"])
+            .status()
+            .unwrap()
+            .success());
+        wait_until_shown("❯ half typed");
+
+        // After the capture, the pane is replaced by a screen with no input box.
+        let replaced = pane.clone();
+        crate::tmux::test_helpers::on_screen_captured(&pane, move || {
+            assert!(crate::tmux::tmux_command()
+                .args([
+                    "respawn-pane",
+                    "-k",
+                    "-t",
+                    &replaced,
+                    "printf 'another screen\\n'; exec cat",
+                ])
+                .status()
+                .unwrap()
+                .success());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &replaced])
+                .output()
+                .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("another screen"))
+            {
+                assert!(std::time::Instant::now() < deadline, "the new screen shows");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let (readiness, checked) = readiness_in(&instance, &session, Some(pane.clone()));
+        assert_eq!(readiness, PaneReadiness::Drafted, "draft-then-replaced");
+        assert_eq!(checked, Some(pane));
     }
 
     #[test]

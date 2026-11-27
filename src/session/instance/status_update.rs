@@ -15,6 +15,15 @@ fn detection_content<'a>(
     fresh.or(reuse.map(|(reused, _)| reused))
 }
 
+/// The last `height` rows of `capture`, a `capture-pane` of the scrollback and the screen below it.
+fn visible_rows(capture: &str, height: usize) -> &str {
+    let body = capture.strip_suffix('\n').unwrap_or(capture);
+    match body.rmatch_indices('\n').nth(height.saturating_sub(1)) {
+        Some((at, _)) => &capture[at + 1..],
+        None => capture,
+    }
+}
+
 /// What ended a pane, as a sentence the remedy can follow: the adapter's diagnostic when it saw
 /// one, else that the terminal ended.
 fn ended_sentence(diagnostic: Option<&str>) -> String {
@@ -767,6 +776,40 @@ impl Instance {
         Some((detection.status, detection.rule))
     }
 
+    /// [`Self::detect_pane_now`] of `pane` and what its input box holds, both from one capture,
+    /// so a frame change can't pair one screen's status with another's box. The box is read from
+    /// the capture's visible rows, as [`Self::input_line_in`] reads it: one left in the
+    /// scrollback is no box.
+    pub(crate) fn detect_pane_and_input_line_now(
+        &self,
+        profile: &str,
+        session: &tmux::Session,
+        pane: &str,
+    ) -> (Option<(Option<Status>, &'static str)>, tmux::InputLine) {
+        let alias = tmux::status_rules::effective_detect_as(profile, &self.tool, &self.detect_as);
+        let manifest_tool: &str = if alias.is_empty() { &self.tool } else { &alias };
+        let rules_tool = tmux::status_rules::detection_tool(profile, &self.tool, &self.detect_as);
+        let lines = tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)
+            .map_or(0, |plan| plan.capture_policy().scope.lines());
+        let Ok(capture) = session.try_capture_pane_in(pane, lines) else {
+            let status = self.detect_pane_now(profile, session, None, Some(pane));
+            return (status, tmux::InputLine::Unknown);
+        };
+        #[cfg(test)]
+        tmux::test_helpers::after_screen_captured(pane);
+        let input = if !tmux::detect::has_input_line(&self.input_line_tool()) {
+            tmux::InputLine::Unknown
+        } else if lines == 0 {
+            self.input_line_of(&capture)
+        } else {
+            tmux::utils::pane_height_at(pane).map_or(tmux::InputLine::Unknown, |height| {
+                self.input_line_of(visible_rows(&capture, height))
+            })
+        };
+        let status = self.detect_pane_now(profile, session, Some((&capture, lines)), Some(pane));
+        (status, input)
+    }
+
     /// Whether the agent, not a shell it left, owns the session's live pane, or `pane` when
     /// given. `metadata`, when present, is the poller's read of that pane.
     pub(crate) fn live_pane_owned(
@@ -961,6 +1004,35 @@ mod tests {
         ];
         for (fresh, reuse, want) in cases {
             assert_eq!(detection_content(fresh, reuse), want, "{fresh:?} {reuse:?}");
+        }
+    }
+
+    #[test]
+    fn the_visible_rows_are_the_captures_last() {
+        // (case, capture, height, want)
+        let cases = [
+            (
+                "history-above",
+                "old\nbox\nscreen1\nscreen2\n",
+                2,
+                "screen1\nscreen2\n",
+            ),
+            (
+                "no-trailing-newline",
+                "old\nscreen1\nscreen2",
+                2,
+                "screen1\nscreen2",
+            ),
+            ("shorter-than-height", "screen1\n", 5, "screen1\n"),
+            (
+                "whole-capture",
+                "screen1\nscreen2\n",
+                2,
+                "screen1\nscreen2\n",
+            ),
+        ];
+        for (case, capture, height, want) in cases {
+            assert_eq!(visible_rows(capture, height), want, "{case}");
         }
     }
 
