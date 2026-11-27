@@ -39,6 +39,9 @@ fn open_regular_for_write(path: &Path) -> Result<Option<std::fs::File>> {
 /// Overwrites `path` through the same inode, for a file a running container may
 /// already mount by inode. Anything but a lone regular file (a link, a FIFO, a
 /// hardlink to another file) is unlinked and created fresh, never written through.
+///
+/// The payload is one `write_all` after `set_len(0)`; a crash between the two leaves
+/// an empty file, which the declared-trust reader treats as absent.
 fn write_in_place(path: &Path, content: &[u8]) -> Result<()> {
     use std::io::Write;
     for _ in 0..2 {
@@ -354,6 +357,10 @@ fn write_declared_trust_with(
         &policy.lock_path(path)?,
         |content| match content {
             None => Ok(Value::Object(Default::default())),
+            // An empty staged file is what an interrupted in-place write leaves.
+            Some(content) if in_place && content.trim().is_empty() => {
+                Ok(Value::Object(Default::default()))
+            }
             Some(content) => serde_json::from_str(&content)
                 .with_context(|| format!("{} is not valid JSON", path.display())),
         },
@@ -872,5 +879,28 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&other).unwrap(), r#"{"keep":true}"#);
         assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 1);
         assert_eq!(read_json(&path)["projects"]["/repo"]["trusted"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_staged_file_is_absent_but_the_host_writer_stays_strict() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".example.json");
+        for empty in ["", " \n\t"] {
+            std::fs::write(&path, empty).unwrap();
+            write_declared_trust_in_place(&path, &staged_trust(), "/repo").unwrap();
+            assert_eq!(read_json(&path)["projects"]["/repo"]["trusted"], true);
+        }
+
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(write_declared_trust_in_place(&path, &staged_trust(), "/repo").is_err());
+        assert!(
+            write_declared_trust(&path, &staged_trust(), "/repo", SymlinkPolicy::Follow).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
+        std::fs::write(&path, "").unwrap();
+        assert!(
+            write_declared_trust(&path, &staged_trust(), "/repo", SymlinkPolicy::Follow).is_err()
+        );
     }
 }
