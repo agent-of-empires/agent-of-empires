@@ -37,33 +37,6 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-/// Rows whose store probe admits resuming, running each distinct probe once.
-fn rows_on_same_store(
-    rows: Vec<(usize, crate::session::capture::OwnCmdStoreProbe)>,
-    mut admits: impl FnMut(&crate::session::capture::OwnCmdStoreProbe) -> bool,
-) -> Vec<usize> {
-    let mut probed = std::collections::HashMap::new();
-    rows.into_iter()
-        .filter(|(_, probe)| *probed.entry(probe.clone()).or_insert_with(|| admits(probe)))
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Longest a list projection waits on the own-command store probe.
-const OWN_CMD_STORE_PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Runs the probe off the runtime; a stall or panic past `bound` counts as no match.
-async fn probe_within(
-    bound: std::time::Duration,
-    rows: Vec<(usize, crate::session::capture::OwnCmdStoreProbe)>,
-    admits: impl FnMut(&crate::session::capture::OwnCmdStoreProbe) -> bool + Send + 'static,
-) -> Vec<usize> {
-    let probe = tokio::task::spawn_blocking(move || rows_on_same_store(rows, admits));
-    tokio::time::timeout(bound, probe)
-        .await
-        .map_or_else(|_| Vec::new(), Result::unwrap_or_default)
-}
-
 pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionResponse> {
     let instances = state.instances.read().await;
     let probes = crate::json_probe::Memo::default();
@@ -175,16 +148,11 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // Overlay custom-agent ACP and fork capability; built-ins were resolved in
     // the constructor. Distinct `(profile, project_path)` pairs resolve once via
     // the shared cache.
-    let mut own_cmd_stores = Vec::new();
-    for (i, (resp, inst)) in sessions
-        .iter_mut()
-        .zip(scoped_instances.iter().copied())
-        .enumerate()
-    {
+    for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
         let needs_identity = inst.tool != "claude"
             && matches!(resp.acp_agent.as_deref(), Some("claude" | "claude-code"));
         if !resp.acp_capable || needs_identity {
-            let (cfg, launch) = session_cfg_cache.resolve_with_launch(
+            let cfg = session_cfg_cache.resolve(
                 &inst.source_profile,
                 &inst.repo_config_path().to_string_lossy(),
             );
@@ -199,18 +167,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 resp.acp_can_fork =
                     crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
             }
-            let agent = inst.effective_acp_agent_with(|| cfg);
-            resp.keeps_context = inst.acp_transcript_cli_resumable_with(&agent, cfg);
-            // The store probe touches the filesystem, so only its inputs are collected here.
-            if !resp.keeps_context && !inst.is_structured() {
-                let stores =
-                    inst.own_acp_cmd_stores_with(&agent, || crate::session::OwnCmdConfig {
-                        session: cfg,
-                        profile_environment: launch.environment.clone(),
-                        before_session_hook: launch.before_session_hook,
-                    });
-                own_cmd_stores.extend(stores.map(|stores| (i, stores)));
-            }
+            resp.keeps_context =
+                inst.acp_transcript_cli_resumable_with(&inst.effective_acp_agent_with(|| cfg), cfg);
         }
         // The solo commands of the agent that classifies this session's prompts, resolved as the
         // queue and publication resolve it, so a custom agent's declared reset is advertised.
@@ -415,15 +373,6 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // session registry unlocked rather than holding writers behind it.
     drop(scoped_instances);
     drop(instances);
-    if !own_cmd_stores.is_empty() {
-        let matching = probe_within(OWN_CMD_STORE_PROBE_BOUND, own_cmd_stores, |probe| {
-            probe.launches_bound_store()
-        })
-        .await;
-        for i in matching {
-            sessions[i].keeps_context = true;
-        }
-    }
     if !park_probes.is_empty() {
         let store = Arc::clone(&state.acp_event_store);
         let overlays = tokio::task::spawn_blocking(move || {
@@ -855,77 +804,6 @@ mod context_resume_tests {
                 reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
             }
         );
-    }
-}
-
-#[cfg(test)]
-mod own_cmd_store_tests {
-    use super::*;
-    use crate::session::capture::OwnCmdStoreProbe;
-    use std::path::PathBuf;
-
-    fn probe(declared: &str, ambient: Option<&str>, bound: &str) -> OwnCmdStoreProbe {
-        OwnCmdStoreProbe {
-            declared: PathBuf::from(declared),
-            home: PathBuf::from("/home/u"),
-            ambient: ambient.map(PathBuf::from),
-            bound: PathBuf::from(bound),
-        }
-    }
-
-    #[test]
-    fn rows_sharing_a_probe_run_it_once() {
-        let rows = vec![
-            (0, probe("/w", None, "/w")),
-            (1, probe("/w", None, "/other")),
-            (2, probe("/w", None, "/w")),
-            (3, probe("/w", None, "/other")),
-            (4, probe("/w", None, "/w")),
-        ];
-        let mut probes = 0;
-        let matching = rows_on_same_store(rows, |p| {
-            probes += 1;
-            p.declared == p.bound
-        });
-        assert_eq!(matching, vec![0, 2, 4]);
-        assert_eq!(probes, 2);
-    }
-
-    #[tokio::test]
-    async fn a_stalled_probe_is_bounded_and_matches_nothing() {
-        let (release, blocked) = std::sync::mpsc::channel::<()>();
-        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
-        let rows = vec![(0, probe("/w", None, "/w"))];
-        let call = probe_within(std::time::Duration::from_millis(50), rows, move |_| {
-            entered_tx.send(()).unwrap();
-            let _ = blocked.recv();
-            true
-        });
-        let matching = tokio::time::timeout(std::time::Duration::from_secs(10), call)
-            .await
-            .expect("probe_within outlived its bound");
-        assert!(matching.is_empty());
-        entered
-            .try_recv()
-            .expect("the probe ran before the bound expired");
-        drop(release);
-    }
-
-    #[test]
-    fn probes_differ_by_ambient_only() {
-        let default_store = "/home/u/.claude";
-        let rows = vec![
-            (0, probe(default_store, Some("/a"), "/a")),
-            (1, probe(default_store, Some("/a"), "/a")),
-            (2, probe(default_store, Some("/b"), "/a")),
-            (3, probe(default_store, None, "/a")),
-        ];
-        let mut probes = 0;
-        rows_on_same_store(rows, |_| {
-            probes += 1;
-            true
-        });
-        assert_eq!(probes, 3);
     }
 }
 

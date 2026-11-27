@@ -410,13 +410,7 @@ pub(crate) struct SessionCfgStore {
 struct StoredSessionCfg {
     /// Every file the resolve read, with the bytes it parsed.
     inputs: Vec<(std::path::PathBuf, Fingerprint)>,
-    config: (SessionConfig, StructuredView, String, HostLaunchInputs),
-}
-
-/// The resolved config a launch-store preview reads beyond `SessionConfig`.
-pub(super) struct HostLaunchInputs {
-    pub(super) environment: Vec<String>,
-    pub(super) before_session_hook: bool,
+    config: (SessionConfig, StructuredView, String),
 }
 
 /// One request's view of [`SessionCfgStore`], shared across the `list_sessions`
@@ -515,7 +509,7 @@ impl<'a> SessionCfgCache<'a> {
         &mut self,
         profile: &str,
         project_path: &str,
-    ) -> &(SessionConfig, StructuredView, String, HostLaunchInputs) {
+    ) -> &(SessionConfig, StructuredView, String) {
         // Resolving `""` would read the default profile's name from disk, past the fingerprints,
         // so key and resolve by the name itself.
         let profile = match profile {
@@ -561,10 +555,6 @@ impl<'a> SessionCfgCache<'a> {
                             config.session,
                             config.acp.structured_view,
                             config.acp.resolved_default_agent().to_string(),
-                            HostLaunchInputs {
-                                before_session_hook: !config.host_hooks.before_session.is_empty(),
-                                environment: config.environment,
-                            },
                         ),
                     },
                 );
@@ -575,16 +565,6 @@ impl<'a> SessionCfgCache<'a> {
 
     pub(super) fn resolve(&mut self, profile: &str, project_path: &str) -> &SessionConfig {
         &self.entry(profile, project_path).0
-    }
-
-    /// As [`Self::resolve`], with the inputs the launch-store preview needs.
-    pub(super) fn resolve_with_launch(
-        &mut self,
-        profile: &str,
-        project_path: &str,
-    ) -> (&SessionConfig, &HostLaunchInputs) {
-        let config = self.entry(profile, project_path);
-        (&config.0, &config.3)
     }
 
     pub(super) fn profile_config(

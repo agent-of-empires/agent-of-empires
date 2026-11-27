@@ -84,7 +84,7 @@ pub(crate) mod test_helpers;
 mod tmux_session;
 mod types;
 
-pub(crate) use accessors::{resolved_agent_for, OwnCmdConfig, UNBOUND_STORE_HINT};
+pub(crate) use accessors::{resolved_agent_for, UNBOUND_STORE_HINT};
 pub use flags::{SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket, StartBlocked};
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 

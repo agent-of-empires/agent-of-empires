@@ -3928,11 +3928,9 @@ impl HomeView {
             return;
         };
         // Mirrors the backend gate (agents::acp_transcript_cli_resumable). See #2252.
-        let keeps_context = self.get_instance(&id).is_some_and(|inst| {
-            let agent = inst.effective_acp_agent();
-            inst.acp_transcript_cli_resumable(&agent)
-                || (to_structured && inst.resumes_claude_under_own_acp_cmd(&agent))
-        });
+        let keeps_context = self
+            .get_instance(&id)
+            .is_some_and(|inst| inst.acp_transcript_cli_resumable(&inst.effective_acp_agent()));
         let (title, body) = if to_structured && keeps_context {
             (
                 "Switch to structured view",
