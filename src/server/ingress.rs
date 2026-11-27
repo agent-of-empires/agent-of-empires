@@ -281,7 +281,16 @@ mod tests {
             peer: &str,
             headers: &[(&str, &str)],
         ) -> (StatusCode, Option<ApiErrorCode>) {
-            let mut builder = Request::builder().uri("/api/sessions");
+            probe_at("/api/sessions", state, peer, headers).await
+        }
+
+        async fn probe_at(
+            uri: &str,
+            state: std::sync::Arc<crate::server::AppState>,
+            peer: &str,
+            headers: &[(&str, &str)],
+        ) -> (StatusCode, Option<ApiErrorCode>) {
+            let mut builder = Request::builder().uri(uri);
             for (name, value) in headers {
                 builder = builder.header(*name, *value);
             }
@@ -317,6 +326,23 @@ mod tests {
             let opted_out = build_test_app_state_ingress(Some(TOKEN.into()), None, false, true);
             let (status, _) = probe(opted_out, "203.0.113.9", &[("host", "localhost")]).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        /// The gate covers the plugin MCP endpoints too: a sandbox reaching the daemon over
+        /// `host.containers.internal` is a remote peer, so the daemon publishes that route only
+        /// when plaintext remote access is on (see `daemon_endpoint::sandbox_url_for`).
+        #[tokio::test]
+        async fn remote_plaintext_is_rejected_on_the_plugin_endpoints_too() {
+            let endpoint = "/mcp/plugins/acme.serve/srv";
+            let sandbox = [("host", "host.containers.internal:8081")];
+            let strict = build_test_app_state_ingress(Some(TOKEN.into()), None, false, false);
+            assert_eq!(
+                probe_at(endpoint, strict, "203.0.113.9", &sandbox).await,
+                TLS_REQUIRED
+            );
+            let opted_out = build_test_app_state_ingress(Some(TOKEN.into()), None, false, true);
+            let (status, _) = probe_at(endpoint, opted_out, "203.0.113.9", &sandbox).await;
+            assert_ne!(status, StatusCode::UPGRADE_REQUIRED);
         }
 
         #[tokio::test]

@@ -55,6 +55,7 @@ Existing examples: `theme-name` (dynamic select plus repaint), `sound-volume` (a
 
 - **`hooks`** has no `SettingsSection` at all. Hooks are arbitrary commands, so the hard exclusion is defense in depth against a future policy change making them web-writable.
 - **`Config.environment`** is a root-level `Vec<String>` with no section, so it is TUI and `config.toml` only. Surfacing it would need a config-layout migration.
+- **`keybinds`** is a root-level action-to-keys map, read by the TUI only and shown on a read-only Keybinds page built from `src/tui/home/keybinds.rs`, so it is `config.toml` only.
 - **`diff`** is schema-backed for the TUI, but the web Diff tab is intentionally client-local.
 - **`telemetry`** is in the schema, but the web toggle uses a dedicated consent endpoint that records "has responded" and honors `DO_NOT_TRACK`.
 - **`app_state`** is global-only runtime bookkeeping persisted to `state.toml` (see the [configuration reference](../guides/configuration.md#file-locations)). Read and write it through `update_app_state` / `AppStateConfig::load`, never `update_config`, which writes `config.toml` and strips `app_state` on save. Before adding a field shaped like this, reconsider whether it is a setting at all.

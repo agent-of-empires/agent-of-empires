@@ -253,6 +253,37 @@ fn enter_or_right_focuses_the_pane_and_esc_returns_to_the_row() {
     }
 }
 
+/// A remapped `activate` focuses the pane from the row, its hint names the new key,
+/// and bare Enter no longer does.
+#[test]
+#[serial]
+fn remapped_activate_focuses_the_pane() {
+    use crate::tui::home::keybinds;
+    let mut env = create_test_env_with_sessions(1);
+    let config = crate::session::Config {
+        keybinds: [("activate".to_string(), vec!["C-Enter".to_string()])].into(),
+        ..Default::default()
+    };
+    let (keymap, warnings) = keybinds::from_config(&config);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    keybinds::install(keymap);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(snapshot(2, &[]));
+    env.view.rebuild_flat_items();
+    select_suggested_row(&mut env);
+
+    let text = render_home_to_string(&mut env.view, 140, 40);
+    assert!(text.contains("Ctrl+Enter browse"), "{text}");
+    assert!(!text.contains("↵ browse"), "{text}");
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(!env.view.suggestions_focused, "bare Enter is unbound");
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), None);
+    assert!(env.view.suggestions_focused);
+    keybinds::install(keybinds::Keymap::default());
+}
+
 /// S (Ctrl+S in strict mode) moves the cursor to the Suggested row and
 /// focuses its pane; with the row hidden it focuses the pane where the cursor
 /// is, and Esc gives the preview back to that Session.
