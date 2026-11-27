@@ -14,7 +14,11 @@ permissions:
 jobs:
   cancel:
     if: github.event.workflow_run.event == 'merge_group'
-    runs-on: ubuntu-latest
+    # Each queue run starts one copy. RunsOn keeps them out of the shared
+    # GitHub-hosted queue, where they waited up to 35 min behind PR jobs.
+    # Copies cannot share a concurrency group: each handles only its own PR's
+    # queue entry.
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cancel-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
     timeout-minutes: 5
     steps:
       # workflow_run's SHA belongs to the default branch, never the queue head.
