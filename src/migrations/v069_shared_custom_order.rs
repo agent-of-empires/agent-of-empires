@@ -176,6 +176,13 @@ fn run_in(app_dir: &Path, pass: Pass) -> Result<()> {
 
     let ordering_path = app_dir.join("workspace-ordering.json");
     let read = read_if_present(&ordering_path).and_then(|content| {
+        if content.is_none() {
+            // A link to a missing directory cannot be seeded, and replacing it would lose it.
+            let target = crate::session::resolve_symlink_chain(&ordering_path)?;
+            if target.parent().is_some_and(|dir| !dir.is_dir()) {
+                anyhow::bail!("{} has no directory to hold it", target.display());
+            }
+        }
         content
             .map(|content| serde_json::from_str(&content))
             .transpose()
@@ -692,6 +699,46 @@ mod tests {
             assert!(!pending.exists(), "{broken}");
             run_in(dir.path(), Pass::Recovery).unwrap();
         }
+    }
+
+    /// A link to a missing directory is kept, with every legacy input, until the directory
+    /// returns and recovery seeds through the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_to_a_missing_directory_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            serde_json::json!([{"id": "a", "project_path": "/r/one", "sort_index": 0}]),
+        );
+        fs::write(
+            dir.path().join("state.toml"),
+            format!("{LEGACY_SORT_KEY} = \"custom\"\n"),
+        )
+        .unwrap();
+        let link = dir.path().join("workspace-ordering.json");
+        let target = dir.path().join("dotfiles/aoe/workspace-ordering.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let rows = || fs::read_to_string(dir.path().join("profiles/main/sessions.json")).unwrap();
+
+        run_in(dir.path(), Pass::Upgrade).unwrap();
+        assert!(rows().contains("sort_index"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join(PENDING_FILE)).unwrap(),
+            "custom\n?order\n?repositories\n"
+        );
+        run_in(dir.path(), Pass::Recovery).unwrap();
+        assert!(dir.path().join(PENDING_FILE).exists());
+
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        run_in(dir.path(), Pass::Recovery).unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(ordering(dir.path()).order, ["/r/one::__session__::a"]);
+        assert!(!rows().contains("sort_index"));
+        assert!(!dir.path().join(PENDING_FILE).exists());
     }
 
     /// An upgrade that ran but was not recorded runs again without the marker; the pending
