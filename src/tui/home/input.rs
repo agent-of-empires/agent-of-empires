@@ -4111,9 +4111,10 @@ impl HomeView {
         }
         let nested = format!("{group_path}/");
         let profile = self.selected_group_profile.as_deref();
-        // Newest member first, so the pick does not depend on `HashMap` order.
+        // Newest live member first, matching the rows the header is built from.
         self.instances
             .values()
+            .filter(|inst| !inst.is_archived() && !inst.is_trashed())
             .filter(|inst| profile.is_none_or(|p| inst.source_profile == p))
             .filter(|inst| {
                 let path = match self.group_by {

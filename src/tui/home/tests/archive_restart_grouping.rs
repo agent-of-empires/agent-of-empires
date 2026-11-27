@@ -1281,7 +1281,10 @@ fn nested_repository_group_new_session_uses_its_own_checkout() {
     let mut frontend = instance_in("fe", "/a/repo", "frontend");
     frontend.created_at = crate::time::Timestamp::now() - crate::time::Duration::days(1);
     let backend = instance_in("be", "/b/repo", "backend");
-    let env = seeded_env(test_home(), &[frontend, backend], false);
+    // A newer archived checkout sharing the basename is not a member of the live header.
+    let mut archived = instance_in("old", "/c/repo", "frontend");
+    archived.archive();
+    let env = seeded_env(test_home(), &[frontend, backend, archived], false);
     for (header, want) in [("repo/frontend", "/a/repo"), ("repo/backend", "/b/repo")] {
         assert_eq!(
             env.view.group_repo_path(header).as_deref(),
