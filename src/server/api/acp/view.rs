@@ -211,7 +211,7 @@ pub async fn acp_enable(
     }
 
     let agent_name = pick_agent(&state, &instance, instance.agent_name.as_deref()).await;
-    let import_terminal = match commit_structured_view(
+    let (import_terminal, reservation) = match commit_structured_view(
         &state,
         &mut instance,
         selected_binding.as_ref(),
@@ -236,24 +236,55 @@ pub async fn acp_enable(
         agent_name,
         selected_conversation,
         import_terminal,
+        reservation,
     );
     view_response(&state, id, View::Structured).await
 }
 
-/// Commit the structured view and publish its authoritative status once.
+/// Reserve the worker before committing and publishing the structured view.
 async fn commit_structured_view(
     state: &Arc<AppState>,
     instance: &mut Instance,
     selected_binding: Option<&crate::session::ConversationBinding>,
     agent_name: &str,
     namespace: tokio::sync::OwnedRwLockReadGuard<()>,
-) -> Result<bool, Response> {
+) -> Result<(bool, crate::acp::supervisor::ResumeReservation), Response> {
     let inst_for_transition = instance.clone();
     let profile = instance.source_profile.clone();
     let commit_state = state.clone();
     let binding_for_transition = selected_binding.cloned();
     let agent_for_transition = agent_name.to_owned();
-    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, bool)> {
+    let (inst_for_transition, agent_for_transition, kind) = tokio::task::spawn_blocking(move || {
+        let (seed, _) = structured_seed_for(
+            &inst_for_transition,
+            &agent_for_transition,
+            inst_for_transition.selected_claude_conversation().map(|(sid, _)| sid),
+        );
+        let kind = if seed.stored_acp_session_id.is_some() {
+            crate::acp::supervisor::ResumeKind::Spawn
+        } else {
+            crate::acp::supervisor::ResumeKind::SpawnFirst
+        };
+        (inst_for_transition, agent_for_transition, kind)
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(target: "acp.switch", session = %instance.id, %error, "structured launch preflight failed");
+        internal_error("failed to switch session to structured view")
+    })?;
+    // The reconciler admits before acquiring the instance lock. Reserve while
+    // the row is still terminal, and keep that lease through deferred launch.
+    let mut reservation = state
+        .acp_supervisor
+        .reserve_spawn(
+            &instance.id,
+            kind,
+            crate::process::worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+        .map_err(|error| supervisor_error_response("enable admission failed", &error))?;
+    let cancellation = reservation.cancellation().clone();
+    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<(Instance, bool)> {
         let _namespace = namespace;
         use crate::session::SessionStore;
         let storage = crate::server::session_store::NativeSessionStore::open(
@@ -306,6 +337,10 @@ async fn commit_structured_view(
         }
         let generation = current.lifecycle_generation.checked_add(1)
             .ok_or(crate::session::LifecycleReservationError::GenerationOverflow)?;
+        anyhow::ensure!(
+            !cancellation.is_cancelled(),
+            SupervisorError::SpawnCancelled(inst_for_transition.id.clone())
+        );
         if let Err(e) = inst_for_transition.kill_locked() {
             tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill tmux failed: {e}");
         }
@@ -320,7 +355,7 @@ async fn commit_structured_view(
                 .iter_mut()
                 .find(|candidate| candidate.id == inst_for_transition.id)
             else {
-                anyhow::bail!("session disappeared during terminal-to-ACP transition");
+                anyhow::bail!(crate::session::SessionGone);
             };
             anyhow::ensure!(
                 matches_source(slot),
@@ -346,14 +381,25 @@ async fn commit_structured_view(
             slot.last_error_evidence = None;
             slot.lifecycle_generation = generation;
             slot.acp_load_session_capable = None;
-            Ok((slot.lifecycle_generation, seed.import_terminal))
+            let mut committed = slot.clone();
+            committed.source_profile.clone_from(&profile);
+            Ok((committed, seed.import_terminal))
         })
     })
     .await;
     let id = instance.id.clone();
-    let (lifecycle_generation, import_terminal) = match transition {
+    let (committed, import_terminal) = match transition {
         Ok(Ok(committed)) => committed,
         Ok(Err(error)) => {
+            if let Some(error) = error.downcast_ref::<SupervisorError>() {
+                return Err(supervisor_error_response("enable admission failed", error));
+            }
+            if error.downcast_ref::<crate::session::LifecycleReservationError>()
+                == Some(&crate::session::LifecycleReservationError::Superseded)
+                || error.is::<crate::session::SessionGone>()
+            {
+                return Err(launch_error_response("enable transition", &error));
+            }
             if let Some(refusal) =
                 error.downcast_ref::<crate::acp::establishment::EstablishmentRefusal>()
             {
@@ -374,51 +420,53 @@ async fn commit_structured_view(
             ));
         }
     };
-    if let Some(committed) = find_instance(state, &id).await {
-        if lifecycle_generation >= instance.lifecycle_generation {
-            *instance = committed;
-        }
-    }
+    reservation.expected_lifecycle_generation = Some(committed.lifecycle_generation);
+    *instance = committed;
     state.runtime.publish(state).await.map_err(|error| {
         tracing::error!(target: "acp.switch", session = %id, %error, "view publication failed");
         internal_error("failed to publish structured view")
     })?;
-    Ok(import_terminal)
+    Ok((import_terminal, reservation))
 }
 
 /// Spawn the worker in the background so the response does not wait on a
 /// container pull. Failures surface as a startup-error banner.
 fn spawn_enabled_worker(
     state: Arc<AppState>,
-
     expected: Instance,
     agent_name: String,
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
     import_terminal: bool,
+    mut reservation: crate::acp::supervisor::ResumeReservation,
 ) {
     let session_id = expected.id.clone();
     let work = state.runtime.work.clone();
     work.spawn("server.acp_enable", async move {
-        let exclusion =
-            match crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &session_id, false)
-                .await
-            {
-                Ok(exclusion) => exclusion,
-                Err(_) => return,
-            };
+        let exclusion = tokio::select! {
+            biased;
+            _ = reservation.cancellation().cancelled() => return,
+            exclusion = crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &session_id, false) => {
+                match exclusion {
+                    Ok(exclusion) => exclusion,
+                    Err(_) => return,
+                }
+            }
+        };
         let supervisor = &state.acp_supervisor;
-        let (request, reservation) = match deferred_enable_request(
+        let request = match deferred_enable_request(
             &state,
             &expected,
             agent_name.clone(),
             selected_conversation,
             import_terminal,
             exclusion,
+            &mut reservation,
         )
         .await
         {
             None => return,
             Some(Ok(request)) => request,
+            Some(Err(_)) if reservation.cancellation().is_cancelled() => return,
             Some(Err(EnableFailure::LoginRequired(blocked))) => {
                 publish_login_required_if_current(
                     &state,
@@ -439,11 +487,7 @@ fn spawn_enabled_worker(
                 return;
             }
         };
-        if let Err(e) = supervisor
-            .spawn_inner(
-                request, reservation)
-            .await
-        {
+        if let Err(e) = supervisor.spawn_inner(request, reservation).await {
             let message = structured_spawn_error_message(&e, &agent_name);
             tracing::warn!(target: "acp.switch", session = %session_id, "spawn after enable: {message}");
             publish_startup_error_if_current(&state, &session_id, &expected.source_profile,
@@ -473,13 +517,18 @@ async fn deferred_enable_request(
     selected_conversation: Option<(String, crate::session::ExecutionBinding)>,
     import_terminal: bool,
     exclusion: crate::acp::sandbox::LaunchExclusion,
-) -> Option<Result<(SpawnRequest, crate::acp::supervisor::ResumeReservation), EnableFailure>> {
+    reservation: &mut crate::acp::supervisor::ResumeReservation,
+) -> Option<Result<SpawnRequest, EnableFailure>> {
     let session_id = expected.id.as_str();
+    if reservation.cancellation().is_cancelled() {
+        return None;
+    }
     let instance = find_instance(state, session_id).await.filter(|row| {
         row.is_structured()
             && row.terminal_handoff.is_none()
             && row.launch_is_finalized()
             && row.lifecycle_generation == expected.lifecycle_generation
+            && row.created_at == expected.created_at
             && row.source_profile == expected.source_profile
             && row.ensure_startable().is_ok()
     })?;
@@ -508,6 +557,9 @@ async fn deferred_enable_request(
     {
         Ok(exclusion) => exclusion,
         Err(error) => {
+            if reservation.cancellation().is_cancelled() {
+                return None;
+            }
             if let Some(login) = error.downcast_ref::<crate::session::SandboxLoginRequired>() {
                 state.session_service.sandbox_login.hold(
                     session_id,
@@ -522,27 +574,6 @@ async fn deferred_enable_request(
             }));
         }
     };
-    let mut reservation = match state
-        .acp_supervisor
-        .reserve_spawn(
-            session_id,
-            if seed.stored_acp_session_id.is_some() {
-                crate::acp::supervisor::ResumeKind::Spawn
-            } else {
-                crate::acp::supervisor::ResumeKind::SpawnFirst
-            },
-            crate::process::worker_registry::ResumeAuthority::Explicit,
-        )
-        .await
-    {
-        Ok(reservation) => reservation,
-        Err(error) => {
-            return Some(Err(EnableFailure::Other {
-                message: error.to_string(),
-                cause: None,
-            }))
-        }
-    };
     let mut admission = crate::acp::supervisor::LaunchAdmission {
         establishment: reservation.establishment.clone(),
         store: native.clone(),
@@ -551,7 +582,7 @@ async fn deferred_enable_request(
         native_scope: None,
     };
     let instance = match exclusion
-        .prepare_native_establishment(&state.acp_supervisor, &mut admission, &mut reservation)
+        .prepare_native_establishment(&state.acp_supervisor, &mut admission, reservation)
         .await
     {
         Ok(row) => row,
@@ -582,25 +613,22 @@ async fn deferred_enable_request(
             }
         };
     drop(exclusion);
-    Some(Ok((
-        SpawnRequest {
-            launch_admission: Some(admission),
-            stored_acp_session_id: seed.stored_acp_session_id,
-            seed_history_replay: seed.seed_history_replay,
-            prior_conversation: instance.acp_session_id.is_some()
-                || instance.agent_session_id.is_some()
-                || instance.pi_session_path.is_some()
-                || selected_conversation.is_some(),
-            sandbox_continuation: if import_terminal || seed.import_terminal {
-                crate::acp::supervisor::SandboxContinuation::ImportTerminal
-            } else {
-                crate::acp::supervisor::SandboxContinuation::Persisted
-            },
-            claude_store_pin,
-            ..spawn_request_for(&instance, agent_name, sandbox_info)
+    Some(Ok(SpawnRequest {
+        launch_admission: Some(admission),
+        stored_acp_session_id: seed.stored_acp_session_id,
+        seed_history_replay: seed.seed_history_replay,
+        prior_conversation: instance.acp_session_id.is_some()
+            || instance.agent_session_id.is_some()
+            || instance.pi_session_path.is_some()
+            || selected_conversation.is_some(),
+        sandbox_continuation: if import_terminal || seed.import_terminal {
+            crate::acp::supervisor::SandboxContinuation::ImportTerminal
+        } else {
+            crate::acp::supervisor::SandboxContinuation::Persisted
         },
-        reservation,
-    )))
+        claude_store_pin,
+        ..spawn_request_for(&instance, agent_name, sandbox_info)
+    }))
 }
 
 type HandoffKey = crate::session::TerminalHandoffKey;
@@ -2390,6 +2418,21 @@ pub(crate) async fn publish_login_required_if_current(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn reserve_test_enable(
+        state: &AppState,
+        id: &str,
+    ) -> crate::acp::supervisor::ResumeReservation {
+        state
+            .acp_supervisor
+            .reserve_spawn(
+                id,
+                crate::acp::supervisor::ResumeKind::Spawn,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+            .unwrap()
+    }
 
     fn handoff_test_event_store(session_id: &str) -> Arc<crate::acp::event_store::EventStore> {
         let db_path = crate::session::get_app_dir()
@@ -4806,6 +4849,20 @@ mod tests {
             let storage = crate::session::Storage::open_unwatched("default").unwrap();
             if case != "retained" {
                 assert!(result.is_err(), "{case}");
+                if matches!(
+                    case,
+                    "superseded"
+                        | "recreated"
+                        | "source_sid"
+                        | "choice"
+                        | "provenance"
+                        | "route"
+                        | "import"
+                        | "fork"
+                        | "provider"
+                ) {
+                    assert_eq!(result.unwrap_err().status(), StatusCode::CONFLICT, "{case}");
+                }
                 let stored = storage.load().unwrap().remove(0);
                 assert_eq!(
                     serde_json::to_value(&stored).unwrap(),
@@ -4831,7 +4888,7 @@ mod tests {
                 );
                 continue;
             }
-            assert!(result.is_ok());
+            let (import_terminal, mut reservation) = result.unwrap();
             assert!(
                 !terminal.exists_live(),
                 "the accepted transition terminates its real pane"
@@ -4840,15 +4897,35 @@ mod tests {
             assert_eq!(working.status, Status::Idle);
             assert!(!working.is_idle_dormant());
             assert_eq!(working.lifecycle_generation, row.lifecycle_generation + 1);
+            assert!(
+                state
+                    .acp_supervisor
+                    .begin_resume(
+                        &row.id,
+                        crate::acp::supervisor::ResumeKind::Spawn,
+                        crate::process::worker_registry::ResumeAuthority::Automatic,
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the published structured row cannot admit a competing reconciler launch"
+            );
             let exclusion =
                 crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &row.id, true)
                     .await
                     .unwrap();
-            let (request, reservation) =
-                deferred_enable_request(&state, &working, "claude".into(), None, false, exclusion)
-                    .await
-                    .expect("fresh enable target")
-                    .unwrap();
+            let request = deferred_enable_request(
+                &state,
+                &working,
+                "claude".into(),
+                None,
+                import_terminal,
+                exclusion,
+                &mut reservation,
+            )
+            .await
+            .expect("fresh enable target")
+            .unwrap();
             assert!(state
                 .acp_supervisor
                 .spawn_inner(request, reservation)
@@ -4863,6 +4940,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
             let stopped = storage.load().unwrap().remove(0);
             assert!(stopped.lifecycle_generation > working.lifecycle_generation);
+            let mut reservation = reserve_test_enable(&state, &row.id).await;
             let exclusion =
                 crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &row.id, true)
                     .await
@@ -4873,7 +4951,8 @@ mod tests {
                 "claude".into(),
                 None,
                 false,
-                exclusion
+                exclusion,
+                &mut reservation,
             )
             .await
             .is_none());
@@ -4965,6 +5044,7 @@ mod tests {
         let id = inst.id.clone();
         let login = &state.session_service.sandbox_login;
         let mut notices = login.subscribe();
+        let mut reservation = reserve_test_enable(&state, &id).await;
         let exclusion =
             crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &inst.id, true)
                 .await
@@ -4977,6 +5057,7 @@ mod tests {
             None,
             false,
             exclusion,
+            &mut reservation,
         )
         .await
         {
@@ -5027,6 +5108,7 @@ mod tests {
         let id = inst.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut reservation = reserve_test_enable(&state, &id).await;
         let exclusion =
             crate::acp::sandbox::LaunchExclusion::acquire(state.clone(), &inst.id, true)
                 .await
@@ -5039,6 +5121,7 @@ mod tests {
             None,
             false,
             exclusion,
+            &mut reservation,
         )
         .await
         {
@@ -5085,12 +5168,14 @@ mod tests {
 
         let inst_lock = state.instance_lock(&id).await;
         let guard = inst_lock.lock().await;
+        let reservation = reserve_test_enable(&state, &id).await;
         spawn_enabled_worker(
             state.clone(),
             inst.clone(),
             "claude".to_string(),
             None,
             false,
+            reservation,
         );
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let (store, ()) = crate::server::session_store::NativeSessionStore::open_for_launch(
