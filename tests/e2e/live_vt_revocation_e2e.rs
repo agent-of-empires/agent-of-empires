@@ -44,6 +44,8 @@ fn stale_pending_vt_arm_is_fenced_after_disconnect() {
     }
 
     let mut h = TuiTestHarness::new_in_tmp("stale_pending_vt_arm");
+    // The output-only clipboard observer also sets pane_pipe.
+    h.append_config("[tmux]\nclipboard = \"disabled\"");
     let gate = h.home_path().join("vt-arm-gate");
     std::fs::create_dir(&gate).unwrap();
     h.stop_daemon_on_drop();
