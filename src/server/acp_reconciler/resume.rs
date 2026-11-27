@@ -574,6 +574,7 @@ async fn build_spawn_request(
         seed_history_replay,
         prior_conversation,
         claude_store_pin,
+        proxy: None,
     })
 }
 

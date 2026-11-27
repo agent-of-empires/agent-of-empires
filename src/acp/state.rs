@@ -164,6 +164,9 @@ pub struct SessionNotice {
     pub description: Option<String>,
 }
 
+/// Key of the notice a `neutral_boot` fallback posts; it lasts as long as the degraded session.
+pub const PROXY_DEGRADED_NOTICE_KEY: &str = "proxy-degraded";
+
 /// A keyed notice keeps one id across updates; others are minted from the seq.
 pub fn notice_id(key: Option<&str>, seq: u64) -> String {
     match key {
@@ -407,6 +410,8 @@ pub enum IntegrationLostReason {
     HoldOverflow,
     /// The proxy held more leases than any real agent does.
     LeaseOverflow,
+    /// The proxy, or the agent behind it, exited after its hello.
+    ProxyExited,
 }
 
 /// Lifecycle status of an async background sub-agent.
@@ -1285,11 +1290,15 @@ impl AcpState {
                     Some(existing) => *existing = notice,
                     None => self.session_notices.push(notice),
                 }
-                let excess = self
-                    .session_notices
-                    .len()
-                    .saturating_sub(Self::MAX_SESSION_NOTICES);
-                self.session_notices.drain(..excess);
+                // The degraded-proxy banner outlives the cap: it stays true
+                // until the proxy is back.
+                let degraded = notice_id(Some(PROXY_DEGRADED_NOTICE_KEY), 0);
+                while self.session_notices.len() > Self::MAX_SESSION_NOTICES {
+                    match self.session_notices.iter().position(|n| n.id != degraded) {
+                        Some(oldest) => self.session_notices.remove(oldest),
+                        None => break,
+                    };
+                }
             }
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
@@ -1356,6 +1365,9 @@ impl AcpState {
                 self.startup_error = None;
                 self.integration_lost = None;
                 self.rate_limit = None;
+                // A degraded worker re-asserts the notice after assignment.
+                let degraded = notice_id(Some(PROXY_DEGRADED_NOTICE_KEY), 0);
+                self.session_notices.retain(|n| n.id != degraded);
                 self.heal_sidebar_phase();
             }
             Event::RateLimitAutoResumed { .. } => self.heal_sidebar_phase(),
@@ -1555,8 +1567,9 @@ impl AcpState {
         }
         self.rate_limit = None;
         // Advisories describe the turn they arrived in, so a new prompt retires
-        // them. Their transcript rows keep the history.
-        self.session_notices.clear();
+        // them, except the degraded-proxy banner. Their transcript rows keep the history.
+        let degraded = notice_id(Some(PROXY_DEGRADED_NOTICE_KEY), 0);
+        self.session_notices.retain(|n| n.id == degraded);
     }
 
     /// A fresh worker attached: a startup error no longer holds the row.
@@ -2030,6 +2043,46 @@ mod tests {
         assert!(
             titles(&applied([notice("stale"), prompt("next")])).is_empty(),
             "a new turn retires the previous turn's advisories"
+        );
+        let degraded = Event::SessionNotice {
+            severity: "warning".into(),
+            title: "Fake features unavailable".into(),
+            description: None,
+            key: Some(PROXY_DEGRADED_NOTICE_KEY.into()),
+        };
+        assert_eq!(
+            titles(&applied([degraded, notice("stale"), prompt("next")])),
+            ["Fake features unavailable"],
+            "a degraded proxy's banner outlives the turn"
+        );
+        let degraded = || Event::SessionNotice {
+            severity: "warning".into(),
+            title: "Fake features unavailable".into(),
+            description: None,
+            key: Some(PROXY_DEGRADED_NOTICE_KEY.into()),
+        };
+        let assigned = Event::AcpSessionAssigned {
+            acp_session_id: "acp-2".into(),
+        };
+        assert_eq!(
+            titles(&applied([degraded(), assigned.clone(), degraded()])),
+            ["Fake features unavailable"],
+            "a degraded worker re-asserts the notice after assignment"
+        );
+        let flood = (0..AcpState::MAX_SESSION_NOTICES + 2).map(|i| notice(&format!("n{i}")));
+        let flooded = applied(
+            std::iter::once(degraded())
+                .chain(flood)
+                .chain([prompt("next")]),
+        );
+        assert_eq!(
+            titles(&flooded),
+            ["Fake features unavailable"],
+            "later notices do not evict the banner, and a turn keeps it"
+        );
+        assert!(
+            titles(&applied([degraded(), assigned])).is_empty(),
+            "a healthy worker's assignment retires the degraded notice"
         );
         assert!(
             titles(&applied([

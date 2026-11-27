@@ -145,6 +145,19 @@ The snapshot's `revision` changes only when the prompt changes, not when runtime
 
 Shell-hook sidecars and native-plugin reports remain distinct transports. Native reports retain their heartbeat and live-writer checks; shell hooks keep their existing freshness and publisher rules. Both reuse hardened host I/O and the established guarded session-identity persistence path where applicable. Declaring launch or reply metadata does not install hooks or companion extensions.
 
+## ACP proxies
+
+A proxy is a per-session process between the runner and an ACP adapter; the wire contract is in [the primitive contract](development/internals/acp-primitive-contract.md). The manifest field that declares one is not available yet (#5319), so the declaration source, its failure policy and its compat are not exposed to plugins. What a proxy process must do once launched:
+
+- It runs in the agent's process group as the direct child of the runner. Its argv is its declared args followed by the full adapter argv, including the `docker exec` wrapper for a sandboxed session. It must start that adapter argv unchanged as a child process in the same process group (no `setsid`, no daemonizing), relay the adapter's stdin and stdout, and stay running to add the hello and translate frames. It cannot `exec` into the adapter. The runner kills the group, which is how the adapter dies with it. If the runner is killed with SIGKILL, the adapter can be orphaned.
+- `AOE_PROXY_LAUNCH_CONFIG` holds the path of an owner-only JSON file, removed when the session ends: `{"version": 1, "session_id": "...", "container_id": "..." | null, "store_root": "..."}`. It holds no secrets. Strip the variable from the adapter's environment.
+- For a sandboxed session the container environment travels on file descriptor 9, which the runner passes to the proxy and the adapter argv names as `--env-file /dev/fd/9`. The proxy must pass descriptor 9 to the adapter's `docker exec` as descriptor 9 (not remapped to another number) and must not close or read it.
+- The `initialize` response must carry the hello with the declared `plugin_id`, and forward the adapter's own `agent_info` unchanged so it can be checked against the declared compat. A missing or invalid hello, a different `plugin_id`, or an `agent_info` outside the compat counts as a hello failure.
+
+A hello failure, a proxy that cannot start or one that exits before its hello follows the declared failure policy. `refuse` fails the session start. `neutral_boot` launches the adapter once without the proxy (on the first launch and on a respawn), posts a "features unavailable" notice, and keeps that state across a reattach. Failures after a valid hello never fall back; see [Failure](development/internals/acp-primitive-contract.md#failure).
+
+A proxy is trusted as the user: it can run anything the user's `docker` can, not only the adapter it was handed, and reads the filesystem with the user's rights ([ADR 0006](adr/0006-meta-aoe-primitive-contract.md)).
+
 ## Plugin id
 
 A dotted, lowercase ASCII identifier such as `dev.example.review-helper`. Each dot-separated segment starts with a lowercase letter and may contain digits and hyphens; the whole id is at most 64 bytes. The `aoe.*` and `agent-of-empires.*` namespaces are reserved for bundled and officially featured plugins; a community install cannot claim them.

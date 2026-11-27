@@ -1,6 +1,7 @@
 //! `SpawnConfig` and agent subprocess spawning, including the environment
 //! filter that decides which host variables the agent sees.
 
+use crate::acp::agent_compat::ProxyCompat;
 use crate::acp::agent_registry::AgentSpec;
 use crate::session::SandboxInfo;
 use agent_client_protocol::v1::schema::McpServer;
@@ -10,6 +11,27 @@ use tracing::{debug, info, warn};
 
 use super::errors::AcpError;
 use super::resolve_command::{resolve_agent_command, Unresolved};
+
+/// What to do when a launched proxy fails before a valid hello.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyFailurePolicy {
+    Refuse,
+    NeutralBoot,
+}
+
+/// A plugin-supplied process that sits between the runner and the adapter.
+/// The runner launches `command args... <adapter argv>`; `SpawnConfig::spec`
+/// stays the adapter.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProxySpec {
+    pub plugin_id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub failure_policy: ProxyFailurePolicy,
+    pub display_name: String,
+    pub compat: ProxyCompat,
+}
 
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -84,6 +106,11 @@ pub struct SpawnConfig {
     /// Recomputed on every launch, and applied only to the agent process environment, which
     /// other local users cannot read, unlike the command line the entries end up on.
     pub mcp_credentials: crate::acp::mcp_rewrite::McpCredentialEnv,
+    /// Runner launches only; the in-proc stdio spawn never uses a proxy.
+    pub proxy: Option<ProxySpec>,
+    /// Display name of the proxy a `NeutralBoot` fallback dropped: the adapter
+    /// runs raw under the neutral profile.
+    pub degraded: Option<String>,
 }
 
 impl SpawnConfig {
@@ -104,6 +131,8 @@ pub(super) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
         Some("empty key")
     } else if key == "AOE_TOKEN" {
         Some("aoe auth token, must not reach the agent")
+    } else if key == crate::process::worker_registry::PROXY_LAUNCH_CONFIG_ENV {
+        Some("reserved proxy launch carrier")
     } else if INFRA_KEYS.contains(&key) {
         Some("infrastructure key, controlled by operator env")
     } else if key.starts_with("LD_") || key.starts_with("DYLD_") {
@@ -130,6 +159,8 @@ pub(crate) fn host_environment_denyreason(key: &str) -> Option<&'static str> {
         Some("aoe auth token, must not reach the agent")
     } else if key == crate::process::runner::ACP_AGENT_ENV {
         Some("reserved structured-worker environment carrier")
+    } else if key == crate::process::worker_registry::PROXY_LAUNCH_CONFIG_ENV {
+        Some("reserved proxy launch carrier")
     } else {
         None
     }
@@ -725,6 +756,9 @@ mod tests {
             );
         }
         assert!(host_environment_denyreason(crate::process::runner::ACP_AGENT_ENV).is_some());
+        let carrier = crate::process::worker_registry::PROXY_LAUNCH_CONFIG_ENV;
+        assert!(host_environment_denyreason(carrier).is_some());
+        assert!(request_env_denyreason(carrier).is_some());
     }
 
     /// #3262: structured-view agents get the desktop env; sandboxed ones

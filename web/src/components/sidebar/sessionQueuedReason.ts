@@ -4,8 +4,7 @@ import type { SessionResponse } from "../../lib/types";
 /** The queued strip's reason line for a row that isn't open, from what the session list carries. */
 export function sessionQueuedReason(session: SessionResponse, agent: string): string | null {
   const held = session.queue_reason;
-  // The strip has no wording for a lost integration, so the badge shows the count alone.
-  if (held === "integration_lost") return null;
+  if (held === "integration_lost") return "held: the agent integration was lost";
   return queuedReason({
     agent,
     online: true,

@@ -445,6 +445,7 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
         acp_mode_id: None,
         agent_command_override: None,
         claude_store_pin: None,
+        proxy: None,
     }
 }
 
@@ -478,6 +479,8 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         seed_history_replay: false,
         prior_conversation: false,
         artifact_dir: None,
+        proxy: None,
+        degraded: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,
@@ -822,6 +825,7 @@ impl HeldAttachRunner {
                                 &ControlBody::SessionReady {
                                     acp_session_id: native_id.clone(),
                                     result: serde_json::json!({}),
+                                    adapter_frames: 0,
                                 },
                             )
                             .await
