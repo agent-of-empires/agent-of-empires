@@ -6224,6 +6224,50 @@ mod tests {
         }
     }
 
+    /// A `[keybinds]` override of cancel-image-pull moves the pull's cancel key in both modes:
+    /// the pull line shows the new key, which asks, and Ctrl+E no longer does.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_keybinds_override_moves_the_pull_cancel_key() {
+        use crate::tui::home::keybinds;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        // App loads `[keybinds]` from the config, as a user's override arrives.
+        crate::session::update_config(|c| {
+            c.keybinds = [("cancel-image-pull".to_string(), vec!["F8".to_string()])].into();
+        })
+        .unwrap();
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        let f8 = KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE);
+        let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
+        for strict in [false, true] {
+            let (mut app, mut terminal) = key_app();
+            app.home.strict_hotkeys = strict;
+            let sent = record_pull_requests(&mut app);
+            let prompt = |app: &App| app.pull.cancel_prompt(std::time::Instant::now());
+            app.pull.start();
+            let screen = draw(&mut app);
+            assert!(
+                screen.contains("[F8] cancel") && !screen.contains("Ctrl+E"),
+                "strict={strict}: the pull line doesn't show the overridden key"
+            );
+            app.handle_key(ctrl_e, &mut terminal).await.unwrap();
+            assert!(!prompt(&app), "strict={strict}: Ctrl+E still asked");
+            app.handle_key(f8, &mut terminal).await.unwrap();
+            assert!(
+                prompt(&app),
+                "strict={strict}: the overridden key didn't ask"
+            );
+            app.handle_key(confirm, &mut terminal).await.unwrap();
+            assert_eq!(
+                *sent.lock().unwrap(),
+                [PullRequest::Cancel],
+                "strict={strict}"
+            );
+        }
+        keybinds::install(keybinds::Keymap::default());
+    }
+
     /// While the search bar takes keys, the bar's keys are the query's: Ctrl+E (go-to-end), the
     /// Update key (`u`, or Ctrl+U, which clears) and Ctrl+X neither cancel, retry, acknowledge
     /// nor prompt a pull.
