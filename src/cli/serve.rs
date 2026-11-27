@@ -1178,9 +1178,9 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
         .rsplit(|byte| *byte == b'/')
         .next()
         .unwrap_or(executable);
-    // A renamed release binary (`aoe-darwin-arm64`) is only trusted as the
-    // daemon child, whose argv `daemon_child_args` always starts `serve --daemon-child`.
-    let known_name = matches!(basename, b"aoe" | b"agent-of-empires");
+    if !matches!(basename, b"aoe" | b"agent-of-empires") {
+        return false;
+    }
 
     // The top-level globals declared on `Cli` in `src/cli/definition.rs`, so a
     // value like `--profile work` is not mistaken for the subcommand.
@@ -1202,11 +1202,38 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
             {
                 index += 1;
             }
-            b"serve" => return known_name || args.get(index + 1) == Some(&&b"--daemon-child"[..]),
+            b"serve" => return true,
             _ => return false,
         }
     }
     false
+}
+
+/// `ps` flattens argv, so match the flattened `serve --daemon-child` tail that
+/// `daemon_child_args` always emits.
+fn renamed_daemon_child_argv(command: &[u8]) -> bool {
+    let flat: Vec<u8> = command
+        .iter()
+        .map(|byte| if *byte == 0 { b' ' } else { *byte })
+        .collect();
+    flat.windows(b" serve --daemon-child".len())
+        .any(|window| window == b" serve --daemon-child")
+}
+
+/// A renamed release binary (`aoe-darwin-arm64`) has no trustworthy name, so it
+/// is the daemon only when `serve.launch` records this PID with an instance id
+/// the live process carries. Absent or mismatched metadata is not evidence.
+fn renamed_daemon_evidence(launch: Option<&ServeLaunch>, pid: u32, instance_is_live: bool) -> bool {
+    launch
+        .is_some_and(|launch| launch.pid == pid && launch.instance_id.is_some() && instance_is_live)
+}
+
+fn is_renamed_daemon(pid: u32, command: &[u8]) -> bool {
+    renamed_daemon_child_argv(command) && {
+        let launch = read_serve_launch().ok();
+        let live = launch.as_ref().is_some_and(|l| instance_is_live(l, pid));
+        renamed_daemon_evidence(launch.as_ref(), pid, live)
+    }
 }
 
 /// Cross-platform check that `pid` belongs to an `aoe serve` process.
@@ -1217,7 +1244,15 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     let proc_path = format!("/proc/{}/cmdline", pid);
     if std::path::Path::new(&proc_path).exists() {
         return match std::fs::read(&proc_path) {
-            Ok(cmdline) if command_is_aoe_serve(&cmdline) => DaemonProcessIdentity::Verified,
+            Ok(cmdline)
+                if command_is_aoe_serve(&cmdline) || is_renamed_daemon(pid as u32, &cmdline) =>
+            {
+                DaemonProcessIdentity::Verified
+            }
+            // A renamed daemon without launch evidence is unverified, not foreign.
+            Ok(cmdline) if renamed_daemon_child_argv(&cmdline) => {
+                DaemonProcessIdentity::Indeterminate
+            }
             Ok(_) => DaemonProcessIdentity::Foreign,
             Err(_) => DaemonProcessIdentity::Indeterminate,
         };
@@ -1235,8 +1270,15 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
         Ok(Some(out)) if !out.status.success() || out.stdout.trim_ascii().is_empty() => {
             DaemonProcessIdentity::Indeterminate
         }
-        Ok(Some(out)) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
-        Ok(Some(out)) if command_mentions_aoe_executable(&out.stdout) => {
+        Ok(Some(out))
+            if command_is_aoe_serve(&out.stdout) || is_renamed_daemon(pid as u32, &out.stdout) =>
+        {
+            DaemonProcessIdentity::Verified
+        }
+        Ok(Some(out))
+            if command_mentions_aoe_executable(&out.stdout)
+                || renamed_daemon_child_argv(&out.stdout) =>
+        {
             DaemonProcessIdentity::Indeterminate
         }
         Ok(Some(_)) => DaemonProcessIdentity::Foreign,
@@ -3187,16 +3229,49 @@ mod tests {
             (b"aoe --profile serve update", false),
             (b"aoe --some-option serve update", false),
             (b"/tmp/aoe-helper serve", false),
-            (b"/x/aoe-darwin-arm64\0serve\0--daemon-child\0", true),
-            (b"/x/aoe-darwin-arm64 -p work serve --daemon-child", true),
-            (b"/x/aoe-darwin-arm64 serve --daemon", false),
-            (b"/x/aoe-darwin-arm64 serve", false),
-            (b"/x/aoe-darwin-arm64 serve --daemon --daemon-child", false),
-            (b"runner --label aoe serve --daemon-child", false),
             (b"runner --label aoe serve", false),
         ];
         for (command, expected) in cases {
             assert_eq!(command_is_aoe_serve(command), *expected, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn renamed_binary_is_the_daemon_only_with_launch_evidence() {
+        let argv: &[(&[u8], bool)] = &[
+            (b"/x/aoe-darwin-arm64\0serve\0--daemon-child\0", true),
+            (b"/x/aoe-darwin-arm64 -p work serve --daemon-child", true),
+            (
+                b"/Users/me/My Apps/aoe-darwin-arm64 serve --daemon-child",
+                true,
+            ),
+            (b"/x/aoe-darwin-arm64 serve --daemon", false),
+            (b"/x/aoe-darwin-arm64 serve", false),
+            (b"/x/aoe-darwin-arm64 serve --daemon --daemon-child", false),
+        ];
+        for (command, expected) in argv {
+            assert_eq!(renamed_daemon_child_argv(command), *expected, "{command:?}");
+        }
+
+        let launch = |pid, instance: Option<&str>| ServeLaunch {
+            pid,
+            instance_id: instance.map(str::to_string),
+            ..sample_launch()
+        };
+        // (launch record, instance is live, evidence)
+        let cases = [
+            (None, true, false),
+            (Some(launch(4242, Some("i"))), false, false),
+            (Some(launch(99, Some("i"))), true, false),
+            (Some(launch(4242, None)), true, false),
+            (Some(launch(4242, Some("i"))), true, true),
+        ];
+        for (record, live, expected) in cases {
+            assert_eq!(
+                renamed_daemon_evidence(record.as_ref(), 4242, live),
+                expected,
+                "{record:?} live {live}"
+            );
         }
     }
 
