@@ -442,6 +442,17 @@ pub(crate) static OWNED_INSTALL_GATE: std::sync::Mutex<
     )>,
 > = std::sync::Mutex::new(None);
 
+#[cfg(test)]
+pub(super) struct LiveFreshValidationGate {
+    pub(super) session_id: String,
+    pub(super) prepared: tokio::sync::oneshot::Sender<()>,
+    pub(super) validate: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(super) static LIVE_FRESH_VALIDATION_GATE: std::sync::Mutex<Option<LiveFreshValidationGate>> =
+    std::sync::Mutex::new(None);
+
 impl<S: BroadcastSink> Supervisor<S> {
     pub(crate) async fn prepare_live_fresh(
         &self,
@@ -494,7 +505,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let workers = Arc::downgrade(&self.workers);
         let lifecycle = Arc::downgrade(&self.lifecycle);
         let client = Arc::downgrade(client);
-        tokio::task::spawn_blocking(move || {
+        let proposal = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let _namespace = namespace;
             let store = &admission.store;
             let _native = store
@@ -546,11 +557,38 @@ impl<S: BroadcastSink> Supervisor<S> {
                 seal,
                 journal,
             });
-            proposal.check_current()?;
             proposal.check_owner()?;
             Ok(proposal)
         })
-        .await?
+        .await??;
+
+        #[cfg(test)]
+        {
+            let gate = {
+                let mut pending = lock_recover(&LIVE_FRESH_VALIDATION_GATE);
+                if pending
+                    .as_ref()
+                    .is_some_and(|gate| gate.session_id == session_id)
+                {
+                    pending.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                let _ = gate.prepared.send(());
+                let _ = gate.validate.await;
+            }
+        }
+
+        // Native and registry guards are gone. Wait for the worker table instead of
+        // refusing a current Fresh intent on lock contention.
+        anyhow::ensure!(proposal.current().await, EstablishmentRefusal::Superseded);
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            EstablishmentRefusal::Unconfirmed
+        );
+        Ok(proposal)
     }
 
     pub(crate) fn validate_reserved_resume(
