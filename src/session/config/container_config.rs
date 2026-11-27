@@ -2373,13 +2373,9 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
                 return blank_staged_file(&file);
             }
             std::fs::create_dir_all(file.parent().expect("staged under home"))?;
-            crate::hooks::write_declared_trust(
-                &file,
-                &trust,
-                container_workspace_path,
-                // Bind-mounted into the container, which can plant a link here.
-                crate::hooks::SymlinkPolicy::Never,
-            )
+            // Bind-mounted into the container, which can plant a link here, and kept on
+            // one inode, which a reused container may still mount.
+            crate::hooks::write_declared_trust_in_place(&file, &trust, container_workspace_path)
         });
         match result {
             // A running container may still mount the old record, so a launch that
@@ -7850,6 +7846,54 @@ sandbox = "SANDBOX"
         // Trust that still applies is not a revocation, so nothing is refused.
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         revoke(true).unwrap();
+    }
+
+    // A running container mounts the staged trust file by inode, so a changed record
+    // is written through that inode rather than replacing it.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_changed_declared_trust_record_keeps_the_mounted_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let install = |value: &str| {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN
+                    .replace("SANDBOX", "always")
+                    .replace("value = true", &format!("value = {value}")),
+            )
+        };
+        let launch = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-inode",
+                "/workspace/project",
+                false,
+            )
+            .unwrap()
+        };
+        let file = crate::hooks::declared_sandbox_dir("declared-inode")
+            .unwrap()
+            .join("home/.example.json");
+
+        install("true");
+        launch();
+        let mounted = fs::metadata(&file).unwrap().ino();
+        assert!(fs::read_to_string(&file).unwrap().contains("true"));
+
+        install("false");
+        launch();
+
+        assert_eq!(fs::metadata(&file).unwrap().ino(), mounted);
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(record["projects"]["/workspace/project"]["trusted"], false);
     }
 
     #[test]

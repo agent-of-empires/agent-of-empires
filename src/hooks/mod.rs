@@ -67,6 +67,7 @@ pub use trust::{
     declared_sandbox_dir, declared_trust_applies_in_sandbox, declared_trust_path,
     disable_gemini_folder_trust, is_other_builtin_trust_file, trust_claude_project,
     trust_codex_project, trust_gemini_project, trust_host_project, write_declared_trust,
+    write_declared_trust_in_place,
 };
 
 /// Where the agent's settings live, which decides the base directory baked into

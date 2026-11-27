@@ -14,10 +14,32 @@ use super::config_io::{
 };
 use super::resolve_config_dir_override;
 
+/// Overwrites `path` through the same inode, never following a link, for a file a
+/// running container may already mount by inode.
+fn write_in_place(path: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // A planted link is replaced, as the atomic write does, never written through.
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .and_then(|mut file| file.write_all(content))
+        .with_context(|| format!("writing {} in place", path.display()))
+}
+
 /// Merge-edits a JSON config under its lock, writing only when `edit` changed it.
+/// The write replaces the file atomically, or keeps its inode with `in_place`.
 fn edit_json(
     path: &Path,
     policy: SymlinkPolicy,
+    in_place: bool,
     lock_path: &Path,
     parse: impl FnOnce(Option<String>) -> Result<Value>,
     edit: impl FnOnce(&mut serde_json::Map<String, Value>) -> Result<()>,
@@ -34,7 +56,12 @@ fn edit_json(
         if config == before {
             return Ok(false);
         }
-        policy.write(path, serde_json::to_string_pretty(&config)?.as_bytes())?;
+        let content = serde_json::to_string_pretty(&config)?;
+        if in_place {
+            write_in_place(path, content.as_bytes())?;
+        } else {
+            policy.write(path, content.as_bytes())?;
+        }
         Ok(true)
     })
 }
@@ -50,6 +77,7 @@ fn edit_json_config(
     edit_json(
         path,
         policy,
+        false,
         lock_path,
         |content| Ok(parse_json_or_empty(content, path)),
         |root| {
@@ -270,6 +298,26 @@ pub fn write_declared_trust(
     project_path: &str,
     policy: SymlinkPolicy,
 ) -> Result<()> {
+    write_declared_trust_with(path, trust, project_path, policy, false)
+}
+
+/// [`write_declared_trust`] for the staged sandbox file: never follows a link, and
+/// keeps the file's inode, which a reused container may still mount.
+pub fn write_declared_trust_in_place(
+    path: &Path,
+    trust: &AgentTrustDeclaration,
+    project_path: &str,
+) -> Result<()> {
+    write_declared_trust_with(path, trust, project_path, SymlinkPolicy::Never, true)
+}
+
+fn write_declared_trust_with(
+    path: &Path,
+    trust: &AgentTrustDeclaration,
+    project_path: &str,
+    policy: SymlinkPolicy,
+    in_place: bool,
+) -> Result<()> {
     let segments = parse_trust_pointer(&trust.pointer)
         .ok_or_else(|| anyhow::anyhow!("invalid trust pointer {:?}", trust.pointer))?;
     let (leaf, parents) = segments
@@ -282,6 +330,7 @@ pub fn write_declared_trust(
     let written = edit_json(
         path,
         policy,
+        in_place,
         &policy.lock_path(path)?,
         |content| match content {
             None => Ok(Value::Object(Default::default())),
