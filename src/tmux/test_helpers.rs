@@ -199,6 +199,41 @@ pub(crate) fn after_input_check(pane: &str) {
     }
 }
 
+static INPUT_CAPTURED_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
+
+/// Runs `hook` once, after an input-line read has captured `pane` and before it classifies it.
+pub(crate) fn on_input_captured(pane: &str, hook: impl FnOnce() + Send + 'static) {
+    INPUT_CAPTURED_HOOKS
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), Box::new(hook)));
+}
+
+pub(crate) fn after_input_captured(pane: &str) {
+    for hook in take_hooks(&INPUT_CAPTURED_HOOKS, pane) {
+        hook();
+    }
+}
+
+static INPUT_WAIT_DEADLINES: std::sync::Mutex<Vec<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn record_input_wait_deadline(pane: &str, deadline: std::time::Instant) {
+    let mut all = INPUT_WAIT_DEADLINES.lock().unwrap();
+    all.retain(|(watched, _)| watched != pane);
+    all.push((pane.to_string(), deadline));
+}
+
+/// The deadline of the latest input-line wait on `pane`.
+pub(crate) fn input_wait_deadline(pane: &str) -> Option<std::time::Instant> {
+    INPUT_WAIT_DEADLINES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(watched, _)| watched == pane)
+        .map(|(_, deadline)| *deadline)
+}
+
 static SCREEN_CAPTURED_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
 
 /// Runs `hook` once, after an automatic-input check has captured `pane` and before it reads

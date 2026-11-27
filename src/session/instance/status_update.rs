@@ -658,11 +658,12 @@ impl Instance {
         if !tmux::detect::has_input_line(&tool) {
             return tmux::InputLine::Unknown;
         }
-        session
-            .try_capture_pane_in(pane, 0)
-            .map_or(tmux::InputLine::Unknown, |capture| {
-                tmux::detect::input_line(&tool, &capture)
-            })
+        let Ok(capture) = session.try_capture_pane_in(pane, 0) else {
+            return tmux::InputLine::Unknown;
+        };
+        #[cfg(test)]
+        tmux::test_helpers::after_input_captured(pane);
+        tmux::detect::input_line(&tool, &capture)
     }
 
     /// What the input box in `capture`, a coloured capture of the agent's pane, holds.
@@ -683,9 +684,10 @@ impl Instance {
         }
     }
 
-    /// Polls [`Self::input_line_in`] until the box reads empty. A first read that is `Unknown`
-    /// passes at once, as for an agent with no input-line rule. Once a draft is seen, only an
-    /// empty read taken before `budget` runs out passes: an unreadable pane proves nothing.
+    /// Polls [`Self::input_line_in`] until the box reads empty. A first read that is `Empty` or
+    /// `Unknown` passes at once, as for an agent with no input-line rule. Once a draft is seen,
+    /// only an empty read that completes before `budget` runs out passes: an unreadable pane
+    /// proves nothing.
     pub(crate) fn wait_for_input_line(
         &self,
         session: &tmux::Session,
@@ -693,10 +695,12 @@ impl Instance {
         budget: std::time::Duration,
     ) -> bool {
         let deadline = std::time::Instant::now() + budget;
+        #[cfg(test)]
+        tmux::test_helpers::record_input_wait_deadline(pane, deadline);
         let mut drafted = false;
         loop {
             match self.input_line_in(session, pane) {
-                tmux::InputLine::Empty => return true,
+                tmux::InputLine::Empty => return !drafted || std::time::Instant::now() < deadline,
                 tmux::InputLine::Unknown if !drafted => return true,
                 tmux::InputLine::Unknown => {}
                 tmux::InputLine::Draft => {

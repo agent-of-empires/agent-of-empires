@@ -5712,9 +5712,10 @@ mod tests {
         }
     }
 
-    /// A draft blocks until a read of an empty box taken within the budget. An unreadable pane
-    /// after a draft, or a box cleared once the budget is spent, still refuses. A first read
-    /// that can't tell, or an agent with no input-line rule, passes without waiting.
+    /// A draft blocks until a read of an empty box completes within the budget. An unreadable
+    /// pane after a draft, a box cleared once the budget is spent, or an empty read that
+    /// completes after it, still refuses. A first read that is empty or can't tell, or an agent
+    /// with no input-line rule, passes without waiting.
     #[test]
     #[serial_test::serial]
     fn a_seen_draft_blocks_until_a_clear_read_within_the_budget() {
@@ -5725,7 +5726,9 @@ mod tests {
         enum Then {
             KillFirst,
             KillOnDraft,
+            ClearFirst,
             ClearOnDraft,
+            ClearOnDraftHeldPastDeadline,
             Leave,
         }
         for (name, tool, budget_ms, then, want) in [
@@ -5750,8 +5753,17 @@ mod tests {
                 Then::ClearOnDraft,
                 true,
             ),
+            (
+                "empty-after-deadline",
+                "claude",
+                1_000,
+                Then::ClearOnDraftHeldPastDeadline,
+                false,
+            ),
             ("no-rule", "opencode", 3_000, Then::Leave, true),
             ("unknown-first", "claude", 3_000, Then::KillFirst, true),
+            ("initial-empty", "claude", 0, Then::ClearFirst, true),
+            ("initial-unknown", "claude", 0, Then::KillFirst, true),
         ] {
             let mut inst = terminal_turn_instance(&format!("sess-wait-{name}"), name, "unused");
             inst.tool = tool.into();
@@ -5769,25 +5781,47 @@ mod tests {
                     assert!(status.success(), "{name}: kill-pane");
                 }
             };
+            let clear = {
+                let target = pane_id.clone();
+                let name = pane.name().to_string();
+                move || {
+                    tmux_keys(&target, &["C-u"]);
+                    let tmux = crate::tmux::Session::from_name(&name);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while tmux
+                        .try_capture_pane_in(&target, 0)
+                        .is_ok_and(|screen| screen.contains("half typed"))
+                    {
+                        assert!(std::time::Instant::now() < deadline, "the draft clears");
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            };
             match then {
                 Then::KillFirst => kill(),
                 Then::Leave => {}
                 Then::KillOnDraft => crate::tmux::test_helpers::on_draft_seen(&pane_id, kill),
-                Then::ClearOnDraft => {
-                    let target = pane_id.clone();
-                    let name = pane.name().to_string();
+                Then::ClearFirst => clear(),
+                Then::ClearOnDraft => crate::tmux::test_helpers::on_draft_seen(&pane_id, clear),
+                Then::ClearOnDraftHeldPastDeadline => {
+                    let held = pane_id.clone();
                     crate::tmux::test_helpers::on_draft_seen(&pane_id, move || {
-                        tmux_keys(&target, &["C-u"]);
-                        let tmux = crate::tmux::Session::from_name(&name);
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(10);
-                        while tmux
-                            .try_capture_pane_in(&target, 0)
-                            .is_ok_and(|screen| screen.contains("half typed"))
-                        {
-                            assert!(std::time::Instant::now() < deadline, "the draft clears");
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                        }
+                        clear();
+                        // The next read's capture returns only once the wait's deadline passed.
+                        let pane = held.clone();
+                        crate::tmux::test_helpers::on_input_captured(&held, move || {
+                            let deadline = crate::tmux::test_helpers::input_wait_deadline(&pane)
+                                .expect("the wait recorded its deadline");
+                            let bound =
+                                std::time::Instant::now() + std::time::Duration::from_secs(10);
+                            while std::time::Instant::now() < deadline {
+                                assert!(
+                                    std::time::Instant::now() < bound,
+                                    "the held capture was never released"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                        });
                     });
                 }
             }
@@ -5802,7 +5836,7 @@ mod tests {
             let waited = drafts.try_recv().is_ok();
             assert_eq!(
                 waited,
-                tool == "claude" && !matches!(then, Then::KillFirst),
+                tool == "claude" && !matches!(then, Then::KillFirst | Then::ClearFirst),
                 "{name}: draft read"
             );
         }
