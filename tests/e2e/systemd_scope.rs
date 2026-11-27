@@ -220,6 +220,8 @@ fn tmux_session_runs_in_its_own_scope_until_removed() {
     }
     let mut h = TuiTestHarness::new("systemd_scope");
     let slice = configure_scopes(&mut h, true);
+    // `AOE_AGENT_PID` comes from the launch wrapper of hook-capable agents.
+    h.use_claude_agent();
     let agent = h.home_path().join("escapee-agent");
     write_executable(&agent, ESCAPEE_AGENT);
     let (id, mut guard) = start_session(&h, agent.to_str().unwrap(), &slice);
@@ -357,6 +359,8 @@ fn rm_releases_an_existing_scope_after_scopes_are_disabled() {
     }
     let mut h = TuiTestHarness::new("systemd_scope_disabled_later");
     let slice = configure_scopes(&mut h, true);
+    // `AOE_AGENT_PID` comes from the launch wrapper of hook-capable agents.
+    h.use_claude_agent();
     let agent = h.home_path().join("escapee-agent");
     write_executable(&agent, ESCAPEE_AGENT);
     let (id, guard) = start_session(&h, agent.to_str().unwrap(), &slice);

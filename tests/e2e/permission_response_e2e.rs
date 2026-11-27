@@ -58,6 +58,7 @@ fn test_respond_to_permission_allow_sends_bare_digit() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("perm_resp_allow");
+    h.install_path_command("claude");
     let fake_claude = install_fake_prompt(&h, "claude");
 
     let project = h.project_path();
