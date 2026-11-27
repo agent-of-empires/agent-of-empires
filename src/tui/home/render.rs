@@ -4995,9 +4995,10 @@ impl HomeView {
         let dismiss_key =
             super::bindings::label(ActionId::DismissUpdateBanner, self.strict_hotkeys);
         let text = match bar {
-            UpdateBar::CancelPrompt => {
-                " Press y to cancel the download. To keep going, press any other key.".to_string()
-            }
+            UpdateBar::CancelPrompt => format!(
+                " Press y within {} s to cancel the download. To keep going, press any other key.",
+                crate::tui::image_pull::CANCEL_CONFIRM_TTL.as_secs()
+            ),
             UpdateBar::Status(s) => format!(" {s}  [{dismiss_key}] dismiss"),
             UpdateBar::Pull(line) => {
                 use super::update_bar::PullTone;

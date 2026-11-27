@@ -2410,14 +2410,20 @@ impl App {
             }
             return Ok(());
         }
-        if key.code == CONFIRM_CANCEL_PULL
+        let confirming = key.code == CONFIRM_CANCEL_PULL
             && key.modifiers == KeyModifiers::NONE
-            && !self.home.has_dialog()
+            && !self.home.has_dialog();
+        if confirming
             && self
                 .pull
                 .confirms_cancel(cancel_armed, std::time::Instant::now())
         {
             self.request_pull(PullRequest::Cancel, self.pull_image.clone());
+            return Ok(());
+        }
+        // The key answers the prompt on screen even once its time is up: it cancels nothing,
+        // and Home doesn't read it as its own `y`.
+        if confirming && self.drawn_bar == Some(DrawnBar::CancelPrompt) {
             return Ok(());
         }
         self.pull.other_key(done_drawn);
@@ -5985,6 +5991,41 @@ mod tests {
             refused(&mut app, "ghcr.io/example/other:1"),
             gated(None),
             "another image's command was shown"
+        );
+    }
+
+    /// The `y` a drawn prompt asked for is the prompt's even once its time is up: it cancels
+    /// nothing, and Home doesn't read it as its own `y` (hide stopped, in non-strict mode).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_expired_cancel_prompt_keeps_its_confirming_key() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let (mut app, mut terminal) = key_app();
+        let sent = record_pull_requests(&mut app);
+        let confirm = KeyEvent::new(CONFIRM_CANCEL_PULL, KeyModifiers::NONE);
+        app.pull.start();
+        let armed = std::time::Instant::now()
+            - crate::tui::image_pull::CANCEL_CONFIRM_TTL
+            - std::time::Duration::from_secs(1);
+        assert!(app.pull.arm_cancel(armed));
+        app.drawn_bar = Some(DrawnBar::CancelPrompt);
+        let hidden = app.home.hide_stopped_in_groups;
+        app.handle_key(confirm, &mut terminal).await.unwrap();
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "an expired prompt's y cancelled"
+        );
+        assert_eq!(
+            app.home.hide_stopped_in_groups, hidden,
+            "an expired prompt's y reached Home"
+        );
+
+        app.drawn_bar = None;
+        app.handle_key(confirm, &mut terminal).await.unwrap();
+        assert_ne!(
+            app.home.hide_stopped_in_groups, hidden,
+            "y without a prompt on screen didn't reach Home"
         );
     }
 
