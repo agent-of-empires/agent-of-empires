@@ -2257,6 +2257,11 @@ Update aoe to the latest release
 * `-y`, `--yes` — Skip confirmation prompt
 * `--check` — Print update status and exit (no install)
 * `--dry-run` — Detect install method and print what would happen, no download
+* `--channel <CHANNEL>` — Switch to the newest release of a channel (tarball installs only)
+
+  Possible values: `stable`, `nightly`
+
+* `--version <TAG>` — Install one exact release, e.g. v1.25.0 or nightly-20261125 (tarball installs only)
 
 
 
