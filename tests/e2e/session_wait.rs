@@ -35,8 +35,9 @@ fn wait_for_poll(h: &TuiTestHarness, accept: impl Fn(&str) -> bool) {
 fn test_wait_times_out_then_reports_stopped_session() {
     require_tmux!();
     let mut h = TuiTestHarness::new("session_wait");
-    let bin = h.install_path_command("claude");
-    std::fs::write(bin.join("claude"), "#!/bin/sh\nexec sleep 600\n").expect("write claude stub");
+    let bin = h.install_path_command("fake-agent");
+    std::fs::write(bin.join("fake-agent"), "#!/bin/sh\nexec sleep 600\n")
+        .expect("write fake-agent stub");
     let project = h.project_path();
     h.add_session(&[project.to_str().unwrap(), "-t", "waiter"]);
     h.run_cli_ok(&["session", "start", "waiter"]);
@@ -74,8 +75,9 @@ fn test_wait_until_error_fails_when_session_is_killed_mid_wait() {
     require_tmux!();
     let mut h = TuiTestHarness::new("session_wait_stop");
     h.set_env("AOE_LOG_LEVEL", "debug");
-    let bin = h.install_path_command("claude");
-    std::fs::write(bin.join("claude"), "#!/bin/sh\nexec sleep 600\n").expect("write claude stub");
+    let bin = h.install_path_command("fake-agent");
+    std::fs::write(bin.join("fake-agent"), "#!/bin/sh\nexec sleep 600\n")
+        .expect("write fake-agent stub");
     let project = h.project_path();
     h.add_session(&[project.to_str().unwrap(), "-t", "stopper"]);
     h.run_cli_ok(&["session", "start", "stopper"]);
@@ -193,8 +195,9 @@ fn test_wait_survives_a_launch_held_by_a_pre_launch_hook() {
     require_tmux!();
     let mut h = TuiTestHarness::new("session_wait_launch");
     h.set_env("AOE_LOG_LEVEL", "debug");
-    let bin = h.install_path_command("claude");
-    std::fs::write(bin.join("claude"), "#!/bin/sh\nexec sleep 600\n").expect("write claude stub");
+    let bin = h.install_path_command("fake-agent");
+    std::fs::write(bin.join("fake-agent"), "#!/bin/sh\nexec sleep 600\n")
+        .expect("write fake-agent stub");
     let gate = h.home_path().join("gate");
     h.append_config(&format!(
         "[hooks]\non_launch = [\"while [ ! -f {} ]; do sleep 0.1; done\"]",

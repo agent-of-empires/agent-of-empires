@@ -983,9 +983,9 @@ fn native_attach_has_one_input_reader_and_survives_peer_delete_on_detach() {
         h.set_env("SHELL", "/bin/sh");
         h.stop_daemon_on_drop();
         let receipt = h.home_path().join("child-input.receipt");
-        let bin = h.install_path_command("claude");
+        let bin = h.install_path_command("fake-agent");
         let script = format!("#!/bin/sh\nprintf 'HANDOFF_CHILD_READY\\n'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> {}; done\n", shell_quote_path(&receipt));
-        fs::write(bin.join("claude"), &script).unwrap();
+        fs::write(bin.join("fake-agent"), &script).unwrap();
         let tools = h.install_path_command("handoffprobe");
         fs::write(tools.join("handoffprobe"), &script).unwrap();
         append_tools_config(

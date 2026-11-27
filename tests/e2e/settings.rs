@@ -66,9 +66,9 @@ fn shortcut_bar_hidden_live_still_relays_input_and_exits() {
     config
         .push_str("\n[session]\nshow_shortcut_bar = false\ndefault_attach_mode = \"live_send\"\n");
     std::fs::write(&config_path, config).unwrap();
-    let bin = h.install_path_command("claude");
+    let bin = h.install_path_command("fake-agent");
     std::fs::write(
-        bin.join("claude"),
+        bin.join("fake-agent"),
         "#!/bin/sh\nstty -echo\ncount=0\ntrap 'count=$((count + 1)); printf \"interrupt-%s-reached-agent\\n\" \"$count\"' INT\nprintf 'agent-ready\\n'\nwhile :; do IFS= read -r line && printf '%s\\n' \"$line\"; done\n",
     )
     .unwrap();
@@ -288,7 +288,7 @@ fn settings_migration_applies_poller_limit_on_the_first_tui_start() {
             );
             serde_json::json!({
                 "id": id, "title": title, "project_path": project, "group_path": "",
-                "command": "", "tool": "claude", "yolo_mode": false, "status": "idle",
+                "command": "", "tool": "fake-agent", "yolo_mode": false, "status": "idle",
                 "created_at": "2026-01-01T00:00:00Z"
             })
         })
