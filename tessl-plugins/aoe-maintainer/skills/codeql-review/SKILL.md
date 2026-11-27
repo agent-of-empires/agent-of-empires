@@ -85,7 +85,8 @@ For each true positive, build the JSON with `jq -n --arg ...` and run
   "observations": [
     {
       "observedAt": "<date -u +%Y-%m-%dT%H:%M:%SZ>",
-      "runId": "<$TESSL_LAUNCH_RUN_ID, omit the key if unset>",
+      "runId": "<$TESSL_LAUNCH_RUN_ID; omit runId and loopId unless both are non-empty>",
+      "loopId": "<jq -r '.[0].payload.loop.id // empty' .cloud-launch/trigger-events.json; same rule as runId>",
       "evidence": ["<alert URL>", "<source path:line>", "<sink path:line>"]
     }
   ]
