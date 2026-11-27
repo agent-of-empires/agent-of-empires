@@ -1174,8 +1174,9 @@ pub fn respond(
         bytes.len() <= MAX_REPORT_BYTES,
         "reply exceeds integration size limit"
     );
-    dir_guard::write_instance_file(
-        &instance.id,
+    let dir = dir_guard::open_instance_dir(&instance.id)?;
+    dir_guard::write_atomic(
+        dir.as_fd(),
         &format!("integration-{}.reply.json", plugin.id()),
         &bytes,
     )?;

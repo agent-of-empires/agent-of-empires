@@ -38,12 +38,6 @@ impl BaseGuard {
         Self(Self::lock())
     }
 
-    /// Explicit host and sandbox bases, apart rather than side by side.
-    pub(crate) fn with_bases(host: PathBuf, sandbox: PathBuf) -> Self {
-        super::dir_guard::override_sandbox_base_for_test(sandbox);
-        Self::with_base(host)
-    }
-
     /// The parent keeps the environment lock until its worker threads exit.
     pub(crate) fn set_thread_base(base: PathBuf) {
         super::dir_guard::override_base_for_test(base);

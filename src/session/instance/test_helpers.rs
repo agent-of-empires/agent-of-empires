@@ -135,10 +135,7 @@ function canonical(p, depth = 0) {
 let args = process.argv.slice(2);
 if (args[0] === "container" && args[1] === "inspect" && args.at(-1) === fixture.name) {
   process.stdout.write(JSON.stringify({id: "fixture:" + fixture.name, mounts: fixture.mounts}) + "\n");
-} else if (args[0] === "container" && args[1] === "inspect") {
-  process.stderr.write("Error: No such container: " + args.at(-1) + "\n");
-  process.exit(1);
-} else if (args[0] === "inspect") {
+} else if (args[0] === "inspect" || (args[0] === "container" && args[1] === "inspect")) {
   process.exit(1);
 } else if (args.shift() === "exec") {
   let cwd = "/";
@@ -208,25 +205,6 @@ if (args[0] === "container" && args[1] === "inspect" && args.at(-1) === fixture.
         ("DOCKER_CONTEXT", std::path::PathBuf::new()),
         ("XDG_RUNTIME_DIR", root.to_path_buf()),
     ])
-}
-
-/// Routes [`install_container_transport`] through a Colima default-profile socket with `root`
-/// as `$HOME`, so the runtime isn't local and only paths under `root` are host paths.
-pub(super) fn route_through_colima(
-    root: &std::path::Path,
-) -> crate::session::test_support::EnvGuard {
-    let colima = root.join("colima");
-    std::fs::create_dir_all(colima.join("default")).unwrap();
-    std::fs::create_dir_all(colima.join("_lima/colima")).unwrap();
-    std::fs::write(colima.join("_lima/colima/colima.yaml"), "mounts: []\n").unwrap();
-    crate::session::test_support::EnvGuard::set(&[
-        (
-            "DOCKER_HOST",
-            std::path::PathBuf::from(format!("unix://{}/default/docker.sock", colima.display())),
-        ),
-        ("COLIMA_HOME", colima),
-    ])
-    .and_set("HOME", root)
 }
 
 pub(super) fn write_sidecar(instance_id: &str, sid: &str) -> std::path::PathBuf {

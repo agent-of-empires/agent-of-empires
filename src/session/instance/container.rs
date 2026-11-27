@@ -1371,52 +1371,13 @@ impl Instance {
         LaunchAuth::from_env(&env)
     }
 
-    /// Refuses rather than launch: the bind configuration resolves the dir again, and a
-    /// switch that failed can leave the old side's dir where that lookup finds it first.
-    fn ensure_container_hook_mount_source(&self) -> Result<()> {
-        match self.container_hook_base() {
-            Some(base) => crate::hooks::switch_instance_dir(&self.id, base),
-            None => crate::hooks::ensure_instance_dir_path(&self.id),
+    fn ensure_container_hook_mount_source(&self) {
+        if let Err(error) = crate::hooks::ensure_instance_dir_path(&self.id) {
+            tracing::warn!(
+                target: "session.profile",
+                "Failed to prepare hook directory before container launch: {error:#}"
+            );
         }
-        .map(drop)
-        .context("prepare the hook directory before the container launch")
-    }
-
-    /// The base this row's container binds its hook dir from. A container that exists keeps the
-    /// bind it was created with until it is recreated; a new one takes the sandbox base. `None`
-    /// when the runtime can't say, which leaves whichever dir exists.
-    fn container_hook_base(&self) -> Option<crate::hooks::HookBase> {
-        use crate::hooks::HookBase;
-        let sandbox = self.sandbox_info.as_ref()?;
-        let runtime = crate::containers::get_container_runtime();
-        if !runtime.does_container_exist(&sandbox.container_name).ok()? {
-            return Some(HookBase::Sandbox);
-        }
-        let snapshot = crate::containers::ContainerExecutionSnapshot::capture(
-            crate::containers::RuntimeExecutionSnapshot::capture(&runtime).ok()?,
-            &sandbox.container_name,
-        )
-        .ok()?;
-        let target = format!(
-            "{}/{}",
-            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
-            self.id
-        );
-        let source = &snapshot
-            .mounts
-            .iter()
-            .find(|mount| mount.container_path == target)?
-            .host_path;
-        let host = crate::hooks::hook_base_path();
-        let canonical = std::fs::canonicalize(&host).unwrap_or_else(|_| host.clone());
-        let source = Path::new(source);
-        Some(
-            if source.starts_with(&host) || source.starts_with(&canonical) {
-                HookBase::Host
-            } else {
-                HookBase::Sandbox
-            },
-        )
     }
 
     /// Pin [`SandboxInfo::container_workdir`] to a live container's own
@@ -1515,7 +1476,7 @@ impl Instance {
         config: &crate::session::LaunchConfig,
         fold: container_config::CredentialFold,
     ) -> Result<crate::containers::ContainerConfig> {
-        self.ensure_container_hook_mount_source()?;
+        self.ensure_container_hook_mount_source();
 
         let sandbox = self
             .sandbox_info
@@ -1842,45 +1803,6 @@ mod tests {
             container_workdir: None,
         });
         inst
-    }
-
-    /// An existing container keeps the hook bind it was created with until it is recreated, so
-    /// one still bound to `/tmp` keeps the host dir; a new container takes the sandbox base.
-    #[test]
-    #[serial_test::serial]
-    fn a_container_keeps_its_hook_bind_until_it_is_recreated() {
-        use crate::hooks::HookBase;
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
-        let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
-        let inst = sandboxed_instance("claude");
-        let target = format!(
-            "{}/{}",
-            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
-            inst.id
-        );
-        let host = crate::hooks::hook_base_path().join(&inst.id);
-        let sandbox = crate::hooks::dir_guard::sandbox_hook_base_path()
-            .unwrap()
-            .join(&inst.id);
-        // (fixture container name, its hook bind source, base)
-        for (name, source, want) in [
-            ("aoe-login-gate", Some(&host), HookBase::Host),
-            ("aoe-login-gate", Some(&sandbox), HookBase::Sandbox),
-            ("another-container", Some(&host), HookBase::Sandbox),
-        ] {
-            let volumes = Vec::from_iter(source.map(|source| crate::containers::VolumeMount {
-                host_path: source.to_string_lossy().into_owned(),
-                container_path: target.clone(),
-                read_only: false,
-            }));
-            let _transport = super::super::test_helpers::install_container_transport(
-                temp.path(),
-                name,
-                &volumes,
-            );
-            assert_eq!(inst.container_hook_base(), Some(want), "{name} {source:?}");
-        }
     }
 
     fn set_shared_credential_mode(mode: SharedCredentialMode) {
@@ -2419,7 +2341,7 @@ mod tests {
         crate::hooks::cleanup_hook_status_dir(&inst.id);
         assert!(!hook_dir.exists());
 
-        inst.ensure_container_hook_mount_source().unwrap();
+        inst.ensure_container_hook_mount_source();
         assert!(hook_dir.is_dir());
 
         crate::hooks::cleanup_hook_status_dir(&inst.id);

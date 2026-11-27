@@ -719,12 +719,6 @@ impl Instance {
         // for either would then be watching the pane this launch is replacing.
         self.capture_poller.clear();
         if !self.is_sandboxed() {
-            // A row that was sandboxed may still hold a sandbox hook dir; the host one wins from here.
-            if let Err(error) =
-                crate::hooks::switch_instance_dir(&self.id, crate::hooks::HookBase::Host)
-            {
-                tracing::warn!(target: "session.profile", "Failed to prepare host hook directory: {error:#}");
-            }
             self.install_agent_status_hooks(self.status_agent());
         }
         self.report_store_override(prepared.execution.as_ref());
@@ -1421,19 +1415,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        // A row that was sandboxed keeps its sandbox hook dir; the host launch reads its host
-        // dir from the first poll (#5960).
-        let stale =
-            crate::hooks::switch_instance_dir(&instance.id, crate::hooks::HookBase::Sandbox)
-                .unwrap();
-        std::fs::write(stale.join("status"), "idle").unwrap();
         let outcome = instance.start_with_size_opts(None, true).unwrap();
         assert_eq!(outcome, LaunchSidOutcome::Existing { sid: sid.into() });
-        assert!(
-            !stale.exists(),
-            "the host launch leaves no sandbox hook dir"
-        );
-        assert_eq!(crate::hooks::read_hook_status(&instance.id), None);
         let replacement = only_pane_id(&name);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let native_pid = loop {
@@ -1975,7 +1958,6 @@ else:
                 local_mounts: true,
                 routing: Vec::new(),
                 global_arguments: Vec::new(),
-                shared_root: None,
             },
             name: "aoe-attested-route".into(),
             id: "0123456789ab".into(),

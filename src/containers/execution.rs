@@ -16,10 +16,6 @@ pub(crate) struct RuntimeExecutionSnapshot {
     /// Frozen transport flags for the inspected Docker endpoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) global_arguments: Vec<String>,
-    /// The one host directory a VM runtime shares at the same path, when `local_mounts` is
-    /// false. Mapped paths that stay under it are host paths.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) shared_root: Option<std::path::PathBuf>,
 }
 
 const RUNTIME_ROUTING_KEYS: &[&str] = &[
@@ -42,8 +38,6 @@ const RUNTIME_ROUTING_KEYS: &[&str] = &[
     "CONTAINERS_CONF_MODULES",
     "CONTAINERS_STORAGE_CONF",
     "SSH_AUTH_SOCK",
-    "COLIMA_HOME",
-    "LIMA_HOME",
 ];
 
 impl RuntimeExecutionSnapshot {
@@ -196,7 +190,6 @@ impl RuntimeExecutionSnapshot {
             local_mounts: false,
             routing,
             global_arguments: Vec::new(),
-            shared_root: None,
         };
         match snapshot.kind {
             Name::Docker => {
@@ -288,21 +281,6 @@ impl RuntimeExecutionSnapshot {
                                         })
                                 })
                         });
-                if !snapshot.local_mounts {
-                    let shared = snapshot
-                        .endpoint
-                        .strip_prefix("unix://")
-                        .zip(snapshot.value("HOME"))
-                        .and_then(|(socket, home)| {
-                            colima_shared_root(
-                                std::path::Path::new(socket),
-                                std::path::Path::new(home),
-                                snapshot.value("COLIMA_HOME").map(std::path::Path::new),
-                                snapshot.value("LIMA_HOME").map(std::path::Path::new),
-                            )
-                        });
-                    snapshot.shared_root = shared;
-                }
             }
             Name::Podman => {
                 let remote = snapshot
@@ -599,35 +577,20 @@ impl ContainerExecutionSnapshot {
         )
     }
 
-    /// Whether a mapped path is one the host sees: any path on a local runtime, and under a
-    /// shared root only a path that stays inside it once symlinks resolve, since the VM
-    /// resolves a link that leaves the share in its own filesystem.
-    fn on_host(&self, mapped: &std::path::Path) -> bool {
-        if self.runtime.local_mounts {
-            return true;
-        }
-        let Some(root) = self.runtime.shared_root.as_deref() else {
-            return false;
-        };
-        let lexical = crate::git::template::lexical_normalize(mapped);
-        lexical.starts_with(root)
-            && canonical_prefix(&lexical)
-                .zip(std::fs::canonicalize(root).ok())
-                .is_some_and(|(path, root)| path.starts_with(root))
-    }
-
     pub(crate) fn host_path(
         &self,
         path: &std::path::Path,
         writable: bool,
     ) -> Option<std::path::PathBuf> {
+        if !self.runtime.local_mounts {
+            return None;
+        }
         self.mapped_path(path, writable)
-            .filter(|mapped| self.on_host(mapped))
     }
 
     pub(crate) fn physical_path(&self, path: &std::path::Path) -> (String, std::path::PathBuf) {
         if let Some(mapped) = self.mapped_path(path, true) {
-            if self.on_host(&mapped) {
+            if self.runtime.local_mounts {
                 let canonical = std::fs::canonicalize(&mapped)
                     .unwrap_or_else(|_| crate::git::template::lexical_normalize(&mapped));
                 return ("host".into(), canonical);
@@ -647,69 +610,6 @@ impl ContainerExecutionSnapshot {
     }
 }
 
-/// `path` with its deepest existing ancestor canonicalized, so a path not created yet still
-/// resolves the links above it. Only missing components are skipped: one that exists but won't
-/// resolve, such as a dangling link, gives `None`, since the VM follows it.
-fn canonical_prefix(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    for ancestor in path.ancestors() {
-        match std::fs::canonicalize(ancestor) {
-            Ok(canonical) => return Some(canonical.join(path.strip_prefix(ancestor).ok()?)),
-            Err(_)
-                if matches!(
-                    std::fs::symlink_metadata(ancestor),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                ) => {}
-            Err(_) => return None,
-        }
-    }
-    None
-}
-
-/// The home directory a Colima VM shares at the same path, when `socket` is a profile's
-/// `<colima home>/<profile>/docker.sock` and the running instance keeps Colima's default
-/// mounts. Its state file, `<lima home>/<id>/colima.yaml`, holds the config the VM started
-/// with; the profile's own `colima.yaml` may have been edited since. A missing or unreadable
-/// state file proves nothing, so it gives `None`.
-fn colima_shared_root(
-    socket: &std::path::Path,
-    home: &std::path::Path,
-    colima_home: Option<&std::path::Path>,
-    lima_home: Option<&std::path::Path>,
-) -> Option<std::path::PathBuf> {
-    use std::path::Component;
-    let base = colima_home.map_or_else(|| home.join(".colima"), std::path::Path::to_path_buf);
-    let mut parts = socket.strip_prefix(&base).ok()?.components();
-    let (Some(Component::Normal(profile)), Some(Component::Normal(file)), None) =
-        (parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    if file != "docker.sock" {
-        return None;
-    }
-    let id = if profile == "default" {
-        "colima".to_owned()
-    } else {
-        format!("colima-{}", profile.to_str()?)
-    };
-    let lima = lima_home.map_or_else(|| base.join("_lima"), std::path::Path::to_path_buf);
-    let config = std::fs::read_to_string(lima.join(id).join("colima.yaml")).ok()?;
-    colima_default_mounts(&config).then(|| home.to_path_buf())
-}
-
-/// Whether a `colima.yaml` keeps the default mounts: a mapping whose `mounts` is an empty list.
-/// Colima shares the home directory only then; an absent or null `mounts` means no mounts, and
-/// any entry replaces the share. A file that doesn't parse as such a mapping proves nothing.
-fn colima_default_mounts(config: &str) -> bool {
-    use serde_json::Value;
-    let Ok(Value::Object(config)) =
-        serde_saphyr::from_str_with_options::<Value>(config, crate::yaml::options())
-    else {
-        return false;
-    };
-    matches!(config.get("mounts"), Some(Value::Array(mounts)) if mounts.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,7 +626,6 @@ mod tests {
                 local_mounts,
                 routing: Vec::new(),
                 global_arguments: Vec::new(),
-                shared_root: None,
             },
             name: "aoe-test".into(),
             id: "container-id".into(),
@@ -762,269 +661,6 @@ mod tests {
             snapshot(true).physical_path(std::path::Path::new("/unmapped/file.txt"));
         assert!(domain.starts_with("container:"));
         assert_eq!(path, std::path::PathBuf::from("/unmapped/file.txt"));
-    }
-
-    /// Colima's profile socket is trusted only when its running instance's state file keeps the
-    /// default mounts, an explicit empty list, which share `$HOME` at the same path; any other
-    /// socket, config or a missing state file proves nothing.
-    #[test]
-    fn colima_shared_root_trusts_only_the_default_home_share() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
-        let elsewhere = temp.path().join("ch");
-        let id = |name: &str| match name {
-            "default" => "colima".to_owned(),
-            name => format!("colima-{name}"),
-        };
-        let write = |path: std::path::PathBuf, yaml: &str| {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, yaml).unwrap();
-        };
-        // A profile's socket, with `state` as its running instance's state file.
-        let profile = |base: &std::path::Path, name: &str, state: Option<&str>| {
-            std::fs::create_dir_all(base.join(name)).unwrap();
-            if let Some(yaml) = state {
-                write(base.join("_lima").join(id(name)).join("colima.yaml"), yaml);
-            }
-            base.join(name).join("docker.sock")
-        };
-        // The profile's own config, which an edit can change while the VM runs.
-        let edited = |base: &std::path::Path, name: &str, yaml: &str| {
-            write(base.join(name).join("colima.yaml"), yaml);
-        };
-        let lima_home = temp.path().join("lima");
-        let custom = "mounts:\n  - location: /Volumes/x\n";
-        let colima = home.join(".colima");
-        let shared = Some(home.clone());
-        // (case, socket, COLIMA_HOME, LIMA_HOME, expected)
-        for (case, socket, colima_home, lima, want) in [
-            (
-                "default-empty-mounts",
-                profile(&colima, "default", Some("cpu: 2\nmounts: [] # none\n")),
-                None,
-                None,
-                shared.clone(),
-            ),
-            (
-                "no-mounts-key",
-                profile(&colima, "nokey", Some("cpu: 2\nvmType: vz\n")),
-                None,
-                None,
-                None,
-            ),
-            (
-                "custom-mounts-list",
-                profile(
-                    &colima,
-                    "listed",
-                    Some("mounts:\n  # mine\n  - location: ~/work\n    writable: true\n"),
-                ),
-                None,
-                None,
-                None,
-            ),
-            (
-                "custom-mounts-inline",
-                profile(
-                    &colima,
-                    "inline",
-                    Some("mounts: [{location: /Volumes/x}]\n"),
-                ),
-                None,
-                None,
-                None,
-            ),
-            (
-                "quoted-key",
-                profile(
-                    &colima,
-                    "quoted",
-                    Some("\"mounts\": [{location: /Volumes/work}]\n"),
-                ),
-                None,
-                None,
-                None,
-            ),
-            (
-                "spaced-key",
-                profile(
-                    &colima,
-                    "spaced",
-                    Some("mounts : [{location: /Volumes/work}]\n"),
-                ),
-                None,
-                None,
-                None,
-            ),
-            (
-                "flow-mapping",
-                profile(
-                    &colima,
-                    "flow",
-                    Some("{cpu: 2, mounts: [{location: /Volumes/work}]}\n"),
-                ),
-                None,
-                None,
-                None,
-            ),
-            (
-                "explicit-null-mounts",
-                profile(&colima, "nulled", Some("mounts: null\n")),
-                None,
-                None,
-                None,
-            ),
-            (
-                "null-mounts",
-                profile(&colima, "null", Some("cpu: 2\nmounts:\n")),
-                None,
-                None,
-                None,
-            ),
-            (
-                "malformed",
-                profile(&colima, "malformed", Some("mounts: [\n")),
-                None,
-                None,
-                None,
-            ),
-            (
-                "not-a-mapping",
-                profile(&colima, "sequence", Some("- mounts\n")),
-                None,
-                None,
-                None,
-            ),
-            ("no-yaml", profile(&colima, "bare", None), None, None, None),
-            (
-                "named-profile",
-                profile(&colima, "work", Some("mounts: []\n")),
-                None,
-                None,
-                shared.clone(),
-            ),
-            (
-                "colima-home",
-                profile(&elsewhere, "default", Some("mounts: []\n")),
-                Some(elsewhere.as_path()),
-                None,
-                shared.clone(),
-            ),
-            (
-                "colima-home-elsewhere",
-                profile(&colima, "default", Some("mounts: []\n")),
-                Some(elsewhere.as_path()),
-                None,
-                None,
-            ),
-            (
-                "nested",
-                profile(&colima.join("default"), "x", Some("mounts: []\n")),
-                None,
-                None,
-                None,
-            ),
-            (
-                "state-shares",
-                {
-                    edited(&colima, "relisted", custom);
-                    profile(&colima, "relisted", Some("mounts: []\n"))
-                },
-                None,
-                None,
-                shared.clone(),
-            ),
-            (
-                "state-custom",
-                {
-                    edited(&colima, "emptied", "mounts: []\n");
-                    profile(&colima, "emptied", Some(custom))
-                },
-                None,
-                None,
-                None,
-            ),
-            (
-                "state-missing",
-                {
-                    edited(&colima, "stopped", "mounts: []\n");
-                    profile(&colima, "stopped", None)
-                },
-                None,
-                None,
-                None,
-            ),
-            (
-                "lima-home",
-                {
-                    write(lima_home.join("colima-lh/colima.yaml"), "mounts: []\n");
-                    profile(&colima, "lh", None)
-                },
-                None,
-                Some(lima_home.as_path()),
-                shared.clone(),
-            ),
-            (
-                "other-socket",
-                temp.path().join("docker.sock"),
-                None,
-                None,
-                None,
-            ),
-        ] {
-            assert_eq!(
-                colima_shared_root(&socket, &home, colima_home, lima),
-                want,
-                "{case}"
-            );
-        }
-    }
-
-    /// Under a shared root, a mapped path is a host path only while it stays inside the root,
-    /// both as written and once its links resolve.
-    #[test]
-    fn a_colima_share_maps_only_paths_under_home() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
-        let outside = temp.path().join("outside");
-        std::fs::create_dir_all(home.join("store")).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, home.join("link")).unwrap();
-        std::os::unix::fs::symlink(outside.join("missing"), home.join("dangling")).unwrap();
-        std::os::unix::fs::symlink(home.join("missing"), home.join("dangling-in")).unwrap();
-        // (case, bind source, shared root, is a host path)
-        for (case, source, shared, host) in [
-            ("under-home", home.join("store"), Some(home.clone()), true),
-            ("outside-home", outside.clone(), Some(home.clone()), false),
-            ("symlink-out", home.join("link"), Some(home.clone()), false),
-            (
-                "dangling-link-out",
-                home.join("dangling"),
-                Some(home.clone()),
-                false,
-            ),
-            (
-                "dangling-link-in",
-                home.join("dangling-in"),
-                Some(home.clone()),
-                false,
-            ),
-            (
-                "missing-under-home",
-                home.join("store/new"),
-                Some(home.clone()),
-                true,
-            ),
-            ("no-share", home.join("store"), None, false),
-        ] {
-            let mut snapshot = snapshot(false);
-            snapshot.runtime.shared_root = shared;
-            snapshot.mounts[0].host_path = source.to_string_lossy().into_owned();
-            let target = std::path::Path::new("/workspace/project/file");
-            let (domain, _) = snapshot.physical_path(target);
-            assert_eq!(domain == "host", host, "{case}: {domain}");
-            assert_eq!(snapshot.host_path(target, true).is_some(), host, "{case}");
-        }
     }
 
     /// A fake `docker` binary plus a hermetic environment let `capture`

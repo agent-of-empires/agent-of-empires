@@ -1,13 +1,6 @@
 //! Hardened access to the AoE hook status directory, the single Rust entry
 //! point for every read, write, and cleanup under `/tmp/aoe-hooks-<euid>`
-//! (#1844) and the sandbox hook base under the app dir.
-//!
-//! A sandboxed row's container binds `<app dir>/sandbox-hooks/<id>`, which
-//! VM runtimes such as Colima share because it is under `$HOME`; `/tmp` is
-//! not shared there (#5960). A row's dir is the host one when it exists, else
-//! the sandbox one, so a container still bound to `/tmp` is never hidden by an
-//! empty sandbox dir. Only [`switch_instance_dir`] moves a row between them,
-//! under a per-id lock that every creating open also takes.
+//! (#1844).
 //!
 //! The base directory is created `0o700`, opened with `O_DIRECTORY |
 //! O_NOFOLLOW`, then verified by `fstat` on the resulting fd, which pins the
@@ -35,9 +28,9 @@ use std::os::fd::AsRawFd;
 
 use anyhow::{anyhow, bail, Context, Result};
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
+use nix::fcntl::{open, openat, renameat, OFlag};
 use nix::libc;
-use nix::sys::stat::{fchmod, fstat, fstatat, mkdirat, Mode};
+use nix::sys::stat::{fchmod, fstat, mkdirat, Mode};
 use nix::unistd::{geteuid, mkdir, unlinkat, UnlinkatFlags};
 
 // Path resolution.
@@ -47,9 +40,6 @@ thread_local! {
     /// Test-only base path override. A test using it must also call
     /// `reset_for_test` and serialize via `serial_test::serial(hook_base)`.
     static HOOK_BASE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-    /// Test-only sandbox base, for a fixture whose two bases must not share a parent.
-    static SANDBOX_HOOK_BASE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -65,70 +55,14 @@ pub(crate) fn hook_base_path() -> PathBuf {
     PathBuf::from(format!("/tmp/aoe-hooks-{}", geteuid().as_raw()))
 }
 
-/// The two bases a row's hook dir can live under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HookBase {
-    Host,
-    Sandbox,
-}
-
-impl HookBase {
-    fn path(self) -> Result<PathBuf> {
-        match self {
-            Self::Host => Ok(hook_base_path()),
-            Self::Sandbox => sandbox_hook_base_path(),
-        }
-    }
-
-    fn other(self) -> Self {
-        match self {
-            Self::Host => Self::Sandbox,
-            Self::Sandbox => Self::Host,
-        }
-    }
-
-    fn label(self, instance_id: &str) -> PathBuf {
-        self.path()
-            .map(|base| base.join(instance_id))
-            .unwrap_or_else(|_| PathBuf::from(instance_id))
-    }
-}
-
-/// Bind source base for sandboxed rows. Tests keep it beside the (overridden) host base, unless
-/// they set it apart.
-pub(crate) fn sandbox_hook_base_path() -> Result<PathBuf> {
-    #[cfg(test)]
-    {
-        if let Some(p) = SANDBOX_HOOK_BASE_OVERRIDE.with(|c| c.borrow().clone()) {
-            return Ok(p);
-        }
-        let host = hook_base_path();
-        let name = host
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        Ok(host.with_file_name(format!("{name}-sandbox")))
-    }
-    #[cfg(not(test))]
-    {
-        Ok(crate::session::get_app_dir()?.join("sandbox-hooks"))
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn override_base_for_test(path: PathBuf) {
     HOOK_BASE_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
 }
 
 #[cfg(test)]
-pub(crate) fn override_sandbox_base_for_test(path: PathBuf) {
-    SANDBOX_HOOK_BASE_OVERRIDE.with(|c| *c.borrow_mut() = Some(path));
-}
-
-#[cfg(test)]
 pub(crate) fn clear_base_override_for_test() {
     HOOK_BASE_OVERRIDE.with(|c| *c.borrow_mut() = None);
-    SANDBOX_HOOK_BASE_OVERRIDE.with(|c| *c.borrow_mut() = None);
 }
 
 // Singleton cell.
@@ -136,57 +70,23 @@ pub(crate) fn clear_base_override_for_test() {
 type CachedBase = std::result::Result<OwnedFd, Arc<anyhow::Error>>;
 
 // `static` so the owned fd lives for the program lifetime and its `close` on
-// drop never fires; `with_base` only lends it for a closure call.
+// drop never fires; `with_hook_base` only lends it for a closure call.
 #[cfg(not(test))]
 static HOOK_BASE: OnceLock<CachedBase> = OnceLock::new();
-#[cfg(not(test))]
-static SANDBOX_HOOK_BASE: OnceLock<CachedBase> = OnceLock::new();
 
 #[cfg(test)]
 thread_local! {
-    /// Per-thread shadow of `HOOK_BASE` and `SANDBOX_HOOK_BASE`, since a test
-    /// cannot reset a process-wide `OnceLock`. Production never touches it.
-    static HOOK_BASE_TEST_CELL: std::cell::RefCell<[Option<CachedBase>; 2]> =
-        const { std::cell::RefCell::new([None, None]) };
-
-    /// Runs inside [`switch_instance_dir`] between its two steps.
-    static SWITCH_PAUSE_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
-        const { std::cell::RefCell::new(None) };
-
-    /// Makes [`set_aside`]'s rename fail, which tests running as root can't cause otherwise.
-    static SET_ASIDE_FAILS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-
-    /// Runs inside [`write_instance_file`] between the lookup and the write.
-    static WRITE_PAUSE_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    /// Per-thread shadow of `HOOK_BASE`, since a test cannot reset a
+    /// process-wide `OnceLock`. Production never touches it.
+    static HOOK_BASE_TEST_CELL: std::cell::RefCell<Option<CachedBase>> =
         const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
-    HOOK_BASE_TEST_CELL.with(|c| *c.borrow_mut() = [None, None]);
+    HOOK_BASE_TEST_CELL.with(|c| *c.borrow_mut() = None);
     OPEN_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
-
-#[cfg(test)]
-pub(crate) fn pause_switch_for_test(pause: impl FnOnce() + 'static) {
-    SWITCH_PAUSE_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(Box::new(pause)));
-}
-
-#[cfg(test)]
-fn fail_set_aside_for_test(fails: bool) {
-    SET_ASIDE_FAILS_FOR_TEST.with(|slot| slot.set(fails));
-}
-
-#[cfg(test)]
-fn pause_write_for_test(pause: impl FnOnce() + 'static) {
-    WRITE_PAUSE_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(Box::new(pause)));
-}
-
-/// Told the lock file's path when an instance lock is contended.
-#[cfg(test)]
-pub(crate) static LOCK_CONTENTION_FOR_TEST: std::sync::Mutex<
-    Option<std::sync::mpsc::Sender<PathBuf>>,
-> = std::sync::Mutex::new(None);
 
 // Syscall counter the caching tests read. Production never observes it.
 #[cfg(test)]
@@ -198,16 +98,15 @@ pub(crate) fn open_calls() -> usize {
 }
 
 #[cfg(test)]
-fn cached_get_or_init_apply<I, A, T>(kind: HookBase, init: I, apply: A) -> Result<T>
+fn cached_get_or_init_apply<I, A, T>(init: I, apply: A) -> Result<T>
 where
     I: FnOnce() -> std::result::Result<OwnedFd, Arc<anyhow::Error>>,
     A: FnOnce(&std::result::Result<OwnedFd, Arc<anyhow::Error>>) -> Result<T>,
 {
     // The `borrow_mut` is held for the whole call, so a closure that
-    // re-enters `with_base` would panic with `BorrowMutError`.
+    // re-enters `with_hook_base` would panic with `BorrowMutError`.
     HOOK_BASE_TEST_CELL.with(|cell| {
-        let mut slots = cell.borrow_mut();
-        let slot = &mut slots[kind as usize];
+        let mut slot = cell.borrow_mut();
         if slot.is_none() {
             *slot = Some(init());
         }
@@ -216,35 +115,30 @@ where
 }
 
 #[cfg(not(test))]
-fn cached_get_or_init_apply<I, A, T>(kind: HookBase, init: I, apply: A) -> Result<T>
+fn cached_get_or_init_apply<I, A, T>(init: I, apply: A) -> Result<T>
 where
     I: FnOnce() -> std::result::Result<OwnedFd, Arc<anyhow::Error>>,
     A: FnOnce(&std::result::Result<OwnedFd, Arc<anyhow::Error>>) -> Result<T>,
 {
-    let cell = match kind {
-        HookBase::Host => &HOOK_BASE,
-        HookBase::Sandbox => &SANDBOX_HOOK_BASE,
-    };
-    apply(cell.get_or_init(init))
+    apply(HOOK_BASE.get_or_init(init))
 }
 
-/// Open and verify a hook base directory once, then run `f` with a borrowed
-/// fd to it; later callers reuse the cached fd or cached error. The closure
-/// shape is what keeps the fd from escaping its borrow.
-fn with_base<F, T>(kind: HookBase, f: F) -> Result<T>
+/// Open and verify the per-user hook base directory once, then run `f` with
+/// a borrowed fd to it; later callers reuse the cached fd or cached error.
+/// The closure shape is what keeps the fd from escaping its borrow.
+pub(crate) fn with_hook_base<F, T>(f: F) -> Result<T>
 where
     F: FnOnce(BorrowedFd<'_>) -> Result<T>,
 {
     cached_get_or_init_apply(
-        kind,
-        || match open_and_verify_base(kind) {
+        || match open_and_verify_base() {
             Ok(fd) => Ok(fd),
             Err(e) => {
                 tracing::error!(
                     target: "hooks.guard",
                     "hook base init failed: {e:#}. AoE will fall back to pane-detection. \
                      Recover: rm -rf {}",
-                    kind.label("").display()
+                    hook_base_path().display()
                 );
                 Err(Arc::new(e))
             }
@@ -256,13 +150,11 @@ where
     )
 }
 
-fn open_and_verify_base(kind: HookBase) -> Result<OwnedFd> {
+fn open_and_verify_base() -> Result<OwnedFd> {
     #[cfg(test)]
-    if kind == HookBase::Host {
-        OPEN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    OPEN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let path = kind.path()?;
+    let path = hook_base_path();
 
     // 1. mkdir(0o700) tolerating EEXIST.
     match mkdir(&path, Mode::S_IRWXU) {
@@ -278,11 +170,7 @@ fn open_and_verify_base(kind: HookBase) -> Result<OwnedFd> {
     //    /tmp -> /private/tmp is still followed.
     let fd: OwnedFd = open(
         &path,
-        OFlag::O_DIRECTORY
-            | OFlag::O_NOFOLLOW
-            | OFlag::O_CLOEXEC
-            | OFlag::O_RDONLY
-            | OFlag::O_NONBLOCK,
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
         Mode::empty(),
     )
     .with_context(|| {
@@ -339,43 +227,12 @@ fn verify_dir_metadata(fd: &OwnedFd, label: &std::path::Path) -> Result<()> {
 
 // Per-instance.
 
-/// The row's existing dir, or a new host one, as an owned fd. Takes the
-/// row's switch lock, so it never creates a host dir while a switch is under way.
-pub(crate) fn open_instance_dir(instance_id: &str) -> Result<OwnedFd> {
-    Ok(resolve_or_create(instance_id)?.1)
-}
-
-fn resolve_or_create(instance_id: &str) -> Result<(HookBase, OwnedFd)> {
-    crate::session::validate_instance_id(instance_id)?;
-    let _lock = lock_instance(instance_id);
-    if let Some(found) = existing_instance_dir(instance_id)? {
-        return Ok(found);
-    }
-    Ok((HookBase::Host, create_child(HookBase::Host, instance_id)?))
-}
-
-/// The host dir when it exists, else the sandbox one.
-fn existing_instance_dir(instance_id: &str) -> Result<Option<(HookBase, OwnedFd)>> {
-    let host = open_child(HookBase::Host, instance_id);
-    if let Ok(Some(fd)) = host {
-        return Ok(Some((HookBase::Host, fd)));
-    }
-    if let Ok(Some(fd)) = open_child(HookBase::Sandbox, instance_id) {
-        return Ok(Some((HookBase::Sandbox, fd)));
-    }
-    host.map(|_| None)
-}
-
-fn open_child(kind: HookBase, instance_id: &str) -> Result<Option<OwnedFd>> {
-    with_base(kind, |base| {
-        open_instance_child(base, instance_id, &kind.label(instance_id))
-    })
-}
-
 /// `mkdirat(base, id, 0o700)` (EEXIST-tolerant) plus `openat(O_NOFOLLOW)` plus
-/// `fstat`-on-fd uid/mode check.
-fn create_child(kind: HookBase, instance_id: &str) -> Result<OwnedFd> {
-    with_base(kind, |base| {
+/// `fstat`-on-fd uid/mode check. Returns an owned fd to the per-instance
+/// directory.
+pub(crate) fn open_instance_dir(instance_id: &str) -> Result<OwnedFd> {
+    crate::session::validate_instance_id(instance_id)?;
+    with_hook_base(|base| {
         match mkdirat(base, instance_id, Mode::S_IRWXU) {
             Ok(()) | Err(Errno::EEXIST) => {}
             Err(e) => {
@@ -385,177 +242,14 @@ fn create_child(kind: HookBase, instance_id: &str) -> Result<OwnedFd> {
         let fd: OwnedFd = openat(
             base,
             instance_id,
-            OFlag::O_DIRECTORY
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_CLOEXEC
-                | OFlag::O_RDONLY
-                | OFlag::O_NONBLOCK,
+            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
             Mode::empty(),
         )
         .with_context(|| format!("openat instance subdir {instance_id} (symlink or non-dir)"))?;
-        verify_dir_metadata(&fd, &kind.label(instance_id))?;
+        let label = hook_base_path().join(instance_id);
+        verify_dir_metadata(&fd, &label)?;
         Ok(fd)
     })
-}
-
-/// Exclusive `flock` on `<sandbox base>/.<id>.lock`, outside any bound dir. `None` when it
-/// can't be taken: the sandbox base is unusable, or the lock file can't be opened or locked.
-/// Cleanup unlinks the name while holding it, so a lock is kept only while the name still
-/// refers to the file locked; otherwise a later opener would lock a new file beside it.
-fn lock_instance(instance_id: &str) -> Option<std::fs::File> {
-    let name = format!(".{instance_id}.lock");
-    for _ in 0..3 {
-        let file = lock_instance_file(instance_id, &name)?;
-        let held = fstat(&file).ok();
-        let current = with_base(HookBase::Sandbox, |base| {
-            Ok(fstatat(base, name.as_str(), AtFlags::AT_SYMLINK_NOFOLLOW).ok())
-        })
-        .ok()
-        .flatten();
-        if held.zip(current).is_some_and(|(held, current)| {
-            (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
-        }) {
-            return Some(file);
-        }
-    }
-    tracing::warn!(target: "hooks.guard", "switch lock for {instance_id} kept being replaced");
-    None
-}
-
-fn lock_instance_file(instance_id: &str, name: &str) -> Option<std::fs::File> {
-    let file = with_base(HookBase::Sandbox, |base| {
-        let fd = openat(
-            base,
-            name,
-            OFlag::O_CREAT
-                | OFlag::O_RDWR
-                | OFlag::O_NOFOLLOW
-                | OFlag::O_CLOEXEC
-                | OFlag::O_NONBLOCK,
-            Mode::S_IRUSR | Mode::S_IWUSR,
-        )
-        .with_context(|| format!("open switch lock for {instance_id}"))?;
-        Ok(std::fs::File::from(fd))
-    })
-    .map_err(|e| tracing::warn!(target: "hooks.guard", "switch lock unavailable: {e:#}"))
-    .ok()?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            #[cfg(test)]
-            if let Some(sender) = LOCK_CONTENTION_FOR_TEST.lock().unwrap().as_ref() {
-                let _ = sender.send(HookBase::Sandbox.label(instance_id));
-            }
-            file.lock()
-                .map_err(|e| tracing::warn!(target: "hooks.guard", "switch lock: {e}"))
-                .ok()?;
-        }
-        Err(std::fs::TryLockError::Error(e)) => {
-            tracing::warn!(target: "hooks.guard", "switch lock: {e}");
-            return None;
-        }
-    }
-    Some(file)
-}
-
-/// Moves a row's hook dir to `to`: creates it there, then removes the other, under the row's
-/// switch lock so a creating open waits rather than recreating the dir being removed. Returns
-/// the canonical path, for a bind-mount source, and then no dir for the row is left under the
-/// other base's lookup name. Without the lock it changes nothing.
-pub(crate) fn switch_instance_dir(instance_id: &str, to: HookBase) -> Result<PathBuf> {
-    crate::session::validate_instance_id(instance_id)?;
-    let _lock = lock_instance(instance_id)
-        .with_context(|| format!("switch lock for {instance_id} unavailable"))?;
-    create_child(to, instance_id)?;
-    #[cfg(test)]
-    if let Some(pause) = SWITCH_PAUSE_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
-        pause();
-    }
-    remove_child(to.other(), instance_id)?;
-    set_aside(to.other(), instance_id)?;
-    let lexical = to.path()?.join(instance_id);
-    std::fs::canonicalize(&lexical)
-        .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
-}
-
-/// Moves a dir cleanup couldn't empty out of the lookup's way, so it never reads it beside the
-/// one a switch made. The row's earlier set-aside dirs are removed first, keeping only those
-/// that still can't go; the dir then takes `.stale-<id>`, or a fresh `.stale-<id>.<n>` while an
-/// earlier one holds that name. Only a rename that fails is an error.
-fn set_aside(kind: HookBase, instance_id: &str) -> Result<()> {
-    let moved = with_base(kind, |base| {
-        remove_stale(kind, base, instance_id);
-        if !entry_exists(base, instance_id)? {
-            return Ok(None);
-        }
-        let mut name = format!(".stale-{instance_id}");
-        while entry_exists(base, &name)? {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            name = format!(".stale-{instance_id}.{}-{n}", std::process::id());
-        }
-        #[cfg(test)]
-        if SET_ASIDE_FAILS_FOR_TEST.with(std::cell::Cell::get) {
-            anyhow::bail!("injected set-aside failure");
-        }
-        renameat(base, instance_id, base, name.as_str())
-            .with_context(|| format!("renameat {instance_id} -> {name}"))?;
-        Ok(Some(name))
-    })
-    .with_context(|| {
-        format!(
-            "set aside {}, which cleanup couldn't empty",
-            kind.label(instance_id).display()
-        )
-    })?;
-    if let Some(name) = moved {
-        tracing::warn!(target: "hooks.guard",
-            "set aside {}, which cleanup couldn't empty, as {name}",
-            kind.label(instance_id).display());
-    }
-    Ok(())
-}
-
-fn entry_exists(base: BorrowedFd<'_>, name: &str) -> Result<bool> {
-    match fstatat(base, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
-        Ok(_) => Ok(true),
-        Err(Errno::ENOENT) => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("fstatat {name}")),
-    }
-}
-
-/// Removes the row's set-aside dirs in `base`: `.stale-<id>` and `.stale-<id>.<anything>`, never
-/// another row's whose id extends this one. Whatever can't be removed stays, with a warning.
-fn remove_stale(kind: HookBase, base: BorrowedFd<'_>, instance_id: &str) {
-    let exact = format!(".stale-{instance_id}");
-    let suffixed = format!("{exact}.");
-    // A fresh open, not a dup: a dup shares the cached base's offset, so a later listing would
-    // start where this one ended.
-    let names: Vec<String> = match openat(
-        base,
-        ".",
-        OFlag::O_DIRECTORY | OFlag::O_RDONLY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .context("open base for readdir")
-    .and_then(|fd| nix::dir::Dir::from_fd(fd).context("Dir::from_fd"))
-    {
-        Ok(mut dir) => dir
-            .iter()
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| entry.file_name().to_str().ok().map(str::to_owned))
-            .filter(|name| *name == exact || name.starts_with(&suffixed))
-            .collect(),
-        Err(e) => {
-            tracing::warn!(target: "hooks.guard", "list set-aside dirs: {e:#}");
-            return;
-        }
-    };
-    for name in names {
-        if let Err(e) = remove_entry(kind, base, &name) {
-            tracing::warn!(target: "hooks.guard", "left {}: {e:#}", kind.label(&name).display());
-        }
-    }
 }
 
 /// Read-only variant: never creates the dir. Returns `Ok(None)` on `ENOENT` /
@@ -563,7 +257,9 @@ fn remove_stale(kind: HookBase, base: BorrowedFd<'_>, instance_id: &str) {
 /// indistinguishable from "no hook fired yet" on the polling path).
 pub(crate) fn open_instance_dir_read_only(instance_id: &str) -> Result<Option<OwnedFd>> {
     crate::session::validate_instance_id(instance_id)?;
-    Ok(existing_instance_dir(instance_id)?.map(|(_, fd)| fd))
+    with_hook_base(|base| {
+        open_instance_child(base, instance_id, &hook_base_path().join(instance_id))
+    })
 }
 
 pub(crate) fn open_recorded_instance_dir(
@@ -580,11 +276,7 @@ pub(crate) fn open_recorded_instance_dir(
         .context("recorded hook directory has no parent")?;
     let base = open(
         parent,
-        OFlag::O_DIRECTORY
-            | OFlag::O_NOFOLLOW
-            | OFlag::O_CLOEXEC
-            | OFlag::O_RDONLY
-            | OFlag::O_NONBLOCK,
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
         Mode::empty(),
     )?;
     verify_dir_metadata(&base, parent)?;
@@ -599,11 +291,7 @@ fn open_instance_child(
     match openat(
         base,
         instance_id,
-        OFlag::O_DIRECTORY
-            | OFlag::O_NOFOLLOW
-            | OFlag::O_CLOEXEC
-            | OFlag::O_RDONLY
-            | OFlag::O_NONBLOCK,
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
         Mode::empty(),
     ) {
         Ok(fd) => {
@@ -611,8 +299,7 @@ fn open_instance_child(
             Ok(Some(fd))
         }
         Err(Errno::ENOENT) | Err(Errno::ELOOP) => Ok(None),
-        Err(e) => Err(e)
-            .with_context(|| format!("openat instance subdir {instance_id} (symlink or non-dir)")),
+        Err(e) => Err(e).with_context(|| format!("openat instance subdir {instance_id}")),
     }
 }
 
@@ -779,24 +466,8 @@ pub(crate) fn write_session_id_via_guard(
     source: Option<&str>,
 ) -> Result<()> {
     let leaf = session_id_leaf(source)?;
-    write_instance_file(instance_id, &leaf, session_id.as_bytes())
-}
-
-/// Writes `name` atomically into the row's hook dir. The lookup doesn't hold the switch lock
-/// through the write, so a switch can remove the dir in between and the write fails with
-/// `ENOENT`; the dir is then looked up again, once.
-pub(crate) fn write_instance_file(instance_id: &str, name: &str, bytes: &[u8]) -> Result<()> {
     let dir = open_instance_dir(instance_id)?;
-    #[cfg(test)]
-    if let Some(pause) = WRITE_PAUSE_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
-        pause();
-    }
-    match write_atomic(dir.as_fd(), name, bytes) {
-        Err(error) if error.root_cause().downcast_ref::<Errno>() == Some(&Errno::ENOENT) => {
-            write_atomic(open_instance_dir(instance_id)?.as_fd(), name, bytes)
-        }
-        result => result,
-    }
+    write_atomic(dir.as_fd(), &leaf, session_id.as_bytes())
 }
 
 /// Delete the `session_id` sidecar with `unlinkat` against a verified
@@ -830,28 +501,10 @@ pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
 /// propagates; callers skip the bind mount, warn, and boot with pane
 /// detection.
 pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
-    let (kind, _fd) = resolve_or_create(instance_id)?;
-    let lexical = kind.path()?.join(instance_id);
+    let _fd = open_instance_dir(instance_id)?;
+    let lexical = hook_base_path().join(instance_id);
     std::fs::canonicalize(&lexical)
         .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
-}
-
-/// The hook dir a host launch prepares its paths in: the host one, switched to now. A later
-/// switch to the host base, the launch's own included, never removes it. When this switch
-/// can't run, only an existing host dir is used: a lock that can't be taken now may be free
-/// for the launch's switch, which would remove a sandbox dir under the paths prepared in it.
-pub(crate) fn host_launch_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
-    switch_instance_dir(instance_id, HookBase::Host).or_else(|error| {
-        let (kind, _fd) = resolve_or_create(instance_id)?;
-        anyhow::ensure!(
-            kind == HookBase::Host,
-            "host hook dir switch failed, and only the sandbox dir exists: {error:#}"
-        );
-        tracing::warn!(target: "hooks.guard", "host hook dir switch failed: {error:#}");
-        let lexical = kind.path()?.join(instance_id);
-        std::fs::canonicalize(&lexical)
-            .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
-    })
 }
 
 // Cleanup.
@@ -864,74 +517,42 @@ pub(crate) fn host_launch_instance_dir_path(instance_id: &str) -> Result<PathBuf
 /// `ENOTEMPTY`, which surfaces as a warn-skip.
 pub(crate) fn remove_instance_dir(instance_id: &str) -> Result<()> {
     crate::session::validate_instance_id(instance_id)?;
-    let sandbox_base = sandbox_hook_base_path().is_ok_and(|base| base.exists());
-    let _lock = sandbox_base.then(|| lock_instance(instance_id)).flatten();
-    let _ = with_base(HookBase::Host, |base| {
-        remove_stale(HookBase::Host, base, instance_id);
+    with_hook_base(|base| {
+        let dir_fd = match openat(
+            base,
+            instance_id,
+            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) | Err(Errno::ELOOP) => {
+                // Gone, or a hostile symlink: unlink whatever is at the path
+                // so a future open succeeds. Without `RemoveDir` that removes
+                // the symlink itself, never its target.
+                let _ = unlinkat(base, instance_id, UnlinkatFlags::NoRemoveDir);
+                return Ok(());
+            }
+            Err(e) => return Err(e).with_context(|| format!("openat cleanup {instance_id}")),
+        };
+        let label = hook_base_path().join(instance_id);
+        if let Err(e) = verify_dir_metadata(&dir_fd, &label) {
+            // Wrong owner or mode: neither walk nor unlink, leave it to the user.
+            tracing::warn!(target: "hooks.guard", "skip cleanup {}: {e:#}", label.display());
+            return Ok(());
+        }
+        walk_and_unlink_entries(&dir_fd)?;
+        // Final unlink of the per-instance subdir itself.
+        if let Err(e) = unlinkat(base, instance_id, UnlinkatFlags::RemoveDir) {
+            if e == Errno::ENOTEMPTY {
+                tracing::warn!(target: "hooks.guard",
+                    "skipped non-empty cleanup of {}: hostile or stale subdir present",
+                    label.display());
+                return Ok(());
+            }
+            return Err(e).with_context(|| format!("unlinkat RemoveDir {instance_id}"));
+        }
         Ok(())
-    });
-    let host = remove_child(HookBase::Host, instance_id);
-    if sandbox_base {
-        let _ = with_base(HookBase::Sandbox, |base| {
-            remove_stale(HookBase::Sandbox, base, instance_id);
-            Ok(())
-        });
-        remove_child(HookBase::Sandbox, instance_id)?;
-        let _ = with_base(HookBase::Sandbox, |base| {
-            Ok(unlinkat(
-                base,
-                format!(".{instance_id}.lock").as_str(),
-                UnlinkatFlags::NoRemoveDir,
-            ))
-        });
-    }
-    host
-}
-
-fn remove_child(kind: HookBase, instance_id: &str) -> Result<()> {
-    with_base(kind, |base| remove_entry(kind, base, instance_id))
-}
-
-/// [`remove_child`] of any entry `name` in `kind`'s base.
-fn remove_entry(kind: HookBase, base: BorrowedFd<'_>, name: &str) -> Result<()> {
-    let dir_fd = match openat(
-        base,
-        name,
-        OFlag::O_DIRECTORY
-            | OFlag::O_NOFOLLOW
-            | OFlag::O_CLOEXEC
-            | OFlag::O_RDONLY
-            | OFlag::O_NONBLOCK,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::ENOENT) | Err(Errno::ELOOP) => {
-            // Gone, or a hostile symlink: unlink whatever is at the path
-            // so a future open succeeds. Without `RemoveDir` that removes
-            // the symlink itself, never its target.
-            let _ = unlinkat(base, name, UnlinkatFlags::NoRemoveDir);
-            return Ok(());
-        }
-        Err(e) => return Err(e).with_context(|| format!("openat cleanup {name}")),
-    };
-    let label = kind.label(name);
-    if let Err(e) = verify_dir_metadata(&dir_fd, &label) {
-        // Wrong owner or mode: neither walk nor unlink, leave it to the user.
-        tracing::warn!(target: "hooks.guard", "skip cleanup {}: {e:#}", label.display());
-        return Ok(());
-    }
-    walk_and_unlink_entries(&dir_fd)?;
-    // Final unlink of the per-instance subdir itself.
-    if let Err(e) = unlinkat(base, name, UnlinkatFlags::RemoveDir) {
-        if e == Errno::ENOTEMPTY {
-            tracing::warn!(target: "hooks.guard",
-                "skipped non-empty cleanup of {}: hostile or stale subdir present",
-                label.display());
-            return Ok(());
-        }
-        return Err(e).with_context(|| format!("unlinkat RemoveDir {name}"));
-    }
-    Ok(())
+    })
 }
 
 fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
@@ -962,47 +583,44 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
                 continue;
             }
         };
-        // Classify without opening: a FIFO with no writer would block an open, and the dir is a
-        // sandbox's writable bind. Symlinks, FIFOs and sockets are unlinked by name, never
-        // opened; a regular file is checked again first; anything else is left.
-        let kind = match fstatat(dir_fd, name_str, AtFlags::AT_SYMLINK_NOFOLLOW) {
-            Ok(st) => st.st_mode & libc::S_IFMT,
-            Err(Errno::ENOENT) => continue,
-            Err(e) => {
-                tracing::warn!(target: "hooks.guard", "fstatat entry {name_str}: {e}; skipping");
-                continue;
-            }
-        };
-        if matches!(kind, libc::S_IFLNK | libc::S_IFIFO | libc::S_IFSOCK) {
-            if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
-                tracing::warn!(target: "hooks.guard", "unlinkat {name_str}: {e}");
-            }
-            continue;
-        }
-        if kind != libc::S_IFREG {
-            tracing::warn!(target: "hooks.guard",
-                "non-regular entry {name_str} (mode {kind:o}) inside {}; skipping. The \
-                 instance dir will be left non-empty; remove manually if it matters.",
-                hook_base_path().display());
-            continue;
-        }
-        // Re-validate before removing, without blocking: an entry swapped in since must still
-        // be a regular file.
+        // Re-validate before removing: O_NOFOLLOW rejects a symlink leaf with
+        // ELOOP, and anything but a regular file is hostile or stale.
         match openat(
             dir_fd,
             name_str,
-            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::empty(),
         ) {
             Ok(child_fd) => {
-                if !fstat(&child_fd).is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG) {
+                let st = match fstat(&child_fd) {
+                    Ok(st) => st,
+                    Err(e) => {
+                        tracing::warn!(target: "hooks.guard",
+                            "fstat entry {name_str}: {e}; skipping");
+                        continue;
+                    }
+                };
+                if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
                     tracing::warn!(target: "hooks.guard",
-                        "entry {name_str} changed type during cleanup; skipping");
+                        "non-regular entry {name_str} (mode {:o}) inside {}; \
+                         skipping. The instance dir will be left non-empty; \
+                         remove manually if it matters.",
+                        st.st_mode,
+                        hook_base_path().display());
                     continue;
                 }
+                // Regular file under a uid-checked parent: safe to unlink.
                 drop(child_fd);
                 if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
-                    tracing::warn!(target: "hooks.guard", "unlinkat {name_str}: {e}");
+                    tracing::warn!(target: "hooks.guard",
+                        "unlinkat {name_str}: {e}");
+                }
+            }
+            Err(Errno::ELOOP) => {
+                // Symlink at leaf: unlink it without following.
+                if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
+                    tracing::warn!(target: "hooks.guard",
+                        "unlinkat symlink {name_str}: {e}");
                 }
             }
             Err(Errno::ENOENT) => {
@@ -1039,7 +657,7 @@ mod tests {
             if precreate {
                 make_correct_base(&base);
             }
-            let raw1 = with_base(HookBase::Host, |fd| {
+            let raw1 = with_hook_base(|fd| {
                 let st = fstat(fd)?;
                 assert_eq!(st.st_mode & 0o7777, 0o700, "precreate={precreate}");
                 assert_eq!(st.st_uid, geteuid().as_raw());
@@ -1048,7 +666,7 @@ mod tests {
             .expect("init must succeed");
             assert!(base.is_dir());
             let after_first = open_calls();
-            let raw2 = with_base(HookBase::Host, |fd| Ok(fd.as_raw_fd())).unwrap();
+            let raw2 = with_hook_base(|fd| Ok(fd.as_raw_fd())).unwrap();
             assert_eq!(raw1, raw2, "cached fd must be reused");
             assert_eq!(open_calls(), after_first, "no new open on second call");
         }
@@ -1100,7 +718,7 @@ mod tests {
         let target = tmp.path().join("decoy");
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, &base).unwrap();
-        let err = with_base(HookBase::Host, |_| Ok(())).unwrap_err();
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
         let s = format!("{err:#}");
         assert!(
             s.contains("symlink") || s.contains("ELOOP") || s.contains("Too many levels"),
@@ -1113,18 +731,14 @@ mod tests {
     #[test]
     #[serial(hook_base)]
     fn init_rejects_every_mode_but_0o700() {
-        for ((mode, expected), kind) in [
+        for (mode, expected) in [
             (0o755, "mode"),
             (0o770, "mode"),
             (0o2700, "setuid/setgid/sticky"),
             (0o4700, "setuid/setgid/sticky"),
             (0o1700, "setuid/setgid/sticky"),
-        ]
-        .into_iter()
-        .flat_map(|case| [HookBase::Host, HookBase::Sandbox].map(|kind| (case, kind)))
-        {
-            let (_g, _base, _tmp) = BaseGuard::fresh();
-            let base = kind.path().unwrap();
+        ] {
+            let (_g, base, _tmp) = BaseGuard::fresh();
             std::fs::create_dir(&base).unwrap();
             let gid = nix::unistd::getegid().as_raw();
             if std::fs::metadata(&base).unwrap().gid() != gid {
@@ -1135,9 +749,9 @@ mod tests {
                 std::fs::metadata(&base).unwrap().permissions().mode() & 0o7777,
                 mode
             );
-            let err = with_base(kind, |_| Ok(())).unwrap_err();
+            let err = with_hook_base(|_| Ok(())).unwrap_err();
             let rendered = format!("{err:#}");
-            assert!(rendered.contains(expected), "{kind:?} {mode:o}: {rendered}");
+            assert!(rendered.contains(expected), "{mode:o}: {rendered}");
         }
     }
 
@@ -1152,7 +766,7 @@ mod tests {
         make_correct_base(&base);
         let alien_uid = make_alien_owned(&base);
 
-        let err = with_base(HookBase::Host, |_| Ok(())).unwrap_err();
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
         let message = format!("{err:#}");
         assert!(
             message.contains(&format!("owned by uid={alien_uid}, expected euid=0")),
@@ -1188,9 +802,9 @@ mod tests {
         let target = tmp.path().join("decoy2");
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, &base).unwrap();
-        let _ = with_base(HookBase::Host, |_| Ok(())).unwrap_err();
+        let _ = with_hook_base(|_| Ok(())).unwrap_err();
         let after_first = open_calls();
-        let _ = with_base(HookBase::Host, |_| Ok(())).unwrap_err();
+        let _ = with_hook_base(|_| Ok(())).unwrap_err();
         assert_eq!(
             open_calls(),
             after_first,
@@ -1198,449 +812,20 @@ mod tests {
         );
     }
 
-    /// A symlinked `<id>`, such as a container could plant in its sandbox base, is refused.
     #[test]
     #[serial(hook_base)]
     fn instance_subdir_rejects_symlink_leaf() {
-        for kind in [HookBase::Host, HookBase::Sandbox] {
-            let (_g, _base, tmp) = BaseGuard::fresh();
-            let base = kind.path().unwrap();
-            make_correct_base(&base);
-            let decoy = tmp.path().join("decoy_for_inst");
-            std::fs::create_dir_all(&decoy).unwrap();
-            std::os::unix::fs::symlink(&decoy, base.join("test_inst_b")).unwrap();
-            let err = match kind {
-                HookBase::Host => open_instance_dir("test_inst_b").unwrap_err(),
-                HookBase::Sandbox => switch_instance_dir("test_inst_b", kind).unwrap_err(),
-            };
-            let s = format!("{err:#}");
-            assert!(
-                s.contains("symlink") || s.contains("ELOOP") || s.contains("Too many levels"),
-                "{kind:?}: expected ELOOP, got: {s}"
-            );
-        }
-    }
-
-    fn write_status(kind: HookBase, id: &str, status: &str) {
-        let dir = create_child(kind, id).unwrap();
-        write_atomic(dir.as_fd(), "status", status.as_bytes()).unwrap();
-    }
-
-    fn read_status(id: &str) -> Option<String> {
-        let dir = open_instance_dir_read_only(id).unwrap()?;
-        let bytes = read_file_at(dir.as_fd(), "status", 64).unwrap()?;
-        Some(String::from_utf8(bytes).unwrap())
-    }
-
-    /// The host dir wins whenever it exists, so a container still bound to `/tmp` is never
-    /// hidden by an empty sandbox dir; a row with only a sandbox dir is read and written there.
-    #[test]
-    #[serial(hook_base)]
-    fn a_rows_hook_dir_is_the_host_one_unless_only_the_sandbox_one_exists() {
-        // (host status, sandbox status, read, where a write lands)
-        for (host, sandbox, want, lands) in [
-            (Some("idle"), Some("running"), Some("idle"), HookBase::Host),
-            (Some("idle"), None, Some("idle"), HookBase::Host),
-            (None, Some("running"), Some("running"), HookBase::Sandbox),
-            (None, None, None, HookBase::Host),
-        ] {
-            let (_g, _base, _tmp) = BaseGuard::ready();
-            let id = "both_bases";
-            if let Some(status) = host {
-                write_status(HookBase::Host, id, status);
-            }
-            if let Some(status) = sandbox {
-                write_status(HookBase::Sandbox, id, status);
-            }
-            assert_eq!(read_status(id).as_deref(), want, "{host:?} {sandbox:?}");
-            write_session_id_via_guard(id, "sid", None).unwrap();
-            for kind in [HookBase::Host, HookBase::Sandbox] {
-                let written = kind.label(id).join("session_id").exists();
-                assert_eq!(written, kind == lands, "{host:?} {sandbox:?} {kind:?}");
-            }
-            assert_eq!(
-                kind_exists(HookBase::Host, id),
-                host.is_some() || lands == HookBase::Host,
-                "a write never creates a host dir beside a sandbox one: {host:?} {sandbox:?}"
-            );
-            remove_instance_dir(id).unwrap();
-            assert!(!kind_exists(HookBase::Host, id) && !kind_exists(HookBase::Sandbox, id));
-        }
-    }
-
-    fn kind_exists(kind: HookBase, id: &str) -> bool {
-        kind.label(id).is_dir()
-    }
-
-    /// A switch makes the new dir before removing the old one, so a read in between still finds
-    /// the old status, and a writer that arrives in between waits on the switch lock and then
-    /// lands in the new dir.
-    /// A write whose dir a switch removed after the lookup lands in the dir the switch made.
-    #[test]
-    #[serial(hook_base)]
-    fn a_write_resolved_before_a_switch_lands_in_the_new_dir() {
-        let (_g, _base, _tmp) = BaseGuard::ready();
-        let id = "outpaced";
-        write_status(HookBase::Host, id, "idle");
-        pause_write_for_test(move || {
-            switch_instance_dir(id, HookBase::Sandbox).unwrap();
-        });
-        write_session_id_via_guard(id, "sid", None).unwrap();
+        let (_g, base, tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        let decoy = tmp.path().join("decoy_for_inst");
+        std::fs::create_dir_all(&decoy).unwrap();
+        std::os::unix::fs::symlink(&decoy, base.join("test_inst_b")).unwrap();
+        let err = open_instance_dir("test_inst_b").unwrap_err();
+        let s = format!("{err:#}");
         assert!(
-            !kind_exists(HookBase::Host, id),
-            "the switch removed the host dir"
+            s.contains("symlink") || s.contains("ELOOP") || s.contains("Too many levels"),
+            "expected ELOOP, got: {s}"
         );
-        assert_eq!(
-            std::fs::read_to_string(HookBase::Sandbox.label(id).join("session_id")).unwrap(),
-            "sid"
-        );
-        remove_instance_dir(id).unwrap();
-    }
-
-    /// A waiter that wins a lock whose name was unlinked meanwhile takes the current one, so it
-    /// and a later opener never both hold the row's lock.
-    #[test]
-    #[serial(hook_base)]
-    fn a_lock_unlinked_while_held_is_not_shared() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let id = "relocked";
-        let lock_path = sandbox_hook_base_path()
-            .unwrap()
-            .join(format!(".{id}.lock"));
-        let holder = lock_instance(id).unwrap();
-        let (contended, waiting) = std::sync::mpsc::channel();
-        *LOCK_CONTENTION_FOR_TEST.lock().unwrap() = Some(contended);
-        let (locked, held) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let waiter = std::thread::spawn(move || {
-            BaseGuard::set_thread_base(base);
-            let lock = lock_instance(id);
-            locked.send(lock.is_some()).unwrap();
-            let _ = released.recv();
-            drop(lock);
-        });
-        waiting
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the waiter blocks on the held lock");
-        *LOCK_CONTENTION_FOR_TEST.lock().unwrap() = None;
-        std::fs::remove_file(&lock_path).unwrap();
-        drop(holder);
-        assert!(held
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .unwrap());
-        let fresh = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .unwrap();
-        assert!(
-            matches!(fresh.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
-            "a later opener must wait on the waiter's lock"
-        );
-        release.send(()).unwrap();
-        waiter.join().unwrap();
-        remove_instance_dir(id).unwrap();
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn a_writer_during_a_switch_lands_in_the_new_dir() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let id = "switching";
-        write_status(HookBase::Host, id, "idle");
-        let (contended, waiting) = std::sync::mpsc::channel();
-        *LOCK_CONTENTION_FOR_TEST.lock().unwrap() = Some(contended);
-        let (reads, read) = std::sync::mpsc::channel();
-        let writer = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let handle = writer.clone();
-        pause_switch_for_test(move || {
-            reads.send(read_status(id)).unwrap();
-            let thread_base = base.clone();
-            let (done, finished) = std::sync::mpsc::channel();
-            let joined = std::thread::spawn(move || {
-                BaseGuard::set_thread_base(thread_base);
-                let result = write_session_id_via_guard(id, "sid", None);
-                // The switch may have stopped listening once it saw the writer wait.
-                let _ = done.send(());
-                result
-            });
-            // Either it is blocked on the lock, or (lock reverted) it already finished or
-            // panicked, which the join below reports.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                if waiting.try_recv().is_ok()
-                    || !matches!(
-                        finished.try_recv(),
-                        Err(std::sync::mpsc::TryRecvError::Empty)
-                    )
-                {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the writer neither waited on the switch lock nor finished"
-                );
-                std::thread::yield_now();
-            }
-            *handle.lock().unwrap() = Some(joined);
-        });
-        switch_instance_dir(id, HookBase::Sandbox).unwrap();
-        *LOCK_CONTENTION_FOR_TEST.lock().unwrap() = None;
-        assert_eq!(read.recv().unwrap().as_deref(), Some("idle"));
-        let joined = writer.lock().unwrap().take().unwrap();
-        joined.join().unwrap().unwrap();
-        assert!(
-            !kind_exists(HookBase::Host, id),
-            "the switch removed the host dir"
-        );
-        assert!(HookBase::Sandbox.label(id).join("session_id").exists());
-        remove_instance_dir(id).unwrap();
-    }
-
-    /// A host launch of a row that was sandboxed reads the host dir at once, and the switch
-    /// leaves no sandbox dir behind.
-    #[test]
-    #[serial(hook_base)]
-    fn a_switch_to_the_host_dir_is_read_before_any_cleanup() {
-        let (_g, _base, _tmp) = BaseGuard::ready();
-        let id = "unsandboxed";
-        write_status(HookBase::Sandbox, id, "idle");
-        let path = switch_instance_dir(id, HookBase::Host).unwrap();
-        assert!(!kind_exists(HookBase::Sandbox, id));
-        assert_eq!(
-            read_status(id),
-            None,
-            "the host dir is read, not the stale sandbox one"
-        );
-        std::fs::write(path.join("status"), "running").unwrap();
-        assert_eq!(read_status(id).as_deref(), Some("running"));
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o700);
-        remove_instance_dir(id).unwrap();
-    }
-
-    /// A host launch never prepares its paths in a dir a later switch to the host base removes,
-    /// even when its own switch can't take the lock and the launch's can.
-    #[test]
-    #[serial(hook_base)]
-    fn a_host_launch_prepares_in_a_dir_its_switch_keeps() {
-        let (_g, _base, _tmp) = BaseGuard::ready();
-        with_base(HookBase::Sandbox, |_| Ok(())).unwrap();
-        // (case, dirs present, lock free while preparing, prepares)
-        for (case, dirs, lock_free, prepares) in [
-            ("prepare-switch-ok", &[HookBase::Sandbox][..], true, true),
-            (
-                "prepare-switch-fails",
-                &[HookBase::Sandbox][..],
-                false,
-                false,
-            ),
-            (
-                "prepare-switch-fails-host-present",
-                &[HookBase::Host, HookBase::Sandbox][..],
-                false,
-                true,
-            ),
-        ] {
-            let id = case;
-            for kind in dirs {
-                write_status(*kind, id, "idle");
-            }
-            let lock = sandbox_hook_base_path()
-                .unwrap()
-                .join(format!(".{id}.lock"));
-            if !lock_free {
-                std::fs::create_dir(&lock).unwrap();
-            }
-            let prepared = host_launch_instance_dir_path(id);
-            if !lock_free {
-                std::fs::remove_dir(&lock).unwrap();
-            }
-            assert_eq!(prepared.is_ok(), prepares, "{case}: {prepared:?}");
-            // The launch's own switch, once the lock is free.
-            switch_instance_dir(id, HookBase::Host).unwrap();
-            if let Ok(dir) = prepared {
-                assert!(
-                    dir.is_dir(),
-                    "{case}: the prepared dir outlives the launch's switch"
-                );
-            }
-            remove_instance_dir(id).unwrap();
-        }
-    }
-
-    /// A switch that can't take its lock changes nothing: it would otherwise remove a dir a
-    /// creating open may be choosing.
-    #[test]
-    #[serial(hook_base)]
-    fn a_switch_without_its_lock_changes_nothing() {
-        let (_g, _base, _tmp) = BaseGuard::ready();
-        let id = "unlockable";
-        write_status(HookBase::Host, id, "idle");
-        // A directory where the lock file goes: opening it read-write fails.
-        with_base(HookBase::Sandbox, |_| Ok(())).unwrap();
-        let lock = sandbox_hook_base_path()
-            .unwrap()
-            .join(format!(".{id}.lock"));
-        std::fs::create_dir(&lock).unwrap();
-        assert!(switch_instance_dir(id, HookBase::Sandbox).is_err());
-        assert_eq!(read_status(id).as_deref(), Some("idle"));
-        assert!(
-            !kind_exists(HookBase::Sandbox, id),
-            "no sandbox dir was made"
-        );
-        std::fs::remove_dir(&lock).unwrap();
-        remove_instance_dir(id).unwrap();
-    }
-
-    /// A dir a switch can't empty is set aside, so the bind source and identity reads after a
-    /// host-to-sandbox switch are the sandbox dir. Earlier set-aside dirs are swept on each
-    /// switch and on deletion, and one that can't go gets a fresh name rather than leaving the
-    /// old dir where the lookup finds it. Only a rename that fails fails the switch, and then
-    /// the container launch refuses.
-    #[test]
-    #[serial(hook_base)]
-    fn a_switch_sets_aside_a_host_dir_it_cannot_empty() {
-        let (_g, _base, _tmp) = BaseGuard::ready();
-        let stale = |id: &str| HookBase::Host.label(&format!(".stale-{id}"));
-        let stuck = |id: &str| {
-            create_child(HookBase::Host, id).unwrap();
-            std::fs::create_dir(HookBase::Host.label(id).join("sub")).unwrap();
-        };
-        let set_aside = |id: &str| -> Vec<String> {
-            let mut names: Vec<String> = std::fs::read_dir(hook_base_path())
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|n| *n == format!(".stale-{id}") || n.starts_with(&format!(".stale-{id}.")))
-                .collect();
-            names.sort();
-            names
-        };
-        let sandbox_path = |id: &str| std::fs::canonicalize(HookBase::Sandbox.label(id)).unwrap();
-        // skip-then-bind: set aside, and bind configuration and identity reads get the sandbox
-        // dir.
-        stuck("subdir");
-        switch_instance_dir("subdir", HookBase::Sandbox).expect("skip-then-bind");
-        assert!(!kind_exists(HookBase::Host, "subdir"), "skip-then-bind");
-        assert!(stale("subdir").join("sub").is_dir(), "skip-then-bind");
-        assert_eq!(
-            ensure_instance_dir_path("subdir").unwrap(),
-            sandbox_path("subdir"),
-            "skip-then-bind: bind source"
-        );
-        write_status(HookBase::Sandbox, "subdir", "running");
-        assert_eq!(
-            read_status("subdir").as_deref(),
-            Some("running"),
-            "skip-then-bind: identity read"
-        );
-        // second-switch: an earlier set-aside that empties is replaced, never stacked. A file
-        // keeps it non-empty, so a rename alone couldn't replace it.
-        std::fs::remove_dir(stale("subdir").join("sub")).unwrap();
-        std::fs::write(stale("subdir").join("status"), "idle").unwrap();
-        stuck("subdir");
-        switch_instance_dir("subdir", HookBase::Sandbox).expect("second-switch");
-        assert!(stale("subdir").join("sub").is_dir(), "second-switch");
-        assert_eq!(
-            set_aside("subdir").len(),
-            1,
-            "second-switch: one set-aside dir"
-        );
-        // deleted: removing the row removes its set-aside dirs once they can be emptied.
-        std::fs::remove_dir(stale("subdir").join("sub")).unwrap();
-        remove_instance_dir("subdir").unwrap();
-        assert_eq!(set_aside("subdir"), Vec::<String>::new(), "deleted");
-        // stale-name-blocked: an earlier set-aside that can't be emptied keeps its name, and this
-        // one takes a fresh one; the lookup still reads the sandbox dir.
-        stuck("blocked");
-        switch_instance_dir("blocked", HookBase::Sandbox).expect("stale-name-blocked");
-        stuck("blocked");
-        switch_instance_dir("blocked", HookBase::Sandbox).expect("stale-name-blocked");
-        assert!(
-            !kind_exists(HookBase::Host, "blocked"),
-            "stale-name-blocked: nothing under the lookup name"
-        );
-        assert_eq!(set_aside("blocked").len(), 2, "stale-name-blocked");
-        assert_eq!(
-            ensure_instance_dir_path("blocked").unwrap(),
-            sandbox_path("blocked"),
-            "stale-name-blocked: bind source"
-        );
-        // blocked-twice-then-clean: once they can be emptied, the next switch sweeps them all.
-        stuck("blocked");
-        switch_instance_dir("blocked", HookBase::Sandbox).expect("blocked-twice-then-clean");
-        assert_eq!(
-            set_aside("blocked").len(),
-            3,
-            "blocked-twice-then-clean: blocked"
-        );
-        for name in set_aside("blocked") {
-            std::fs::remove_dir(hook_base_path().join(name).join("sub")).unwrap();
-        }
-        switch_instance_dir("blocked", HookBase::Sandbox).expect("blocked-twice-then-clean");
-        assert_eq!(
-            set_aside("blocked"),
-            Vec::<String>::new(),
-            "blocked-twice-then-clean"
-        );
-        // another-id-prefix: a row whose id extends this one keeps its set-aside dir.
-        stuck("blockedx");
-        switch_instance_dir("blockedx", HookBase::Sandbox).expect("another-id-prefix");
-        // Removable, so only the name match keeps it.
-        std::fs::remove_dir(stale("blockedx").join("sub")).unwrap();
-        std::fs::write(stale("blockedx").join("status"), "idle").unwrap();
-        stuck("blocked");
-        switch_instance_dir("blocked", HookBase::Sandbox).expect("another-id-prefix");
-        std::fs::remove_dir(stale("blocked").join("sub")).unwrap();
-        remove_instance_dir("blocked").unwrap();
-        assert!(stale("blockedx").is_dir(), "another-id-prefix");
-        // rename-fails: a set-aside that cannot rename fails the switch.
-        stuck("renamed");
-        fail_set_aside_for_test(true);
-        let switched = switch_instance_dir("renamed", HookBase::Sandbox);
-        fail_set_aside_for_test(false);
-        assert!(switched.is_err(), "rename-fails: {switched:?}");
-        for id in ["blockedx", "renamed"] {
-            let _ = std::fs::remove_dir(stale(id).join("sub"));
-            let _ = std::fs::remove_dir(HookBase::Host.label(id).join("sub"));
-            remove_instance_dir(id).unwrap();
-        }
-    }
-
-    /// A sandbox can leave a FIFO in its writable hook dir. Cleanup unlinks it without opening
-    /// it, so a switch away completes and removes the dir, leaving nothing set aside.
-    #[test]
-    #[serial(hook_base)]
-    fn a_switch_skips_a_fifo_in_the_old_dir() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let id = "fifo";
-        create_child(HookBase::Sandbox, id).unwrap();
-        let fifo = HookBase::Sandbox.label(id).join("status");
-        nix::unistd::mkfifo(&fifo, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        let (done, finished) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            BaseGuard::set_thread_base(base);
-            switch_instance_dir(id, HookBase::Host).unwrap();
-            let _ = done.send((
-                read_status(id),
-                kind_exists(HookBase::Sandbox, id),
-                HookBase::Sandbox.label(&format!(".stale-{id}")).exists(),
-            ));
-        });
-        let Ok((after_host, sandbox_left, set_aside)) =
-            finished.recv_timeout(std::time::Duration::from_secs(10))
-        else {
-            // A writer releases an open blocked on the FIFO, so the thread can end.
-            let _ = open(&fifo, OFlag::O_WRONLY | OFlag::O_NONBLOCK, Mode::empty());
-            panic!("the switch or a read blocked on a FIFO");
-        };
-        worker.join().unwrap();
-        assert_eq!(after_host, None, "the host dir is read");
-        assert!(!sandbox_left, "the FIFO's dir is removed");
-        assert!(!set_aside, "nothing is set aside");
-        remove_instance_dir(id).unwrap();
     }
 
     #[test]
@@ -1854,7 +1039,7 @@ mod tests {
         let base = symlink_parent.join("aoe-hooks");
         override_base_for_test(base.clone());
         reset_for_test();
-        with_base(HookBase::Host, |_| Ok(())).expect("prefix symlink must not block init");
+        with_hook_base(|_| Ok(())).expect("prefix symlink must not block init");
         clear_base_override_for_test();
         reset_for_test();
     }

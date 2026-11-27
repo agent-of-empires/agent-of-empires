@@ -1113,17 +1113,6 @@ impl Instance {
                     ));
             let mut handoff_prior = None;
             let (execution, unpinned) = self.resolve_launch_routing()?;
-            if let Some((execution, container)) = execution
-                .as_ref()
-                .and_then(|execution| Some((execution, execution.inputs.container.as_ref()?)))
-            {
-                crate::migrations::requalify_shared_runtime_bindings(
-                    self,
-                    stores,
-                    &execution.binding,
-                    container,
-                )?;
-            }
             if let Some(execution) = execution.as_ref() {
                 handoff_prior = self.hand_off_prime_fork_parent(execution)?;
                 if validate_target {
@@ -2500,131 +2489,6 @@ sandbox = "unsupported"
         .unwrap();
     }
 
-    /// A host launch prepares Pi's sidecar and OMP's marker in the host hook dir, so the launch's
-    /// switch away from a stale sandbox dir removes nothing they point into. A sandboxed launch
-    /// prepares them in the container and leaves the hook dirs alone.
-    #[test]
-    #[serial_test::serial]
-    fn identity_paths_are_prepared_on_the_launchs_own_side() {
-        use crate::hooks::dir_guard::sandbox_hook_base_path;
-        // (case, tool, sandboxed)
-        for (case, tool, sandboxed) in [
-            ("pi-host", "pi", false),
-            ("omp-host", "omp", false),
-            ("pi-sandboxed", "pi", true),
-            ("omp-sandboxed", "omp", true),
-        ] {
-            let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
-            let temp_home = tempfile::tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_home(temp_home.path());
-            let project = temp_home.path().join("proj");
-            std::fs::create_dir_all(&project).unwrap();
-            let mut inst = tool_instance(tool, project.to_str().unwrap());
-            let bin = temp_home.path().join("bin");
-            std::fs::create_dir_all(&bin).unwrap();
-            let stub = bin.join("pi");
-            std::fs::write(
-                &stub,
-                "#!/bin/sh\nprintf '%s\\n' '  -e, --extension <path>'\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
-            let path = format!(
-                "{}:{}",
-                bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            );
-            let _path = crate::session::test_support::EnvGuard::set(&[("PATH", path.as_str())]);
-            crate::agents::forget_agent_help_for_test();
-            let config = sandboxed.then(|| {
-                let mut sandbox = test_sandbox(&format!("aoe-{case}"), Some("/workspace"));
-                sandbox.extra_env = Some(vec![
-                    "PI_CODING_AGENT_SESSION_DIR=/root/.pi/agent/sessions".to_string(),
-                ]);
-                inst.sandbox_info = Some(sandbox);
-                admit_sandbox_fixture(&inst);
-                inst.build_container_config_for_test().unwrap()
-            });
-            let _transport = config.as_ref().map(|config| {
-                install_container_transport(
-                    temp_home.path(),
-                    &format!("aoe-{case}"),
-                    &config.volumes,
-                )
-            });
-            // The row was sandboxed before: only its sandbox hook dir exists.
-            crate::hooks::switch_instance_dir(&inst.id, crate::hooks::HookBase::Sandbox).unwrap();
-            let host_dir = crate::hooks::hook_base_path().join(&inst.id);
-            let sandbox_dir = sandbox_hook_base_path().unwrap().join(&inst.id);
-
-            let prepared = if tool == "pi" {
-                let (_, env) = inst
-                    .identity_extension_launch()
-                    .expect("a Pi identity launch");
-                let value = env.trim().strip_prefix("AOE_SESSION_ID_FILE=").unwrap();
-                value.trim_matches('\'').to_string()
-            } else {
-                let context = crate::session::capture::resolve_omp_store_layout_with_environment(
-                    std::collections::HashMap::from([(
-                        "HOME".into(),
-                        temp_home.path().display().to_string(),
-                    )]),
-                    &inst.project_path,
-                    &inst.omp_capture_options().unwrap(),
-                )
-                .unwrap();
-                inst.resolve_omp_capture_plan(&context, None)
-                    .expect("an OMP launch plan")
-                    .launch_marker
-            };
-            let prepared = std::path::PathBuf::from(prepared);
-
-            if let Some(config) = &config {
-                assert!(
-                    sandbox_dir.is_dir(),
-                    "{case}: the sandbox hook dir is untouched"
-                );
-                assert!(!host_dir.exists(), "{case}: no host hook dir is made");
-                if tool == "pi" {
-                    assert_eq!(
-                        prepared,
-                        std::path::Path::new(
-                            crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER
-                        )
-                        .join(&inst.id)
-                        .join("session_id"),
-                        "{case}"
-                    );
-                } else {
-                    assert_eq!(
-                        prepared.to_str(),
-                        Some(crate::session::capture::omp_sandbox_launch_marker(&inst.id).as_str()),
-                        "{case}"
-                    );
-                    assert!(
-                        !config
-                            .volumes
-                            .iter()
-                            .any(|mount| prepared.starts_with(&mount.container_path)),
-                        "{case}: the marker is private to the container"
-                    );
-                }
-            } else {
-                assert_eq!(
-                    prepared.parent(),
-                    Some(std::fs::canonicalize(&host_dir).unwrap().as_path()),
-                    "{case}: prepared in the host hook dir"
-                );
-                assert!(
-                    !sandbox_dir.exists(),
-                    "{case}: the stale sandbox dir is gone"
-                );
-            }
-            crate::hooks::dir_guard::remove_instance_dir(&inst.id).unwrap();
-        }
-    }
-
     // The sidecar env var has to survive into the docker argv; no CI container would catch it.
     #[test]
     #[serial_test::serial]
@@ -3650,134 +3514,99 @@ sandbox = "unsupported"
             eprintln!("skipping: jq not on PATH");
             return;
         }
-        for runtime in ["colima", "local"] {
-            let temp_dir = tempfile::tempdir().unwrap();
-            // Resolved, as a real HOME is: under a symlinked TMPDIR the hook source resolves out of
-            // a HOME written through the link, which Colima wouldn't share.
-            let root = std::fs::canonicalize(temp_dir.path()).unwrap();
-            let temp = root.as_path();
-            // As on a Mac: the host base outside the shared HOME (`temp`), the sandbox base under
-            // the app dir inside it. Both runtimes use their own bases, never the per-user one.
-            let host_hooks = tempfile::tempdir().unwrap();
-            let sandbox_base = temp.join("app").join("sandbox-hooks");
-            std::fs::create_dir_all(temp.join("app")).unwrap();
-            let _hooks = crate::hooks::test_support::BaseGuard::with_bases(
-                host_hooks.path().join("aoe-hooks"),
-                sandbox_base.clone(),
-            );
-            let _app = crate::session::test_support::isolate_app_dir_at(&temp.join("app"));
-            let project = temp.join("project");
-            std::fs::create_dir_all(&project).unwrap();
-            let profile = "sandbox-sidecar-leaf";
-            super::super::test_helpers::declare_execution_aliases(
-                profile,
-                &[("claude", "claude")],
-                temp,
-            );
-            let mut inst = Instance::new("claude-sidecar", project.to_str().unwrap());
-            inst.tool = "claude".into();
-            inst.command = "claude".into();
-            inst.source_profile = profile.into();
-            inst.sandbox_info = Some(crate::session::SandboxInfo {
-                provider: None,
-                enabled: true,
-                container_id: None,
-                image: "fixture".into(),
-                container_name: "claude-sidecar".into(),
-                extra_env: None,
-                custom_instruction: None,
-                container_workdir: Some("/workspace/project".into()),
-                before_start_env: Vec::new(),
-                before_start_hook_env: Vec::new(),
-            });
-            // A new container: the runtime has none by this name yet, so mount preparation picks
-            // the base, as a first launch does.
-            let absent = super::super::test_helpers::install_container_transport(
-                temp,
-                "not-created-yet",
-                &[],
-            );
-            let config = inst.build_container_config_for_test().unwrap();
-            drop(absent);
-            let _transport = super::super::test_helpers::install_container_transport(
-                temp,
-                "claude-sidecar",
-                &config.volumes,
-            );
-            // Under Colima the hook dir reaches AoE only through the home share.
-            let _colima = (runtime == "colima")
-                .then(|| super::super::test_helpers::route_through_colima(temp));
-            std::fs::copy(
-                temp.join("native-bin/prime-agent"),
-                temp.join("native-bin/claude"),
-            )
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = "sandbox-sidecar-leaf";
+        super::super::test_helpers::declare_execution_aliases(
+            profile,
+            &[("claude", "claude")],
+            temp.path(),
+        );
+        let mut inst = Instance::new("claude-sidecar", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        inst.source_profile = profile.into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "claude-sidecar".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/project".into()),
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+        });
+        let config = inst.build_container_config_for_test().unwrap();
+        let _transport = super::super::test_helpers::install_container_transport(
+            temp.path(),
+            "claude-sidecar",
+            &config.volumes,
+        );
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/claude"),
+        )
+        .unwrap();
+        let execution = inst.resolve_native_execution(None).unwrap();
+        let source = execution
+            .routing
+            .iter()
+            .find(|(key, _)| key == crate::hooks::SESSION_SOURCE_ENV)
+            .and_then(|(_, value)| value.clone())
+            .expect("a sandboxed launch exports its source");
+        let active = super::super::execution::ActiveExecution {
+            launch_id: execution.inputs.launch_id.clone(),
+            binding: execution.binding.clone(),
+            capture: execution.capture.clone(),
+            container: execution.inputs.container.clone(),
+            container_cwd: None,
+        };
+        let mounted = config
+            .volumes
+            .iter()
+            .find(|mount| {
+                mount
+                    .container_path
+                    .starts_with(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
+            })
+            .expect("hook dir is bind-mounted");
+        let host_base = std::path::Path::new(&mounted.host_path).parent().unwrap();
+        let writer = crate::hooks::hook_command_session_id(
+            crate::hooks::HookInstallTarget::Sandbox,
+            crate::agents::HookIdentityField::SessionId,
+            None,
+        )
+        .replace(
+            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
+            host_base.to_str().unwrap(),
+        );
+        let minted = "22222222-2222-4222-8222-222222222222";
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", &writer])
+            .env("AOE_INSTANCE_ID", &inst.id)
+            .env(crate::hooks::SESSION_SOURCE_ENV, &source)
+            .env_remove("AOE_AGENT_BIN")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
-            let execution = inst.resolve_native_execution(None).unwrap();
-            let source = execution
-                .routing
-                .iter()
-                .find(|(key, _)| key == crate::hooks::SESSION_SOURCE_ENV)
-                .and_then(|(_, value)| value.clone())
-                .expect("a sandboxed launch exports its source");
-            let active = super::super::execution::ActiveExecution {
-                launch_id: execution.inputs.launch_id.clone(),
-                binding: execution.binding.clone(),
-                capture: execution.capture.clone(),
-                container: execution.inputs.container.clone(),
-                container_cwd: None,
-            };
-            let mounted = config
-                .volumes
-                .iter()
-                .find(|mount| {
-                    mount
-                        .container_path
-                        .starts_with(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
-                })
-                .expect("hook dir is bind-mounted");
-            if runtime == "colima" {
-                assert!(
-                    std::path::Path::new(&mounted.host_path)
-                        .starts_with(std::fs::canonicalize(&sandbox_base).unwrap()),
-                    "colima: the hook bind comes from the sandbox base: {}",
-                    mounted.host_path
-                );
-            }
-            let host_base = std::path::Path::new(&mounted.host_path).parent().unwrap();
-            let writer = crate::hooks::hook_command_session_id(
-                crate::hooks::HookInstallTarget::Sandbox,
-                crate::agents::HookIdentityField::SessionId,
-                None,
-            )
-            .replace(
-                crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
-                host_base.to_str().unwrap(),
-            );
-            let minted = "22222222-2222-4222-8222-222222222222";
-            let mut child = std::process::Command::new("sh")
-                .args(["-c", &writer])
-                .env("AOE_INSTANCE_ID", &inst.id)
-                .env(crate::hooks::SESSION_SOURCE_ENV, &source)
-                .env_remove("AOE_AGENT_BIN")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(format!(r#"{{"session_id":"{minted}"}}"#).as_bytes())
-                .unwrap();
-            assert!(child.wait().unwrap().success());
-            let observed =
-                super::super::execution::hook_session_observation(&inst.id, Some(&active), None);
-            assert_eq!(
-                observed.map(|observation| observation.sid).as_deref(),
-                Some(minted),
-                "{runtime}"
-            );
-            crate::hooks::cleanup_hook_status_dir(&inst.id);
-        }
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!(r#"{{"session_id":"{minted}"}}"#).as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let observed =
+            super::super::execution::hook_session_observation(&inst.id, Some(&active), None);
+        assert_eq!(
+            observed.map(|observation| observation.sid).as_deref(),
+            Some(minted)
+        );
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
     }
 
     #[test]
@@ -3854,14 +3683,7 @@ sandbox = "unsupported"
                 "/workspace/project",
             ))
             .join(format!("{sid}.jsonl"));
-        // (runtime, transcript written, flag). Colima's home share makes its store a host path.
-        for (runtime, written, want) in [
-            ("colima", false, "--session-id"),
-            ("local", false, "--session-id"),
-            ("local", true, "--resume"),
-        ] {
-            let _colima = (runtime == "colima")
-                .then(|| super::super::test_helpers::route_through_colima(temp.path()));
+        for (written, want) in [(false, "--session-id"), (true, "--resume")] {
             if written {
                 std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
                 std::fs::write(&transcript, "").unwrap();
@@ -3879,351 +3701,10 @@ sandbox = "unsupported"
             let command = carried.command.unwrap();
             assert!(
                 command.contains(&format!("{want} {sid}")),
-                "{runtime} {written}: {command}"
+                "{written}: {command}"
             );
-            assert_eq!(
-                inst.agent_session_id.as_deref(),
-                Some(sid),
-                "{runtime} {written}"
-            );
+            assert_eq!(inst.agent_session_id.as_deref(), Some(sid), "{written}");
         }
-    }
-
-    /// v068: an execution recorded before Colima's home share became a host path is
-    /// requalified at the next launch only when it is this launch's runtime and context.
-    #[test]
-    #[serial_test::serial]
-    fn a_launch_requalifies_an_execution_recorded_before_its_runtime_shared_home() {
-        use crate::session::ConversationProvenance::{Asserted, Preallocated};
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let profile = "sandbox-legacy-colima";
-        super::super::test_helpers::declare_execution_aliases(
-            profile,
-            &[("claude", "claude")],
-            temp.path(),
-        );
-        let mut inst = Instance::new("claude-legacy", project.to_str().unwrap());
-        inst.tool = "claude".into();
-        inst.command = "claude".into();
-        inst.source_profile = profile.into();
-        inst.sandbox_info = Some(crate::session::SandboxInfo {
-            provider: None,
-            enabled: true,
-            container_id: None,
-            image: "fixture".into(),
-            container_name: "claude-legacy".into(),
-            extra_env: None,
-            custom_instruction: None,
-            container_workdir: Some("/workspace/project".into()),
-            before_start_env: Vec::new(),
-            before_start_hook_env: Vec::new(),
-        });
-        let config = inst.build_container_config_for_test().unwrap();
-        let _transport = super::super::test_helpers::install_container_transport(
-            temp.path(),
-            "claude-legacy",
-            &config.volumes,
-        );
-        std::fs::copy(
-            temp.path().join("native-bin/prime-agent"),
-            temp.path().join("native-bin/claude"),
-        )
-        .unwrap();
-        let _colima = super::super::test_helpers::route_through_colima(temp.path());
-        let yaml = temp.path().join("colima/_lima/colima/colima.yaml");
-        let sid = "33333333-3333-4333-8333-333333333333";
-        // Before the upgrade the share wasn't recorded, as a custom mount list gives today.
-        std::fs::write(&yaml, "mounts:\n  - location: /elsewhere\n").unwrap();
-        let legacy = inst.resolve_native_execution(None).unwrap().binding;
-        std::fs::write(&yaml, "mounts: []\n").unwrap();
-        let now = inst.resolve_native_execution(None).unwrap().binding;
-        assert!(legacy.filesystem.starts_with("runtime:") && now.filesystem == "host");
-        let other_endpoint = ExecutionBinding {
-            filesystem: "runtime:Docker:unix:///elsewhere/docker.sock".into(),
-            cwd_filesystem: "runtime:Docker:unix:///elsewhere/docker.sock".into(),
-            ..legacy.clone()
-        };
-        let moved_cwd = ExecutionBinding {
-            cwd: temp.path().join("moved"),
-            ..legacy.clone()
-        };
-        let transcript = now.stores[0]
-            .join("projects")
-            .join(crate::session::capture::encode_claude_project_path(
-                "/workspace/project",
-            ))
-            .join(format!("{sid}.jsonl"));
-        let storage = crate::session::Storage::open_unwatched(profile).unwrap();
-        let path = storage.sessions_path().to_path_buf();
-        let backups = || crate::session::migration_backups(&path).unwrap();
-        let seed = |inst: &Instance| {
-            for (_, backup) in backups() {
-                std::fs::remove_file(backup).unwrap();
-            }
-            storage
-                .update(|rows, _| {
-                    rows.retain(|row| row.id != inst.id);
-                    rows.push(inst.clone());
-                    Ok(())
-                })
-                .unwrap();
-            std::fs::read(&path).unwrap()
-        };
-        // The row as sessions.json holds it: its conversation's and active execution's domains.
-        let id = inst.id.clone();
-        let on_disk = || {
-            let rows: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            let row = rows
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|row| row["id"] == id.as_str())
-                .unwrap()
-                .clone();
-            let domain = |pointer: &str| {
-                row.pointer(pointer)
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            };
-            (
-                domain("/agent_session_binding/execution/filesystem"),
-                domain("/active_execution/binding/filesystem"),
-            )
-        };
-        let host = |execution: Option<&ExecutionBinding>| {
-            execution.map(|execution| execution.filesystem.clone())
-        };
-        let legacy_active = || super::super::execution::ActiveExecution {
-            launch_id: "legacy-launch".into(),
-            binding: legacy.clone(),
-            capture: None,
-            container: None,
-            container_cwd: None,
-        };
-        #[derive(PartialEq)]
-        enum Want {
-            Requalified,
-            Refused,
-            Untouched,
-        }
-        for (case, provenance, recorded, active, want, flag) in [
-            (
-                "legacy-asserted",
-                Asserted,
-                &legacy,
-                false,
-                Want::Requalified,
-                "--resume",
-            ),
-            (
-                "active-legacy-requalified",
-                Asserted,
-                &legacy,
-                true,
-                Want::Requalified,
-                "--resume",
-            ),
-            (
-                "set-session-id-after",
-                Asserted,
-                &legacy,
-                true,
-                Want::Requalified,
-                "--resume",
-            ),
-            (
-                "second-run",
-                Asserted,
-                &now,
-                false,
-                Want::Untouched,
-                "--resume",
-            ),
-            (
-                "other-endpoint",
-                Asserted,
-                &other_endpoint,
-                false,
-                Want::Refused,
-                "",
-            ),
-            ("moved-cwd", Asserted, &moved_cwd, false, Want::Refused, ""),
-            (
-                "refused-beside-active",
-                Asserted,
-                &moved_cwd,
-                true,
-                Want::Refused,
-                "",
-            ),
-            (
-                "legacy-reserved",
-                Preallocated,
-                &legacy,
-                false,
-                Want::Untouched,
-                "--session-id",
-            ),
-            (
-                "legacy-reserved-written",
-                Preallocated,
-                &legacy,
-                false,
-                Want::Untouched,
-                "--resume",
-            ),
-        ] {
-            let _ = std::fs::remove_file(&transcript);
-            if case != "legacy-reserved" {
-                std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-                std::fs::write(&transcript, "").unwrap();
-            }
-            inst.resume_intent = ResumeIntent::Default;
-            inst.resume_binding = None;
-            inst.set_agent_conversation(
-                Some(sid.into()),
-                Some(crate::session::ConversationBinding {
-                    session_id: sid.into(),
-                    execution: Some(recorded.clone()),
-                    provenance,
-                    transcript_path: None,
-                }),
-                None,
-            );
-            inst.active_execution = active.then(legacy_active);
-            let before = seed(&inst);
-            let got = inst.prepare_launch_command_in(
-                CaptureStorage::Scoped(&storage),
-                inst.conversation_state(),
-            );
-            if want == Want::Refused {
-                let error = format!("{:#}", got.err().expect(case));
-                assert!(
-                    error.contains("differs from this launch"),
-                    "{case}: {error}"
-                );
-            } else {
-                let command = got.expect(case).command.unwrap_or_default();
-                assert!(command.contains(flag), "{case}: {command}");
-            }
-            if want != Want::Requalified {
-                assert_eq!(std::fs::read(&path).unwrap(), before, "{case}");
-                assert!(backups().is_empty(), "{case}");
-                continue;
-            }
-            assert_eq!(backups().len(), 1, "{case}");
-            let (conversation, active_domain) = on_disk();
-            assert_eq!(conversation.as_deref(), Some("host"), "{case}");
-            if active {
-                assert_eq!(active_domain.as_deref(), Some("host"), "{case}");
-            }
-            if case == "set-session-id-after" {
-                let mut rebound = storage
-                    .load()
-                    .unwrap()
-                    .into_iter()
-                    .find(|row| row.id == inst.id)
-                    .unwrap();
-                let binding = rebound.asserted_resume_binding(sid, None).expect(case);
-                assert_eq!(
-                    host(binding.execution.as_ref()).as_deref(),
-                    Some("host"),
-                    "{case}"
-                );
-                rebound.resume_intent = ResumeIntent::Use(sid.into());
-                rebound.resume_binding = Some(binding);
-                let command = rebound
-                    .prepare_launch_command_in(
-                        CaptureStorage::Scoped(&storage),
-                        rebound.conversation_state(),
-                    )
-                    .expect(case)
-                    .command
-                    .unwrap_or_default();
-                assert!(command.contains("--resume"), "{case}: {command}");
-            }
-        }
-
-        // `aoe migrate` requalifies a stored row with no launch, then finds nothing left.
-        inst.resume_intent = ResumeIntent::Default;
-        inst.set_agent_conversation(
-            Some(sid.into()),
-            Some(crate::session::ConversationBinding {
-                session_id: sid.into(),
-                execution: Some(legacy.clone()),
-                provenance: Asserted,
-                transcript_path: None,
-            }),
-            None,
-        );
-        inst.active_execution = Some(legacy_active());
-        seed(&inst);
-        // Another profile's undecodable component waits for its repair, untouched.
-        let broken = crate::session::get_profile_dir("broken")
-            .unwrap()
-            .join("sessions.json");
-        std::fs::write(&broken, b"{").unwrap();
-        crate::migrations::reconcile_shared_runtime_bindings(true).expect("reconcile-pending");
-        assert_eq!(std::fs::read(&broken).unwrap(), b"{", "reconcile-pending");
-        assert!(
-            crate::session::migration_backups(&broken)
-                .unwrap()
-                .is_empty(),
-            "reconcile-pending"
-        );
-        assert_eq!(
-            on_disk(),
-            (Some("host".into()), Some("host".into())),
-            "reconcile-pending"
-        );
-        assert_eq!(backups().len(), 1, "reconcile-pending");
-        let migrated = std::fs::read(&path).unwrap();
-        crate::migrations::reconcile_shared_runtime_bindings(true).unwrap();
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            migrated,
-            "reconcile-pending second run"
-        );
-        assert_eq!(backups().len(), 1, "reconcile-pending second run");
-
-        // A row a build before v060 wrote doesn't load until `aoe migrate`'s recovery repairs
-        // it, so the same run must requalify it after that recovery.
-        std::fs::remove_file(&broken).unwrap();
-        let mut row = serde_json::to_value(&inst).unwrap();
-        let mut handoff =
-            serde_json::to_value(crate::session::test_support::launch_owed_handoff(&inst)).unwrap();
-        handoff.as_object_mut().unwrap().remove("outcome");
-        row["terminal_handoff"] = handoff;
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!([row])).unwrap(),
-        )
-        .unwrap();
-        assert!(
-            storage.load_instances_complete().is_err(),
-            "repaired-in-same-run"
-        );
-        let app = crate::session::get_app_dir().unwrap();
-        std::fs::write(
-            app.join(".schema_version"),
-            crate::migrations::current_schema_version().to_string(),
-        )
-        .unwrap();
-        crate::session::purge_owners::initialize(&app).unwrap();
-        crate::migrations::run_migrations_announced(None).expect("repaired-in-same-run");
-        assert_eq!(
-            on_disk(),
-            (Some("host".into()), Some("host".into())),
-            "repaired-in-same-run"
-        );
-        assert!(
-            storage.load_instances_complete().is_ok(),
-            "repaired-in-same-run"
-        );
     }
 
     #[test]

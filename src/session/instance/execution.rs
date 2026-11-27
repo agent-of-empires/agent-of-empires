@@ -1999,17 +1999,6 @@ impl Instance {
             .context(ManagedResumeCause::UnsupportedManagedArguments)
     }
 
-    /// This context's execution and container, for a migration that compares recorded ones.
-    pub(crate) fn current_native_execution(
-        &self,
-    ) -> Result<(
-        ExecutionBinding,
-        Option<crate::containers::ContainerExecutionSnapshot>,
-    )> {
-        let execution = self.resolve_native_execution(None)?;
-        Ok((execution.binding, execution.inputs.container))
-    }
-
     pub(super) fn resolve_native_execution(
         &self,
         target: Option<(&str, Option<&ConversationBinding>, bool)>,
@@ -3826,7 +3815,6 @@ mod tests {
                     local_mounts: true,
                     routing: Vec::new(),
                     global_arguments: Vec::new(),
-                    shared_root: None,
                 },
                 name: "fixture".into(),
                 id: "fixture-id".into(),
@@ -3928,7 +3916,6 @@ mod tests {
                     local_mounts: true,
                     routing: Vec::new(),
                     global_arguments: Vec::new(),
-                    shared_root: None,
                 },
                 name: "fixture".into(),
                 id: "fixture-id".into(),
