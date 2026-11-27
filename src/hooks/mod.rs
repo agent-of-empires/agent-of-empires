@@ -39,6 +39,9 @@ pub(crate) use dir_guard::{
 pub(crate) use status_file::{
     read_hook_session_id_within, read_hook_sidecar_at, SESSION_ID_SIDECAR_MAX_AGE,
 };
+/// A launch's id, exported only to that launch's Agent exec and inherited by everything it starts.
+/// It names the launch's `session_id` sidecar and, in a sandbox, picks the processes a restart
+/// stops in the container ([`crate::containers::launch_stop`]); a change must keep both.
 pub(crate) const SESSION_SOURCE_ENV: &str = "AOE_SESSION_SOURCE";
 pub use hermes::{install_hermes_hooks_with_events, uninstall_hermes_hooks, HERMES_ALLOWLIST_FILE};
 pub use json_settings::{

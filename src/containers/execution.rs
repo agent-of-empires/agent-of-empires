@@ -356,6 +356,21 @@ impl RuntimeExecutionSnapshot {
         self.command(&argv[1..])
     }
 
+    /// Runs `args` in container `name` with stdin closed, killing it after `timeout`.
+    pub(crate) fn exec_output(
+        &self,
+        name: &str,
+        args: &[String],
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<std::process::Output> {
+        use anyhow::Context as _;
+
+        let mut command = self.exec(name, "", args);
+        command.stdin(std::process::Stdio::null());
+        crate::process::run_with_timeout(&mut command, timeout)?
+            .with_context(|| format!("container exec timed out after {}s", timeout.as_secs()))
+    }
+
     pub(crate) fn exec_with_env_file(
         &self,
         name: &str,

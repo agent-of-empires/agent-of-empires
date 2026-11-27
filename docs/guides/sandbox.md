@@ -157,6 +157,8 @@ When a newer version of the image a Sandbox uses is published, the web dashboard
 
 A session keeps the container it was created with, so pulling a newer image only affects new sessions. To move an existing sandboxed session onto the current local image, open its context menu in the web dashboard and choose **More > Recreate container**, or use **Recreate container** on the structured view's [adapter error screen](../structured-view/troubleshooting.md#an-adapter-is-missing-or-too-old). The container is removed and the session restarts on a new one: anything outside the working directory and the mounted folders is lost, including tools installed inside the container, and a running turn stops.
 
+Restarting a sandboxed session stops the old Agent in the container and every process its launch started there, backgrounded ones (dev servers, watchers) included, before the new Agent starts. A process that clears its environment (`env -i`, some daemonizers) isn't found and keeps running, as does anything an earlier launch left behind. If the stop fails, the restart goes ahead and the daemon log names the container; stop what is left with `<runtime> stop <container>`.
+
 ## Custom Docker Images
 
 Extend either image for project dependencies:

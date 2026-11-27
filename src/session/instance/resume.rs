@@ -600,7 +600,7 @@ impl Instance {
             None
         };
         if restart {
-            self.kill_clean_locked()?;
+            self.kill_for_restart()?;
         }
         if let Some(carry) = conversation_carry {
             self.absorb_published_prime_session(publication);

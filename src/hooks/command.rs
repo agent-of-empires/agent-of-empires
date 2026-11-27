@@ -879,6 +879,40 @@ mod tests {
         }
     }
 
+    /// A restart's container stop reads `AOE_SESSION_SOURCE` as a launch's marker; the sandbox
+    /// writer must keep writing the plain leaf whether or not the marker is set.
+    #[test]
+    fn sandbox_session_id_command_writes_the_plain_leaf_whatever_the_session_source() {
+        if !jq_available() {
+            return;
+        }
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let payload = format!(r#"{{"session_id":"{uuid}"}}"#);
+        for source in [None, Some("0b6c1c2e-4f1a-4c9e-9d55-3f5a1b7e2c10")] {
+            let tmp = TempDir::new().unwrap();
+            let cmd = hook_command_session_id_sandbox(
+                tmp.path().to_str().unwrap(),
+                HookIdentityField::SessionId,
+                None,
+            );
+            run_hook("sh", &cmd, "sid", &payload, |c| {
+                if let Some(source) = source {
+                    c.env(crate::hooks::SESSION_SOURCE_ENV, source);
+                }
+            });
+            let written: Vec<_> = std::fs::read_dir(tmp.path().join("sid"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert_eq!(written, ["session_id"], "{source:?}");
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("sid/session_id")).unwrap(),
+                uuid,
+                "{source:?}"
+            );
+        }
+    }
+
     #[test]
     fn sandbox_session_id_command_skips_nested_agent() {
         if !jq_available() || !Path::new("/proc/self/cmdline").exists() {

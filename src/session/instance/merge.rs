@@ -87,6 +87,7 @@ impl Instance {
         self.sandbox_info = src.sandbox_info.clone();
         self.capture_started_at = src.capture_started_at;
         self.launch_executable = src.launch_executable.clone();
+        self.sandbox_launch.clone_from(&src.sandbox_launch);
     }
 
     /// Same fields as `merge_post_start`. Resume-probe failure markers are
@@ -229,6 +230,7 @@ impl Instance {
         self.resume_intent = ResumeIntent::Default;
         self.resume_binding = None;
         self.active_execution = None;
+        self.sandbox_launch = None;
         self.terminal_rebind_pending = false;
     }
 
@@ -273,6 +275,7 @@ impl Instance {
         self.acp_load_session_capable = None;
         self.resume_probe_failed_sid = None;
         self.active_execution = None;
+        self.sandbox_launch = None;
         self.acp_effort = None;
         self.acp_model_config.clear();
         self.agent_model = None;
@@ -566,6 +569,31 @@ mod tests {
 
     fn inst() -> Instance {
         Instance::new("s", "/tmp/x")
+    }
+
+    /// A relaunch's sandbox launch record lands with the launch it describes, an older launch's doesn't,
+    /// and switching agents drops it with the execution.
+    #[test]
+    fn the_sandbox_launch_record_follows_its_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |launch_id: &str| SandboxLaunch {
+            launch_id: launch_id.into(),
+            container: crate::containers::launch_stop::fake_container(dir.path(), "docker", ""),
+        };
+        let mut live = inst();
+        live.tool = "claude".into();
+        live.lifecycle_generation = 2;
+        live.sandbox_launch = Some(record("launch-1"));
+        for (generation, want) in [(1, "launch-1"), (2, "launch-2"), (3, "launch-2")] {
+            let mut relaunched = live.clone();
+            relaunched.lifecycle_generation = generation;
+            relaunched.sandbox_launch = Some(record("launch-2"));
+            let mut merged = live.clone();
+            merged.merge_post_start(&relaunched);
+            assert_eq!(merged.sandbox_launch, Some(record(want)), "{generation}");
+        }
+        live.swap_tool("codex");
+        assert_eq!(live.sandbox_launch, None);
     }
 
     /// An error that never reached disk survives a reload of the same turn of

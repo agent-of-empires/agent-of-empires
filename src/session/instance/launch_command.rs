@@ -10,6 +10,7 @@ pub(super) struct LaunchCommandParts {
     omp_capture_plan: Option<OmpCapturePlan>,
     launch_env: LaunchEnvironment,
     fork_mints_child: bool,
+    sandbox_launch: Option<super::SandboxLaunch>,
 }
 
 #[derive(Default)]
@@ -29,6 +30,7 @@ pub(super) struct PreparedLaunch {
     pub(super) canonical_conversation: Option<ConversationState>,
     pub(super) expected_prior_omp_generation: Option<String>,
     pub(super) execution: Option<super::execution::NativeExecution>,
+    pub(super) sandbox_launch: Option<super::SandboxLaunch>,
     /// Relocated and store-adopted conversations require durable confirmation.
     pub(super) require_conversation_publication: bool,
 }
@@ -813,6 +815,27 @@ fn wrap_native_container_command(
 }
 
 impl Instance {
+    /// The record a launch with no execution leaves for a restart's container stop. Reading the
+    /// container's id is best effort: without it the launch goes ahead unrecorded.
+    fn record_sandbox_launch(
+        &self,
+        launch_id: Option<String>,
+        runtime: Option<&crate::containers::RuntimeExecutionSnapshot>,
+        container_name: Option<&str>,
+    ) -> Option<super::SandboxLaunch> {
+        let (launch_id, runtime, name) = (launch_id?, runtime?, container_name?);
+        match crate::containers::ContainerExecutionSnapshot::capture(runtime.clone(), name) {
+            Ok(container) => Some(super::SandboxLaunch {
+                launch_id,
+                container,
+            }),
+            Err(error) => {
+                tracing::warn!(target: "session.lifecycle", session = %self.id, error = %format_args!("{error:#}"), "sandboxed launch left unrecorded; a restart cannot stop its container processes");
+                None
+            }
+        }
+    }
+
     fn sandbox_launch_context(
         &self,
         agent: Option<&crate::agents::AgentDef>,
@@ -1179,6 +1202,7 @@ impl Instance {
                 omp_capture_plan,
                 mut launch_env,
                 fork_mints_child,
+                sandbox_launch,
             },
             mut execution,
             canonical_conversation,
@@ -1221,6 +1245,7 @@ impl Instance {
             expected_prior_omp_generation,
             sandbox_context_reset,
             execution,
+            sandbox_launch,
             require_conversation_publication,
         })
     }
@@ -1403,12 +1428,17 @@ impl Instance {
             let identity_extension = execution
                 .and_then(|execution| execution.inputs.identity_extension.as_ref())
                 .or(fallback_identity.as_ref());
+            // A launch with no execution mints its own id, so a restart's container stop can still
+            // tell its processes from the container's others.
+            let fallback_launch_id = execution
+                .is_none()
+                .then(|| uuid::Uuid::new_v4().to_string());
             let fallback_environment = if execution.is_none() {
                 Some(self.sandbox_launch_environment(
                     agent,
                     identity_extension,
                     &self.effective_profile(),
-                    None,
+                    fallback_launch_id.as_deref(),
                     &crate::session::config::repo_config::resolve_config_with_repo(
                         &self.effective_profile(),
                         self.repo_config_path(),
@@ -1587,6 +1617,11 @@ impl Instance {
                         .map(|environment| environment.env)
                         .unwrap_or_default(),
                 },
+                sandbox_launch: self.record_sandbox_launch(
+                    fallback_launch_id,
+                    fallback_runtime.as_ref(),
+                    fallback_container_name.as_deref(),
+                ),
             }
         } else {
             let mut result =
@@ -1829,6 +1864,7 @@ impl Instance {
                         omp_capture_plan,
                         fork_mints_child,
                         launch_env: LaunchEnvironment::default(),
+                        sandbox_launch: None,
                     })
                 }
                 None => Ok(LaunchCommandParts {
@@ -1837,6 +1873,7 @@ impl Instance {
                     omp_capture_plan,
                     fork_mints_child,
                     launch_env: LaunchEnvironment::default(),
+                    sandbox_launch: None,
                 }),
             }
         } else {
@@ -1927,6 +1964,7 @@ impl Instance {
                 omp_capture_plan,
                 fork_mints_child,
                 launch_env: LaunchEnvironment::default(),
+                sandbox_launch: None,
             })
         }
     }
@@ -4403,6 +4441,26 @@ sandbox = "unsupported"
         assert!(prepared.is_existing);
         let command = prepared.command.unwrap();
         assert!(command.contains(&format!("resume {local}")), "{command}");
+        // No execution, so the launch marks its processes with an id of its own and records it.
+        let recorded = prepared
+            .sandbox_launch
+            .expect("an execution-less launch is recorded");
+        assert_eq!(recorded.container.id, "fixture:codex-5477");
+        assert_eq!(
+            uuid::Uuid::parse_str(&recorded.launch_id)
+                .unwrap()
+                .hyphenated()
+                .to_string(),
+            recorded.launch_id
+        );
+        assert!(
+            prepared.launch_env.container.contains(&(
+                crate::hooks::SESSION_SOURCE_ENV.to_owned(),
+                recorded.launch_id.clone()
+            )),
+            "{:?}",
+            prepared.launch_env.container
+        );
 
         let binding = |session_id: &str, agent: &str, stores: Vec<PathBuf>| {
             let mut binding = ConversationBinding::unknown(session_id);
