@@ -1311,12 +1311,19 @@ mod tests {
             "source_group":"aaa","direction":"down"});
         let (status, _, value) = request_with_headers(&state, "POST", "/api/reorder", body).await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{value}");
-        // Headers are bounded like an order, since the move arranges them under its guards.
+        // Headers and siblings are bounded like an order, since the move arranges them under
+        // its guards.
         let headers: Vec<String> = (0..=4096).map(|n| format!("g{n}")).collect();
-        let body = serde_json::json!({"target":"session","id":id,"profile":"reorder",
-            "source_group":"aaa","headers":headers,"direction":"down"});
-        let (status, _, value) = request_with_headers(&state, "POST", "/api/reorder", body).await;
-        assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{value}");
+        for body in [
+            serde_json::json!({"target":"session","id":id,"profile":"reorder",
+                "source_group":"aaa","headers":headers,"direction":"down"}),
+            serde_json::json!({"target":"group","group":{"profile":"reorder","path":"aaa"},
+                "siblings":headers,"direction":"down"}),
+        ] {
+            let (status, _, value) =
+                request_with_headers(&state, "POST", "/api/reorder", body).await;
+            assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{value}");
+        }
         let ordering = crate::session::get_app_dir()
             .unwrap()
             .join("workspace-ordering.json");
@@ -1332,13 +1339,13 @@ mod tests {
     }
 
     /// A carry writes only live workspaces, so a Client rewriting the full order next keeps
-    /// every placement it carried.
+    /// every placement it carried, and places none outside its destination.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_carry_drops_workspaces_no_session_belongs_to() {
+    async fn a_carry_places_only_live_workspaces_of_its_destination() {
         let _home = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
-        let rows: Vec<Instance> = [("one", "aaa"), ("two", "bbb")]
+        let rows: Vec<Instance> = [("one", "aaa"), ("two", "bbb"), ("three", "ccc")]
             .into_iter()
             .map(|(title, group)| {
                 let mut row = Instance::new(title, &format!("/tmp/{title}"));
@@ -1350,7 +1357,7 @@ mod tests {
         storage
             .update(|stored, groups| {
                 *stored = rows.clone();
-                *groups = ["aaa", "bbb"]
+                *groups = ["aaa", "bbb", "ccc"]
                     .map(|path| crate::session::Group::new(path, path))
                     .into();
                 Ok(())

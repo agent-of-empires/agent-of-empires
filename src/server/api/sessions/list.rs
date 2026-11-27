@@ -716,6 +716,16 @@ pub(crate) fn writable_live_order(
     writable_repository_order(order)
 }
 
+/// `order` without repeats, workspaces outside `live` or entries the endpoint refuses, or
+/// None when it is still longer than the endpoint accepts, so no placement is cut.
+pub(crate) fn bounded_live_order(
+    mut live: std::collections::HashSet<String>,
+    mut order: Vec<String>,
+) -> Option<Vec<String>> {
+    order.retain(|id| id.len() <= MAX_ORDER_ENTRY_LEN && live.remove(id));
+    (order.len() <= MAX_ORDER_ENTRIES).then_some(order)
+}
+
 /// `order` with entries the endpoint refuses dropped and cut to the length it accepts.
 pub(crate) fn writable_repository_order(mut order: Vec<String>) -> Vec<String> {
     order.retain(|entry| entry.len() <= MAX_ORDER_ENTRY_LEN);
