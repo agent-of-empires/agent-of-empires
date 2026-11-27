@@ -386,7 +386,11 @@ mod deliver_to_live_pane_tests {
             .args(["list-panes", "-a", "-F", "#{pane_id}"])
             .output()
             .expect("list-panes");
-        assert!(out.status.success(), "list-panes");
+        assert!(
+            out.status.success(),
+            "list-panes: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .any(|line| line == pane)

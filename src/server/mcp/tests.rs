@@ -1486,6 +1486,11 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
             .args(["list-panes", "-a", "-F", "#{pane_id} #{session_name}"])
             .output()
             .unwrap();
+        assert!(
+            panes.status.success(),
+            "{case}: list-panes: {}",
+            String::from_utf8_lossy(&panes.stderr)
+        );
         let checked_session = String::from_utf8_lossy(&panes.stdout)
             .lines()
             .find_map(|line| {
