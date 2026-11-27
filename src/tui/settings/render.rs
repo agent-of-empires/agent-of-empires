@@ -1832,10 +1832,17 @@ mod status_message_tests {
         // Editing the tall field brings its value row, below the description, into view.
         view.fields[1].value = FieldValue::Text("VALUE".to_string());
         view.selected_field = 1;
-        view.fields_scroll_offset = b_top;
-        press(&mut view, KeyCode::Enter);
-        assert!(view.editing_input.is_some());
-        assert_eq!(view.fields_scroll_offset, b_top + b_height - 4);
+        for offset in [b_top, b_top + b_height + 2] {
+            view.editing_input = None;
+            view.fields_scroll_offset = offset;
+            press(&mut view, KeyCode::Enter);
+            assert!(view.editing_input.is_some());
+            assert_eq!(
+                view.fields_scroll_offset,
+                b_top + b_height - 4,
+                "from {offset}"
+            );
+        }
     }
 
     /// The status has its own footer row beneath the key hints, so it can

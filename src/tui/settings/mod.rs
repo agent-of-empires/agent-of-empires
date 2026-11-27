@@ -663,13 +663,15 @@ impl SettingsView {
         false
     }
 
-    /// Bring the selected field's bottom into view, where its value and any
-    /// inline editor sit below the description.
+    /// Bring the selected field's last row into view, where a text or number
+    /// editor sits below the description.
     pub(super) fn reveal_selected_field_value(&mut self) {
         let (top, height) = self.selected_field_span();
         let bottom = top + height;
-        if bottom > self.fields_scroll_offset + self.fields_viewport_height {
-            self.fields_scroll_offset = bottom.saturating_sub(self.fields_viewport_height);
+        let value_row = bottom.saturating_sub(1);
+        let viewport = self.fields_viewport_height;
+        if value_row < self.fields_scroll_offset || bottom > self.fields_scroll_offset + viewport {
+            self.fields_scroll_offset = bottom.saturating_sub(viewport);
         }
     }
 
