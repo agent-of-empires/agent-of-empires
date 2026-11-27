@@ -58,7 +58,9 @@ impl<T> ArrivalOrder<T> {
     pub fn count_frame(&mut self) {
         self.adapter_frames = self.adapter_frames.saturating_add(1);
         let frames = self.adapter_frames;
-        let kept = self.held.split_off(&(frames + 1));
+        let kept = frames
+            .checked_add(1)
+            .map_or_else(Default::default, |next| self.held.split_off(&next));
         self.held_len = kept.values().map(Vec::len).sum();
         self.held = kept;
     }
