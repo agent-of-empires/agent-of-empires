@@ -72,5 +72,3 @@ module.exports = async function macosGate({ github, context, core, queueRef }) {
   core.notice('macOS skipped: runs post-merge on main. Add ci-macos and re-run this job to run it here.');
   core.setOutput('run', 'false');
 };
-
-module.exports.sensitiveFile = sensitiveFile;
