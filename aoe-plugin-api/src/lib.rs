@@ -5,6 +5,7 @@ pub mod agent_integration;
 mod capability;
 mod id;
 mod manifest;
+mod mcp;
 pub mod session;
 pub mod suggestions;
 
@@ -23,4 +24,8 @@ pub use suggestions::{
     SuggestionSource, SuggestionsError, SuggestionsSpec,
 };
 
-pub const API_VERSION: u32 = 25;
+pub use mcp::{
+    is_valid_mcp_server_name, mcp_prefix, MCP_SERVE_CAPABILITY, MCP_SERVE_MAX_PER_PLUGIN,
+};
+
+pub const API_VERSION: u32 = 26;

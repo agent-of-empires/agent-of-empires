@@ -24,6 +24,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -98,17 +99,17 @@ async fn disabled_codex_server_does_not_reach_new_session() {
             std::fs::write(
                 codex_dir.join("config.toml"),
                 r#"
-[mcp_servers.omitted]
-command = "omitted"
+        [mcp_servers.omitted]
+        command = "omitted"
 
-[mcp_servers.explicit_true]
-command = "true"
-enabled = true
+        [mcp_servers.explicit_true]
+        command = "true"
+        enabled = true
 
-[mcp_servers.explicit_false]
-command = "false"
-enabled = false
-"#,
+        [mcp_servers.explicit_false]
+        command = "false"
+        enabled = false
+        "#,
             )
             .unwrap();
             let native = mcp_model::load_native_mcp_servers("codex", home.path()).unwrap();
@@ -129,6 +130,7 @@ enabled = false
                     })
                     .collect(),
                 &[],
+                mcp_config::PluginCredentials::None,
             );
 
             let client = scope
@@ -170,7 +172,7 @@ async fn new_session_receives_expanded_and_unresolved_mcp_auth_headers() {
         "resolved":{"type":"http","url":"https://resolved.mcp.invalid","headers":{
             "Authorization":"Bearer ${GITHUB_TOKEN}"
         }}
-    }}"#,
+            }}"#,
             )
             .unwrap()
             .into_iter()
@@ -191,7 +193,11 @@ async fn new_session_receives_expanded_and_unresolved_mcp_auth_headers() {
                 .provider_env
                 .push(("SHIM_MCP_CAPABILITY".into(), "http".into()));
             config.host_environment = session_env.clone();
-            config.mcp_servers = mcp_config::project_servers_to_acp(servers, &session_env);
+            config.mcp_servers = mcp_config::project_servers_to_acp(
+                servers,
+                &session_env,
+                mcp_config::PluginCredentials::None,
+            );
 
             let client = scope
                 .spawn(config, "mcp-header-expansion")
