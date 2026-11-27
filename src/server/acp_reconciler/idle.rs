@@ -63,6 +63,13 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
             .acp_supervisor
             .running_lease(&id)
             .map(|lease| (lease.admissions(), lease));
+        // A prompt still being published is not in the log yet.
+        if observed
+            .as_ref()
+            .is_some_and(|(_, lease)| lease.has_unsettled_admission())
+        {
+            continue;
+        }
         let probe = query_store(&state.acp_event_store, &id, "terminal-repair", |s, id| {
             (
                 s.terminal_repair_probe(id),
@@ -101,13 +108,6 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
             .as_deref()
             .and_then(crate::acp::state::RateLimitInfo::from_agent_text)
         {
-            // An admission marks the baseline before its prompt is stored, so a
-            // recent one may be a prompt the log does not show yet.
-            if observed.as_ref().is_some_and(|(_, lease)| {
-                now_ms.saturating_sub(lease.idle_baseline_ms()) < grace_ms
-            }) {
-                continue;
-            }
             park_limited_agent_turn(state, &id, info, latest.latest_seq, observed).await;
             continue;
         }
@@ -878,7 +878,7 @@ mod tests {
 
     /// The production shape: a live worker is stopped with a `rate_limited`
     /// terminal, leaving a workerless park for the reaper (#5990). A prompt
-    /// admitted but not yet stored keeps the worker.
+    /// admitted but not yet stored keeps the worker, however long it takes.
     #[tokio::test]
     #[serial_test::serial]
     async fn terminal_repair_stops_the_worker_of_a_limited_agent_turn() {
@@ -889,10 +889,9 @@ mod tests {
             let sup = &state.acp_supervisor;
             sup.test_insert_worker(id).await;
             let lease = sup.running_lease(id).unwrap();
+            // Backdated after the admission, so only its unsettled publication protects the worker.
+            let _admission = admitted_unstored.then(|| sup.test_note_admission(id));
             lease.test_backdate_idle_baseline(Timestamp::now().as_millis() - 3_600_000);
-            if admitted_unstored {
-                sup.test_note_admission(id);
-            }
             let at_ms = Timestamp::now().as_millis() - 120_000;
             let events = [
                 Event::Stopped {

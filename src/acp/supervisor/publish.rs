@@ -182,7 +182,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             classified_as,
         } = prompt;
         // Before any await or store, so an idle stop cannot claim the worker in between.
-        super::lock_recover(&self.lifecycle).note_admission(session_id);
+        let _admission = super::lock_recover(&self.lifecycle).note_admission(session_id);
         let profile = match classified_as {
             Some(profile) => profile,
             None => self.profile_for_session(session_id, &text).await,
@@ -249,7 +249,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         comments: Vec<crate::acp::state::DiffComment>,
         assembled_markdown: String,
     ) {
-        super::lock_recover(&self.lifecycle).note_admission(session_id);
+        let _admission = super::lock_recover(&self.lifecycle).note_admission(session_id);
         self.publish_next(
             session_id,
             &Event::UserDiffCommentsPrompt {
