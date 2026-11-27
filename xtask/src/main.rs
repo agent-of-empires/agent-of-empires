@@ -102,12 +102,6 @@ fn web_deps_stale(web: &Path) -> bool {
         .any(|file| mtime(&web.join(file)).is_some_and(|at| at > marker))
 }
 
-/// The dev backend lacks the `web` feature, so its own `web_disabled` gate never fires.
-#[cfg(unix)]
-fn web_plugin_disabled(config: &agent_of_empires::session::Config) -> bool {
-    config.plugins.get("aoe.web").is_some_and(|p| !p.enabled)
-}
-
 #[cfg(unix)]
 fn host_is_loopback(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.")
@@ -174,15 +168,6 @@ fn run_dev(args: DevArgs) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-
-    // Built in the dev profile, so this reads the same `-dev` app dir as `target/debug/aoe`.
-    if web_plugin_disabled(&agent_of_empires::session::Config::load_or_warn()) {
-        eprintln!(
-            "[xtask dev] aoe.web is disabled in the dev config \
-             ([plugins.\"aoe.web\"] enabled = false); enable it to run the dashboard"
-        );
-        std::process::exit(1);
-    }
 
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let target_dir = Path::new(&target_dir);
@@ -834,21 +819,8 @@ mod skill_check_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{is_watch_relevant, web_deps_stale, web_plugin_disabled};
+    use super::{is_watch_relevant, web_deps_stale};
     use std::path::Path;
-
-    #[test]
-    fn only_an_explicitly_disabled_web_plugin_blocks_dev() {
-        for (toml_src, disabled) in [
-            ("", false),
-            ("[plugins.\"aoe.web\"]\nenabled = true", false),
-            ("[plugins.\"aoe.web\"]\nenabled = false", true),
-            ("[plugins.\"other\"]\nenabled = false", false),
-        ] {
-            let config: agent_of_empires::session::Config = toml::from_str(toml_src).unwrap();
-            assert_eq!(web_plugin_disabled(&config), disabled, "{toml_src:?}");
-        }
-    }
 
     #[test]
     fn web_deps_are_stale_when_the_npm_marker_is_missing_or_older() {
