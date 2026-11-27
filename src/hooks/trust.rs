@@ -38,23 +38,21 @@ pub(crate) fn open_regular_for_write(path: &Path) -> Result<Option<std::fs::File
 
 /// Overwrites `path` through the same inode, for a file a running container may
 /// already mount by inode. Anything but a lone regular file (a link, a FIFO, a
-/// hardlink to another file) is unlinked and created fresh, never written through.
+/// hardlink to another file) is refused, never replaced or written through.
 ///
 /// The payload is one `write_all` after `set_len(0)`; a crash between the two leaves
 /// an empty file, which the declared-trust reader treats as absent.
 fn write_in_place(path: &Path, content: &[u8]) -> Result<()> {
     use std::io::Write;
-    for _ in 0..2 {
-        if let Some(mut file) = open_regular_for_write(path)? {
-            file.set_len(0)?;
-            return file
-                .write_all(content)
-                .with_context(|| format!("writing {} in place", path.display()));
-        }
-        std::fs::remove_file(path)
-            .with_context(|| format!("replacing the non-regular {}", path.display()))?;
-    }
-    anyhow::bail!("{} is not a regular file after replacement", path.display())
+    let mut file = open_regular_for_write(path)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "staged trust file {} is not a lone regular file; remove the session's container and relaunch",
+            path.display()
+        )
+    })?;
+    file.set_len(0)?;
+    file.write_all(content)
+        .with_context(|| format!("writing {} in place", path.display()))
 }
 
 /// Merge-edits a JSON config under its lock, writing only when `edit` changed it.
@@ -841,7 +839,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn in_place_write_replaces_a_planted_fifo_without_blocking() {
+    fn in_place_write_refuses_a_planted_fifo_without_blocking() {
+        use std::os::unix::fs::FileTypeExt;
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(".example.json");
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o644)).unwrap();
@@ -856,12 +855,11 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("the write must not block on a FIFO");
 
-        result.unwrap();
+        assert!(result.is_err());
         assert!(std::fs::symlink_metadata(&path)
             .unwrap()
             .file_type()
-            .is_file());
-        assert_eq!(read_json(&path)["projects"]["/repo"]["trusted"], true);
+            .is_fifo());
     }
 
     #[cfg(unix)]
@@ -874,11 +872,11 @@ mod tests {
         let path = tmp.path().join(".example.json");
         std::fs::hard_link(&other, &path).unwrap();
 
-        write_declared_trust_in_place(&path, &staged_trust(), "/repo").unwrap();
+        assert!(write_declared_trust_in_place(&path, &staged_trust(), "/repo").is_err());
 
         assert_eq!(std::fs::read_to_string(&other).unwrap(), r#"{"keep":true}"#);
-        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 1);
-        assert_eq!(read_json(&path)["projects"]["/repo"]["trusted"], true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"keep":true}"#);
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 2);
     }
 
     #[cfg(unix)]

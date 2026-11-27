@@ -2389,14 +2389,13 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
         });
         match result {
             // A running container may still mount the old record, so a launch that
-            // could not blank it must not go on to reuse that container.
-            Err(e) if !applies => {
+            // could not update it must not go on to reuse that container.
+            Err(e) => {
+                let action = if applies { "update" } else { "revoke" };
                 return Err(e.context(format!(
-                    "cannot revoke the staged sandbox trust file for {tool}; refusing to reuse the container; make the file writable or remove the session's container and relaunch"
-                )))
+                    "cannot {action} the staged sandbox trust file for {tool}; refusing to reuse the container; make the file writable or remove the session's container and relaunch"
+                )));
             }
-            Err(e) => tracing::warn!(target: "session.profile",
-                "Failed to apply sandbox folder trust for {tool}: {e:#}"),
             Ok(()) => {}
         }
         return Ok(());
@@ -7813,7 +7812,7 @@ sandbox = "SANDBOX"
         assert_eq!(inode(&staged), mounted_inode);
         assert_eq!(fs::read_to_string(&staged).unwrap(), "{}");
 
-        // A link planted in the staged directory is replaced, never followed.
+        // A link planted in the staged directory is discarded on create, never followed.
         crate::session::test_support::install_agent_plugin(
             "acme.declared-sandbox",
             &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "always"),
@@ -7823,6 +7822,12 @@ sandbox = "SANDBOX"
         let stage = crate::hooks::declared_sandbox_dir("declared-link").unwrap();
         fs::create_dir_all(stage.join("home")).unwrap();
         std::os::unix::fs::symlink(&outside, stage.join("home/.example.json")).unwrap();
+        discard_staged_declared_trust(
+            "example-helper",
+            Some("example-helper"),
+            &super::super::SessionConfig::default(),
+            "declared-link",
+        );
         let config = launch("declared-link", false);
         assert_eq!(fs::read_to_string(&outside).unwrap(), "{}");
         let staged = mount_of(&config, "/root/.example.json").unwrap();
@@ -8093,6 +8098,100 @@ sandbox = "SANDBOX"
 
         assert_eq!(fs::read_to_string(&other).unwrap(), "precious");
         assert_eq!(fs::metadata(&file).unwrap().ino(), mounted);
+    }
+
+    // A reused container mounts the staged file by inode: a refresh and a revoke both
+    // reach it through that inode.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn refresh_then_revoke_reach_the_mounted_staged_file() {
+        use std::io::{Read, Seek};
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let install = |sandbox: &str, value: &str| {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN
+                    .replace("SANDBOX", sandbox)
+                    .replace("value = true", &format!("value = {value}")),
+            )
+        };
+        let ensure = |yolo: bool| {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-held",
+                "/workspace/project",
+                yolo,
+            )
+        };
+        let file = crate::hooks::declared_sandbox_dir("declared-held")
+            .unwrap()
+            .join("home/.example.json");
+
+        install("yolo_only", "true");
+        ensure(true).unwrap();
+        let mut mount = fs::File::open(&file).unwrap();
+        let inode = fs::metadata(&file).unwrap().ino();
+        let mut held = || {
+            let mut text = String::new();
+            mount.rewind().unwrap();
+            mount.read_to_string(&mut text).unwrap();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+
+        install("yolo_only", "false");
+        ensure(true).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().ino(), inode);
+        assert_eq!(held()["projects"]["/workspace/project"]["trusted"], false);
+
+        ensure(false).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().ino(), inode);
+        assert_eq!(held(), serde_json::json!({}));
+    }
+
+    // A hardlinked staged file cannot be updated in place, so reuse refuses.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn refreshing_staged_trust_refuses_a_hardlinked_file() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "always"),
+        );
+        let file = crate::hooks::declared_sandbox_dir("declared-refresh-link")
+            .unwrap()
+            .join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let other = temp_home.path().join("other");
+        fs::write(&other, r#"{"old":true}"#).unwrap();
+        fs::hard_link(&other, &file).unwrap();
+
+        let error = ensure_folder_trust_config_for_active_agent(
+            "example-helper",
+            Some("example-helper"),
+            &super::super::SessionConfig::default(),
+            "declared-refresh-link",
+            "/workspace/project",
+            false,
+        )
+        .expect_err("a hardlinked file cannot be updated in place");
+
+        assert!(
+            format!("{error:#}").contains("refusing to reuse the container"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_to_string(&other).unwrap(), r#"{"old":true}"#);
+        assert_eq!(fs::read_to_string(&file).unwrap(), r#"{"old":true}"#);
     }
 
     // Dropping a plugin's trust declaration must revoke the record it staged, in
