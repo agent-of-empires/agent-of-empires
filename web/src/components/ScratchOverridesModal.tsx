@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchMachineSettings, getProfileSettings, updateMachineSettings, updateProfileSettings } from "../lib/api";
-import { BRAND_BUTTON, CancelButton, ConfirmButton, Dialog } from "./Dialog";
+import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
 import { useConfirmKeys, useDialogFocus } from "./dialogHooks";
 
 interface Props {
@@ -99,7 +99,6 @@ export function ScratchOverridesModal({ profile, onClose }: Props) {
             buttonRef={saveButtonRef}
             onClick={handleSubmit}
             busy={submitting || loading || loadError}
-            className={BRAND_BUTTON}
             testId="scratch-overrides-save"
           >
             {submitting ? "Saving…" : "Save"}

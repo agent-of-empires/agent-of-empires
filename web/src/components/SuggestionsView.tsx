@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { useReportFeatureOnce } from "../hooks/useReportFeatureOnce";
 import { ChevronDown, ChevronRight, RefreshCw, Search, Settings, X } from "lucide-react";
 import { agoLabel } from "../lib/suggestionTime";
 import { chipId, filterSuggestions, keyChipGroups, type KeyChip } from "../lib/suggestionFilter";
@@ -10,6 +11,8 @@ import { useAgentNames } from "../hooks/useAgentNames";
 import { useSuggestionPresets } from "../hooks/useSuggestionPresets";
 import { SuggestionItemActions } from "./SuggestionItemActions";
 import { SuggestionHooksReview } from "./SuggestionHooksReview";
+import { SuggestionsAgentGuide } from "./SuggestionsAgentGuide";
+import { isPluginProvider } from "../lib/suggestionProviders";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import { StartedPromptNote } from "./PromptBlockedNote";
 import {
@@ -21,6 +24,7 @@ import {
   UndoBar,
 } from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 interface Props {
   readOnly?: boolean;
@@ -91,11 +95,14 @@ export function SuggestionsView({
   const agentName = useAgentNames();
   const presetOf = useSuggestionPresets();
   const { undo, dismiss, stop } = useDismissUndo(act);
+  useReportFeatureOnce("suggest_from_page", snapshot !== null);
   const [filter, setFilter] = useState<Filter>(initialDismissed ? "dismissed" : "all");
   const [query, setQuery] = useState("");
   const [keyChips, setKeyChips] = useState<KeyChip[]>([]);
   const [kinds, setKinds] = useState<string[]>([]);
   const [collapsed, setCollapsed] = useState<string[]>([]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [batching, setBatching] = useState(false);
 
   // A source chip belongs to the list it was picked in, so it does not outlive a tab change.
   const changeFilter = (next: Filter) => {
@@ -134,6 +141,19 @@ export function SuggestionsView({
   const allOff = !!snapshot && snapshot.providers.length > 0 && providers.length === 0;
   const anyRefreshing = refreshing || providers.some((p) => p.refreshing);
   const groups = groupByRepo(visible);
+  // What Start would act on: not dismissed, closed or already started.
+  const startable = (i: SuggestionItem) => !i.dismissed && !i.stale && !i.started_session;
+  const canSelect = !readOnly && !offline;
+  const chosen = visible.filter((i) => startable(i) && selected.includes(suggestionKey(i)));
+  const allChosen = visible.filter(startable).length > 0 && visible.filter(startable).every((i) => chosen.includes(i));
+  const toggleSelected = (key: string, on: boolean) =>
+    setSelected((c) => (on ? (c.includes(key) ? c : [...c, key]) : c.filter((k) => k !== key)));
+  const startChosen = async () => {
+    setBatching(true);
+    setSelected([]);
+    await ctrl.startMany(chosen);
+    setBatching(false);
+  };
   const kindOptions = providers.flatMap((p) =>
     p.sources
       .map((src) => ({ id: kindId({ provider_id: p.id, criterion: src.criterion }), label: src.label }))
@@ -160,25 +180,35 @@ export function SuggestionsView({
   const chip = (selected: boolean) =>
     `${CHIP} ${selected ? "border-brand-500 bg-brand-500/10 text-text-primary" : "border-surface-700 text-text-secondary hover:bg-surface-800"}`;
 
-  const noProviderNote =
-    !readOnly && onOpenMarketplace ? (
-      <SuggestionsSetupHint
-        ignoreDismissed
-        noProvider
-        onOpenMarketplace={onOpenMarketplace}
-        onFinished={() => void load()}
-        fallback="No plugin provides suggestions."
-      />
-    ) : (
-      "No plugin provides suggestions."
-    );
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const noProviderNote = (
+    <>
+      <SuggestionsAgentGuide />
+      {!readOnly && onOpenMarketplace ? (
+        <SuggestionsSetupHint
+          ignoreDismissed
+          noProvider
+          onOpenMarketplace={onOpenMarketplace}
+          onFinished={() => {
+            headingRef.current?.focus();
+            void load();
+          }}
+          fallback="No plugin provides suggestions."
+        />
+      ) : (
+        "No plugin provides suggestions."
+      )}
+    </>
+  );
 
   return (
     <main className="flex-1 min-h-0 overflow-y-auto bg-surface-900 text-text-primary">
       <div className="mx-auto max-w-4xl p-4 md:p-8">
         <header className="flex items-center justify-between gap-4">
           <div className="min-w-0">
-            <h1 className="text-lg font-semibold">Suggested sessions</h1>
+            <h1 ref={headingRef} tabIndex={-1} className="text-lg font-semibold outline-none">
+              Suggested sessions
+            </h1>
             {snapshot && snapshot.providers.length > 0 && (
               <ul aria-label="Provider status" className="mt-1 flex flex-wrap gap-x-3 font-mono text-xs text-text-dim">
                 <li>
@@ -242,7 +272,7 @@ export function SuggestionsView({
             {!notice && (
               <>
                 {" "}
-                <button type="button" onClick={() => void load()} className="cursor-pointer underline">
+                <button type="button" onClick={() => void load()} className={BUTTON_INLINE}>
                   Try again
                 </button>
               </>
@@ -335,6 +365,20 @@ export function SuggestionsView({
                 </button>
               )}
             </div>
+            {canSelect && visible.filter(startable).length > 1 && (
+              <label className="flex items-center gap-2 text-xs text-text-secondary">
+                <input
+                  type="checkbox"
+                  aria-label="Select all shown"
+                  checked={allChosen}
+                  onChange={(e) =>
+                    setSelected(e.target.checked ? visible.filter(startable).map((i) => suggestionKey(i)) : [])
+                  }
+                  className="h-4 w-4 cursor-pointer accent-brand-500"
+                />
+                Select all shown
+              </label>
+            )}
             {(providers.length > 1 || dismissedCount > 0 || showDismissed) && (
               <div className="flex gap-2 overflow-x-auto" role="group" aria-label="Filter suggestions">
                 {providers.length > 1 && (
@@ -417,12 +461,26 @@ export function SuggestionsView({
                             session={liveSession(item.started_session, sessions)}
                             stale={item.stale}
                             failure={failures[key]}
+                            select={
+                              canSelect && startable(item)
+                                ? {
+                                    checked: selected.includes(key),
+                                    onChange: (on) => toggleSelected(key, on),
+                                    label: `Select ${item.title}`,
+                                  }
+                                : undefined
+                            }
                             note={
-                              <StartedPromptNote
-                                session={liveSession(item.started_session, sessions)}
-                                onTryAgain={() => ctrl.retryBlocked(item)}
-                                disabled={disabled}
-                              />
+                              <>
+                                <StartedPromptNote
+                                  session={liveSession(item.started_session, sessions)}
+                                  onTryAgain={() => ctrl.retryBlocked(item)}
+                                  disabled={disabled}
+                                />
+                                {item.auto_note && !item.started_session && (
+                                  <p className="mt-0.5 break-words text-xs text-text-dim">{item.auto_note}</p>
+                                )}
+                              </>
                             }
                             actions={
                               <SuggestionItemActions
@@ -462,7 +520,7 @@ export function SuggestionsView({
                     ? "No suggestions match the filters."
                     : showDismissed
                       ? "No dismissed suggestions."
-                      : snapshot.providers.length === 0
+                      : !snapshot.providers.some(isPluginProvider)
                         ? noProviderNote
                         : "Nothing to suggest right now."}
                 </li>
@@ -476,11 +534,7 @@ export function SuggestionsView({
                         ? `${p.name} suggestions are hidden because ${p.name} is off. Read-only: this dashboard can't turn it on.`
                         : `${p.name} suggestions are hidden because ${p.name} is off in Settings › Suggestions. `}
                       {!readOnly && onOpenSettings && (
-                        <button
-                          type="button"
-                          onClick={onOpenSettings}
-                          className="cursor-pointer text-brand-500 hover:underline"
-                        >
+                        <button type="button" onClick={onOpenSettings} className={BUTTON_INLINE}>
                           Turn it on
                         </button>
                       )}
@@ -488,6 +542,30 @@ export function SuggestionsView({
                   ))}
               <SuggestionStatusNotes readOnly={readOnly} offline={offline} cityhall={cityhall} />
             </ul>
+            {chosen.length > 0 && (
+              <div
+                role="region"
+                aria-label="Selected suggestions"
+                className="sticky bottom-3 mt-4 flex items-center gap-2 rounded-lg border border-surface-700 bg-surface-800 px-3 py-2 shadow-lg"
+              >
+                <span className="flex-1 text-sm text-text-primary">{chosen.length} selected</span>
+                <button
+                  type="button"
+                  onClick={() => setSelected([])}
+                  className="inline-flex h-8 items-center rounded-md px-3 text-xs text-text-secondary hover:bg-surface-700/50"
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  disabled={batching || disabled}
+                  onClick={() => void startChosen()}
+                  className="inline-flex h-8 items-center rounded-md bg-brand-600 px-3 text-xs font-medium text-white hover:bg-brand-500 disabled:opacity-50"
+                >
+                  {batching ? "Starting…" : `Start ${chosen.length}`}
+                </button>
+              </div>
+            )}
             {undo && (
               <UndoBar
                 // A new dismissal gets a fresh bar, not the last one's Stop state.

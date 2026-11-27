@@ -168,7 +168,7 @@ describe("opening the wizard without a group", () => {
       projectPath: "/repo-a",
     });
     const { unmount } = render(sidebar(one, onNew));
-    fireEvent.click(screen.getByRole("button", { name: "New project session" }));
+    fireEvent.click(screen.getByTestId("sidebar-new-session"));
     expect(onNew).toHaveBeenLastCalledWith();
     unmount();
 

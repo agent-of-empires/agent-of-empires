@@ -123,7 +123,6 @@ describe("reconnect (#1130)", () => {
     await flushAsync();
     sockets[0]!.drop();
     expect(result.current).toMatchObject({ reconnecting: true, retryCount: 1 });
-    expect(result.current.retryCountdown).toBeGreaterThanOrEqual(1);
 
     await act(() => vi.advanceTimersByTimeAsync(acpRetryDelayMs(1)));
     await flushAsync();

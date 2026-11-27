@@ -57,7 +57,6 @@ export interface AcpContext {
   /** The auto-reconnect backoff is armed between a close and the next dial. */
   reconnecting: boolean;
   retryCount: number;
-  retryCountdown: number;
   maxRetries: number;
   manualReconnect: () => void;
   resolveApproval: (nonce: string, decision: ApprovalDecision, optionId?: string) => Promise<void>;
@@ -258,7 +257,6 @@ export function AcpRuntime({
         replayedWhileDown: acp.replayedWhileDown,
         reconnecting: acp.reconnecting,
         retryCount: acp.retryCount,
-        retryCountdown: acp.retryCountdown,
         maxRetries: acp.maxRetries,
         manualReconnect: acp.manualReconnect,
         resolveApproval: acp.resolveApproval,

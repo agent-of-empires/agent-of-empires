@@ -17,6 +17,15 @@ export function loadFeaturedSuggestionSources(): Promise<FeaturedSources> {
   return cached;
 }
 
+/** A sentence with a next step for a failed lookup; `raw` is the server's reason, for an unknown failure's tooltip. */
+export function discoveryFailureText(message: string): { text: string; raw?: string } {
+  if (/rate limit/i.test(message)) return { text: "GitHub is rate limiting requests. Try again in a few minutes." };
+  if (/unreachable|network error/i.test(message)) {
+    return { text: "Couldn't reach GitHub. Check your connection and try again." };
+  }
+  return { text: "Couldn't look up suggestion sources.", raw: message };
+}
+
 export function clearFeaturedSuggestionSources(): void {
   cached = null;
 }

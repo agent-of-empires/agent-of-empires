@@ -7,13 +7,12 @@ import type { AcpWorkerState } from "../../lib/types";
 import type { StartupCause } from "../../lib/acpTypes";
 import { SandboxLoginDialog } from "../SandboxLoginDialog";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
-import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
+import { BUTTON_INLINE, BUTTON_SECONDARY_SM } from "../../lib/surfaces";
+import { CommandBlock, InlineCode, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 import { ApiKeyAlternative } from "./SignInPopover";
 import { signInSteps } from "./signInSteps";
 
-function Code({ children }: { children: React.ReactNode }) {
-  return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
-}
+const Code = InlineCode;
 
 const RETRY = (
   <>
@@ -243,6 +242,7 @@ export function StartupErrorBanner({
     onClick: () => void retry(),
     testId: "startup-error-banner-retry",
     disabled: busy || !canRecover,
+    busy: retryState === "retrying",
   };
   const installAction: RecoveryAction = {
     label:
@@ -254,6 +254,7 @@ export function StartupErrorBanner({
     onClick: () => void install.install(),
     testId: "startup-error-banner-install",
     disabled: busy || !canRecover,
+    busy: install.state === "installing",
   };
   const loginAction: RecoveryAction = {
     label: "Log in",
@@ -347,7 +348,7 @@ export function StartupErrorBanner({
           data-testid="startup-error-banner-details"
           aria-expanded={detailsOpen}
           onClick={() => setDetailsOpen(!detailsOpen)}
-          className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+          className={BUTTON_INLINE}
         >
           Details
         </button>
@@ -358,7 +359,7 @@ export function StartupErrorBanner({
               type="button"
               data-testid="startup-error-banner-copy"
               onClick={() => void copy()}
-              className="mt-1 text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+              className={`${BUTTON_INLINE} mt-1`}
             >
               {copied === message ? "Copied" : "Copy"}
             </button>
@@ -447,7 +448,7 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
           onClick={handleToggle}
           data-testid="acp-agent-log-toggle"
           aria-expanded={open}
-          className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+          className={BUTTON_INLINE}
         >
           {open ? "Hide agent log" : "Open agent log"}
         </button>
@@ -457,7 +458,7 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
             onClick={() => void fetchLog()}
             disabled={log.kind === "loading"}
             data-testid="acp-agent-log-refresh"
-            className="rounded-md border border-surface-700 bg-surface-800 px-2 py-0.5 text-[10px] font-medium text-text-primary hover:bg-surface-700 disabled:cursor-not-allowed disabled:opacity-60"
+            className={BUTTON_SECONDARY_SM}
           >
             {log.kind === "loading" ? "Loading…" : "Refresh"}
           </button>
@@ -480,7 +481,7 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
           {log.kind === "ok" && log.exists && log.tail.length > 0 && (
             <>
               {log.truncated && (
-                <div className="mb-1 text-[10px] text-text-subtle">Log is large; showing the tail.</div>
+                <div className="mb-1 text-[11px] text-text-subtle">Log is large; showing the tail.</div>
               )}
               <pre
                 data-testid="acp-agent-log-pre"

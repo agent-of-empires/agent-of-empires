@@ -195,6 +195,11 @@ async fn sensitive_routes_are_blocked() {
             r#"{"provider_id":"x","id":"y"}"#,
         ),
         (
+            Method::POST,
+            "/api/suggestions/start-batch",
+            r#"{"items":[{"provider_id":"x","id":"y"}]}"#,
+        ),
+        (
             Method::PUT,
             "/api/suggestions/mappings",
             r#"{"provider_id":"x","mapping_key":"k","projects":["/tmp/p"]}"#,

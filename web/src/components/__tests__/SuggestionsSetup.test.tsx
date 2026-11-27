@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsSetupHint } from "../SuggestionsSetupHint";
 import { SuggestionsSetupSheet } from "../SuggestionsSetupSheet";
+import { tabStops } from "../../hooks/useFocusTrap";
 import { safeGetItem } from "../../lib/safeStorage";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { clearFeaturedSuggestionSources } from "../../lib/featuredSuggestionSources";
 import type { SuggestionProvider, SuggestionsSnapshot } from "../../lib/types";
 
@@ -113,8 +115,14 @@ describe("first-run hint", () => {
     renderHint();
     const hint = await screen.findByTestId("suggestions-hint");
     expect(hint.textContent).toContain("based on your GitHub issues and PRs?");
+    expect(vi.mocked(reportFeatureUse).mock.calls).toEqual([["suggest_tip_shown"]]);
     fireEvent.click(screen.getByTestId("suggestions-hint-open"));
     expect(screen.getByTestId("suggestions-setup-sheet")).toBeTruthy();
+    expect(vi.mocked(reportFeatureUse).mock.calls).toEqual([
+      ["suggest_tip_shown"],
+      ["suggest_tip_clicked"],
+      ["suggest_setup_opened"],
+    ]);
     expect(screen.getByText("Install 1 plugin")).toBeTruthy();
     expect(screen.getByTestId(`suggestions-setup-option-${github.slug}`).textContent).toContain("GitHub");
   });
@@ -148,6 +156,7 @@ describe("first-run hint", () => {
     fireEvent.click(await screen.findByTestId("suggestions-hint-dismiss"));
     expect(screen.queryByTestId("suggestions-hint")).toBeNull();
     expect(safeGetItem("aoe-suggestions-hint-dismissed")).toBe("1");
+    expect(reportFeatureUse).toHaveBeenCalledWith("suggest_tip_dismissed");
   });
 
   it("waits for hydration before reading the dismissal, so another Device's dismissal wins", async () => {
@@ -170,6 +179,15 @@ describe("first-run hint", () => {
     expect(await screen.findByTestId("suggestions-hint")).toBeTruthy();
   });
 
+  it("draws the dismiss button with the shared X icon, named for assistive tech", async () => {
+    renderHint();
+    const dismiss = await screen.findByTestId("suggestions-hint-dismiss");
+    expect(dismiss.querySelector("svg")).not.toBeNull();
+    expect(dismiss.textContent).toBe("");
+    expect(dismiss.getAttribute("aria-label")).toBe("Don't show again");
+    expect(dismiss.getAttribute("title")).toBe("Don't show again");
+  });
+
   it("looks sources up once per page load, shared across mounts", async () => {
     const first = renderHint();
     await screen.findByTestId("suggestions-hint");
@@ -186,12 +204,33 @@ describe("first-run hint", () => {
   });
 
   it("shows a banner when discovery fails and recovers on retry", async () => {
-    api.discoverPlugins.mockResolvedValueOnce({ kind: "error", message: "rate limited" });
+    api.discoverPlugins.mockResolvedValueOnce({
+      kind: "error",
+      message:
+        "GitHub API rate limit exceeded.\nWait for the limit to reset (see the X-RateLimit-Reset header) and retry.",
+    });
     renderHint();
     const banner = await screen.findByTestId("suggestions-hint-error");
-    expect(banner.textContent).toContain("rate limited");
+    expect(banner.textContent).toContain("GitHub is rate limiting requests. Try again in a few minutes.");
+    expect(banner.textContent).not.toContain("X-RateLimit");
     fireEvent.click(screen.getByText("Try again"));
     expect(await screen.findByTestId("suggestions-hint")).toBeTruthy();
+  });
+
+  it("says what a failed lookup means, and keeps the raw reason of an unknown one in the tooltip", async () => {
+    api.discoverPlugins.mockResolvedValueOnce({ kind: "error", message: "Network error." });
+    const first = renderHint();
+    expect((await screen.findByTestId("suggestions-hint-error")).textContent).toContain(
+      "Couldn't reach GitHub. Check your connection and try again.",
+    );
+    first.unmount();
+
+    api.discoverPlugins.mockResolvedValueOnce({ kind: "error", message: "GitHub API returned HTTP 500: boom" });
+    renderHint();
+    const banner = await screen.findByTestId("suggestions-hint-error");
+    expect(banner.textContent).toContain("Couldn't look up suggestion sources.");
+    expect(banner.textContent).not.toContain("boom");
+    expect(banner.querySelector("[title]")?.getAttribute("title")).toBe("GitHub API returned HTTP 500: boom");
   });
 });
 
@@ -216,6 +255,25 @@ describe("setup sheet", () => {
     api.startPluginInstall.mockResolvedValue({ kind: "ok", jobId: "j1" });
     api.runSuggestionChecks.mockResolvedValue({ ok: true, data: undefined });
     api.refreshSuggestions.mockResolvedValue({ ok: true, data: undefined });
+  });
+
+  it("takes focus on open, keeps Tab inside, and hands focus back on close", async () => {
+    renderHint();
+    const opener = await screen.findByTestId("suggestions-hint-open");
+    opener.focus();
+    fireEvent.click(opener);
+    const sheet = screen.getByTestId("suggestions-setup-sheet");
+    expect(sheet.contains(document.activeElement)).toBe(true);
+    const stops = tabStops(sheet);
+    expect(stops.length).toBeGreaterThan(1);
+    const [first, last] = [stops[0], stops[stops.length - 1]];
+    last.focus();
+    fireEvent.keyDown(last, { key: "Tab" });
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(first, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(last);
+    fireEvent.click(screen.getByTestId("suggestions-setup-close"));
+    await waitFor(() => expect(document.activeElement).toBe(opener));
   });
 
   it("opens the Marketplace from the last row", async () => {
@@ -301,6 +359,8 @@ describe("setup sheet", () => {
     await waitFor(() => expect(api.runSuggestionChecks).toHaveBeenCalled());
     await waitFor(() => expect(api.fetchSuggestions.mock.calls.length).toBeGreaterThan(calls));
     fireEvent.click(screen.getByTestId("suggestions-setup-later"));
+    expect(reportFeatureUse).toHaveBeenCalledWith("suggest_setup_later");
+    expect(reportFeatureUse).not.toHaveBeenCalledWith("suggest_setup_finished");
     expect(onFinished).toHaveBeenCalled();
   });
 
@@ -353,6 +413,8 @@ describe("setup sheet", () => {
     fireEvent.click(await screen.findByText("close-job"));
 
     fireEvent.click(await screen.findByTestId("suggestions-setup-show"));
+    expect(reportFeatureUse).toHaveBeenCalledWith("suggest_setup_finished");
+    expect(reportFeatureUse).not.toHaveBeenCalledWith("suggest_setup_later");
     expect(onFinished).toHaveBeenCalled();
   });
 

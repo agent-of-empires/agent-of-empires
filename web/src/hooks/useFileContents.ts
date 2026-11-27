@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getSessionFileContents } from "../lib/api";
+import type { DiffScope } from "../lib/diffScope";
 import type { RichFileContentsResponse } from "../lib/types";
 
 interface UseFileContentsResult {
@@ -29,8 +30,9 @@ function cacheKeyFor(
   filePath: string,
   repoName: string | undefined,
   revision: number | undefined,
+  scope: DiffScope,
 ): string {
-  return JSON.stringify([sessionId, filePath, repoName ?? null, revision ?? 0]);
+  return JSON.stringify([sessionId, filePath, repoName ?? null, revision ?? 0, scope]);
 }
 
 function cachePut(key: string, value: RichFileContentsResponse) {
@@ -67,8 +69,9 @@ export function useFileContents(
   filePath: string | null,
   repoName: string | undefined,
   externalRevision?: number,
+  scope: DiffScope = "branch",
 ): UseFileContentsResult {
-  const key = sessionId && filePath ? cacheKeyFor(sessionId, filePath, repoName, externalRevision) : null;
+  const key = sessionId && filePath ? cacheKeyFor(sessionId, filePath, repoName, externalRevision, scope) : null;
 
   const [contents, setContents] = useState<RichFileContentsResponse | null>(() => (key ? cacheGet(key) : null));
   const [loading, setLoading] = useState(key != null && cacheGet(key) == null);
@@ -100,7 +103,7 @@ export function useFileContents(
         setLoading(false);
         return;
       }
-      const k = cacheKeyFor(sessionId, filePath, repoName, externalRevision);
+      const k = cacheKeyFor(sessionId, filePath, repoName, externalRevision, scope);
       if (!force) {
         const hit = cacheGet(k);
         if (hit) {
@@ -113,7 +116,7 @@ export function useFileContents(
       const reqId = ++requestIdRef.current;
       setLoading(true);
       setError(null);
-      const resp = await getSessionFileContents(sessionId, filePath, repoName);
+      const resp = await getSessionFileContents(sessionId, filePath, repoName, scope);
       if (reqId !== requestIdRef.current) return;
       if (resp) {
         cachePut(k, resp);
@@ -123,7 +126,7 @@ export function useFileContents(
       }
       setLoading(false);
     },
-    [sessionId, filePath, repoName, externalRevision],
+    [sessionId, filePath, repoName, externalRevision, scope],
   );
 
   useEffect(() => {

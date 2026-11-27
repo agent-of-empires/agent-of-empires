@@ -201,3 +201,20 @@ describe("useDiffFiles", () => {
     expect(result.current.loading).toBe(false);
   });
 });
+
+describe("useDiffFiles scope", () => {
+  it("asks for the picked scope and keeps it when a request fails", async () => {
+    mockGetFiles.mockImplementation(async (_id, scope) => resp({ files: [file(`${scope}.ts`)] }));
+    const { result, rerender } = renderHook(({ scope }) => useDiffFiles("s1", true, scope), {
+      initialProps: { scope: "branch" as "branch" | "uncommitted" },
+    });
+    await waitFor(() => expect(result.current.files[0]?.path).toBe("branch.ts"));
+    rerender({ scope: "uncommitted" });
+    await waitFor(() => expect(result.current.files[0]?.path).toBe("uncommitted.ts"));
+    expect(result.current.scope).toBe("uncommitted");
+    mockGetFiles.mockResolvedValueOnce(null);
+    await act(() => result.current.refresh());
+    expect([result.current.scope, result.current.files[0]?.path]).toEqual(["uncommitted", "uncommitted.ts"]);
+    expect(mockGetFiles.mock.calls.map((c) => c[1])).toEqual(["branch", "uncommitted", "uncommitted"]);
+  });
+});

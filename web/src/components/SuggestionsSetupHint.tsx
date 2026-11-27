@@ -1,9 +1,19 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { fetchSuggestions } from "../lib/api";
-import { loadFeaturedSuggestionSources, sourceLabel, type FeaturedSources } from "../lib/featuredSuggestionSources";
+import { X } from "lucide-react";
+import { reportFeatureUse } from "../lib/featureUse";
+import { useReportFeatureOnce } from "../hooks/useReportFeatureOnce";
+import {
+  discoveryFailureText,
+  loadFeaturedSuggestionSources,
+  sourceLabel,
+  type FeaturedSources,
+} from "../lib/featuredSuggestionSources";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { isWebUiStateHydrated, onWebUiStateHydrated } from "../lib/webUiHydration";
+import { isPluginProvider } from "../lib/suggestionProviders";
 import { SuggestionsSetupSheet } from "./SuggestionsSetupSheet";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 /** Synced to the server (see webUiSync), so one dismissal covers every device. */
 const DISMISSED_KEY = "aoe-suggestions-hint-dismissed";
@@ -49,7 +59,7 @@ export function SuggestionsSetupHint({
       if (noProviderProp === false) return;
       if (noProviderProp === undefined) {
         const snapshot = await fetchSuggestions();
-        if (!alive || !snapshot || snapshot.providers.length > 0 || !snapshot.prefs.homepage) return;
+        if (!alive || !snapshot || snapshot.providers.some(isPluginProvider) || !snapshot.prefs.homepage) return;
       }
       setNoProvider(true);
       const next = await loadFeaturedSuggestionSources();
@@ -77,26 +87,28 @@ export function SuggestionsSetupHint({
   };
 
   const dismiss = () => {
+    reportFeatureUse("suggest_tip_dismissed");
     safeSetItem(DISMISSED_KEY, "1");
     setDismissed(true);
   };
+  useReportFeatureOnce(
+    "suggest_tip_shown",
+    noProvider && !hidden && featured.status === "ok" && featured.sources.length > 0,
+  );
 
   if (!noProvider) return null;
   if (hidden) return fallback;
   if (featured.status === "loading") return null;
   if (featured.status === "error") {
+    const failure = discoveryFailureText(featured.message);
     return (
       <p
         className="mt-3.5 flex items-center justify-center gap-2 text-xs text-text-dim"
         role="status"
         data-testid="suggestions-hint-error"
       >
-        Couldn&apos;t look up suggestion sources: {featured.message.replace(/[.!]$/, "")}.
-        <button
-          type="button"
-          className="min-h-8 cursor-pointer font-medium text-brand-500 hover:underline"
-          onClick={() => void retry()}
-        >
+        <span title={failure.raw}>{failure.text}</span>
+        <button type="button" className={BUTTON_INLINE} onClick={() => void retry()}>
           Try again
         </button>
         <DismissButton onClick={dismiss} />
@@ -115,8 +127,11 @@ export function SuggestionsSetupHint({
         <span>Want AoE to suggest what to work on next, based on your {names} issues and PRs?</span>
         <button
           type="button"
-          className="min-h-8 cursor-pointer font-medium text-brand-500 hover:underline"
-          onClick={() => setSheetOpen(true)}
+          className={BUTTON_INLINE}
+          onClick={() => {
+            reportFeatureUse("suggest_tip_clicked");
+            setSheetOpen(true);
+          }}
           data-testid="suggestions-hint-open"
         >
           Set up suggestions
@@ -148,11 +163,11 @@ function DismissButton({ onClick }: { onClick: () => void }) {
       type="button"
       title="Don't show again"
       aria-label="Don't show again"
-      className="size-8 cursor-pointer rounded-md text-text-dim hover:bg-surface-800"
+      className="inline-flex size-8 cursor-pointer items-center justify-center rounded-md text-text-dim hover:bg-surface-800"
       onClick={onClick}
       data-testid="suggestions-hint-dismiss"
     >
-      ✕
+      <X className="size-4" aria-hidden />
     </button>
   );
 }

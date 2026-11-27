@@ -80,7 +80,7 @@ test.describe("resize handle and compact rail (#2288)", () => {
     await expect.poll(width).toBeLessThan(120);
     await expect(page.locator(COUNT)).toHaveCount(0);
     await expect(page.getByRole("button", { name: "New session in repo-alpha" })).toHaveCount(0);
-    await page.getByText("alpha-session").click();
+    await page.locator('[data-tour="sidebar"]').getByText("alpha-session").click();
     // Wide uppercase footer labels used to spill past the rail.
     await expect.poll(() => panel.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1);
     await expect(page.getByTestId("sidebar-projects-toggle")).toBeVisible();
@@ -98,19 +98,20 @@ test.describe("resize handle and compact rail (#2288)", () => {
     await expect(page.locator(COUNT).first()).toBeVisible();
 
     // Entering compact hides an open filter and stops its query narrowing the list.
-    await page.getByRole("button", { name: "Filter sessions" }).click();
+    await page.getByTestId("sidebar-view-toggle").click();
+    await page.getByTestId("sidebar-filter-toggle").click();
     const filterInput = page.getByTestId("sidebar-filter-input");
     // "beta" matches a title only; "alpha" would also match the project name.
     await filterInput.fill("beta");
-    await expect(page.getByText("alpha-session")).toHaveCount(0);
-    await expect(page.getByText("beta-session")).toBeVisible();
+    await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toHaveCount(0);
+    await expect(page.locator('[data-tour="sidebar"]').getByText("beta-session")).toBeVisible();
     await dragSidebarHandle(page, 100);
     await expect(filterInput).toHaveCount(0);
-    await expect(page.getByRole("button", { name: "Filter sessions" })).toHaveCount(0);
-    await expect(page.getByText("alpha-session")).toBeVisible();
+    await expect(page.getByTestId("sidebar-view-toggle")).toHaveCount(0);
+    await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toBeVisible();
     await dragSidebarHandle(page, 260);
     await expect(filterInput).toHaveValue("beta");
-    await expect(page.getByText("alpha-session")).toHaveCount(0);
+    await expect(page.locator('[data-tour="sidebar"]').getByText("alpha-session")).toHaveCount(0);
   });
 
   test("dragging past the rail closes the sidebar, and reopening restores the sidebar the drag started from", async ({
@@ -182,9 +183,7 @@ test.describe("resize handle and compact rail (#2288)", () => {
     expect(await page.evaluate(() => localStorage.getItem("aoe-sidebar-width"))).toBe("280");
   });
 
-  test("a phone drawer ignores a compact rail saved on a wider screen and fits a saved maximum width", async ({
-    page,
-  }) => {
+  test("a phone's session list ignores a compact rail and a width saved on a wider screen", async ({ page }) => {
     await installSidebarMocks(page, { sessions: SESSIONS });
     await page.addInitScript(() => {
       localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarCompact: true }));
@@ -193,12 +192,12 @@ test.describe("resize handle and compact rail (#2288)", () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/");
     await openMobileSidebar(page);
-    const panel = page.locator('[data-tour="sidebar"]');
+    // A CSS locator: the panel stays mounted, hidden, once the wider screen leaves it closed.
+    const panel = page.locator('[role="navigation"][aria-label="Sessions sidebar"]');
     await expect(panel).not.toHaveAttribute("data-compact", "true");
     await expect(page.locator(COUNT).first()).toBeVisible();
-    expect((await panel.boundingBox())!.width).toBe(390);
-    const close = (await page.getByRole("button", { name: "Close sidebar" }).boundingBox())!;
-    expect(close.x + close.width).toBeLessThanOrEqual(390);
+    // The drawer's own width, 85% of the phone, not the saved 480.
+    expect((await panel.boundingBox())!.width).toBeCloseTo(390 * 0.85, 0);
 
     await page.setViewportSize({ width: 1280, height: 720 });
     await expect(panel).toHaveAttribute("data-compact", "true");
@@ -275,19 +274,14 @@ test("empty sidebar shows a hint that opens the wizard, and hides it once a sess
   await expect(page.getByTestId("sidebar-empty-state")).toHaveCount(0);
 });
 
-test("the two new-session buttons have distinct tooltips and labels", async ({ page }) => {
-  // #2205. Tooltips portal on hover only (#2214).
+test("the two new-session buttons have distinct labels", async ({ page }) => {
+  // #2205. The sidebar's New session row names itself; a group's button names its project, kept out of the
+  // tooltip text. Tooltips portal on hover only (#2214).
   await openSidebar(page, [{ id: "s-a", title: "alpha-session", project_path: "/tmp/repo-alpha", branch: "feat/a" }]);
-  for (const [name, tooltip] of [
-    ["New project session", "New project session"],
-    // The project name stays out of the tooltip text.
-    ["New session in repo-alpha", "New session"],
-  ]) {
-    const button = page.getByRole("button", { name });
-    await expect(button).toBeVisible();
-    await button.hover();
-    await expect(page.getByRole("tooltip")).toHaveText(tooltip!);
-  }
+  await expect(page.getByTestId("sidebar-new-session")).toHaveAccessibleName("New session");
+  const groupButton = page.getByRole("button", { name: "New session in repo-alpha" });
+  await groupButton.hover();
+  await expect(page.getByRole("tooltip")).toHaveText("New session");
 });
 
 // #2207: no grip; the icon and fold chevron swap on hover (group-hover opacity); the count always shows.
@@ -363,20 +357,21 @@ test.describe("row chips and naming actions", () => {
   });
 });
 
-test.describe("mobile overlay on a notched phone", () => {
+test.describe("session list on a notched phone", () => {
   test.use(iPhone13);
 
-  test("starts below the inset header and keeps its footer above the home indicator", async ({ page }) => {
+  test("clears the status bar and keeps its footer above the home indicator", async ({ page }) => {
     const cdp = await page.context().newCDPSession(page);
     await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: { top: 47, bottom: 34 } });
     await installSidebarMocks(page, { sessions: threeSessionsInOneRepo() });
     await page.goto("/");
     await openMobileSidebar(page);
 
-    const header = (await page.locator("header").boundingBox())!;
-    const sidebar = (await page.locator("[data-tour='sidebar']").boundingBox())!;
-    expect(header.y).toBe(47);
-    expect(sidebar.y).toBe(header.y + header.height);
+    const menu = (await page
+      .getByRole("navigation", { name: "Sessions sidebar" })
+      .getByRole("button", { name: "More options" })
+      .boundingBox())!;
+    expect(menu.y).toBeGreaterThanOrEqual(47);
     const settings = (await page.getByRole("button", { name: "Settings" }).boundingBox())!;
     expect(settings.y + settings.height).toBeLessThanOrEqual(page.viewportSize()!.height - 34);
   });

@@ -4,9 +4,13 @@
 import type { ReactNode } from "react";
 import { useWebSettings } from "../../hooks/useWebSettings";
 
-export const ACTIVE = "bg-brand-600 text-white";
+export const ACTIVE = "bg-surface-700 text-text-primary";
+/** Split chosen but the pane is too narrow to show it. */
+export const ACTIVE_DEFERRED = "bg-surface-700/50 text-text-secondary";
 export const IDLE = "text-text-dim hover:text-text-secondary";
-export const GROUP = "flex items-center rounded border border-surface-700/40 overflow-hidden";
+export const GROUP = "flex items-center rounded-md border border-surface-700/50 overflow-hidden";
+/** One segment of a GROUP, or a lone toggle beside one. */
+export const SEGMENT = "px-2 py-0.5 max-md:py-2 text-[11px] font-mono cursor-pointer transition-colors";
 
 export function ToggleButton({
   pressed,
@@ -27,7 +31,7 @@ export function ToggleButton({
       onClick={onClick}
       aria-pressed={pressed}
       title={title}
-      className={`px-2 py-0.5 text-[11px] font-mono cursor-pointer transition-colors ${skin ?? (pressed ? ACTIVE : IDLE)}`}
+      className={`${SEGMENT} ${skin ?? (pressed ? ACTIVE : IDLE)}`}
     >
       {children}
     </button>
@@ -39,7 +43,7 @@ export function BackButton({ label, onClick }: { label: string; onClick: () => v
   return (
     <button
       onClick={onClick}
-      className="text-text-dim hover:text-text-secondary cursor-pointer transition-colors flex items-center gap-1 text-[11px]"
+      className="min-h-7 max-md:min-h-11 text-text-dim hover:text-text-secondary cursor-pointer transition-colors flex items-center gap-1 text-[12px]"
       title={`Back to ${label.toLowerCase()}`}
       aria-label={`Back to ${label.toLowerCase()}`}
     >
@@ -83,17 +87,22 @@ export function MarkdownToggle({ className }: { className?: string }) {
   );
 }
 
+/** A pane's loading, empty or failed state, centered in the space it has. */
 export function Centered({ className = "text-text-dim", children }: { className?: string; children: ReactNode }) {
-  return <div className={`flex-1 flex items-center justify-center ${className}`}>{children}</div>;
+  return (
+    <div className={`flex-1 flex items-center justify-center px-4 text-center text-[13px] leading-normal ${className}`}>
+      {children}
+    </div>
+  );
 }
 
 /** The "too large to diff/display" placeholder; `hint` differs per pane. */
 export function TooLarge({ what, hint }: { what: string; hint: string }) {
   return (
     <Centered>
-      <div className="text-center px-4">
-        <p className="text-sm mb-1">{what}</p>
-        <p className="text-xs">{hint}</p>
+      <div>
+        <p className="mb-1 text-text-secondary">{what}</p>
+        <p className="text-[12px]">{hint}</p>
       </div>
     </Centered>
   );

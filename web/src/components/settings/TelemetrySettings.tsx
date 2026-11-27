@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 
 import { fetchTelemetryStatus, setTelemetryConsent, type TelemetryStatus } from "../../lib/api";
+import { CARD } from "../../lib/surfaces";
+import { PanelMessage } from "../panelParts";
 import { ToggleField } from "./FormFields";
 
 /// Uses the dedicated consent endpoint, which also creates or deletes the install id.
@@ -37,7 +39,7 @@ export function TelemetrySettings() {
   const enabled = status?.enabled ?? false;
 
   return (
-    <div className="space-y-4">
+    <div className={`${CARD} py-4 space-y-3`}>
       <ToggleField
         label="Enable usage telemetry"
         description="Anonymous, opt-in usage telemetry: counts of sessions, agents/models, your aoe version, and OS. Off by default. Never sends prompts, paths, names, branches, or commands. Honors DO_NOT_TRACK."
@@ -47,10 +49,10 @@ export function TelemetrySettings() {
         }}
       />
       {dnt && (
-        <p className="text-xs text-text-dim">
+        <PanelMessage>
           DO_NOT_TRACK is set in the server environment, so telemetry stays off and no install id is generated
           regardless of this toggle.
-        </p>
+        </PanelMessage>
       )}
     </div>
   );

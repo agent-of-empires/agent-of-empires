@@ -95,6 +95,8 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger, and the Settin
   await expect(intro).toBeHidden();
 
   await page.goto(serve.baseUrl);
+  // The tour lists the Suggested step only if its section is already on the page.
+  await expect(page.locator('[data-tour="dashboard-suggestions"]')).toBeVisible({ timeout: 10_000 });
   await openTopBarMenuItem(page, "Show tutorial");
   await expect(firstStep).toBeVisible({ timeout: 10_000 });
   await expect
@@ -107,7 +109,13 @@ test("first-run tutorial: auto-launch, skip, persist, re-trigger, and the Settin
 
   // #4594: the tour stays on the dashboard.
   const next = page.getByRole("button", { name: /^Next/ });
-  for (const heading of ["Your sessions", "Start a session", "Settings", "Replay this tour any time"]) {
+  for (const heading of [
+    "Your sessions",
+    "Start a session",
+    "Suggested sessions",
+    "Settings",
+    "Replay this tour any time",
+  ]) {
     await next.click();
     await expect(tourStep(heading)).toBeVisible({ timeout: 10_000 });
     expect(new URL(page.url()).pathname).toBe("/");
@@ -297,10 +305,10 @@ test.describe("telemetry signals", () => {
     await sessionRow.click();
     await expectPing("web_terminal");
 
-    const diffToggle = page.getByTestId("pane-toggle-diff").first();
+    const diffToggle = page.getByTestId("right-dock-toggle").first();
     await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
     // Wait for the badge so the panel opens with an already-loaded diff.
-    await expect(diffToggle).toHaveAccessibleName("Toggle diff pane, 1 changed");
+    await expect(diffToggle).toHaveAccessibleName("Toggle review panel, 1 changed");
     expect(pings().map((p) => p.surface)).not.toContain("diff_panel");
     await diffToggle.click();
     await expectPing("diff_panel");
