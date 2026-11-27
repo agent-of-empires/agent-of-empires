@@ -43,7 +43,7 @@ A `session/update` with no `_meta.aoe` is an unanchored adapter frame: it is cou
 
 Read on any update kind, and forbidden together with `ephemeral: true`. Replayed history emits none of them and takes no lease from them.
 
-- `background_task: {id, state: started|ended, ttl_ms}`: emits `BackgroundTaskStarted` or `BackgroundTaskFinished`. It lists no shell, since it has no command, and keeps the session `Running` until it ends.
+- `background_task: {id, state: started|ended, ttl_ms}`: emits `BackgroundTaskStarted` or `BackgroundTaskFinished`. It is listed as a commandless row in the panel's shells group, labelled with its id, and keeps the session `Running` until it ends.
 - `workflow_run: {id, state: started|ended, ttl_ms, progress: {label, completed, total}}`: emits `WorkflowRunStarted`, `WorkflowRunProgress` and `WorkflowRunFinished`. Open runs keep the session `Running` and clear on `ended`, a conversation reset or a clear.
 - `wakeup: {at, reason}`: emits `WakeupScheduled`. `at` is an absolute RFC 3339 time, never a delay.
 - `monitor: {description}`: emits `MonitorArmed`.
