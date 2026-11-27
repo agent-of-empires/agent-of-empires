@@ -541,6 +541,74 @@ provider_versions = ["^18"]
         }
     }
 
+    /// A reserved takeover of a bundled fallback is plugin-owned, so a one-off
+    /// command override is refused unless the tool configures its own override.
+    #[test]
+    #[serial_test::serial]
+    fn a_takeover_of_a_fallback_refuses_a_command_override_like_any_plugin_agent() {
+        let home = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        for tool in ["claude", "omp"] {
+            let manifest = format!(
+                "id = \"aoe.cli-{tool}\"\nname = \"Takeover\"\nversion = \"1.0.0\"\napi_version = 21\n\n[[agent_integrations]]\ntool = \"{tool}\"\ncommand = \"{tool}-next\"\n[agent_integrations.launch]\noneshot_flag = \"-p\"\n"
+            );
+            crate::session::test_support::install_agent_plugin(
+                &format!("aoe.cli-{tool}"),
+                &manifest,
+            );
+            assert!(crate::agents::get_agent(tool).is_none());
+            let resolve = |override_command: &str| {
+                let body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+                    "path": home.path(), "scratch": true, "tool": tool,
+                    "command_override": override_command
+                }))
+                .unwrap();
+                resolve_host_creation(body, Default::default(), None, "default")
+            };
+
+            let refused = match resolve("false") {
+                Ok(_) => panic!("a plugin-owned {tool} must refuse an override"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                refused.contains("--cmd-override cannot be used"),
+                "{refused}"
+            );
+
+            crate::session::update_config(|config| {
+                config
+                    .session
+                    .agent_command_override
+                    .insert(tool.into(), "true".into());
+            })
+            .unwrap();
+            assert_eq!(resolve("false").unwrap().0.tool, tool);
+
+            crate::session::update_config(|config| {
+                config.session.agent_command_override.clear();
+            })
+            .unwrap();
+            std::fs::remove_dir_all(
+                crate::plugin::plugins_dir()
+                    .unwrap()
+                    .join(format!("aoe.cli-{tool}")),
+            )
+            .unwrap();
+            crate::session::update_config(|config| {
+                config.plugins.remove(&format!("aoe.cli-{tool}"));
+            })
+            .unwrap();
+            crate::plugin::reload_registry();
+            // The fallback is back, so the override is no longer plugin-owned; the
+            // host may still lack the binary.
+            assert!(crate::agents::get_agent(tool).is_some());
+            if let Err(error) = resolve("false") {
+                assert!(!error.to_string().contains("--cmd-override cannot be used"));
+            }
+        }
+    }
+
     /// A takeover hides `omp` from listings, but a configured wrapper detected
     /// as `omp` still names a real identity, so `--tool` must accept it.
     #[test]

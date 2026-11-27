@@ -3243,4 +3243,316 @@ command = "acme-omp-shim"
         changed.provider_version = "1.3.0".into();
         assert!(!same_prompt(&snapshot(), &changed));
     }
+
+    fn bundled_manifest(id: &str, api_version: u32, tool: &str, shape: &str) -> String {
+        let launch = if shape.contains("launch") {
+            "[agent_integrations.launch]\noneshot_flag = \"-p\"\n"
+        } else {
+            ""
+        };
+        let command = if shape.contains("command") {
+            format!("command = \"{tool}-next\"\n")
+        } else {
+            String::new()
+        };
+        let capabilities = if shape.contains("status") {
+            "capabilities = [\"session.integration\"]\n"
+        } else {
+            ""
+        };
+        format!(
+            "id = \"{id}\"\nname = \"Takeover\"\nversion = \"1.0.0\"\napi_version = {api_version}\n{capabilities}\n[[agent_integrations]]\ntool = \"{tool}\"\n{command}{launch}"
+        )
+    }
+
+    fn test_registry(plugins: &[(String, bool)]) -> std::sync::Arc<super::super::PluginRegistry> {
+        let loaded = plugins
+            .iter()
+            .map(|(manifest, enabled)| super::super::LoadedPlugin {
+                manifest: toml::from_str(manifest).unwrap(),
+                enabled: *enabled,
+                trust: aoe_plugin_api::TrustLevel::Community,
+                validation: super::super::registry::ValidationState::Local,
+                source: None,
+                dir: None,
+                manifest_hash: String::new(),
+                granted: true,
+            })
+            .collect();
+        std::sync::Arc::new(super::super::PluginRegistry::from_test_plugins(loaded))
+    }
+
+    /// One predicate gates takeover for the catalog, declaration lookup, the
+    /// declaration probe and the fallback listing, for both bundled tools.
+    #[test]
+    fn only_an_active_reserved_api21_launch_declaration_takes_over_a_fallback() {
+        for tool in ["claude", "omp"] {
+            let full = |id: &str| bundled_manifest(id, 28, tool, "launch command");
+            const AMBIGUOUS: usize = 7;
+            // (plugins, taken over)
+            let cases: Vec<(Vec<(String, bool)>, bool)> = vec![
+                (vec![(full("acme.x"), true)], false),
+                (vec![(full("aoe.x"), true)], true),
+                (vec![(full("agent-of-empires.x"), true)], true),
+                (vec![(full("aoe.x"), false)], false),
+                (
+                    vec![(bundled_manifest("aoe.x", 20, tool, "launch command"), true)],
+                    false,
+                ),
+                (
+                    vec![(bundled_manifest("aoe.x", 28, tool, "command"), true)],
+                    false,
+                ),
+                (
+                    vec![(bundled_manifest("aoe.x", 28, tool, "launch"), true)],
+                    false,
+                ),
+                // Ambiguous: two eligible declarations keep the fallback.
+                (vec![(full("aoe.x"), true), (full("aoe.y"), true)], false),
+                // An ineligible neighbour does not make a reserved one ambiguous.
+                (vec![(full("aoe.x"), true), (full("acme.y"), true)], true),
+                (vec![(full("aoe.x"), true), (full("aoe.y"), false)], true),
+            ];
+            for (index, (plugins, expected)) in cases.iter().enumerate() {
+                let registry = test_registry(plugins);
+                let context = format!("{tool} case {index}");
+                assert_eq!(
+                    super::super::bundled_agents::taken_over(&registry, tool),
+                    *expected,
+                    "{context}"
+                );
+                assert_eq!(
+                    declared_agent(registry.clone(), tool, std::iter::empty()).is_some(),
+                    *expected,
+                    "{context}"
+                );
+                assert_eq!(
+                    catalog(&registry, std::iter::empty(), std::iter::empty())
+                        .iter()
+                        .any(|agent| agent.tool == tool),
+                    // The catalog lists each eligible declaration; ambiguity drops both.
+                    *expected,
+                    "{context}"
+                );
+                // Ambiguity still declares the tool; it only keeps the fallback listed.
+                assert_eq!(
+                    registry_declares(&registry, tool),
+                    *expected || index == AMBIGUOUS,
+                    "{context}"
+                );
+            }
+            let taken = test_registry(&[(full("aoe.x"), true)]);
+            assert!(registry_declares(&taken, tool));
+            assert_eq!(
+                declared_agent(taken, tool, std::iter::empty())
+                    .unwrap()
+                    .plugin_id(),
+                "aoe.x"
+            );
+        }
+    }
+
+    /// Aliases and names that merely contain a fallback name are never takeover names.
+    #[test]
+    fn a_name_that_only_contains_a_fallback_name_does_not_take_it_over() {
+        let registry = test_registry(&[
+            (
+                bundled_manifest("aoe.x", 28, "claude-code", "launch command"),
+                true,
+            ),
+            (
+                bundled_manifest("aoe.y", 28, "omp-next", "launch command"),
+                true,
+            ),
+        ]);
+        for bundled in ["claude", "omp"] {
+            assert!(!super::super::bundled_agents::taken_over(
+                &registry, bundled
+            ));
+            assert!(declared_agent(registry.clone(), bundled, std::iter::empty()).is_none());
+        }
+        for reserved in ["claude-code", "my-claude"] {
+            assert!(declared_agent(registry.clone(), reserved, std::iter::empty()).is_none());
+        }
+    }
+
+    /// A status provider (API 19, no launch table) augments status but never
+    /// replaces the fallback, in any namespace.
+    #[test]
+    fn a_status_provider_never_takes_over_a_fallback() {
+        for tool in ["claude", "omp"] {
+            for id in ["acme.status", "aoe.status"] {
+                let registry =
+                    test_registry(&[(bundled_manifest(id, 19, tool, "status command"), true)]);
+                assert!(
+                    provider(&registry, tool).unwrap().is_some(),
+                    "{id} still provides {tool} status"
+                );
+                assert!(!super::super::bundled_agents::taken_over(&registry, tool));
+                assert!(declared_agent(registry.clone(), tool, std::iter::empty()).is_none());
+                assert!(!registry_declares(&registry, tool));
+            }
+        }
+    }
+
+    struct IsolatedRegistry {
+        _featured: crate::session::test_support::EnvGuard,
+        _env: crate::session::test_support::EnvGuard,
+        _reload: super::super::ReloadRegistryOnDrop,
+        home: tempfile::TempDir,
+    }
+
+    fn isolated_registry() -> IsolatedRegistry {
+        let home = tempfile::tempdir().unwrap();
+        let env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.path()),
+            ("XDG_CONFIG_HOME", home.path()),
+            ("USERPROFILE", home.path()),
+        ]);
+        IsolatedRegistry {
+            _featured: crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]),
+            _env: env,
+            _reload: super::super::ReloadRegistryOnDrop,
+            home,
+        }
+    }
+
+    /// Takeover and restoration follow the live registry in one process, for
+    /// both fallbacks: a non-reserved plugin is ignored, a reserved one takes
+    /// over, and disabling or uninstalling it restores the fallback.
+    #[test]
+    #[serial_test::serial]
+    fn a_reserved_takeover_hides_the_fallback_until_it_is_disabled_or_removed() {
+        let isolated = isolated_registry();
+        for tool in ["claude", "omp"] {
+            let manifest = |id: &str| bundled_manifest(id, 28, tool, "launch command");
+            let listed = || crate::agents::listed_agents().any(|agent| agent.name == tool);
+            let mut instance = Instance::new("takeover", isolated.home.path().to_str().unwrap());
+            instance.tool = tool.into();
+            let fallback = |expected: bool| {
+                assert_eq!(listed(), expected, "{tool} listing");
+                assert_eq!(crate::agents::get_agent(tool).is_some(), expected, "{tool}");
+                // The fallback identity outlives the takeover.
+                assert_eq!(
+                    crate::agents::native_definition(tool).map(|agent| agent.name),
+                    Some(tool)
+                );
+                assert_eq!(
+                    super::super::bundled_agents::definition(tool).map(|agent| agent.name),
+                    Some(tool)
+                );
+                assert_eq!(instance.declared_agent().is_none(), expected, "{tool}");
+            };
+
+            super::super::reload_registry();
+            fallback(true);
+            install_test_manifest("acme.x", &manifest("acme.x"));
+            super::super::reload_registry();
+            fallback(true);
+            assert!(declared_agent(super::super::registry(), tool, std::iter::empty()).is_none());
+
+            install_test_manifest("aoe.x", &manifest("aoe.x"));
+            super::super::reload_registry();
+            fallback(false);
+            let declared = declared_agent(super::super::registry(), tool, std::iter::empty())
+                .expect("the reserved plugin provides the tool");
+            assert_eq!(declared.plugin_id(), "aoe.x");
+
+            crate::session::update_config(|config| {
+                config.plugins.get_mut("aoe.x").unwrap().enabled = false;
+            })
+            .unwrap();
+            super::super::reload_registry();
+            fallback(true);
+
+            crate::session::update_config(|config| {
+                config.plugins.get_mut("aoe.x").unwrap().enabled = true;
+            })
+            .unwrap();
+            super::super::reload_registry();
+            fallback(false);
+
+            for id in ["aoe.x", "acme.x"] {
+                std::fs::remove_dir_all(super::super::plugins_dir().unwrap().join(id)).unwrap();
+                crate::session::update_config(|config| {
+                    config.plugins.remove(id);
+                })
+                .unwrap();
+            }
+            super::super::reload_registry();
+            fallback(true);
+        }
+    }
+
+    /// A configured custom agent or command override of the bundled name keeps
+    /// the plugin out, and a wrapper that only inherits the identity through
+    /// `agent_detect_as` keeps the native fallback with or without a takeover.
+    #[test]
+    #[serial_test::serial]
+    fn custom_agents_and_detect_as_resolve_the_fallback_around_a_takeover() {
+        let isolated = isolated_registry();
+        for tool in ["claude", "omp"] {
+            let wrapper = format!("work-{tool}");
+            let mut session = crate::session::config::SessionConfig::default();
+            session.agent_detect_as.insert(wrapper.clone(), tool.into());
+            session
+                .custom_agents
+                .insert(wrapper.clone(), format!("{tool} --verbose"));
+            let identity = |command: Option<&str>| {
+                crate::session::config::container_config::resolve_active_agent(
+                    &wrapper, command, &session,
+                )
+                .map(|agent| agent.name)
+            };
+            let own_declaration = |custom: bool, overridden: bool| {
+                crate::session::update_config(|config| {
+                    config.session.custom_agents.clear();
+                    config.session.agent_command_override.clear();
+                    if custom {
+                        config
+                            .session
+                            .custom_agents
+                            .insert(tool.into(), format!("/opt/{tool}-wrapper"));
+                    }
+                    if overridden {
+                        config
+                            .session
+                            .agent_command_override
+                            .insert(tool.into(), format!("/opt/{tool}-override"));
+                    }
+                })
+                .unwrap();
+                let mut instance = Instance::new("guards", isolated.home.path().to_str().unwrap());
+                instance.tool = tool.into();
+                instance.declared_agent().is_some()
+            };
+
+            super::super::reload_registry();
+            assert_eq!(identity(None), Some(tool), "{tool} fallback");
+            assert_eq!(identity(Some(&format!("{tool} --verbose"))), Some(tool));
+
+            install_test_manifest(
+                "aoe.x",
+                &bundled_manifest("aoe.x", 28, tool, "launch command"),
+            );
+            super::super::reload_registry();
+            assert!(crate::agents::get_agent(tool).is_none());
+            // Inheritance names the retained native identity, never the declaration.
+            assert_eq!(identity(None), Some(tool), "{tool} takeover");
+            assert_eq!(identity(Some(&format!("{tool} --verbose"))), Some(tool));
+
+            assert!(own_declaration(false, false));
+            assert!(!own_declaration(true, false), "#5560 custom name guard");
+            assert!(
+                !own_declaration(false, true),
+                "#5546 command override guard"
+            );
+
+            std::fs::remove_dir_all(super::super::plugins_dir().unwrap().join("aoe.x")).unwrap();
+            crate::session::update_config(|config| {
+                config.plugins.remove("aoe.x");
+            })
+            .unwrap();
+        }
+    }
 }
