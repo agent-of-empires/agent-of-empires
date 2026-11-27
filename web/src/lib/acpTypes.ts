@@ -1626,10 +1626,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     const { task_id: id, tool_call_id: toolCallId, workflow, description, started_at } = event.BackgroundTaskStarted;
     if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
     next.backgroundShells = next.backgroundShells.filter((s) => s.taskId !== id);
-    if (!workflow && description != null) {
+    if (!workflow) {
       next.backgroundShells = [
         ...next.backgroundShells,
-        { taskId: id, command: description, startedAt: started_at ?? null, endedAt: null, finished: false },
+        { taskId: id, command: description ?? "", startedAt: started_at ?? null, endedAt: null, finished: false },
       ];
     }
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, null);

@@ -1603,10 +1603,10 @@ impl AcpState {
                 // A reused task id replaces whatever run held it.
                 self.close_workflow_run(&task_id, None);
                 self.background_shells.retain(|s| s.task_id != task_id);
-                if let (None, Some(command)) = (&workflow, description) {
+                if workflow.is_none() {
                     self.background_shells.push(BackgroundShellRecord {
                         task_id: task_id.clone(),
-                        command,
+                        command: description.unwrap_or_default(),
                         started_at,
                         ended_at: None,
                         finished: false,
@@ -3131,7 +3131,7 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_background_task_is_idempotent_and_lists_no_shell() {
+    fn a_generic_background_task_is_idempotent_and_lists_a_commandless_shell() {
         let started = Event::BackgroundTaskStarted {
             task_id: "g".into(),
             tool_call_id: None,
@@ -3141,7 +3141,10 @@ mod tests {
         };
         let mut s = applied([prompt("go"), started.clone(), started, stopped("end")]);
         assert_eq!(s.background_tasks, ["g"], "a renewal adds no second entry");
-        assert!(s.background_shells.is_empty());
+        assert_eq!(s.background_shells.len(), 1);
+        assert_eq!(s.background_shells[0].task_id, "g");
+        assert_eq!(s.background_shells[0].command, "");
+        assert!(!s.background_shells[0].finished);
         assert!(s.workflow_runs.is_empty());
         assert!(s.has_active_background_agent());
         s.apply_event(
@@ -3153,6 +3156,7 @@ mod tests {
         )
         .unwrap();
         assert!(!s.has_active_background_agent());
+        assert!(s.background_shells[0].finished);
     }
 
     #[test]

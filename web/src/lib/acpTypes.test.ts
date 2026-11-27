@@ -887,10 +887,12 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     });
   });
 
-  it("a generic background task without a description lists no shell", () => {
-    const s = fold(emptyAcpState(), { BackgroundTaskStarted: { task_id: "g", description: null } });
-    expect(s.backgroundTasks).toEqual(["g"]);
-    expect(s.backgroundShells).toEqual([]);
+  it("a generic background task without a description lists a commandless shell until it finishes", () => {
+    const started = fold(emptyAcpState(), { BackgroundTaskStarted: { task_id: "g", description: null } });
+    expect(started.backgroundTasks).toEqual(["g"]);
+    expect(started.backgroundShells).toMatchObject([{ taskId: "g", command: "", finished: false }]);
+    const done = fold(started, { BackgroundTaskFinished: { task_id: "g" } });
+    expect(done.backgroundShells).toMatchObject([{ taskId: "g", finished: true }]);
   });
 
   it("a stalled background agent still reads as active, since Progress never sets endedAt (#4001)", () => {
