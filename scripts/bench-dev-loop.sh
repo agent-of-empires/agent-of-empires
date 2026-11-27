@@ -108,7 +108,7 @@ echo "== 3. xtask dev rebuild"
 cargo build --features web -q
 mkdir -p "$B/empty-dist"
 # Toggling AOE_WEB_DIST reruns build.rs, so each row gets a warm-up run.
-hyperfine --runs 5 --warmup 1 --export-markdown "$OUT/3-xtask-dev.md" \
+hyperfine --runs 5 --warmup 1 --export-markdown "$OUT/3-xtask-dev.md" --export-json "$OUT/3-xtask-dev.json" \
   -n 'web, Rust edit' --prepare "\"$DISK\" && touch src/lib.rs" 'cargo build --features web -q' \
   -n 'web, Rust edit after a frontend edit' --prepare "\"$DISK\" && touch web/src/main.tsx src/lib.rs" 'cargo build --features web -q' \
   -n 'web, empty bundle, Rust edit after a frontend edit' --prepare "\"$DISK\" && touch web/src/main.tsx src/lib.rs" \
