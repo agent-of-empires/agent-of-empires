@@ -319,13 +319,15 @@ impl GitWorktree {
             )));
         }
         let wanted = format!("refs/heads/{branch}");
-        let mut path = None;
+        let mut raw_path: Option<&[u8]> = None;
         let mut paths = Vec::new();
         for field in output.stdout.split(|byte| *byte == 0) {
-            if let Some(raw_path) = field.strip_prefix(b"worktree ") {
-                path = Some(path_from_git_bytes(raw_path, "worktree path")?);
+            if let Some(bytes) = field.strip_prefix(b"worktree ") {
+                raw_path = Some(bytes);
             } else if field.strip_prefix(b"branch ") == Some(wanted.as_bytes()) {
-                paths.extend(path.clone());
+                if let Some(bytes) = raw_path {
+                    paths.push(path_from_git_bytes(bytes, "worktree path")?);
+                }
             }
         }
         Ok(paths)
@@ -456,7 +458,7 @@ fn observe_local_branch_ref(repo_path: &Path, branch: &str) -> Option<bool> {
 mod tests {
     use super::super::create::tests::fork_upstream_layout;
     use super::*;
-    use crate::git::test_support::{commit, init_repo, run_git};
+    use crate::git::test_support::{commit, init_repo, run_git, run_git_os};
     use git2::Repository;
     use tempfile::TempDir;
 
@@ -797,7 +799,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn live_checkout_for_branch_finds_non_utf8_path() {
-        use std::ffi::OsString;
+        use std::ffi::{OsStr, OsString};
         use std::os::unix::ffi::OsStringExt;
 
         let (dir, _repo) = init_repo();
@@ -811,16 +813,15 @@ mod tests {
             return; // filesystem rejects non-UTF-8 names
         }
         std::fs::remove_dir(&foreign).unwrap();
-        let created = std::process::Command::new("git")
-            .current_dir(main)
-            .args(["worktree", "add", "-b", "foreign"])
-            .arg(&foreign)
-            .output()
-            .unwrap();
-        assert!(
-            created.status.success(),
-            "{}",
-            String::from_utf8_lossy(&created.stderr)
+        run_git_os(
+            main,
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("foreign"),
+                foreign.as_os_str(),
+            ],
         );
 
         // git reports the canonical path; TMPDIR may sit behind a symlink.
