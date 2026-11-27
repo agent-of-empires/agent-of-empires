@@ -1272,7 +1272,7 @@ function AppContent({
           // input on iOS (#3285). Start it as a monitoring view until that
           // separate transport race is fixed; other terminal agents remain
           // safe to auto-open.
-          if (usableAgentProfile(picked?.agent_profile).mobile_monitor_only && picked.view !== "structured") {
+          if (picked && usableAgentProfile(picked.agent_profile).mobile_monitor_only && picked.view !== "structured") {
             closeKeyboardProxy();
           } else if (webSettings.autoOpenKeyboard) {
             focusKeyboardProxy();
