@@ -149,7 +149,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                                 kind: HookTargetKind::JsonSettings,
                                 path,
                                 events: crate::agents::resolved_hook_events(
-                                    crate::agents::get_agent("claude")
+                                    crate::agents::native_definition("claude")
                                         .expect("built-in Claude agent"),
                                     &crate::session::config::Config::default(),
                                 )
@@ -525,6 +525,46 @@ mod tests {
             "{malformed}"
         );
         assert!(malformed.contains("session.store"), "{malformed}");
+    }
+
+    // The bundled Claude fallback is a native hook target, and its settings file
+    // stays protected from other declarations even after a plugin takes `claude` over.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn the_bundled_claude_fallback_stays_a_protected_hook_target() {
+        let app = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        crate::session::test_support::install_agent_plugin(
+            "acme.claude",
+            "id = \"acme.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
+             command = \"claude-next\"\n[agent_integrations.launch]\noneshot_flag = \"-p\"\n",
+        );
+        assert!(crate::agents::get_agent("claude").is_none());
+
+        let home = TempDir::new().unwrap();
+        let targets = builtin_hook_targets_in(
+            home.path(),
+            &[Vec::new()],
+            &crate::session::config::Config::default(),
+        );
+        let claude: Vec<_> = targets
+            .iter()
+            .filter(|target| target.agent_name == "claude")
+            .collect();
+        assert_eq!(claude.len(), 1);
+        assert!(matches!(claude[0].kind, HookTargetKind::JsonSettings));
+        assert_eq!(claude[0].path, home.path().join(".claude/settings.json"));
+        assert!(!claude[0].events.is_empty());
+        assert!(is_other_builtin_hook_path(
+            &home.path().join(".claude/settings.json"),
+            "example",
+            home.path(),
+            &[],
+            &Default::default(),
+        ));
     }
 
     #[test]

@@ -2654,6 +2654,22 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
     }
 
     #[test]
+    fn native_agents_keep_claude_first_and_the_bundled_fallbacks_around_the_table() {
+        let names: Vec<_> = native_agents().map(|agent| agent.name).collect();
+        assert_eq!(names.first(), Some(&"claude"));
+        assert_eq!(names.last(), Some(&"omp"));
+        assert_eq!(names.len(), AGENTS.len() + 2);
+        assert_eq!(names.iter().filter(|name| **name == "claude").count(), 1);
+        assert!(AGENTS.iter().all(|agent| agent.name != "claude"));
+        assert_eq!(
+            AGENTS.iter().map(|agent| agent.name).collect::<Vec<_>>(),
+            names[1..names.len() - 1]
+        );
+        assert_eq!(settings_index_from_name(Some("claude")), 1);
+        assert_eq!(name_from_settings_index(1), Some("claude"));
+    }
+
+    #[test]
     fn test_settings_index_roundtrip() {
         assert_eq!(settings_index_from_name(None), 0);
         assert_eq!(settings_index_from_name(Some("unknown")), 0);
