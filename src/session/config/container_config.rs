@@ -3120,19 +3120,12 @@ pub(crate) fn discard_staged_declared_trust(
     }
 }
 
-/// Truncates a staged file to `{}` through the same inode, never following a link.
+/// Blanks a staged file to `{}` through the same inode, never writing through a link.
 fn blank_staged_file(file: &Path) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(file)
-    {
-        Ok(mut staged) => Ok(staged.write_all(b"{}")?),
+    match std::fs::symlink_metadata(file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("blanking {}", file.display())),
+        _ => crate::hooks::write_in_place(file, b"{}")
+            .with_context(|| format!("blanking {}", file.display())),
     }
 }
 
@@ -7969,6 +7962,85 @@ sandbox = "SANDBOX"
         let record: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
         assert_eq!(record["projects"]["/workspace/project"]["trusted"], false);
+    }
+
+    // A staged trust file the container replaced with a FIFO must neither hang the
+    // revocation nor stay a FIFO.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn revoking_staged_trust_replaces_a_planted_fifo() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        let file = crate::hooks::declared_sandbox_dir("declared-fifo")
+            .unwrap()
+            .join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&file).status();
+        if !made.is_ok_and(|status| status.success()) {
+            eprintln!("mkfifo is unavailable; FIFO revocation not exercised");
+            return;
+        }
+
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-fifo",
+                "/workspace/project",
+                false,
+            ));
+        });
+
+        result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("revocation hung on the FIFO")
+            .unwrap();
+        assert!(fs::symlink_metadata(&file).unwrap().is_file());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
+    }
+
+    // A hardlink planted at the staged path must not carry the blank to its target.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn revoking_staged_trust_leaves_a_hardlink_target_alone() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        let file = crate::hooks::declared_sandbox_dir("declared-hardlink")
+            .unwrap()
+            .join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let other = temp_home.path().join("other");
+        fs::write(&other, "precious").unwrap();
+        fs::hard_link(&other, &file).unwrap();
+
+        ensure_folder_trust_config_for_active_agent(
+            "example-helper",
+            Some("example-helper"),
+            &super::super::SessionConfig::default(),
+            "declared-hardlink",
+            "/workspace/project",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&other).unwrap(), "precious");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
     }
 
     #[test]

@@ -42,7 +42,7 @@ fn open_regular_for_write(path: &Path) -> Result<Option<std::fs::File>> {
 ///
 /// The payload is one `write_all` after `set_len(0)`; a crash between the two leaves
 /// an empty file, which the declared-trust reader treats as absent.
-fn write_in_place(path: &Path, content: &[u8]) -> Result<()> {
+pub(crate) fn write_in_place(path: &Path, content: &[u8]) -> Result<()> {
     use std::io::Write;
     for _ in 0..2 {
         if let Some(mut file) = open_regular_for_write(path)? {
