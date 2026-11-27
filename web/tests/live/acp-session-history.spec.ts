@@ -3,7 +3,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect, bootDashboard, type ServeHandle } from "../helpers/liveTest";
-import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
+import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd, waitForView } from "../helpers/aoeServe";
 import {
   enableStructuredViewAndWait,
   postAcp,
@@ -11,6 +11,7 @@ import {
   replayFrames,
   startAcpSession,
   sessionIdByTitle,
+  waitForAcpReady,
   waitForReplayContains,
 } from "../helpers/acp";
 
@@ -239,16 +240,33 @@ test("view switch preserves the claude conversation in both directions", async (
   const sessionId: string = (await createRes.json()).id;
   await expectReplay(sessionId);
 
-  expect((await postAcp(serve.baseUrl, sessionId, "/disable")).ok).toBe(true);
+  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
   await expect
-    .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.view === "structured", {
-      timeout: 10_000,
-      intervals: [100, 200, 400],
-    })
-    .toBe(false);
+    .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.acp_session_id)
+    .toBe(sid);
+  await expect
+    .poll(
+      async () => {
+        const check = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/terminal-check`);
+        return check.ok ? await check.json() : { status: check.status, body: await check.text() };
+      },
+      { timeout: 10_000 },
+    )
+    .toMatchObject({ context: "continues" });
+  const disable = await postAcp(serve.baseUrl, sessionId, "/disable");
+  expect(disable.ok, await disable.text()).toBe(true);
+  await waitForView(serve.baseUrl, sessionId, "terminal");
+  const fakeLog = join(serve.home, "fake-acp.log");
+  await expect.poll(() => readFileSync(fakeLog, "utf8"), { timeout: 15_000 }).toContain(`"--resume","${sid}"`);
 
-  // The carried agent_session_id drives a seeded session/load.
-  expect((await postAcp(serve.baseUrl, sessionId, "/enable")).ok).toBe(true);
+  const enable = await postAcp(serve.baseUrl, sessionId, "/enable");
+  expect(enable.ok, await enable.text()).toBe(true);
+  await waitForAcpReady(serve.baseUrl, sessionId, 30_000, serve.home);
+  await expect
+    .poll(() => readFileSync(fakeLog, "utf8").match(/handleRequest method=session\/load /g)?.length ?? 0, {
+      timeout: 15_000,
+    })
+    .toBe(2);
   await expectReplay(sessionId);
   await expect
     .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId), {
