@@ -5289,9 +5289,8 @@ impl HomeView {
             self.observed_sidebar_view = None;
             return false;
         };
-        let changed = self.follow_sidebar_view(&view);
-        self.observed_sidebar_view = Some(view);
-        changed
+        let seen = self.observed_sidebar_view.replace(view.clone());
+        self.follow_sidebar_view(&view, seen.as_ref())
     }
 
     /// Follow the Daemon's grouping and sort when a snapshot changes it, unless this view's
@@ -5305,20 +5304,21 @@ impl HomeView {
         {
             return;
         }
-        self.observed_sidebar_view = Some(view.clone());
-        self.follow_sidebar_view(&view);
+        let seen = self.observed_sidebar_view.replace(view.clone());
+        self.follow_sidebar_view(&view, seen.as_ref());
     }
 
     /// Show the Daemon's grouping and sort, saying which Client changed them when another
-    /// kind of Client did and the list on screen moved. Returns whether anything changed.
+    /// kind of Client did and the list on screen moved. Only a change from `seen`, the value
+    /// last observed, is named, so a refused local pick falling back is not blamed on a peer.
+    /// Returns whether anything changed.
     pub(super) fn follow_sidebar_view(
         &mut self,
         view: &crate::session::config::SidebarView,
+        seen: Option<&crate::session::config::SidebarView>,
     ) -> bool {
         use crate::session::config::ClientKind;
-        let grouping = view.group_by != self.group_by;
-        let sort = view.sort != self.sort_order;
-        if !grouping && !sort {
+        if (view.group_by, view.sort) == (self.group_by, self.sort_order) {
             return false;
         }
         let before = self.visible_list();
@@ -5328,7 +5328,12 @@ impl HomeView {
             Some(ClientKind::Cli) => "in the CLI",
             Some(ClientKind::Tui) | None => return true,
         };
-        if self.visible_list() != before {
+        let Some(seen) = seen else {
+            return true;
+        };
+        let grouping = seen.group_by != view.group_by;
+        let sort = seen.sort != view.sort;
+        if (grouping || sort) && self.visible_list() != before {
             let what = match (grouping, sort) {
                 (true, true) => "Grouping and sort",
                 (true, false) => "Grouping",

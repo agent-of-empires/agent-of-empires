@@ -82,7 +82,7 @@ While no plugin that provides suggestions is installed and a featured one exists
 
 ## Sidebar grouping and sort
 
-The **View options** button (sliders icon) beside the **Sessions** label holds the sidebar's view in one menu: **Group by**, **Sort by**, **Filter sessions** and, when plugins add them, **Plugin facets**. A dot on the button means the view differs from the default: Repository, Custom, no filter. The grouping and sort are shared: the TUI and every browser on this server show the same pick, and a change made in one shows up in the others without a reload. When a change made in the TUI or the CLI moves the rows on screen, a notice says so, for example "Sort changed in the TUI".
+The **View options** button (sliders icon) beside the **Sessions** label holds the sidebar's view in one menu: **Group by**, **Sort by**, **Filter sessions** and, when plugins add them, **Plugin facets**. A dot on the button means the view differs from the default: Repository, Custom, no filter. The grouping and sort are shared: the TUI and every browser on this server show the same pick, and a change made in one shows up in the others without a reload. When a change made in the TUI moves the rows on screen, a notice says so, for example "Sort changed in the TUI".
 
 Each project header shows the project icon next to its name, with a count of the sessions it holds. Hovering the header swaps the icon for a fold chevron and shows its **+** (always shown on touch screens); clicking the header collapses or expands the project's sessions.
 

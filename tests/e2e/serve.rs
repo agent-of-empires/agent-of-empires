@@ -449,9 +449,12 @@ async fn daemon_group_move_preserves_live_terminal_and_restarts_in_target_profil
         .build()
         .unwrap();
     sdk.create_group(
-        &GroupLocation {
-            profile: "default".into(),
-            path: "empty".into(),
+        &agent_of_empires::daemon::CreateGroupBody {
+            group: GroupLocation {
+                profile: "default".into(),
+                path: "empty".into(),
+            },
+            sessions: None,
         },
         &epoch,
     )

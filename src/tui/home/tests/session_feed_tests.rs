@@ -4375,3 +4375,43 @@ fn a_sidebar_write_closed_before_a_snapshot_adopts_the_next_one() {
     env.view.apply_session_feed();
     assert_eq!(env.view.group_by, GroupByMode::Project);
 }
+
+/// A refused pick falls back to the Daemon's value without naming the Client that changed
+/// it last, so the refusal stays on screen.
+#[test]
+#[serial]
+fn a_refused_pick_falling_back_is_not_named_as_a_peer_change() {
+    use crate::session::config::{ClientKind, GroupByMode, SidebarView, SortOrder};
+    let mut env = create_test_env_empty();
+    let id = structured_row(&mut env, Status::Idle);
+    let mut older = Instance::new("alpha", "/tmp/alpha");
+    older.source_profile = "test".into();
+    older.created_at =
+        crate::time::Timestamp::from_millis(crate::time::Timestamp::now().as_millis() - 3_600_000)
+            .unwrap();
+    env.view.add_instance(older);
+    env.view
+        .mutate_instance(&id, |row| row.title = "zulu".into());
+    seed_profile("test", &env.view.cloned_instances());
+    let mut reply = env.view.session_feed.sidebar_view_driver_for_test();
+    let SessionFeedResult::Snapshot(mut snapshot) = daemon_snapshot(&env.view, &id, "Idle") else {
+        unreachable!()
+    };
+    Arc::make_mut(&mut snapshot).contents.sidebar_view = SidebarView {
+        changed_by: Some(ClientKind::Web),
+        ..Default::default()
+    };
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+    env.view.apply_session_feed();
+    env.view.apply_sort_order(SortOrder::Name);
+    assert!(reply(Err("disk full".into())).is_some());
+    env.view.apply_session_feed();
+    assert_eq!(
+        (env.view.group_by, env.view.sort_order),
+        (GroupByMode::Project, SortOrder::Custom)
+    );
+    let flash = env.view.status_flash_text();
+    assert!(flash.is_some_and(|t| t.contains("disk full")), "{flash:?}");
+}
