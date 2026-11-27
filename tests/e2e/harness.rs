@@ -715,6 +715,14 @@ last_seen_version = "{}"
         bin
     }
 
+    /// Install a no-op `claude` and make it the default tool. For tests that
+    /// need an agent allowed in worktrees or sandboxes, which the host-only
+    /// `fake-agent` refuses.
+    pub fn use_claude_agent(&mut self) {
+        self.install_path_command("claude");
+        self.append_config("[session]\ndefault_tool = \"claude\"");
+    }
+
     /// Install a PATH stub that records the argv it was invoked with to
     /// `<home>/<name>.argv`, then exits 0. Returns that record path. Unlike
     /// `install_path_command`, this lets a test assert the command a launch
@@ -821,7 +829,17 @@ last_seen_version = "{}"
     pub fn append_config(&self, toml: &str) {
         let path = app_dir_in(self.home_path()).join("config.toml");
         let seeded = std::fs::read_to_string(&path).expect("read seeded config");
-        std::fs::write(&path, format!("{seeded}\n{toml}\n")).expect("write config.toml");
+        // Merge when both sides parse so a test can extend a table the harness
+        // seeds (`[session]`); unparsable input is appended verbatim for tests
+        // that exercise invalid config.
+        let merged = match (seeded.parse::<toml::Table>(), toml.parse::<toml::Table>()) {
+            (Ok(mut base), Ok(extra)) => {
+                merge_toml(&mut base, extra);
+                toml::to_string(&base).expect("serialize merged config")
+            }
+            _ => format!("{seeded}\n{toml}\n"),
+        };
+        std::fs::write(&path, merged).expect("write config.toml");
     }
 
     pub fn sessions_path(&self) -> PathBuf {
@@ -1919,5 +1937,19 @@ fn tui_launch_isolates_daemon_endpoint_from_the_tmux_server() {
             vec![expected; panes],
             "server hostile {hostile}, set_env {explicit:?}"
         );
+    }
+}
+
+/// Recursively merge `extra` into `base`; scalar and array values in `extra` win.
+fn merge_toml(base: &mut toml::Table, extra: toml::Table) {
+    for (key, value) in extra {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(extra_table)) => {
+                merge_toml(base_table, extra_table);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
     }
 }
