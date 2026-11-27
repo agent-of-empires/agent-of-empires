@@ -670,6 +670,19 @@ impl Instance {
                 } else {
                     container_config::place_shadowed_credential_mountpoints(&config);
                     checkpoint()?;
+                    // Revoke before the start: its mounts are the old ones, and a
+                    // failed revocation must stop the reuse before anything runs.
+                    // The workdir comes from `docker inspect`, which needs no running
+                    // container.
+                    self.reconcile_container_workdir(&container);
+                    container_config::ensure_folder_trust_config_for_active_agent(
+                        &self.tool,
+                        Some(command.as_str()),
+                        &profile_config.session,
+                        &self.id,
+                        &self.container_workdir(),
+                        self.is_yolo_mode(),
+                    )?;
                     container.start()?;
                     self.finish_container_reuse(
                         &container,
