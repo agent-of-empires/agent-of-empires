@@ -110,7 +110,7 @@ struct SubmoduleCheckout {
     gitdir: PathBuf,
 }
 
-fn path_from_git_bytes(bytes: &[u8], description: &str) -> Result<PathBuf> {
+pub(super) fn path_from_git_bytes(bytes: &[u8], description: &str) -> Result<PathBuf> {
     #[cfg(unix)]
     {
         let _ = description;

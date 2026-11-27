@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use super::relocate::{classify_ref_observations, TimedMutationOutcome};
+use super::relocate::{classify_ref_observations, path_from_git_bytes, TimedMutationOutcome};
 use super::{GitWorktree, FETCH_REMOTE, MUTATION_OBSERVATION_TIMEOUT, WORKTREE_MUTATION_TIMEOUT};
 use crate::git::command::{run_git, run_git_with_timeout};
 use crate::git::error::{GitError, Result};
@@ -323,9 +323,7 @@ impl GitWorktree {
         let mut paths = Vec::new();
         for field in output.stdout.split(|byte| *byte == 0) {
             if let Some(raw_path) = field.strip_prefix(b"worktree ") {
-                path = Some(PathBuf::from(
-                    String::from_utf8_lossy(raw_path).into_owned(),
-                ));
+                path = Some(path_from_git_bytes(raw_path, "worktree path")?);
             } else if field.strip_prefix(b"branch ") == Some(wanted.as_bytes()) {
                 paths.extend(path.clone());
             }
@@ -793,6 +791,35 @@ mod tests {
                 .canonicalize()
                 .unwrap(),
             live.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_checkout_for_branch_finds_non_utf8_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let (dir, _repo) = init_repo();
+        let main = dir.path();
+        let git = GitWorktree::new(main.to_path_buf()).unwrap();
+
+        let mut name = b"wt-".to_vec();
+        name.push(0xFF);
+        let foreign = main.join(OsString::from_vec(name));
+        let created = std::process::Command::new("git")
+            .current_dir(main)
+            .args(["worktree", "add", "-b", "foreign"])
+            .arg(&foreign)
+            .output()
+            .unwrap();
+        if !created.status.success() || !foreign.exists() {
+            return; // filesystem rejects non-UTF-8 names
+        }
+
+        assert_eq!(
+            git.live_checkout_for_branch("foreign").unwrap(),
+            Some(foreign)
         );
     }
 }
