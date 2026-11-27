@@ -805,7 +805,7 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::acp::approvals::ApprovalDecision;
-    use crate::acp::state::{BackgroundAgentStatus, WorkflowLaunch, WorkflowRef};
+    use crate::acp::state::{BackgroundAgentStatus, WorkflowLaunch, WorkflowProgress, WorkflowRef};
 
     #[test]
     fn first_prompt_and_first_turn_context() {
@@ -1578,6 +1578,90 @@ mod tests {
         assert_eq!(
             runs,
             [(true, "open".to_string()), (true, "reused".to_string())]
+        );
+    }
+
+    /// A run's latest progress survives the retention cap as one row, and
+    /// goes once the run ends; a reused id keeps its open run's progress.
+    #[test]
+    fn workflow_run_progress_is_pinned_replaced_and_swept_on_finish() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let started = |id: &str| Event::WorkflowRunStarted {
+            run_id: id.into(),
+            started_at: None,
+        };
+        let progress = |id: &str, completed| Event::WorkflowRunProgress {
+            run_id: id.into(),
+            progress: WorkflowProgress {
+                label: Some(format!("step {completed}")),
+                completed: Some(completed),
+                total: Some(9),
+            },
+        };
+        let filler = |record: &mut dyn FnMut(Event), n| {
+            for _ in 0..n {
+                record(Event::AgentMessageChunk {
+                    text: "x".into(),
+                    message_id: None,
+                });
+            }
+        };
+        record(started("open"));
+        record(progress("open", 1));
+        record(progress("open", 2));
+        record(started("done"));
+        record(progress("done", 1));
+        record(started("reused"));
+        record(progress("reused", 1));
+        record(Event::WorkflowRunFinished {
+            run_id: "reused".into(),
+        });
+        record(started("reused"));
+        record(progress("reused", 5));
+        filler(&mut record, 150);
+        record(Event::WorkflowRunFinished {
+            run_id: "done".into(),
+        });
+        filler(&mut record, 150);
+
+        let progresses: Vec<(String, Option<u64>)> = store
+            .replay_from("s-1", 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::WorkflowRunProgress { run_id, progress } => {
+                    Some((run_id, progress.completed))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            progresses,
+            [
+                ("open".to_string(), Some(2)),
+                ("reused".to_string(), Some(5))
+            ]
+        );
+
+        let mut folded =
+            AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        for (seq, event) in store.replay_from("s-1", 0) {
+            folded.apply_event(seq, event).unwrap();
+        }
+        let open = folded
+            .lifecycle_runs
+            .iter()
+            .find(|r| r.run_id == "open")
+            .unwrap();
+        let p = open.progress.as_ref().unwrap();
+        assert_eq!(
+            (p.label.as_deref(), p.completed, p.total),
+            (Some("step 2"), Some(2), Some(9))
         );
     }
 

@@ -69,7 +69,8 @@ const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str, &[&str])] = &[
 const COMPLETED_WORK_SWEEP_INTERVAL: u64 = 64;
 
 /// Rows the retention prune keeps: the non-substantive events above, plus the
-/// background work events of [`BACKGROUND_WORK_EVENTS`].
+/// background work events of [`BACKGROUND_WORK_EVENTS`] and a run's latest
+/// progress (one row per run, see [`replace_run_progress`]).
 const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
     "AvailableCommandsUpdated",
     "ModesAvailable",
@@ -85,6 +86,7 @@ const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
     "BackgroundTaskFinished",
     "WorkflowRunStarted",
     "WorkflowRunFinished",
+    "WorkflowRunProgress",
     "SubagentUpdated",
 ];
 
@@ -287,6 +289,9 @@ impl EventStore {
         let inserted = events::insert_event(&tx, &self.schema, session_id, seq, &json, now_ms)?;
         if inserted != 0 {
             rate_limit::update_rate_limit_budget(&tx, &self.schema, session_id, seq, event);
+            if let Event::WorkflowRunProgress { run_id, .. } = event {
+                replace_run_progress(&tx, &self.schema, session_id, seq, run_id)?;
+            }
         }
         tx.commit()?;
         trace!(
@@ -456,6 +461,28 @@ impl EventStore {
     }
 }
 
+/// Drops the run's older progress rows, so the pinned progress stays one row
+/// per run.
+fn replace_run_progress(
+    conn: &Connection,
+    schema: &events::Schema,
+    session_id: &str,
+    seq: u64,
+    run_id: &str,
+) -> Result<()> {
+    conn.execute(
+        &format!(
+            "DELETE FROM {} WHERE session_id = ?1 AND seq < ?2
+               AND discriminant = 'WorkflowRunProgress'
+               AND json_extract(event_json, '$.WorkflowRunProgress.run_id') = ?3",
+            schema.events_table()
+        ),
+        rusqlite::params![session_id, seq as i64, run_id],
+    )
+    .with_context(|| format!("replace progress of {run_id} for {session_id}"))?;
+    Ok(())
+}
+
 /// Deletes background work that has ended and fell past the retention cutoff,
 /// leaving open work pinned. Starts go first, so an end is never removed while
 /// its start survives (that start would then read as open).
@@ -481,6 +508,22 @@ fn prune_completed_background_work(
     let Some(cutoff) = cutoff else {
         return;
     };
+    // Pinned progress of an ended run goes before its end can be deleted.
+    let delete_progress = format!(
+        "DELETE FROM {events} AS progress
+         WHERE progress.session_id = ?1 AND progress.seq <= ?2
+           AND progress.discriminant = 'WorkflowRunProgress'
+           AND EXISTS (
+               SELECT 1 FROM {events} AS ended
+               WHERE ended.session_id = ?1 AND ended.discriminant = 'WorkflowRunFinished'
+                 AND ended.seq > progress.seq
+                 AND json_extract(ended.event_json, '$.WorkflowRunFinished.run_id') =
+                     json_extract(progress.event_json, '$.WorkflowRunProgress.run_id'))"
+    );
+    if let Err(e) = conn.execute(&delete_progress, rusqlite::params![session_id, cutoff]) {
+        warn!(target: "acp.event_store", "prune run progress {session_id}: {e}");
+        return;
+    }
     for (start, end, id, kept_groups) in BACKGROUND_WORK_EVENTS {
         // An end closes only the starts before it: ids may be reused.
         let closed = |started: &str| {
