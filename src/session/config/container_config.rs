@@ -8703,10 +8703,7 @@ sandbox = "SANDBOX"
             before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
-        for agent in crate::agents::AGENTS
-            .iter()
-            .filter(|agent| !agent.host_only)
-        {
+        for agent in crate::agents::native_agents().filter(|agent| !agent.host_only) {
             let mounts: Vec<_> = AGENT_CONFIG_MOUNTS
                 .iter()
                 .filter(|mount| mount.tool_name == agent.name)

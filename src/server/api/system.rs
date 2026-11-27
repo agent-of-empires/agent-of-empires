@@ -295,9 +295,7 @@ pub async fn list_agents(
         // control and a profile override must not widen it (#3241).
         let policy = crate::acp::agent_policy::AgentPolicy::load();
         let data_dir = crate::session::get_app_dir().ok();
-        let mut agents = crate::agents::AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::available())
+        let mut agents = crate::agents::listed_agents()
             .map(|a| {
                 let (acp_command, acp_args) =
                     acp_command_fields(acp_registry.get(a.name), data_dir.as_deref());

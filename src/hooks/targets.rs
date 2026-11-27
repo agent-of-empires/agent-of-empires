@@ -206,8 +206,7 @@ pub(crate) fn is_other_builtin_hook_path(
     session: &crate::session::config::SessionConfig,
 ) -> bool {
     let destination = resolved(path);
-    let relocated = crate::agents::AGENTS
-        .iter()
+    let relocated = crate::agents::native_agents()
         .filter(|agent| agent.name != agent_name)
         .filter_map(|agent| {
             let leaf = Path::new(agent.hook_config.as_ref()?.settings_rel_path).file_name()?;
@@ -231,7 +230,7 @@ fn builtin_hook_targets_in(
     defaults: &crate::session::config::Config,
 ) -> Vec<HookTarget> {
     let mut out = Vec::new();
-    for agent in crate::agents::AGENTS {
+    for agent in crate::agents::native_agents() {
         push_hook_config_targets(&mut out, agent, home, env_lists, defaults);
         if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
             out.push(HookTarget {

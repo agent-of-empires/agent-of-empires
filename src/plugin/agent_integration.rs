@@ -101,6 +101,13 @@ fn warn_reserved(plugin: &str, tool: &str, builtin: &str) {
     }
 }
 
+/// The built-in a plugin tool name collides with. A bundled fallback's own name
+/// is open to takeover; names that merely contain it stay reserved.
+fn reserved_builtin(tool: &str) -> Option<&'static str> {
+    crate::agents::resolve_builtin_tool_name(tool)
+        .filter(|_| !super::bundled_agents::contains(tool))
+}
+
 /// An active plugin-provided agent that does not collide with a built-in or custom agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginAgent<'a> {
@@ -126,7 +133,7 @@ fn unique_candidates<'a, 'b, 'c>(
         candidate_counts.remove(name);
     }
     for (plugin, tool, _) in &candidates {
-        if let Some(builtin) = crate::agents::resolve_builtin_tool_name(tool) {
+        if let Some(builtin) = reserved_builtin(tool) {
             warn_reserved(plugin, tool, builtin);
             candidate_counts.remove(tool);
         }
@@ -323,7 +330,7 @@ pub(crate) fn declared_agent<'a>(
     if custom_names.into_iter().any(|name| name == tool) {
         return None;
     }
-    if let Some(builtin) = crate::agents::resolve_builtin_tool_name(tool) {
+    if let Some(builtin) = reserved_builtin(tool) {
         for plugin in registry.active().filter(|plugin| {
             plugin
                 .manifest

@@ -8,10 +8,7 @@ pub fn agent_bucket(agent: &str) -> String {
     let lower = trimmed.to_ascii_lowercase();
     // The bundled definitions keep reporting their own bucket after a plugin
     // declares the agent, so a tool never changes bucket with the plugin set.
-    for def in crate::agents::AGENTS
-        .iter()
-        .chain(crate::plugin::bundled_agents::definitions())
-    {
+    for def in crate::agents::native_agents() {
         if def.name.eq_ignore_ascii_case(&lower)
             || def.aliases.iter().any(|a| a.eq_ignore_ascii_case(&lower))
         {

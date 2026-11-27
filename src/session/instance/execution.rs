@@ -398,7 +398,7 @@ pub(crate) enum CaptureContext {
 }
 
 use super::{Instance, ManagedResumeCause, ResumeIntent};
-use crate::agents::{AgentDef, AGENTS};
+use crate::agents::AgentDef;
 use crate::session::fork::ForkParentRef;
 use anyhow::{bail, Context, Result};
 
@@ -1885,11 +1885,7 @@ impl Instance {
         // A declaration for this tool hides the bundled fallback from listings,
         // but a session stored with the fallback's own command still runs it, so
         // every bundled identity stays resolvable here.
-        let retained = || {
-            AGENTS
-                .iter()
-                .chain(crate::plugin::bundled_agents::definitions())
-        };
+        let retained = || crate::agents::native_agents();
         let direct = retained().find(|agent| agent.binary == program);
         let declared = config
             .agent_execution_as
@@ -1937,9 +1933,7 @@ impl Instance {
                 .file_name()
                 .and_then(|name| name.to_str());
             anyhow::ensure!(
-                !AGENTS
-                    .iter()
-                    .chain(crate::plugin::bundled_agents::definitions())
+                !crate::agents::native_agents()
                     .any(|agent| Some(agent.binary) == basename && agent.name != actual.name),
                 "wrapper command names a different native agent"
             );

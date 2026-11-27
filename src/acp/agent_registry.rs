@@ -401,7 +401,7 @@ mod tests {
         for (name, _) in AgentRegistry::with_defaults().list() {
             assert!(display_name_for(name).is_some(), "{name}");
         }
-        for agent in crate::agents::AGENTS {
+        for agent in crate::agents::native_agents() {
             assert!(display_name_for(agent.name).is_some(), "{}", agent.name);
         }
     }

@@ -3489,10 +3489,7 @@ pub struct AvailableTools {
 impl AvailableTools {
     /// Startup's local snapshot. Login shells and executable probes run later.
     pub(crate) fn detect_on_path() -> Self {
-        let refs: Vec<_> = crate::agents::AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::available())
-            .collect();
+        let refs: Vec<_> = crate::agents::listed_agents().collect();
         let session = crate::session::config::Config::load()
             .ok()
             .map(load_session);
@@ -3506,10 +3503,7 @@ impl AvailableTools {
     }
 
     pub fn detect() -> Self {
-        let refs: Vec<_> = crate::agents::AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::available())
-            .collect();
+        let refs: Vec<_> = crate::agents::listed_agents().collect();
         let found = probe_agents_available(&refs);
         let session = crate::session::config::Config::load()
             .ok()
@@ -3521,10 +3515,7 @@ impl AvailableTools {
         session: &crate::session::config::SessionConfig,
     ) -> Self {
         session.warn_custom_agent_issues();
-        let refs: Vec<_> = crate::agents::AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::available())
-            .collect();
+        let refs: Vec<_> = crate::agents::listed_agents().collect();
         let found = probe_agents_available(&refs);
         Self::from_detected(found, true, None, false, Some(session))
     }
@@ -3533,10 +3524,7 @@ impl AvailableTools {
         cancel: &tokio_util::sync::CancellationToken,
         force: bool,
     ) -> Self {
-        let refs: Vec<_> = crate::agents::AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::available())
-            .collect();
+        let refs: Vec<_> = crate::agents::listed_agents().collect();
         let found = probe_agents_available_inner(&refs, Some(cancel), force);
         let session = crate::session::config::Config::load()
             .ok()
@@ -3551,10 +3539,7 @@ impl AvailableTools {
         force: bool,
         session_config: Option<&crate::session::config::SessionConfig>,
     ) -> Self {
-        let agents = crate::agents::AGENTS;
-        let mut available: Vec<String> = agents
-            .iter()
-            .chain(crate::plugin::bundled_agents::available())
+        let mut available: Vec<String> = crate::agents::listed_agents()
             .filter(|agent| found.contains(agent.name))
             .map(|agent| agent.name.to_string())
             .collect();
@@ -3577,7 +3562,7 @@ impl AvailableTools {
         let registry = crate::plugin::registry();
         let plugin_agents = crate::plugin::agent_integration::catalog(
             &registry,
-            agents.iter().map(|agent| agent.name),
+            crate::agents::AGENTS.iter().map(|agent| agent.name),
             custom_agents
                 .iter()
                 .filter(|(_, command)| !command.trim().is_empty())
@@ -3631,7 +3616,7 @@ mod tests {
     #[serial_test::serial]
     fn invalidate_agent_availability_waits_for_an_in_flight_probe() {
         let memo = AgentAvailabilityGuard::capture();
-        memo.seed(crate::agents::AGENTS[0].name, false);
+        memo.seed(crate::agents::native_agents().next().unwrap().name, false);
         let (contended_tx, contended_rx) = std::sync::mpsc::channel();
         let (returned_tx, returned_rx) = std::sync::mpsc::channel();
         let mut worker = BlockedProbeWorker::new(

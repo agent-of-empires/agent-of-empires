@@ -352,8 +352,7 @@ pub(crate) fn host_hook_disclosure(
 /// and the current setting can change between the approval and that launch, so
 /// the surfaces state what is permitted rather than what happened today.
 pub(crate) fn host_hook_post_install_notes() -> Vec<(String, &'static str)> {
-    crate::agents::AGENTS
-        .iter()
+    crate::agents::native_agents()
         .filter_map(|agent| {
             let note = agent.sidecar_hooks.as_ref()?.post_install_note?;
             Some((agent.name.to_string(), note))
