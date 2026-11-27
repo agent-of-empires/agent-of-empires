@@ -3078,7 +3078,9 @@ fn stage_declared_sandbox(
                     .map(|dir| format!("{dir}/{}", trust.file))
                     .filter(|target| {
                         !overlaps_bound_mount(target, bound)
-                            && entry.container_hooks_file().as_ref() != Some(target)
+                            && !entry
+                                .container_hooks_file()
+                                .is_some_and(|hooks| Path::new(&hooks).starts_with(target))
                     });
             match target {
                 Some(container_path) => mounts.volumes.push(VolumeMount {

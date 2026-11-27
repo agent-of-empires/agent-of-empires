@@ -1067,10 +1067,13 @@ fn validate_agent_declaration(
     }
     if integration.hooks.is_some() && integration.trust.is_some() {
         check(
-            integration.container_hooks_file() != integration.container_trust_file(),
+            integration
+                .container_hooks_file()
+                .zip(integration.container_trust_file())
+                .is_none_or(|(hooks, trust)| !std::path::Path::new(&hooks).starts_with(trust)),
             format!(
-                "agent_integrations[{i}].hooks.settings_rel_path and trust.file must not name the \
-                 same file in the sandbox"
+                "agent_integrations[{i}].trust.file must not be, or contain, the sandbox path of \
+                 hooks.settings_rel_path"
             ),
         );
     }

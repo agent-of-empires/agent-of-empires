@@ -1089,13 +1089,25 @@ fn declaration_bounds_each_reject() {
             .collect::<Vec<_>>()
             .join(",")
     );
+    // Without a config-dir variable the hooks directory is `/root/.example.json`.
+    let home_relative = |hooks_path: &str| {
+        let tables = format!("{HOOKS}{TRUST}")
+            .replace("config_dir_env_var = \"EXAMPLE_CONFIG_DIR\"\n", "")
+            .replace(".example/settings.json", hooks_path);
+        agent(&tables)
+    };
+    parse(28, &home_relative(".example/settings.json"));
     let cases: Vec<(String, &str)> = vec![
+        (
+            home_relative(".example.json/settings.json"),
+            "must not be, or contain, the sandbox path",
+        ),
         (
             agent(&format!(
                 "{HOOKS}{}",
                 TRUST.replace(".example.json", "settings.json")
             )),
-            "must not name the same file",
+            "must not be, or contain, the sandbox path",
         ),
         (
             hooks_with(".example/settings.json", &long_path),
