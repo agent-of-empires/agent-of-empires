@@ -663,16 +663,38 @@ impl SettingsView {
         false
     }
 
-    /// Bring the selected field's last row into view, where a text or number
-    /// editor sits below the description.
+    /// Scroll the selected field's open editor into view: a text or number
+    /// editor's value row, or an open list's header through its selected item
+    /// (its add prompt while adding).
     pub(super) fn reveal_selected_field_value(&mut self) {
+        let Some(field) = self.fields.get(self.selected_field) else {
+            return;
+        };
         let (top, height) = self.selected_field_span();
-        let bottom = top + height;
-        let value_row = bottom.saturating_sub(1);
+        let header = top + 1 + self.description_height(&field.description);
+        let (start, end) = match (&field.value, &self.list_edit_state) {
+            (FieldValue::List(_), Some(state)) if !state.adding_new => {
+                (header, header + 2 + state.selected_index as u16)
+            }
+            _ => ((top + height).saturating_sub(1), top + height),
+        };
         let viewport = self.fields_viewport_height;
-        if value_row < self.fields_scroll_offset || bottom > self.fields_scroll_offset + viewport {
-            self.fields_scroll_offset = bottom.saturating_sub(viewport);
+        // When the header and selected item cannot both fit, the item wins.
+        let start = if end - start > viewport {
+            end - 1
+        } else {
+            start
+        };
+        if start < self.fields_scroll_offset {
+            self.fields_scroll_offset = start;
+        } else if end > self.fields_scroll_offset + viewport {
+            self.fields_scroll_offset = end.saturating_sub(viewport);
         }
+    }
+
+    /// Pull the offset back into range after the selected field shrinks.
+    pub(super) fn clamp_fields_scroll(&mut self) {
+        self.fields_scroll_offset = self.fields_scroll_offset.min(self.max_fields_scroll());
     }
 
     /// Total height of all field rows plus inter-row spacing, in the same

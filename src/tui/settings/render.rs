@@ -1837,12 +1837,66 @@ mod status_message_tests {
             view.fields_scroll_offset = offset;
             press(&mut view, KeyCode::Enter);
             assert!(view.editing_input.is_some());
-            assert_eq!(
-                view.fields_scroll_offset,
-                b_top + b_height - 4,
-                "from {offset}"
+            let value_row = b_top + b_height - 1;
+            let offset_now = view.fields_scroll_offset;
+            assert!(
+                offset_now <= value_row && value_row < offset_now + 4,
+                "from {offset}: offset {offset_now}"
             );
         }
+    }
+
+    /// A list editor taller than the panel keeps its header and selected item in
+    /// view, and closing it leaves the collapsed field on screen.
+    #[test]
+    #[serial]
+    fn tall_list_editor_keeps_its_cursor_in_view() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_temp, _guard, mut view) = fresh_view();
+        let items: Vec<String> = (0..12).map(|i| format!("item{i}")).collect();
+        view.fields = vec![SettingField {
+            value: FieldValue::List(items),
+            ..bool_field("Things", &"word ".repeat(12))
+        }];
+        view.focus = super::super::SettingsFocus::Fields;
+        view.selected_field = 0;
+        view.fields_content_width = 20;
+        view.fields_viewport_height = 4;
+        let header = 1 + view.description_height(&view.fields[0].description);
+        // The view starts below the collapsed field, as after a wheel scroll.
+        view.fields_scroll_offset = header + 1;
+        let press = |view: &mut super::super::SettingsView, code| {
+            view.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        let cursor_visible = |view: &super::super::SettingsView| {
+            let selected = view.list_edit_state.as_ref().unwrap().selected_index as u16;
+            let offset = view.fields_scroll_offset;
+            let row = header + 1 + selected;
+            offset <= row && row < offset + view.fields_viewport_height
+        };
+
+        press(&mut view, KeyCode::Enter);
+        assert!(view.list_edit_state.is_some());
+        assert_eq!(
+            view.fields_scroll_offset, header,
+            "the header opens in view"
+        );
+        assert!(cursor_visible(&view));
+        for _ in 0..8 {
+            press(&mut view, KeyCode::Char('j'));
+            assert!(
+                cursor_visible(&view),
+                "offset {}",
+                view.fields_scroll_offset
+            );
+        }
+        press(&mut view, KeyCode::Esc);
+        assert!(view.list_edit_state.is_none());
+        let height = view.field_height(&view.fields[0], 0);
+        assert!(
+            view.fields_scroll_offset + view.fields_viewport_height >= height,
+            "the collapsed field stays on screen"
+        );
     }
 
     /// The status has its own footer row beneath the key hints, so it can
