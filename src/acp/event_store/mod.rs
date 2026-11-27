@@ -61,6 +61,7 @@ const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str, &[&str])] = &[
         "agent_id",
         &[],
     ),
+    ("WorkflowRunStarted", "WorkflowRunFinished", "run_id", &[]),
 ];
 
 /// How often (in seqs) a session's completed background work is swept, which
@@ -82,6 +83,8 @@ const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
     "BackgroundAgentCompleted",
     "BackgroundTaskStarted",
     "BackgroundTaskFinished",
+    "WorkflowRunStarted",
+    "WorkflowRunFinished",
     "SubagentUpdated",
 ];
 

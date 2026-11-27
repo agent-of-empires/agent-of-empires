@@ -1470,6 +1470,44 @@ mod tests {
         assert_eq!(store.unresolved_background_task_ids("s-1").len(), 3);
     }
 
+    /// An open run's start stays replayable past the retention cap, so a
+    /// reload still counts it; an ended run's pair ages out.
+    #[test]
+    fn open_workflow_runs_survive_the_retention_prune() {
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let started = |id: &str| Event::WorkflowRunStarted {
+            run_id: id.into(),
+            started_at: None,
+        };
+        record(started("done"));
+        record(Event::WorkflowRunFinished {
+            run_id: "done".into(),
+        });
+        record(started("open"));
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let runs: Vec<(bool, String)> = store
+            .replay_from("s-1", 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::WorkflowRunStarted { run_id, .. } => Some((true, run_id)),
+                Event::WorkflowRunFinished { run_id } => Some((false, run_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(runs, [(true, "open".to_string())]);
+    }
+
     /// Workflows share the task events but must not use up the shells' kept
     /// slots, on replay or in the folded state.
     #[test]
