@@ -1216,19 +1216,11 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
     matches!(basename, b"aoe" | b"agent-of-empires") && serve_subcommand_index(&args).is_some()
 }
 
-/// Whether the command line is `<any executable> [globals] serve --daemon-child`,
-/// the argv `daemon_child_args` always emits. Exact for NUL-separated argv. `ps`
-/// flattens argv and cannot be split when the executable path contains spaces, so
-/// match its `serve --daemon-child` tail instead.
-fn renamed_daemon_child_argv(command: &[u8]) -> bool {
-    if command.contains(&0) {
-        let args = split_argv(command);
-        return serve_subcommand_index(&args)
-            .is_some_and(|index| args.get(index + 1) == Some(&&b"--daemon-child"[..]));
-    }
-    command
-        .windows(b" serve --daemon-child".len())
-        .any(|window| window == b" serve --daemon-child")
+/// Whether `args` is `<any executable> [globals] serve --daemon-child`, the argv
+/// `daemon_child_args` always emits.
+fn renamed_daemon_child_argv(args: &[&[u8]]) -> bool {
+    serve_subcommand_index(args)
+        .is_some_and(|index| args.get(index + 1) == Some(&&b"--daemon-child"[..]))
 }
 
 /// A renamed release binary (`aoe-darwin-arm64`) has no trustworthy name, so it
@@ -1239,12 +1231,19 @@ fn renamed_daemon_evidence(launch: Option<&ServeLaunch>, pid: u32, instance_is_l
         .is_some_and(|launch| launch.pid == pid && launch.instance_id.is_some() && instance_is_live)
 }
 
-fn is_renamed_daemon(pid: u32, command: &[u8]) -> bool {
-    renamed_daemon_child_argv(command) && {
+/// `None` when `args` is not a daemon child. Otherwise `Verified` with launch
+/// evidence, else `Indeterminate`, so a stale PID is never signalled and its
+/// launch state is never deleted.
+fn classify_renamed_daemon(pid: u32, args: &[&[u8]]) -> Option<DaemonProcessIdentity> {
+    renamed_daemon_child_argv(args).then(|| {
         let launch = read_serve_launch().ok();
         let live = launch.as_ref().is_some_and(|l| instance_is_live(l, pid));
-        renamed_daemon_evidence(launch.as_ref(), pid, live)
-    }
+        if renamed_daemon_evidence(launch.as_ref(), pid, live) {
+            DaemonProcessIdentity::Verified
+        } else {
+            DaemonProcessIdentity::Indeterminate
+        }
+    })
 }
 
 /// Cross-platform check that `pid` belongs to an `aoe serve` process.
@@ -1255,16 +1254,9 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     let proc_path = format!("/proc/{}/cmdline", pid);
     if std::path::Path::new(&proc_path).exists() {
         return match std::fs::read(&proc_path) {
-            Ok(cmdline)
-                if command_is_aoe_serve(&cmdline) || is_renamed_daemon(pid as u32, &cmdline) =>
-            {
-                DaemonProcessIdentity::Verified
-            }
-            // A renamed daemon without launch evidence is unverified, not foreign.
-            Ok(cmdline) if renamed_daemon_child_argv(&cmdline) => {
-                DaemonProcessIdentity::Indeterminate
-            }
-            Ok(_) => DaemonProcessIdentity::Foreign,
+            Ok(cmdline) if command_is_aoe_serve(&cmdline) => DaemonProcessIdentity::Verified,
+            Ok(cmdline) => classify_renamed_daemon(pid as u32, &split_argv(&cmdline))
+                .unwrap_or(DaemonProcessIdentity::Foreign),
             Err(_) => DaemonProcessIdentity::Indeterminate,
         };
     }
@@ -1281,18 +1273,18 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
         Ok(Some(out)) if !out.status.success() || out.stdout.trim_ascii().is_empty() => {
             DaemonProcessIdentity::Indeterminate
         }
-        Ok(Some(out))
-            if command_is_aoe_serve(&out.stdout) || is_renamed_daemon(pid as u32, &out.stdout) =>
-        {
-            DaemonProcessIdentity::Verified
+        Ok(Some(out)) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
+        Ok(Some(out)) => {
+            // `ps` flattens argv; macOS has the structured argv for the renamed check.
+            let argv = crate::process::process_argv(pid as u32);
+            let args: Vec<&[u8]> = argv.iter().flatten().map(Vec::as_slice).collect();
+            classify_renamed_daemon(pid as u32, &args)
+                .or_else(|| {
+                    command_mentions_aoe_executable(&out.stdout)
+                        .then_some(DaemonProcessIdentity::Indeterminate)
+                })
+                .unwrap_or(DaemonProcessIdentity::Foreign)
         }
-        Ok(Some(out))
-            if command_mentions_aoe_executable(&out.stdout)
-                || renamed_daemon_child_argv(&out.stdout) =>
-        {
-            DaemonProcessIdentity::Indeterminate
-        }
-        Ok(Some(_)) => DaemonProcessIdentity::Foreign,
         Ok(None) | Err(_) => DaemonProcessIdentity::Indeterminate,
     }
 }
@@ -3249,21 +3241,46 @@ mod tests {
 
     #[test]
     fn renamed_binary_is_the_daemon_only_with_launch_evidence() {
-        let argv: &[(&[u8], bool)] = &[
-            (b"/x/aoe-darwin-arm64\0serve\0--daemon-child\0", true),
-            (b"/x/aoe-darwin-arm64 -p work serve --daemon-child", true),
+        let argv: &[(&[&[u8]], bool)] = &[
+            (&[b"/x/aoe-darwin-arm64", b"serve", b"--daemon-child"], true),
             (
-                b"/Users/me/My Apps/aoe-darwin-arm64 serve --daemon-child",
+                &[
+                    b"/x/aoe-darwin-arm64",
+                    b"-p",
+                    b"work",
+                    b"serve",
+                    b"--daemon-child",
+                ],
                 true,
             ),
-            (b"/x/aoe-darwin-arm64 serve --daemon", false),
-            (b"/x/aoe-darwin-arm64 serve", false),
-            (b"/x/aoe-darwin-arm64 serve --daemon --daemon-child", false),
-            (b"/usr/bin/worker\0--label\0serve --daemon-child\0", false),
-            (b"/My Apps/x\0-p\0work\0serve\0--daemon-child\0", true),
+            // A path with spaces is still one argument.
+            (
+                &[
+                    b"/Users/me/My Apps/aoe-darwin-arm64",
+                    b"serve",
+                    b"--daemon-child",
+                ],
+                true,
+            ),
+            (&[b"/x/aoe-darwin-arm64", b"serve", b"--daemon"], false),
+            (&[b"/x/aoe-darwin-arm64", b"serve"], false),
+            (
+                &[
+                    b"/x/aoe-darwin-arm64",
+                    b"serve",
+                    b"--daemon",
+                    b"--daemon-child",
+                ],
+                false,
+            ),
+            (&[b"worker", b"serve", b"--daemon-children"], false),
+            (
+                &[b"/usr/bin/worker", b"--label", b"serve --daemon-child"],
+                false,
+            ),
         ];
-        for (command, expected) in argv {
-            assert_eq!(renamed_daemon_child_argv(command), *expected, "{command:?}");
+        for (args, expected) in argv {
+            assert_eq!(renamed_daemon_child_argv(args), *expected, "{args:?}");
         }
 
         let launch = |pid, instance: Option<&str>| ServeLaunch {

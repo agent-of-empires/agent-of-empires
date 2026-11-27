@@ -2952,6 +2952,60 @@ pub(super) fn boot_id() -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+/// The structured argv of `pid`, with each argument kept whole.
+pub(super) fn process_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROCARGS2,
+        i32::try_from(pid).ok()?,
+    ];
+    let mut length = 0usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || length > 256 * 1024
+    {
+        return None;
+    }
+    let mut bytes = vec![0u8; length];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    bytes.truncate(length);
+    let count = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    if !(1..=4096).contains(&count) {
+        return None;
+    }
+    let tail = bytes.get(4..)?;
+    let executable_end = tail.iter().position(|byte| *byte == 0)?;
+    let padding = tail.get(executable_end + 1..)?;
+    let start = padding.iter().position(|byte| *byte != 0)?;
+    Some(
+        padding[start..]
+            .split(|byte| *byte == 0)
+            .take(count as usize)
+            .map(<[u8]>::to_vec)
+            .collect(),
+    )
+}
+
 pub(super) fn foreground_arguments(shell_pid: u32) -> Vec<super::ProcessArguments> {
     let Some(foreground) = get_foreground_pid(shell_pid) else {
         return Vec::new();
@@ -2966,51 +3020,10 @@ pub(super) fn foreground_arguments(shell_pid: u32) -> Vec<super::ProcessArgument
             if unsafe { libc::getpgid(pid as i32) } != group {
                 return None;
             }
-            let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as i32];
-            let mut length = 0usize;
-            if unsafe {
-                libc::sysctl(
-                    mib.as_mut_ptr(),
-                    3,
-                    std::ptr::null_mut(),
-                    &mut length,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            } != 0
-                || length > 256 * 1024
-            {
-                return None;
-            }
-            let mut bytes = vec![0u8; length];
-            if unsafe {
-                libc::sysctl(
-                    mib.as_mut_ptr(),
-                    3,
-                    bytes.as_mut_ptr().cast(),
-                    &mut length,
-                    std::ptr::null_mut(),
-                    0,
-                )
-            } != 0
-            {
-                return None;
-            }
-            bytes.truncate(length);
-            let count = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
-            if !(1..=4096).contains(&count) {
-                return None;
-            }
-            let tail = bytes.get(4..)?;
-            let executable_end = tail.iter().position(|byte| *byte == 0)?;
-            let padding = tail.get(executable_end + 1..)?;
-            let start = padding.iter().position(|byte| *byte != 0)?;
-            let mut arguments = padding[start..].split(|byte| *byte == 0);
-            let argv: Vec<String> = arguments
-                .by_ref()
-                .take(count as usize)
-                .map(|word| std::str::from_utf8(word).map(str::to_owned))
-                .collect::<Result<_, _>>()
+            let argv = process_argv(pid)?
+                .into_iter()
+                .map(String::from_utf8)
+                .collect::<Result<Vec<_>, _>>()
                 .ok()?;
 
             Some(super::ProcessArguments {

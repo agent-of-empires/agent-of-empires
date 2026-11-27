@@ -2166,6 +2166,21 @@ pub(crate) fn foreground_arguments(shell_pid: u32) -> Vec<ProcessArguments> {
     }
 }
 
+/// The structured argv of `pid` on macOS, where `ps` flattens it. Linux callers
+/// read `/proc/<pid>/cmdline` directly.
+pub(crate) fn process_argv(pid: u32) -> Option<Vec<Vec<u8>>> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::process_argv(pid)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// The parent pid and `argv[0]` of `pid`, or `None` when it cannot be read.
 pub fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     #[cfg(target_os = "linux")]
