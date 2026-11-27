@@ -88,7 +88,8 @@ Web changes have additional checks in [web/AGENTS.md](web/AGENTS.md).
 A skipped macOS check is not coverage. The `macOS gate` job in
 [tests.yml](.github/workflows/tests.yml) runs macOS for sensitive changes or
 potentially incomplete file data; when adding macOS-specific code or tests
-outside its covered paths, extend its sensitive-file list. To force a run, add
+outside its covered paths, extend the sensitive-file list in
+[macos-gate.cjs](.github/scripts/macos-gate.cjs). To force a run, add
 `ci-macos` and re-run the `macOS gate` job.
 
 Releases ship from a release-plz PR, with daily nightlies of `main`.

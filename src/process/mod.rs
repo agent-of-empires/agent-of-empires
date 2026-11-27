@@ -65,6 +65,33 @@ pub(crate) fn mount_points() -> std::io::Result<std::collections::HashSet<std::p
     }
 }
 
+/// Standard system folders that live directly under $HOME. On macOS several
+/// of these (Downloads, Desktop, Pictures/Photos, Music) are TCC-protected:
+/// opening them triggers a permission prompt. None is ever a git repo, so the
+/// directory browser skips its `.git` probe for them and avoids the prompt.
+const HOME_SYSTEM_DIRS: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+    "Public",
+    "Library",
+];
+
+/// Whether `name` is a TCC-protected folder directly under `home`, so opening
+/// it would prompt. Always false off macOS, where no such prompt exists.
+pub(crate) fn is_tcc_protected_home_dir(parent: &Path, name: &str, home: Option<&Path>) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    match home {
+        Some(home) => parent == home && HOME_SYSTEM_DIRS.contains(&name),
+        None => false,
+    }
+}
+
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]
@@ -2479,6 +2506,34 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcc_protected_home_dirs_are_macos_only() {
+        let home = Path::new("/Users/alice");
+
+        // The TCC prompt is macOS-only, so other platforms probe normally.
+        let macos = cfg!(target_os = "macos");
+
+        // Protected folders directly under $HOME: skipped on macOS.
+        for name in ["Downloads", "Desktop", "Music", "Pictures", "Documents"] {
+            assert_eq!(
+                is_tcc_protected_home_dir(home, name, Some(home)),
+                macos,
+                "unexpected probe decision for ~/{name}"
+            );
+        }
+
+        // A real project directly under $HOME still gets probed, so its git
+        // badge is preserved.
+        assert!(!is_tcc_protected_home_dir(home, "myproject", Some(home)));
+
+        // A system-looking name that is not directly under $HOME is probed.
+        let sub = Path::new("/Users/alice/code");
+        assert!(!is_tcc_protected_home_dir(sub, "Downloads", Some(home)));
+
+        // No home resolved: never skip (falls back to normal probing).
+        assert!(!is_tcc_protected_home_dir(home, "Downloads", None));
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
