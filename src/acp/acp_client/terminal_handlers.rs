@@ -189,7 +189,7 @@ pub(super) fn handle_release_terminal(
         &state,
     );
     async move {
-        res.terminals.release(&terminal?).map_err(|error| {
+        res.terminals.release(&terminal?).await.map_err(|error| {
             agent_client_protocol::Error::internal_error().data(error.to_string())
         })?;
         Ok(ReleaseTerminalResponse::new())
