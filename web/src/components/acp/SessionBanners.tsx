@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
-import { BRAND_BUTTON, DANGER_BUTTON, CancelButton, ConfirmButton, Dialog } from "../Dialog";
+import { CancelButton, ConfirmButton, Dialog } from "../Dialog";
 import { useBusyAction, useConfirmKeys, useDialogFocus } from "../dialogHooks";
 import {
   nativeInputAvailable,
@@ -440,7 +440,6 @@ function StartupFreshDialog({
             buttonRef={confirmRef}
             onClick={confirm}
             busy={starting}
-            className={BRAND_BUTTON}
             testId="startup-fresh-confirm"
           >
             {starting ? "Starting fresh…" : "Start fresh"}
@@ -515,7 +514,7 @@ function InteractionErrorBanner({
   if (onDismiss && !children) {
     return (
       <WarningStrip title={title} onDismiss={onDismiss}>
-        {message}
+        <span className="block">{message}</span>
       </WarningStrip>
     );
   }
@@ -730,7 +729,7 @@ function FreshRecoveryConfirm({ onCancel, onConfirm }: { onCancel: () => void; o
             buttonRef={confirmRef}
             onClick={onConfirm}
             testId="session-recovery-fresh-confirm"
-            className={DANGER_BUTTON}
+            tone="danger"
           >
             Launch without restore flags
           </ConfirmButton>
