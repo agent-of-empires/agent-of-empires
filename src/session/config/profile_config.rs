@@ -234,13 +234,17 @@ pub(crate) fn resolve_config_or_warn_via(profile: &str, read: super::ReadFile) -
     }
 }
 
-/// Merge profile overrides, keeping schema-declared global-only fields global.
+/// Merge profile overrides, keeping schema-declared global-only fields, and the
+/// unschematized global-only `keybinds` table, global.
 pub fn merge_configs(global: Config, profile: &ProfileConfig) -> Config {
     let mut overrides = profile.overrides_value();
     for field in super::settings_schema::schema_ref() {
         if !field.profile_overridable {
             super::settings_schema::clear_path(&mut overrides, &field.section, &field.field);
         }
+    }
+    if let serde_json::Value::Object(map) = &mut overrides {
+        map.remove("keybinds");
     }
     merge_configs_generic(&global, &overrides)
 }
@@ -852,6 +856,17 @@ mod tests {
         let merged = merge_configs(global, &profile);
         // Profile env replaces (matches sandbox.environment semantics).
         assert_eq!(merged.environment, vec!["FROM_PROFILE=2".to_string()]);
+    }
+
+    #[test]
+    fn profile_keybinds_never_replace_the_global_table() {
+        let global = Config {
+            keybinds: [("delete".to_string(), vec!["F2".to_string()])].into(),
+            ..Default::default()
+        };
+        let profile: ProfileConfig = toml::from_str("[keybinds]\ndelete = []\n").unwrap();
+        let merged = merge_configs(global, &profile);
+        assert_eq!(merged.keybinds["delete"], vec!["F2".to_string()]);
     }
 
     #[test]

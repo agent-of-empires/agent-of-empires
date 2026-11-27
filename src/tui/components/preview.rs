@@ -164,6 +164,7 @@ impl Preview {
         theme: &Theme,
         compact: bool,
         show_info: bool,
+        activate_key: &str,
     ) {
         use crate::session::PanePresence;
         // One source of truth for the header / banner / output split. Compact
@@ -248,9 +249,13 @@ impl Preview {
 
         let inner = layout.output;
         if terminal_presence == PanePresence::Absent {
-            let hint = Paragraph::new("Press Enter to start terminal")
-                .style(Style::default().fg(theme.dimmed))
-                .alignment(Alignment::Center);
+            let hint = Paragraph::new(if activate_key.is_empty() {
+                "Terminal not started".to_string()
+            } else {
+                format!("Press {activate_key} to start terminal")
+            })
+            .style(Style::default().fg(theme.dimmed))
+            .alignment(Alignment::Center);
             frame.render_widget(hint, inner);
         } else if let Some(output_text) = parsed_output {
             render_scrolled_output(
@@ -264,9 +269,10 @@ impl Preview {
             );
         } else if !cached_output.pending {
             let hint = Paragraph::new(match terminal_presence {
-                PanePresence::Unknown => "Terminal status unavailable",
-                PanePresence::Dead => "Terminal exited; press Enter to restart",
-                _ => "No output available",
+                PanePresence::Unknown => "Terminal status unavailable".to_string(),
+                PanePresence::Dead if activate_key.is_empty() => "Terminal exited".to_string(),
+                PanePresence::Dead => format!("Terminal exited; press {activate_key} to restart"),
+                _ => "No output available".to_string(),
             })
             .style(Style::default().fg(theme.dimmed))
             .alignment(Alignment::Center);
@@ -903,7 +909,11 @@ mod tests {
     }
 
     /// Rows of a rendered terminal preview, for the hint assertions below.
-    fn terminal_preview_rows(pending: bool) -> Vec<String> {
+    fn terminal_preview_rows(
+        presence: crate::session::PanePresence,
+        pending: bool,
+        activate_key: &str,
+    ) -> Vec<String> {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let theme = crate::tui::styles::load_theme("empire");
@@ -915,12 +925,13 @@ mod tests {
                     frame,
                     frame.area(),
                     &instance,
-                    crate::session::PanePresence::Alive,
+                    presence,
                     CachedPreview::new(None, pending),
                     0,
                     &theme,
                     false,
                     false,
+                    activate_key,
                 );
             })
             .unwrap();
@@ -937,7 +948,7 @@ mod tests {
     #[test]
     fn empty_preview_hint_waits_for_the_first_frame() {
         let hint = |pending| {
-            terminal_preview_rows(pending)
+            terminal_preview_rows(crate::session::PanePresence::Alive, pending, "Enter")
                 .iter()
                 .any(|row| row.contains("No output available"))
         };
@@ -949,5 +960,30 @@ mod tests {
             !hint(true),
             "no frame yet for the displayed session paints nothing"
         );
+    }
+
+    /// Absent and exited panes name the effective activation key, or drop the prompt when
+    /// activation is unbound.
+    #[test]
+    fn pane_hints_name_the_activation_key() {
+        use crate::session::PanePresence::{Absent, Dead};
+        let cases = [
+            (Absent, "Enter", "Press Enter to start terminal"),
+            (Absent, "Ctrl+Enter", "Press Ctrl+Enter to start terminal"),
+            (Absent, "", "Terminal not started"),
+            (
+                Dead,
+                "Ctrl+Enter",
+                "Terminal exited; press Ctrl+Enter to restart",
+            ),
+            (Dead, "", "Terminal exited"),
+        ];
+        for (presence, key, want) in cases {
+            let rows = terminal_preview_rows(presence, false, key);
+            assert!(
+                rows.iter().any(|row| row.trim() == want),
+                "{presence:?} {key:?}: {rows:?}"
+            );
+        }
     }
 }

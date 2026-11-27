@@ -331,3 +331,73 @@ fn an_offline_daemon_takes_over_the_home_screen_as_connections() {
     }
     assert!(!screen.contains("Runtime unavailable"), "{screen}");
 }
+
+/// The committed-search cue and New follow the effective keys. An overridden search-next is
+/// what "next" sends and New keeps the bare `n` it no longer shares; an unbound search-next
+/// leaves an Esc button that clears the search.
+#[test]
+#[serial]
+fn committed_search_footer_follows_keybind_overrides() {
+    use crate::tui::home::keybinds;
+    for next in [vec!["F8".to_string()], vec![]] {
+        let mut env = create_test_env_with_sessions(3);
+        let config = crate::session::Config {
+            keybinds: [("search-next".to_string(), next.clone())].into(),
+            ..Default::default()
+        };
+        let (keymap, warnings) = keybinds::from_config(&config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        keybinds::install(keymap);
+        for c in ['/', 's', 'e', 's', 's'] {
+            env.view.handle_key(key(KeyCode::Char(c)), None);
+        }
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(env.view.search_matches.len() > 1, "{next:?}");
+        render_at(&mut env, 200, 12);
+
+        if next.is_empty() {
+            let esc = button_key(&env, KeyCode::Esc).expect("Esc clears the search");
+            env.view.handle_key(esc, None);
+            assert!(env.view.search_query.value().is_empty(), "Esc cleared");
+        } else {
+            assert!(button_key(&env, KeyCode::Char('n')).is_some());
+            let next = button_key(&env, KeyCode::F(8)).expect("next sends F8");
+            env.view.handle_key(next, None);
+            assert_eq!(env.view.search_match_index, 1, "F8 cycled");
+            render_at(&mut env, 200, 12);
+        }
+        let new = button_key(&env, KeyCode::Char('n')).expect("New keeps bare n");
+        env.view.handle_key(new, None);
+        assert!(env.view.new_dialog.is_some(), "{next:?}: New opened");
+    }
+}
+
+/// With new-session unbound, New falls back to new-from-selection only while a session or
+/// group is selected, since that action creates nothing without one.
+#[test]
+#[serial]
+fn new_button_falls_back_only_with_a_selection() {
+    use crate::tui::home::keybinds;
+    for sessions in [0, 3] {
+        let mut env = if sessions == 0 {
+            create_test_env_empty()
+        } else {
+            create_test_env_with_sessions(sessions)
+        };
+        let config = crate::session::Config {
+            keybinds: [("new-session".to_string(), vec![])].into(),
+            ..Default::default()
+        };
+        let (keymap, warnings) = keybinds::from_config(&config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        keybinds::install(keymap);
+        render_at(&mut env, 200, 12);
+        let selected = env.view.selected_session.is_some() || env.view.selected_group.is_some();
+        assert_eq!(selected, sessions > 0, "fixture selection");
+        assert_eq!(
+            button_key(&env, KeyCode::Char('N')).is_some(),
+            selected,
+            "{sessions} sessions"
+        );
+    }
+}
