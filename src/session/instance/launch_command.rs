@@ -406,14 +406,14 @@ pub(super) fn build_fork_flags(
     child_id: &str,
     generation: crate::agents::AgentGeneration,
 ) -> String {
-    use crate::agents::{get_agent, ForkStrategy};
+    use crate::agents::{native_definition, ForkStrategy};
 
     if !is_valid_session_id(parent_id) || !is_valid_session_id(child_id) {
         tracing::warn!(target: "session.store",
             "Refusing to build fork flags: invalid id (parent={parent_id:?} child={child_id:?})");
         return String::new();
     }
-    let Some(agent) = get_agent(tool) else {
+    let Some(agent) = native_definition(tool) else {
         return String::new();
     };
     let Some(strategy) = agent.fork_strategy.resolve(generation) else {

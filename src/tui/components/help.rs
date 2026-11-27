@@ -97,10 +97,9 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
         ("\u{1f4a1}", "Tips (badge, or Ctrl+K \u{2192} \"tips\")"),
     ]));
 
-    // Navigation is mode-invariant except the collapse row: in non-strict mode
-    // bare `h` is the contextual snooze key, so only `<-` is advertised for
-    // collapse; in strict mode `h` always collapses.
-    let nav_collapse = if strict { "h/\u{2190}" } else { "\u{2190}" };
+    // Bare `h` snoozes on a session row and collapses on a group header, so the
+    // collapse row can advertise it in both modes.
+    let nav_collapse = "h/\u{2190}";
     let navigation = owned([
         ("j/\u{2193}", "Move down"),
         ("k/\u{2191}", "Move up"),
@@ -115,13 +114,12 @@ fn shortcuts(strict: bool, live_on_enter: bool) -> Vec<(&'static str, Vec<(Strin
     } else {
         "Actions"
     };
-    // Favorite is an Attention-section shortcut, but it also works outside the
-    // Attention sort while `favorites_first` is on, so the heading lists it as
-    // an exception only then. Archive is always an exception.
+    // These shortcuts belong to the Attention sort; the exceptions also work in
+    // every other sort. Favorite is one only while `favorites_first` is on.
     let attention_title = if crate::session::favorites_first() {
-        "Attention (Attention sort only, except Archive and Favorite)"
+        "Attention (except Archive, Favorite and Snooze)"
     } else {
-        "Attention (Attention sort only, except Archive)"
+        "Attention (except Archive and Snooze)"
     };
     vec![
         ("Navigation", navigation),

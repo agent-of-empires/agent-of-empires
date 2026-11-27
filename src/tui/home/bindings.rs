@@ -256,7 +256,10 @@ const fn shift_code(code: KeyCode) -> Chord {
 pub enum Context {
     Always,
     TerminalView,
-    AttentionSort,
+    /// A session row sits under the cursor, whatever the sort order. Snooze acts on
+    /// that session, and must not claim the chord on a group header, where `h` still
+    /// collapses the group.
+    SessionSelected,
     /// Favorites are actionable: either the Attention sort is active, where
     /// favorite is a within-tier tiebreak, or `session.favorites_first` is on,
     /// where it pins in every sort order. With neither, toggling a favorite
@@ -313,6 +316,8 @@ pub struct Ctx {
     pub view_mode: ViewMode,
     pub sort_order: SortOrder,
     pub has_search: bool,
+    /// True when the cursor sits on a session row rather than a group or suggestion header.
+    pub session_selected: bool,
     /// True when the cursor sits on a real project header in project view, so
     /// the pin toggle can claim its chord ahead of the projects-dialog binding.
     pub project_group_selected: bool,
@@ -336,7 +341,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
     match context {
         Context::Always => true,
         Context::TerminalView => ctx.view_mode == ViewMode::Terminal,
-        Context::AttentionSort => ctx.sort_order == SortOrder::Attention,
+        Context::SessionSelected => ctx.session_selected,
         Context::FavoritesUsable => {
             ctx.sort_order == SortOrder::Attention || crate::session::favorites_first()
         }
@@ -656,10 +661,10 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::ToggleSnooze,
         non_strict: &[k('h')],
         strict: &[k('H')],
-        context: Context::AttentionSort,
+        context: Context::SessionSelected,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Snooze (toggle, Attention sort)",
+            desc: "Snooze (toggle)",
         }),
         palette: Some(PaletteMeta {
             title: "Toggle snooze",
@@ -1454,6 +1459,7 @@ mod tests {
             view_mode: ViewMode::Structured,
             sort_order: SortOrder::Newest,
             has_search: false,
+            session_selected: true,
             project_group_selected: false,
             preview_scroll: false,
         }
@@ -1671,14 +1677,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn context_guards_gate_attention_and_terminal_actions() {
-        // Snooze resolves only in the Attention sort. Favorite resolves there regardless
+        // Snooze resolves on a session row in any sort. Favorite resolves there regardless
         // of `session.favorites_first`, which only opens it outside Attention.
         let original = crate::session::favorites_first();
         crate::session::set_favorites_first(false);
 
         let mut c = ctx();
         assert_eq!(resolve(&key('f'), false, &c), None);
+        assert_eq!(resolve(&key('h'), false, &c), Some(ActionId::ToggleSnooze));
+        // Without a session under the cursor `h` is a group collapse, not a snooze.
+        c.session_selected = false;
         assert_eq!(resolve(&key('h'), false, &c), None);
+        c.session_selected = true;
         crate::session::set_favorites_first(true);
         assert_eq!(
             resolve(&key('f'), false, &c),
