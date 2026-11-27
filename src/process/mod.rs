@@ -1050,13 +1050,20 @@ pub(crate) fn run_status_with_timeout_process_group(
         Some(cleanup),
         cancel,
     );
-    if cleanup == ProcessGroupCleanup::Always {
+    #[cfg(unix)]
+    if result
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(libc::ECHILD))
+    {
         return result;
     }
     if result.is_err() {
         platform::kill_process_group(&child);
         let _ = child.kill();
         poll_killed_status_child(&mut child);
+    }
+    if cleanup == ProcessGroupCleanup::Always && result.is_ok() {
+        return result;
     }
     if !matches!(result, Ok(Some(_))) && matches!(child.try_wait(), Ok(None)) {
         // A killed child may still be in uninterruptible sleep. Shutdown must not join it.
