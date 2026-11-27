@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `26`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `28`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 27
+api_version = 28
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,10 +30,11 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `26`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `28`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
+| `command_groups` | array of tables | no | Named CLI verbs that nest their commands under `aoe <verb>`. Requires `api_version >= 27`. See [Command groups](#command-groups-api_version--27). |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 23` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
@@ -125,7 +126,7 @@ The example's `detection` requires `session.integration` in the manifest's capab
 - `launch.aliases` are unique lowercase agent ids, distinct from the tool. `oneshot_flag` and `model_flag` are single shell-safe flags. `instruction_flag` has one `{}` placeholder, as a whole argument or after `=`, and otherwise contains shell-safe words.
 - `launch.send_keys_enter_delay_ms` is the pause, in milliseconds, that the host leaves between typing a message into the agent's pane and sending Enter. Some agents read a fast burst as a paste and drop the Enter, which leaves the message as an unsent draft that looks like a running session. It requires `api_version >= 22` and is capped at 2000. An agent that declares nothing falls back to the host's built-in pause for its tool.
 - `launch.yolo` is `kind = "flag"` with `flag`, `kind = "always"`, or `kind = "env"` with `key` and `value`. An `always` declaration applies while active without changing the session's saved Yolo preference. `container_env` is applied to sandbox launches. Protected environment names are rejected.
-- `launch.resume` is `kind = "flag"` with `flag`, `kind = "flag_pair"` with `existing` and `new_session`, or `kind = "subcommand"` with `command`. Resume and capture require each other. Capture accepts `backend = "omp"` or `backend = "extension_sidecar"` (`api_version >= 27`), with `pane_scoped` in at least one of `host` or `sandbox` and `pane_scoped` or `unsupported` in the other. `extension_sidecar` means the agent-side extension the plugin ships writes the conversation id into the session's hook sidecar, so the host parses no provider format and carries no provider-specific resume code of its own. Every launch sets `AOE_SESSION_SOURCE` to its launch id, and the extension names the file `session_id.<launch id>`, or plain `session_id` when the launch names no source, so an id an earlier launch published is never read as the current one. A sandboxed launch bind-mounts that same directory and names it in `AOE_INTEGRATION_DIR`. The host reads an id of 1 to 256 ASCII bytes drawn from letters, digits, `-`, `_` and `.` that does not start with `-`, and ignores any other value. It opens that file as the host's effective uid, so a sandboxed extension must write it readable by that uid: a rootful runtime writes as `root`, where mode `0644` is what a non-root host needs, since it cannot change the mode of a root-owned file. An id file the host cannot open counts as no id.
+- `launch.resume` is `kind = "flag"` with `flag`, `kind = "flag_pair"` with `existing` and `new_session`, or `kind = "subcommand"` with `command`. Resume and capture require each other. Capture accepts `backend = "omp"` or `backend = "extension_sidecar"` (`api_version >= 28`), with `pane_scoped` in at least one of `host` or `sandbox` and `pane_scoped` or `unsupported` in the other. `extension_sidecar` means the agent-side extension the plugin ships writes the conversation id into the session's hook sidecar, so the host parses no provider format and carries no provider-specific resume code of its own. Every launch sets `AOE_SESSION_SOURCE` to its launch id, and the extension names the file `session_id.<launch id>`, or plain `session_id` when the launch names no source, so an id an earlier launch published is never read as the current one. A sandboxed launch bind-mounts that same directory and names it in `AOE_INTEGRATION_DIR`. The host reads an id of 1 to 256 ASCII bytes drawn from letters, digits, `-`, `_` and `.` that does not start with `-`, and ignores any other value. It opens that file as the host's effective uid, so a sandboxed extension must write it readable by that uid: a rootful runtime writes as `root`, where mode `0644` is what a non-root host needs, since it cannot change the mode of a root-owned file. An id file the host cannot open counts as no id.
 - `detection.mode = "native_only"` requires `session.integration`; the integration owns status rather than falling back to pane parsing when a report is missing or invalid.
 - `session_id` declares that the plugin worker owns session-id capture for the tool, so the provider's store layout and wire formats stay in the plugin. It requires `api_version >= 22` and a manifest that declares a `[runtime]` worker. The declared worker reports what it captured with the `session.capture.set` RPC, taking `session_id` (the session to attribute) and `agent_session_id` (the provider's id) and requiring `session.write`. Only the plugin that owns the session's tool may report; any other caller gets `not_capture_owner`. The host applies the id through `persist_session_with_storage`, the guarded observation path the pollers use, and answers `applied = false` with one of three reasons: `pinned` (the row pins a different conversation for its next launch), `owned_elsewhere` (another session durably owns the id), or `stale` (the row changed since the host read it, or the id is capture-excluded).
 
@@ -187,7 +188,7 @@ A capability this host version does not recognize is rejected, not granted.
 
 ## Commands
 
-Palette entries, namespaced by the host as `plugin.<id>.<command-id>`. A command with no `action` is delivered to the worker as a `plugin.command.invoke` notification. The CLI lists them in `aoe --help` but cannot run them yet. A command whose name a core subcommand or an earlier plugin already uses is not listed.
+Palette entries, namespaced by the host as `plugin.<id>.<command-id>`. A command with no `action` is delivered to the worker as a `plugin.command.invoke` notification. The CLI lists them in `aoe --help` but cannot run them yet. A command whose name a core subcommand or an earlier plugin already uses is not listed. A command that names a `group` appears as `aoe <group> <id>` instead of a flat top-level verb.
 
 ```toml
 [[commands]]
@@ -202,6 +203,7 @@ description = "Show the status summary."
 | `title` | string | no | Display name. |
 | `description` | string | no | Help text. |
 | `action` | table | no | A client-executed action. Requires `api_version >= 6` and the `browser_open` capability. |
+| `group` | string | no | Id of a declared `[[command_groups]]` entry. Requires `api_version >= 27`. See [Command groups](#command-groups-api_version--27). |
 
 A command `action` is a client-executed action instead of a worker call. The only `kind` is `open-ui-link`, which opens the `href` from the plugin's own `(slot, id)` UI-state entry in the browser, with no worker round-trip; that pair must match a declared `[[ui]]` entry on a per-session slot.
 
@@ -217,6 +219,37 @@ to link back into aoe (a plugin cannot know the host, port, or tunnel origin).
 Relative hrefs must start with exactly one `/`; `//host`, backslashes, and
 embedded tab/CR/LF are rejected because a browser would resolve them onto a
 different origin. See [Link targets](#link-targets).
+
+### Command groups (`api_version >= 27`)
+
+A group gives the plugin a short CLI verb instead of a name-prefixed one.
+Declare the verb once and set `group` on the commands it carries:
+
+```toml
+[[command_groups]]
+id = "linear"
+about = "Linear issue commands"
+
+[[commands]]
+id = "refresh"
+title = "Refresh Linear issues"
+group = "linear"
+```
+
+That grafts `aoe linear refresh`. A `[[commands]]` entry with no `group` keeps
+its flat top-level name, so groups are additive and one level deep.
+
+`id` on a group, and on a command that names one, is a single bare lowercase
+verb (letters, digits, `-`, `_`), and `help` is reserved for the group's own
+help subcommand. Nesting changes only the CLI path: the command id, the
+`plugin.<id>.<command-id>` name the host sends in `plugin.command.invoke`
+params, `action` targets, and `[[keybinds]]` stay as they are.
+
+Core keeps the top level. A group whose id matches a core subcommand is not
+grafted, and neither are its commands; a group id goes to the first active
+plugin that declares it, and within a group the first plugin to claim a leaf
+name wins. A flat command whose name an accepted group verb already takes is not
+grafted.
 
 ## Keybinds
 

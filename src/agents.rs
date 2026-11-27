@@ -405,6 +405,8 @@ pub struct AgentDef<'a> {
     pub sidecar_hooks: Option<SidecarHooks>,
     pub session_support: Option<SessionSupport<'a>>,
     pub fork_strategy: ForkStrategy,
+    /// The fork reads the parent's transcript on the host, so a sandboxed parent cannot fork.
+    pub fork_host_only: bool,
     pub host_only: bool,
     /// Delay before Enter, for agents whose paste-burst detection swallows a fast Enter.
     pub send_keys_enter_delay_ms: u64,
@@ -628,6 +630,7 @@ const fn agent(
         sidecar_hooks: None,
         session_support: None,
         fork_strategy: ForkStrategy::Unsupported,
+        fork_host_only: false,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         ready_markers: &[],
@@ -1007,9 +1010,13 @@ pub const AGENTS: &[AgentDef<'static>] = &[
 ];
 
 impl AgentDef<'_> {
-    /// Whether a fork can run in this context. A `ValueFlag` fork leaves the
-    /// child id to the agent, so it needs a capture context that can read it.
+    /// Whether a fork can run in this context. A host-only fork needs a host
+    /// parent, and a `ValueFlag` fork leaves the child id to the agent, so it
+    /// needs a capture context that can read it.
     pub fn can_fork_in(&self, sandboxed: bool) -> bool {
+        if sandboxed && self.fork_host_only {
+            return false;
+        }
         if !matches!(self.fork_strategy, ForkStrategy::ValueFlag(_)) {
             return true;
         }

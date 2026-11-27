@@ -36,6 +36,10 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandContribution>,
 
+    /// Named groups that nest their commands under one CLI verb (API v27).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_groups: Vec<CommandGroupContribution>,
+
     /// Keybinds the plugin contributes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keybinds: Vec<KeybindContribution>,
@@ -87,6 +91,19 @@ pub struct CommandContribution {
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<ClientAction>,
+    /// Group id this command nests under as `aoe <group> <id>` (API v27).
+    /// Ungrouped commands keep their flat top-level name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// A CLI verb that nests the commands naming it as `aoe <id> <command-id>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandGroupContribution {
+    pub id: String,
+    #[serde(default)]
+    pub about: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -806,6 +823,15 @@ fn declaration_method_ok(method: &str) -> bool {
         })
 }
 
+/// A CLI verb or leaf name: one bare lowercase segment clap can carry.
+fn cli_verb_ok(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
+}
+
 fn validate_agent_declaration(
     i: usize,
     integration: &crate::agent_integration::AgentIntegrationContribution,
@@ -1185,15 +1211,66 @@ impl PluginManifest {
             );
         }
 
+        let mut group_ids = std::collections::HashSet::new();
+        for (i, g) in self.command_groups.iter().enumerate() {
+            check(
+                cli_verb_ok(&g.id),
+                format!(
+                    "command_groups[{i}].id {:?} must be one bare lowercase CLI verb",
+                    g.id
+                ),
+            );
+            check(
+                g.id != "help",
+                format!("command_groups[{i}].id \"help\" is clap's own subcommand"),
+            );
+            check(
+                group_ids.insert(g.id.as_str()),
+                format!("command_groups must not repeat id {:?}", g.id),
+            );
+        }
+
         let has_browser_open = self
             .capabilities
             .iter()
             .any(|c| c.as_str() == "browser_open");
+        let mut command_ids = std::collections::HashSet::new();
         for (i, c) in self.commands.iter().enumerate() {
             check(
                 !c.id.is_empty(),
                 format!("commands[{i}].id must not be empty"),
             );
+            // The command id alone names the command for the palette, keybinds
+            // and dispatch, so two groups cannot both publish `refresh`.
+            check(
+                command_ids.insert(c.id.as_str()),
+                format!("commands must not repeat id {:?}", c.id),
+            );
+            if let Some(group) = &c.group {
+                check(
+                    self.api_version >= 27,
+                    format!("commands[{i}].group requires api_version >= 27"),
+                );
+                check(
+                    c.id != "help",
+                    format!(
+                        "commands[{i}].id \"help\" is the group's own help subcommand and cannot be a grouped command id"
+                    ),
+                );
+                check(
+                    cli_verb_ok(&c.id),
+                    format!(
+                        "commands[{i}].id {:?} must be one bare lowercase CLI verb when it names a group",
+                        c.id
+                    ),
+                );
+                check(
+                    group_ids.contains(group.as_str()),
+                    format!(
+                        "commands[{i}].group {group:?} does not match any declared command_groups id"
+                    ),
+                );
+            }
             if let Some(ClientAction::OpenUiLink { slot, id }) = &c.action {
                 check(
                     self.api_version >= 6,
@@ -1349,7 +1426,7 @@ impl PluginManifest {
                 format!("agent_integrations[{i}].session_id requires api_version >= 22"),
             );
             check(
-                self.api_version >= 27
+                self.api_version >= 28
                     || integration
                         .launch
                         .as_ref()
@@ -1359,7 +1436,7 @@ impl PluginManifest {
                                 != crate::agent_integration::AgentCaptureBackend::ExtensionSidecar
                         }),
                 format!(
-                    "agent_integrations[{i}].launch.capture.backend = \"extension_sidecar\" requires api_version >= 27"
+                    "agent_integrations[{i}].launch.capture.backend = \"extension_sidecar\" requires api_version >= 28"
                 ),
             );
             if let Some(delay) = integration
@@ -1518,6 +1595,12 @@ impl PluginManifest {
             check(
                 self.ui.iter().all(|u| u.slot != UiSlot::ComposerStatus),
                 "composer-status UI slots require api_version >= 25".into(),
+            );
+        }
+        if self.api_version < 27 {
+            check(
+                self.command_groups.is_empty(),
+                "command_groups require api_version >= 27".into(),
             );
         }
         if self.api_version < 9 {
@@ -1759,7 +1842,7 @@ mod tests {
     const HEAD: &str = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = ";
 
     #[test]
-    fn extension_sidecar_capture_requires_api_27() {
+    fn extension_sidecar_capture_requires_api_28() {
         let manifest = |api_version: u32| {
             format!(
                 "id = \"acme.sidecar\"\nname = \"Sidecar\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\
@@ -1768,15 +1851,15 @@ mod tests {
                  [agent_integrations.launch.capture]\nbackend = \"extension_sidecar\"\nhost = \"pane_scoped\"\nsandbox = \"pane_scoped\"\n"
             )
         };
-        // 26 is the merged base's own version and cannot read this backend, so
-        // the gate moves past it instead of sharing it.
-        for version in [25, 26] {
+        // The base's own versions cannot read this backend, so the gate moves
+        // past them instead of sharing one.
+        for version in [25, 26, 27] {
             let error = PluginManifest::from_toml_str(&manifest(version))
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("requires api_version >= 27"), "{error}");
+            assert!(error.contains("requires api_version >= 28"), "{error}");
         }
-        assert!(PluginManifest::from_toml_str(&manifest(27)).is_ok());
+        assert!(PluginManifest::from_toml_str(&manifest(28)).is_ok());
     }
 
     fn object_list_toml(api_version: u32) -> String {
@@ -2302,6 +2385,115 @@ mod tests {
                  [[ui]]\nslot = \"row-column\"\nid = \"link\"\n\n[[ui]]\nslot = \"row-column\"\nid = \"link\"\n\n\
                  [[commands]]\nid = \"open\"\n[commands.action]\nkind = \"open-ui-link\"\nslot = \"row-column\"\nid = \"link\"\n".to_string(),
                 "exactly one ui slot",
+            ),
+        ]);
+    }
+
+    fn grouped_commands_toml(api_version: u32, groups: &str, commands: &str) -> String {
+        format!("{HEAD}{api_version}\n\n{groups}{commands}")
+    }
+
+    #[test]
+    fn command_groups_parse_from_api_27_and_leave_flat_commands_unchanged() {
+        let m = PluginManifest::from_toml_str(&grouped_commands_toml(
+            27,
+            "[[command_groups]]\nid = \"linear\"\nabout = \"Linear issue commands\"\n\n",
+            "[[commands]]\nid = \"refresh\"\ntitle = \"Refresh Linear issues\"\ngroup = \"linear\"\n\n\
+             [[commands]]\nid = \"linear_sync\"\n",
+        ))
+        .expect("v27 grouped manifest parses");
+        assert_eq!(m.command_groups[0].id, "linear");
+        assert_eq!(m.command_groups[0].about, "Linear issue commands");
+        assert_eq!(m.commands[0].group.as_deref(), Some("linear"));
+        assert_eq!(m.commands[1].group, None);
+
+        let round_tripped =
+            PluginManifest::from_toml_str(&toml::to_string(&m).unwrap()).expect("round-trips");
+        assert_eq!(round_tripped.commands[0].group.as_deref(), Some("linear"));
+        assert_eq!(round_tripped.command_groups.len(), 1);
+
+        // A manifest written before command groups still parses flat, and one
+        // that does not use them does not grow the section on re-serialization.
+        for version in [2, 12, 26, 27] {
+            let flat = PluginManifest::from_toml_str(&grouped_commands_toml(
+                version,
+                "",
+                "[[commands]]\nid = \"linear_status\"\ntitle = \"Status\"\n",
+            ))
+            .expect("flat manifest parses");
+            assert!(flat.command_groups.is_empty(), "v{version}");
+            assert_eq!(flat.commands[0].id, "linear_status");
+            assert_eq!(flat.commands[0].group, None);
+            assert!(!toml::to_string(&flat).unwrap().contains("command_groups"));
+        }
+    }
+
+    #[test]
+    fn command_groups_require_api_27_and_a_declared_id() {
+        let group = "[[command_groups]]\nid = \"linear\"\n\n";
+        let nested = "[[commands]]\nid = \"refresh\"\ngroup = \"linear\"\n";
+        rejects(&[
+            (
+                "a group before api_version 27",
+                grouped_commands_toml(26, group, ""),
+                "command_groups require api_version >= 27",
+            ),
+            (
+                "a nested command before api_version 27",
+                grouped_commands_toml(26, group, nested),
+                "commands[0].group requires api_version >= 27",
+            ),
+            (
+                "a group id that is not a bare verb",
+                grouped_commands_toml(27, "[[command_groups]]\nid = \"Linear Issue\"\n\n", ""),
+                "bare lowercase CLI verb",
+            ),
+            (
+                "a repeated group id",
+                grouped_commands_toml(27, &format!("{group}{group}"), ""),
+                "must not repeat id",
+            ),
+            (
+                "a group named like clap's help subcommand",
+                grouped_commands_toml(27, "[[command_groups]]\nid = \"help\"\n\n", ""),
+                "is clap's own subcommand",
+            ),
+            (
+                "a command naming an undeclared group",
+                grouped_commands_toml(
+                    27,
+                    group,
+                    "[[commands]]\nid = \"refresh\"\ngroup = \"github\"\n",
+                ),
+                "does not match any declared command_groups id",
+            ),
+            (
+                "a grouped command id that is not a bare leaf",
+                grouped_commands_toml(
+                    27,
+                    group,
+                    "[[commands]]\nid = \"linear.refresh\"\ngroup = \"linear\"\n",
+                ),
+                "bare lowercase CLI verb when it names a group",
+            ),
+            (
+                "a grouped command named like clap's help subcommand",
+                grouped_commands_toml(
+                    27,
+                    group,
+                    "[[commands]]\nid = \"help\"\ngroup = \"linear\"\n",
+                ),
+                "cannot be a grouped command id",
+            ),
+            (
+                "two groups publishing the same command id",
+                grouped_commands_toml(
+                    27,
+                    &format!("{group}[[command_groups]]\nid = \"github\"\n\n"),
+                    "[[commands]]\nid = \"refresh\"\ngroup = \"linear\"\n\n\
+                     [[commands]]\nid = \"refresh\"\ngroup = \"github\"\n",
+                ),
+                "commands must not repeat id",
             ),
         ]);
     }
