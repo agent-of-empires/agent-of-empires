@@ -2,7 +2,7 @@
 
 pub mod install;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -158,11 +158,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         }
     }
 
-    let client = crate::github::GitHubClient::unauthenticated(crate::github::GitHubClientConfig {
-        api_base: github_api_base(),
-        user_agent: crate::github::DEFAULT_USER_AGENT.to_string(),
-        timeout: std::time::Duration::from_secs(5),
-    })?;
+    let client = github_client()?;
 
     let releases = match fetch_releases(&client, current_version).await {
         Ok(r) => r,
@@ -229,20 +225,92 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
 }
 
 #[tracing::instrument(target = "update.fetch", skip_all)]
+fn github_client() -> Result<crate::github::GitHubClient> {
+    Ok(crate::github::GitHubClient::unauthenticated(
+        crate::github::GitHubClientConfig {
+            api_base: github_api_base(),
+            user_agent: crate::github::DEFAULT_USER_AGENT.to_string(),
+            timeout: std::time::Duration::from_secs(5),
+        },
+    )?)
+}
+
 async fn fetch_releases(
     client: &crate::github::GitHubClient,
     current_version: &str,
 ) -> Result<Vec<ReleaseInfo>> {
     let releases = client.list_releases(GITHUB_OWNER, GITHUB_REPO, 20).await?;
-    Ok(channel_releases(releases, current_version))
+    Ok(channel_releases(releases, is_nightly(current_version)))
 }
 
-/// Stable builds only see stable releases, nightly builds only nightlies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Channel {
+    Stable,
+    Nightly,
+}
+
+/// An explicit `aoe update` destination: a channel's newest release, or one exact tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Channel(Channel),
+    Tag(String),
+}
+
+/// Version of the release `target` names, read live (never from the update cache).
+pub async fn resolve_target(target: &Target) -> Result<String> {
+    let releases = github_client()?
+        .list_releases(GITHUB_OWNER, GITHUB_REPO, 100)
+        .await?;
+    select_release(releases, target)
+        .map(|r| r.version)
+        .with_context(|| format!("no matching release for {target:?}"))
+}
+
+/// Newest nightly that is ahead of a stable `current_version`; `None` on any failure.
+pub async fn newer_nightly(current_version: &str) -> Option<String> {
+    if is_nightly(current_version) {
+        return None;
+    }
+    resolve_target(&Target::Channel(Channel::Nightly))
+        .await
+        .ok()
+        .filter(|v| is_newer_version(v, current_version))
+}
+
+/// Stable to nightly, or any downgrade, may leave data an older binary cannot read.
+pub fn needs_migration_warning(current_version: &str, target_version: &str) -> bool {
+    (is_nightly(target_version) && !is_nightly(current_version))
+        || is_newer_version(current_version, target_version)
+}
+
+fn select_release(
+    releases: Vec<crate::github::GitHubRelease>,
+    target: &Target,
+) -> Option<ReleaseInfo> {
+    match target {
+        Target::Channel(channel) => channel_releases(releases, *channel == Channel::Nightly)
+            .into_iter()
+            .next(),
+        Target::Tag(tag) => {
+            let tag = if tag.starts_with(NIGHTLY_TAG_PREFIX) {
+                tag.clone()
+            } else {
+                format!("v{}", tag.trim_start_matches('v'))
+            };
+            releases
+                .into_iter()
+                .find(|r| !r.draft && r.tag_name == tag)
+                .map(release_info_from)
+                .filter(|r| parse_version(&r.version).is_some())
+        }
+    }
+}
+
+/// A channel only sees its own releases: stable the non-prereleases, nightly the nightlies.
 fn channel_releases(
     releases: Vec<crate::github::GitHubRelease>,
-    current_version: &str,
+    nightly: bool,
 ) -> Vec<ReleaseInfo> {
-    let nightly = is_nightly(current_version);
     releases
         .into_iter()
         .filter(|r| {
@@ -511,11 +579,77 @@ mod tests {
                 &["1.22.2-nightly.20261109", "1.22.2-nightly.20261108"][..],
             ),
         ] {
-            let versions: Vec<String> = channel_releases(releases(), current)
+            let versions: Vec<String> = channel_releases(releases(), is_nightly(current))
                 .into_iter()
                 .map(|r| r.version)
                 .collect();
             assert_eq!(versions, expected, "{current}");
+        }
+    }
+
+    #[test]
+    fn select_release_resolves_channels_and_exact_tags() {
+        let gh = |tag: &str, name: &str, prerelease: bool| crate::github::GitHubRelease {
+            tag_name: tag.to_string(),
+            name: Some(name.to_string()),
+            body: None,
+            published_at: None,
+            draft: false,
+            prerelease,
+            assets: vec![],
+        };
+        let releases = || {
+            vec![
+                gh(
+                    "nightly-20261109",
+                    "Agent of Empires v1.22.2-nightly.20261109",
+                    true,
+                ),
+                gh("v1.22.1", "Agent of Empires v1.22.1", false),
+                gh(
+                    "nightly-20261108",
+                    "Agent of Empires v1.22.2-nightly.20261108",
+                    true,
+                ),
+                gh("v1.22.0", "Agent of Empires v1.22.0", false),
+            ]
+        };
+        for (target, expected) in [
+            (
+                Target::Channel(Channel::Nightly),
+                Some("1.22.2-nightly.20261109"),
+            ),
+            (Target::Channel(Channel::Stable), Some("1.22.1")),
+            (
+                Target::Tag("nightly-20261108".into()),
+                Some("1.22.2-nightly.20261108"),
+            ),
+            (Target::Tag("v1.22.0".into()), Some("1.22.0")),
+            (Target::Tag("1.22.0".into()), Some("1.22.0")),
+            (Target::Tag("nightly-20250101".into()), None),
+            (Target::Tag("1.99.0".into()), None),
+        ] {
+            let got = select_release(releases(), &target).map(|r| r.version);
+            assert_eq!(got.as_deref(), expected, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn migration_warning_covers_nightly_entry_and_downgrades_only() {
+        for (current, target, warn) in [
+            ("1.22.1", "1.22.2-nightly.20261108", true),
+            ("1.22.2-nightly.20261109", "1.22.2-nightly.20261108", true),
+            ("1.22.2-nightly.20261109", "1.22.1", true),
+            ("1.22.1", "1.22.0", true),
+            ("1.22.2-nightly.20261108", "1.22.2-nightly.20261109", false),
+            ("1.22.2-nightly.20261108", "1.22.2", false),
+            ("1.22.1", "1.23.0", false),
+        ] {
+            assert_eq!(
+                needs_migration_warning(current, target),
+                warn,
+                "{current} -> {target}"
+            );
         }
     }
 
