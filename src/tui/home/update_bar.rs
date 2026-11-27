@@ -399,6 +399,13 @@ mod tests {
                     vec!["Unpacking sandbox image…", "▰▰▰▰▰▰ 7 of 7 layers"],
                     vec!["▱"],
                 ),
+                // A phase a newer Daemon reports reads as the default verb.
+                (
+                    PullLine::Running(snapshot(Some(PullPhase::Unknown), Some(3), Some(7))),
+                    120,
+                    vec!["Downloading sandbox image…", "3 of 7 layers"],
+                    vec!["Unpacking"],
+                ),
                 (
                     PullLine::Running(ProgressSnapshot::default()),
                     120,

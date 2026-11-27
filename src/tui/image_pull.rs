@@ -16,6 +16,7 @@ const CANCEL_GATED: &str =
     "Couldn't cancel the sandbox image download: image pulls are off on the Daemon.";
 pub(crate) const CANCEL_REPLACED: &str =
     "That download already ended and another one is running, so nothing was cancelled.";
+pub(crate) const UNKNOWN_ENDED: &str = "The sandbox image download ended in a state this version of aoe doesn't recognize. Update aoe to see it.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PullRequest {
@@ -36,6 +37,9 @@ pub(crate) enum PullReport {
     UnknownImage,
     /// The cancel named a pull that has ended; the one running now replaced it.
     Replaced,
+    /// A poll found the pull in a state this TUI doesn't know, with no pull running: it ended
+    /// in a newer Daemon's state.
+    UnknownEnded,
     /// No answer: the Daemon is unreachable or failed the request.
     Unavailable,
 }
@@ -159,6 +163,8 @@ async fn daemon(
             .map(|reply| (None, reply.pull, None)),
     };
     match answer {
+        // A running pull always has an id, so an unknown state without one has ended.
+        Ok((Some(_), PullState::Unknown, None)) => PullReport::UnknownEnded.into(),
         Ok((polled, pull, flight)) => {
             let (offer, image, pull_command) = match polled {
                 Some((offer, image, command)) => (Some(offer), Some(image), Some(command)),
@@ -311,6 +317,15 @@ impl PullWatch {
         let before = self.line.clone();
         let mut applied = Applied::Changed;
         match report {
+            // A newer Daemon's state of a pull still running: the line waits for one it knows.
+            PullReport::State(PullState::Unknown) => return Applied::Unchanged,
+            PullReport::UnknownEnded => {
+                if !self.running() {
+                    return Applied::Unchanged;
+                }
+                self.end(None);
+                return Applied::Unanswered(UNKNOWN_ENDED);
+            }
             PullReport::State(PullState::Running(snapshot)) => {
                 self.watched = true;
                 self.seen_running = true;
@@ -500,6 +515,12 @@ impl PullWatch {
                 self.behind = Some(PullLine::Done);
                 self.behind_flight = None;
                 return Some(Applied::Updated(digest.clone()));
+            }
+            // Still running, in a state this TUI doesn't know: the pull behind stays as it was.
+            PullReport::State(PullState::Unknown) if self.behind.is_some() => {}
+            PullReport::UnknownEnded if self.behind.is_some() => {
+                self.behind = None;
+                self.behind_flight = None;
             }
             PullReport::State(state) if self.behind.is_some() => {
                 // An ended or vanished pull's id goes with it.
@@ -916,6 +937,93 @@ mod tests {
         assert_eq!(watch.line(), None, "the same pull unhid");
         assert!(watch.note_flight(Some(2)), "another pull didn't repaint");
         assert!(watch.line().is_some(), "another pull started hidden");
+    }
+
+    /// A newer Daemon's pull state. While a poll still names the pull's id it runs on, so its
+    /// line stays; once a poll finds no id it has ended, so the watch ends and says so, once.
+    /// The pull behind an outcome is kept and dropped the same way.
+    #[tokio::test]
+    async fn a_pull_in_an_unknown_state_runs_until_it_has_no_id() {
+        let flight = std::sync::Arc::new(std::sync::Mutex::new(Some(7_u64)));
+        let answer = flight.clone();
+        let status = move || {
+            let flight = *answer.lock().unwrap();
+            async move {
+                axum::Json(serde_json::json!({
+                    "image": IMAGE,
+                    "state": "current",
+                    "dismissed": false,
+                    "checks_enabled": true,
+                    "sandbox_in_use": true,
+                    "pull": { "state": "verifying" },
+                    "flight": flight,
+                    "pull_blocked": null,
+                    "pull_command": format!("docker pull {IMAGE}"),
+                }))
+            }
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app =
+            axum::Router::new().route("/api/sandbox/image-status", axum::routing::get(status));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let endpoint = DaemonEndpoint::new(base, None, crate::daemon::Source::Env);
+        let source = PullSource::Daemon(HttpClient::new(endpoint).unwrap());
+        let poll = || source.run(IMAGE, PullRequest::Poll, None);
+
+        let running_poll = poll().await;
+        assert_eq!(
+            running_poll.report,
+            PullReport::State(PullState::Unknown),
+            "an unknown state with an id isn't a running pull"
+        );
+        let mut watch = PullWatch::default();
+        watch.start();
+        watch.apply(PullRequest::Poll, running(2));
+        let line = watch.drawn();
+        for _ in 0..3 {
+            assert_eq!(
+                watch.apply(PullRequest::Poll, poll().await.report),
+                Applied::Unchanged
+            );
+        }
+        assert_eq!(
+            watch.drawn(),
+            line,
+            "a running pull in a newer state lost its line"
+        );
+
+        *flight.lock().unwrap() = None;
+        let ended = poll().await.report;
+        assert_eq!(
+            watch.apply(PullRequest::Poll, ended.clone()),
+            Applied::Unanswered(UNKNOWN_ENDED),
+            "an ended Unknown pull stayed running"
+        );
+        assert_eq!(watch.line(), None);
+        assert!(!watch.holds_line());
+        assert_eq!(
+            watch.apply(PullRequest::Poll, ended.clone()),
+            Applied::Unchanged,
+            "the ended pull said so twice"
+        );
+
+        let mut watch = PullWatch::default();
+        watch.start();
+        watch.apply(PullRequest::Poll, failed());
+        watch.apply(PullRequest::Poll, running(1));
+        assert!(watch.behind_running());
+        watch.apply(PullRequest::Poll, running_poll.report);
+        assert!(
+            watch.behind_running(),
+            "a pull behind an outcome in a newer state was dropped"
+        );
+        watch.apply(PullRequest::Poll, ended);
+        assert!(
+            !watch.behind_running() && matches!(watch.line(), Some(PullLine::Failed(_))),
+            "an ended Unknown pull stayed behind the outcome"
+        );
+        server.abort();
     }
 
     /// Ctrl+E only opens the prompt, so repeating it never cancels; the confirming key cancels

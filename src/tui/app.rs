@@ -6046,6 +6046,7 @@ mod tests {
         for case in [
             "cancel unconfirmed",
             "image no longer configured",
+            "unknown state ended",
             "dismissed",
             "another status",
         ] {
@@ -6062,6 +6063,16 @@ mod tests {
                 "image no longer configured" => {
                     app.pull.start();
                     answer_pull(&mut app, PullRequest::Poll, PullReport::UnknownImage);
+                }
+                "unknown state ended" => {
+                    app.pull.start();
+                    answer_pull(&mut app, PullRequest::Poll, PullReport::UnknownEnded);
+                    assert_eq!(
+                        app.update_status.as_ref().map(|s| s.text.as_str()),
+                        Some(crate::tui::image_pull::UNKNOWN_ENDED),
+                        "{case}"
+                    );
+                    assert!(!app.pull.holds_line(), "{case}: the pull line stayed");
                 }
                 "dismissed" => app.set_pull_status(DISMISS_UNSAVED),
                 _ => app.set_status("auto-naming \"x\"…"),

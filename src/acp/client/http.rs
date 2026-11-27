@@ -171,10 +171,20 @@ pub struct SandboxImageStatus {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SandboxImageAvailability {
-    Available { remote_digest: String },
+    Available {
+        remote_digest: String,
+    },
     Current,
-    Unknown { reason: String },
-    CheckFailed { error: String },
+    Unknown {
+        reason: String,
+    },
+    CheckFailed {
+        error: String,
+    },
+    /// A state a newer Daemon reports that this client doesn't know. Not `Unknown`, which is
+    /// the Daemon's own "no answer from the check".
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// What `image-pull` and `image-pull/cancel` answer.
@@ -3224,5 +3234,73 @@ mod tests {
         ));
         read_only.shutdown.cancel();
         server.await.unwrap();
+    }
+
+    /// A newer Daemon's values in `image-status` decode to each enum's catch-all, so one new
+    /// variant can't fail the whole poll.
+    #[test]
+    fn a_newer_daemons_image_status_values_decode() {
+        use crate::containers::image_pull::{PullFailureReason, PullState};
+        use crate::containers::pull_progress::{ProgressSnapshot, PullPhase};
+        let status = |state: &str, pull: serde_json::Value| {
+            serde_json::from_value::<SandboxImageStatus>(serde_json::json!({
+                "image": "ghcr.io/example/sandbox:latest",
+                "state": state,
+                "dismissed": false,
+                "checks_enabled": true,
+                "sandbox_in_use": true,
+                "pull": pull,
+                "flight": null,
+                "pull_blocked": null,
+                "pull_command": "docker pull ghcr.io/example/sandbox:latest",
+            }))
+        };
+        let idle = serde_json::json!({ "state": "idle" });
+        for (label, state, pull, want_state, want_pull) in [
+            (
+                "SandboxImageAvailability",
+                "stale",
+                idle.clone(),
+                SandboxImageAvailability::Unrecognized,
+                PullState::Idle,
+            ),
+            (
+                "PullState",
+                "current",
+                serde_json::json!({ "state": "verifying" }),
+                SandboxImageAvailability::Current,
+                PullState::Unknown,
+            ),
+            (
+                "PullPhase",
+                "current",
+                serde_json::json!({ "state": "running", "phase": "verifying", "layers_done": 1, "layers_known": 2 }),
+                SandboxImageAvailability::Current,
+                PullState::Running(ProgressSnapshot {
+                    phase: Some(PullPhase::Unknown),
+                    layers_done: Some(1),
+                    layers_known: Some(2),
+                }),
+            ),
+            (
+                "PullFailureReason",
+                "current",
+                serde_json::json!({ "state": "failed", "reason": "quota", "message": "m", "error": "e" }),
+                SandboxImageAvailability::Current,
+                PullState::Failed {
+                    reason: PullFailureReason::Other,
+                    message: "m".into(),
+                    error: "e".into(),
+                },
+            ),
+        ] {
+            let status = status(state, pull)
+                .unwrap_or_else(|e| panic!("{label}: a newer Daemon's value failed the poll: {e}"));
+            assert_eq!(
+                (status.state, status.pull),
+                (want_state, want_pull),
+                "{label}"
+            );
+        }
     }
 }

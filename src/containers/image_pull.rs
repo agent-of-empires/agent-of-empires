@@ -24,6 +24,8 @@ pub enum PullFailureReason {
     Network,
     DiskSpace,
     Auth,
+    /// Also a reason a newer Daemon reports that this client doesn't know.
+    #[serde(other)]
     Other,
 }
 
@@ -78,6 +80,9 @@ pub enum PullState {
         message: String,
         error: String,
     },
+    /// A state a newer Daemon reports that this client doesn't know; never sent.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

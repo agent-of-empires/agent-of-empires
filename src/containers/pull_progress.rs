@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 pub enum PullPhase {
     Downloading,
     Unpacking,
+    /// A phase a newer Daemon reports that this client doesn't know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One layer's status line from a runtime's pull output.
