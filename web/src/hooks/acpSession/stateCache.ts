@@ -11,6 +11,7 @@ import {
   type BackgroundShell,
   type QueuedPrompt,
   type SubagentRecord,
+  type LifecycleRun,
   type WorkflowRun,
 } from "../../lib/acpTypes";
 import {
@@ -392,6 +393,7 @@ const EMPTY_BACKGROUND_TASKS: string[] = [];
 const EMPTY_SUBAGENTS: SubagentRecord[] = [];
 const EMPTY_BACKGROUND_SHELLS: BackgroundShell[] = [];
 const EMPTY_WORKFLOW_RUNS: Record<string, WorkflowRun> = {};
+const EMPTY_LIFECYCLE_RUNS: LifecycleRun[] = [];
 
 /** One field of a session's cached state, so sibling panels need no second WebSocket. */
 function useCachedField<T>(sessionId: string | null, pick: (state: AcpState) => T, empty: T): T {
@@ -412,6 +414,7 @@ const pickSubagents = (s: AcpState) => s.subagents;
 const pickBackgroundTasks = (s: AcpState) => s.backgroundTasks;
 const pickBackgroundShells = (s: AcpState) => s.backgroundShells;
 const pickWorkflowRuns = (s: AcpState) => s.workflowRuns;
+const pickLifecycleRuns = (s: AcpState) => s.lifecycleRuns;
 
 export function useActivity(sessionId: string | null): ActivityRow[] {
   return useCachedField(sessionId, pickActivity, EMPTY_ACTIVITY);
@@ -435,6 +438,10 @@ export function useBackgroundShells(sessionId: string | null): BackgroundShell[]
 
 export function useWorkflowRuns(sessionId: string | null): Record<string, WorkflowRun> {
   return useCachedField(sessionId, pickWorkflowRuns, EMPTY_WORKFLOW_RUNS);
+}
+
+export function useLifecycleRuns(sessionId: string | null): LifecycleRun[] {
+  return useCachedField(sessionId, pickLifecycleRuns, EMPTY_LIFECYCLE_RUNS);
 }
 
 /** Drop one session's cached state, or all of it, so a reused id never shows a prior transcript. */

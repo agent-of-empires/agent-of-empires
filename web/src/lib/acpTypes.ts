@@ -480,6 +480,9 @@ export type AcpEvent =
       };
     }
   | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
+  | { WorkflowRunStarted: { run_id: string; started_at?: string | null } }
+  | { WorkflowRunProgress: { run_id: string; progress: WorkflowProgress } }
+  | { WorkflowRunFinished: { run_id: string } }
   | { PromptRejected: { reason: string; text: string; attachments?: PromptAttachmentRefWire[] } }
   | { AgentSwitched: { from: string; to: string; reason: string } }
   | { ConversationSummary: { text: string; summarized_until_seq: number } };
@@ -578,6 +581,8 @@ export interface ReducedState {
     ended_at?: string | null;
     finished?: boolean;
   }[];
+  /** Open `_meta.aoe` workflow runs; omitted when there are none. */
+  lifecycle_runs?: { run_id: string; progress?: WorkflowProgress | null }[];
   /** The session's workflow runs; omitted when there are none. */
   /** The subagent roster; the Web projection keeps it for children older than the replay tail. */
   subagents?: SubagentRecord[];
@@ -736,10 +741,25 @@ export interface AcpState {
   backgroundShells: BackgroundShell[];
   /** Workflow runs by the `Workflow` tool call that launched them. */
   workflowRuns: Record<string, WorkflowRun>;
+  /** Open workflow runs reported through `_meta.aoe`, oldest first. */
+  lifecycleRuns: LifecycleRun[];
   /** Agent-pushed advisories for the current turn, oldest first. */
   sessionNotices: SessionNotice[];
   /** Ids dismissed in this tab. Local, so it never clears another client. */
   dismissedNoticeIds: string[];
+}
+
+/** Progress an agent reports for a `_meta.aoe` workflow run. */
+export interface WorkflowProgress {
+  label?: string | null;
+  completed?: number | null;
+  total?: number | null;
+}
+
+/** An open workflow run reported through `_meta.aoe`, with its latest progress. */
+export interface LifecycleRun {
+  runId: string;
+  progress: WorkflowProgress | null;
 }
 
 /** Wire mirror of the Rust `SessionNotice` (src/acp/state.rs). */
@@ -1118,6 +1138,7 @@ export function emptyAcpState(): AcpState {
     backgroundTasks: [],
     backgroundShells: [],
     workflowRuns: {},
+    lifecycleRuns: [],
     modeSwitchFailed: null,
     lastAgentSwitch: null,
     configOptions: [],
@@ -1189,6 +1210,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.usageBaseline = { cost: priorUsage + priorBaseline };
       next.sessionUsage = null;
     }
+    if (event === "SessionCleared") next.lifecycleRuns = [];
     return next;
   }
   if ("AgentThoughtChunk" in event) {
@@ -1445,6 +1467,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("SessionContextReset" in event) {
+    next.lifecycleRuns = [];
     next.sessionUsage = null;
     next.usageBaseline = null;
     // A session/load failure before any prompt is expected; no primer to offer.
@@ -1631,6 +1654,25 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, endedAt ?? null);
     return next;
   }
+  if ("WorkflowRunStarted" in event) {
+    const { run_id: runId } = event.WorkflowRunStarted;
+    if (!next.lifecycleRuns.some((r) => r.runId === runId)) {
+      next.lifecycleRuns = [...next.lifecycleRuns, { runId, progress: null }];
+    }
+    return next;
+  }
+  if ("WorkflowRunProgress" in event) {
+    const { run_id: runId, progress } = event.WorkflowRunProgress;
+    next.lifecycleRuns = next.lifecycleRuns.some((r) => r.runId === runId)
+      ? next.lifecycleRuns.map((r) => (r.runId === runId ? { ...r, progress } : r))
+      : [...next.lifecycleRuns, { runId, progress }];
+    return next;
+  }
+  if ("WorkflowRunFinished" in event) {
+    const { run_id: runId } = event.WorkflowRunFinished;
+    next.lifecycleRuns = next.lifecycleRuns.filter((r) => r.runId !== runId);
+    return next;
+  }
   // Remaining events carry no client control state.
   return next;
 }
@@ -1745,6 +1787,7 @@ export function applyReducedState(
     backgroundTasks: reduced.background_tasks ?? [],
     backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
+    lifecycleRuns: (reduced.lifecycle_runs ?? []).map((r) => ({ runId: r.run_id, progress: r.progress ?? null })),
     subagents: mergeSubagents(state.subagents, reduced.subagents ?? [], seq === undefined || seq >= state.lastSeq),
     subagentsSeq: seq === undefined ? state.subagentsSeq : Math.max(state.subagentsSeq ?? 0, seq),
     locallyResolved,
@@ -1877,10 +1920,11 @@ export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inf
  *  Agents are keyed on `endedAt` rather than status, since a stalled agent's own
  *  terminal completion counts as done. */
 export function hasActiveBackgroundAgent(
-  state: Pick<AcpState, "backgroundAgents" | "backgroundTasks" | "subagents">,
+  state: Pick<AcpState, "backgroundAgents" | "backgroundTasks" | "lifecycleRuns" | "subagents">,
 ): boolean {
   return (
     state.backgroundTasks.length > 0 ||
+    state.lifecycleRuns.length > 0 ||
     state.backgroundAgents.some((a) => a.endedAt === null) ||
     state.subagents.some((s) => s.state === "running" || s.state === "requires_action")
   );
@@ -1889,7 +1933,7 @@ export function hasActiveBackgroundAgent(
 /** Display-only busy signal for the runtime spinner. Distinct from `turnActive`,
  *  which tracks only the main turn because send-vs-queue composer gating reads it. */
 export function isVisiblyBusy(
-  state: Pick<AcpState, "turnActive" | "backgroundAgents" | "backgroundTasks" | "subagents">,
+  state: Pick<AcpState, "turnActive" | "backgroundAgents" | "backgroundTasks" | "lifecycleRuns" | "subagents">,
 ): boolean {
   return state.turnActive || hasActiveBackgroundAgent(state);
 }

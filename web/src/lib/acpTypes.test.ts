@@ -760,11 +760,14 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     });
     const active = [bg(null)];
 
-    expect(hasActiveBackgroundAgent({ backgroundAgents: [], backgroundTasks: [], subagents: [] })).toBe(false);
+    expect(
+      hasActiveBackgroundAgent({ backgroundAgents: [], backgroundTasks: [], lifecycleRuns: [], subagents: [] }),
+    ).toBe(false);
     expect(
       hasActiveBackgroundAgent({
         backgroundAgents: active,
         backgroundTasks: [],
+        lifecycleRuns: [],
         subagents: [],
       }),
     ).toBe(true);
@@ -772,6 +775,7 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
       hasActiveBackgroundAgent({
         backgroundAgents: [bg("2026-06-27T00:00:10Z")],
         backgroundTasks: [],
+        lifecycleRuns: [],
         subagents: [],
       }),
     ).toBe(false);
@@ -781,6 +785,7 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
         turnActive: false,
         backgroundAgents: [],
         backgroundTasks: [],
+        lifecycleRuns: [],
         subagents: [],
       }),
     ).toBe(false);
@@ -789,6 +794,7 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
         turnActive: true,
         backgroundAgents: [],
         backgroundTasks: [],
+        lifecycleRuns: [],
         subagents: [],
       }),
     ).toBe(true);
@@ -797,6 +803,7 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
         turnActive: false,
         backgroundAgents: active,
         backgroundTasks: [],
+        lifecycleRuns: [],
         subagents: [],
       }),
     ).toBe(true);
@@ -817,6 +824,73 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     const oneLeft = fold(running, finished("t1"));
     expect(isVisiblyBusy(oneLeft)).toBe(true);
     expect(isVisiblyBusy(fold(oneLeft, finished("t2")))).toBe(false);
+  });
+
+  describe("workflow runs from _meta.aoe", () => {
+    const started = (run_id: string): AcpEvent => ({ WorkflowRunStarted: { run_id } });
+    const progress = (run_id: string, completed: number, label = "step"): AcpEvent => ({
+      WorkflowRunProgress: { run_id, progress: { label, completed, total: 3 } },
+    });
+    const finished = (run_id: string): AcpEvent => ({ WorkflowRunFinished: { run_id } });
+    const ids = (s: AcpState) => s.lifecycleRuns.map((r) => r.runId);
+
+    it("tracks start, progress and finish, and a repeated start keeps the progress", () => {
+      let s = fold(emptyAcpState(), started("a"), progress("a", 1), started("a"), started("b"));
+      expect(ids(s)).toEqual(["a", "b"]);
+      expect(s.lifecycleRuns[0]!.progress).toEqual({ label: "step", completed: 1, total: 3 });
+      expect(isVisiblyBusy(s)).toBe(true);
+
+      s = fold(s, progress("a", 2), progress("c", 1));
+      expect(s.lifecycleRuns[0]!.progress?.completed).toBe(2);
+      expect(ids(s)).toEqual(["a", "b", "c"]);
+
+      s = fold(s, finished("a"), finished("zzz"));
+      expect(ids(s)).toEqual(["b", "c"]);
+      expect(isVisiblyBusy(fold(s, finished("b"), finished("c")))).toBe(false);
+    });
+
+    it.each<[string, AcpEvent]>([
+      ["SessionContextReset", reset()],
+      ["SessionCleared", "SessionCleared"],
+    ])("%s clears open runs", (_name, boundary) => {
+      expect(fold(emptyAcpState(), started("a"), boundary).lifecycleRuns).toEqual([]);
+    });
+
+    it("a snapshot replaces the runs, and omitting the field clears them", () => {
+      const base = {
+        agent: "claude",
+        model: null,
+        mode: "default",
+        current_plan: null,
+        in_flight_tool: null,
+        pending_approvals: [],
+        pending_elicitations: [],
+        thinking: null,
+        rate_limit: null,
+        available_commands: [],
+        available_modes: [],
+        current_mode_id: null,
+        turn_active: false,
+        cancelling: false,
+        compacting: false,
+      } as ReducedState;
+      const local = fold(emptyAcpState(), started("old"));
+      const adopted = applyReducedState(local, {
+        ...base,
+        lifecycle_runs: [{ run_id: "a", progress: { label: "x", completed: 1 } }, { run_id: "b" }],
+      });
+      expect(adopted.lifecycleRuns).toEqual([
+        { runId: "a", progress: { label: "x", completed: 1 } },
+        { runId: "b", progress: null },
+      ]);
+      expect(applyReducedState(adopted, base).lifecycleRuns).toEqual([]);
+    });
+  });
+
+  it("a generic background task without a description lists no shell", () => {
+    const s = fold(emptyAcpState(), { BackgroundTaskStarted: { task_id: "g", description: null } });
+    expect(s.backgroundTasks).toEqual(["g"]);
+    expect(s.backgroundShells).toEqual([]);
   });
 
   it("a stalled background agent still reads as active, since Progress never sets endedAt (#4001)", () => {
