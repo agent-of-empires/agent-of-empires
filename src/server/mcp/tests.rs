@@ -1522,6 +1522,66 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
     }
 }
 
+/// MCP `send` never types without a pane its check read. A snapshot that says `Stopped` reads
+/// `Gone` before any capture, so it is refused as not running even while its pane is live.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_mcp_send_without_a_checked_pane_is_refused() {
+    use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_command, TmuxTestSession};
+    if !crate::tmux::test_helpers::tmux_available() {
+        return;
+    }
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut stopped = Instance::new("mcp-stopped", "/tmp/aoe-mcp-stopped");
+    stopped.source_profile = "default".into();
+    stopped.status = crate::session::Status::Stopped;
+    let id = stopped.id.clone();
+    let session = stopped.tmux_session().unwrap();
+    let (app, _state, _secret) = seeded_app_with_secret(vec![stopped], false).await;
+    let mut args: Vec<String> = ["new-session", "-d", "-s", session.name(), "exec cat"]
+        .map(str::to_string)
+        .to_vec();
+    crate::tmux::utils::append_pane_base_index_args(&mut args, session.name());
+    assert!(crate::tmux::tmux_command()
+        .args(&args)
+        .status()
+        .unwrap()
+        .success());
+    let _cleanup = TmuxTestSession::from_name(session.name());
+    let pane = only_pane_id(session.name());
+    wait_for_pane_command(&pane, "cat");
+
+    let arguments = json!({"session_id": id, "message": "typed-by-mcp"});
+    let result = call_result(&app, "send", arguments).await;
+    assert_eq!(
+        error_code(&result),
+        Some("not_running"),
+        "stopped-snapshot: {result}"
+    );
+    assert_eq!(
+        result["structuredContent"]["message"], "The terminal session is not running",
+        "stopped-snapshot: {result}"
+    );
+    assert!(
+        !captured(&pane).contains("typed-by-mcp"),
+        "stopped-snapshot: typed without a checked pane"
+    );
+}
+
+/// The pane's screen; a failed capture fails the test rather than reading as nothing typed.
+fn captured(pane: &str) -> String {
+    let out = crate::tmux::tmux_command()
+        .args(["capture-pane", "-p", "-t", pane])
+        .output()
+        .expect("tmux capture-pane");
+    assert!(
+        out.status.success(),
+        "capture {pane}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// A retried `idempotency_key` answers with the first create's session and delivers nothing:
 /// a terminal pane is not typed into again, and a structured session stores no prompt.
 #[tokio::test]

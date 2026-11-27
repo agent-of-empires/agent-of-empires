@@ -468,7 +468,7 @@ impl McpServer {
             false,
             true,
             SendPane {
-                checked: checked_pane,
+                checked: Some(checked_pane),
                 draft_wait: std::time::Duration::ZERO,
             },
         )
@@ -645,8 +645,10 @@ impl McpServer {
     /// detect a dialog or question waiting on a person, or its input box holds a person's draft.
     /// A check that fails to run counts as waiting, as does, for an agent with a status manifest,
     /// a pane that can't be captured. `send` is explicit, so an agent without one
-    /// (`NoPromptRule`) is not refused. Otherwise answers the pane it checked, for the send.
-    async fn terminal_pane_refusal(&self, id: &str) -> Result<Option<String>, Box<CallToolResult>> {
+    /// (`NoPromptRule`) is not refused. A session with no pane to check is refused as not
+    /// running, so `send` never types into a pane that appeared after the check. Otherwise
+    /// answers the pane it checked, for the send.
+    async fn terminal_pane_refusal(&self, id: &str) -> Result<String, Box<CallToolResult>> {
         let instance = self
             .state
             .instances
@@ -656,7 +658,9 @@ impl McpServer {
             .find(|i| i.id == id)
             .cloned();
         let Some(instance) = instance else {
-            return Ok(None);
+            return Err(Box::new(
+                terminal_refusal(id, SendKeysError::NotFound).await,
+            ));
         };
         let (readiness, pane) = tokio::task::spawn_blocking(move || pane_readiness(&instance))
             .await
@@ -672,7 +676,12 @@ impl McpServer {
                  not be read, so nothing was typed. A person answers a dialog there; retry once \
                  the pane can be read.",
             ))),
-            _ => Ok(pane),
+            _ => match pane {
+                Some(pane) => Ok(pane),
+                None => Err(Box::new(
+                    terminal_refusal(id, SendKeysError::NotRunning).await,
+                )),
+            },
         }
     }
 
