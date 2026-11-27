@@ -8,12 +8,23 @@ use std::process::Command;
 #[tokio::test]
 #[serial]
 async fn update_via_tarball_replaces_binary_at_target_path() {
+    update_via_tarball_serves("99.99.99", "v99.99.99").await;
+}
+
+/// A nightly version downloads from its `nightly-YYYYMMDD` release, not a `v*` tag.
+#[tokio::test]
+#[serial]
+async fn update_via_tarball_downloads_a_nightly_from_its_nightly_tag() {
+    update_via_tarball_serves("99.99.99-nightly.20990101", "nightly-20990101").await;
+}
+
+async fn update_via_tarball_serves(version: &str, release_tag: &str) {
     // Build a minimal tar.gz containing a dummy `aoe-{platform}` script
     // that prints the expected version when run with --version.
     let workdir = tempfile::tempdir().unwrap();
     let platform = agent_of_empires::update::install::current_platform_string().unwrap();
     let dummy = workdir.path().join(format!("aoe-{platform}"));
-    fs::write(&dummy, "#!/bin/sh\necho 'aoe 99.99.99'\n").unwrap();
+    fs::write(&dummy, format!("#!/bin/sh\necho 'aoe {version}'\n")).unwrap();
     fs::set_permissions(&dummy, fs::Permissions::from_mode(0o755)).unwrap();
 
     let tarball = workdir.path().join(format!("aoe-{platform}.tar.gz"));
@@ -35,7 +46,7 @@ async fn update_via_tarball_replaces_binary_at_target_path() {
     std_listener.set_nonblocking(true).unwrap();
     let port = std_listener.local_addr().unwrap().port();
     let tarball_bytes = fs::read(&tarball).unwrap();
-    let path_for_route = format!("/v99.99.99/aoe-{platform}.tar.gz");
+    let path_for_route = format!("/{release_tag}/aoe-{platform}.tar.gz");
     let app = axum::Router::new().route(
         &path_for_route,
         axum::routing::get(move || {
@@ -60,7 +71,7 @@ async fn update_via_tarball_replaces_binary_at_target_path() {
         std::env::set_var("AOE_UPDATE_BASE_URL", format!("http://127.0.0.1:{port}"));
     }
     let result =
-        agent_of_empires::update::install::update_via_tarball(&target, "99.99.99", None).await;
+        agent_of_empires::update::install::update_via_tarball(&target, version, None).await;
     unsafe {
         std::env::remove_var("AOE_UPDATE_BASE_URL");
     }
@@ -70,5 +81,5 @@ async fn update_via_tarball_replaces_binary_at_target_path() {
     // Assert the target was replaced.
     let output = Command::new(&target).arg("--version").output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("99.99.99"), "stdout: {stdout}");
+    assert!(stdout.contains(version), "stdout: {stdout}");
 }

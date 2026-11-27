@@ -27,9 +27,20 @@ struct FixtureServer {
 }
 
 fn spawn_fixture(latest_version: &str) -> FixtureServer {
+    let release = serde_json::json!({
+        "tag_name": format!("v{latest_version}"),
+        "body": "fixture release notes",
+        "published_at": "2026-04-29T00:00:00Z",
+    });
+    spawn_fixture_with(release.clone(), serde_json::json!([release]))
+}
+
+/// Serves `latest` for `releases/latest` and `releases` for the list endpoint.
+fn spawn_fixture_with(latest: serde_json::Value, releases: serde_json::Value) -> FixtureServer {
     let (port_tx, port_rx) = mpsc::channel::<u16>();
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
-    let version = latest_version.to_string();
+    let latest = latest.to_string();
+    let releases = releases.to_string();
 
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -43,21 +54,11 @@ fn spawn_fixture(latest_version: &str) -> FixtureServer {
             let port = listener.local_addr().expect("local_addr").port();
             port_tx.send(port).expect("port channel");
 
-            let release_json = move || {
-                serde_json::json!({
-                    "tag_name": format!("v{version}"),
-                    "body": "fixture release notes",
-                    "published_at": "2026-04-29T00:00:00Z",
-                })
-                .to_string()
-            };
-            let releases_json = release_json.clone();
-
             let app = axum::Router::new()
                 .route(
                     "/repos/agent-of-empires/agent-of-empires/releases/latest",
                     axum::routing::get(move || {
-                        let body = release_json();
+                        let body = latest.clone();
                         async move {
                             (
                                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -69,7 +70,7 @@ fn spawn_fixture(latest_version: &str) -> FixtureServer {
                 .route(
                     "/repos/agent-of-empires/agent-of-empires/releases",
                     axum::routing::get(move || {
-                        let body = format!("[{}]", releases_json());
+                        let body = releases.clone();
                         async move {
                             (
                                 [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -129,4 +130,125 @@ fn update_check_reports_availability_and_exits_zero() {
             "stdout was: {stdout}"
         );
     }
+}
+
+fn stable_and_nightly_fixture() -> FixtureServer {
+    let stable = env!("CARGO_PKG_VERSION");
+    let release = |tag: &str, name: &str, prerelease: bool| {
+        serde_json::json!({
+            "tag_name": tag,
+            "name": name,
+            "body": "",
+            "published_at": "2026-04-29T00:00:00Z",
+            "prerelease": prerelease,
+        })
+    };
+    let stable_release = release(&format!("v{stable}"), &format!("v{stable}"), false);
+    spawn_fixture_with(
+        stable_release.clone(),
+        serde_json::json!([
+            release(
+                "nightly-29990102",
+                "Agent of Empires v999.0.0-nightly.29990102",
+                true
+            ),
+            stable_release,
+            release(
+                "nightly-29990101",
+                "Agent of Empires v999.0.0-nightly.29990101",
+                true
+            ),
+        ]),
+    )
+}
+
+fn run_update(fixture: &FixtureServer, args: &[&str]) -> std::process::Output {
+    let tmp = tempfile::TempDir::new().unwrap();
+    Command::new(aoe_binary())
+        .arg("update")
+        .args(args)
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .env("AOE_UPDATE_API_BASE", &fixture.base_url)
+        .output()
+        .expect("running aoe update")
+}
+
+/// A stable build's `--check` hints at a newer nightly on stderr and leaves stdout alone.
+#[test]
+#[serial_test::parallel]
+fn update_check_hints_newer_nightly_on_stderr_only() {
+    let fixture = stable_and_nightly_fixture();
+    let output = run_update(&fixture, &["--check"]);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("available: false"), "stdout was: {stdout}");
+    assert!(!stdout.contains("nightly"), "stdout was: {stdout}");
+    assert!(
+        stderr.contains("v999.0.0-nightly.29990102") && stderr.contains("--channel nightly"),
+        "stderr was: {stderr}"
+    );
+}
+
+/// `--channel` and `--version` resolve the target from the release list.
+#[test]
+#[serial_test::parallel]
+fn update_check_resolves_explicit_targets() {
+    let fixture = stable_and_nightly_fixture();
+    let stable = env!("CARGO_PKG_VERSION");
+    for (args, latest, available) in [
+        (
+            vec!["--check", "--channel", "nightly"],
+            "999.0.0-nightly.29990102",
+            true,
+        ),
+        (
+            vec!["--check", "--version", "nightly-29990101"],
+            "999.0.0-nightly.29990101",
+            true,
+        ),
+        (
+            vec!["--check", "--version", &format!("v{stable}")],
+            stable,
+            false,
+        ),
+    ] {
+        let output = run_update(&fixture, &args);
+        assert!(output.status.success(), "{args:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains(&format!("latest:  {latest}"))
+                && stdout.contains(&format!("available: {available}")),
+            "{args:?}: {stdout}"
+        );
+    }
+}
+
+/// An explicit target on an install that is not an install-script tarball is refused.
+#[test]
+#[serial_test::parallel]
+fn update_explicit_target_refuses_non_tarball_install() {
+    let fixture = stable_and_nightly_fixture();
+    let output = run_update(&fixture, &["--channel", "nightly", "-y"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("tarball"), "stderr was: {stderr}");
+}
+
+/// Asking for the running version is a no-op.
+#[test]
+#[serial_test::parallel]
+fn update_explicit_current_version_is_a_noop() {
+    let fixture = stable_and_nightly_fixture();
+    let output = run_update(
+        &fixture,
+        &["--version", &format!("v{}", env!("CARGO_PKG_VERSION"))],
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Nothing to do"), "stdout was: {stdout}");
 }
