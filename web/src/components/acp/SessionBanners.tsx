@@ -380,7 +380,7 @@ function ChipBanner({
 }
 
 function InteractionErrorBanner({
-  title = "Action did not complete.",
+  title = "Action did not complete",
   message,
   onDismiss,
 }: {
@@ -390,7 +390,7 @@ function InteractionErrorBanner({
 }) {
   return (
     <WarningStrip title={title} onDismiss={onDismiss}>
-      {message}
+      <span className="block">{message}</span>
     </WarningStrip>
   );
 }
