@@ -670,7 +670,7 @@ fn wizard_created_structured_session_opens_structured_view() {
     require_tmux!();
     require_node!();
     let mut h = structured_tui_harness("structured_wizard");
-    h.append_config("[session]\ndefault_tool = \"claude\"");
+    h.append_config("[session]\ndefault_tool = \"fake-agent\"");
     let project = h.project_path();
 
     h.spawn_tui();
@@ -707,7 +707,13 @@ fn keyboard_confirmed_view_switch_fires_immediately() {
     require_node!();
     let mut h = structured_tui_harness("structured_switch");
     let project = h.project_path();
-    h.add_session(&[project.to_str().unwrap(), "-t", "switchme", "-c", "claude"]);
+    h.add_session(&[
+        project.to_str().unwrap(),
+        "-t",
+        "switchme",
+        "-c",
+        "fake-agent",
+    ]);
 
     h.spawn_tui();
     h.wait_for("switchme");

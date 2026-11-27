@@ -612,7 +612,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             config: "",
             path_command: None,
             args: &[],
-            expect: vec![("tool", json!("claude"))],
+            expect: vec![("tool", json!("fake-agent"))],
         },
         Case {
             name: "default_tool sets tool and command",
@@ -625,36 +625,36 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "--cmd overrides default_tool",
             config: "[session]\ndefault_tool = \"opencode\"",
             path_command: None,
-            args: &["--cmd", "claude"],
-            expect: vec![("tool", json!("claude"))],
+            args: &["--cmd", "fake-agent"],
+            expect: vec![("tool", json!("fake-agent"))],
         },
         Case {
             name: "config extra args and command override",
-            config: "[session]\ndefault_tool = \"claude\"\n\
-                     agent_extra_args = { claude = \"--verbose --debug\" }\n\
-                     agent_command_override = { claude = \"my-custom-claude\" }",
+            config: "[session]\ndefault_tool = \"fake-agent\"\n\
+                     agent_extra_args = { fake-agent = \"--verbose --debug\" }\n\
+                     agent_command_override = { fake-agent = \"my-custom-agent\" }",
             path_command: None,
             args: &[],
             expect: vec![
                 ("extra_args", json!("--verbose --debug")),
-                ("command", json!("my-custom-claude")),
+                ("command", json!("my-custom-agent")),
             ],
         },
         Case {
             name: "CLI flags beat config",
-            config: "[session]\ndefault_tool = \"claude\"\n\
-                     agent_extra_args = { claude = \"--from-config\" }\n\
-                     agent_command_override = { claude = \"config-claude\" }",
+            config: "[session]\ndefault_tool = \"fake-agent\"\n\
+                     agent_extra_args = { fake-agent = \"--from-config\" }\n\
+                     agent_command_override = { fake-agent = \"config-agent\" }",
             path_command: None,
             args: &[
                 "--extra-args",
                 "from-cli-extra",
                 "--cmd-override",
-                "cli-claude",
+                "cli-agent",
             ],
             expect: vec![
                 ("extra_args", json!("from-cli-extra")),
-                ("command", json!("cli-claude")),
+                ("command", json!("cli-agent")),
             ],
         },
         Case {
@@ -685,14 +685,14 @@ fn cli_add_resolves_tool_and_command_from_config() {
         Case {
             name: "custom agent keeps its command, extra args, and detect_as",
             config: "[session]\ncustom_agents = { custom = \"bash -lc true\" }\n\
-                     agent_detect_as = { custom = \"claude\" }",
+                     agent_detect_as = { custom = \"fake-agent\" }",
             path_command: None,
             args: &["--tool", "custom", "--extra-args", "--flag value"],
             expect: vec![
                 ("tool", json!("custom")),
                 ("command", json!("bash -lc true")),
                 ("extra_args", json!("--flag value")),
-                ("detect_as", json!("claude")),
+                ("detect_as", json!("fake-agent")),
             ],
         },
         Case {
@@ -706,10 +706,10 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "built-in --tool accepts --cmd-override",
             config: "",
             path_command: None,
-            args: &["--tool", "claude", "--cmd-override", "custom-claude"],
+            args: &["--tool", "fake-agent", "--cmd-override", "custom-agent"],
             expect: vec![
-                ("tool", json!("claude")),
-                ("command", json!("custom-claude")),
+                ("tool", json!("fake-agent")),
+                ("command", json!("custom-agent")),
             ],
         },
     ];
@@ -936,7 +936,7 @@ fn cli_add_rejects_invalid_requests() {
         Case {
             name: "--tool conflicts with --cmd",
             config: "",
-            args: &["add", "$PROJECT", "--tool", "custom", "--cmd", "claude"],
+            args: &["add", "$PROJECT", "--tool", "custom", "--cmd", "fake-agent"],
             forbid: None,
         },
         Case {
@@ -982,7 +982,7 @@ fn cli_add_rejects_invalid_requests() {
         assert!(!out.status.success(), "{}: must exit non-zero", case.name);
         if case.forbid.is_some() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            for alternative in ["custom", "claude"] {
+            for alternative in ["custom", "fake-agent"] {
                 assert!(
                     stderr.contains(alternative),
                     "missing safe alternative {alternative}: {stderr}"
@@ -1112,7 +1112,8 @@ fn cli_mcp_list_merges_layers_and_redacts_secrets() {
 #[test]
 #[parallel]
 fn cli_mcp_add_edit_remove_flow() {
-    let h = TuiTestHarness::new("cli_mcp_add_edit_remove");
+    let mut h = TuiTestHarness::new("cli_mcp_add_edit_remove");
+    h.use_claude_agent();
     let home = h.home_path();
     std::fs::write(
         home.join(".claude.json"),
@@ -1472,7 +1473,8 @@ fn cli_rename_and_rm_move_the_agent_tmux_session() {
 #[parallel]
 fn cli_add_workspace_runs_effective_on_create_hooks() {
     for repo_hooks in [true, false] {
-        let h = TuiTestHarness::new("cli_workspace_hooks");
+        let mut h = TuiTestHarness::new("cli_workspace_hooks");
+        h.use_claude_agent();
         let project_a = h.home_path().join("project-a");
         let project_b = h.home_path().join("project-b");
         init_git_repo(&project_a);
@@ -1577,7 +1579,8 @@ fn cli_add_skip_on_create_keeps_a_session_whose_setup_fails() {
 #[test]
 #[parallel]
 fn cli_add_attaches_to_existing_worktree() {
-    let h = TuiTestHarness::new("cli_attach_existing");
+    let mut h = TuiTestHarness::new("cli_attach_existing");
+    h.use_claude_agent();
     let project = h.home_path().join("attach-project");
     init_git_repo(&project);
     let project = project.to_str().unwrap();
@@ -1621,7 +1624,8 @@ fn cli_add_sanitizes_or_ignores_the_explicit_worktree_branch() {
         ),
         ("   ", None),
     ] {
-        let h = TuiTestHarness::new("cli_branch_sanitize");
+        let mut h = TuiTestHarness::new("cli_branch_sanitize");
+        h.use_claude_agent();
         let project = h.home_path().join("branch-project");
         init_git_repo(&project);
         h.run_cli_ok(&[
@@ -1711,7 +1715,7 @@ fn cli_scratch_session_provisions_and_purges_its_dir() {
 #[parallel]
 fn cli_add_effort_is_stored_and_refusals_provision_nothing() {
     let mut h = TuiTestHarness::new("cli_add_effort");
-    h.install_path_command("claude");
+    h.install_path_command("fake-agent");
     h.install_path_command("claude-agent-acp");
 
     h.run_cli_ok(&[
@@ -1720,7 +1724,7 @@ fn cli_add_effort_is_stored_and_refusals_provision_nothing() {
         "-t",
         "Effort",
         "-c",
-        "claude",
+        "fake-agent",
         "--structured-view",
         "--effort",
         " high ",
@@ -1739,7 +1743,7 @@ fn cli_add_effort_is_stored_and_refusals_provision_nothing() {
         ),
         (&["--effort", "high"][..], "needs the structured view"),
     ] {
-        let mut args = vec!["add", "--scratch", "-t", "Refused", "-c", "claude"];
+        let mut args = vec!["add", "--scratch", "-t", "Refused", "-c", "fake-agent"];
         args.extend_from_slice(extra);
         let out = h.run_cli(&args);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1996,7 +2000,7 @@ fn cli_migration_34_37_43_persists_policy_and_second_run_bytes() {
             "title":"Retained legacy session",
             "project_path":h.project_path().to_str().unwrap(),
             "created_at":"2026-10-10T00:00:00Z",
-            "tool":"claude",
+            "tool":"fake-agent",
             "trashed_at":"2026-10-11T00:00:00Z",
             "trash_lifecycle_id":identity,
             "lifecycle_generation":7,
@@ -2173,7 +2177,7 @@ fn cli_agent_probe_does_not_block_daemon_requests() {
         ),
     );
     h.set_env("SHELL", &shell);
-    h.append_config("[session]\nagent_command_override = { claude = \"aoe-review-missing\" }");
+    h.append_config("[session]\nagent_command_override = { fake-agent = \"aoe-review-missing\" }");
     let port = h.start_daemon();
     let project = h.project_path();
     let mut pending = GatedCli::spawn(
@@ -2183,7 +2187,7 @@ fn cli_agent_probe_does_not_block_daemon_requests() {
             "-t",
             "probe",
             "--cmd",
-            "claude",
+            "fake-agent",
         ]),
         release,
     );
@@ -2291,7 +2295,8 @@ fn cli_launch_waits_for_a_hook_beyond_the_read_timeout() {
 #[test]
 #[parallel]
 fn cli_repo_base_uses_original_symlink_names_without_hiding_ambiguity() {
-    let h = TuiTestHarness::new("cli_repo_base_alias");
+    let mut h = TuiTestHarness::new("cli_repo_base_alias");
+    h.use_claude_agent();
     let primary = h.home_path().join("primary");
     let added = h.home_path().join("api");
     let other = h.home_path().join("other");
@@ -2467,7 +2472,8 @@ fn cli_review_boundary_sigint_during_launch_preserves_the_created_session() {
 #[test]
 #[parallel]
 fn cli_review_boundary_repo_base_from_a_linked_worktree() {
-    let h = TuiTestHarness::new("cli_linked_repo_base");
+    let mut h = TuiTestHarness::new("cli_linked_repo_base");
+    h.use_claude_agent();
     let primary = h.home_path().join("principal");
     init_git_repo(&primary);
     let repo = git2::Repository::open(&primary).unwrap();
@@ -2564,6 +2570,7 @@ fn cli_sandbox_images_preserve_normalization_and_default_fallback() {
         (Some(""), "   ", automatic),
     ] {
         let mut h = TuiTestHarness::new("cli_sandbox_image");
+        h.use_claude_agent();
         let bin = h.install_path_command("docker");
         write_executable(
             &bin.join("docker"),
@@ -2596,6 +2603,7 @@ fn cli_sandbox_images_preserve_normalization_and_default_fallback() {
 fn cli_deferred_sandbox_preserves_offline_creation_and_runtime_guards() {
     for (default_sandbox, create_hook) in [(false, false), (true, false), (false, true)] {
         let mut h = TuiTestHarness::new_in_tmp("cli_deferred_sandbox");
+        h.use_claude_agent();
         h.stop_daemon_on_drop();
         let engine_down = h.home_path().join("engine-down");
         let container_effect = h.home_path().join("container-effect");
