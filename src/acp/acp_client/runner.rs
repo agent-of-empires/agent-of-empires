@@ -232,6 +232,19 @@ pub(super) fn agent_argv(proxy: Option<&ProxySpec>, command: &str, args: &[Strin
     argv
 }
 
+fn proxy_launch_config_json(
+    config: &SpawnConfig,
+    session_id: &str,
+    store_root: &std::path::Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "session_id": session_id,
+        "container_id": config.sandbox_info.as_ref().and_then(|s| s.container_id.as_deref()),
+        "store_root": store_root,
+    })
+}
+
 /// Replaces any config left by a previous runner of this session. Holds no
 /// secrets: it only locates the session for the proxy.
 fn write_proxy_launch_config(
@@ -240,12 +253,8 @@ fn write_proxy_launch_config(
 ) -> Result<std::path::PathBuf, AcpError> {
     let spawn_err = |e: anyhow::Error| AcpError::ProxyLaunchConfig(format!("{e:#}"));
     crate::process::worker_registry::remove_proxy_launch_configs(session_id).map_err(spawn_err)?;
-    let contents = serde_json::json!({
-        "version": 1,
-        "session_id": session_id,
-        "container_id": config.sandbox_info.as_ref().and_then(|s| s.container_id.as_deref()),
-        "store_root": crate::session::get_app_dir().map_err(spawn_err)?,
-    });
+    let store_root = crate::session::get_app_dir().map_err(spawn_err)?;
+    let contents = proxy_launch_config_json(config, session_id, &store_root);
     crate::process::worker_registry::write_proxy_launch_config(
         session_id,
         contents.to_string().as_bytes(),
@@ -660,6 +669,38 @@ mod tests {
     const XDG: &str = "XDG_RUNTIME_DIR";
     const BUS: &str = "DBUS_SESSION_BUS_ADDRESS";
     const ENV: &str = "/usr/bin/env";
+
+    #[test]
+    fn proxy_launch_config_locates_the_session() {
+        let root = std::path::Path::new("/store");
+        let mut config = crate::acp::acp_client::test_helpers::env_test_spawn_config("/w".into());
+        assert_eq!(
+            proxy_launch_config_json(&config, "sess-1", root),
+            serde_json::json!({
+                "version": 1,
+                "session_id": "sess-1",
+                "container_id": null,
+                "store_root": "/store",
+            })
+        );
+
+        config.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: Some("abc123".into()),
+            image: "alpine:latest".into(),
+            container_name: "c".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert_eq!(
+            proxy_launch_config_json(&config, "sess-1", root)["container_id"],
+            "abc123"
+        );
+    }
 
     #[test]
     fn agent_argv_prepends_proxy_and_keeps_arguments_intact() {
