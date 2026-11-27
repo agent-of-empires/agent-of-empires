@@ -93,6 +93,11 @@ outside its covered paths, extend the sensitive-file list in
 `ci-macos` and re-run the `macOS gate` job. The first merge-queue entry skips
 macOS when its PR already passed it on the same head, label or not.
 
+On pull requests the `Change gate` job in tests.yml skips the web jobs when
+nothing under `web/` or `.github/` changes, and the Rust test legs when only
+`web/` or docs change ([change-gate.cjs](.github/scripts/change-gate.cjs)). The
+merge queue runs every job.
+
 Releases ship from a release-plz PR, with daily nightlies of `main`.
 Maintainer instructions live in
 [docs/development/releases.md](docs/development/releases.md).

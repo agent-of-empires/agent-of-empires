@@ -28,12 +28,42 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    # Path-gates the expensive jobs on pull requests; push and merge_group
+    # skip it, and its dependents then run in full. RunsOn keeps it out of the
+    # shared GitHub-hosted queue for same-repo PRs.
+    name: Change gate
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-changes-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      web: ${{ steps.decide.outputs.web }}
+      live: ${{ steps.decide.outputs.live }}
+      legs: ${{ steps.decide.outputs.legs }}
+      skipped_legs: ${{ steps.decide.outputs.skipped_legs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: decide
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const gate = require('./.github/scripts/change-gate.cjs');
+            await gate({ github, context, core });
+
   cargo-linux:
     # Each leg builds its own feature set on its own runner and cache key. The
-    # branch ruleset requires every leg's context by name; keep it and the
-    # cargo-linux-release-pr matrix in sync if the leg set changes.
+    # branch ruleset requires every leg's context by name; keep it, the
+    # fallback matrix below and LEGS in .github/scripts/change-gate.cjs in
+    # sync if the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.legs != '[]') }}
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-cargo-{1}-{2}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, matrix.leg, github.run_attempt) }}
     timeout-minutes: 40
     permissions:
@@ -42,7 +72,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [web-e2e, core-rest, bare-core]
+        leg: ${{ fromJSON(needs.changes.result == 'success' && needs.changes.outputs.legs || '["web-e2e","core-rest","bare-core"]') }}
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
       - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
@@ -266,19 +296,20 @@ jobs:
           sudo env AOE_PRIVDROP_TESTS=1 \
             "$test_binary" privdrop_ --test-threads=1 --nocapture
 
-  cargo-linux-release-pr:
+  cargo-linux-skipped:
     # A matrix job skipped at job level posts one unexpanded context, so this
-    # reports the three required cargo-linux contexts on release PRs instead.
-    # The merge queue runs the real legs.
+    # reports each required cargo-linux context the change gate skipped. The
+    # merge queue runs every leg.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-')
-    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.skipped_legs != '[]'
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-cargo-skip-{1}-{2}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, matrix.leg, github.run_attempt) }}
     permissions: {}
     strategy:
       matrix:
-        leg: [web-e2e, core-rest, bare-core]
+        leg: ${{ fromJSON(needs.changes.outputs.skipped_legs) }}
     steps:
-      - run: echo "Release PR, so the merge queue runs this leg."
+      - run: echo "The change gate skipped this leg; the merge queue runs it."
 
   macos-gate:
     # Decides on Linux whether macOS runs, so a skip holds no macOS runner.
@@ -316,7 +347,7 @@ jobs:
     # Both Cargo steps share e2e-tests; no frontend build is needed on macOS.
     name: Cargo Test (macos)
     needs: [macos-gate, cargo-linux]
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.macos-gate.result != 'success' || needs.macos-gate.outputs.run == 'true') && (github.event_name == 'push' || needs.cargo-linux.result == 'success') }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.macos-gate.result != 'success' || needs.macos-gate.outputs.run == 'true') && (github.event_name == 'push' || needs.cargo-linux.result == 'success' || needs.cargo-linux.result == 'skipped') }}
     runs-on: macos-latest
     permissions:
       contents: read
@@ -364,7 +395,8 @@ jobs:
 
   vitest:
     name: Vitest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-vitest-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 15
     steps:
@@ -446,7 +478,8 @@ jobs:
 
   bundle-analysis:
     name: Bundle Analysis
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -478,7 +511,8 @@ jobs:
 
   playwright:
     name: Playwright (mocked)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     steps:
@@ -573,7 +607,8 @@ jobs:
     # Unsharded: shards each repeat the ~2 min cargo build and hold a runner
     # from the shared concurrency pool, which costs more wall than it saves.
     name: Playwright (live)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.live == 'true') }}
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-live-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 30
     permissions:
