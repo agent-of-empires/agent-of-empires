@@ -3093,6 +3093,33 @@ fn stage_declared_sandbox(
     Ok(mounts)
 }
 
+/// Drops the staged declared trust file before a container is created, so one that
+/// [`blank_staged_file`] cannot clear never blocks the reuse of a container that does
+/// not mount it. The caller guarantees no earlier container is left to mount it.
+pub(crate) fn discard_staged_declared_trust(
+    tool: &str,
+    command: Option<&str>,
+    session_config: &super::SessionConfig,
+    instance_id: &str,
+) {
+    let Some(trust) = declared_sandbox_agent(tool, command, session_config)
+        .and_then(|declared| declared.contribution().trust.clone())
+    else {
+        return;
+    };
+    let result =
+        crate::hooks::declared_sandbox_dir(instance_id).and_then(
+            |stage| match std::fs::remove_file(stage.join("home").join(&trust.file)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            },
+        );
+    if let Err(e) = result {
+        tracing::warn!(target: "session.profile",
+            "Failed to discard the staged sandbox trust file for {tool}: {e:#}");
+    }
+}
+
 /// Truncates a staged file to `{}` through the same inode, never following a link.
 fn blank_staged_file(file: &Path) -> Result<()> {
     use std::io::Write;
@@ -7846,6 +7873,54 @@ sandbox = "SANDBOX"
         // Trust that still applies is not a revocation, so nothing is refused.
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         revoke(true).unwrap();
+    }
+
+    // A new container mounts only what applies, so a staged record that cannot be
+    // blanked must not make every later reuse of that container refuse.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_discarded_trust_file_no_longer_blocks_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        let stage = crate::hooks::declared_sandbox_dir("declared-discard").unwrap();
+        let file = stage.join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, r#"{"projects":{}}"#).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        if fs::OpenOptions::new().write(true).open(&file).is_ok() {
+            eprintln!("the file is writable (privileged); revocation failure not exercised");
+            return;
+        }
+        let session = super::super::SessionConfig::default();
+        let revoke = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &session,
+                "declared-discard",
+                "/workspace/project",
+                false,
+            )
+        };
+        revoke().expect_err("the record cannot be blanked");
+
+        discard_staged_declared_trust(
+            "example-helper",
+            Some("example-helper"),
+            &session,
+            "declared-discard",
+        );
+
+        assert!(!file.exists());
+        revoke().unwrap();
     }
 
     // A running container mounts the staged trust file by inode, so a changed record

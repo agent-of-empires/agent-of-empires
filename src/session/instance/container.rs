@@ -732,6 +732,13 @@ impl Instance {
         if let Some(sandbox) = self.sandbox_info.as_mut() {
             sandbox.image = used_image;
         }
+        // No earlier container is left to mount a trust record this launch cannot clear.
+        container_config::discard_staged_declared_trust(
+            &self.tool,
+            Some(command.as_str()),
+            &profile_config.session,
+            &self.id,
+        );
         let mut config = self.build_container_config(&launch_config)?;
         // The profile `spawn_prepared_launch` gives `scope_prefix_for`, so the
         // container lands in its session's slice.
