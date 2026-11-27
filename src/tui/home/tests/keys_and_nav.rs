@@ -1612,15 +1612,15 @@ fn a_blocked_suggestion_start_keeps_the_view_open_with_the_reason() {
 
 /// A pinned workspace sits above every unpinned one in its header, so a move across that
 /// boundary would change nothing on screen; it is refused instead of writing the order. A
-/// row sharing a pinned row's worktree is lifted with it.
+/// row sharing a pinned row's worktree is lifted with it, unless a filter hides the pin.
 #[test]
 #[serial]
 fn a_row_does_not_move_across_the_pinned_boundary() {
-    for shared_worktree in [false, true] {
+    let pinned_env = |shared_worktree: bool| {
         let mut env = create_test_env_with_sessions(3);
         let ids: Vec<String> = (0..3).map(|i| env.view.instance_at(i).id.clone()).collect();
         env.view.mutate_instance(&ids[1], |inst| inst.pin());
-        let lifted = if shared_worktree {
+        if shared_worktree {
             for id in [&ids[1], &ids[2]] {
                 env.view.mutate_instance(id, |inst| {
                     inst.worktree_info = Some(crate::session::WorktreeInfo {
@@ -1632,20 +1632,23 @@ fn a_row_does_not_move_across_the_pinned_boundary() {
                     });
                 });
             }
-            2
-        } else {
-            1
-        };
-        env.view.flat_items = env.view.build_flat_items();
-        let rows: Vec<String> = env
-            .view
-            .flat_items
+        }
+        (env, ids)
+    };
+    let shown_rows = |view: &HomeView| -> Vec<String> {
+        view.flat_items
             .iter()
             .filter_map(|item| match item {
                 Item::Session { id, .. } => Some(id.clone()),
                 _ => None,
             })
-            .collect();
+            .collect()
+    };
+    for shared_worktree in [false, true] {
+        let (mut env, ids) = pinned_env(shared_worktree);
+        let lifted = if shared_worktree { 2 } else { 1 };
+        env.view.flat_items = env.view.build_flat_items();
+        let rows = shown_rows(&env.view);
         assert!(rows[..lifted].contains(&ids[1]), "{shared_worktree}");
         assert!(!rows[..lifted].contains(&ids[0]), "{shared_worktree}");
         for (id, delta) in [(&rows[lifted], -1), (&rows[lifted - 1], 1)] {
@@ -1658,4 +1661,24 @@ fn a_row_does_not_move_across_the_pinned_boundary() {
             );
         }
     }
+
+    // A pin the needs-you filter hides lifts nothing, so its worktree's other row may move.
+    let (mut env, ids) = pinned_env(true);
+    for id in [&ids[0], &ids[2]] {
+        env.view
+            .mutate_instance(id, |inst| inst.status = crate::session::Status::Waiting);
+    }
+    env.view.toggle_needs_you_only();
+    env.view.flat_items = env.view.build_flat_items();
+    let rows = shown_rows(&env.view);
+    assert!(!rows.contains(&ids[1]));
+    let at = rows.iter().position(|id| id == &ids[2]).unwrap();
+    env.view.select_session_by_id(&ids[2]);
+    env.view
+        .move_row_at_cursor(if at == 0 { 1 } else { -1 })
+        .unwrap();
+    assert_ne!(
+        env.view.status_flash_text(),
+        Some("Pinned rows stay at the top of their header")
+    );
 }

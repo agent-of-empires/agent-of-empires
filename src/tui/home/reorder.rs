@@ -107,13 +107,14 @@ impl HomeView {
         }
     }
 
-    /// The workspaces the list lifts: a pin anywhere in the view lifts its workspace under
-    /// every header, as `flatten_tree` sorts them.
+    /// The workspaces the list lifts: a pin listed anywhere in the view lifts its workspace
+    /// under every header, as `flatten_tree` sorts them from the rows the filters leave.
     fn listed_pinned_workspaces(&self) -> std::collections::HashSet<String> {
         crate::session::pinned_workspaces(self.instances.values().filter(|i| {
             self.active_profile
                 .as_ref()
                 .is_none_or(|profile| &i.source_profile == profile)
+                && !self.hidden_by_filter(i)
         }))
     }
 
