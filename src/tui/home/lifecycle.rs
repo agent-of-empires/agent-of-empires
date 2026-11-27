@@ -246,6 +246,7 @@ impl HomeView {
             pending_paste: None,
             pending_paste_for_structured_view: HashMap::new(),
             pending_attach_after_warning: None,
+            refused_send: None,
             pending_stop_session: None,
             pending_stop_auxiliary: None,
             pending_legacy_tool_preparation: None,

@@ -77,6 +77,37 @@ impl HomeView {
         )
     }
 
+    /// Shows why a send was refused at delivery, keeping its text for the dialog that reopens.
+    pub(super) fn refuse_send(
+        &mut self,
+        session_id: &str,
+        target: live_send::LiveSendTarget,
+        title: &str,
+        message: &str,
+        refusal: &str,
+    ) {
+        self.info_dialog = Some(InfoDialog::new("Send Failed", refusal));
+        self.refused_send = Some((
+            session_id.to_owned(),
+            target,
+            title.to_owned(),
+            message.to_owned(),
+        ));
+    }
+
+    /// Closes the info dialog, then reopens a send it refused at delivery with the same text.
+    pub(super) fn dismiss_info_dialog(&mut self) {
+        self.info_dialog = None;
+        if let Some((session_id, target, title, message)) = self.refused_send.take() {
+            let label = live_send::format_target_label(&title, &target);
+            self.pending_send_session = Some(session_id);
+            self.pending_send_target = target;
+            let mut dialog = crate::tui::dialogs::SendMessageDialog::new(&label);
+            dialog.handle_paste(&message);
+            self.send_message_dialog = Some(dialog);
+        }
+    }
+
     /// Deliver a queued message to a pane the daemon has confirmed ready.
     pub(in crate::tui) fn finish_send(
         &mut self,
@@ -140,7 +171,7 @@ impl HomeView {
         if let Err(refusal) =
             deliver_to_live_pane(&inst, &tmux_session, check_draft, message, delay)
         {
-            self.info_dialog = Some(InfoDialog::new("Send Failed", &refusal));
+            self.refuse_send(session_id, target, &inst.title, message, &refusal);
             return;
         }
         self.stamp_last_accessed(session_id);
