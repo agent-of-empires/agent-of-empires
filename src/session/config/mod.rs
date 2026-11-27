@@ -3415,7 +3415,8 @@ pub struct SandboxConfig {
     pub auto_cleanup: bool,
 
     /// Let the web dashboard and the TUI pull a newer sandbox image through the Daemon. Off, they
-    /// show the Container runtime's pull command to run instead. Read globally by the Daemon, so it can't be set per profile.
+    /// show the Container runtime's pull command to run instead. Read globally by the Daemon, so
+    /// it can't be set per profile.
     #[serde(default = "default_true")]
     #[setting(
         label = "Allow image pull from the dashboard and TUI",
