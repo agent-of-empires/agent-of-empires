@@ -5524,53 +5524,94 @@ time.sleep(60)
         }))
     }
 
-    /// Spawn `session` with a proxy under `policy`; each launch pops its outcome from
-    /// `outcomes`, and every config the launcher sees is recorded.
+    /// Failed launches own a runner (pid 4400 + launch number), as a real one does by the
+    /// time its hello fails; `signals_at_launch` holds the signals sent before each launch.
+    #[derive(Default)]
+    struct ProxyHarness {
+        control: Arc<FakeProcessControl>,
+        signals_at_launch: Arc<std::sync::Mutex<Vec<Vec<(u32, &'static str)>>>>,
+    }
+
+    impl ProxyHarness {
+        /// Spawn `session` with a proxy under `policy`; each launch pops its outcome from
+        /// `outcomes`, and every config the launcher sees is recorded.
+        async fn spawn(
+            &self,
+            session: &str,
+            policy: ProxyFailurePolicy,
+            outcomes: Vec<Result<(), AcpError>>,
+        ) -> (Result<(), SupervisorError>, Vec<SpawnConfig>, Vec<Event>) {
+            let (_home, _tmp) = isolate_home();
+            let (sink, store, _rx, _store_tmp) = channel_sink();
+            let seen: Arc<std::sync::Mutex<Vec<SpawnConfig>>> = Default::default();
+            let outcomes = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                outcomes,
+            )));
+            let launcher: super::super::Launcher = {
+                let seen = seen.clone();
+                let control = self.control.clone();
+                let signals_at_launch = self.signals_at_launch.clone();
+                Arc::new(move |config: SpawnConfig, session_id| {
+                    let launch = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(config.clone());
+                        seen.len() as u32
+                    };
+                    signals_at_launch.lock().unwrap().push(control.signals());
+                    let outcome = outcomes.lock().unwrap().pop_front().expect("outcome");
+                    let control = control.clone();
+                    Box::pin(async move {
+                        if let Err(err) = outcome {
+                            let pid = 4400 + launch;
+                            let lease = config
+                                .launch_lease
+                                .as_ref()
+                                .expect("supervisor retains its producer lease");
+                            lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
+                            assert!(
+                                lease.record_runner(attested_test_identity(pid, config.generation))
+                            );
+                            save_attested_test_record(&session_id.0, pid, config.generation);
+                            control.alive(pid);
+                            return Err(err);
+                        }
+                        save_record(&session_id.0, 4345, config.generation);
+                        let (client, _tx) = AcpClient::fake_for_test(session_id);
+                        Ok(client.with_runner_pid(4345))
+                    })
+                })
+            };
+            self.control.alive(4345);
+            let sup = Supervisor::new(sink)
+                .with_process_control(self.control.clone())
+                .with_launcher(launcher);
+            let mut request = spawn_request(session);
+            request.proxy = Some(proxy_spec(policy));
+            let result = sup
+                .spawn(
+                    request,
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                )
+                .await;
+            let events = store
+                .replay_from(session, 0)
+                .into_iter()
+                .map(|(_, event)| event)
+                .collect();
+            let _ = sup.shutdown(session).await;
+            let configs = seen.lock().unwrap().clone();
+            (result, configs, events)
+        }
+    }
+
     async fn spawn_with_proxy(
         session: &str,
         policy: ProxyFailurePolicy,
         outcomes: Vec<Result<(), AcpError>>,
     ) -> (Result<(), SupervisorError>, Vec<SpawnConfig>, Vec<Event>) {
-        let (_home, _tmp) = isolate_home();
-        let (sink, store, _rx, _store_tmp) = channel_sink();
-        let seen: Arc<std::sync::Mutex<Vec<SpawnConfig>>> = Default::default();
-        let outcomes = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
-            outcomes,
-        )));
-        let launcher: super::super::Launcher = {
-            let seen = seen.clone();
-            Arc::new(move |config: SpawnConfig, session_id| {
-                seen.lock().unwrap().push(config.clone());
-                let outcome = outcomes.lock().unwrap().pop_front().expect("outcome");
-                Box::pin(async move {
-                    outcome?;
-                    save_record(&session_id.0, 4345, config.generation);
-                    let (client, _tx) = AcpClient::fake_for_test(session_id);
-                    Ok(client.with_runner_pid(4345))
-                })
-            })
-        };
-        let control = Arc::new(FakeProcessControl::default());
-        control.alive(4345);
-        let sup = Supervisor::new(sink)
-            .with_process_control(control)
-            .with_launcher(launcher);
-        let mut request = spawn_request(session);
-        request.proxy = Some(proxy_spec(policy));
-        let result = sup
-            .spawn(
-                request,
-                crate::process::worker_registry::ResumeAuthority::Explicit,
-            )
-            .await;
-        let events = store
-            .replay_from(session, 0)
-            .into_iter()
-            .map(|(_, event)| event)
-            .collect();
-        let _ = sup.shutdown(session).await;
-        let configs = seen.lock().unwrap().clone();
-        (result, configs, events)
+        ProxyHarness::default()
+            .spawn(session, policy, outcomes)
+            .await
     }
 
     fn degraded_notices(events: &[Event]) -> Vec<&str> {
@@ -5610,18 +5651,44 @@ time.sleep(60)
     #[tokio::test]
     #[serial_test::serial]
     async fn neutral_boot_relaunches_once_raw_and_posts_a_notice() {
-        let (result, configs, events) = spawn_with_proxy(
-            "s-neutral",
-            ProxyFailurePolicy::NeutralBoot,
-            vec![Err(bad_hello()), Ok(())],
-        )
-        .await;
+        let harness = ProxyHarness::default();
+        let (result, configs, events) = harness
+            .spawn(
+                "s-neutral",
+                ProxyFailurePolicy::NeutralBoot,
+                vec![Err(bad_hello()), Ok(())],
+            )
+            .await;
         result.expect("the raw relaunch succeeds");
         assert_eq!(configs.len(), 2);
         assert!(configs[0].proxy.is_some() && configs[0].degraded.is_none());
         assert!(configs[1].proxy.is_none());
         assert_eq!(configs[1].degraded.as_deref(), Some("Fake"));
         assert_eq!(degraded_notices(&events), ["Fake features unavailable"]);
+        let at_launch = harness.signals_at_launch.lock().unwrap();
+        assert!(at_launch[0].is_empty());
+        assert!(
+            at_launch[1].iter().any(|(pid, _)| *pid == 4401),
+            "the failed proxy runner is retired before the raw relaunch: {:?}",
+            at_launch[1]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn neutral_boot_does_not_relaunch_over_a_runner_it_cannot_retire() {
+        let harness = ProxyHarness::default();
+        harness.control.immortal(4401);
+        let (result, configs, events) = harness
+            .spawn(
+                "s-neutral-stuck",
+                ProxyFailurePolicy::NeutralBoot,
+                vec![Err(bad_hello()), Ok(())],
+            )
+            .await;
+        assert!(matches!(result, Err(SupervisorError::Acp(_))));
+        assert_eq!(configs.len(), 1, "an unsettled runner blocks the relaunch");
+        assert!(degraded_notices(&events).is_empty());
     }
 
     #[tokio::test]
