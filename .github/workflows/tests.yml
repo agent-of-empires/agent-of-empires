@@ -355,7 +355,7 @@ jobs:
       contents: read
       id-token: write
     # Allow cold compilation and both test stages within a bounded job.
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       # The 7 GB runner compiles the crate twice (lib and lib tests); skipping
       # debug info shrinks both. Backtraces lose file and line numbers.

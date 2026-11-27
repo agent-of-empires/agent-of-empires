@@ -578,6 +578,22 @@ hotkey = "Alt+g"
 
 See [Tool Sessions](tool-sessions.md) for the full reference.
 
+## Keybinds
+
+`[keybinds]` changes the TUI's home-view and live-mode shortcuts. Each key is an action name and each value a list of keys in the `live_send_leader` grammar (`C-n`, `M-Up`, `S-PageUp`, `F7`, `x`); a bare letter is lowercase, so write `S-d` for `D`. The list replaces the action's keys in both hotkey modes, and `[]` unbinds it.
+
+```toml
+[keybinds]
+previous-finished = ["M-k"]
+next-finished = ["M-j"]
+move-row-up = []
+activate = ["C-Enter"]
+```
+
+`activate` (Enter) opens the selected session the way `default_attach_mode` says, and `activate-alt` (Tab) does the other of live mode and tmux attach. Ctrl+Enter reaches AoE only in terminals with the kitty keyboard protocol enabled; elsewhere it arrives as Enter.
+
+**Settings > Global > Keybinds** lists every action name with its current keys, read-only, checked against the hotkey mode, leader and exit chord the TUI uses for the current profile. An entry is ignored, with a warning on that page and when the TUI loads config, if it names an unknown action, has a key that does not parse, or adds a key already in use: another action's key in the current hotkey mode, a tool hotkey, `Ctrl+C`, `Ctrl+L`, or the navigation keys (arrows, `j` `k` `h` `l`, `G`, `{` `}`, `<` `>`, Home, End, Page Up/Down, Esc). Keeping one of the action's own default keys is always allowed. `quit` takes its key under every modifier, so no other action or tool hotkey can use that key with Ctrl or Alt, and `quit` itself cannot use Ctrl or Alt, or Shift on a key other than a letter, such as `S-F10` or `S-Space`. The actions live mode keeps from the Agent (`previous-finished`, `next-finished`, `preview-scroll-up`, `preview-scroll-down`) also cannot use the live-send leader or exit chord, or a character key, Enter, Tab, Backspace, Delete or Shift+Tab without Ctrl or Alt. An ignored entry leaves its action on the default keys. Dialog keys are not configurable. Global only: a `[keybinds]` table in a profile's `config.toml` is ignored.
+
 ## Profiles
 
 Profiles have separate sessions, groups, and overrides of profile-overridable settings. Press `P` in the TUI to choose from the last applied Daemon profile list. Reopen it to see later changes. A removed profile stays selected until you choose another filter; choose `all` to see remaining profiles.

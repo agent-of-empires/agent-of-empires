@@ -167,7 +167,9 @@ Thanks for the report. To work on it we need the steps to reproduce it, what you
 - Every open issue (sweep): the exhaustive recipe in
   `docs/agents/issue-tracker.md`, section "Exhaustive issue inventories".
   Only a command that succeeds gives a complete list; if it fails, end the
-  run `failed` rather than sweep part of the list.
+  run `failed` rather than sweep part of the list. Drop the issue whose
+  `title` is exactly `Maintainer digest` and whose `user.login` is
+  `agent-of-empires-bot`: it is the maintainer loops' digest, not a report.
 - Board ID: `gh project view 1 --owner agent-of-empires --format json --jq
   .id`. A project number is unique only per owner, so match board items by
   this ID.
