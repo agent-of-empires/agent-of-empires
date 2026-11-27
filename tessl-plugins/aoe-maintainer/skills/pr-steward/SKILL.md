@@ -164,7 +164,10 @@ gh api "repos/$REPO/actions/runs?head_sha=<headRefOid>&per_page=100" \
 
 Take each run with `conclusion` `failure` and `run_attempt` 1. Skip a run
 whose `run_attempt` is 2 or more, and never act on a run whose
-`conclusion` is `action_required`.
+`conclusion` is `action_required`. Rerun only same-repo PRs
+(`isCrossRepository` false). A fork log can print test-shaped text for a
+test that never ran, so for a fork PR that passes item 4 below, list it under
+Reruns as `no (fork, rerun by hand)` and rerun nothing.
 
 1. Never read a failed log, whole or in part. For each failed job
    (`gh api "repos/$REPO/actions/runs/<id>/jobs?filter=latest&per_page=100" --jq '.jobs[] | select(.conclusion == "failure") | .id'`),
@@ -184,18 +187,14 @@ whose `run_attempt` is 2 or more, and never act on a run whose
    - Vitest file, relative to `web/`: `^src/[A-Za-z0-9_./-]+\.test\.tsx?$`.
    - Playwright spec, relative to its test directory:
      `^[A-Za-z0-9_./-]+\.spec\.ts(:[0-9]+)?$`.
-3. For a fork PR (`isCrossRepository` true), also keep an id only when it
-   exists in this checkout: `git grep -n -w -F -e '<last :: segment>' -- '*.rs'`
-   for a test path, `git ls-files --error-unmatch -- 'web/<path>'` for
-   Vitest, and `git ls-files -- 'web/tests/<spec>' 'web/tests/*/<spec>'`
-   printing a file, with `:<line>` removed, for Playwright. Never quote a
-   fork log anywhere, not even a short excerpt.
-4. A test path matches a known flaky issue only when that issue's title or
+   Never quote a fork log anywhere, not even a short excerpt.
+3. A test path matches a known flaky issue only when that issue's title or
    body names the full path. A Vitest or Playwright id matches when the
    issue names the same file.
-5. Rerun only when every failed job gave at least one id and every id
+4. Rerun only when every failed job gave at least one id and every id
    matches a known flaky issue. A failed job with no test id (a build,
-   lint or infrastructure failure) or any unmatched id means no rerun.
+   lint or infrastructure failure), any unmatched id, or any extracted
+   line dropped by the pattern check means no rerun.
 
    ```sh
    gh run rerun <id> -R $REPO --failed
@@ -282,9 +281,9 @@ The comment, with every section present and `None.` for an empty table:
 
 ### Reruns
 
-| PR | Run | Flaky issue |
-| --- | --- | --- |
-| #<n> | <html_url> | #<issue> |
+| PR | Run | Flaky issue | Rerun |
+| --- | --- | --- | --- |
+| #<n> | <html_url> | #<issue> | yes, or no (fork, rerun by hand) |
 
 ### Takeover candidates
 
