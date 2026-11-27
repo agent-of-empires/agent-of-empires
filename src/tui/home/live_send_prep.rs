@@ -70,12 +70,6 @@ impl HomeView {
         self.target_pane_is_warm(session_id, &self.pending_send_target)
     }
 
-    /// Size to boot a cold/dead pane at on live-send entry: the visible
-    /// preview output rect when known, else the full terminal. Seeding the boot
-    /// here avoids an initial reflow; any post-toast geometry change is queued
-    /// through the size-owning worker. Falls back to the terminal size for the
-    /// rare entry with no prior preview frame, and to `None` if neither is
-    /// available so tmux keeps its default.
     /// Live send as entered, with no session or send worker behind it.
     #[cfg(test)]
     pub(in crate::tui) fn enter_live_send_for_test(&mut self) {
@@ -89,6 +83,12 @@ impl HomeView {
         });
     }
 
+    /// Size to boot a cold/dead pane at on live-send entry: the visible
+    /// preview output rect when known, else the full terminal. Seeding the boot
+    /// here avoids an initial reflow; any post-toast geometry change is queued
+    /// through the size-owning worker. Falls back to the terminal size for the
+    /// rare entry with no prior preview frame, and to `None` if neither is
+    /// available so tmux keeps its default.
     pub(in crate::tui) fn live_send_boot_size(&self) -> Option<(u16, u16)> {
         let pane = self.preview_pane_area;
         if pane.width > 0 && pane.height > 0 {
