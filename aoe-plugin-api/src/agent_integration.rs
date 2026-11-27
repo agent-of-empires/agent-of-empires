@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct AgentIntegrationContribution {
     pub tool: String,
+    /// Requires API 29: how pickers, notifications and the API name the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Requires API 29: a lucide icon name for the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     /// Alternative semver requirements for provider-native status reporting.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_versions: Vec<String>,
@@ -55,6 +61,7 @@ pub const AGENT_HOOK_EVENTS_MAX: usize = 32;
 pub const AGENT_HOOK_PATH_MAX: usize = 256;
 pub const AGENT_HOOK_STRING_MAX: usize = 256;
 pub const AGENT_TRUST_POINTER_SEGMENTS_MAX: usize = 8;
+pub const AGENT_DISPLAY_NAME_MAX: usize = 40;
 
 /// Status hooks installed into the agent's JSON settings file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
