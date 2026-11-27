@@ -1,17 +1,20 @@
 //! Handlers for ACP `terminal/*` requests.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::process::Command;
+use tokio::time::{sleep_until, Instant};
 use tracing::info;
 
 use crate::acp::establishment::NativeRequestContext;
 use crate::containers::container_interface::{
     docker_env_args, EnvEntry, RuntimeEnvArgs, TargetEnvFile,
 };
+use crate::process::worker_registry::RegistryBusy;
 
 /// Routing target for a terminal command.
 #[derive(Debug, Clone)]
@@ -27,6 +30,8 @@ pub enum TerminalError {
     Io(#[from] std::io::Error),
     #[error("terminal {0} does not exist")]
     UnknownTerminal(String),
+    #[error("terminal cwd outside session roots: {0}")]
+    CwdOutsideRoots(crate::acp::fs_handler::FsError),
     #[error("terminal authority refused: {0}")]
     Authority(String),
 }
@@ -60,6 +65,30 @@ struct TerminalEntry {
     source: Option<Arc<NativeRequestContext>>,
 }
 
+/// Retry only lock contention before an effect. The callback owns cancellation,
+/// and no lifecycle or registry guard survives a sleep or child wait.
+async fn with_terminal_authority<T, G>(
+    try_guard: impl Fn() -> anyhow::Result<G>,
+    effect: impl FnOnce() -> T,
+) -> Result<T, TerminalError> {
+    let mut deadline = None;
+    loop {
+        let error = match try_guard() {
+            Ok(_guard) => return Ok(effect()),
+            Err(error) => error,
+        };
+        if !error.is::<RegistryBusy>() {
+            return Err(TerminalError::Authority(error.to_string()));
+        }
+        let now = Instant::now();
+        let until = *deadline.get_or_insert_with(|| now + Duration::from_secs(3));
+        sleep_until((now + Duration::from_millis(10)).min(until)).await;
+        if Instant::now() >= until {
+            return Err(TerminalError::Authority(error.to_string()));
+        }
+    }
+}
+
 /// Pins the actual allocation, not a terminal ID to look up after waiting.
 #[derive(Debug, Clone)]
 pub(crate) struct CapturedTerminal {
@@ -67,18 +96,25 @@ pub(crate) struct CapturedTerminal {
 }
 
 impl CapturedTerminal {
-    pub(crate) fn with_output<T>(
+    async fn with_authority<T>(&self, effect: impl FnOnce() -> T) -> Result<T, TerminalError> {
+        with_terminal_authority(
+            || {
+                self.entry
+                    .source
+                    .as_deref()
+                    .map(NativeRequestContext::try_owned_resource_guard)
+                    .transpose()
+            },
+            effect,
+        )
+        .await
+    }
+
+    pub(crate) async fn with_output<T>(
         &self,
         read: impl FnOnce(&TerminalOutput) -> T,
     ) -> Result<T, TerminalError> {
-        let _source = self
-            .entry
-            .source
-            .as_deref()
-            .map(NativeRequestContext::try_owned_resource_guard)
-            .transpose()
-            .map_err(|error| TerminalError::Authority(error.to_string()))?;
-        Ok(read(&self.entry.output))
+        self.with_authority(|| read(&self.entry.output)).await
     }
 }
 
@@ -118,56 +154,60 @@ impl TerminalManager {
         session_id: &str,
         command: (&str, Vec<String>),
         cwd: PathBuf,
-        sandbox: Option<&TerminalSandbox>,
         source: Option<Arc<NativeRequestContext>>,
+        prepare_sandbox: impl FnOnce(&Path) -> Result<Option<TerminalSandbox>, TerminalError>,
         spawn: impl FnOnce(&mut Command) -> Result<tokio::process::Child, TerminalError>,
     ) -> Result<TerminalId, TerminalError> {
         let (command, args) = command;
         let id: TerminalId = format!("term-{}", uuid::Uuid::new_v4().simple()).into();
-        info!(
-            target: "acp.terminal",
-            session = %session_id,
-            terminal = %id,
-            command = %command,
-            cwd = %cwd.display(),
-            sandboxed = sandbox.is_some(),
-            "terminal/create"
-        );
-
-        let child = {
-            let _current = source
-                .as_deref()
-                .map(NativeRequestContext::try_original_io_guard)
-                .transpose()
-                .map_err(|error| TerminalError::Authority(error.to_string()))?;
-            let mut command = match sandbox {
-                Some(s) => {
-                    let runtime = crate::containers::get_container_runtime();
-                    let env = build_sandbox_exec_args(s, &cwd, command, &args);
-                    let mut command = Command::new(runtime.base.binary);
-                    command.args(&env.argv);
-                    for (key, value) in &env.inherit {
-                        command.env(key, value);
+        let child = with_terminal_authority(
+            || {
+                source
+                    .as_deref()
+                    .map(NativeRequestContext::try_original_io_guard)
+                    .transpose()
+            },
+            || {
+                let sandbox = prepare_sandbox(&cwd)?;
+                info!(
+                    target: "acp.terminal",
+                    session = %session_id,
+                    terminal = %id,
+                    command = %command,
+                    cwd = %cwd.display(),
+                    sandboxed = sandbox.is_some(),
+                    "terminal/create"
+                );
+                let mut command = match sandbox.as_ref() {
+                    Some(s) => {
+                        let runtime = crate::containers::get_container_runtime();
+                        let env = build_sandbox_exec_args(s, &cwd, command, &args);
+                        let mut command = Command::new(runtime.base.binary);
+                        command.args(&env.argv);
+                        for (key, value) in &env.inherit {
+                            command.env(key, value);
+                        }
+                        if let Some(file) = TargetEnvFile::create(&env.target_env)? {
+                            file.attach(command.as_std_mut())?;
+                        }
+                        command
                     }
-                    if let Some(file) = TargetEnvFile::create(&env.target_env)? {
-                        file.attach(command.as_std_mut())?;
+                    None => {
+                        let mut command = Command::new(command);
+                        command.args(args).current_dir(cwd);
+                        command
                     }
-                    command
-                }
-                None => {
-                    let mut command = Command::new(command);
-                    command.args(args).current_dir(cwd);
-                    command
-                }
-            };
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            // Original I/O and connection admission cover spawn, never the output await.
-            spawn(&mut command)?
-        };
+                };
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                // Original I/O and connection admission cover spawn, never the output await.
+                spawn(&mut command)
+            },
+        )
+        .await??;
 
         // Drain stdout, stderr, and wait() concurrently; sequential reads deadlock on a full pipe.
         let raw = child.wait_with_output().await?;
@@ -218,29 +258,108 @@ impl TerminalManager {
     }
 
     /// Remove only the captured allocation. Repeated cleanup stays idempotent.
-    pub(crate) fn release(&self, terminal: &CapturedTerminal) -> Result<(), TerminalError> {
-        let _source = terminal
-            .entry
-            .source
-            .as_deref()
-            .map(NativeRequestContext::try_owned_resource_guard)
-            .transpose()
-            .map_err(|error| TerminalError::Authority(error.to_string()))?;
-        let mut inner = self.inner.lock().expect("terminal manager lock");
-        if inner
-            .outputs
-            .get(terminal.entry.id.as_ref())
-            .is_some_and(|entry| Arc::ptr_eq(entry, &terminal.entry))
-        {
-            inner.outputs.remove(terminal.entry.id.as_ref());
-        }
-        Ok(())
+    pub(crate) async fn release(&self, terminal: &CapturedTerminal) -> Result<(), TerminalError> {
+        terminal
+            .with_authority(|| {
+                let mut inner = self.inner.lock().expect("terminal manager lock");
+                if inner
+                    .outputs
+                    .get(terminal.entry.id.as_ref())
+                    .is_some_and(|entry| Arc::ptr_eq(entry, &terminal.entry))
+                {
+                    inner.outputs.remove(terminal.entry.id.as_ref());
+                }
+            })
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_authority_waits_only_before_the_effect() {
+        use std::cell::Cell;
+
+        let lock = tokio::sync::Mutex::new(());
+        let held = lock.try_lock().unwrap();
+        let attempts = Cell::new(0);
+        let effects = Cell::new(0);
+        let (_, result) = tokio::join!(
+            async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                assert_eq!(attempts.get(), 1);
+                assert_eq!(effects.get(), 0);
+                drop(held);
+            },
+            with_terminal_authority(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    lock.try_lock().map_err(|_| RegistryBusy.into())
+                },
+                || {
+                    effects.set(effects.get() + 1);
+                    Err::<(), _>(TerminalError::Io(std::io::Error::other("spawn failed")))
+                },
+            ),
+        );
+        assert!(matches!(result, Ok(Err(TerminalError::Io(_)))));
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(effects.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_authority_times_out_but_does_not_retry_refusal() {
+        use std::cell::Cell;
+
+        let effects = Cell::new(0);
+        let start = Instant::now();
+        let result = with_terminal_authority(
+            || Err::<(), _>(RegistryBusy.into()),
+            || effects.set(effects.get() + 1),
+        )
+        .await;
+        assert!(matches!(result, Err(TerminalError::Authority(_))));
+        let elapsed = start.elapsed();
+        assert!((Duration::from_secs(3)..Duration::from_millis(3010)).contains(&elapsed));
+
+        let attempts = Cell::new(0);
+        let result = with_terminal_authority(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err::<(), _>(crate::acp::establishment::EstablishmentRefusal::Superseded.into())
+            },
+            || effects.set(effects.get() + 1),
+        )
+        .await;
+        assert!(matches!(result, Err(TerminalError::Authority(_))));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(effects.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_busy_terminal_authority_does_not_run_the_effect() {
+        use std::cell::Cell;
+
+        let busy = Cell::new(true);
+        let effects = Cell::new(0);
+        let attempt = with_terminal_authority(
+            || {
+                if busy.get() {
+                    Err(RegistryBusy.into())
+                } else {
+                    Ok(())
+                }
+            },
+            || effects.set(effects.get() + 1),
+        );
+        let result = tokio::time::timeout(Duration::from_millis(5), attempt).await;
+        assert!(result.is_err());
+        busy.set(false);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(effects.get(), 0);
+    }
 
     #[tokio::test]
     async fn create_captures_output_and_release_is_idempotent() {
@@ -253,7 +372,7 @@ mod tests {
                 ("echo", vec!["hello".into()]),
                 cwd,
                 None,
-                None,
+                |_| Ok(None),
                 |command| Ok(command.spawn()?),
             )
             .await
@@ -264,10 +383,11 @@ mod tests {
                 assert!(out.stdout.contains("hello"));
                 assert_eq!(out.exit_code, Some(0));
             })
+            .await
             .unwrap();
 
-        mgr.release(&terminal).unwrap();
-        mgr.release(&terminal).unwrap();
+        mgr.release(&terminal).await.unwrap();
+        mgr.release(&terminal).await.unwrap();
         assert!(matches!(
             mgr.capture("never-existed", None),
             Err(TerminalError::UnknownTerminal(_))
@@ -307,7 +427,7 @@ mod tests {
                 ("sh", vec!["-c".into(), script.into()]),
                 std::env::temp_dir(),
                 None,
-                None,
+                |_| Ok(None),
                 |command| Ok(command.spawn()?),
             );
             let id = tokio::time::timeout(std::time::Duration::from_secs(5), run)
@@ -323,6 +443,7 @@ mod tests {
                     assert_eq!(out.stderr.len(), stderr_len, "{session}");
                     assert_eq!(out.exit_code, Some(0), "{session}");
                 })
+                .await
                 .unwrap();
         }
     }

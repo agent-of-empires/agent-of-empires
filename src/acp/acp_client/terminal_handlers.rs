@@ -33,44 +33,26 @@ pub(super) async fn handle_create_terminal(
         "ACP request handler entered"
     );
     let cwd = request.cwd.unwrap_or_else(|| res.cwd.clone());
-    let terminal_sandbox = {
-        require_native_context(context.as_deref(), &state)?;
-        let _current = context
-            .as_deref()
-            .map(NativeRequestContext::try_original_io_guard)
-            .transpose()
-            .map_err(|error| {
-                agent_client_protocol::Error::internal_error().data(error.to_string())
-            })?;
-        // Policy resolution is synchronous; no guard survives the child await.
-        if let Err(e) = res.fs_policy.resolve_inside(&cwd) {
-            let r = Err(agent_client_protocol::Error::internal_error()
-                .data(format!("terminal cwd outside session roots: {e}")));
-            trace!(
-                target: "acp.protocol.tool_dispatch",
-                handler = "create_terminal",
-                enter_ns,
-                elapsed_ns = enter_timestamp_ns() - enter_ns,
-                outcome = "cwd_outside_roots",
-                "ACP request handler exited"
-            );
-            return r;
-        }
-        res.sandbox
-            .as_ref()
-            .map(|s| crate::acp::terminal_handler::TerminalSandbox {
-                container_name: s.container_name.clone(),
-                env_entries: s.current_env_entries(),
-            })
-    };
+    require_native_context(context.as_deref(), &state)?;
     let result = match res
         .terminals
         .create_and_run(
             &res.label,
             (&request.command, request.args),
             cwd,
-            terminal_sandbox.as_ref(),
             context,
+            |cwd| {
+                res.fs_policy
+                    .resolve_inside(cwd)
+                    .map_err(TerminalError::CwdOutsideRoots)?;
+                Ok(res
+                    .sandbox
+                    .as_ref()
+                    .map(|s| crate::acp::terminal_handler::TerminalSandbox {
+                        container_name: s.container_name.clone(),
+                        env_entries: s.current_env_entries(),
+                    }))
+            },
             move |command| {
                 state
                     .admit(|| command.spawn())
@@ -143,6 +125,7 @@ pub(super) fn handle_terminal_output(
                 TerminalOutputResponse::new(format!("{}{}", output.stdout, output.stderr), false)
                     .exit_status(build_exit_status(output.exit_code))
             })
+            .await
             .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))
     }
 }
@@ -166,6 +149,7 @@ pub(super) fn handle_wait_for_terminal_exit(
             .with_output(|output| {
                 WaitForTerminalExitResponse::new(build_exit_status(output.exit_code))
             })
+            .await
             .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))
     }
 }
@@ -186,6 +170,7 @@ pub(super) fn handle_kill_terminal(
         // One-shot terminals have exited, but their original ownership is required.
         terminal?
             .with_output(|_| KillTerminalResponse::new())
+            .await
             .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))
     }
 }
@@ -204,7 +189,7 @@ pub(super) fn handle_release_terminal(
         &state,
     );
     async move {
-        res.terminals.release(&terminal?).map_err(|error| {
+        res.terminals.release(&terminal?).await.map_err(|error| {
             agent_client_protocol::Error::internal_error().data(error.to_string())
         })?;
         Ok(ReleaseTerminalResponse::new())
