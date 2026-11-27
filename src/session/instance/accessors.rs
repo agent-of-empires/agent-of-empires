@@ -346,6 +346,7 @@ impl Instance {
                     .then(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
                     .flatten()
             },
+            Path::new(&self.project_path),
         );
         self.acp_transcript_cli_resumable_with("claude", session)
             .then_some(crate::session::capture::OwnCmdStoreProbe {

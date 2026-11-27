@@ -1153,6 +1153,7 @@ impl<S: BroadcastSink> Drain<S> {
                             &config.tool,
                             target,
                             native,
+                            &config.cwd,
                         )
                     });
             config.host_environment = host_environment;

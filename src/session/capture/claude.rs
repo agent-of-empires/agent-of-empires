@@ -90,14 +90,16 @@ pub(crate) fn is_explicit_claude_store_route(
 
 /// The `CLAUDE_CONFIG_DIR` a launch environment already carries: the profile or hook value,
 /// else the daemon's inherited one (`daemon`, read only when the launch would see it).
+/// A relative value is read from the worker's `cwd`, so it is joined onto it here.
 pub(crate) fn ambient_claude_config_dir(
     environment: Option<String>,
     daemon: impl FnOnce() -> Option<String>,
+    cwd: &Path,
 ) -> Option<PathBuf> {
     environment
         .or_else(daemon)
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+        .map(|value| cwd.join(value))
 }
 
 /// The store a launch declaring `dir` ends up reading, and whether it exports `dir` as
@@ -187,6 +189,23 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn relative_ambient_config_dir_resolves_against_the_worker_cwd() {
+        let cwd = Path::new("/work/a");
+        let relative = ambient_claude_config_dir(Some("rel-store".into()), || None, cwd);
+        assert_eq!(relative.as_deref(), Some(Path::new("/work/a/rel-store")));
+        let absolute = ambient_claude_config_dir(None, || Some("/abs/store".into()), cwd);
+        assert_eq!(absolute.as_deref(), Some(Path::new("/abs/store")));
+
+        let home = Path::new("/home/u");
+        let (store, exported) =
+            declared_claude_store_route(&home.join(".claude"), home, relative.as_deref());
+        assert_eq!(
+            (store, exported),
+            (PathBuf::from("/work/a/rel-store"), false)
+        );
+    }
 
     #[test]
     fn encode_claude_project_path_replaces_non_alphanumerics() {

@@ -563,6 +563,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         &req.tool,
                         target,
                         native,
+                        &req.cwd,
                     )
                 },
             );
@@ -1461,6 +1462,7 @@ pub(super) fn apply_declared_config_dir(
     tool: &str,
     target: &str,
     native: &str,
+    cwd: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
     let session = &cfg.session;
     let native_of = |name: &str| crate::acp::agent_profiles::resolve(name).native_config_agent;
@@ -1526,6 +1528,7 @@ pub(super) fn apply_declared_config_dir(
                 .find(|(name, _)| name == variable)
                 .map(|(_, value)| value.clone()),
             || std::env::var(variable).ok(),
+            cwd,
         );
         if !crate::session::capture::declared_claude_store_route(&dir, &home, ambient.as_deref()).1
         {
@@ -2172,7 +2175,14 @@ time.sleep(60)
         };
         let run = |cfg: &crate::session::Config, tool: &str, agent: &str| {
             let mut env = vec![("CLAUDE_CONFIG_DIR".to_string(), "/hook".to_string())];
-            let claude_dir = apply_declared_config_dir(&mut env, cfg, tool, agent, agent);
+            let claude_dir = apply_declared_config_dir(
+                &mut env,
+                cfg,
+                tool,
+                agent,
+                agent,
+                std::path::Path::new("/"),
+            );
             (env, claude_dir)
         };
         let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
@@ -2364,7 +2374,14 @@ time.sleep(60)
         // Switching into a custom target selects the target's own key and identity.
         let into = |cfg: &crate::session::Config, tool: &str, target: &str, native: &str| {
             let mut env = vec![];
-            let claude_dir = apply_declared_config_dir(&mut env, cfg, tool, target, native);
+            let claude_dir = apply_declared_config_dir(
+                &mut env,
+                cfg,
+                tool,
+                target,
+                native,
+                std::path::Path::new("/"),
+            );
             (env, claude_dir)
         };
         let mut explicit = cfg(&[
@@ -2407,7 +2424,8 @@ time.sleep(60)
                 &cfg(&[("codex", "~/.codex-work")]),
                 "codex",
                 "codex",
-                "codex"
+                "codex",
+                std::path::Path::new("/")
             ),
             Some(PathBuf::from("/accounts/work/.codex-work"))
         );
@@ -2429,7 +2447,14 @@ time.sleep(60)
         let default_store = cfg(&[("claude", "~/.claude")]);
         let mut env = vec![pair("HOME", "/home/u")];
         assert_eq!(
-            apply_declared_config_dir(&mut env, &default_store, "claude", "claude", "claude"),
+            apply_declared_config_dir(
+                &mut env,
+                &default_store,
+                "claude",
+                "claude",
+                "claude",
+                std::path::Path::new("/")
+            ),
             None
         );
         assert_eq!(env, vec![pair("HOME", "/home/u")]);
@@ -2438,7 +2463,14 @@ time.sleep(60)
             pair("CLAUDE_CONFIG_DIR", "/home/u/.claude"),
         ];
         assert_eq!(
-            apply_declared_config_dir(&mut env, &default_store, "claude", "claude", "claude"),
+            apply_declared_config_dir(
+                &mut env,
+                &default_store,
+                "claude",
+                "claude",
+                "claude",
+                std::path::Path::new("/")
+            ),
             Some(PathBuf::from("/home/u/.claude"))
         );
 
@@ -2446,7 +2478,14 @@ time.sleep(60)
         let mut env = vec![pair("HOME", "account")];
         let relative_home = cfg(&[("claude", "~/.claude-work")]);
         assert_eq!(
-            apply_declared_config_dir(&mut env, &relative_home, "claude", "claude", "claude"),
+            apply_declared_config_dir(
+                &mut env,
+                &relative_home,
+                "claude",
+                "claude",
+                "claude",
+                std::path::Path::new("/")
+            ),
             None
         );
         assert_eq!(env, vec![pair("HOME", "account")]);
@@ -2455,7 +2494,14 @@ time.sleep(60)
         let mut cfg = cfg(&[("claude", "~/.claude-work")]);
         cfg.environment = vec!["HOME=/home/operator".into()];
         let mut env = vec![pair("HOME", "/srv/account")];
-        let claude_dir = apply_declared_config_dir(&mut env, &cfg, "claude", "claude", "claude");
+        let claude_dir = apply_declared_config_dir(
+            &mut env,
+            &cfg,
+            "claude",
+            "claude",
+            "claude",
+            std::path::Path::new("/"),
+        );
         assert_eq!(claude_dir, Some(PathBuf::from("/srv/account/.claude-work")));
         assert_eq!(
             env,
