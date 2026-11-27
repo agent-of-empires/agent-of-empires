@@ -199,7 +199,7 @@ export interface SidebarView {
   group_by: "project" | "group";
   sort: "custom" | "newest" | "name";
   /** The Client kind that last changed the grouping or the sort. */
-  changed_by?: "tui" | "web" | "cli";
+  changed_by?: "tui" | "web";
   /** The label of a plugin sort a web dashboard applies in place of `sort`. */
   web_plugin_sort?: string;
 }
@@ -389,6 +389,14 @@ export async function reorderGroup(
 /** `base_sort` is the sort the write replaces; it is refused with `conflict` once that changed. */
 export function updateSidebarView(patch: SidebarViewPatch & { base_sort?: SidebarView["sort"] }): Promise<WriteResult> {
   return writeReceipt("/api/sidebar-view", jsonInit("PATCH", { ...patch, client: "web" }));
+}
+
+/** Clears this browser's plugin sort marker as its page goes away; `keepalive` lets the request outlive the page. */
+export function clearWebPluginSortOnUnload(): void {
+  void fetch("/api/sidebar-view", {
+    ...jsonInit("PATCH", { web_plugin_sort: null, client: "web" }),
+    keepalive: true,
+  }).catch(() => {});
 }
 
 export type CreateGroupResult = { ok: true } | { ok: false; status: number; code: string | null };

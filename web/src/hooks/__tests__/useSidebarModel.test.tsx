@@ -181,6 +181,7 @@ function heldWrites(method: "patch" | "put", path: string) {
 
 beforeEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
   toasts.info.mockClear();
   toasts.undo.length = 0;
   toastBus.handler = toastApi;
@@ -210,6 +211,7 @@ function mount({ viewWritable = true } = {}) {
       workspaces,
       projects: [],
       view: sessions.sidebarView,
+      polledView: sessions.polledSidebarView,
       viewWritable,
       workspaceOrdering: sessions.workspaceOrdering,
       repositoryOrder: sessions.repositoryOrder,
@@ -354,7 +356,11 @@ describe("the shared sidebar view", () => {
 describe("another Client's view change", () => {
   it.each<[string, Partial<SidebarView>, string | null]>([
     ["a TUI sort that moves the rows", { sort: "name", changed_by: "tui" }, "Sort changed in the TUI"],
-    ["a CLI grouping", { group_by: "group", changed_by: "cli" }, "Grouping changed in the CLI"],
+    [
+      "a TUI grouping and sort",
+      { group_by: "group", sort: "name", changed_by: "tui" },
+      "Grouping and sort changed in the TUI",
+    ],
     ["another browser's sort", { sort: "name", changed_by: "web" }, null],
     ["a sort that moves nothing", { sort: "newest", changed_by: "tui" }, null],
   ])("says why the list moved only when it did: %s", async (_, change, notice) => {
@@ -367,6 +373,19 @@ describe("another Client's view change", () => {
     await pollAt(result, 2);
     await waitFor(() => expect(result.current.model.groupBy).toBe(change.group_by ?? "project"));
     expect(toasts.info.mock.calls).toEqual(notice ? [[notice]] : []);
+  });
+
+  it("does not blame the TUI for this browser's refused pick falling back", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "custom", changed_by: "tui" };
+    server.use(http.patch("*/api/sidebar-view", () => new HttpResponse(null, { status: 500 })));
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    const before = rows(result);
+    await act(async () => result.current.model.selectSort("name"));
+    await waitFor(() => expect(rows(result)).not.toEqual(before));
+    await pollAt(result, 2);
+    await waitFor(() => expect(rows(result)).toEqual(before));
+    expect(toasts.info.mock.calls).toEqual([]);
   });
 });
 
@@ -395,6 +414,39 @@ describe("plugin sorts", () => {
       { sort: "name" },
     ]);
     expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined();
+  });
+
+  it("clears this browser's marker when its page unloads or the plugin goes away", async () => {
+    const { result, rerender } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    act(() => result.current.model.selectPluginSort({ pluginId: "p", entryId: "cost" }));
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBe("Cost"));
+    expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBe("Cost");
+    const sent = vi.spyOn(globalThis, "fetch");
+    window.dispatchEvent(new Event("pagehide"));
+    expect(sent.mock.calls.map(([url, init]) => [url, init?.keepalive])).toEqual([["/api/sidebar-view", true]]);
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined());
+    sent.mockRestore();
+    daemon.sidebar_view.web_plugin_sort = "Cost";
+
+    pluginEntries = [];
+    rerender();
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined());
+    expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBeNull();
+  });
+
+  it.each<[string, string | undefined, boolean]>([
+    ["clears a marker this tab set before a reload", "Cost", true],
+    ["leaves another browser's marker", "Tokens", false],
+    ["writes nothing when the Daemon dropped it", undefined, false],
+  ])("on load %s", async (_, onDaemon, cleared) => {
+    sessionStorage.setItem("aoe-web-plugin-sort-marker", "Cost");
+    daemon.sidebar_view = { ...daemon.sidebar_view, web_plugin_sort: onDaemon };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await pollAt(result, 2);
+    expect(writes.map((w) => w.body)).toEqual(cleared ? [{ web_plugin_sort: null }] : []);
+    expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBeNull();
   });
 
   it("writes no marker where the Daemon refuses view changes", async () => {

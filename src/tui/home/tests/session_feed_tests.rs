@@ -4076,7 +4076,7 @@ fn the_view_follows_a_daemon_sidebar_change_but_not_a_stale_snapshot() {
 #[test]
 #[serial]
 fn a_peer_view_change_is_named_only_when_the_list_moves() {
-    use crate::session::config::ClientKind::{Cli, Tui, Web};
+    use crate::session::config::ClientKind::{Tui, Web};
     use crate::session::config::{GroupByMode, SidebarView, SortOrder};
     use GroupByMode::{Group, Project};
     use SortOrder::{Custom, Name};
@@ -4090,10 +4090,10 @@ fn a_peer_view_change_is_named_only_when_the_list_moves() {
         ),
         (
             true,
-            Some(Cli),
+            Some(Web),
             Group,
             Name,
-            Some("Grouping and sort changed in the CLI"),
+            Some("Grouping and sort changed on the web"),
         ),
         (
             true,

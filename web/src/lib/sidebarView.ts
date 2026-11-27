@@ -28,11 +28,12 @@ export const sameView = (a: SidebarView, b: SidebarView) =>
   a.changed_by === b.changed_by &&
   a.web_plugin_sort === b.web_plugin_sort;
 
-const PEER_PLACE = { tui: "in the TUI", cli: "in the CLI" } as const;
+const PEER_PLACE = { tui: "in the TUI" } as const;
 
 /** Why the list moved when another Client kind changed the view from `before` to `after`, or null when this
  *  dashboard's own kind did, or neither the grouping nor the sort changed. */
-export function peerViewChangeNotice(before: SidebarView, after: SidebarView): string | null {
+export function peerViewChangeNotice(before: SidebarView | null, after: SidebarView | null): string | null {
+  if (!before || !after) return null;
   const by = after.changed_by;
   if (!by || by === "web") return null;
   const grouping = before.group_by !== after.group_by;

@@ -424,7 +424,7 @@ Change the one sidebar grouping and sort the Daemon owns. The body is
 {
   "group_by": "project" | "group",
   "sort": "custom" | "newest" | "name",
-  "client": "tui" | "web" | "cli",
+  "client": "tui" | "web",
   "web_plugin_sort": "Cost" | null
 }
 ```
@@ -441,7 +441,10 @@ receives it as `sidebar_view` in the runtime snapshot and shows it. Refused unde
 - `web_plugin_sort` is the label (1 to 64 characters, else 400) of a plugin sort
   a web dashboard applies in place of `sort`. Plugin sorts run only in browsers,
   so other Clients keep `sort` and may say a plugin sort is on. `null` clears
-  it, and so does a patch with `"client": "web"` that sets `sort`.
+  it, and so does a patch with `"client": "web"` that sets `sort`. The Daemon
+  keeps it in memory only, so a restart clears it; the browser that set it
+  clears it when its page unloads, or on its next load if that clear was lost.
+  With several browsers the marker is the last one set, and any of them can clear it.
 
 The value as published:
 

@@ -982,6 +982,15 @@ async fn commit_sidebar_view(
         )
             .into_response();
     }
+    let marker = match patch.web_plugin_sort.clone() {
+        Some(marker) => Some(marker),
+        None if patch.sort.is_some()
+            && patch.client == Some(crate::session::config::ClientKind::Web) =>
+        {
+            Some(None)
+        }
+        None => None,
+    };
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_app_state(|app| {
             let before = app.sidebar_view();
@@ -994,15 +1003,6 @@ async fn commit_sidebar_view(
             let after = app.sidebar_view();
             if (after.group_by, after.sort) != (before.group_by, before.sort) {
                 app.sidebar_view_changed_by = patch.client;
-            }
-            match patch.web_plugin_sort {
-                Some(marker) => app.web_plugin_sort = marker,
-                None if patch.sort.is_some()
-                    && patch.client == Some(crate::session::config::ClientKind::Web) =>
-                {
-                    app.web_plugin_sort = None;
-                }
-                None => {}
             }
             app.sidebar_view()
         })
@@ -1036,6 +1036,12 @@ async fn commit_sidebar_view(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     state.canonical_metadata.write().await.sidebar_view = view;
+    if let Some(marker) = marker {
+        *state
+            .web_plugin_sort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = marker;
+    }
     state.runtime.request_publish();
     drop(publication);
     drop(lane);
@@ -1135,6 +1141,11 @@ mod sidebar_view_tests {
                 .await
                 .into_response();
             assert_eq!(response.status(), status);
+            // A reload of state.toml, as the Daemon's reload installs it, keeps the marker.
+            state.canonical_metadata.write().await.sidebar_view = crate::session::Config::load()
+                .unwrap()
+                .app_state
+                .sidebar_view();
             let snapshot = state.runtime.publish(&state).await.unwrap();
             assert_eq!(snapshot.value.contents.sidebar_view, expected);
             assert_eq!(
@@ -1142,7 +1153,10 @@ mod sidebar_view_tests {
                     .unwrap()
                     .app_state
                     .sidebar_view(),
-                expected
+                SidebarView {
+                    web_plugin_sort: None,
+                    ..expected
+                }
             );
         }
     }

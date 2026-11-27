@@ -878,7 +878,6 @@ where
 pub enum ClientKind {
     Tui,
     Web,
-    Cli,
 }
 
 /// The one grouping and sort the Daemon owns. Clients read it from the runtime snapshot
@@ -891,7 +890,7 @@ pub struct SidebarView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed_by: Option<ClientKind>,
     /// Label of the plugin sort a web dashboard applies in place of `sort`, which only
-    /// browsers can run; other Clients keep `sort`.
+    /// browsers can run; other Clients keep `sort`. Held in Daemon memory only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_plugin_sort: Option<String>,
 }
@@ -902,7 +901,7 @@ impl AppStateConfig {
             group_by: self.group_by.unwrap_or_default(),
             sort: self.sort_order.unwrap_or_default(),
             changed_by: self.sidebar_view_changed_by,
-            web_plugin_sort: self.web_plugin_sort.clone(),
+            web_plugin_sort: None,
         }
     }
 }
@@ -1014,9 +1013,6 @@ pub struct AppStateConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub sidebar_view_changed_by: Option<ClientKind>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_plugin_sort: Option<String>,
 
     /// Last directory the user navigated to in the new-session dir picker.
     /// Restored on subsequent opens so users don't re-navigate every time.

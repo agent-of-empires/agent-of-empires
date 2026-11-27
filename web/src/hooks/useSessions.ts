@@ -86,6 +86,8 @@ export function useSessions() {
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
   const [repositoryOrder, setRepositoryOrder] = useState<string[]>([]);
   const [sidebarView, setSidebarView] = useState<SidebarView>(DEFAULT_SIDEBAR_VIEW);
+  // What the Daemon last served, apart from this browser's own picks shown ahead of it.
+  const [polledSidebarView, setPolledSidebarView] = useState<SidebarView | null>(null);
   const [groupOrder, setGroupOrder] = useState<GroupOrder>({});
   // This Client's own writes of each shared value, so a poll that predates one cannot undo it.
   const orderHold = useRef(newWriteHold());
@@ -312,8 +314,10 @@ export function useSessions() {
           read.groups = data.group_order ?? {};
           setGroupOrder(keepIfSameOrder(read.groups));
         }
+        const polledView = data.sidebar_view ?? DEFAULT_SIDEBAR_VIEW;
+        setPolledSidebarView((prev) => (prev && sameView(prev, polledView) ? prev : polledView));
         if (pollMayReplace(viewHold.current, cursor)) {
-          const view = data.sidebar_view ?? DEFAULT_SIDEBAR_VIEW;
+          const view = polledView;
           read.sort = view.sort;
           setSidebarView((prev) => (sameView(prev, view) ? prev : view));
         }
@@ -543,6 +547,7 @@ export function useSessions() {
     workspaceOrdering,
     repositoryOrder,
     sidebarView,
+    polledSidebarView,
     groupOrder,
     moveGroup,
     changeOrdering,

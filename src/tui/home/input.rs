@@ -5325,7 +5325,6 @@ impl HomeView {
         self.show_sidebar_view(view.group_by, view.sort);
         let place = match view.changed_by {
             Some(ClientKind::Web) => "on the web",
-            Some(ClientKind::Cli) => "in the CLI",
             Some(ClientKind::Tui) | None => return true,
         };
         let Some(seen) = seen else {
