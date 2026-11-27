@@ -44,7 +44,7 @@ fn is_registry_selector(selector: &str) -> bool {
     {
         return false;
     }
-    let is_tag = selector.starts_with(|c: char| c.is_ascii_alphabetic())
+    let is_tag = !matches!(selector, "" | "." | "..")
         && selector
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
@@ -529,6 +529,9 @@ mod tests {
             ("npx @agentclientprotocol/claude-agent-acp@*", true),
             ("npx @agentclientprotocol/claude-agent-acp@latest", true),
             ("npx @agentclientprotocol/claude-agent-acp@next", true),
+            ("npx @agentclientprotocol/claude-agent-acp@_canary", true),
+            ("npx @agentclientprotocol/claude-agent-acp@-stable", true),
+            ("npx \"@agentclientprotocol/claude-agent-acp@a b\"", false),
             ("npx @agentclientprotocol/claude-agent-acp@./x", false),
             ("npx @agentclientprotocol/claude-agent-acp@../x", false),
             ("npx @agentclientprotocol/claude-agent-acp@/abs", false),
