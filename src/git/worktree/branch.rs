@@ -331,13 +331,13 @@ impl GitWorktree {
         Ok(paths)
     }
 
-    /// The checkout holding `branch` when it still exists on disk. A stale
+    /// The checkout holding `branch` unless it is confirmed absent. A stale
     /// entry whose checkout is gone is skipped; `delete_branch` reaps those.
     pub(crate) fn live_checkout_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
         Ok(self
             .worktree_paths_for_branch(branch)?
             .into_iter()
-            .find(|path| matches!(path.try_exists(), Ok(true))))
+            .find(|path| !checkout_confirmed_absent(path.try_exists())))
     }
 
     /// Unlock and prune the one entry git ties to the branch being deleted.
