@@ -4673,6 +4673,10 @@ impl HomeView {
                 let (click, key) = bound(ActionId::Delete);
                 groups.push((3, click, mk(&key, "Del")));
             }
+            if self.selected_session.is_some() {
+                let (click, key) = bound(ActionId::ToggleSnooze);
+                groups.push((1, click, mk(&key, "Snooze")));
+            }
             // Fav follows the key's own gate (`Context::FavoritesUsable`), so the footer
             // advertises it wherever `f` actually does something.
             if self.selected_session.is_some() && crate::session::favorites_first() {

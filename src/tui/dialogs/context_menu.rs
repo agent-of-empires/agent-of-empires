@@ -110,7 +110,8 @@ fn row_to_item_idx(area: Rect, items_len: usize, col: u16, row: u16) -> Option<u
 impl ContextMenuDialog {
     /// Build the session row's menu. Each `Option` argument hides its row when
     /// `None` and carries the current state when `Some`, which flips the label:
-    /// `snooze`, `unread` (hidden when the feature is off), `can_fork` (only for an agent
+    /// `snooze` (hidden for a header row, where the `'h'` keybinding collapses),
+    /// `unread` (hidden when the feature is off), `can_fork` (only for an agent
     /// that can actually fork), and `switch_view` (only for a row that can
     /// change views, labelled with the view it lands on).
     pub fn for_session(

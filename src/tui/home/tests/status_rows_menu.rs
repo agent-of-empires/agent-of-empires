@@ -396,7 +396,7 @@ fn trash_system_health_releases_reader_keyboard() {
 }
 
 /// The footer advertises Fav only while `favorites_first` makes `f` pin rows
-/// (`Context::FavoritesUsable`); Archive and Snooze have no footer hint.
+/// (`Context::FavoritesUsable`), Snooze on every session row, and no Archive.
 #[test]
 #[serial]
 fn footer_fav_hint_follows_favorites_first() {
@@ -432,9 +432,8 @@ fn footer_fav_hint_follows_favorites_first() {
         crate::session::set_favorites_first(favorites_first);
         let footer = render_footer(&mut env);
         assert_eq!(footer.contains("Fav"), favorites_first, "{footer}");
-        for hint in ["Snooze", "Archive"] {
-            assert!(!footer.contains(hint), "{hint}\n{footer}");
-        }
+        assert!(footer.contains("Snooze"), "{footer}");
+        assert!(!footer.contains("Archive"), "{footer}");
     }
 
     crate::session::set_favorites_first(original);

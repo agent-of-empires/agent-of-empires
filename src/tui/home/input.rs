@@ -4048,7 +4048,8 @@ impl HomeView {
                 Err(denied) => {
                     let dialog_title = match denied {
                         crate::session::ForkDenied::AgentCannotFork { .. }
-                        | crate::session::ForkDenied::ChildNotCapturable { .. } => {
+                        | crate::session::ForkDenied::ChildNotCapturable { .. }
+                        | crate::session::ForkDenied::SandboxedParent { .. } => {
                             "Fork not supported"
                         }
                         crate::session::ForkDenied::NoParentSession
@@ -4530,6 +4531,7 @@ impl HomeView {
         bindings::Ctx {
             view_mode: self.view_mode.clone(),
             has_search: !self.search_matches.is_empty(),
+            session_selected: self.selected_session.is_some(),
             project_group_selected: self.project_group_at_cursor().is_some(),
             preview_scroll: live_send || (self.selected_is_trashed() && !self.system_health_open),
         }
@@ -5701,7 +5703,10 @@ impl HomeView {
                         .unwrap_or((false, false, false)),
                     _ => (false, false, false),
                 };
-                let snooze = Some(is_snoozed);
+                // Snooze acts on a session row in any sort order, matching `'h'`.
+                // A group header has no session, so it keeps `h` for collapse.
+                let snooze = matches!(self.flat_items[idx], super::Item::Session { .. })
+                    .then_some(is_snoozed);
                 // The unread toggle is always-on (any sort), so it shows
                 // whenever the feature is enabled.
                 let unread = crate::session::unread_enabled().then_some(is_unread);
