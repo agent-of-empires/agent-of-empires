@@ -3267,7 +3267,10 @@ pub(super) mod tests {
                 }).await.expect("actual deadline failure retains its original installation");
                 assert_eq!(supervisor.running_lease(&id), Some(lease.clone()));
                 assert_eq!(crate::process::process_birth_identity(owner.pid).unwrap().unwrap().fingerprint(), birth.fingerprint());
-                let record = worker_registry::load_strict(&id).unwrap().unwrap();
+                let record = worker_registry::registry_lock_until(
+                    &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                ).await.expect("inspect the exact retained registration after any in-flight update")
+                    .record().unwrap().unwrap();
                 assert!(owner.owns_record(&record));
                 if mode != "resume" {
                     scope.stop_observed_original(&lease).await;
@@ -3337,7 +3340,11 @@ pub(super) mod tests {
                 assert_eq!(supervisor.running_lease(&id), Some(lease.clone()));
                 assert_eq!(original.connected_runner(), Some(owner));
                 assert_eq!(crate::process::process_birth_identity(owner.pid).unwrap().unwrap().fingerprint(), birth.fingerprint());
-                assert!(owner.owns_record(&worker_registry::load_strict(&id).unwrap().unwrap()));
+                let record = worker_registry::registry_lock_until(
+                    &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                ).await.expect("inspect the resumed original registration")
+                    .record().unwrap().unwrap();
+                assert!(owner.owns_record(&record));
                 let flush = supervisor.sink.clone();
                 tokio::task::spawn_blocking(move || flush.flush()).await.unwrap();
                 let rows = store.replay_from(&id, 0).unwrap();

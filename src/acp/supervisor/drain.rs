@@ -2989,39 +2989,40 @@ mod tests {
                         .await.expect("the real completion reaches the ordered drain")
                         .expect("the ordered drain reaches the runtime diagnostic");
                     let storage = crate::session::Storage::open_reference("test").unwrap();
+                    // The anchored path and this profile can spell the same lock
+                    // differently on macOS (for example, /var versus /private/var).
+                    let profile_dir = storage.sessions_path().parent().unwrap().canonicalize().unwrap();
+                    let lifecycle_path = profile_dir.join(format!(".instance-lifecycle-{}.lock", client.id));
                     let mut preceding_lifecycle = if profile_writer {
-                        Some((
-                            storage.sessions_path().parent().unwrap().join(
-                                format!(".instance-lifecycle-{}.lock", client.id)),
-                            storage.acquire_instance_lifecycle_lock(&client.id).unwrap(),
-                        ))
+                        Some(storage.acquire_instance_lifecycle_lock(&client.id).unwrap())
                     } else {
                         None
                     };
                     let native = if profile_writer {
-                        crate::session::acquire_storage_flock(storage.sessions_path().parent().unwrap(), crate::session::STORAGE_LOCK_FILENAME).unwrap()
+                        crate::session::acquire_storage_flock(&profile_dir, crate::session::STORAGE_LOCK_FILENAME).unwrap()
                     } else {
                         storage.acquire_instance_lifecycle_lock(&client.id).unwrap()
                     };
                     if profile_writer {
-                        // An unchanged cached revision does not read the profile flock.
-                        // Force a real reload without changing the captured Native source.
-                        let file = std::fs::File::open(storage.sessions_path()).unwrap();
-                        let modified = file.metadata().unwrap().modified().unwrap() + Duration::from_secs(1);
-                        file.set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+                        // Force a revision change even on filesystems with coarse
+                        // timestamps. The trailing whitespace leaves the Native row intact.
+                        use std::io::Write as _;
+                        std::fs::OpenOptions::new().append(true)
+                            .open(storage.sessions_path()).unwrap().write_all(b"\n").unwrap();
                     }
                     assert_eq!(completion.origin.context,
                         crate::acp::state::NativeEventContext::capture(&original_row, &storage).unwrap());
                     resume_diagnostic.send(()).expect("resume actual diagnostic publication");
-                    let held_path = storage.sessions_path().parent().unwrap().join(
-                        if profile_writer { crate::session::STORAGE_LOCK_FILENAME.to_owned() }
-                        else { format!(".instance-lifecycle-{}.lock", client.id) });
+                    let held_path = if profile_writer {
+                        profile_dir.join(crate::session::STORAGE_LOCK_FILENAME)
+                    } else {
+                        lifecycle_path.clone()
+                    };
                     tokio::task::spawn_blocking(move || {
                         loop {
-                            let reported_path = contended_rx.recv_timeout(Duration::from_secs(10))?;
-                            if preceding_lifecycle.as_ref()
-                                .is_some_and(|(path, _)| path == &reported_path)
-                            {
+                            let reported_path = contended_rx.recv_timeout(Duration::from_secs(10))?
+                                .canonicalize().expect("observed lock file still exists");
+                            if reported_path == lifecycle_path {
                                 drop(preceding_lifecycle.take());
                             }
                             if reported_path == held_path {
@@ -3033,7 +3034,8 @@ mod tests {
                             }
                         }
                         Ok::<(), std::sync::mpsc::RecvTimeoutError>(())
-                    }).await.unwrap().expect("the captured diagnostic reaches the held flock");
+                    }).await.unwrap().unwrap_or_else(|error|
+                        panic!("the captured diagnostic reaches the held flock (supersede={supersede}, profile_writer={profile_writer}): {error}"));
                     assert!(supervisor.workers.try_lock().is_ok(),
                         "the diagnostic releases worker custody before its physical wait");
                     assert!(supervisor.lifecycle.try_lock().is_ok(),

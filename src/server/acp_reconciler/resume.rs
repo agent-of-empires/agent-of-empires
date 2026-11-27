@@ -1314,6 +1314,53 @@ mod tests {
         assert!(state.acp_supervisor.respawn_pending_ids().is_empty());
     }
 
+    async fn reap_orphaned_turn_runner(
+        live: &mut crate::server::test_support::ManagedControlSession,
+    ) {
+        let id = live.id().to_owned();
+        let owner = live
+            .state
+            .acp_supervisor
+            .current_native_availability(&id)
+            .await
+            .unwrap()
+            .owner
+            .unwrap();
+        let lease = live.state.acp_supervisor.running_lease(&id).unwrap();
+        assert_eq!(lease.spawned_runner(), Some(owner));
+        let mut reaped = lease.test_child_wait_completed();
+        let paused = live.client.pause_drain().await;
+        let guard = crate::process::RunnerProcessGuard::capture(owner.pid, owner.birth_fingerprint)
+            .unwrap();
+        guard
+            .signal(libc::SIGKILL)
+            .expect("retire only this fixture's captured private Native owner");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while guard.executing().unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original captured owner is conclusively dead");
+        live.state.acp_supervisor.test_remove_worker(&id).await;
+        drop(paused);
+        live.client.actual().shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while live.client.next_event().await.is_some() {}
+        })
+        .await
+        .expect("the old SDK and its ordered drain have actually retired");
+        // Registry admission still treats an unreaped zombie as a retained owner.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            reaped.wait_for(|outcome| outcome.is_some()),
+        )
+        .await
+        .expect("the exact original runner is reaped before readmission")
+        .unwrap();
+        assert_eq!(*outcome, Some(true));
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn prompt_wake_closes_an_orphaned_turn_before_resuming() {
@@ -1340,20 +1387,7 @@ mod tests {
                     let _request = live.start_prompt("keep going").await;
                 }
                 let id = live.id().to_owned();
-                let owner = live.state.acp_supervisor.current_native_availability(&id)
-                    .await.unwrap().owner.unwrap();
-                let paused = live.client.pause_drain().await;
-                let guard = crate::process::RunnerProcessGuard::capture(owner.pid, owner.birth_fingerprint).unwrap();
-                guard.signal(libc::SIGKILL).expect("retire only this fixture's captured private Native owner");
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while guard.executing().unwrap() { tokio::task::yield_now().await; }
-                }).await.expect("the original captured owner is conclusively dead");
-                live.state.acp_supervisor.test_remove_worker(&id).await;
-                drop(paused);
-                live.client.actual().shutdown().await.unwrap();
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while live.client.next_event().await.is_some() {}
-                }).await.expect("the old SDK and its ordered drain have actually retired");
+                reap_orphaned_turn_runner(&mut live).await;
                 assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(true));
                 let trigger = trigger_resume_background(&live.state.session_service, &id,
                     crate::process::worker_registry::ResumeAuthority::Explicit, crate::server::sandbox_login::LaunchOrigin::Interactive, None).await.unwrap();
@@ -1392,20 +1426,7 @@ mod tests {
                 assert_eq!(live.state.acp_event_store.has_open_turn(live.id()).unwrap(), Known(true),
                     "the original's real lifecycle, not content, establishes the open precondition");
                 let id = live.id().to_owned();
-                let owner = live.state.acp_supervisor.current_native_availability(&id)
-                    .await.unwrap().owner.unwrap();
-                let paused = live.client.pause_drain().await;
-                let guard = crate::process::RunnerProcessGuard::capture(owner.pid, owner.birth_fingerprint).unwrap();
-                guard.signal(libc::SIGKILL).expect("retire only this fixture's captured private Native owner");
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while guard.executing().unwrap() { tokio::task::yield_now().await; }
-                }).await.expect("the original captured owner is conclusively dead");
-                live.state.acp_supervisor.test_remove_worker(&id).await;
-                drop(paused);
-                live.client.actual().shutdown().await.unwrap();
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while live.client.next_event().await.is_some() {}
-                }).await.expect("the old SDK and its ordered drain have actually retired");
+                reap_orphaned_turn_runner(&mut live).await;
                 assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(true));
                 let authority = crate::process::worker_registry::ResumeAuthority::Explicit;
                 live.state.acp_event_store.test_set_unavailable(true);
@@ -1413,13 +1434,18 @@ mod tests {
                 assert!(matches!(deferred, Err(SupervisorError::EventStoreUnavailable(_))));
                 assert!(!live.state.acp_supervisor.is_running(&id).await, "nothing spawned");
                 live.state.acp_event_store.test_set_unavailable(false);
+                assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(true));
                 let trigger = trigger_resume_background(&live.state.session_service, &id, authority, crate::server::sandbox_login::LaunchOrigin::Interactive, None).await.unwrap();
                 assert!(matches!(trigger, ResumeTrigger::Started));
                 tokio::time::timeout(Duration::from_secs(10), async {
-                    while live.state.acp_event_store.has_open_turn(&id).unwrap() != Known(false) {
+                    loop {
+                        let events = live.state.acp_event_store.replay_from(&id, 0).unwrap();
+                        if events.iter().any(|stored| matches!(stored.event.as_ref(),
+                            crate::acp::Event::Stopped { reason } if reason == "orphaned_at_restart")) { break; }
                         tokio::task::yield_now().await;
                     }
                 }).await.expect("recovery closes the actual orphan rather than losing its history");
+                assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(false));
         })).await;
     }
 

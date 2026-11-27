@@ -2359,9 +2359,9 @@ mod tests {
     #[serial_test::serial]
     async fn queue_drain_ignores_background_work_but_preserves_foreground_barriers() {
         use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::acp::task_transcript::resource_test_support::append;
         use crate::acp::Event;
         use crate::server::test_support;
-        use std::io::Write as _;
 
         with_managed(|scope| Box::pin(async move {
             for (name, text, drains) in [
@@ -2495,14 +2495,16 @@ mod tests {
                         "timestamp":crate::time::Timestamp::now().to_rfc3339(),
                         "content":"<task-notification>\n<task-id>task</task-id>\n<tool-use-id>tool-background</tool-use-id>\n<status>completed</status>\n</task-notification>"
                     });
-                    let mut file = std::fs::OpenOptions::new().append(true)
-                        .open(task_transcript.as_ref().unwrap()).unwrap();
-                    writeln!(file, "{line}").unwrap();
-                    file.flush().unwrap();
+                    // FSEvents can defer write notifications until the writer closes.
+                    append(task_transcript.as_ref().unwrap(), &format!("{line}\n"));
                     tokio::time::timeout(Duration::from_secs(10), async {
                         loop {
                             let event = live.client.next_event().await.expect("original task observer");
-                            if matches!(event, Event::BackgroundTaskFinished { task_id, .. } if task_id == "task") {
+                            if let Event::BackgroundTaskFinished { task_id, ended_at } = event {
+                                if task_id != "task" {
+                                    continue;
+                                }
+                                assert!(ended_at.is_some(), "the original tailer observed completion");
                                 assert!(state.acp_event_store.replay_from(&id, 0).unwrap().iter().any(|stored| {
                                     stored.metadata.resource_ref == Some(allocation)
                                         && matches!(stored.event.as_ref(), Event::BackgroundTaskFinished { task_id, .. }

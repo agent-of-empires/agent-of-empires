@@ -2048,9 +2048,13 @@ pub(crate) mod resource_test_support {
                 workdir.path().to_path_buf()
             };
             if agent_key == "claude" {
-                assert!(home.starts_with(PathBuf::from(
-                    std::env::var_os("HOME").expect("isolated HOME")
-                )));
+                let isolated_home = PathBuf::from(std::env::var_os("HOME").expect("isolated HOME"))
+                    .canonicalize()
+                    .expect("canonical isolated HOME");
+                assert!(
+                    home.starts_with(&isolated_home),
+                    "Claude store {home:?} is outside isolated HOME {isolated_home:?}"
+                );
             }
             let project = if agent_key == "claude" {
                 let encoded = crate::session::capture::encode_claude_project_path(
