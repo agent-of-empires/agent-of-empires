@@ -30,7 +30,7 @@ use super::{
     lock_recover, BroadcastSink, ChannelSink, Launcher, ResumeKind, ResumeReservation,
     SpawnRequest, Supervisor, SupervisorError, WorkerHandle, WorkerKind,
 };
-use crate::acp::acp_client::{AcpClient, SpawnConfig};
+use crate::acp::acp_client::{AcpClient, SpawnConfig, TestRunner};
 use crate::acp::agent_registry::AgentSpec;
 use crate::acp::approvals::Nonce;
 use crate::acp::event_store::EventStore;
@@ -1350,21 +1350,21 @@ for line in sys.stdin:
     }
 
     pub(crate) fn launcher(&self, owned_runner: bool) -> Launcher {
-        self.launcher_with_runner(owned_runner.then(cargo_runner_executable))
+        self.launcher_with_runner(owned_runner.then(|| cargo_runner_executable().into()))
     }
 
     pub(crate) fn managed_launcher(&self) -> Launcher {
         let thread = std::thread::current();
-        let (executable, _) =
+        let (command, _) =
             crate::process::runner::test_support::managed_runner::RunnerInspection::prepare(
                 self._directory.path(),
                 thread.name().expect("managed libtest name"),
             );
-        self.launcher_with_runner(Some(executable))
+        self.launcher_with_runner(Some(command.into()))
     }
 
-    fn launcher_with_runner(&self, executable: Option<PathBuf>) -> Launcher {
-        let owned_runner = executable.is_some();
+    fn launcher_with_runner(&self, runner: Option<TestRunner>) -> Launcher {
+        let owned_runner = runner.is_some();
         let script = self.script.clone();
         let capture = self.capture.clone();
         let pid_file = self.pid_file.clone();
@@ -1373,7 +1373,7 @@ for line in sys.stdin:
             let script = script.clone();
             let capture = capture.clone();
             let pid_file = pid_file.clone();
-            let executable = executable.clone();
+            let runner = runner.clone();
             if let Some(lease) = config.launch_lease.as_ref() {
                 leases.lock().unwrap().push(lease.clone());
             }
@@ -1394,9 +1394,9 @@ for line in sys.stdin:
                 } else {
                     None
                 };
-                match executable {
-                    Some(executable) => {
-                        AcpClient::spawn_with_test_runner(config, session_id, executable).await
+                match runner {
+                    Some(runner) => {
+                        AcpClient::spawn_with_test_runner(config, session_id, runner).await
                     }
                     None => AcpClient::spawn(config, session_id).await,
                 }

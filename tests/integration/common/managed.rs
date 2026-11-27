@@ -24,7 +24,7 @@ use crate::acp::runner_lifecycle::{Lease, ProcessControl, SystemProcessControl};
 use crate::acp::state::Event;
 use crate::acp::supervisor::{ChannelSink, Launcher, Supervisor, SupervisorError};
 use crate::process::runner::test_support::managed_runner::{
-    child_if_requested, NativeSpawnProof, RunnerInspection,
+    child_if_requested, ManagedRunnerCommand, NativeSpawnProof, RunnerInspection,
 };
 use crate::server::{AcpBroadcastFrame, AppState};
 
@@ -662,7 +662,7 @@ impl ManagedRetirement {
 #[derive(Default)]
 struct CaseOneShot {
     options: SdkTestOptions,
-    runner: Option<(PathBuf, RunnerInspection)>,
+    runner: Option<(ManagedRunnerCommand, RunnerInspection)>,
 }
 
 struct CaseInputs {
@@ -773,7 +773,7 @@ pub struct ManagedScope {
     leases: Arc<Mutex<Vec<Lease>>>,
     native_launches: Arc<Mutex<Vec<NativeLaunch>>>,
     options: Arc<Mutex<Option<SdkTestOptions>>>,
-    runner_override: Arc<Mutex<Option<(PathBuf, RunnerInspection)>>>,
+    runner_override: Arc<Mutex<Option<(ManagedRunnerCommand, RunnerInspection)>>>,
     helpers: Vec<ManagedTask>,
     bin: PathBuf,
     clients: Vec<Arc<AcpClient>>,
@@ -860,10 +860,6 @@ async fn with_managed_configured<F>(
         std::fs::write(&path, &wrapper).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    // Preserve each case's original executable/argv and builtin AgentProfile.
-    let node_launcher = bin.join("managed-native");
-    std::fs::write(&node_launcher, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-    std::fs::set_permissions(&node_launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut paths = node::EnvGuard::new(&["PATH"]);
     let mut entries = vec![bin];
     entries.extend(std::env::split_paths(
@@ -873,7 +869,7 @@ async fn with_managed_configured<F>(
     let inputs: Arc<InputBindings> = Arc::default();
     let leases: Arc<Mutex<Vec<Lease>>> = Arc::default();
     let options: Arc<Mutex<Option<SdkTestOptions>>> = Arc::default();
-    let runner_override: Arc<Mutex<Option<(PathBuf, RunnerInspection)>>> = Arc::default();
+    let runner_override = Arc::default();
     let directories: Arc<Mutex<Vec<Arc<tempfile::TempDir>>>> = Arc::default();
     let native_launches: Arc<Mutex<Vec<NativeLaunch>>> = Arc::default();
     let launcher_override: Arc<Mutex<Option<Launcher>>> = Arc::default();
@@ -898,7 +894,6 @@ async fn with_managed_configured<F>(
             let inputs = inputs.clone();
             let directories = directories.clone();
             let native_launches = native_launches.clone();
-            let node_launcher = node_launcher.clone();
             let test_name = test_name.clone();
             Box::pin(async move {
                 let (template, first) = inputs.claim(&lease).await?;
@@ -918,11 +913,6 @@ async fn with_managed_configured<F>(
                 // Only case inputs are overlaid. Attempt, producer, native store,
                 // selected identity, generation and admission remain factory-owned.
                 actual.spec = template.spec;
-                actual
-                    .spec
-                    .args
-                    .insert(0, std::mem::take(&mut actual.spec.command));
-                actual.spec.command = node_launcher.to_string_lossy().into_owned();
                 actual.additional_dirs = template.additional_dirs;
                 super::super::launch::overlay_env(&mut actual.provider_env, template.provider_env);
                 super::super::launch::overlay_env(
@@ -947,7 +937,7 @@ async fn with_managed_configured<F>(
                 actual.mcp_servers = template.mcp_servers;
                 actual.socket_path =
                     Some(crate::process::worker_registry::socket_path_for(&session_id.0).unwrap());
-                let (candidate, inspection) = first.runner.unwrap_or_else(|| {
+                let (command, inspection) = first.runner.unwrap_or_else(|| {
                     let directory = Arc::new(
                         tempfile::tempdir_in("/tmp").expect("unique runner/lease directory"),
                     );

@@ -9,6 +9,8 @@ use super::spawn::{
     apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
     SpawnConfig,
 };
+#[cfg(test)]
+use crate::process::runner::test_support::managed_runner::ManagedRunnerCommand;
 
 /// Deadline for the runner socket to appear. 10s suffices in production, but
 /// a debug-build cold start under CI load blows past it deterministically, so
@@ -220,8 +222,39 @@ fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) enum TestRunner {
+    Executable(std::path::PathBuf),
+    Managed(ManagedRunnerCommand),
+}
+
+#[cfg(test)]
+impl TestRunner {
+    fn executable(&self) -> &std::path::Path {
+        match self {
+            Self::Executable(path) => path,
+            Self::Managed(command) => command.executable(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<std::path::PathBuf> for TestRunner {
+    fn from(path: std::path::PathBuf) -> Self {
+        Self::Executable(path)
+    }
+}
+
+#[cfg(test)]
+impl From<ManagedRunnerCommand> for TestRunner {
+    fn from(command: ManagedRunnerCommand) -> Self {
+        Self::Managed(command)
+    }
+}
+
+#[cfg(test)]
 tokio::task_local! {
-    pub(super) static TEST_RUNNER_EXECUTABLE: std::path::PathBuf;
+    pub(super) static TEST_RUNNER: TestRunner;
 }
 
 /// The runner owns the agent subprocess and outlives the daemon; its Child is
@@ -241,8 +274,11 @@ pub(super) async fn spawn_runner_detached(
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
     #[cfg(test)]
-    let current_exe = TEST_RUNNER_EXECUTABLE
-        .try_with(Clone::clone)
+    let test_runner = TEST_RUNNER.try_with(Clone::clone).ok();
+    #[cfg(test)]
+    let current_exe = test_runner
+        .as_ref()
+        .map(|runner| runner.executable().to_owned())
         .unwrap_or(current_exe);
     ensure_runner_exe(&current_exe)?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
@@ -498,6 +534,28 @@ pub(super) async fn spawn_runner_detached(
 
     // Reads the runner env, so it runs before the scope wrapper adds its own.
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
+    // Darwin audit tokens identify an execution, not an exec-stable birth.
+    // Start the real libtest runner directly so the lease cannot attest a
+    // shell trampoline instead of the executable that registers the worker.
+    #[cfg(test)]
+    if let Some(TestRunner::Managed(test_runner)) = test_runner {
+        let mut direct = test_runner
+            .command(cmd.as_std().get_args())
+            .map_err(|error| AcpError::Spawn(format!("prepare managed runner: {error}")))?;
+        let fixture_environment: Vec<_> = direct
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_owned(), value?.to_owned())))
+            .collect();
+        direct
+            .env_clear()
+            .envs(
+                cmd.as_std()
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .envs(fixture_environment);
+        cmd = direct.into();
+    }
     let mut cmd = match &prefix {
         Some(prefix) => wrap_in_scope(cmd, prefix),
         None => cmd,

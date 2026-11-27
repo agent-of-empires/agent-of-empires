@@ -3694,6 +3694,7 @@ mod tests {
             let group = original.0.as_ref().unwrap();
             let pid = published_pid(&effects.path().join("ready"));
             let before = audit_token(pid).unwrap().unwrap();
+            let birth = unique_identity(pid, false).unwrap().unwrap().unique_id;
             let stale = CapturedProcessTree::capture(pid).unwrap();
             if descendant_exec {
                 original.1 = ProcessHandle::capture_owned(
@@ -3710,6 +3711,11 @@ mod tests {
             assert_eq!(published_pid(&effects.path().join("advanced")), pid);
             let after = audit_token(pid).unwrap().unwrap();
             assert_ne!(before.values[7], after.values[7]);
+            assert_eq!(
+                unique_identity(pid, false).unwrap().unwrap().unique_id,
+                birth,
+                "exec changes signal authority, not the underlying process birth"
+            );
             assert!(!group.exited().unwrap());
 
             let recovered = CapturedProcessTree::resume(stale.receipt().clone(), pid).unwrap();

@@ -62,7 +62,7 @@ fn spawn_runner_and_wait_for_record(test_name: &str, session_id: &str) -> (Owned
     let producer = uuid::Uuid::new_v4();
     let attempt = arm_selected(&storage, session_id, producer, None);
     let directory = tempfile::tempdir_in("/tmp").unwrap();
-    let (executable, inspection) =
+    let (launch, inspection) =
         managed_runner::RunnerInspection::prepare(directory.path(), test_name);
     let socket = worker_registry::socket_path_for(session_id).unwrap();
     let record_path = worker_registry::workers_dir()
@@ -83,7 +83,10 @@ fn spawn_runner_and_wait_for_record(test_name: &str, session_id: &str) -> (Owned
         .arg(attempt.id.to_string())
         .arg("--establishment-producer")
         .arg(producer.to_string())
-        .args(["--", "cat"])
+        .args(["--", "cat"]);
+    let child = launch
+        .command(runner.get_args())
+        .expect("prepare actual acp runner command")
         .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
         .spawn()
         .expect("spawn actual acp runner without setsid");

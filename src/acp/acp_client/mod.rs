@@ -62,6 +62,8 @@ pub use resolve_command::{
     is_bare_command, on_agent_path, resolve_agent_command, ResolvedAgentCommand, Unresolved,
 };
 pub(crate) use runner::wrap_in_scope;
+#[cfg(test)]
+pub(crate) use runner::TestRunner;
 pub use session_sandbox::{effective_launch_env, SessionSandbox};
 pub(crate) use session_sandbox::{known_container_workdir, SandboxLayout};
 pub(crate) use spawn::host_environment_denyreason;
@@ -888,10 +890,10 @@ impl AcpClient {
     pub(crate) async fn spawn_with_test_runner(
         config: SpawnConfig,
         session_id: AcpSessionId,
-        executable: PathBuf,
+        runner: impl Into<TestRunner>,
     ) -> Result<Self, AcpError> {
-        runner::TEST_RUNNER_EXECUTABLE
-            .scope(executable, Self::spawn(config, session_id))
+        runner::TEST_RUNNER
+            .scope(runner.into(), Self::spawn(config, session_id))
             .await
     }
 
