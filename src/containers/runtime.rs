@@ -137,10 +137,19 @@ impl ContainerRuntime {
 
     /// Joins this process's running pull of `image`, or starts one.
     pub(crate) fn join_pull(&self, image: &str) -> image_pull::Waiter {
-        let base = self.base;
+        let runtime = ContainerRuntime {
+            base: self.base,
+            kind: self.kind,
+        };
         let pulled = image.to_string();
         image_pull::join_with(self.pull_key(image), move |pull| {
-            base.pull_until_cancelled(&pulled, pull)
+            runtime.base.pull_until_cancelled(&pulled, pull)?;
+            // The update check's local side, so a client compares it with an offer's digest.
+            pull.installed(match runtime.local_image_digest(&pulled) {
+                LocalDigest::Digest(digest) => Some(digest),
+                _ => None,
+            });
+            Ok(())
         })
     }
 
@@ -1034,6 +1043,47 @@ mod tests {
         ];
         for (runtime, image, expected) in cases {
             assert_eq!(runtime.pull_command(image), expected, "{image:?}");
+        }
+    }
+
+    /// A pull's Done names what it installed: the image's repo digest after the pull, which is
+    /// what the update check compares an offer with.
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_pull_reports_the_digest_it_installed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for (image, inspect, want) in [
+            (
+                "ghcr.io/x/installed:1",
+                r#"echo "ghcr.io/x/installed@sha256:abc""#,
+                Some("sha256:abc"),
+            ),
+            ("ghcr.io/x/uninspectable:1", "exit 1", None),
+        ] {
+            let path = dir.path().join(image.replace(['/', ':'], "_"));
+            let script =
+                format!("#!/bin/sh\ncase \"$1\" in image) {inspect} ;; *) exit 0 ;; esac\n");
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let runtime = ContainerRuntime {
+                base: RuntimeBase {
+                    binary: Box::leak(path.to_string_lossy().into_owned().into_boxed_str()),
+                    ..RuntimeBase::DOCKER
+                },
+                kind: RuntimeKind::Docker,
+            };
+            runtime
+                .join_pull(image)
+                .wait(&tokio_util::sync::CancellationToken::new())
+                .unwrap();
+            assert_eq!(
+                runtime.pull_state(image),
+                image_pull::PullState::Done {
+                    digest: want.map(str::to_string)
+                },
+                "{image}: the Done didn't name what the pull installed"
+            );
         }
     }
 

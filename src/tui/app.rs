@@ -5086,7 +5086,7 @@ mod tests {
         answer_pull(
             &mut app,
             PullRequest::Poll,
-            answer(PullState::Done, ImageOffer::Update(image_update())),
+            answer(PullState::Done { digest: None }, ImageOffer::Update(image_update())),
         );
         assert_eq!(app.pull.line(), Some(&PullLine::Done));
         assert_eq!(app.image_update, None, "the update just pulled came back");
@@ -5122,7 +5122,7 @@ mod tests {
         answer_pull(
             &mut app,
             PullRequest::Poll,
-            PullReport::State(PullState::Done),
+            PullReport::State(PullState::Done { digest: None }),
         );
         assert_eq!(app.pull.line(), Some(&PullLine::Done));
         assert_eq!(
@@ -5440,7 +5440,7 @@ mod tests {
         answer_sent(&mut app, &sent, 0, PullReport::State(running()));
         answer_pull(&mut app, PullRequest::Poll, poll(running(), &newer));
         assert_eq!(app.image_update, Some(newer.clone()));
-        answer_pull(&mut app, PullRequest::Poll, poll(PullState::Done, &newer));
+        answer_pull(&mut app, PullRequest::Poll, poll(PullState::Done { digest: None }, &newer));
         assert_eq!(app.pull.line(), Some(&PullLine::Done));
         assert_eq!(
             app.image_update,
@@ -5457,7 +5457,7 @@ mod tests {
         );
         assert!(app.pull.running(), "a pull started elsewhere isn't shown");
         answer_pull(&mut app, PullRequest::Poll, poll(running(), &newer));
-        answer_pull(&mut app, PullRequest::Poll, poll(PullState::Done, &newer));
+        answer_pull(&mut app, PullRequest::Poll, poll(PullState::Done { digest: None }, &newer));
         assert_eq!(app.image_update, Some(newer));
         assert_eq!(app.pulled_image, Some(image_update()));
     }
@@ -5499,7 +5499,7 @@ mod tests {
             remote_digest: "sha256:bbb".into(),
         };
         let running = || PullReport::State(PullState::Running(Default::default()));
-        let done = || PullReport::State(PullState::Done);
+        let done = || PullReport::State(PullState::Done { digest: None });
         for case in ["confirm", "done", "running elsewhere"] {
             let (mut app, mut terminal) = key_app();
             let sent = hold_pull_requests(&mut app);
@@ -5913,13 +5913,13 @@ mod tests {
             answer_pull(
                 &mut app,
                 PullRequest::Poll,
-                PullReport::State(PullState::Done),
+                PullReport::State(PullState::Done { digest: None }),
             );
             let mut last_offer = None;
             for step in steps {
                 let (report, flight, offer) = match step {
                     Run(flight, offer) => (PullState::Running(Default::default()), flight, offer),
-                    End(flight, offer) => (PullState::Done, flight, offer),
+                    End(flight, offer) => (PullState::Done { digest: None }, flight, offer),
                     Ack => {
                         assert!(
                             app.pull.dismiss(&app.pull.drawn().unwrap()),
@@ -5974,7 +5974,7 @@ mod tests {
         answer_pull(
             &mut app,
             PullRequest::Poll,
-            PullReport::State(PullState::Done),
+            PullReport::State(PullState::Done { digest: None }),
         );
         app.update_status = Some(UpdateStatus::persistent("updating aoe…".into()));
         draw(&mut app);
@@ -5999,9 +5999,9 @@ mod tests {
             app.start_pull(image_update().image);
             for state in [
                 PullState::Running(Default::default()),
-                PullState::Done,
+                PullState::Done { digest: None },
                 PullState::Running(Default::default()),
-                PullState::Done,
+                PullState::Done { digest: None },
             ] {
                 answer_pull(&mut app, PullRequest::Poll, PullReport::State(state));
             }
@@ -6041,7 +6041,7 @@ mod tests {
             error: String::new(),
         };
         for (kind, outcome, line) in [
-            ("done", PullState::Done, PullLine::Done),
+            ("done", PullState::Done { digest: None }, PullLine::Done),
             (
                 "failed",
                 failed,
@@ -6054,7 +6054,7 @@ mod tests {
                 PullState::Running(Default::default()),
                 outcome,
                 PullState::Running(Default::default()),
-                PullState::Done,
+                PullState::Done { digest: None },
             ] {
                 answer_pull(&mut app, PullRequest::Poll, PullReport::State(state));
             }
@@ -6239,8 +6239,10 @@ mod tests {
                 app.handle_key(ctrl_e, &mut terminal).await.unwrap();
                 assert!(app.pull.cancel_prompt(std::time::Instant::now()), "{path}");
             } else {
-                app.pull
-                    .apply(PullRequest::Poll, PullReport::State(PullState::Done));
+                app.pull.apply(
+                    PullRequest::Poll,
+                    PullReport::State(PullState::Done { digest: None }),
+                );
                 if case == "drawn done" {
                     app.drawn_bar = app.pull.drawn().map(DrawnBar::Pull);
                 }
@@ -6355,7 +6357,7 @@ mod tests {
             answer_pull(
                 &mut app,
                 PullRequest::Poll,
-                PullReport::State(PullState::Done),
+                PullReport::State(PullState::Done { digest: None }),
             );
             draw(&mut app);
             app.handle_key(help, &mut terminal).await.unwrap();

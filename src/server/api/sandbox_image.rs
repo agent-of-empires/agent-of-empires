@@ -1055,7 +1055,7 @@ mod tests {
             runtime: runtime.display_name(),
             image: IMAGE.into(),
         };
-        let status_flight = || {
+        let status = || {
             let state = state.clone();
             async move {
                 let resp = sandbox_image_status(
@@ -1067,9 +1067,10 @@ mod tests {
                     }),
                 )
                 .await;
-                json(resp).await.1["flight"].as_u64()
+                json(resp).await.1
             }
         };
+        let status_flight = || async { status().await["flight"].as_u64() };
         let cancel = |flight: u64| {
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(
@@ -1080,12 +1081,20 @@ mod tests {
             sandbox_image_cancel(State(state.clone()), headers, body.into())
         };
 
-        let first = image_pull::join_with(pull_key.clone(), |_| Ok(()));
+        let first = image_pull::join_with(pull_key.clone(), |pull| {
+            pull.installed(Some("sha256:first".into()));
+            Ok(())
+        });
         let stale = first.flight_id();
         first
             .wait(&tokio_util::sync::CancellationToken::new())
             .unwrap();
         assert_eq!(status_flight().await, None, "an ended pull has no flight");
+        assert_eq!(
+            status().await["pull"],
+            serde_json::json!({ "state": "done", "digest": "sha256:first" }),
+            "a Done doesn't name what it installed"
+        );
         let second = image_pull::join_with(pull_key.clone(), |pull| {
             while !pull.kill.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(5));

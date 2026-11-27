@@ -346,7 +346,7 @@ impl PullWatch {
                 self.end(None);
                 return Applied::Unanswered(START_UNANSWERED);
             }
-            PullReport::State(PullState::Done) => {
+            PullReport::State(PullState::Done { .. }) => {
                 let flight = std::mem::take(&mut self.shown);
                 self.end(Some(PullLine::Done));
                 applied = Applied::Updated(flight);
@@ -532,7 +532,7 @@ impl PullWatch {
             PullReport::State(PullState::Running(snapshot)) => {
                 self.behind = Some(PullLine::Running(*snapshot));
             }
-            PullReport::State(PullState::Done) if self.behind_running() => {
+            PullReport::State(PullState::Done { .. }) if self.behind_running() => {
                 self.behind = Some(PullLine::Done);
                 return Some(Applied::Updated(std::mem::take(&mut self.behind_flight)));
             }
@@ -540,7 +540,7 @@ impl PullWatch {
                 // An ended or vanished pull's update goes with it.
                 self.behind_flight = Flight::default();
                 self.behind = match state {
-                    PullState::Done => Some(PullLine::Done),
+                    PullState::Done { .. } => Some(PullLine::Done),
                     PullState::Cancelled => Some(PullLine::Cancelled),
                     PullState::Failed { reason, .. } => Some(PullLine::Failed(*reason)),
                     _ => None,
@@ -624,7 +624,7 @@ mod tests {
     #[test]
     fn a_pull_shows_its_outcome_only_once_watched() {
         use PullRequest::{Cancel, Poll, Start};
-        let done = || PullReport::State(PullState::Done);
+        let done = || PullReport::State(PullState::Done { digest: None });
         let cancelled = || PullReport::State(PullState::Cancelled);
         let idle = || PullReport::State(PullState::Idle);
         let gated = || PullReport::Gated {
@@ -833,13 +833,13 @@ mod tests {
             (
                 "a failure, then another pull that finishes",
                 failed(),
-                vec![running(1), PullReport::State(PullState::Done)],
+                vec![running(1), PullReport::State(PullState::Done { digest: None })],
                 failure.clone(),
                 Some(PullLine::Done),
             ),
             (
                 "done, then another pull",
-                PullReport::State(PullState::Done),
+                PullReport::State(PullState::Done { digest: None }),
                 vec![running(2)],
                 PullLine::Done,
                 Some(other(2)),
@@ -857,7 +857,7 @@ mod tests {
             watch.start(None);
             watch.apply(PullRequest::Poll, outcome);
             for report in after {
-                let finished = report == PullReport::State(PullState::Done);
+                let finished = report == PullReport::State(PullState::Done { digest: None });
                 assert_eq!(
                     watch.apply(PullRequest::Poll, report),
                     if finished {
@@ -891,7 +891,10 @@ mod tests {
             watch.line(),
             Some(&PullLine::Running(ProgressSnapshot::default()))
         );
-        watch.apply(PullRequest::Poll, PullReport::State(PullState::Done));
+        watch.apply(
+            PullRequest::Poll,
+            PullReport::State(PullState::Done { digest: None }),
+        );
         assert_eq!(watch.line(), Some(&PullLine::Done), "the retry's outcome");
     }
 
@@ -975,7 +978,10 @@ mod tests {
             "a running pull's line changed on a key"
         );
 
-        watch.apply(PullRequest::Poll, PullReport::State(PullState::Done));
+        watch.apply(
+            PullRequest::Poll,
+            PullReport::State(PullState::Done { digest: None }),
+        );
         assert!(
             !watch.other_key(None),
             "a key cleared a Done that wasn't drawn"

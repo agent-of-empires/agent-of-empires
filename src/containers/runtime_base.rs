@@ -1404,6 +1404,7 @@ mod tests {
                 let pull = PullContext {
                     kill: &CancellationToken::new(),
                     progress: &progress,
+                    installed: &Mutex::default(),
                 };
                 runtime.pull_with_timeout("img", &pull, DEADLINE)
             })
@@ -1458,6 +1459,7 @@ mod tests {
         let pull = PullContext {
             kill: &CancellationToken::new(),
             progress: &progress,
+            installed: &std::sync::Mutex::default(),
         };
         let result = runtime.pull_with_timeout("img", &pull, Duration::from_secs(1));
         assert!(matches!(

@@ -64,7 +64,12 @@ impl PullFailureReason {
 pub enum PullState {
     Idle,
     Running(ProgressSnapshot),
-    Done,
+    /// `digest` is the repo digest the runtime reports for the image just pulled, so a client can
+    /// tell which update it installed; None where the runtime has none (Apple's) or can't say.
+    Done {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+    },
     /// Ended by an explicit `cancel`; a pull its last waiter left ends `Idle`.
     Cancelled,
     /// `message` is `reason`'s shared wording; `error` is the runtime's output, for Details.
@@ -89,17 +94,25 @@ struct Flight {
     state: Mutex<FlightState>,
     finished: Condvar,
     progress: Mutex<Progress>,
+    installed: Mutex<Option<String>>,
 }
 
-/// What a running pull is handed: the token that kills it, and where its progress goes.
+/// What a running pull is handed: the token that kills it, where its progress goes, and where
+/// it says what it installed.
 pub(crate) struct PullContext<'a> {
     pub kill: &'a CancellationToken,
     pub(crate) progress: &'a Mutex<Progress>,
+    pub(crate) installed: &'a Mutex<Option<String>>,
 }
 
 impl PullContext<'_> {
     pub(crate) fn report(&self, update: LayerUpdate) {
         lock(self.progress).apply(update);
+    }
+
+    /// The digest a successful pull installed, for its `Done`.
+    pub(crate) fn installed(&self, digest: Option<String>) {
+        *lock(self.installed) = digest;
     }
 }
 
@@ -179,6 +192,7 @@ where
         }),
         finished: Condvar::new(),
         progress: Mutex::default(),
+        installed: Mutex::default(),
     });
     flights.insert(key.clone(), Entry::Running(flight.clone()));
     drop(flights);
@@ -189,6 +203,7 @@ where
         let context = PullContext {
             kill: &runner.kill,
             progress: &runner.progress,
+            installed: &runner.installed,
         };
         // A panic still finishes the flight; otherwise its waiters and every later joiner hang.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pull(&context)))
@@ -213,7 +228,7 @@ where
         // A pull started after this one was killed owns the entry now.
         if matches!(flights.get(&key), Some(Entry::Running(f)) if Arc::ptr_eq(f, &runner)) {
             let cancel_requested = lock(&runner.state).cancel_requested;
-            match finished_state(&outcome, cancel_requested) {
+            match finished_state(&outcome, cancel_requested, lock(&runner.installed).clone()) {
                 Some(state) => flights.insert(key, Entry::Finished(state)),
                 None => flights.remove(&key),
             };
@@ -229,9 +244,13 @@ where
     }
 }
 
-fn finished_state(outcome: &Result<()>, cancel_requested: bool) -> Option<PullState> {
+fn finished_state(
+    outcome: &Result<()>,
+    cancel_requested: bool,
+    installed: Option<String>,
+) -> Option<PullState> {
     match outcome {
-        Ok(()) => Some(PullState::Done),
+        Ok(()) => Some(PullState::Done { digest: installed }),
         Err(DockerError::Cancelled(_)) if cancel_requested => Some(PullState::Cancelled),
         Err(DockerError::Cancelled(_)) => None,
         Err(error) => {
@@ -391,10 +410,9 @@ pub(crate) fn cancel(
             .unwrap_or_else(|e| e.into_inner())
             .0;
     }
-    let ended = guard
-        .outcome
-        .as_ref()
-        .map(|outcome| finished_state(outcome, true).unwrap_or(PullState::Idle));
+    let ended = guard.outcome.as_ref().map(|outcome| {
+        finished_state(outcome, true, lock(&flight.installed).clone()).unwrap_or(PullState::Idle)
+    });
     drop(guard);
     Ok(ended.unwrap_or_else(|| PullState::Running(lock(&flight.progress).snapshot())))
 }
@@ -491,7 +509,7 @@ mod tests {
         let retry = join_with(shared.clone(), counted(|| Ok(()), None));
         assert!(within("a retry", move || retry.wait(&CancellationToken::new())).is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 3, "per runtime, and a retry");
-        assert_eq!(state(&shared), PullState::Done);
+        assert_eq!(state(&shared), PullState::Done { digest: None });
     }
 
     #[test]
@@ -571,7 +589,7 @@ mod tests {
         ));
         assert_eq!(
             state(&killed),
-            PullState::Done,
+            PullState::Done { digest: None },
             "the killed pull leaves the newcomer's outcome alone"
         );
     }
@@ -776,7 +794,7 @@ mod tests {
             .wait(&CancellationToken::new()))
         .is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a fresh flight ran");
-        assert_eq!(state(&panicked), PullState::Done);
+        assert_eq!(state(&panicked), PullState::Done { digest: None });
     }
 
     #[test]

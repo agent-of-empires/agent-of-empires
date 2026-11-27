@@ -810,7 +810,9 @@ expires.
   (`downloading`, then `unpacking`), `layers_done` and `layers_known`. Only
   Docker reports them; Podman and Apple Container report a bare
   `{"state": "running"}`.
-- `done`.
+- `done`, with `digest` when the runtime reports one: the image's repo digest
+  after the pull, comparable with `remote_digest`, so a client can tell which
+  update it installed. Apple Container reports none.
 - `cancelled`: ended by `image-pull/cancel`.
 - `failed`, with `reason` (`timeout`, `network`, `disk_space`, `auth` or
   `other`), `message` (the wording both clients show) and `error` (the
