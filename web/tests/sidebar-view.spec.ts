@@ -43,7 +43,8 @@ test.describe("shared sidebar view (#5896)", () => {
     const wrappers = page.locator(WRAPPERS);
     await dragRow(page, wrappers.nth(2), wrappers.nth(1));
 
-    await expect.poll(() => handle.viewPatches).toEqual([{ sort: "custom" }]);
+    // Conditioned on the sort the drag began under, so a peer's later pick wins.
+    await expect.poll(() => handle.viewPatches).toEqual([{ sort: "custom", base_sort: "name" }]);
     expect(handle.puts).toEqual([
       {
         order: [sessions[2]!, sessions[0]!, sessions[1]!].map(workspaceId),

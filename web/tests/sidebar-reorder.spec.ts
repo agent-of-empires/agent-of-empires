@@ -452,7 +452,8 @@ test.describe("Groups headers", () => {
           target: "group",
           group: { profile: "default", path: "alpha" },
           direction: "down",
-          siblings: ["alpha", "beta", "other"],
+          // other sits under /tmp/other, so this Repository's move leaves its slot alone.
+          siblings: ["alpha", "beta"],
         },
       ]);
   });
@@ -476,7 +477,7 @@ test.describe("Groups headers", () => {
     // Each Group's session is newer than the one before it.
     await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["gamma", "beta", "alpha"]);
     await dragHeader(page, 2, 0);
-    await expect.poll(() => handle.viewPatches, { timeout: 4_000 }).toEqual([{ sort: "custom" }]);
+    await expect.poll(() => handle.viewPatches, { timeout: 4_000 }).toEqual([{ sort: "custom", base_sort: "newest" }]);
     await expect.poll(() => names(page)).toEqual(["alpha", "gamma", "beta"]);
     await expect(page.getByText("Switched to Custom")).toBeVisible();
     expect(handle.reorders.at(-1)).toMatchObject({ group: { path: "alpha" }, direction: "up" });
