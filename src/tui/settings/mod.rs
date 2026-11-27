@@ -646,6 +646,12 @@ impl SettingsView {
         if height <= viewport {
             return false;
         }
+        // The wheel or scrollbar moved the view off the field: reveal it first.
+        let offset = self.fields_scroll_offset;
+        if offset >= top + height || offset + viewport <= top {
+            self.ensure_field_visible(viewport);
+            return true;
+        }
         if up && self.fields_scroll_offset > top {
             self.fields_scroll_offset -= 1;
             return true;
@@ -655,6 +661,16 @@ impl SettingsView {
             return true;
         }
         false
+    }
+
+    /// Bring the selected field's bottom into view, where its value and any
+    /// inline editor sit below the description.
+    pub(super) fn reveal_selected_field_value(&mut self) {
+        let (top, height) = self.selected_field_span();
+        let bottom = top + height;
+        if bottom > self.fields_scroll_offset + self.fields_viewport_height {
+            self.fields_scroll_offset = bottom.saturating_sub(self.fields_viewport_height);
+        }
     }
 
     /// Total height of all field rows plus inter-row spacing, in the same

@@ -1772,8 +1772,8 @@ mod status_message_tests {
         );
     }
 
-    /// A field taller than the panel opens at its label, and j/k scroll through it
-    /// line by line before moving to the next field.
+    /// A field taller than the panel opens at its label, j/k scroll through it line
+    /// by line before moving to the next field, and editing reveals its value.
     #[test]
     #[serial]
     fn keyboard_reaches_all_of_a_field_taller_than_the_panel() {
@@ -1816,6 +1816,26 @@ mod status_message_tests {
         assert_eq!(view.fields_scroll_offset, b_top, "k scrolls back up");
         press(&mut view, KeyCode::Char('k'));
         assert_eq!(view.selected_field, 0);
+
+        // After the wheel moves the view off the selected field, one key reveals it.
+        for (offset, code) in [
+            (0, KeyCode::Char('j')),
+            (b_top + b_height + 1, KeyCode::Char('k')),
+        ] {
+            view.selected_field = 1;
+            view.fields_scroll_offset = offset;
+            press(&mut view, code);
+            assert_eq!(view.selected_field, 1, "{code:?}");
+            assert_eq!(view.fields_scroll_offset, b_top, "{code:?}");
+        }
+
+        // Editing the tall field brings its value row, below the description, into view.
+        view.fields[1].value = FieldValue::Text("VALUE".to_string());
+        view.selected_field = 1;
+        view.fields_scroll_offset = b_top;
+        press(&mut view, KeyCode::Enter);
+        assert!(view.editing_input.is_some());
+        assert_eq!(view.fields_scroll_offset, b_top + b_height - 4);
     }
 
     /// The status has its own footer row beneath the key hints, so it can

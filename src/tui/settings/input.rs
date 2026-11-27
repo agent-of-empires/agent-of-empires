@@ -308,6 +308,9 @@ impl SettingsView {
                             // Navigation never lands here; arm is for exhaustiveness.
                         }
                     }
+                    if self.editing_input.is_some() || self.list_edit_state.is_some() {
+                        self.reveal_selected_field_value();
+                    }
                 } else if self.focus == SettingsFocus::Categories {
                     self.focus = SettingsFocus::Fields;
                 }
