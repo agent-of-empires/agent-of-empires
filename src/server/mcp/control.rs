@@ -1180,7 +1180,15 @@ mod tests {
                 .await;
             assert!(!sent, "{case}");
             assert_eq!(code, Some(INPUT_LINE_BUSY), "{case}");
-            assert!(!shows(&pane, "typed-by-create"), "{case}");
+            let screen = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &pane])
+                .output()
+                .unwrap();
+            assert!(screen.status.success(), "{case}: the pane is captured");
+            assert!(
+                !String::from_utf8_lossy(&screen.stdout).contains("typed-by-create"),
+                "{case}"
+            );
         }
     }
 

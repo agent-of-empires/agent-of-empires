@@ -366,12 +366,34 @@ mod deliver_to_live_pane_tests {
             .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(text))
     }
 
-    fn lines_of(pane: &str) -> Vec<String> {
+    /// The pane's screen; a failed capture fails the test rather than reading as nothing typed.
+    fn captured(pane: &str) -> String {
         let out = crate::tmux::tmux_command()
             .args(["capture-pane", "-p", "-t", pane])
             .output()
             .expect("capture-pane");
+        assert!(
+            out.status.success(),
+            "capture {pane}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Whether any session on the server lists `pane`.
+    fn pane_listed(pane: &str) -> bool {
+        let out = crate::tmux::tmux_command()
+            .args(["list-panes", "-a", "-F", "#{pane_id}"])
+            .output()
+            .expect("list-panes");
+        assert!(out.status.success(), "list-panes");
         String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line == pane)
+    }
+
+    fn lines_of(pane: &str) -> Vec<String> {
+        captured(pane)
             .lines()
             .map(|line| line.trim().to_string())
             .collect()
@@ -469,10 +491,14 @@ mod deliver_to_live_pane_tests {
                     assert_eq!(sent, Ok(()), "{case}");
                     wait_for(case, "never typed", || pane_shows(&checked, "hello"));
                 }
-                Then::Kill | Then::Move => {
+                Then::Kill => {
+                    assert!(sent.is_err(), "{case}: {sent:?}");
+                    assert!(!pane_listed(&checked), "{case}: still there");
+                }
+                Then::Move => {
                     assert!(sent.is_err(), "{case}: {sent:?}");
                     assert!(
-                        !pane_shows(&checked, "hello"),
+                        !captured(&checked).contains("hello"),
                         "{case}: typed after the move"
                     );
                 }
@@ -515,7 +541,7 @@ mod deliver_to_live_pane_tests {
                 }
             }
             assert!(
-                !pane_shows(&first, "hello"),
+                !captured(&first).contains("hello"),
                 "{case}: typed into the other pane"
             );
         }

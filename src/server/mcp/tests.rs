@@ -1510,13 +1510,16 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
             }
         } else {
             assert_eq!(error_code(&result), want, "{case}: {result}");
-            assert!(
-                !shows(&checked, "typed-by-mcp"),
-                "{case}: typed after the check"
-            );
+            // A killed pane is shown gone by the pane list above; any other is captured.
+            if then != Then::Kill {
+                assert!(
+                    !captured(&checked).contains("typed-by-mcp"),
+                    "{case}: typed after the check"
+                );
+            }
         }
         assert!(
-            !shows(&first, "typed-by-mcp"),
+            !captured(&first).contains("typed-by-mcp"),
             "{case}: typed into the other pane"
         );
     }
