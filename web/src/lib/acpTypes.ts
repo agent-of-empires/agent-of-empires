@@ -561,6 +561,8 @@ export interface ReducedState {
   }>;
   current_mode_id: string | null;
   auth_status?: AuthStatus | null;
+  /** Absent means no loss. */
+  integration_lost?: IntegrationLostReason | null;
   turn_active: boolean;
   cancelling: boolean;
   compacting: boolean;
@@ -1717,6 +1719,9 @@ export function applyReducedState(
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,
     authStatus: reduced.auth_status ?? null,
+    // The daemon is authoritative: a loss whose frame is outside the replay
+    // window still shows, and a snapshot without the field clears a stale one.
+    integrationLost: reduced.integration_lost ?? null,
     // A false frame cannot suppress a prompt whose POST is still unacknowledged.
     serverTurnActive: reduced.turn_active,
     turnActive: deriveTurnActive({
