@@ -29,6 +29,10 @@ use super::ViewMode;
 use crate::session::config::SortOrder;
 use crate::tui::dialogs::PaletteGroup;
 
+/// The sandbox image cancel prompt's confirming key, with no modifiers. Not configurable and not
+/// cancel-image-pull's, so holding the cancel key can't confirm it.
+pub(crate) const CONFIRM_CANCEL_PULL: KeyCode = KeyCode::Char('y');
+
 /// Logical action. Each variant is dispatched by `HomeView::run_action`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionId {

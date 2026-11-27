@@ -86,8 +86,7 @@ const CANCEL_UNCONFIRMED: &str =
     "Can't cancel yet: the Daemon hasn't confirmed the download started.";
 const DISMISS_UNSAVED: &str = "Hidden for this session: the Daemon couldn't save it";
 
-/// The cancel prompt's confirming key: not Ctrl+E, so holding Ctrl+E can't confirm it.
-const CONFIRM_CANCEL_PULL: KeyCode = KeyCode::Char('y');
+use super::home::bindings::CONFIRM_CANCEL_PULL;
 
 fn run_dismiss_request(digest: String) -> tokio::sync::oneshot::Receiver<bool> {
     let (tx, rx) = tokio::sync::oneshot::channel();
