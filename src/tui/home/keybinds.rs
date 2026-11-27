@@ -529,6 +529,7 @@ mod tests {
             view_mode: super::super::ViewMode::Structured,
             sort_order: crate::session::config::SortOrder::Newest,
             has_search: false,
+            session_selected: false,
             project_group_selected: false,
             preview_scroll: false,
         };
