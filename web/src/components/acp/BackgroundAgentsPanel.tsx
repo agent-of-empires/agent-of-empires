@@ -9,10 +9,11 @@ import {
   useBackgroundAgents,
   useBackgroundShells,
   useBackgroundTasks,
+  useLifecycleRuns,
   useSubagents,
   useWorkflowRuns,
 } from "../../hooks/useAcpSession";
-import type { BackgroundAgent, BackgroundAgentStatus, SubagentRecord } from "../../lib/acpTypes";
+import type { BackgroundAgent, BackgroundAgentStatus, LifecycleRun, SubagentRecord } from "../../lib/acpTypes";
 import { cancelSubagent } from "../../lib/api";
 import { reportError } from "../../lib/toastBus";
 import {
@@ -79,6 +80,7 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
   const backgroundTasks = useBackgroundTasks(sessionId);
   const workflowRuns = useWorkflowRuns(sessionId);
   const shells = useBackgroundShells(sessionId);
+  const lifecycleRuns = useLifecycleRuns(sessionId);
   const [kind, setKind] = useState<Kind>("all");
   const [openShell, setOpenShell] = useState<string | null>(null);
   const closeShell = useCallback(() => setOpenShell(null), []);
@@ -114,7 +116,7 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
     [sessionId, agents, subagents, readOnly],
   );
 
-  if (agents.length === 0 && shells.length === 0) {
+  if (agents.length === 0 && shells.length === 0 && lifecycleRuns.length === 0) {
     return (
       <div className="flex h-full items-center justify-center px-4 text-center text-[13px] leading-normal text-text-dim">
         No background work yet. Async <span className="font-mono">Task</span> sub-agents,{" "}
@@ -151,9 +153,10 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
       : workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents);
   const all = showAgents ? entries(sorted, agents) : [];
   const shellsBy = (finished: boolean) => (showShells ? shells.filter((s) => s.finished === finished).reverse() : []);
+  const runs = showAgents ? lifecycleRuns : [];
   const groups = [
-    { label: "Running", shells: shellsBy(false), entries: all.filter(live) },
-    { label: "Recent", shells: shellsBy(true), entries: all.filter((e) => !live(e)) },
+    { label: "Running", runs, shells: shellsBy(false), entries: all.filter(live) },
+    { label: "Recent", runs: [], shells: shellsBy(true), entries: all.filter((e) => !live(e)) },
   ];
   const opened = shells.find((s) => s.taskId === openShell);
   const chip = (value: Kind, label: string) => (
@@ -171,7 +174,7 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
   return (
     <div className="flex h-full flex-col overflow-y-auto">
       <div className="flex flex-wrap items-center gap-2 border-b border-surface-700/50 px-3 py-1.5">
-        <span className={CAPTION_INLINE}>Background · {agents.length + shells.length}</span>
+        <span className={CAPTION_INLINE}>Background · {agents.length + shells.length + lifecycleRuns.length}</span>
         <span className="flex flex-1 items-center gap-0.5" role="group" aria-label="Filter background work">
           {agents.length > 0 &&
             shells.length > 0 && [
@@ -184,11 +187,14 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
       </div>
       {groups.map(
         (group) =>
-          group.shells.length + group.entries.length > 0 && (
+          group.runs.length + group.shells.length + group.entries.length > 0 && (
             <div key={group.label} className="border-b border-surface-700/50">
               <div className={ROW_CAPTION}>
-                {group.label} · {group.shells.length + group.entries.length}
+                {group.label} · {group.runs.length + group.shells.length + group.entries.length}
               </div>
+              {group.runs.map((r) => (
+                <LifecycleRunRow key={r.runId} run={r} />
+              ))}
               {group.shells.map((s) => (
                 <ShellRow key={s.taskId} shell={s} onOpen={setOpenShell} />
               ))}
@@ -308,6 +314,35 @@ function AgentDetailView({
           }
         />
       </div>
+    </div>
+  );
+}
+
+/** A `_meta.aoe` workflow run: its label (else run id) and progress when the agent reports it. */
+function LifecycleRunRow({ run }: { run: LifecycleRun }) {
+  const { label, completed, total } = run.progress ?? {};
+  const count = completed == null ? null : total == null ? `${completed}` : `${completed}/${total}`;
+  const percent = completed != null && total ? Math.min(100, Math.round((completed / total) * 100)) : null;
+  return (
+    <div className="border-b border-surface-800 px-3 py-2">
+      <div className="flex items-center gap-2">
+        <StatusDot status="running" />
+        <Workflow className="h-3.5 w-3.5 shrink-0 text-text-dim" />
+        <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">{label || run.runId}</span>
+        {count && <span className="shrink-0 text-[11px] tabular-nums text-text-dim">{count}</span>}
+      </div>
+      {percent != null && (
+        <div
+          role="progressbar"
+          aria-label={label || run.runId}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={percent}
+          className="ml-9 mt-1.5 h-1 rounded bg-surface-700"
+        >
+          <div className="h-full rounded bg-status-running" style={{ width: `${percent}%` }} />
+        </div>
+      )}
     </div>
   );
 }

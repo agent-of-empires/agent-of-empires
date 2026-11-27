@@ -2,7 +2,14 @@
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ActivityRow, BackgroundAgent, BackgroundShell, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
+import type {
+  ActivityRow,
+  BackgroundAgent,
+  BackgroundShell,
+  LifecycleRun,
+  SubagentRecord,
+  WorkflowRun,
+} from "../../../lib/acpTypes";
 import { writeClipboard } from "../../../lib/clipboard";
 
 vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
@@ -14,6 +21,7 @@ const tasksMock = vi.fn<() => string[]>(() => []);
 const runsMock = vi.fn<() => Record<string, WorkflowRun>>(() => ({}));
 const subagentsMock = vi.fn<() => SubagentRecord[]>(() => []);
 const shellsMock = vi.fn<() => BackgroundShell[]>(() => []);
+const lifecycleMock = vi.fn<() => LifecycleRun[]>(() => []);
 const activityMock = vi.fn<() => ActivityRow[]>(() => []);
 const taskOutputMock = vi.fn();
 vi.mock("../../../lib/api", async (importActual) => ({
@@ -25,6 +33,7 @@ vi.mock("../../../hooks/useAcpSession", () => ({
   useBackgroundAgents: () => agentsMock(),
   useBackgroundShells: () => shellsMock(),
   useBackgroundTasks: () => tasksMock(),
+  useLifecycleRuns: () => lifecycleMock(),
   useWorkflowRuns: () => runsMock(),
   useSubagents: () => subagentsMock(),
 }));
@@ -53,6 +62,7 @@ function agent(over: Partial<BackgroundAgent> = {}): BackgroundAgent {
 
 beforeEach(() => {
   shellsMock.mockReturnValue([]);
+  lifecycleMock.mockReturnValue([]);
 });
 
 function shell(over: Partial<BackgroundShell> = {}): BackgroundShell {
@@ -792,5 +802,32 @@ describe("BackgroundAgentsPanel copy", () => {
     expect(writeClipboard).toHaveBeenLastCalledWith(prompt);
     fireEvent.click(getByRole("button", { name: "Copy report" }));
     expect(writeClipboard).toHaveBeenLastCalledWith("done");
+  });
+});
+
+describe("BackgroundAgentsPanel generic workflow runs", () => {
+  it.each<[string, LifecycleRun, string, string | null]>([
+    ["label with counts", { runId: "r1", progress: { label: "Indexing", completed: 1, total: 4 } }, "Indexing", "1/4"],
+    ["run id and no count without progress", { runId: "run-7", progress: null }, "run-7", null],
+    ["count without a total", { runId: "r2", progress: { label: "Scan", completed: 2 } }, "Scan", "2"],
+    ["run id for an empty label", { runId: "r3", progress: { label: "", completed: 0, total: 2 } }, "r3", "0/2"],
+  ])("shows %s", (_name, run, title, count) => {
+    agentsMock.mockReturnValue([]);
+    lifecycleMock.mockReturnValue([run]);
+    const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const text = container.textContent ?? "";
+    expect(text).not.toContain("No background work yet");
+    expect(text).toContain("Running · 1");
+    expect(text).toContain(title);
+    expect(text).not.toMatch(/null|undefined/);
+    if (count) expect(text).toContain(count);
+    const bar = container.querySelector('[role="progressbar"]');
+    expect(bar === null).toBe(!run.progress?.total);
+  });
+
+  it("fills the bar to the completed share", () => {
+    lifecycleMock.mockReturnValue([{ runId: "r1", progress: { completed: 1, total: 4 } }]);
+    const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(container.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("25");
   });
 });
