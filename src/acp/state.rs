@@ -562,6 +562,24 @@ pub struct LifecycleRunRecord {
     pub started_at: Option<Timestamp>,
 }
 
+/// The latest `ScheduleWakeup`; a client hides it once `at` has passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingWakeup {
+    pub at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// An armed `Monitor`, until the user takes over or the work it fired ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArmedMonitor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A tool call ran since arming, so the next `Stopped` ends the monitor.
+    #[serde(skip)]
+    worked: bool,
+}
+
 /// Finished shells kept for the Background panel's Recent group.
 pub const MAX_FINISHED_BACKGROUND_SHELLS: usize = 20;
 
@@ -770,6 +788,10 @@ pub struct AcpState {
     /// Open workflow runs reported through `_meta.aoe`, not a Claude `Workflow`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_runs: Vec<LifecycleRunRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_wakeup: Option<PendingWakeup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_monitor: Option<ArmedMonitor>,
 
     /// Whether the main turn is in flight. Dispatch (`acp::dispatch::decide`)
     /// and the queue drain gate on this directly, so it tracks only the main
@@ -1640,16 +1662,23 @@ impl AcpState {
             Event::WorkflowRunFinished { run_id } => {
                 self.lifecycle_runs.retain(|r| r.run_id != run_id);
             }
-            // Titles live on `Instance`; wakeups and monitors are read from the log.
+            Event::WakeupScheduled { at, reason } => {
+                self.pending_wakeup = Some(PendingWakeup { at, reason });
+            }
+            Event::MonitorArmed { description } => {
+                self.armed_monitor = Some(ArmedMonitor {
+                    description,
+                    worked: false,
+                });
+            }
+            // Titles live on `Instance`.
             Event::AgentMessageChunk { .. } => self.sidebar_phase = SidebarPhase::Active,
             Event::SessionTitleSuggested { .. }
             | Event::ToolCallContent { .. }
             | Event::ModeSwitchFailed { .. }
             | Event::RawAgentUpdate { .. }
             | Event::ConversationSummary { .. }
-            | Event::ConversationCompactionSummary { .. }
-            | Event::WakeupScheduled { .. }
-            | Event::MonitorArmed { .. } => {}
+            | Event::ConversationCompactionSummary { .. } => {}
         }
         self.last_seq = seq;
         self.updated_at = Timestamp::now();
@@ -1657,6 +1686,9 @@ impl AcpState {
     }
 
     fn start_tool_call(&mut self, tool_call: ToolCall) {
+        if let Some(monitor) = self.armed_monitor.as_mut() {
+            monitor.worked = true;
+        }
         if tool_call.name == COMPACT_TOOL_NAME {
             self.compacting = true;
             self.compaction_tool_id = Some(tool_call.id.clone());
@@ -1679,6 +1711,7 @@ impl AcpState {
     fn open_turn(&mut self) {
         let steered = self.turn_active && self.steering;
         self.turn_active = true;
+        self.armed_monitor = None;
         self.sidebar_phase = SidebarPhase::Active;
         if !steered {
             self.cancelling = false;
@@ -1700,6 +1733,9 @@ impl AcpState {
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
+        if self.armed_monitor.as_ref().is_some_and(|m| m.worked) {
+            self.armed_monitor = None;
+        }
         // A lost integration is an error until a new connection restores it.
         if self.integration_lost.is_none() {
             self.sidebar_phase = SidebarPhase::Idle;
@@ -3113,6 +3149,41 @@ mod tests {
         )
         .unwrap();
         assert!(!s.has_active_background_agent());
+    }
+
+    #[test]
+    fn wakeup_and_monitor_are_reduced_and_monitor_ends_with_its_work() {
+        let at = Timestamp::now();
+        let armed = || Event::MonitorArmed {
+            description: Some("watch ci".into()),
+        };
+        let s = applied([
+            Event::WakeupScheduled {
+                at,
+                reason: Some("check".into()),
+            },
+            armed(),
+            stopped("end"),
+        ]);
+        let wakeup = s.pending_wakeup.expect("wakeup");
+        assert_eq!((wakeup.at, wakeup.reason.as_deref()), (at, Some("check")));
+        assert!(
+            s.armed_monitor.is_some(),
+            "a Stopped with no work since arming keeps it"
+        );
+
+        let worked = |tail| {
+            applied([
+                armed(),
+                Event::ToolCallStarted {
+                    tool_call: tool_call("t"),
+                },
+                tail,
+            ])
+        };
+        assert!(worked(stopped("end")).armed_monitor.is_none());
+        assert!(worked(prompt("hi")).armed_monitor.is_none());
+        assert!(applied([armed(), prompt("hi")]).armed_monitor.is_none());
     }
 
     #[test]

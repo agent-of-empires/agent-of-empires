@@ -29,9 +29,9 @@
 
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
-    AcpState, AuthStatus, AvailableCommand, ConfigOptionDescriptor, ConfigOptionSwitchFailure,
-    DiffPreview, IntegrationLostReason, ModeInfo, PlanStepStatus, SessionNotice, SessionUsage,
-    SubagentRecord, SubagentState,
+    AcpState, ArmedMonitor, AuthStatus, AvailableCommand, ConfigOptionDescriptor,
+    ConfigOptionSwitchFailure, DiffPreview, IntegrationLostReason, LifecycleRunRecord, ModeInfo,
+    PendingWakeup, PlanStepStatus, SessionNotice, SessionUsage, SubagentRecord, SubagentState,
 };
 use crate::acp::transcript::{
     patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
@@ -99,6 +99,12 @@ pub struct AcpTranscript {
     /// with `turn_active` for the busy spinner, never for send-vs-park or Esc.
     pub background_agent_active: bool,
     background_subagent_active: bool,
+    /// Open background tasks, workflow runs, wakeup and monitor, for the
+    /// status-line badges.
+    pub background_task_count: usize,
+    pub lifecycle_runs: Vec<LifecycleRunRecord>,
+    pub pending_wakeup: Option<PendingWakeup>,
+    pub armed_monitor: Option<ArmedMonitor>,
     /// ACP subagents roster; titles and badges the parent tool cards. Private
     /// for the same reason as the rows: a write that skips the revision leaves
     /// the cached transcript showing a child's old state.
@@ -252,6 +258,10 @@ impl AcpTranscript {
             compacting: false,
             turn_active: false,
             background_agent_active: false,
+            background_task_count: 0,
+            lifecycle_runs: Vec::new(),
+            pending_wakeup: None,
+            armed_monitor: None,
             background_subagent_active: false,
             subagents: Vec::new(),
             usage: None,
@@ -394,8 +404,13 @@ impl AcpTranscript {
                 .iter()
                 .any(|agent| agent.ended_at.is_none());
         }
-        self.background_agent_active =
-            self.background_subagent_active || !state.background_tasks.is_empty();
+        self.background_agent_active = self.background_subagent_active
+            || !state.background_tasks.is_empty()
+            || !state.lifecycle_runs.is_empty();
+        self.background_task_count = state.background_tasks.len();
+        self.lifecycle_runs = state.lifecycle_runs;
+        self.pending_wakeup = state.pending_wakeup;
+        self.armed_monitor = state.armed_monitor;
         self.set_subagents(state.subagents);
         self.agent_name = Some(state.agent.0);
         self.turn_active = state.turn_active;
@@ -862,6 +877,63 @@ mod tests {
 
         // A frame that does not name it is authoritative, including empty.
         t.apply_reduced_state(3, reduced(&[]), &[]);
+        assert!(!t.background_agent_active);
+    }
+
+    #[test]
+    fn reduced_state_carries_lifecycle_badges_and_their_end() {
+        use crate::acp::state::WorkflowProgress;
+        let at = crate::time::Timestamp::now();
+        let open = reduced(&[
+            Event::BackgroundTaskStarted {
+                task_id: "g".into(),
+                tool_call_id: None,
+                description: None,
+                workflow: None,
+                started_at: None,
+            },
+            Event::WorkflowRunStarted {
+                run_id: "r".into(),
+                started_at: None,
+            },
+            Event::WorkflowRunProgress {
+                run_id: "r".into(),
+                progress: WorkflowProgress {
+                    label: Some("build".into()),
+                    completed: Some(2),
+                    total: Some(5),
+                },
+            },
+            Event::WakeupScheduled {
+                at,
+                reason: Some("check ci".into()),
+            },
+            Event::MonitorArmed {
+                description: Some("tail logs".into()),
+            },
+        ]);
+        let mut t = AcpTranscript::new("s-1");
+        t.apply_reduced_state(1, open, &[]);
+        assert_eq!(t.background_task_count, 1);
+        assert_eq!(t.lifecycle_runs.len(), 1);
+        assert_eq!(
+            t.lifecycle_runs[0].progress.as_ref().unwrap().completed,
+            Some(2)
+        );
+        assert_eq!(
+            t.pending_wakeup.as_ref().unwrap().reason.as_deref(),
+            Some("check ci")
+        );
+        assert_eq!(
+            t.armed_monitor.as_ref().unwrap().description.as_deref(),
+            Some("tail logs")
+        );
+        assert!(t.background_agent_active);
+
+        t.apply_reduced_state(2, reduced(&[]), &[]);
+        assert_eq!(t.background_task_count, 0);
+        assert!(t.lifecycle_runs.is_empty());
+        assert!(t.pending_wakeup.is_none() && t.armed_monitor.is_none());
         assert!(!t.background_agent_active);
     }
 
