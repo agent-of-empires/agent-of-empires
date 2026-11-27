@@ -390,6 +390,17 @@ impl EventStore {
         )
     }
 
+    /// `None` when the query failed.
+    fn try_has_unresolved_workflow_runs(&self, session_id: &str) -> Option<bool> {
+        logged(
+            self.conn()
+                .prepare_cached(UNRESOLVED_WORKFLOW_RUNS_SQL)
+                .and_then(|mut statement| statement.exists(params![session_id])),
+            "has_unresolved_workflow_runs",
+            session_id,
+        )
+    }
+
     pub fn unresolved_background_task_launches(
         &self,
         session_id: &str,
@@ -627,14 +638,16 @@ impl EventStore {
         Some(Some(terminator.is_none()))
     }
 
-    /// True while a main turn, background task, or recently reporting background agent is open.
+    /// True while a main turn, background task, workflow run, or recently reporting background agent is open.
     pub fn has_in_flight_turn(&self, session_id: &str) -> bool {
         self.try_in_flight_turn(session_id).unwrap_or(false)
     }
 
     /// [`Self::has_in_flight_turn`], or `None` when any constituent query failed.
     pub(crate) fn try_in_flight_turn(&self, session_id: &str) -> Option<bool> {
-        if self.try_has_unresolved_background_tasks(session_id)? {
+        if self.try_has_unresolved_background_tasks(session_id)?
+            || self.try_has_unresolved_workflow_runs(session_id)?
+        {
             return Some(true);
         }
         match self.latest_prompt_state(session_id)? {
@@ -952,9 +965,32 @@ mod tests {
             task_id: "t".into(),
             ended_at: None,
         };
+        let run_started = Event::WorkflowRunStarted {
+            run_id: "w".into(),
+            started_at: None,
+        };
+        let run_finished = Event::WorkflowRunFinished { run_id: "w".into() };
         // (events, holds live work)
         let cases = [
+            (vec![], false),
             (vec![user_prompt("go"), stopped("prompt_complete")], false),
+            (
+                vec![
+                    user_prompt("go"),
+                    run_started.clone(),
+                    stopped("prompt_complete"),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    run_started,
+                    stopped("prompt_complete"),
+                    run_finished,
+                ],
+                false,
+            ),
             (
                 vec![
                     user_prompt("go"),
