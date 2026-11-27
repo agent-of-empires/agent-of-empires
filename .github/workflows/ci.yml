@@ -42,8 +42,8 @@ jobs:
       pull-requests: read
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       # #3974: a raw NUL makes git treat a source file as binary and hide its
@@ -74,7 +74,7 @@ jobs:
           HEAD_REF: ${{ github.event.merge_group.head_ref }}
           GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
         run: .github/scripts/release-pr-fresh.sh
-      - uses: ./.github/actions/rust-toolchain
+      - uses: $/.github/actions/rust-toolchain
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -89,12 +89,12 @@ jobs:
       id-token: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/rust-toolchain
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
+      - uses: $/.github/actions/rust-toolchain
         with:
           components: clippy
-      - uses: ./.github/actions/kache
+      - uses: $/.github/actions/kache
         with:
           manifest-key: clippy
       # `--all-features` so the `web`-gated dashboard tree gets linted too.
@@ -143,16 +143,16 @@ jobs:
       id-token: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
       - name: Read rust-version
         id: msrv
         run: |
           python3 -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
-      - uses: ./.github/actions/rust-toolchain
+      - uses: $/.github/actions/rust-toolchain
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: ./.github/actions/kache
+      - uses: $/.github/actions/kache
         with:
           manifest-key: msrv
       # Lib and bins only: dev-dependencies such as `serial_test` may need a
@@ -175,11 +175,11 @@ jobs:
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-web-lint-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -202,13 +202,13 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-deny-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
       - name: Test toolchain editor
         run: |
           python3 -m venv "$RUNNER_TEMP/toolchain-editor"
           "$RUNNER_TEMP/toolchain-editor/bin/python" -m pip install --require-hashes -r .github/scripts/requirements-toolchain.txt
           "$RUNNER_TEMP/toolchain-editor/bin/python" .github/scripts/update-rust-toolchain.py --self-test
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
 
   docs:
     # Also the skill check: both build xtask.
@@ -221,10 +221,10 @@ jobs:
       id-token: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/rust-toolchain
-      - uses: ./.github/actions/kache
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
+      - uses: $/.github/actions/rust-toolchain
+      - uses: $/.github/actions/kache
         with:
           manifest-key: docs
       - name: Build xtask and workspace member tests
@@ -266,7 +266,7 @@ jobs:
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
       # Runs before Nix is even installed: no toolchain, a couple of seconds, and
       # it covers the failure class from #3204 (an embedded asset dropped by the
       # Cargo source filter) on EVERY PR, which is why the compile-based Nix
@@ -276,7 +276,7 @@ jobs:
           set -euo pipefail
           python3 scripts/check-nix-embedded-assets.py --self-test
           python3 scripts/check-nix-embedded-assets.py
-      - uses: ./.github/actions/install-nix
+      - uses: $/.github/actions/install-nix
       - name: Evaluate flake outputs (all systems)
         run: |
           set -euo pipefail
@@ -346,8 +346,8 @@ jobs:
     # (see its `paths:` list), so wider breakage still surfaces there.
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -388,7 +388,7 @@ jobs:
             echo "relevant=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: ./.github/actions/install-nix
+      - uses: $/.github/actions/install-nix
         if: steps.changes.outputs.relevant == 'true'
 
       - name: Build default package
@@ -404,8 +404,8 @@ jobs:
     # is offline. Path-gated so Rust-only PRs keep fast feedback.
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -442,7 +442,7 @@ jobs:
             echo "relevant=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: ./.github/actions/install-nix
+      - uses: $/.github/actions/install-nix
         if: steps.changes.outputs.relevant == 'true'
 
       - name: Build aoe-web-frontend
@@ -461,9 +461,9 @@ jobs:
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-website-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
