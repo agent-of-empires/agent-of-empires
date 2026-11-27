@@ -39,6 +39,9 @@ pub struct UpdateArgs {
 const MIGRATION_WARNING: &str = "WARNING: moving to a nightly or an older release may migrate \
 your data so that a stable build cannot read it until the next stable release.";
 
+const NOT_TARBALL: &str = "--channel and --version need an install-script (tarball) install. \
+Reinstall with scripts/install.sh --channel or --version; see docs/installation.md.";
+
 #[tracing::instrument(target = "cli.session", skip_all)]
 pub async fn run(args: UpdateArgs) -> Result<()> {
     let current_version = env!("CARGO_PKG_VERSION");
@@ -47,6 +50,17 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         (Some(channel), _) => Some(Target::Channel(channel)),
         (None, Some(tag)) => Some(Target::Tag(tag)),
         (None, None) => None,
+    };
+
+    // Refuse before any network call: a Homebrew or Nix user needs no release lookup to be told.
+    let early_method = if explicit.is_some() && !args.check {
+        let method = detect_install_method()?;
+        if !matches!(&method, InstallMethod::Tarball { .. }) {
+            bail!(NOT_TARBALL);
+        }
+        Some(method)
+    } else {
+        None
     };
 
     let info = match &explicit {
@@ -87,14 +101,10 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         return Ok(());
     }
 
-    let method = detect_install_method()?;
-
-    if explicit.is_some() && !matches!(&method, InstallMethod::Tarball { .. }) {
-        bail!(
-            "--channel and --version need an install-script (tarball) install. Reinstall with \
-             scripts/install.sh --channel or --version; see docs/installation.md."
-        );
-    }
+    let method = match early_method {
+        Some(method) => method,
+        None => detect_install_method()?,
+    };
 
     if matches!(
         &method,

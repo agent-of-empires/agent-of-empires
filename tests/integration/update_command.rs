@@ -40,6 +40,7 @@ fn spawn_fixture_with(latest: serde_json::Value, releases: serde_json::Value) ->
     let (port_tx, port_rx) = mpsc::channel::<u16>();
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
     let latest = latest.to_string();
+    let releases_value = releases.clone();
     let releases = releases.to_string();
 
     thread::spawn(move || {
@@ -66,6 +67,31 @@ fn spawn_fixture_with(latest: serde_json::Value, releases: serde_json::Value) ->
                             )
                         }
                     }),
+                )
+                .route(
+                    "/repos/agent-of-empires/agent-of-empires/releases/tags/{tag}",
+                    axum::routing::get(
+                        move |axum::extract::Path(tag): axum::extract::Path<String>| {
+                            let found = releases_value
+                                .as_array()
+                                .and_then(|all| all.iter().find(|r| r["tag_name"] == tag.as_str()))
+                                .map(|r| r.to_string());
+                            async move {
+                                match found {
+                                    Some(body) => (
+                                        axum::http::StatusCode::OK,
+                                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                        body,
+                                    ),
+                                    None => (
+                                        axum::http::StatusCode::NOT_FOUND,
+                                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                        "{}".to_string(),
+                                    ),
+                                }
+                            }
+                        },
+                    ),
                 )
                 .route(
                     "/repos/agent-of-empires/agent-of-empires/releases",
@@ -214,6 +240,13 @@ fn update_check_resolves_explicit_targets() {
             stable,
             false,
         ),
+        (vec!["--check", "--version", stable], stable, false),
+        (
+            vec!["--check", "--version", "999.0.0-nightly.29990101"],
+            "999.0.0-nightly.29990101",
+            true,
+        ),
+        (vec!["--check", "--channel", "stable"], stable, false),
     ] {
         let output = run_update(&fixture, &args);
         assert!(output.status.success(), "{args:?}");
@@ -226,29 +259,50 @@ fn update_check_resolves_explicit_targets() {
     }
 }
 
-/// An explicit target on an install that is not an install-script tarball is refused.
+/// An explicit target on an install that is not an install-script tarball is refused before
+/// any release lookup, so the refusal holds offline.
 #[test]
 #[serial_test::parallel]
-fn update_explicit_target_refuses_non_tarball_install() {
-    let fixture = stable_and_nightly_fixture();
-    let output = run_update(&fixture, &["--channel", "nightly", "-y"]);
+fn update_explicit_target_refuses_non_tarball_install_without_network() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let output = Command::new(aoe_binary())
+        .args(["update", "--channel", "nightly", "-y"])
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .env("AOE_UPDATE_API_BASE", "http://127.0.0.1:1")
+        .output()
+        .expect("running aoe update");
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("tarball"), "stderr was: {stderr}");
 }
 
-/// Asking for the running version is a no-op.
+/// With update checks off, `aoe update --check` makes no nightly lookup and prints no hint.
 #[test]
 #[serial_test::parallel]
-fn update_explicit_current_version_is_a_noop() {
+fn update_check_hint_respects_disabled_update_checks() {
     let fixture = stable_and_nightly_fixture();
-    let output = run_update(
-        &fixture,
-        &["--version", &format!("v{}", env!("CARGO_PKG_VERSION"))],
-    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config_dir = tmp
+        .path()
+        .join(".config")
+        .join(agent_of_empires::session::APP_DIR_NAME_XDG);
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[updates]\nupdate_check_mode = \"off\"\n",
+    )
+    .unwrap();
+    let output = Command::new(aoe_binary())
+        .args(["update", "--check"])
+        .env("HOME", tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
+        .env("AOE_UPDATE_API_BASE", &fixture.base_url)
+        .output()
+        .expect("running aoe update");
 
     assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Nothing to do"), "stdout was: {stdout}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("nightly"), "stderr was: {stderr}");
 }

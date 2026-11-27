@@ -224,7 +224,6 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
     })
 }
 
-#[tracing::instrument(target = "update.fetch", skip_all)]
 fn github_client() -> Result<crate::github::GitHubClient> {
     Ok(crate::github::GitHubClient::unauthenticated(
         crate::github::GitHubClientConfig {
@@ -235,6 +234,7 @@ fn github_client() -> Result<crate::github::GitHubClient> {
     )?)
 }
 
+#[tracing::instrument(target = "update.fetch", skip_all)]
 async fn fetch_releases(
     client: &crate::github::GitHubClient,
     current_version: &str,
@@ -257,18 +257,48 @@ pub enum Target {
 }
 
 /// Version of the release `target` names, read live (never from the update cache).
+#[tracing::instrument(target = "update.fetch", skip_all)]
 pub async fn resolve_target(target: &Target) -> Result<String> {
-    let releases = github_client()?
-        .list_releases(GITHUB_OWNER, GITHUB_REPO, 100)
-        .await?;
-    select_release(releases, target)
+    let client = github_client()?;
+    let release = match target {
+        // `releases/latest` never returns a prerelease.
+        Target::Channel(Channel::Stable) => Some(release_info_from(
+            client.latest_release(GITHUB_OWNER, GITHUB_REPO).await?,
+        )),
+        Target::Channel(Channel::Nightly) => {
+            let releases = client.list_releases(GITHUB_OWNER, GITHUB_REPO, 100).await?;
+            channel_releases(releases, true).into_iter().next()
+        }
+        Target::Tag(tag) => {
+            let release = client
+                .release_by_tag(GITHUB_OWNER, GITHUB_REPO, &release_tag_for(tag))
+                .await
+                .with_context(|| format!("no release found for {tag}"))?;
+            (!release.draft).then(|| release_info_from(release))
+        }
+    };
+    release
+        .filter(|r| parse_version(&r.version).is_some())
         .map(|r| r.version)
-        .with_context(|| format!("no matching release for {target:?}"))
+        .with_context(|| match target {
+            Target::Channel(channel) => format!("no {channel:?} release found").to_lowercase(),
+            Target::Tag(tag) => format!("no release found for {tag}"),
+        })
+}
+
+/// The release tag a user-typed `--version` names: a `nightly-*` tag as is, otherwise a
+/// version (`1.25.0`, `v1.25.0`, `1.26.1-nightly.20261127`) mapped like `release_tag`.
+fn release_tag_for(input: &str) -> String {
+    if input.starts_with(NIGHTLY_TAG_PREFIX) {
+        input.to_string()
+    } else {
+        release_tag(input)
+    }
 }
 
 /// Newest nightly that is ahead of a stable `current_version`; `None` on any failure.
 pub async fn newer_nightly(current_version: &str) -> Option<String> {
-    if is_nightly(current_version) {
+    if is_nightly(current_version) || !get_update_settings().update_check_mode.is_enabled() {
         return None;
     }
     resolve_target(&Target::Channel(Channel::Nightly))
@@ -281,29 +311,6 @@ pub async fn newer_nightly(current_version: &str) -> Option<String> {
 pub fn needs_migration_warning(current_version: &str, target_version: &str) -> bool {
     (is_nightly(target_version) && !is_nightly(current_version))
         || is_newer_version(current_version, target_version)
-}
-
-fn select_release(
-    releases: Vec<crate::github::GitHubRelease>,
-    target: &Target,
-) -> Option<ReleaseInfo> {
-    match target {
-        Target::Channel(channel) => channel_releases(releases, *channel == Channel::Nightly)
-            .into_iter()
-            .next(),
-        Target::Tag(tag) => {
-            let tag = if tag.starts_with(NIGHTLY_TAG_PREFIX) {
-                tag.clone()
-            } else {
-                format!("v{}", tag.trim_start_matches('v'))
-            };
-            releases
-                .into_iter()
-                .find(|r| !r.draft && r.tag_name == tag)
-                .map(release_info_from)
-                .filter(|r| parse_version(&r.version).is_some())
-        }
-    }
 }
 
 /// A channel only sees its own releases: stable the non-prereleases, nightly the nightlies.
@@ -588,49 +595,15 @@ mod tests {
     }
 
     #[test]
-    fn select_release_resolves_channels_and_exact_tags() {
-        let gh = |tag: &str, name: &str, prerelease: bool| crate::github::GitHubRelease {
-            tag_name: tag.to_string(),
-            name: Some(name.to_string()),
-            body: None,
-            published_at: None,
-            draft: false,
-            prerelease,
-            assets: vec![],
-        };
-        let releases = || {
-            vec![
-                gh(
-                    "nightly-20261109",
-                    "Agent of Empires v1.22.2-nightly.20261109",
-                    true,
-                ),
-                gh("v1.22.1", "Agent of Empires v1.22.1", false),
-                gh(
-                    "nightly-20261108",
-                    "Agent of Empires v1.22.2-nightly.20261108",
-                    true,
-                ),
-                gh("v1.22.0", "Agent of Empires v1.22.0", false),
-            ]
-        };
-        for (target, expected) in [
-            (
-                Target::Channel(Channel::Nightly),
-                Some("1.22.2-nightly.20261109"),
-            ),
-            (Target::Channel(Channel::Stable), Some("1.22.1")),
-            (
-                Target::Tag("nightly-20261108".into()),
-                Some("1.22.2-nightly.20261108"),
-            ),
-            (Target::Tag("v1.22.0".into()), Some("1.22.0")),
-            (Target::Tag("1.22.0".into()), Some("1.22.0")),
-            (Target::Tag("nightly-20250101".into()), None),
-            (Target::Tag("1.99.0".into()), None),
+    fn release_tag_for_accepts_tags_and_every_printed_version_form() {
+        for (input, tag) in [
+            ("nightly-20261108", "nightly-20261108"),
+            ("1.22.2-nightly.20261108", "nightly-20261108"),
+            ("v1.22.2-nightly.20261108", "nightly-20261108"),
+            ("v1.22.0", "v1.22.0"),
+            ("1.22.0", "v1.22.0"),
         ] {
-            let got = select_release(releases(), &target).map(|r| r.version);
-            assert_eq!(got.as_deref(), expected, "{target:?}");
+            assert_eq!(release_tag_for(input), tag, "{input}");
         }
     }
 
