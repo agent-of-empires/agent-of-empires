@@ -23,7 +23,8 @@ concurrency:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+    # Rust gets m-family only: 16 GB at 4 vCPU, like the hosted runner.
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-codeql-{1}-{2}/runner={3}/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, matrix.language, github.run_attempt, matrix.language == 'rust' && '4cpu-linux-x64/family=m8a+m8i+m7i' || '2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i') }}
     permissions:
       contents: read
       actions: read
@@ -39,6 +40,8 @@ jobs:
       # the brackets are load-bearing: a bare `-test` fails the extractor.
       CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES: "[-test]"
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL

@@ -30,8 +30,10 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-docs-build-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Rust
@@ -59,7 +61,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-docs-deploy-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
     needs: build
     steps:
       - name: Deploy to GitHub Pages
