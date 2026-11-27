@@ -535,7 +535,9 @@ impl SettingsView {
         };
 
         if state.editing_item.is_some() {
-            return self.handle_list_item_edit_key(key);
+            let action = self.handle_list_item_edit_key(key);
+            self.reveal_selected_field_value();
+            return action;
         }
 
         match key.code {

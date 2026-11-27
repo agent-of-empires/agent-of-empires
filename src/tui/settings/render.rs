@@ -1890,6 +1890,15 @@ mod status_message_tests {
                 view.fields_scroll_offset
             );
         }
+        // Cancelling an add prompt, which sits below the list, returns to the item.
+        press(&mut view, KeyCode::Char('a'));
+        press(&mut view, KeyCode::Esc);
+        assert!(!view.list_edit_state.as_ref().unwrap().adding_new);
+        assert!(
+            cursor_visible(&view),
+            "offset {}",
+            view.fields_scroll_offset
+        );
         press(&mut view, KeyCode::Esc);
         assert!(view.list_edit_state.is_none());
         let height = view.field_height(&view.fields[0], 0);
