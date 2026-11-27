@@ -290,7 +290,7 @@ impl EventStore {
         if inserted != 0 {
             rate_limit::update_rate_limit_budget(&tx, &self.schema, session_id, seq, event);
             if let Event::WorkflowRunProgress { run_id, .. } = event {
-                replace_run_progress(&tx, &self.schema, session_id, seq, run_id)?;
+                replace_run_progress(&tx, &self.schema, session_id, run_id)?;
             }
         }
         tx.commit()?;
@@ -461,23 +461,25 @@ impl EventStore {
     }
 }
 
-/// Drops the run's older progress rows, so the pinned progress stays one row
-/// per run.
+/// Keeps only the run's highest-seq progress row, so the pinned progress stays
+/// one row per run even when a lower seq lands late.
 fn replace_run_progress(
     conn: &Connection,
     schema: &events::Schema,
     session_id: &str,
-    seq: u64,
     run_id: &str,
 ) -> Result<()> {
     conn.execute(
         &format!(
-            "DELETE FROM {} WHERE session_id = ?1 AND seq < ?2
+            "DELETE FROM {t} WHERE session_id = ?1
                AND discriminant = 'WorkflowRunProgress'
-               AND json_extract(event_json, '$.WorkflowRunProgress.run_id') = ?3",
-            schema.events_table()
+               AND json_extract(event_json, '$.WorkflowRunProgress.run_id') = ?2
+               AND seq < (SELECT MAX(seq) FROM {t} WHERE session_id = ?1
+                 AND discriminant = 'WorkflowRunProgress'
+                 AND json_extract(event_json, '$.WorkflowRunProgress.run_id') = ?2)",
+            t = schema.events_table()
         ),
-        rusqlite::params![session_id, seq as i64, run_id],
+        rusqlite::params![session_id, run_id],
     )
     .with_context(|| format!("replace progress of {run_id} for {session_id}"))?;
     Ok(())

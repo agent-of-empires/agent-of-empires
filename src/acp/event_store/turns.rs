@@ -1581,6 +1581,30 @@ mod tests {
         );
     }
 
+    /// A progress row that lands with a lower seq than the run's current one
+    /// does not leave a second pinned row.
+    #[test]
+    fn late_lower_seq_progress_leaves_one_row() {
+        let (_tmp, store) = open_store(3);
+        for seq in [20, 10] {
+            let event = Event::WorkflowRunProgress {
+                run_id: "r".into(),
+                progress: WorkflowProgress {
+                    label: None,
+                    completed: Some(seq),
+                    total: None,
+                },
+            };
+            store.record("s-1", seq, &event).unwrap();
+        }
+        let seqs: Vec<u64> = store
+            .replay_from("s-1", 0)
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(seqs, [20]);
+    }
+
     /// A run's latest progress survives the retention cap as one row, and
     /// goes once the run ends; a reused id keeps its open run's progress.
     #[test]
