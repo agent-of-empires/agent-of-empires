@@ -10,14 +10,6 @@ import { TopBar } from "../TopBar";
 import { DisconnectBanner } from "../DisconnectBanner";
 import { useConnectionBanner } from "../../hooks/useConnectionBanner";
 import type { SessionResponse, Workspace } from "../../lib/types";
-import type { AttentionBadgeColors } from "../../lib/attentionBadgeColors";
-
-const DEFAULT_ATTENTION_BADGE_COLORS: AttentionBadgeColors = {
-  unreadBg: "#38bdf8",
-  unreadFg: "#000000",
-  waitingBg: "#fbbf24",
-  waitingFg: "#000000",
-};
 
 afterEach(() => {
   cleanup();
@@ -32,9 +24,8 @@ type TopBarOverrides = {
   activeWorkspace?: Workspace;
   activeSession?: SessionResponse | null;
   onToggleSidebar?: () => void;
-  unreadCount?: number;
-  waitingCount?: number;
-  attentionBadgeColors?: AttentionBadgeColors;
+  needsYouCount?: number;
+  sidebarColumnVisible?: boolean;
 };
 
 function topBarProps(overrides: TopBarOverrides = {}) {
@@ -47,13 +38,11 @@ function topBarProps(overrides: TopBarOverrides = {}) {
     paneDescriptor: (id: string) => ({ title: id, icon: (() => null) as never }),
     isPaneOpen: () => true,
     onTogglePane: vi.fn(),
-    unreadCount: overrides.unreadCount ?? 0,
-    waitingCount: overrides.waitingCount ?? 0,
-    attentionBadgeColors: overrides.attentionBadgeColors ?? DEFAULT_ATTENTION_BADGE_COLORS,
+    needsYouCount: overrides.needsYouCount ?? 0,
     isDevBuild: overrides.isDevBuild ?? false,
     appMenu: [],
     onGoDashboard: vi.fn(),
-    sidebarColumnVisible: false,
+    sidebarColumnVisible: overrides.sidebarColumnVisible ?? false,
     rightColumnVisible: false,
   };
 }
@@ -114,13 +103,13 @@ describe("TopBar", () => {
     const onToggleSidebar = vi.fn();
     const onExitFocusMode = vi.fn();
     const { getByRole, queryByRole } = render(
-      <TopBar {...topBarProps({ onToggleSidebar, waitingCount: 1 })} onExitFocusMode={onExitFocusMode} />,
+      <TopBar {...topBarProps({ onToggleSidebar, needsYouCount: 1 })} onExitFocusMode={onExitFocusMode} />,
       { wrapper: MemoryRouter },
     );
     expect(queryByRole("button", { name: /Toggle sidebar/ })).toBeNull();
     expect(queryByRole("button", { name: "Go to dashboard" })).toBeNull();
     // The button is the only left control, and its visible label names what it brings back.
-    const exit = getByRole("button", { name: "All Sessions, 0 unread, 1 waiting for your input" });
+    const exit = getByRole("button", { name: "All Sessions, 1 needs you" });
     expect(exit.textContent).toContain("All Sessions");
     expect(exit.closest("header")!.querySelector('img[src="/icon-192.png"]')).toBeNull();
     fireEvent.click(exit);
@@ -128,50 +117,38 @@ describe("TopBar", () => {
     expect(onToggleSidebar).not.toHaveBeenCalled();
   });
 
-  it("shows counts on the sidebar toggle's badges and accessible name, and nothing extra at zero", () => {
-    const zero = renderTopBar({ unreadCount: 0, waitingCount: 0 });
-    expect(zero.queryByTestId("topbar-unread-badge")).toBeNull();
-    expect(zero.queryByTestId("topbar-waiting-badge")).toBeNull();
+  it("shows the needs-you count on the sidebar toggle only while the sidebar is hidden", () => {
+    const zero = renderTopBar({ needsYouCount: 0 });
+    expect(zero.queryByTestId("topbar-needs-you-badge")).toBeNull();
     expect(zero.getByRole("button", { name: "Toggle sidebar" })).toBeTruthy();
     zero.unmount();
 
+    const shown = renderTopBar({ needsYouCount: 3, sidebarColumnVisible: true });
+    expect(shown.queryByTestId("topbar-needs-you-badge")).toBeNull();
+    expect(shown.getByRole("button", { name: "Toggle sidebar" })).toBeTruthy();
+    shown.unmount();
+
     const onToggleSidebar = vi.fn();
-    const { getByTestId, getByRole } = renderTopBar({ unreadCount: 3, waitingCount: 1, onToggleSidebar });
-    expect(getByTestId("topbar-unread-badge").textContent).toBe("3");
-    expect(getByTestId("topbar-waiting-badge").textContent).toBe("1");
-    expect(getByRole("button", { name: "Toggle sidebar, 3 unread, 1 waiting for your input" })).toBeTruthy();
-    // Badges nest inside the toggle, so tapping one toggles the sidebar.
-    fireEvent.click(getByTestId("topbar-unread-badge"));
+    const { getByTestId, getByRole } = renderTopBar({ needsYouCount: 3, onToggleSidebar });
+    expect(getByTestId("topbar-needs-you-badge").textContent).toBe("3");
+    expect(getByRole("button", { name: "Toggle sidebar, 3 need you" })).toBeTruthy();
+    // The badge nests inside the toggle, so tapping it toggles the sidebar.
+    fireEvent.click(getByTestId("topbar-needs-you-badge"));
     expect(onToggleSidebar).toHaveBeenCalledTimes(1);
   });
 
-  it("colors each badge from the attentionBadgeColors prop", () => {
-    const { getByTestId } = renderTopBar({
-      unreadCount: 3,
-      waitingCount: 1,
-      attentionBadgeColors: { unreadBg: "#0f0f11", unreadFg: "#ffffff", waitingBg: "#fe640b", waitingFg: "#000000" },
-    });
-    const unreadBadge = getByTestId("topbar-unread-badge");
-    const waitingBadge = getByTestId("topbar-waiting-badge");
-    expect(unreadBadge.style.backgroundColor).toBe("rgb(15, 15, 17)");
-    expect(unreadBadge.style.color).toBe("rgb(255, 255, 255)");
-    expect(waitingBadge.style.backgroundColor).toBe("rgb(254, 100, 11)");
-    expect(waitingBadge.style.color).toBe("rgb(0, 0, 0)");
-  });
-
   it("announces count changes through a persistent live region, including the return to zero", () => {
-    const { getByTestId, rerender } = renderTopBar({ unreadCount: 0, waitingCount: 0 });
+    const { getByTestId, rerender } = renderTopBar({ needsYouCount: 0 });
     const live = getByTestId("topbar-attention-live-region");
     expect(live.getAttribute("aria-live")).toBe("polite");
-    expect(live.textContent).toBe("0 unread, 0 waiting for your input");
+    expect(live.textContent).toBe("0 need you");
 
-    rerender(<TopBar {...topBarProps({ unreadCount: 2, waitingCount: 0 })} />);
-    expect(getByTestId("topbar-attention-live-region").textContent).toBe("2 unread, 0 waiting for your input");
+    rerender(<TopBar {...topBarProps({ needsYouCount: 2 })} />);
+    expect(getByTestId("topbar-attention-live-region").textContent).toBe("2 need you");
 
-    // Clearing the last attention item is a real text mutation (not an empty string), so screen readers get a
-    // reliable announcement here too.
-    rerender(<TopBar {...topBarProps({ unreadCount: 0, waitingCount: 0 })} />);
-    expect(getByTestId("topbar-attention-live-region").textContent).toBe("0 unread, 0 waiting for your input");
+    // Clearing the last one is a real text mutation (not an empty string), so screen readers announce it too.
+    rerender(<TopBar {...topBarProps({ needsYouCount: 0 })} />);
+    expect(getByTestId("topbar-attention-live-region").textContent).toBe("0 need you");
   });
 });
 

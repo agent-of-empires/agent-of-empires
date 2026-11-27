@@ -2,7 +2,7 @@
 // order are the Daemon's, shared with every Client; a plugin sort is this browser's alone.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { RuntimeCursor, SidebarView, WorkspaceOrderingPatch, WriteResult } from "../../lib/api";
+import type { RuntimeCursor, SidebarView, SidebarViewPatch, WorkspaceOrderingPatch, WriteResult } from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
 import {
   arrangeGroups,
@@ -19,7 +19,13 @@ import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import { reportInfo, toastBus } from "../../lib/toastBus";
 import { keepUnshown, moveId, orderStartingWith } from "../../lib/sidebarReorder";
 import { workspaceComparator, type PluginSortContext } from "../../lib/sidebarSort";
-import { GROUP_BY_FEATURE, SORT_FEATURE, type SidebarGroupBy, type SidebarSort } from "../../lib/sidebarView";
+import {
+  GROUP_BY_FEATURE,
+  peerViewChangeNotice,
+  SORT_FEATURE,
+  type SidebarGroupBy,
+  type SidebarSort,
+} from "../../lib/sidebarView";
 import type { PathOrder } from "../../lib/sidebarGroups";
 import type { ProjectInfo, Workspace } from "../../lib/types";
 import type { SharedRead } from "../useSessions";
@@ -34,6 +40,8 @@ interface Options {
   workspaces: Workspace[];
   projects: ProjectInfo[];
   view: SidebarView;
+  /** False on a read-only Daemon or under CityHall, which refuse view writes. */
+  viewWritable: boolean;
   workspaceOrdering: string[];
   repositoryOrder: string[];
   groupOrder: GroupOrder;
@@ -48,7 +56,7 @@ interface Options {
   changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<WriteResult>;
   orderingSaving: () => boolean;
   changeSidebarView: (
-    patch: Partial<SidebarView>,
+    patch: SidebarViewPatch,
     after?: Promise<WriteResult>,
     baseSort?: SidebarSort,
   ) => Promise<WriteResult>;
@@ -143,6 +151,7 @@ export function useSidebarModel({
   workspaces,
   projects,
   view,
+  viewWritable,
   workspaceOrdering,
   repositoryOrder,
   groupOrder,
@@ -206,6 +215,20 @@ export function useSidebarModel({
     [groupBy, nested.groups, session.groups],
   );
   const attentionJump = useAttentionJump(displayGroups);
+
+  // Says why the list moved when another Client kind changed the view, and only when the rows on screen moved.
+  const shownOrder = useMemo(
+    () => displayGroups.map((g) => `${g.id}:${g.workspaces.map((v) => v.key).join(",")}`).join("|"),
+    [displayGroups],
+  );
+  const lastShown = useRef({ view, order: shownOrder });
+  useEffect(() => {
+    const last = lastShown.current;
+    lastShown.current = { view, order: shownOrder };
+    if (last.order === "" || last.order === shownOrder) return;
+    const notice = peerViewChangeNotice(last.view, view);
+    if (notice) reportInfo(notice);
+  }, [view, shownOrder]);
 
   // Like the TUI, a move is refused while the last one is saving, so it never builds on a write that may fail.
   const switching = useRef(false);
@@ -302,20 +325,31 @@ export function useSidebarModel({
     },
     [groupBy, changeSidebarView],
   );
+  // A web patch that sets the sort also clears the plugin sort marker the other Clients show.
   const selectSort = useCallback(
     (next: SidebarSort) => {
       reportFeatureUse(SORT_FEATURE[next]);
       setPluginSortRef(null);
-      if (next === sort) return;
+      if (next === sort) {
+        if (pluginSortRef && viewWritable) void changeSidebarView({ web_plugin_sort: null });
+        return;
+      }
       dropUndo();
       void changeSidebarView({ sort: next });
     },
-    [sort, dropUndo, changeSidebarView],
+    [sort, pluginSortRef, viewWritable, dropUndo, changeSidebarView],
   );
-  const selectPluginSort = useCallback((ref: PluginSortRef) => {
-    reportFeatureUse("sort_plugin");
-    setPluginSortRef(ref);
-  }, []);
+  const selectPluginSort = useCallback(
+    (ref: PluginSortRef) => {
+      reportFeatureUse("sort_plugin");
+      setPluginSortRef(ref);
+      const label = pluginSortSpecs(pluginUiEntries).find(
+        (s) => s.pluginId === ref.pluginId && s.entryId === ref.entryId,
+      )?.label;
+      if (label?.trim() && viewWritable) void changeSidebarView({ web_plugin_sort: [...label].slice(0, 64).join("") });
+    },
+    [pluginUiEntries, viewWritable, changeSidebarView],
+  );
 
   // Under Name or Newest first a drag switches to Custom starting from the order on screen, so nothing else moves.
   const frozen = sort !== "custom" && !pluginSort;

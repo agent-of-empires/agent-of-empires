@@ -82,7 +82,7 @@ While no plugin that provides suggestions is installed and a featured one exists
 
 ## Sidebar grouping and sort
 
-The **View options** button (sliders icon) beside the **Sessions** label holds the sidebar's view in one menu: **Group by**, **Sort by**, **Filter sessions** and, when plugins add them, **Plugin facets**. A dot on the button means the view differs from the default: Repository, Custom, no filter. The grouping and sort are shared: the TUI and every browser on this server show the same pick, and a change made in one shows up in the others without a reload.
+The **View options** button (sliders icon) beside the **Sessions** label holds the sidebar's view in one menu: **Group by**, **Sort by**, **Filter sessions** and, when plugins add them, **Plugin facets**. A dot on the button means the view differs from the default: Repository, Custom, no filter. The grouping and sort are shared: the TUI and every browser on this server show the same pick, and a change made in one shows up in the others without a reload. When a change made in the TUI or the CLI moves the rows on screen, a notice says so, for example "Sort changed in the TUI".
 
 Each project header shows the project icon next to its name, with a count of the sessions it holds. Hovering the header swaps the icon for a fold chevron and shows its **+** (always shown on touch screens); clicking the header collapses or expands the project's sessions.
 
@@ -93,6 +93,8 @@ Each project header shows the project icon next to its name, with a count of the
 - **Repository** (default): a header per git repository, with your Groups nested inside it. Sessions in no Group sit directly under the repository header. A session split across Groups appears once per Group.
 - **Groups**: a header per user-defined Group, assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions sit in an **Ungrouped** bucket at the top, as in the TUI.
 
+**+ New group…** ends the Group by list, below a divider, under either grouping. It asks for a name (`/` nests it) and at least one Session of one profile, with the open Session checked, and creates the Group with those Sessions in it, so no Group starts empty.
+
 Collapse state is tracked per grouping and is not shared with the TUI.
 
 **Sort by**:
@@ -100,13 +102,13 @@ Collapse state is tracked per grouping and is not shared with the TUI.
 - **Custom** (default): the order you set by dragging. Press and hold a row to move it within its header, or press and drag a repository header (there is no separate handle) to move the whole repository. Press and drag a Group header to move it among the Groups that share its parent, under either grouping. Groups follow each profile's Group order, which the TUI shows and moves too; ones never arranged follow by name. A Group shared by two profiles does not move, and a drop that cannot be made snaps back with a notice saying why. Rows and repository headers you never moved sit on top, newest first. The order is the one the TUI uses, stored in `workspace-ordering.json` and, for Groups, each profile's `groups.json`. While a move is saving, another drag is refused with "The last move is still saving".
 - **Newest first**: rows by their newest session, newest on top, and headers by the newest session under them that is not archived or trashed, as in the TUI. Switching sorts keeps the Custom order.
 - **Name**: rows A to Z by title, headers by name, ignoring case.
-- Plugin sorts, when a plugin offers one, are listed below and apply only in this browser until you reload or pick another sort. Dragging is off while one applies.
+- Plugin sorts, when a plugin offers one, are listed below and apply only in this browser until you reload or pick another sort. Dragging is off while one applies. The TUI keeps its own sort and its title says a plugin sort is on the web.
 
 Under Newest first or Name, dragging a row or a header switches to Custom, starting from the order on screen, Group headers included, so only what you dragged moves; the "Switched to Custom" notice offers **Undo**, which puts back the orders that drag rewrote and the previous sort, until the notice closes or the order or sort changes again, here or in another Client. When another Client changed the order first, Undo keeps that change and says so. When no Group order can keep the headers where they are, for example Groups of several profiles, the drag is refused and asks you to pick Custom first. When the switch fails the order is put back with a notice, unless a write may have saved, in which case the list shows what the Daemon holds.
 
-Pinned rows stay at the top of their header under every sort. The Multi-repo and Scratch headers stay at the bottom. Header drag is off while a filter is active, and every drag is off while a plugin facet filters the rows. In CityHall client mode the grouping, the sort and the row and repository order are fixed; Group headers still move.
+Pinned rows stay at the top of their header under every sort. The Multi-repo and Scratch headers stay at the bottom. Header drag is off while a filter is active, and every drag is off while a plugin facet filters the rows. On a read-only Daemon or in CityHall client mode the menu still opens and shows the current choice, with the options disabled and a line saying why: "This Daemon is read-only." or "Managed by CityHall.". In CityHall mode the row and repository order are fixed too, but Group headers still move and **+ New group…** stays available.
 
-**Filter sessions** opens a text filter and a **Needs you** toggle, which shows only the rows with a session waiting on you, in error, flagged urgent, flagged by a plugin, or finished and not yet seen (while the unread indicator is on), under their headers, and hides the "Snoozed & archived" footer. Closing the filter clears both.
+**Filter sessions** opens a text filter and a **Needs you** toggle, which shows only the rows with a session waiting on you, in error, flagged urgent, flagged by a plugin, or finished and not yet seen (while the unread indicator is on), under their headers, and hides the "Snoozed & archived" footer. Closing the filter clears both. While the sidebar is hidden, the sidebar toggle shows how many sessions need you, counted the same way as the header counts.
 
 **Move to another group.** Right-click (long-press on touch) a session row and choose **More > Move to another group**. The dialog lists the profile's existing groups with the current one highlighted: pick one, or type a new path to create that group. **Remove from group** (or clearing the field) drops the session back to **Ungrouped**. With the list open, Enter picks the highlighted group and a second Enter saves; Escape closes the list, then the dialog. Group paths use `/` for hierarchy (e.g. `work/projects`). Hidden in read-only mode.
 

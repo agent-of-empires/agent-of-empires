@@ -158,7 +158,7 @@ test.describe("Phone session stack", () => {
     await expect(drawer).toBeHidden();
     // Beta waits, so ☰ carries the count.
     const menu = page.getByTestId("topbar-menu");
-    await expect(menu).toHaveAccessibleName("Show sessions, 1 waiting for your input");
+    await expect(menu).toHaveAccessibleName("Show sessions, 1 needs you");
 
     await menu.click();
     await expect(drawer).toBeInViewport();

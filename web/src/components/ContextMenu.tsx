@@ -289,6 +289,7 @@ export function DropdownMenu({
   id,
   label,
   labelledBy,
+  describedBy,
   testId,
   className,
   style,
@@ -301,6 +302,8 @@ export function DropdownMenu({
   id?: string;
   label?: string;
   labelledBy?: string;
+  /** A line inside the menu that says why its choices are unavailable. */
+  describedBy?: string;
   testId?: string;
   /** Position, width and height cap. */
   className: string;
@@ -334,6 +337,7 @@ export function DropdownMenu({
       role="menu"
       aria-label={label}
       aria-labelledby={labelledBy}
+      aria-describedby={describedBy}
       data-testid={testId}
       data-owns-escape="open"
       onKeyDown={onKeyDown}

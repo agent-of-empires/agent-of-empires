@@ -1523,23 +1523,20 @@
       "components": ["web/src/components/TopBar.tsx"]
     },
     {
-      "id": "app-shell.topbar-attention-badges",
+      "id": "app-shell.topbar-needs-you-badge",
       "kind": "vitest",
       "risk": "low",
       "specs": [
         "src/components/__tests__/TopBar.test.tsx",
-        "src/lib/__tests__/session.test.ts",
-        "src/hooks/useAttentionCounts.test.tsx",
-        "src/lib/__tests__/contrastColor.test.ts",
-        "src/lib/__tests__/attentionBadgeColors.test.ts"
+        "src/hooks/useNeedsYouCount.test.tsx",
+        "tests/sidebar-view.spec.ts"
       ],
       "components": [
         "web/src/components/TopBar.tsx",
-        "web/src/lib/session.ts",
-        "web/src/hooks/useAttentionCounts.ts",
-        "web/src/lib/contrastColor.ts",
-        "web/src/lib/attentionBadgeColors.ts"
-      ]
+        "web/src/hooks/useNeedsYouCount.ts",
+        "web/src/lib/sidebarSort.ts"
+      ],
+      "notes": "The sidebar toggle, and a phone's Show sessions button, show one needs-you count, counting what the headers count: Waiting, Error, urgent, plugin-flagged, and unread while the unread indicator is on (the TUI's needs_you). The desktop toggle shows it only while the sidebar is hidden; its accessible name and a persistent live region carry the count (#5896)."
     },
     {
       "id": "app-shell.topbar-header-start",
@@ -2867,7 +2864,25 @@
         "web/src/components/Tooltip.tsx",
         "web/src/components/sidebar/SidebarToolbar.tsx"
       ],
-      "notes": "The View options menu holds the shared Group by (Repository, Groups) and Sort by (Custom, Newest first, Name), this browser's plugin sorts, Filter sessions with its Needs you toggle, and Plugin facets; the trigger marks the grouping and sort and shows a dot off the default (#5896). Read-only viewers and CityHall clients cannot change the shared choices, and CityHall drags only Group headers."
+      "notes": "The View options menu holds the shared Group by (Repository, Groups) ending in + New group…, Sort by (Custom, Newest first, Name), this browser's plugin sorts, Filter sessions with its Needs you toggle, and Plugin facets; the trigger marks the grouping and sort and shows a dot off the default (#5896). On a read-only Daemon or under CityHall the menu shows the current choice with the options disabled and says why; CityHall still drags Group headers and creates Groups."
+    },
+    {
+      "id": "sidebar.new-group",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/sidebar-view.spec.ts",
+        "src/components/__tests__/NewGroupDialog.test.tsx",
+        "src/components/__tests__/WorkspaceSidebarView.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/NewGroupDialog.tsx",
+        "web/src/components/sidebar/SidebarViewMenu.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "\"+ New group…\" ends the Group by list under both groupings. Its dialog asks for a name and at least one Session of one profile, with the open Session checked, and creates the Group with them through POST /api/groups with `sessions`, so the dashboard never creates an empty Group; a refusal is named in the dialog (#5896). Disabled on a read-only Daemon, enabled under CityHall."
     },
     {
       "id": "sidebar.popup-escape-keeps-selection",
@@ -2892,7 +2907,7 @@
         "web/src/lib/sidebarView.ts",
         "web/src/lib/sidebarReorder.ts"
       ],
-      "notes": "The grouping and sort are the Daemon's (PATCH /api/sidebar-view): a pick shows at once and no poll older than its receipt undoes it, another Client's pick arrives on the next poll, a drag under Name or Newest first freezes the order on screen and switches to Custom once that order saves, unless another Client picked a sort since the drag began, and a write that never answers stops holding polls off. Newest first orders rows by their newest session and headers by their newest live one, as the TUI does. Sort and grouping writes, and ordering writes, reach the Daemon one at a time in the order made; a drag while a move is saving is refused with \"The last move is still saving\". A drag-switch to Custom also keeps the Group headers where they are and offers a \"Switched to Custom\" Undo toast once saved that writes back only what the change wrote and the previous sort, held while a write is saving and dropped by the next order or sort change or a read showing another Client's change. A write receipt from a restarted Daemon rejects reads still in flight from the old one. Undo and the rollback send the stored orders the change left as `base`, and Undo every write also the sort and Group order it replaces, so a refusal keeps another Client's newer choice with a notice, put back only the Groups the change listed, and say so when the restore fails; teardown withdraws the offer. When the switch to Custom fails after an order landed, the orders are put back with a notice, each write conditioned on the Group order the switch's landed moves left; when a write may have landed (5xx or no answer), nothing is put back and the list is read again with a notice. A switch whose Group headers no Group order can keep is refused before any write."
+      "notes": "The grouping and sort are the Daemon's (PATCH /api/sidebar-view): a pick shows at once and no poll older than its receipt undoes it, another Client's pick arrives on the next poll, a drag under Name or Newest first freezes the order on screen and switches to Custom once that order saves, unless another Client picked a sort since the drag began, and a write that never answers stops holding polls off. Newest first orders rows by their newest session and headers by their newest live one, as the TUI does. Sort and grouping writes, and ordering writes, reach the Daemon one at a time in the order made; a drag while a move is saving is refused with \"The last move is still saving\". A drag-switch to Custom also keeps the Group headers where they are and offers a \"Switched to Custom\" Undo toast once saved that writes back only what the change wrote and the previous sort, held while a write is saving and dropped by the next order or sort change or a read showing another Client's change. A write receipt from a restarted Daemon rejects reads still in flight from the old one. Undo and the rollback send the stored orders the change left as `base`, and Undo every write also the sort and Group order it replaces, so a refusal keeps another Client's newer choice with a notice, put back only the Groups the change listed, and say so when the restore fails; teardown withdraws the offer. When the switch to Custom fails after an order landed, the orders are put back with a notice, each write conditioned on the Group order the switch's landed moves left; when a write may have landed (5xx or no answer), nothing is put back and the list is read again with a notice. A switch whose Group headers no Group order can keep is refused before any write. Every view patch names `client: \"web\"`; when the TUI or CLI changes the grouping or sort and the rows on screen move, a notice says so (\"Sort changed in the TUI\"), and the web's own changes and changes that move nothing stay silent. Picking a plugin sort PATCHes `web_plugin_sort` with its label and picking a built-in sort clears it, except where the Daemon refuses view writes."
     },
     {
       "id": "sidebar.plugin-sort-filter",

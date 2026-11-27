@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { SlidersHorizontal } from "lucide-react";
 
 import type { PluginSortSpec } from "../../lib/pluginUi";
@@ -65,7 +65,9 @@ export function SidebarViewMenu({
   pluginSorts,
   pluginSortRef,
   onPluginSortChange,
-  locked = false,
+  lockReason = null,
+  onNewGroup,
+  newGroupDisabled = false,
   filterOpen,
   filterActive = false,
   onToggleFilter,
@@ -81,8 +83,11 @@ export function SidebarViewMenu({
   pluginSorts: PluginSortSpec[];
   pluginSortRef: PluginSortRef | null;
   onPluginSortChange: (ref: PluginSortRef) => void;
-  /** The shared view is the Daemon's, which a read-only viewer or a CityHall client cannot change. */
-  locked?: boolean;
+  /** Why this viewer cannot change the shared view, which is the Daemon's: a read-only Daemon or CityHall. */
+  lockReason?: string | null;
+  /** Opens New group, which asks for a name and the Sessions to put in it. */
+  onNewGroup: () => void;
+  newGroupDisabled?: boolean;
   filterOpen: boolean;
   /** A filter applies while its panel is closed, such as Needs you. */
   filterActive?: boolean;
@@ -93,6 +98,8 @@ export function SidebarViewMenu({
   onToggleFacets: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const locked = lockReason !== null;
+  const reasonId = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   useOutsideDismiss(open, [triggerRef, menuRef], (e) => {
@@ -142,6 +149,7 @@ export function SidebarViewMenu({
           menuRef={menuRef}
           initialFocus="checked"
           label="View options"
+          describedBy={lockReason ? reasonId : undefined}
           testId="sidebar-view-menu"
           onKeyDown={(e) => {
             // Tab leaves the menu rather than walking its options.
@@ -155,6 +163,15 @@ export function SidebarViewMenu({
           }}
           className="absolute right-0 top-full mt-1 z-50 w-60 max-h-[calc(100vh-8rem)]"
         >
+          {lockReason && (
+            <div
+              id={reasonId}
+              className="px-3 pt-1 pb-1.5 text-[12px] text-text-muted"
+              data-testid="sidebar-view-lock-reason"
+            >
+              {lockReason}
+            </div>
+          )}
           <MenuHeading decorative>Group by</MenuHeading>
           <div role="group" aria-label="Group by">
             {GROUPINGS.map((value) => (
@@ -169,6 +186,20 @@ export function SidebarViewMenu({
               />
             ))}
           </div>
+          {/* Under Group by, past a divider, so it does not read as a third grouping. */}
+          <MenuSeparator />
+          <MenuItem
+            role="menuitem"
+            tabIndex={-1}
+            testId="sidebar-view-new-group"
+            disabled={newGroupDisabled}
+            onClick={() => {
+              setOpen(false);
+              onNewGroup();
+            }}
+          >
+            + New group…
+          </MenuItem>
           <MenuSeparator />
           <MenuHeading decorative>Sort by</MenuHeading>
           <div role="group" aria-label="Sort by">

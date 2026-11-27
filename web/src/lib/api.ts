@@ -198,6 +198,17 @@ export type SessionSettingOutcome =
 export interface SidebarView {
   group_by: "project" | "group";
   sort: "custom" | "newest" | "name";
+  /** The Client kind that last changed the grouping or the sort. */
+  changed_by?: "tui" | "web" | "cli";
+  /** The label of a plugin sort a web dashboard applies in place of `sort`. */
+  web_plugin_sort?: string;
+}
+
+/** A web change of the shared view; `web_plugin_sort: null` clears the marker. */
+export interface SidebarViewPatch {
+  group_by?: SidebarView["group_by"];
+  sort?: SidebarView["sort"];
+  web_plugin_sort?: string | null;
 }
 
 export interface SessionsEnvelope {
@@ -376,10 +387,23 @@ export async function reorderGroup(
 }
 
 /** `base_sort` is the sort the write replaces; it is refused with `conflict` once that changed. */
-export function updateSidebarView(
-  patch: Partial<SidebarView> & { base_sort?: SidebarView["sort"] },
-): Promise<WriteResult> {
-  return writeReceipt("/api/sidebar-view", jsonInit("PATCH", patch));
+export function updateSidebarView(patch: SidebarViewPatch & { base_sort?: SidebarView["sort"] }): Promise<WriteResult> {
+  return writeReceipt("/api/sidebar-view", jsonInit("PATCH", { ...patch, client: "web" }));
+}
+
+export type CreateGroupResult = { ok: true } | { ok: false; status: number; code: string | null };
+
+/** Creates the Group `path` in `profile` with `sessions` moved into it, in one commit. */
+export async function createGroup(profile: string, path: string, sessions: string[]): Promise<CreateGroupResult> {
+  try {
+    const res = await fetch("/api/groups", {
+      ...jsonInit("POST", { profile, path, sessions }),
+      signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS),
+    });
+    return res.ok ? { ok: true } : { ok: false, status: res.status, code: res.headers.get("aoe-error-code") };
+  } catch {
+    return { ok: false, status: 0, code: null };
+  }
 }
 
 export interface EnsureSessionResult {

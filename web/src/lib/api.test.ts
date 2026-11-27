@@ -103,9 +103,18 @@ const requestCases: RequestCase[] = [
     "PATCH /api/sidebar-view",
     () => api.updateSidebarView({ sort: "name" }),
     {
-      body: { sort: "name" },
+      body: { sort: "name", client: "web" },
       respond: runtimeJson({ group_by: "project", sort: "name" }),
       result: { receipt: cursor },
+    },
+  ],
+  [
+    "POST /api/groups",
+    () => api.createGroup("default", "work/api", ["s1"]),
+    {
+      body: { profile: "default", path: "work/api", sessions: ["s1"] },
+      respond: json({ ok: true }),
+      result: { ok: true },
     },
   ],
   ["POST /api/sessions/s1/terminal?index=0", () => api.ensureTerminal("s1"), { result: { ok: true } }],
@@ -901,6 +910,21 @@ describe("shared sidebar writes", () => {
   ])("report %s", async (_name, call, response, failure) => {
     fetchSpy.mockResolvedValueOnce(response);
     expect(await call()).toEqual({ receipt: null, failure });
+  });
+});
+
+describe("createGroup", () => {
+  it("reports the refusal's status and error code, and a network failure as status 0", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response("{}", { status: 400, headers: { "AoE-Error-Code": "group_sessions_required" } }),
+    );
+    expect(await api.createGroup("default", "g", [])).toEqual({
+      ok: false,
+      status: 400,
+      code: "group_sessions_required",
+    });
+    offline();
+    expect(await api.createGroup("default", "g", ["s1"])).toEqual({ ok: false, status: 0, code: null });
   });
 });
 

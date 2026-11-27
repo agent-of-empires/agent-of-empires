@@ -19,7 +19,9 @@ export function SidebarToolbar({
   pluginSorts,
   pluginSortRef,
   onPluginSortChange,
-  viewLocked,
+  lockReason,
+  onNewGroup,
+  newGroupDisabled,
   hasFacets,
   facetsActive,
   facetOpen,
@@ -39,8 +41,10 @@ export function SidebarToolbar({
   pluginSorts: PluginSortSpec[];
   pluginSortRef: PluginSortRef | null;
   onPluginSortChange: (ref: PluginSortRef) => void;
-  /** A read-only viewer or a CityHall client cannot change the shared view. */
-  viewLocked?: boolean;
+  /** Why this viewer cannot change the shared view: a read-only Daemon or CityHall. */
+  lockReason: string | null;
+  onNewGroup: () => void;
+  newGroupDisabled: boolean;
   hasFacets: boolean;
   facetsActive: boolean;
   facetOpen: boolean;
@@ -96,7 +100,9 @@ export function SidebarToolbar({
             pluginSorts={pluginSorts}
             pluginSortRef={pluginSortRef}
             onPluginSortChange={onPluginSortChange}
-            locked={viewLocked}
+            lockReason={lockReason}
+            onNewGroup={onNewGroup}
+            newGroupDisabled={newGroupDisabled}
             filterOpen={filterOpen}
             filterActive={filterActive}
             onToggleFilter={onToggleFilter}

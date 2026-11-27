@@ -26,6 +26,7 @@ function setup(overrides: Partial<Parameters<typeof SidebarViewMenu>[0]> = {}) {
     facetsActive: false,
     facetOpen: false,
     onToggleFacets: vi.fn(),
+    onNewGroup: vi.fn(),
     ...overrides,
   };
   render(<SidebarViewMenu {...props} />);
@@ -81,8 +82,12 @@ describe("SidebarViewMenu", () => {
   });
 
   it("lets a viewer who cannot change the view drop a plugin sort without changing the shared sort", () => {
-    const { props, open } = setup({ locked: true, pluginSortRef: { pluginId: "p", entryId: "metric" } });
+    const { props, open } = setup({
+      lockReason: "Managed by CityHall.",
+      pluginSortRef: { pluginId: "p", entryId: "metric" },
+    });
     open();
+    expect(screen.getByTestId("sidebar-view-lock-reason").textContent).toBe("Managed by CityHall.");
     expect((screen.getByTestId("sidebar-view-sort-name") as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByTestId("sidebar-view-group-group") as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByTestId("sidebar-view-sort-custom"));
