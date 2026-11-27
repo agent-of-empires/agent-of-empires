@@ -91,6 +91,9 @@ on_create = ["{hook_cmd}"]
 [updates]
 update_check_mode = "off"
 
+[session]
+default_tool = "fake-agent"
+
 [acp]
 structured_view = "off"
 

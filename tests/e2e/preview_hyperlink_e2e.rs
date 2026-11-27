@@ -99,6 +99,7 @@ has_acknowledged_agent_hooks = true
 
 [session]
 default_attach_mode = "live_send"
+default_tool = "fake-agent"
 
 {systemd_off}
 {extra}"#,
@@ -357,6 +358,7 @@ has_acknowledged_agent_hooks = true
 
 [session]
 default_attach_mode = "live_send"
+default_tool = "fake-agent"
 custom_agents = {{ "{LINK_AGENT}" = "{LINK_AGENT}" }}
 
 {systemd_off}"#,

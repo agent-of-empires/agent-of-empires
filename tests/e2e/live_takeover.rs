@@ -26,6 +26,7 @@ has_acknowledged_agent_hooks = true
 
 [session]
 default_attach_mode = "live_send"
+default_tool = "fake-agent"
 
 {systemd_off}"#,
         version = env!("CARGO_PKG_VERSION"),
