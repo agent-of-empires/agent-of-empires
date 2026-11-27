@@ -10,6 +10,34 @@ async fn serve(app: Router) -> (DaemonClient, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
+async fn a_batch_start_is_one_post_answered_per_item() {
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let app = Router::new().route(
+        "/api/suggestions/start-batch",
+        post(move |Json(body): Json<serde_json::Value>| async move {
+            sent.send(body).unwrap();
+            Json(serde_json::json!({ "results": [
+                { "provider_id": "gh", "id": "1", "status": 201, "body": { "session_id": "s" } },
+                { "provider_id": "gh", "id": "2", "status": 400, "body": { "error": "no_project" } },
+            ] }))
+        }),
+    );
+    let (client, server) = serve(app).await;
+    let body = serde_json::json!({ "items": [
+        { "provider_id": "gh", "id": "1" }, { "provider_id": "gh", "id": "2" },
+    ] });
+    let answers = client.start_suggestions(&body, 2).await.unwrap();
+    server.abort();
+    assert_eq!(received.recv().await.unwrap(), body);
+    let seen: Vec<(&str, &str, u16)> = answers
+        .iter()
+        .map(|a| (a.provider_id.as_str(), a.id.as_str(), a.status))
+        .collect();
+    assert_eq!(seen, [("gh", "1", 201), ("gh", "2", 400)]);
+    assert_eq!(answers[1].body["error"], "no_project");
+}
+
+#[tokio::test]
 async fn pre_trust_is_patched_through_the_settings_api() {
     let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
     let app = Router::new().route(

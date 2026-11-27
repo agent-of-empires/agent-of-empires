@@ -157,6 +157,7 @@ export function Dashboard({
       {onPrepareSuggestion && onViewAllSuggestions && (
         <DashboardSuggestions
           key={suggestionsEpoch}
+          focusHeading={suggestionsEpoch > 0}
           readOnly={readOnly || !canManageSuggestions}
           cityhall={!canManageSuggestions}
           onPrepare={onPrepareSuggestion}

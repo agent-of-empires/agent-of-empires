@@ -11355,13 +11355,17 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         axum::http::HeaderName::from_static("x-aoe-prompt-origin"),
         axum::http::HeaderValue::from_static("tui"),
     );
+    // A multi-line preset prompt, as the dashboard and the TUI send it.
+    const MULTI_LINE: &str = "Review it\n\n1. Find it.   Then run:\r\n2. Done\n";
     for (title, headers) in [
         ("with-prompt", axum::http::HeaderMap::new()),
         ("with-prompt-tui", tui),
+        ("multi-line", axum::http::HeaderMap::new()),
     ] {
         let mut body = serde_json::json!({
             "title": title, "path": "", "tool": "claude",
-            "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
+            "scratch": true, "view": "structured",
+            "initial_prompt": if title == "multi-line" { MULTI_LINE } else { "fix the bug" },
         });
         if title == "with-prompt" {
             body["suggestion"] = serde_json::json!({ "provider_id": "acme.gh", "id": "42" });
@@ -11373,7 +11377,14 @@ async fn create_persists_initial_prompt_as_pending_turn() {
     let origin_of = |title: &str| {
         let row = instances.iter().find(|i| i.title == title).expect("row");
         let turn = row.pending_initial_turn.as_ref().expect("queued");
-        assert_eq!(turn.text, "fix the bug");
+        assert_eq!(
+            turn.text,
+            if title == "multi-line" {
+                MULTI_LINE
+            } else {
+                "fix the bug"
+            }
+        );
         assert!(!turn.synthesized);
         turn.origin
     };
@@ -11385,6 +11396,7 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         origin_of("with-prompt-tui"),
         crate::daemon::PromptOrigin::Tui
     );
+    origin_of("multi-line");
     let linked = instances.iter().find(|i| i.title == "with-prompt").unwrap();
     let origin = linked.suggestion.as_ref().expect("linked");
     assert_eq!(

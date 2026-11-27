@@ -102,6 +102,8 @@ export interface WizardPrefill {
   useStructuredView?: boolean;
   /** A preset's worktree choice, kept over project and profile defaults like a direct edit. */
   useWorktree?: boolean;
+  /** A preset's sandbox choice, kept over project and profile defaults like a direct edit. */
+  useSandbox?: boolean;
   initialPrompt?: string;
   title?: string;
   /** Where a suggested session came from, shown as the "From" strip. */
@@ -153,6 +155,7 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     }),
     ...(prefill.useWorktree !== undefined &&
       !prefill.scratch && { useWorktree: prefill.useWorktree, worktreeDirty: true }),
+    ...(prefill.useSandbox !== undefined && { sandboxEnabled: prefill.useSandbox, sandboxDirty: true }),
   };
 }
 
@@ -302,12 +305,14 @@ export function SessionWizard({
   onCreatedInBackground,
   onReopenFailure,
   restore,
-  prefill,
+  prefill: openedWith,
   servedProfile,
   onRetryServedProfile,
   nameOnly = false,
   onEditPreset,
 }: Props) {
+  // The form is seeded once, so a later prefill (a slow Start with changes) must not swap its provenance.
+  const [prefill] = useState(openedWith);
   const [state, dispatch] = useReducer(reducer, {
     data: restore?.data ?? initialWizardData(prefill, nameOnly),
     isSubmitting: false,

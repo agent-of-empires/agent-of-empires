@@ -31,6 +31,9 @@ pub struct Snapshot {
     pub items: Vec<Item>,
     #[serde(default)]
     pub prefs: Prefs,
+    /// A featured plugin offers suggestions, as the daemon's index says.
+    #[serde(default)]
+    pub setup_offered: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +68,17 @@ pub struct Provider {
     pub refreshing: bool,
     #[serde(default)]
     pub checks: Vec<Check>,
+    #[serde(default)]
+    pub sources: Vec<Source>,
+}
+
+/// One kind of suggestion a provider declares.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Source {
+    pub criterion: String,
+    /// Set (to the cap) when open items of this kind start on their own.
+    #[serde(default)]
+    pub auto_start: Option<serde_json::Value>,
 }
 
 /// A provider's setup check; `fix` is the plugin's own untrusted advice.
@@ -128,6 +142,12 @@ pub struct Item {
     /// The source closed or changed; the item cannot start.
     #[serde(default)]
     pub stale: bool,
+    /// Which declared kind produced the item.
+    #[serde(default)]
+    pub criterion: String,
+    /// Why auto start left the item alone, or that its start failed.
+    #[serde(default)]
+    pub auto_note: Option<String>,
 }
 
 /// The live Session an item was started as.
@@ -164,6 +184,9 @@ pub struct Prepared {
     pub initial_prompt: String,
     pub tool: String,
     pub project: Option<PreparedProject>,
+    /// The rest of the repo's mapped Projects, for a worktree Session.
+    #[serde(default)]
+    pub extra_projects: Vec<PreparedProject>,
     #[serde(default)]
     pub view: Option<String>,
     #[serde(default)]
@@ -304,6 +327,22 @@ impl DaemonClient {
         }
     }
 
+    /// `PUT /api/suggestions/auto-start`: turns auto start on or off for one kind.
+    pub async fn set_suggestion_auto_start(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<(), DaemonClientError> {
+        let url = self.suggestions_url("suggestions/auto-start")?;
+        let response = self
+            .send_suggestion_request(self.http.put(url).json(body))
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Self::suggestion_refusal(response).await)
+        }
+    }
+
     /// `POST /api/suggestions/prepare`. The New Session prefill for one item.
     pub async fn prepare_suggestion(
         &self,
@@ -357,6 +396,42 @@ impl DaemonClient {
         }
         Err(Self::suggestion_refusal(response).await)
     }
+
+    /// `POST /api/suggestions/start-batch`: the items start one after another
+    /// on the daemon, each answered as `start` would, so each may take as long.
+    pub async fn start_suggestions(
+        &self,
+        body: &serde_json::Value,
+        items: usize,
+    ) -> Result<Vec<StartBatchAnswer>, DaemonClientError> {
+        let url = self.suggestions_url("suggestions/start-batch")?;
+        let timeout = START_TIMEOUT * u32::try_from(items).unwrap_or(u32::MAX);
+        let response = self
+            .send_suggestion_request(self.http.post(url).json(body).timeout(timeout))
+            .await?;
+        if !response.status().is_success() {
+            return Err(Self::suggestion_refusal(response).await);
+        }
+        Ok(super::decode_json::<StartBatchResults>(response)
+            .await?
+            .results)
+    }
+}
+
+/// One item's answer to `POST /api/suggestions/start-batch`: the status and
+/// body `start` would have given for it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartBatchAnswer {
+    pub provider_id: String,
+    pub id: String,
+    pub status: u16,
+    #[serde(default)]
+    pub body: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct StartBatchResults {
+    results: Vec<StartBatchAnswer>,
 }
 
 #[cfg(test)]

@@ -1462,6 +1462,7 @@ pub async fn get_tips(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 .as_array()
                 .into_iter()
                 .flatten()
+                .filter(|p| p["id"] != crate::plugin::suggestions::AGENT_PROVIDER_ID)
                 .map(|p| p["enabled"].as_bool().unwrap_or(false))
                 .collect();
             crate::tips::suggestions_setup_available(&enabled)
