@@ -105,8 +105,8 @@ export interface DragOptions {
   groupHeadersDisabled: boolean;
   onMoveWorkspace: (activeId: string, overId: string, after: boolean) => void;
   onMoveRepository: (activeId: string, overId: string, after: boolean) => void;
-  /** Moves a Group header among its siblings, by path. */
-  onMoveGroup: (activePath: string, overPath: string, after: boolean) => void;
+  /** Moves a Group header among its siblings, by path, under `repoId` when nested in a Repository. */
+  onMoveGroup: (activePath: string, overPath: string, after: boolean, repoId?: string) => void;
   dragClickGuard: MutableRefObject<DragClickGuard>;
 }
 
@@ -114,6 +114,7 @@ interface SortableData {
   type?: "group" | "sessionGroup" | "workspace";
   workspaceId?: string;
   groupPath?: string;
+  repoId?: string;
   sortable?: { containerId: string | number; index: number };
 }
 
@@ -134,7 +135,7 @@ function SidebarDnd({ drag, children }: { drag: DragOptions; children: ReactNode
     if (from.type === "group" && !drag.repoHeadersDisabled)
       drag.onMoveRepository(String(active.id), String(over.id), after);
     if (from.type === "sessionGroup" && !drag.groupHeadersDisabled && from.groupPath && to.groupPath) {
-      drag.onMoveGroup(from.groupPath, to.groupPath, after);
+      drag.onMoveGroup(from.groupPath, to.groupPath, after, from.repoId);
     }
     if (from.type === "workspace" && !drag.rowsDisabled && from.workspaceId && to.workspaceId) {
       drag.onMoveWorkspace(from.workspaceId, to.workspaceId, after);
@@ -290,6 +291,7 @@ export function NestedGroupList({
                       key={subgroupId(sg)}
                       groupId={subgroupId(sg)}
                       groupPath={groupPath}
+                      repoId={repo.id}
                       disabled={drag.groupHeadersDisabled}
                     >
                       {(handle) => (

@@ -409,7 +409,8 @@ export function useSidebarModel({
       }
       const writes = [write, ...moves.map((m) => moveGroup(m.profile, m.path, m.move, write))];
       switching.current = true;
-      const switched = changeSidebarView({ sort: "custom" }, settleAll(writes));
+      // Refused once a peer picked another sort since the drag began.
+      const switched = changeSidebarView({ sort: "custom" }, settleAll(writes), sort);
       // The Daemon stores a list as written, so `base` is what `write` leaves.
       const change: Undoable = {
         previous,
@@ -494,17 +495,20 @@ export function useSidebarModel({
     [refuseWhileSaving, repo.groups, repositoryOrder, frozen, onScreenOrder, switchToCustom, commit],
   );
 
-  /** Moves a Group header next to its sibling `overPath`, after it when the drag went down. */
+  /** Moves a Group header next to its sibling `overPath`, after it when the drag went down. Under Repository,
+   *  `repoId` is the header's repository, whose Groups alone decide its profile and shown siblings. */
   const moveGroupHeader = useCallback(
-    (activePath: string, overPath: string, after: boolean) => {
+    (activePath: string, overPath: string, after: boolean, repoId?: string) => {
       if (pluginSort) {
         reportInfo("Pick Custom to arrange groups");
         return;
       }
       if (refuseWhileSaving() || activePath === overPath) return;
-      const profilesOf = (g: (typeof displayGroups)[number]) =>
+      const scope =
+        repoId === undefined ? displayGroups : (nested.groups.find((n) => n.repo.id === repoId)?.subgroups ?? []);
+      const profilesOf = (g: (typeof scope)[number]) =>
         g.workspaces.flatMap((v) => v.workspace.sessions.map((s) => s.profile));
-      const profiles = new Set(displayGroups.filter((g) => g.groupPath === activePath).flatMap(profilesOf));
+      const profiles = new Set(scope.filter((g) => g.groupPath === activePath).flatMap(profilesOf));
       // The Daemon orders each profile's Groups apart, so a header merging two has no one place to go.
       const [profile] = profiles;
       if (profiles.size !== 1 || profile === undefined) {
@@ -516,9 +520,7 @@ export function useSidebarModel({
         return;
       }
       const order = groupOrder[profile] ?? [];
-      const shown = displayGroups
-        .filter((g) => g.groupPath && profilesOf(g).includes(profile))
-        .map((g) => g.groupPath!);
+      const shown = scope.filter((g) => g.groupPath && profilesOf(g).includes(profile)).map((g) => g.groupPath!);
       if (!order.includes(overPath) && !shown.includes(overPath)) {
         reportInfo("Groups move only within one profile");
         return;
@@ -538,6 +540,7 @@ export function useSidebarModel({
       pluginSort,
       refuseWhileSaving,
       displayGroups,
+      nested.groups,
       groupOrder,
       frozen,
       switchToCustom,

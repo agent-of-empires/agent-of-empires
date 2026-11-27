@@ -374,7 +374,7 @@ describe("the shared Custom order", () => {
         method: "PUT",
         body: { order: ["/r/Alpha::a1", "/r/beta::b2", "/r/beta::b1"], repositories: ["/r/Alpha", "/r/beta"] },
       },
-      { method: "PATCH", body: { sort: "custom" } },
+      { method: "PATCH", body: { sort: "custom", base_sort: "name" } },
     ]);
     expect(result.current.model.sort).toBe("custom");
     expect(headers(result)).toEqual(["/r/Alpha", "/r/beta"]);
@@ -441,6 +441,22 @@ describe("the shared Custom order", () => {
     expect(writes.map((w) => w.method)).toEqual(["PUT", "PATCH"]);
     expect(writes[1]!.body).toEqual({ sort: "name" });
     expect(result.current.model.sort).toBe("name");
+  });
+
+  it("under Name, a drag's switch to Custom keeps a sort another Client picked while its order saved", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toEqual(["/r/Alpha::a1", "/r/beta::b1", "/r/beta::b2"]));
+    const releases = heldWrites("put", "*/api/workspace-ordering");
+    act(() => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    daemon.sidebar_view = { group_by: "project", sort: "newest" };
+    await act(async () => releases.shift()!());
+    await waitFor(() => expect(writes).toHaveLength(3));
+    expect(writes[1]).toEqual({ method: "PATCH", body: { sort: "custom", base_sort: "name" } });
+    await act(async () => releases.shift()!());
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    expect(daemon.sidebar_view.sort).toBe("newest");
   });
 
   it("under Name, a header drag freezes the rows too and moves only that header", async () => {
@@ -784,7 +800,7 @@ describe("Group headers", () => {
           siblings: ["loose", "alpha", "mid", "zeta"],
         },
       },
-      { method: "PATCH", body: { sort: "custom" } },
+      { method: "PATCH", body: { sort: "custom", base_sort: "name" } },
     ]);
     expect(result.current.model.sort).toBe("custom");
     expect(groupHeaders(result)).toEqual(named);
@@ -988,6 +1004,36 @@ describe("Group headers", () => {
     server.use(http.post("*/api/reorder", () => HttpResponse.json({ status: "at_edge" })));
     act(() => result.current.model.moveGroupHeader("alpha", "zeta", false));
     await waitFor(() => expect(toasts.info).toHaveBeenLastCalledWith("Couldn't move the group there"));
+  });
+
+  it("under Repository, take a nested header's profile and siblings from its own Repository", async () => {
+    const at = (id: string, repo: string, group_path: string, profile = "default") => ({
+      ...session({ id, title: id, project_path: repo, branch: id, group_path, created_at: "2025-01-01T00:00:00Z" }),
+      profile,
+    });
+    daemon.sessions = [
+      at("one-a", "/r/one", "a"),
+      at("one-c", "/r/one", "c"),
+      at("two-b", "/r/two", "b"),
+      at("two-a", "/r/two", "a", "work"),
+    ];
+    daemon.workspace_ordering = daemon.sessions.map(wsId);
+    daemon.repository_order = ["/r/one", "/r/two"];
+    daemon.group_order = { default: ["a", "b", "c"], work: ["a"] };
+    daemon.sidebar_view = { group_by: "project", sort: "custom" };
+    const { result } = mount();
+    await waitFor(() => expect(result.current.model.nestedGroups).toHaveLength(2));
+    // b, shown only under /r/two, keeps its slot.
+    act(() => result.current.model.moveGroupHeader("c", "a", false, "/r/one"));
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    // The other profile's a under /r/two does not make /r/one's a span two profiles.
+    act(() => result.current.model.moveGroupHeader("a", "c", false, "/r/one"));
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    expect(toasts.info).not.toHaveBeenCalled();
+    expect(writes.map((w) => w.body)).toMatchObject([
+      { group: { profile: "default", path: "c" }, siblings: ["a", "c"] },
+      { group: { profile: "default", path: "a" } },
+    ]);
   });
 
   it("count only the dragged profile's Groups as siblings", async () => {

@@ -47,18 +47,21 @@ export function SortableSessionRow({
 export function SortableGroupBlock({
   groupId,
   groupPath,
+  repoId,
   disabled,
   children,
 }: {
   groupId: string;
   groupPath?: string;
+  /** The Repository a nested Group header sits in. */
+  repoId?: string;
   disabled: boolean;
   children: (handle: DragHandleProps) => ReactNode;
 }) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({
     id: groupId,
     disabled,
-    data: groupPath === undefined ? { type: "group" } : { type: "sessionGroup", groupPath },
+    data: groupPath === undefined ? { type: "group" } : { type: "sessionGroup", groupPath, repoId },
   });
   return (
     <div
