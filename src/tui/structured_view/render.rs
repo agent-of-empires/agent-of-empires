@@ -319,8 +319,8 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
         .constraints([
             Constraint::Min(5), // transcript
             Constraint::Length(approval_height),
-            Constraint::Length(notices_strip_height(state)), // 0 when none
-            Constraint::Length(queue_height),                // queued prompts strip (0 when empty)
+            Constraint::Length(notices_strip_height(state, area.width)), // 0 when none
+            Constraint::Length(queue_height), // queued prompts strip (0 when empty)
             Constraint::Length(composer_height(state)),
             Constraint::Length(1), // status line
         ])
@@ -450,10 +450,49 @@ fn integration_lost_text(reason: &IntegrationLostReason) -> String {
     format!(" {what} Messages you send stay queued.")
 }
 
-/// One line for a lost integration, then one per undismissed advisory.
+/// A long contract-violation detail is cut here rather than crowd the transcript.
+const INTEGRATION_LOST_MAX_ROWS: usize = 3;
+
+/// The lost-integration line wrapped to `width`, ellipsized on its last row.
+fn integration_lost_lines(
+    reason: &IntegrationLostReason,
+    width: u16,
+    title: Style,
+    hint: Style,
+) -> Vec<Line<'static>> {
+    let line = Line::from(vec![
+        Span::styled(" Agent integration lost ", title),
+        Span::styled(integration_lost_text(reason), hint),
+    ]);
+    let mut lines = Vec::new();
+    wrap_line_into(line, width, &mut lines);
+    if lines.len() > INTEGRATION_LOST_MAX_ROWS {
+        let last: String = lines[INTEGRATION_LOST_MAX_ROWS - 1]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        lines.truncate(INTEGRATION_LOST_MAX_ROWS);
+        let clipped = crate::tui::components::text::truncate_to_width(
+            &format!("{last}\u{2026}"),
+            width as usize,
+        );
+        lines[INTEGRATION_LOST_MAX_ROWS - 1] = Line::from(Span::styled(clipped, hint));
+    }
+    lines
+}
+
+/// The wrapped lost-integration rows, then one line per undismissed advisory.
 /// Advisories are capped daemon-side, so this never starves the transcript.
-fn notices_strip_height(state: &StructuredViewState) -> u16 {
-    state.visible_notices().count() as u16 + u16::from(state.transcript.integration_lost.is_some())
+fn notices_strip_height(state: &StructuredViewState, width: u16) -> u16 {
+    let lost = state
+        .transcript
+        .integration_lost
+        .as_ref()
+        .map_or(0, |reason| {
+            integration_lost_lines(reason, width, Style::default(), Style::default()).len()
+        });
+    (state.visible_notices().count() + lost) as u16
 }
 
 /// Agent-pushed advisories, toned by severity, each dismissable with `x` or a
@@ -467,20 +506,14 @@ fn render_notices(
     let mut buttons = Vec::new();
     let mut first_notice_row = 0;
     if let Some(reason) = &state.transcript.integration_lost {
-        let line = Line::from(vec![
-            Span::styled(
-                " Agent integration lost ",
-                Style::default()
-                    .fg(theme.error)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                integration_lost_text(reason),
-                Style::default().fg(theme.hint),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), Rect { height: 1, ..area });
-        first_notice_row = 1;
+        let title = Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD);
+        let lines =
+            integration_lost_lines(reason, area.width, title, Style::default().fg(theme.hint));
+        first_notice_row = lines.len();
+        let height = (first_notice_row as u16).min(area.height);
+        frame.render_widget(Paragraph::new(lines), Rect { height, ..area });
     }
     for (row, notice) in state.visible_notices().enumerate() {
         let row = row + first_notice_row;
@@ -3063,6 +3096,45 @@ mod tests {
 
         state.transcript.integration_lost = None;
         assert_eq!(strip(&state).len(), 1);
+    }
+
+    #[test]
+    fn integration_lost_wraps_at_80_columns_and_caps_long_detail() {
+        let mut state = test_state();
+        state.transcript.session_notices = vec![SessionNotice {
+            id: "notice-1".into(),
+            severity: "info".into(),
+            title: "Fast mode turned off".into(),
+            description: None,
+        }];
+        let rows = |state: &StructuredViewState| render_rows(state, 80, 24, true);
+
+        state.transcript.integration_lost = Some(IntegrationLostReason::ProxyExited);
+        let text = rows(&state).join("\n");
+        assert!(text.contains("process exited"), "{text}");
+        assert!(text.contains("queued."), "{text}");
+        let all = rows(&state);
+        let lost = all
+            .iter()
+            .position(|r| r.contains("Agent integration lost"));
+        let notice = all.iter().position(|r| r.contains("Fast mode turned off"));
+        assert!(notice > lost.map(|i| i + 1), "{all:?}");
+        assert!(all[notice.unwrap()].contains('×'), "{all:?}");
+
+        state.transcript.integration_lost = Some(IntegrationLostReason::ContractViolation {
+            detail: "word ".repeat(100),
+        });
+        let all = rows(&state);
+        let lost = all
+            .iter()
+            .position(|r| r.contains("Agent integration lost"))
+            .expect("lost line");
+        let notice = all
+            .iter()
+            .position(|r| r.contains("Fast mode turned off"))
+            .expect("notice row");
+        assert_eq!(notice - lost, 3, "{all:?}");
+        assert!(all[lost + 2].trim_end().ends_with('\u{2026}'), "{all:?}");
     }
 
     #[test]
