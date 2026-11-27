@@ -79,7 +79,8 @@ test.describe("at 375px", () => {
     expect(terminalBox.y).toBeGreaterThan(retryBox.y);
     for (const box of [retryBox, terminalBox]) {
       expect(box.height).toBeGreaterThanOrEqual(32);
-      expect(box.height).toBeLessThanOrEqual(40);
+      // A phone tap target, one line tall.
+      expect(box.height).toBeLessThanOrEqual(44);
     }
     const overflow = await page.evaluate(
       () => document.documentElement.scrollWidth - document.documentElement.clientWidth,

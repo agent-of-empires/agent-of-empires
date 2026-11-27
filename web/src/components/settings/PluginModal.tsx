@@ -1,30 +1,44 @@
-import { useEffect, type ReactNode } from "react";
+import { useEffect, type ReactNode, type Ref } from "react";
+import { CAPTION } from "../../lib/surfaces";
+import { CancelButton, CloseButton, ConfirmButton, ModalFrame } from "../Dialog";
+import { DIALOG_BODY, DIALOG_FOOTER } from "../../lib/surfaces";
 
 interface Props {
   testId: string;
   ariaLabel: string;
   header: ReactNode;
   closeTestId: string;
+  /** The Close button's accessible name. */
+  closeLabel?: string;
   onClose: () => void;
   /** While busy, Escape, the backdrop and Close do nothing. */
   busy?: boolean;
   /** Set false when the caller owns Escape. */
   closeOnEscape?: boolean;
+  rootRef?: Ref<HTMLDivElement>;
+  /** Desktop size, as `md:` classes. */
+  panelClassName?: string;
   /** Rendered outside the panel, e.g. a lightbox. */
   overlay?: ReactNode;
+  /** The footer's buttons. */
+  actions?: ReactNode;
   children: ReactNode;
 }
 
-/** Backdrop, panel and header-with-Close shared by the plugin modals. */
+/** Backdrop, panel, header-with-Close and footer shared by the plugin modals. */
 export function PluginModal({
   testId,
   ariaLabel,
   header,
   closeTestId,
+  closeLabel,
   onClose,
   busy = false,
   closeOnEscape = true,
+  rootRef,
+  panelClassName = "md:w-[32rem] md:max-h-[80vh]",
   overlay,
+  actions,
   children,
 }: Props) {
   const closeIfIdle = () => {
@@ -41,34 +55,19 @@ export function PluginModal({
   }, [busy, onClose, closeOnEscape]);
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-label={ariaLabel}
-      onClick={closeIfIdle}
-      data-testid={testId}
+    <ModalFrame
+      rootProps={{ ref: rootRef, role: "dialog", "aria-modal": true, "aria-label": ariaLabel, "data-testid": testId }}
+      panelClassName={panelClassName}
+      onBackdrop={busy ? undefined : onClose}
+      outside={overlay}
     >
-      <div
-        className="max-h-[80vh] w-full max-w-lg overflow-auto rounded border border-surface-700 bg-surface-900 p-4 text-sm"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-3 flex items-start justify-between gap-3">
-          {header}
-          <button
-            type="button"
-            className="rounded border border-surface-700 px-2 py-0.5 text-xs hover:bg-surface-800 disabled:opacity-50"
-            disabled={busy}
-            onClick={closeIfIdle}
-            data-testid={closeTestId}
-          >
-            Close
-          </button>
-        </div>
-        {children}
+      <div className="flex items-start gap-3 px-5 max-md:px-4 pt-4 pb-1 max-md:pt-2 text-[15px] md:text-sm">
+        <div className="flex-1 min-w-0">{header}</div>
+        <CloseButton testId={closeTestId} label={closeLabel} disabled={busy} onClick={closeIfIdle} />
       </div>
-      {overlay}
-    </div>
+      <div className={`${DIALOG_BODY} text-[15px] md:text-sm`}>{children}</div>
+      {actions && <div className={DIALOG_FOOTER}>{actions}</div>}
+    </ModalFrame>
   );
 }
 
@@ -87,8 +86,8 @@ export function ModalSection({
   const color = warn ? "text-status-warning" : "text-text-dim";
   return (
     <div className="mb-3" data-testid={testId}>
-      <p className={`mb-1 text-[11px] font-semibold uppercase tracking-wide ${color}`}>{label}</p>
-      {typeof children === "string" ? <p className={`text-xs ${color}`}>{children}</p> : children}
+      <p className={`${CAPTION} !px-0 !mb-1 ${warn ? "!text-status-warning" : ""}`}>{label}</p>
+      {typeof children === "string" ? <p className={`text-[13px] md:text-xs ${color}`}>{children}</p> : children}
     </div>
   );
 }
@@ -108,10 +107,7 @@ export function BuildSteps({ steps, testId }: { steps: string[]; testId: string 
   );
 }
 
-const CANCEL = "rounded border border-surface-700 px-3 py-1 text-xs hover:bg-surface-800 disabled:opacity-50";
-const CONFIRM = "rounded bg-brand-600 px-3 py-1 text-xs font-medium text-white hover:bg-brand-500 disabled:opacity-50";
-
-/** The modal's trailing cancel/confirm pair; both go flat while `busy`. */
+/** The footer's cancel/confirm pair; both disable while `busy`. */
 export function ModalActions(p: {
   busy: boolean;
   cancelLabel: string;
@@ -122,13 +118,11 @@ export function ModalActions(p: {
   onConfirm: () => void;
 }) {
   return (
-    <div className="flex justify-end gap-2">
-      <button type="button" className={CANCEL} disabled={p.busy} onClick={p.onCancel} data-testid={p.cancelTestId}>
-        {p.cancelLabel}
-      </button>
-      <button type="button" className={CONFIRM} disabled={p.busy} onClick={p.onConfirm} data-testid={p.confirmTestId}>
+    <>
+      <CancelButton label={p.cancelLabel} testId={p.cancelTestId} disabled={p.busy} onClick={p.onCancel} />
+      <ConfirmButton testId={p.confirmTestId} disabled={p.busy} onClick={p.onConfirm}>
         {p.confirmLabel}
-      </button>
-    </div>
+      </ConfirmButton>
+    </>
   );
 }

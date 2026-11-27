@@ -41,6 +41,8 @@ pub struct HostApiState {
     /// Publishes seen per provider. Counted, not timestamped: a publish in the same second
     /// as a refresh request must still end it.
     publishes: Mutex<HashMap<String, u64>>,
+    /// Wakes the auto start sweep; a permit is kept when nothing waits, so publishes coalesce.
+    published: tokio::sync::Notify,
 }
 
 /// A worker that never answers stops counting as refreshing after this long.
@@ -74,6 +76,7 @@ impl HostApiState {
             settings_revision: std::sync::atomic::AtomicU64::new(0),
             refreshing: Mutex::new(HashMap::new()),
             publishes: Mutex::new(HashMap::new()),
+            published: tokio::sync::Notify::new(),
         })
     }
 
@@ -100,6 +103,15 @@ impl HostApiState {
     fn record_publish(&self, provider_id: &str) {
         let mut publishes = self.publishes.lock().unwrap_or_else(|p| p.into_inner());
         *publishes.entry(provider_id.to_string()).or_insert(0) += 1;
+        self.published.notify_one();
+    }
+
+    pub(crate) fn notify_published(&self) {
+        self.published.notify_one();
+    }
+
+    pub(crate) async fn wait_published(&self) {
+        self.published.notified().await;
     }
 
     /// Providers asked to refresh, within [`REFRESH_TTL`], that have not published since.

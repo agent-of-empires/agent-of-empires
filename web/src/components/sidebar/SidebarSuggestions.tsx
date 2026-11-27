@@ -1,4 +1,5 @@
 import { useContext } from "react";
+import { useReportFeatureOnce } from "../../hooks/useReportFeatureOnce";
 import { Play } from "lucide-react";
 import { dismissSuggestion } from "../../lib/api";
 import { failureText, lockTitle, shortRef, STALE_REASON, startMenuFor } from "../../lib/suggestionPlan";
@@ -42,6 +43,10 @@ export function SidebarSuggestions({
   const [expanded, toggleExpanded] = usePersistedFlag("aoe-sidebar-suggested-expanded", false);
   const ctrl = useSuggestions(onPrepare, onOpenSession, (s) => !s.prefs.sidebar);
   const { snapshot, offline, notice } = ctrl;
+  useReportFeatureOnce(
+    "suggest_from_sidebar",
+    Boolean(snapshot?.prefs.sidebar && snapshot.items.some((item) => !item.dismissed && !item.started_session)),
+  );
 
   if (!snapshot?.prefs.sidebar) return null;
   // A started suggestion is a Session already listed under its Project.

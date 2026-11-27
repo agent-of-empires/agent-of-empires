@@ -12,7 +12,10 @@ import {
   type McpServerView,
   type McpConflictView,
 } from "../lib/api";
+import { BACKDROP, BUTTON_GHOST, BUTTON_PRIMARY, BUTTON_SECONDARY, CARD, DIALOG } from "../lib/surfaces";
 import { ProvenanceBadge } from "./ProvenanceBadge";
+import { BUTTON_DANGER_GHOST_SM, BUTTON_PRIMARY_SM, BUTTON_SECONDARY_SM, ROWS } from "../lib/surfaces";
+import { Notice, PanelMessage, SectionHeading } from "./panelParts";
 import { McpServerForm } from "./McpServerForm";
 
 /** One-line redacted connection detail: command/args or url, plus secret NAMES. */
@@ -37,19 +40,19 @@ function ServerRow({
   onDelete?: () => void;
 }) {
   return (
-    <div className="py-2 border-b border-surface-700">
+    <div className="py-3">
       <div className="flex items-center gap-2">
-        <span className="font-body text-[13px] font-medium text-text-primary">{s.name}</span>
+        <span className="text-[15px] md:text-sm font-medium text-text-primary">{s.name}</span>
         <span className="font-mono text-[11px] text-text-muted">({s.transport})</span>
         <ProvenanceBadge label={s.provenance} />
         {onEdit && onDelete && (
-          <span className="ml-auto flex gap-2">
+          <span className="ml-auto flex gap-1">
             <button
               type="button"
               disabled={busy}
               onClick={onEdit}
               aria-label={`edit ${s.name}`}
-              className="px-2.5 py-1 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700 disabled:opacity-50"
+              className={BUTTON_SECONDARY_SM}
             >
               Edit
             </button>
@@ -58,16 +61,16 @@ function ServerRow({
               disabled={busy}
               onClick={onDelete}
               aria-label={`delete ${s.name}`}
-              className="px-2.5 py-1 text-[12px] rounded border border-status-error/50 text-status-error hover:bg-status-error/10 disabled:opacity-50"
+              className={BUTTON_DANGER_GHOST_SM}
             >
               Delete
             </button>
           </span>
         )}
       </div>
-      <p className="font-mono text-[11px] text-text-secondary ml-1">{detail(s)}</p>
+      <p className="mt-0.5 break-all font-mono text-[12px] text-text-secondary">{detail(s)}</p>
       {s.shadowed && s.shadowed.length > 0 && (
-        <p className="font-body text-[11px] text-text-muted ml-1">shadows: {s.shadowed.join(", ")}</p>
+        <p className="mt-0.5 text-[12px] text-text-dim">shadows: {s.shadowed.join(", ")}</p>
       )}
     </div>
   );
@@ -89,47 +92,34 @@ function ConflictModal({
       role="dialog"
       aria-modal="true"
       aria-label={`Resolve MCP conflict for ${conflict.name}`}
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
+      className={`fixed inset-0 ${BACKDROP} flex items-center justify-center z-50 animate-fade-in`}
     >
-      <div className="bg-surface-800 border border-surface-700/50 rounded-lg p-5 w-[min(36rem,90vw)]">
-        <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">Conflict: {conflict.name}</h3>
-        <p className="font-body text-[13px] text-text-secondary mb-3">
+      <div className={`${DIALOG} p-5 w-[min(36rem,90vw)]`}>
+        <h3 className="text-[15px] font-semibold text-text-primary mb-2">
+          Conflict: <span className="font-mono">{conflict.name}</span>
+        </h3>
+        <p className="text-[13px] leading-normal text-text-secondary mb-3">
           This server's definition in the agent's native config changed since AoE last saw it. Pick which side wins. AoE
           never writes back to the native config; keeping AoE's version stores it in the global mcp.json.
         </p>
         <div className="space-y-2 mb-4">
           <div>
-            <span className="font-mono text-[11px] text-text-muted">AoE (last seen):</span>
-            <p className="font-mono text-[12px] text-text-primary">{conflict.previous}</p>
+            <span className="text-[12px] text-text-dim">AoE (last seen):</span>
+            <p className="break-all font-mono text-[12px] text-text-primary">{conflict.previous}</p>
           </div>
           <div>
-            <span className="font-mono text-[11px] text-text-muted">native (now):</span>
-            <p className="font-mono text-[12px] text-text-primary">{conflict.current}</p>
+            <span className="text-[12px] text-text-dim">native (now):</span>
+            <p className="break-all font-mono text-[12px] text-text-primary">{conflict.current}</p>
           </div>
         </div>
         <div className="flex justify-end gap-2">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onClose}
-            className="px-3 py-1.5 text-[13px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700 disabled:opacity-50"
-          >
+          <button type="button" disabled={busy} onClick={onClose} className={BUTTON_GHOST}>
             Cancel
           </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => onResolve("native")}
-            className="px-3 py-1.5 text-[13px] rounded border border-surface-700 text-text-primary hover:bg-surface-700 disabled:opacity-50"
-          >
+          <button type="button" disabled={busy} onClick={() => onResolve("native")} className={BUTTON_SECONDARY}>
             Use native
           </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => onResolve("aoe")}
-            className="px-3 py-1.5 text-[13px] rounded bg-brand-600 text-white hover:bg-brand-500 disabled:opacity-50"
-          >
+          <button type="button" disabled={busy} onClick={() => onResolve("aoe")} className={BUTTON_PRIMARY}>
             Keep AoE version
           </button>
         </div>
@@ -227,143 +217,145 @@ export function McpServers({ readOnly = false }: { readOnly?: boolean } = {}) {
     await load();
   };
 
-  if (error) {
+  if (error || data === null) {
     return (
       <div>
-        <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">MCP Servers</h3>
-        <p className="font-body text-[13px] text-status-error">Could not load MCP servers</p>
-      </div>
-    );
-  }
-
-  if (data === null) {
-    return (
-      <div>
-        <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">MCP Servers</h3>
-        <p className="font-mono text-[11px] text-text-muted">Loading...</p>
+        <SectionHeading title="MCP Servers" />
+        <PanelMessage tone={error ? "error" : "dim"} className="px-1">
+          {error ? "Could not load MCP servers" : "Loading..."}
+        </PanelMessage>
       </div>
     );
   }
 
   return (
-    <div data-testid="mcp-panel">
-      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-1">MCP Servers</h3>
-      <p className="font-body text-[12px] text-text-muted mb-4">
-        Effective set forwarded to <span className="font-mono">{agent}</span>, with provenance. Values are redacted;
-        only env and header names are shown.
-      </p>
+    <div data-testid="mcp-panel" className="space-y-6">
+      <div>
+        <SectionHeading
+          title="MCP Servers"
+          description={
+            <>
+              Effective set forwarded to <span className="font-mono">{agent}</span>, with provenance. Values are
+              redacted; only env and header names are shown.
+            </>
+          }
+        />
 
-      {notice && (
-        <p className="font-body text-[12px] text-status-waiting mb-3" role="status">
-          {notice}
-        </p>
-      )}
+        {notice && (
+          <PanelMessage tone="warning" role="status" className="px-1 mb-2">
+            {notice}
+          </PanelMessage>
+        )}
 
-      {data.conflicts.length > 0 && (
-        <div className="mb-5" data-testid="mcp-conflicts">
-          <h4 className="font-mono text-[11px] uppercase tracking-wider text-status-error mb-2">Conflicts</h4>
-          {data.conflicts.map((c) => (
-            <div key={c.name} className="flex items-center justify-between py-2 border-b border-surface-700">
-              <span className="font-body text-[13px] text-text-primary">{c.name}</span>
-              {!readOnly && (
-                <button
-                  type="button"
-                  onClick={() => setActive(c)}
-                  aria-label={`resolve ${c.name}`}
-                  className="px-2.5 py-1 text-[12px] rounded border border-status-error/50 text-status-error hover:bg-status-error/10"
-                >
-                  Resolve
-                </button>
-              )}
+        {data.driftPaused && (
+          <PanelMessage tone="warning" className="px-1 mb-2">
+            Drift detection is paused: the native config for {agent} has a malformed entry.
+          </PanelMessage>
+        )}
+
+        {data.conflicts.length > 0 && (
+          <Notice tone="error" title="Conflicts" testId="mcp-conflicts" className="mb-3">
+            <div className="divide-y divide-status-error/20">
+              {data.conflicts.map((c) => (
+                <div key={c.name} className="flex items-center justify-between gap-3 py-1.5">
+                  <span className="font-mono text-text-primary">{c.name}</span>
+                  {!readOnly && (
+                    <button
+                      type="button"
+                      onClick={() => setActive(c)}
+                      aria-label={`resolve ${c.name}`}
+                      className={BUTTON_SECONDARY_SM}
+                    >
+                      Resolve
+                    </button>
+                  )}
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
-      )}
+          </Notice>
+        )}
 
-      {data.driftPaused && (
-        <p className="font-body text-[12px] text-status-waiting mb-4">
-          Drift detection is paused: the native config for {agent} has a malformed entry.
-        </p>
-      )}
+        {data.effective.length === 0 ? (
+          <div className={`${CARD} py-3`}>
+            <PanelMessage>No servers forwarded.</PanelMessage>
+          </div>
+        ) : (
+          <div className={`${CARD} ${ROWS}`}>
+            {data.effective.map((s) => {
+              const owned = !readOnly && s.provenance === "global";
+              return (
+                <ServerRow
+                  key={s.name}
+                  s={s}
+                  busy={busy}
+                  onEdit={
+                    owned
+                      ? () => {
+                          setFormError(null);
+                          setForm({ server: s });
+                        }
+                      : undefined
+                  }
+                  onDelete={owned ? () => onDelete(s.name) : undefined}
+                />
+              );
+            })}
+          </div>
+        )}
 
-      {data.effective.length === 0 ? (
-        <p className="font-body text-[13px] text-text-muted">No servers forwarded.</p>
-      ) : (
-        <div className="mb-5">
-          {data.effective.map((s) => {
-            const owned = !readOnly && s.provenance === "global";
-            return (
-              <ServerRow
-                key={s.name}
-                s={s}
-                busy={busy}
-                onEdit={
-                  owned
-                    ? () => {
-                        setFormError(null);
-                        setForm({ server: s });
-                      }
-                    : undefined
-                }
-                onDelete={owned ? () => onDelete(s.name) : undefined}
-              />
-            );
-          })}
-        </div>
-      )}
-
-      {!readOnly && (
-        <button
-          type="button"
-          onClick={() => {
-            setFormError(null);
-            setForm({});
-          }}
-          className="mb-5 px-3 py-1.5 text-[13px] rounded bg-brand-600 text-white hover:bg-brand-500"
-        >
-          Add server
-        </button>
-      )}
+        {!readOnly && (
+          <button
+            type="button"
+            onClick={() => {
+              setFormError(null);
+              setForm({});
+            }}
+            className={`mt-3 ${BUTTON_PRIMARY}`}
+          >
+            Add server
+          </button>
+        )}
+      </div>
 
       {data.keptOnRemoval.length > 0 && (
         <div data-testid="mcp-kept">
-          <h4 className="font-mono text-[11px] uppercase tracking-wider text-status-waiting mb-2">
-            Kept after removal from the native config
-          </h4>
-          <p className="font-body text-[12px] text-text-muted mb-2">
-            These are no longer in the native config and are not forwarded. Keep promotes them to the global mcp.json;
-            drop discards them.
-          </p>
-          {data.keptOnRemoval.map((s) => (
-            <div key={s.name} className="flex items-center justify-between py-2 border-b border-surface-700">
-              <div>
-                <span className="font-body text-[13px] text-text-primary">{s.name}</span>
-                <p className="font-mono text-[11px] text-text-secondary">{detail(s)}</p>
-              </div>
-              {!readOnly && (
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => onKeep(s.name)}
-                    aria-label={`keep ${s.name}`}
-                    className="px-2.5 py-1 text-[12px] rounded bg-brand-600 text-white hover:bg-brand-500 disabled:opacity-50"
-                  >
-                    Keep
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => onDrop(s.name)}
-                    aria-label={`drop ${s.name}`}
-                    className="px-2.5 py-1 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700 disabled:opacity-50"
-                  >
-                    Drop
-                  </button>
+          <SectionHeading
+            as="h4"
+            title="Kept after removal from the native config"
+            description="These are no longer in the native config and are not forwarded. Keep promotes them to the global mcp.json; drop discards them."
+          />
+          <div className={`${CARD} ${ROWS}`}>
+            {data.keptOnRemoval.map((s) => (
+              <div key={s.name} className="flex items-center justify-between gap-3 py-3">
+                <div className="min-w-0">
+                  <span className="text-[15px] md:text-sm text-text-primary">{s.name}</span>
+                  <p className="mt-0.5 break-all font-mono text-[12px] text-text-secondary">{detail(s)}</p>
                 </div>
-              )}
-            </div>
-          ))}
+                {!readOnly && (
+                  <div className="flex shrink-0 gap-1">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => onKeep(s.name)}
+                      aria-label={`keep ${s.name}`}
+                      className={BUTTON_PRIMARY_SM}
+                    >
+                      Keep
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => onDrop(s.name)}
+                      aria-label={`drop ${s.name}`}
+                      className={BUTTON_SECONDARY_SM}
+                    >
+                      Drop
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       )}
 

@@ -1,5 +1,5 @@
 import { useCallback, useRef } from "react";
-import { CancelButton, ConfirmButton, DANGER_BUTTON, Dialog } from "./Dialog";
+import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
 import { useConfirmKeys, useDialogFocus } from "./dialogHooks";
 
 export function EmptyTrashConfirm({
@@ -31,12 +31,7 @@ export function EmptyTrashConfirm({
       footer={
         <>
           <CancelButton onClick={onCancel} />
-          <ConfirmButton
-            buttonRef={confirmButtonRef}
-            onClick={confirm}
-            testId="empty-trash-confirm"
-            className={DANGER_BUTTON}
-          >
+          <ConfirmButton buttonRef={confirmButtonRef} onClick={confirm} testId="empty-trash-confirm" tone="danger">
             Empty Trash
           </ConfirmButton>
         </>

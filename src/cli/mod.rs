@@ -33,6 +33,7 @@ pub mod settings;
 pub mod skill;
 pub mod sounds;
 pub mod status;
+pub mod suggest;
 pub mod telemetry;
 pub mod theme;
 pub mod tmux;

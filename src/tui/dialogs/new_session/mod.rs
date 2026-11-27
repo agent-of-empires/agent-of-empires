@@ -745,6 +745,12 @@ impl NewSessionDialog {
         self.yolo_mode = yolo || self.yolo_mode;
     }
 
+    /// Prefill the extra repos of a worktree Session; they are sent only while worktree mode is on.
+    pub fn set_extra_repos(&mut self, paths: Vec<String>) {
+        self.workspace_repos_expanded = !paths.is_empty();
+        self.workspace_repos = paths;
+    }
+
     /// Set the first turn a plugin proposed, edited with Ctrl+O.
     pub fn set_suggestion(&mut self, prompt: String, origin: PromptOrigin) {
         self.prompt = Input::new(prompt);

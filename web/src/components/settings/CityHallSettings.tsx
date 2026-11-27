@@ -1,6 +1,9 @@
 import { useState } from "react";
 
 import { fetchCityHallBundle } from "../../lib/api";
+import { BUTTON_GHOST, BUTTON_PRIMARY, CARD } from "../../lib/surfaces";
+import { CODE_BLOCK } from "../../lib/surfaces";
+import { PanelMessage, SectionHeading } from "../panelParts";
 
 /// Exports the CityHall config bundle. Export only: workspaces apply bundles at boot.
 export function CityHallSettings() {
@@ -44,57 +47,42 @@ export function CityHallSettings() {
   }
 
   return (
-    <div className="space-y-4">
-      <div>
-        <div className="text-[13px] text-text-secondary">CityHall config bundle</div>
-        <p className="mt-1 text-[11px] text-text-muted">
-          One file describing how CityHall should set up every workspace: the settings on this install that differ from
-          the defaults, plus your registered Projects, addressed by git remote so a workspace can clone them.
-          Host-specific paths are left out, and no credentials are included. Paste it into CityHall's workspace
-          configuration.
-        </p>
+    <div>
+      <SectionHeading
+        title="CityHall config bundle"
+        description="One file describing how CityHall should set up every workspace: the settings on this install that differ from the defaults, plus your registered Projects, addressed by git remote so a workspace can clone them. Host-specific paths are left out, and no credentials are included. Paste it into CityHall's workspace configuration."
+      />
+
+      <div className={`${CARD} py-4 space-y-3`}>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className={BUTTON_PRIMARY}
+            disabled={busy}
+            onClick={() => void generate()}
+            data-testid="cityhall-export"
+          >
+            {busy ? "Generating…" : bundle ? "Regenerate" : "Generate bundle"}
+          </button>
+          {bundle && (
+            <>
+              <button type="button" className={BUTTON_GHOST} onClick={download}>
+                Download cityhall.toml
+              </button>
+              <button type="button" className={BUTTON_GHOST} onClick={() => void copy()}>
+                {copied ? "Copied" : "Copy"}
+              </button>
+            </>
+          )}
+          <span className="text-[12px] text-text-dim">
+            or in a terminal: <code>aoe cityhall export --out cityhall.toml</code>
+          </span>
+        </div>
+
+        {error && <PanelMessage tone="error">{error}</PanelMessage>}
+
+        {bundle && <pre className={`${CODE_BLOCK} max-h-96`}>{bundle}</pre>}
       </div>
-
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          className="h-8 cursor-pointer rounded-md bg-brand-600 px-3 text-xs font-medium text-white transition-colors duration-150 hover:bg-brand-500 disabled:opacity-50"
-          disabled={busy}
-          onClick={() => void generate()}
-          data-testid="cityhall-export"
-        >
-          {busy ? "Generating…" : bundle ? "Regenerate" : "Generate bundle"}
-        </button>
-        {bundle && (
-          <>
-            <button
-              type="button"
-              className="h-8 cursor-pointer rounded-md px-3 text-xs text-text-secondary transition-colors duration-150 hover:bg-surface-800 hover:text-text-primary"
-              onClick={download}
-            >
-              Download cityhall.toml
-            </button>
-            <button
-              type="button"
-              className="h-8 cursor-pointer rounded-md px-3 text-xs text-text-secondary transition-colors duration-150 hover:bg-surface-800 hover:text-text-primary"
-              onClick={() => void copy()}
-            >
-              {copied ? "Copied" : "Copy"}
-            </button>
-          </>
-        )}
-        <span className="text-[11px] text-text-dim">
-          or in a terminal: <code>aoe cityhall export --out cityhall.toml</code>
-        </span>
-      </div>
-
-      {error && <p className="text-[11px] text-status-error">{error}</p>}
-
-      {bundle && (
-        <pre className="max-h-96 overflow-auto rounded border border-surface-700 bg-surface-900 p-3 text-[11px] leading-relaxed text-text-secondary">
-          {bundle}
-        </pre>
-      )}
     </div>
   );
 }

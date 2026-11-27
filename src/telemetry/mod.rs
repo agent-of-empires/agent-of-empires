@@ -10,6 +10,7 @@ pub mod form_factor;
 pub mod plugins;
 pub mod sanitize;
 mod state;
+pub mod suggestions;
 pub mod usage_signals;
 
 use std::collections::BTreeMap;
@@ -339,6 +340,7 @@ fn assemble_usage_snapshot(
         features,
         prefs: features::active_prefs(config),
         feature_uses: BTreeMap::new(),
+        suggestion_kind_uses: BTreeMap::new(),
         usage_seen,
         web_clients_seen: BTreeMap::new(),
         structured_clients_seen: BTreeMap::new(),
@@ -598,6 +600,7 @@ mod tests {
             features: BTreeMap::new(),
             prefs: BTreeMap::new(),
             feature_uses: BTreeMap::new(),
+            suggestion_kind_uses: BTreeMap::new(),
             usage_seen: usage_signals::zeroed(),
             web_clients_seen: BTreeMap::new(),
             structured_clients_seen: BTreeMap::new(),
@@ -721,7 +724,10 @@ mod tests {
         );
 
         // Deltas are zeroed after a confirmed send, so an equal count later is new usage.
-        let deltas: [(&str, fn(&mut UsageSnapshot)); 8] = [
+        let deltas: [(&str, fn(&mut UsageSnapshot)); 9] = [
+            ("suggestion_kind_uses", |s| {
+                s.suggestion_kind_uses.insert("a/b".into(), 1);
+            }),
             ("feature_uses", |s| {
                 s.feature_uses.insert("command_palette".into(), 1);
             }),

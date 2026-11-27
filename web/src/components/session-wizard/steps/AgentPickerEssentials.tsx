@@ -2,6 +2,7 @@ import type { AgentInfo } from "../../../lib/types";
 import { effectiveLifecycle, type AgentLifecycleInfo } from "../../../lib/agentProfiles";
 import type { WizardData } from "../wizardReducer";
 import { hasFinePointer } from "../../../lib/platform";
+import { CHOICE, CHOICE_SELECTED } from "../../../lib/surfaces";
 
 interface Props {
   data: WizardData;
@@ -31,7 +32,7 @@ export function AgentPickerEssentials({ data, onChange, agents }: Props) {
     <div>
       {/* No agents installed */}
       {selectableAgents.length === 0 && agents.length > 0 && (
-        <div className="mb-5 p-4 rounded-lg border border-status-warning/30 bg-status-warning/5">
+        <div className="mb-5 p-4 rounded-xl border border-status-warning/30 bg-status-warning/5">
           <p className="text-sm font-semibold text-status-warning mb-2">No agents installed</p>
           <p className="text-sm text-text-muted mb-3">Install at least one AI coding agent to create a session.</p>
           <div className="space-y-1.5">
@@ -55,14 +56,10 @@ export function AgentPickerEssentials({ data, onChange, agents }: Props) {
             key={agent.name}
             autoFocus={data.tool === agent.name && hasFinePointer()}
             onClick={() => onChange("tool", agent.name)}
-            className={`min-h-[44px] text-left p-3 rounded-lg border transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
-              data.tool === agent.name
-                ? "border-brand-600 bg-surface-900"
-                : "border-surface-700 bg-surface-950 hover:border-surface-600"
-            }`}
+            className={`${data.tool === agent.name ? CHOICE_SELECTED : CHOICE} cursor-pointer`}
           >
             <div className="flex flex-wrap items-center gap-2">
-              <span className="text-sm font-semibold text-text-primary">{agent.name}</span>
+              <span className="text-[15px] md:text-sm font-semibold text-text-primary">{agent.name}</span>
               {agent.kind === "custom" && (
                 <span className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-surface-700 text-text-dim">
                   Custom

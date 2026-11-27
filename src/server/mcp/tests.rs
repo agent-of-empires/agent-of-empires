@@ -386,6 +386,7 @@ async fn tools_list_advertises_each_tool_with_an_output_schema() {
             "list_sessions",
             "read_output",
             "send",
+            "suggest_session",
             "wait_for",
             "whoami"
         ]

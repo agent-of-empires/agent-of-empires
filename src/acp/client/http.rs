@@ -567,6 +567,18 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/suggestions/push`: adds or replaces one built-in agent
+    /// suggestion. Returns its id.
+    pub async fn push_suggestion(&self, body: &serde_json::Value) -> Result<String, HttpError> {
+        let url = format!("{}/api/suggestions/push", self.endpoint.base_url);
+        let res = self
+            .execute_elevated(|| self.http.post(&url).json(body))
+            .await?;
+        let res = check_global_status(res)?;
+        let reply: serde_json::Value = crate::daemon::decode_json(res).await?;
+        Ok(reply["id"].as_str().unwrap_or_default().to_string())
+    }
+
     /// A config mutation on a daemon-wide endpoint, retried after a passphrase
     /// step-up. Returns the JSON body, `Null` when empty.
     pub async fn mutate(

@@ -39,11 +39,7 @@ impl HomeView {
     pub(super) fn ensure_suggestions_view(&mut self) {
         if self.suggestions_view.is_none() {
             let mut view = SuggestionsView::new(&self.suggestions_feed);
-            // The local config stands in until a load reads the daemon's setting.
-            view.pretrusted = self.suggestions_feed.daemon_pre_trust().unwrap_or_else(|| {
-                crate::session::config::Config::load()
-                    .is_ok_and(|c| c.session.pre_trust_agent_folders)
-            });
+            view.pretrusted = self.suggestions_feed.daemon_pre_trust().unwrap_or(false);
             self.suggestions_view = Some(view);
         }
         if let Some(view) = &mut self.suggestions_view {
@@ -75,6 +71,11 @@ impl HomeView {
         self.system_health_open = false;
         // A Trash transcript reader would otherwise take the keys first.
         self.retained_focus = None;
+        if !self.suggestions_focused {
+            crate::tui::telemetry::report_feature_use(
+                crate::telemetry::feature_use::FeatureUse::SuggestFromTui,
+            );
+        }
         self.suggestions_focused = true;
     }
 
