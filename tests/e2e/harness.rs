@@ -584,7 +584,8 @@ last_seen_version = "{}"
     }
 
     /// Hide host-installed agent CLIs: the system PATH shrinks to symlinks for
-    /// the tools aoe needs, so tool auto-selection only sees the fake agent.
+    /// the tools aoe needs, and `$SHELL` probes run without a login profile, so
+    /// tool auto-selection only sees the fake agent.
     /// Returns false, leaving the PATH untouched, when a needed tool is missing.
     pub fn isolate_host_path(&mut self) -> bool {
         let system_path = std::env::var_os("PATH").unwrap_or_default();
@@ -603,6 +604,12 @@ last_seen_version = "{}"
         for (tool, real) in tools {
             std::os::unix::fs::symlink(real, bin.join(tool)).expect("symlink system tool");
         }
+        let shell = self.home_path().join("isolated-shell");
+        write_executable(
+            &shell,
+            "#!/bin/sh\n[ \"${1-}\" = -lc ] && { shift; exec /bin/sh -c \"$@\"; }\nexec /bin/sh \"$@\"\n",
+        );
+        self.set_env("SHELL", shell.to_str().expect("UTF-8 isolated shell path"));
         self.isolate_host_path = true;
         true
     }
