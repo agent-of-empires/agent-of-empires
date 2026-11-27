@@ -1349,7 +1349,7 @@ impl PluginManifest {
                 format!("agent_integrations[{i}].session_id requires api_version >= 22"),
             );
             check(
-                self.api_version >= 26
+                self.api_version >= 27
                     || integration
                         .launch
                         .as_ref()
@@ -1359,7 +1359,7 @@ impl PluginManifest {
                                 != crate::agent_integration::AgentCaptureBackend::ExtensionSidecar
                         }),
                 format!(
-                    "agent_integrations[{i}].launch.capture.backend = \"extension_sidecar\" requires api_version >= 26"
+                    "agent_integrations[{i}].launch.capture.backend = \"extension_sidecar\" requires api_version >= 27"
                 ),
             );
             if let Some(delay) = integration
@@ -1759,7 +1759,7 @@ mod tests {
     const HEAD: &str = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = ";
 
     #[test]
-    fn extension_sidecar_capture_requires_api_26() {
+    fn extension_sidecar_capture_requires_api_27() {
         let manifest = |api_version: u32| {
             format!(
                 "id = \"acme.sidecar\"\nname = \"Sidecar\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\
@@ -1768,11 +1768,15 @@ mod tests {
                  [agent_integrations.launch.capture]\nbackend = \"extension_sidecar\"\nhost = \"pane_scoped\"\nsandbox = \"pane_scoped\"\n"
             )
         };
-        let error = PluginManifest::from_toml_str(&manifest(25))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("requires api_version >= 26"), "{error}");
-        assert!(PluginManifest::from_toml_str(&manifest(26)).is_ok());
+        // 26 is the merged base's own version and cannot read this backend, so
+        // the gate moves past it instead of sharing it.
+        for version in [25, 26] {
+            let error = PluginManifest::from_toml_str(&manifest(version))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("requires api_version >= 27"), "{error}");
+        }
+        assert!(PluginManifest::from_toml_str(&manifest(27)).is_ok());
     }
 
     fn object_list_toml(api_version: u32) -> String {

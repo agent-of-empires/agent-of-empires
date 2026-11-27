@@ -3000,6 +3000,7 @@ fn resume_contract(
     execution: &ExecutionBinding,
     own_tool: &str,
     declared: Option<crate::plugin::agent_integration::DeclaredAgent>,
+    hook_sidecar_launch: bool,
 ) -> (bool, Option<crate::agents::SessionCaptureBackend>) {
     let contract = |agent: &AgentDef<'_>| {
         (
@@ -3010,15 +3011,19 @@ fn resume_contract(
                 .map(|capture| capture.backend),
         )
     };
+    let builtin = crate::agents::native_definition(&execution.agent);
     // A declaration that speaks for this pane's tool is what launched it, so it
     // names the backend even where a retained built-in identity still answers: a
-    // declared sidecar has no store for the built-in reader to consult.
+    // declared sidecar has no store for the built-in reader to consult. Where the
+    // tool also has a built-in capture, only a launch that published through the
+    // hook sidecar answers to the declaration; an execution that launched under
+    // the built-in backend keeps that backend when a declaration appears later.
     if execution.agent == own_tool {
-        if let Some(declared) = declared {
+        if let Some(declared) = declared.filter(|_| builtin.is_none() || hook_sidecar_launch) {
             return declared.with_definition(contract).unwrap_or((false, None));
         }
     }
-    crate::agents::native_definition(&execution.agent).map_or((false, None), contract)
+    builtin.map_or((false, None), contract)
 }
 
 pub(super) fn validate_managed_arguments(
@@ -3450,7 +3455,17 @@ impl Instance {
         &self,
         execution: &ExecutionBinding,
     ) -> (bool, Option<crate::agents::SessionCaptureBackend>) {
-        resume_contract(execution, &self.tool, self.declared_agent())
+        let hook_sidecar_launch = self
+            .active_execution
+            .as_ref()
+            .filter(|active| active.binding == *execution)
+            .is_some_and(|active| matches!(active.capture, Some(CaptureContext::Hooks(_))));
+        resume_contract(
+            execution,
+            &self.tool,
+            self.declared_agent(),
+            hook_sidecar_launch,
+        )
     }
 
     pub(crate) fn asserted_resume_binding(
@@ -4256,7 +4271,7 @@ mod tests {
 id = "acme.sidecar"
 name = "Sidecar"
 version = "1.0.0"
-api_version = 26
+api_version = 27
 [[agent_integrations]]
 tool = "{tool}"
 command = "{tool}"
@@ -4341,31 +4356,52 @@ sandbox = "unsupported"
         let omp = Some(crate::agents::SessionCaptureBackend::Omp);
         let declared = declared_omp_fixture();
         assert_eq!(
-            resume_contract(&binding("example-helper"), "example-helper", Some(declared)),
+            resume_contract(
+                &binding("example-helper"),
+                "example-helper",
+                Some(declared),
+                false
+            ),
             (true, omp)
         );
         // The bundled identity answers even while a declaration hides it from
         // listings, so recovery does not depend on which plugin provides OMP.
-        assert_eq!(resume_contract(&binding("omp"), "omp", None), (true, omp));
-        // A declared sidecar on that same tool answers with its own backend: it
-        // has no store for the retained built-in reader to consult.
+        assert_eq!(
+            resume_contract(&binding("omp"), "omp", None, false),
+            (true, omp)
+        );
+        // A launch that published through the hook sidecar answers with the
+        // declaration's backend: it has no store for the built-in reader.
         assert_eq!(
             resume_contract(
                 &binding("omp"),
                 "omp",
-                Some(declared_sidecar_fixture("omp"))
+                Some(declared_sidecar_fixture("omp")),
+                true
             ),
             (
                 true,
                 Some(crate::agents::SessionCaptureBackend::ExtensionSidecar)
             )
         );
+        // The same declaration appearing after a built-in OMP launch does not
+        // reclassify the retained execution.
+        assert_eq!(
+            resume_contract(
+                &binding("omp"),
+                "omp",
+                Some(declared_sidecar_fixture("omp")),
+                false
+            ),
+            (true, omp)
+        );
         // Another tool's binding never inherits this pane's declaration.
         assert_eq!(
             resume_contract(
                 &binding("other-helper"),
                 "example-helper",
-                Some(declared_omp_fixture())
+                Some(declared_omp_fixture()),
+                false
             ),
             (false, None)
         );
@@ -4373,7 +4409,8 @@ sandbox = "unsupported"
             resume_contract(
                 &binding("claude"),
                 "example-helper",
-                Some(declared_omp_fixture())
+                Some(declared_omp_fixture()),
+                false
             ),
             (true, Some(crate::agents::SessionCaptureBackend::Claude))
         );
@@ -4419,17 +4456,17 @@ sandbox = "unsupported"
             .unwrap();
     }
 
-    /// Installs a sidecar-backed declaration for `example-helper`, a tool the
-    /// host has no built-in namespace for.
-    fn install_declared_sidecar_plugin() {
-        let manifest = r#"
+    /// Installs a sidecar-backed declaration for `tool`.
+    fn install_declared_sidecar_plugin(tool: &str) {
+        let manifest = &format!(
+            r#"
 id = "acme.sidecar"
 name = "Sidecar"
 version = "1.0.0"
-api_version = 26
+api_version = 27
 [[agent_integrations]]
-tool = "example-helper"
-command = "example-helper"
+tool = "{tool}"
+command = "{tool}"
 [agent_integrations.launch.resume]
 kind = "flag"
 flag = "--continue"
@@ -4437,7 +4474,8 @@ flag = "--continue"
 backend = "extension_sidecar"
 host = "pane_scoped"
 sandbox = "pane_scoped"
-"#;
+"#
+        );
         let dir = crate::plugin::plugins_dir().unwrap().join("acme.sidecar");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
@@ -4478,7 +4516,7 @@ sandbox = "pane_scoped"
             "example-helper",
             "#!/bin/sh\nexit 0\n",
         );
-        install_declared_sidecar_plugin();
+        install_declared_sidecar_plugin("example-helper");
 
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -4506,6 +4544,68 @@ sandbox = "pane_scoped"
             .asserted_resume_binding("2f6a1f9c-0d7a-4d0e-9b58-2c4b3f1e5a11", None)
             .expect("a declared sidecar binds an id without a store");
         assert_eq!(bound.session_id, "2f6a1f9c-0d7a-4d0e-9b58-2c4b3f1e5a11");
+    }
+
+    /// A declaration owns the executions it launched even where the tool name
+    /// also carries a built-in capture, and leaves the built-in ones alone.
+    #[test]
+    #[serial_test::serial]
+    fn an_omp_sidecar_launch_captures_through_its_declaration() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp",
+            "#!/bin/sh\nexit 0\n",
+        );
+        install_declared_sidecar_plugin("omp");
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = Instance::new("omp-sidecar", project.to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp".into();
+        let binding = ExecutionBinding {
+            agent: "omp".into(),
+            stores: Vec::new(),
+            configuration: Vec::new(),
+            cwd: project.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        };
+        instance.active_execution = Some(ActiveExecution {
+            launch_id: "launch-a".into(),
+            binding,
+            capture: Some(CaptureContext::Hooks(project.join("session_id.launch-a"))),
+            container: None,
+        });
+        assert_eq!(
+            instance
+                .source_session_support()
+                .map(|(capture, context)| (capture.backend, context)),
+            Some((
+                crate::agents::SessionCaptureBackend::ExtensionSidecar,
+                crate::agents::SessionCaptureContext::PaneScoped
+            ))
+        );
+        assert!(instance.capture_reads_hook_sidecar());
+        // The same tool launched under the built-in backend keeps its reader.
+        instance.active_execution.as_mut().unwrap().capture = None;
+        assert_eq!(
+            instance
+                .source_session_support()
+                .map(|(capture, _)| capture.backend),
+            Some(crate::agents::SessionCaptureBackend::Omp)
+        );
     }
 
     /// Installs an OMP-backed declaration for `example-helper` in the isolated

@@ -8133,7 +8133,7 @@ codex-work = "{}"
 id = "acme.sidecar"
 name = "Sidecar"
 version = "1.0.0"
-api_version = 26
+api_version = 27
 
 [[agent_integrations]]
 tool = "sidecario"
