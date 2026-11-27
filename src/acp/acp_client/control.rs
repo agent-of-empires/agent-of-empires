@@ -62,7 +62,25 @@ pub(crate) struct ControlLoss {
     pub(crate) io_error: Option<std::io::ErrorKind>,
     pub(crate) turn_in_flight: bool,
     /// A proxied agent was behind the channel, so its loss is the proxy's.
+    /// Set from the validated hello when read through [`ControlLossHandle`],
+    /// never at EOF, which can beat the hello's handoff.
     pub(crate) proxied: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct ControlLossHandle {
+    loss: Arc<std::sync::OnceLock<ControlLoss>>,
+    proxied: Arc<AtomicBool>,
+}
+
+impl ControlLossHandle {
+    pub(super) fn get(&self) -> Option<ControlLoss> {
+        let loss = self.loss.get()?;
+        Some(ControlLoss {
+            proxied: self.proxied.load(AtomicOrdering::Acquire),
+            ..*loss
+        })
+    }
 }
 
 enum CompletionDelivery {
@@ -157,15 +175,18 @@ impl DaemonControlClient {
     }
 
     pub(super) fn mark_proxied(&self) {
-        self.proxied.store(true, AtomicOrdering::Relaxed);
+        self.proxied.store(true, AtomicOrdering::Release);
     }
 
     pub(super) fn lost(&self) -> bool {
         self.loss.get().is_some()
     }
 
-    pub(super) fn loss_handle(&self) -> Arc<std::sync::OnceLock<ControlLoss>> {
-        Arc::clone(&self.loss)
+    pub(super) fn loss_handle(&self) -> ControlLossHandle {
+        ControlLossHandle {
+            loss: Arc::clone(&self.loss),
+            proxied: Arc::clone(&self.proxied),
+        }
     }
 
     async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
@@ -439,7 +460,6 @@ pub(super) async fn connect_runner_control_v3(
     let loss = Arc::new(std::sync::OnceLock::new());
     let (reader_closed_locally, reader_loss) = (closed_locally.clone(), loss.clone());
     let proxied = Arc::new(AtomicBool::new(false));
-    let reader_proxied = proxied.clone();
     let disconnected = tokio_util::sync::CancellationToken::new();
     let reader_disconnected = disconnected.clone();
     tokio::spawn(async move {
@@ -451,7 +471,7 @@ pub(super) async fn connect_runner_control_v3(
             let loss = ControlLoss {
                 io_error,
                 turn_in_flight: reader_prompt_in_flight.load(AtomicOrdering::Relaxed),
-                proxied: reader_proxied.load(AtomicOrdering::Relaxed),
+                proxied: false,
             };
             warn!(
                 target: "acp.protocol",
@@ -1492,6 +1512,39 @@ mod tests {
             .await
             .expect("crate transport must observe control EOF");
         assert_eq!(read.unwrap(), 0);
+    }
+
+    /// EOF can be read before `establish` marks the validated proxy hello. The
+    /// loss still reports the proxy, so the order is forced here: the reader
+    /// records the loss first, the mark lands after.
+    #[tokio::test]
+    async fn control_loss_reports_a_proxy_hello_validated_after_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (control, listener) = bind(&tmp);
+        let fake = tokio::spawn(async move {
+            let mut peer = accept_hello(
+                &listener,
+                "late",
+                control_protocol::CONTROL_PROTOCOL_VERSION,
+            )
+            .await;
+            assert!(matches!(
+                control_protocol::read_frame(&mut peer).await.unwrap(),
+                Some(ControlBody::Attach { .. })
+            ));
+        });
+        let (client, _crate_side) =
+            connect(&control, "late", Arc::new(TerminalClaim::new()), false)
+                .await
+                .unwrap();
+        fake.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.disconnected.cancelled())
+            .await
+            .expect("reader must observe control EOF");
+        let handle = client.loss_handle();
+        assert!(!handle.get().expect("loss recorded").proxied);
+        client.mark_proxied();
+        assert!(handle.get().expect("loss recorded").proxied);
     }
 
     #[tokio::test]

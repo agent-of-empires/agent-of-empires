@@ -131,7 +131,7 @@ pub struct AcpClient {
     connection_shutdown: tokio_util::sync::CancellationToken,
     connection_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     _prime_runtime: Option<crate::process::prime::PrimeCleanupGuard>,
-    control_loss: Option<Arc<std::sync::OnceLock<control::ControlLoss>>>,
+    control_loss: Option<control::ControlLossHandle>,
     reattach: Option<Box<ReattachSpec>>,
 }
 
@@ -839,7 +839,7 @@ impl AcpClient {
 
     /// Set once the runner side ended this client's control channel.
     pub(crate) fn control_loss(&self) -> Option<control::ControlLoss> {
-        self.control_loss.as_ref()?.get().copied()
+        self.control_loss.as_ref()?.get()
     }
 
     #[cfg(test)]
