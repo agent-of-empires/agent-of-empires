@@ -66,11 +66,13 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
             }
         };
 
-        // A session/new result with a new id starts a fresh key space, as the
-        // runtime's reset commit does.
+        // A session/new result with a new id starts a fresh key space and
+        // drops open leases and runs, as the runtime's reset commit does.
         if let Some(id) = frame.pointer("/result/sessionId").and_then(|v| v.as_str()) {
             if session.as_deref().is_some_and(|current| current != id) {
                 keys.clear();
+                leases.clear();
+                runs.clear();
                 order.session_reset();
             }
             session = Some(id.to_string());
@@ -568,6 +570,51 @@ mod tests {
                 ],
                 false,
                 vec!["blank_id", "bad_lifecycle_ttl", "bad_progress", "bad_wakeup_at", "ephemeral_lifecycle"],
+            ),
+            (
+                "a run started in one session is not open in the next",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"a","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session("s2", update(r#"{"v":2,"key":"b","workflow_run":{"id":"w","state":"ended"}}"#)),
+                ],
+                false,
+                vec!["lifecycle_unknown"],
+            ),
+            (
+                "a lease held in one session is not held in the next",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session("s2", update(r#"{"v":2,"key":"b","lease":{"id":"l","kind":"busy","op":"renew","ttl_ms":5}}"#)),
+                ],
+                false,
+                vec!["lease_unknown"],
+            ),
+            (
+                "the same run started in two sessions and ended in the second",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"a","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session("s2", update(r#"{"v":2,"key":"b","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    in_session("s2", update(r#"{"v":2,"key":"c","workflow_run":{"id":"w","state":"ended"}}"#)),
+                ],
+                false,
+                vec![],
+            ),
+            (
+                "start, renew and end in one session",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"a","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    in_session("s1", update(r#"{"v":2,"key":"b","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    in_session("s1", update(r#"{"v":2,"key":"c","workflow_run":{"id":"w","state":"ended"}}"#)),
+                ],
+                false,
+                vec![],
             ),
             (
                 "plan proposal on a tool call",
