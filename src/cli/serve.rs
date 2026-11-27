@@ -248,25 +248,26 @@ impl ServeArgs {
             self.passphrase = resolve_launch_passphrase(self.passphrase.take(), None, || {
                 std::env::var("AOE_SERVE_PASSPHRASE").ok()
             });
-            self.resolve_port()?;
+            self.resolve_port(|| match requested {
+                None => crate::acp::client::autostart::load_or_generate_port(),
+                Some(_) => crate::session::config::DEFAULT_SERVE_PORT,
+            })?;
             self.resolve_funnel_port()?;
         }
         self.cityhall = self.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
         Ok(())
     }
 
-    /// Resolve the port: explicit `--port` wins; otherwise the build default
-    /// (8081 in debug builds, 8080 in release). Fresh launches fill `port` from
-    /// `AOE_SERVE_PORT` and `[serve] port` first, in `resolve_launch`.
+    /// Returns the selected port or the build default (8081 in debug, 8080 in release).
     pub fn resolved_port(&self) -> u16 {
         self.port
             .unwrap_or(crate::session::config::DEFAULT_SERVE_PORT)
     }
 
-    /// Fill a missing TCP port from `AOE_SERVE_PORT`, then `[serve] port`.
-    fn resolve_port(&mut self) -> Result<()> {
+    /// Fills a missing TCP port from `AOE_SERVE_PORT`, `[serve] port`, or the fallback.
+    fn resolve_port(&mut self, fallback: impl FnOnce() -> u16) -> Result<()> {
         self.fill_port(std::env::var_os("AOE_SERVE_PORT"), || {
-            Ok(crate::session::config::ServeConfig::load()?.port)
+            crate::session::config::ServeConfig::load_port(fallback)
         })
     }
 
@@ -2446,7 +2447,7 @@ async fn replay_managed_launch(
         override_args,
         predecessor_passphrase.as_deref(),
         |args| {
-            args.resolve_port()?;
+            args.resolve_port(|| crate::session::config::DEFAULT_SERVE_PORT)?;
             args.resolve_funnel_port()
         },
     )?;
