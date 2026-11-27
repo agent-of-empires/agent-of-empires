@@ -447,7 +447,8 @@ fn pending_frame_flush_then_control_backpressure_retains_ordered_restore() {
     let mut draws = 0;
     loop {
         assert!(Instant::now() < deadline);
-        let result = frame(|_| {
+        let result = frame(|redraw| {
+            assert!(redraw, "screen restoration must invalidate the next frame");
             draws += 1;
             let mut writer = Output::default();
             writer.write_all(b"AFTER-CONTROL-RESTORE")?;
@@ -486,6 +487,23 @@ fn pending_frame_flush_then_control_backpressure_retains_ordered_restore() {
         .position(|bytes| bytes == b"AFTER-CONTROL-RESTORE")
         .unwrap();
     assert!(leave < restore && restore < after);
+
+    let lock = output.0.lock().unwrap();
+    assert!(
+        frame(|_| panic!("frame captured with the output lock held"))
+            .unwrap()
+            .captured
+            .is_none()
+    );
+    drop(lock);
+    assert!(needs_redraw(), "contention must schedule another frame");
+    let retry = frame(|redraw| {
+        assert!(!redraw, "a scheduling retry must not clear the screen");
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(retry.presented, retry.captured);
+    assert!(retry.presented.is_some());
 }
 
 #[cfg(unix)]

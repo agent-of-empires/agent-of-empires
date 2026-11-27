@@ -5,7 +5,7 @@ use std::{
     fs::File,
     io::{self, Write},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         LazyLock, Mutex, TryLockError,
     },
     time::{Duration, Instant},
@@ -15,14 +15,16 @@ use tokio_util::sync::CancellationToken;
 static OUTPUT: LazyLock<io::Result<Mutex<State>>> = LazyLock::new(|| {
     crate::process::independent_terminal_output().map(|file| Mutex::new(State::new(file)))
 });
-static REDRAW: AtomicBool = AtomicBool::new(false);
+const FRAME_REQUESTED: u8 = 1 << 0;
+const SCREEN_INVALID: u8 = 1 << 1;
+static RENDER_REQUESTS: AtomicU8 = AtomicU8::new(0);
 #[cfg(feature = "e2e-tests")]
 static ACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 #[cfg(feature = "e2e-tests")]
 pub(crate) fn acknowledge(sequence: u64) {
     ACK.store(sequence, Ordering::Release);
-    REDRAW.store(true, Ordering::Release);
+    request_frame();
 }
 thread_local! { static FRAME: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) }; }
 
@@ -217,7 +219,7 @@ impl State {
                 Ok(true)
             }
             Err(error) if is_backpressure(&error) => {
-                REDRAW.store(true, Ordering::Release);
+                request_frame();
                 Ok(false)
             }
             Err(error) => Err(error),
@@ -256,7 +258,7 @@ impl State {
                 Ok(true)
             }
             Err(error) if is_backpressure(&error) => {
-                REDRAW.store(true, Ordering::Release);
+                request_frame();
                 Ok(false)
             }
             Err(error) => {
@@ -285,7 +287,6 @@ impl State {
         *offset += writer.written;
         if result.is_ok() {
             self.recovery = None;
-            REDRAW.store(true, Ordering::Release);
         }
         result
     }
@@ -298,7 +299,7 @@ impl State {
         }
         bytes.extend_from_slice(b"\x1b[?2026l\x1b]8;;\x1b\\\x1b[0m");
         self.recovery = Some((bytes, 0));
-        REDRAW.store(true, Ordering::Release);
+        request_redraw();
         let _ = self.recover(
             deadline.min(Instant::now() + Duration::from_millis(10)),
             None,
@@ -307,11 +308,15 @@ impl State {
 }
 
 pub(crate) fn needs_redraw() -> bool {
-    REDRAW.load(Ordering::Acquire)
+    RENDER_REQUESTS.load(Ordering::Acquire) != 0
+}
+
+pub(crate) fn request_frame() {
+    RENDER_REQUESTS.fetch_or(FRAME_REQUESTED, Ordering::Release);
 }
 
 pub(crate) fn request_redraw() {
-    REDRAW.store(true, Ordering::Release);
+    RENDER_REQUESTS.fetch_or(SCREEN_INVALID, Ordering::Release);
 }
 
 pub(crate) struct Suspension {
@@ -430,9 +435,11 @@ impl Drop for Suspension {
                 } else {
                     state.control = Some(PendingControl { bytes, offset: 0 });
                 }
+                request_redraw();
+            } else {
+                request_frame();
             }
             state.suspended = false;
-            REDRAW.store(true, Ordering::Release);
         }
     }
 }
@@ -545,7 +552,7 @@ fn frame_in(
     let mut state = match output.try_lock() {
         Ok(state) => state,
         Err(TryLockError::WouldBlock) => {
-            REDRAW.store(true, Ordering::Release);
+            request_frame();
             return Ok(FrameOutcome::default());
         }
         Err(TryLockError::Poisoned(error)) => {
@@ -567,13 +574,13 @@ fn frame_in(
     if state.pending.is_some() || state.completed.is_some() {
         state.write_pending(Instant::now() + Duration::from_millis(20), None)?;
         let presented = state.completed.take();
-        REDRAW.store(true, Ordering::Release);
+        request_frame();
         return Ok(FrameOutcome {
             captured: None,
             presented,
         });
     }
-    let redraw = REDRAW.swap(false, Ordering::AcqRel);
+    let redraw = RENDER_REQUESTS.swap(0, Ordering::AcqRel) & SCREEN_INVALID != 0;
     FRAME.with(|frame| *frame.borrow_mut() = Some(Vec::new()));
     let result = operation(redraw);
     let bytes = FRAME.with(|frame| frame.borrow_mut().take().expect("frame capture installed"));
@@ -808,7 +815,7 @@ impl TestOutput {
             state.control.as_ref().map(|control| {
                 (control.offset, control.bytes.len(), control.bytes.as_slice())
             }),
-            REDRAW.load(Ordering::Acquire),
+            needs_redraw(),
         )
     }
 
