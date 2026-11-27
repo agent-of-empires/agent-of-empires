@@ -2392,6 +2392,16 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
         return Ok(());
     }
 
+    // A declaration dropped since an earlier launch leaves its record staged, and a
+    // running container may still mount it.
+    if let Ok(stage) = crate::hooks::declared_sandbox_dir(instance_id) {
+        blank_staged_tree(&stage.join("home")).map_err(|e| {
+            e.context(format!(
+                "cannot revoke the staged sandbox trust left by a removed declaration for {tool}; refusing to reuse the container; make the files writable or remove the session's container and relaunch"
+            ))
+        })?;
+    }
+
     let active_agent = resolve_active_agent(tool, command, session_config);
     let config_tool = active_agent.map_or(tool, |agent| agent.name);
     // A session whose agent reads its own config dir (a wrapper exporting
@@ -3127,6 +3137,24 @@ fn blank_staged_file(file: &Path) -> Result<()> {
         _ => crate::hooks::write_in_place(file, b"{}")
             .with_context(|| format!("blanking {}", file.display())),
     }
+}
+
+/// Blanks every file under `dir`, never following a symlink.
+fn blank_staged_tree(dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        entries => entries.with_context(|| format!("reading {}", dir.display()))?,
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let kind = std::fs::symlink_metadata(&path)?.file_type();
+        if kind.is_dir() {
+            blank_staged_tree(&path)?;
+        } else if !kind.is_symlink() {
+            blank_staged_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_managed_container_environment(
@@ -8041,6 +8069,50 @@ sandbox = "SANDBOX"
 
         assert_eq!(fs::read_to_string(&other).unwrap(), "precious");
         assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
+    }
+
+    // Dropping a plugin's trust declaration must revoke the record it staged, in
+    // place, since an earlier container may still mount it.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_dropped_declaration_revokes_its_staged_trust() {
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let plugin = DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "always");
+        let launch = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-dropped",
+                "/workspace/project",
+                false,
+            )
+            .unwrap()
+        };
+        let file = crate::hooks::declared_sandbox_dir("declared-dropped")
+            .unwrap()
+            .join("home/.example.json");
+
+        crate::session::test_support::install_agent_plugin("acme.declared-sandbox", &plugin);
+        launch();
+        let mounted = fs::metadata(&file).unwrap().ino();
+        assert!(fs::read_to_string(&file).unwrap().contains("trusted"));
+
+        let without_trust = plugin
+            .split("[agent_integrations.trust]")
+            .next()
+            .unwrap()
+            .to_string();
+        crate::session::test_support::install_agent_plugin("acme.declared-sandbox", &without_trust);
+        launch();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
+        assert_eq!(fs::metadata(&file).unwrap().ino(), mounted);
     }
 
     #[test]
