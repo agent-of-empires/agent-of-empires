@@ -349,6 +349,10 @@ impl SettingsView {
         push_tab(&mut rows, SettingsCategory::Session);
         push_tab(&mut rows, SettingsCategory::Agents);
         push_tab(&mut rows, SettingsCategory::Interaction);
+        // `[keybinds]` is global-only.
+        if scope == SettingsScope::Global {
+            push_tab(&mut rows, SettingsCategory::Keybinds);
+        }
         push_tab(&mut rows, SettingsCategory::Diff);
         push_tab(&mut rows, SettingsCategory::Acp);
 
@@ -1082,8 +1086,11 @@ impl SettingsView {
 
         let (scope_for_fields, global_ref, profile_ref) = self.field_build_inputs();
 
-        let mut scored: Vec<(SearchHit, u32)> = Vec::new();
+        let tokens: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let mut scored: Vec<(SearchHit, (u32, bool))> = Vec::new();
         for category in self.categories.iter().filter_map(|r| r.as_tab()) {
+            let label = category.label().to_lowercase();
+            let names_tab = tokens.iter().any(|t| label.starts_with(t.as_str()));
             let fields = fields::build_fields_for_category(
                 category,
                 scope_for_fields,
@@ -1094,8 +1101,8 @@ impl SettingsView {
                 if field.is_section_header() {
                     continue;
                 }
-                // The category label is part of the title so "sandbox"
-                // matches (and ranks) every field on the Sandbox tab.
+                // The category label is part of the title so "sandbox" matches every
+                // field on the Sandbox tab; `names_tab` wins them any score tie.
                 let title = format!("{} {}", category.label(), field.label);
                 let full = format!("{} {}", title, field.description);
                 let Some(score) = fuzzy_settings_score(&query, &title, &full) else {
@@ -1109,14 +1116,14 @@ impl SettingsView {
                         category_label: category.label(),
                         value_display: field.display_value(),
                     },
-                    score,
+                    (score, names_tab),
                 ));
             }
         }
 
-        // Stable sort by score descending: ties (and the empty-query case where
-        // every field scores 0) keep their natural (category, field) order.
-        scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+        // Stable sort descending: ties (and the empty query, where every field
+        // scores 0) keep their natural (category, field) order.
+        scored.sort_by_key(|(_, rank)| std::cmp::Reverse(*rank));
         self.search_hits = scored.into_iter().map(|(hit, _)| hit).collect();
         if self.search_selected >= self.search_hits.len() {
             self.search_selected = self.search_hits.len().saturating_sub(1);
@@ -1319,9 +1326,11 @@ mod categories_for_scope_tests {
             "repo-overridable"
         );
         let profile = SettingsView::categories_for_scope(SettingsScope::Profile);
-        assert!(has_tab(&global, SettingsCategory::Systemd));
-        assert!(!has_tab(&profile, SettingsCategory::Systemd), "global-only");
-        assert!(!has_tab(&repo, SettingsCategory::Systemd), "global-only");
+        for cat in [SettingsCategory::Systemd, SettingsCategory::Keybinds] {
+            assert!(has_tab(&global, cat), "{cat:?}");
+            assert!(!has_tab(&profile, cat), "{cat:?} is global-only");
+            assert!(!has_tab(&repo, cat), "{cat:?} is global-only");
+        }
     }
 }
 

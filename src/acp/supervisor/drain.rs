@@ -42,7 +42,10 @@ struct PublicationFlockObservation {
     session_id: String,
     message: &'static str,
     before_lock: Option<(
-        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Sender<(
+            EventScope,
+            Option<crate::acp::state::NativeObservationScope>,
+        )>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
     contended: std::sync::mpsc::Sender<std::path::PathBuf>,
@@ -403,7 +406,7 @@ impl<S: BroadcastSink> Drain<S> {
                 .filter(|observer| observer.matches(&self.session_id, data.event.as_ref()))
                 .and_then(|observer| observer.before_lock.take());
             if let Some((entered, release)) = gate {
-                let _ = entered.send(());
+                let _ = entered.send((data.metadata.scope, self.history_scope.clone()));
                 let _ = release.await;
             }
         }
@@ -2985,55 +2988,54 @@ mod tests {
                         ).unwrap());
                     // Hold the real flocks only when the ordered drain reaches the actual
                     // diagnostic. Earlier SDK publications and completion routing must run freely.
-                    tokio::time::timeout(Duration::from_secs(10), at_diagnostic)
+                    let (diagnostic_scope, history) = tokio::time::timeout(Duration::from_secs(10), at_diagnostic)
                         .await.expect("the real completion reaches the ordered drain")
                         .expect("the ordered drain reaches the runtime diagnostic");
                     let storage = crate::session::Storage::open_reference("test").unwrap();
-                    let mut preceding_lifecycle = if profile_writer {
-                        Some((
-                            storage.sessions_path().parent().unwrap().join(
-                                format!(".instance-lifecycle-{}.lock", client.id)),
-                            storage.acquire_instance_lifecycle_lock(&client.id).unwrap(),
-                        ))
+                    // The anchored path and this profile can spell the same lock
+                    // differently on macOS (for example, /var versus /private/var).
+                    let profile_dir = storage.sessions_path().parent().unwrap().canonicalize().unwrap();
+                    let (native, held_path) = if profile_writer {
+                        assert_eq!(diagnostic_scope, EventScope::HistoryOnly);
+                        let history = history.expect("the retained drain captured a physical Native fence");
+                        assert_eq!(history.context, completion.origin.context);
+                        drop(history.fence.lock_original_history()
+                            .expect("the exact retained fence can read its original row"));
+                        // Isolate the profile writer: holding a second lifecycle lock
+                        // could stall a competing reader before it releases the
+                        // fence's cache mutex and lets the diagnostic reach its wait.
+                        let native = crate::session::acquire_storage_flock(
+                            &profile_dir, crate::session::STORAGE_LOCK_FILENAME,
+                        ).unwrap();
+                        // Force a revision change even on filesystems with coarse
+                        // timestamps. The trailing whitespace leaves the Native row intact.
+                        use std::io::Write as _;
+                        std::fs::OpenOptions::new().append(true)
+                            .open(storage.sessions_path()).unwrap().write_all(b"\n").unwrap();
+                        assert!(history.fence.try_lock_original_history()
+                            .expect("the retained fence still binds the original row")
+                            .is_none(), "the profile writer physically excludes the exact retained fence");
+                        (native, profile_dir.join(crate::session::STORAGE_LOCK_FILENAME))
                     } else {
-                        None
+                        (storage.acquire_instance_lifecycle_lock(&client.id).unwrap(),
+                            profile_dir.join(format!(".instance-lifecycle-{}.lock", client.id)))
                     };
-                    let native = if profile_writer {
-                        crate::session::acquire_storage_flock(storage.sessions_path().parent().unwrap(), crate::session::STORAGE_LOCK_FILENAME).unwrap()
-                    } else {
-                        storage.acquire_instance_lifecycle_lock(&client.id).unwrap()
-                    };
-                    if profile_writer {
-                        // An unchanged cached revision does not read the profile flock.
-                        // Force a real reload without changing the captured Native source.
-                        let file = std::fs::File::open(storage.sessions_path()).unwrap();
-                        let modified = file.metadata().unwrap().modified().unwrap() + Duration::from_secs(1);
-                        file.set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
-                    }
                     assert_eq!(completion.origin.context,
                         crate::acp::state::NativeEventContext::capture(&original_row, &storage).unwrap());
                     resume_diagnostic.send(()).expect("resume actual diagnostic publication");
-                    let held_path = storage.sessions_path().parent().unwrap().join(
-                        if profile_writer { crate::session::STORAGE_LOCK_FILENAME.to_owned() }
-                        else { format!(".instance-lifecycle-{}.lock", client.id) });
+                    // Require the actual diagnostic to hit the physical lock,
+                    // independently of the retained fence preflight above.
                     tokio::task::spawn_blocking(move || {
                         loop {
-                            let reported_path = contended_rx.recv_timeout(Duration::from_secs(10))?;
-                            if preceding_lifecycle.as_ref()
-                                .is_some_and(|(path, _)| path == &reported_path)
-                            {
-                                drop(preceding_lifecycle.take());
-                            }
+                            let reported_path = contended_rx.recv_timeout(Duration::from_secs(10))?
+                                .canonicalize().expect("observed lock file still exists");
                             if reported_path == held_path {
-                                if profile_writer {
-                                    assert!(preceding_lifecycle.is_none(),
-                                        "profile contention follows the actual lifecycle wait");
-                                }
                                 break;
                             }
                         }
                         Ok::<(), std::sync::mpsc::RecvTimeoutError>(())
-                    }).await.unwrap().expect("the captured diagnostic reaches the held flock");
+                    }).await.unwrap().unwrap_or_else(|error|
+                        panic!("the captured diagnostic reaches the held flock (supersede={supersede}, profile_writer={profile_writer}): {error}"));
                     assert!(supervisor.workers.try_lock().is_ok(),
                         "the diagnostic releases worker custody before its physical wait");
                     assert!(supervisor.lifecycle.try_lock().is_ok(),
