@@ -960,7 +960,7 @@ fn wait_with_timeout_inner_with_clock(
                 platform::kill_process_group(child);
             }
             let _ = child.kill();
-            if cleanup.is_some() {
+            if cleanup == Some(ProcessGroupCleanup::OnFailure) {
                 poll_killed_status_child(child);
             } else {
                 let _ = child.wait();
@@ -1031,6 +1031,7 @@ pub fn run_with_timeout_process_group(
 /// Run a command without capturing output; cancellation terminates and reaps
 /// its process group with the same bounded grace as a timeout.
 /// The exit policy controls custody of descendants after successful completion.
+/// Clipboard owner transfers also bound the synchronous wait after SIGKILL.
 pub(crate) fn run_status_with_timeout_process_group(
     cmd: &mut Command,
     timeout: Duration,
@@ -1049,6 +1050,9 @@ pub(crate) fn run_status_with_timeout_process_group(
         Some(cleanup),
         cancel,
     );
+    if cleanup == ProcessGroupCleanup::Always {
+        return result;
+    }
     if result.is_err() {
         platform::kill_process_group(&child);
         let _ = child.kill();
