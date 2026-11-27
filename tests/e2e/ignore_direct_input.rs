@@ -19,8 +19,8 @@ fn typing_in_a_live_agent_terminal_clears_ignore() {
     h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
     h.stop_daemon_on_drop();
     // An agent that stays alive so its pane is capturable and takes keys.
-    let bin = h.install_path_command("claude");
-    std::fs::write(bin.join("claude"), "#!/bin/sh\nsleep 300\n").expect("write sleeping agent");
+    let bin = h.install_path_command("fake-agent");
+    std::fs::write(bin.join("fake-agent"), "#!/bin/sh\nsleep 300\n").expect("write sleeping agent");
     let project = h.project_path();
     let project = project.to_str().expect("utf8 project path").to_string();
     // The CLI drives the daemon, so it starts before any row is written.

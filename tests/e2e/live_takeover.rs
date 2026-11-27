@@ -71,12 +71,12 @@ fn test_web_takeover_exits_tui_live_mode_with_a_footer_line() {
     let mut h = TuiTestHarness::new("live_takeover");
     write_live_send_config(&h);
 
-    // The default `claude` stub exits immediately, which kills the agent
+    // The default `fake-agent` stub exits immediately, which kills the agent
     // pane before live mode can observe anything (the known short-lived-
     // shell flake). Shadow it with a long-running stand-in so the pane
     // survives the whole test.
-    let bin = h.install_path_command("claude");
-    std::fs::write(bin.join("claude"), "#!/bin/sh\nsleep 300\n").expect("write sleeping claude");
+    let bin = h.install_path_command("fake-agent");
+    std::fs::write(bin.join("fake-agent"), "#!/bin/sh\nsleep 300\n").expect("write sleeping agent");
 
     let project = h.project_path();
     let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Takeover"]);
@@ -169,8 +169,8 @@ fn test_web_claim_moves_the_socket_onto_the_tuis_released_pipe() {
 
     let mut h = TuiTestHarness::new("live_takeover_pipe");
     write_live_send_config(&h);
-    let bin = h.install_path_command("claude");
-    std::fs::write(bin.join("claude"), "#!/bin/sh\nsleep 300\n").expect("write sleeping claude");
+    let bin = h.install_path_command("fake-agent");
+    std::fs::write(bin.join("fake-agent"), "#!/bin/sh\nsleep 300\n").expect("write sleeping agent");
 
     let project = h.project_path();
     let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Takeover"]);

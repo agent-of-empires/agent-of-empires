@@ -79,9 +79,9 @@ fn swap_round_trip(split: bool) {
         "live_terminal_swap"
     });
     write_live_send_config(&h);
-    let bin = h.install_path_command("claude");
+    let bin = h.install_path_command("fake-agent");
     std::fs::write(
-        bin.join("claude"),
+        bin.join("fake-agent"),
         "#!/bin/sh\nstty -echo -icanon min 1 time 0 2>/dev/null\nexec cat -v\n",
     )
     .expect("write cat stub");

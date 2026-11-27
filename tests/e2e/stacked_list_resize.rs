@@ -19,9 +19,9 @@ fn test_stacked_list_resize_persists_and_restores_after_window_resize() {
     require_tmux!();
     let mut h = TuiTestHarness::new("stacked_list_resize");
     h.append_config("[session]\ndefault_attach_mode = \"live_send\"");
-    let bin = h.install_path_command("claude");
+    let bin = h.install_path_command("fake-agent");
     std::fs::write(
-        bin.join("claude"),
+        bin.join("fake-agent"),
         "#!/bin/sh\nstty -echo -icanon min 1 time 0\nprintf '\\033[?1049h\\033[?1002h\\033[?1006hDEMO READY\\r\\n'\nexec cat > \"$HOME/agent-input\"\n",
     )
     .unwrap();
