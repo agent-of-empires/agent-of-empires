@@ -54,6 +54,7 @@ function toJoyrideStep(step: TourStep, installLine: string | undefined): Step {
       />
     ),
     placement: "auto",
+    skipScroll: step.skipScroll,
   };
 }
 

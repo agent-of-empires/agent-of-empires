@@ -37,4 +37,17 @@ describe("MenuPopover", () => {
     rerender(<Menu items={["a", "b"]} tick={1} />);
     expect(document.activeElement).toBe(document.body);
   });
+
+  it("does not pull focus back when the user moved on before the items arrived", () => {
+    const other = document.body.appendChild(document.createElement("button"));
+    try {
+      const { rerender } = render(<Menu items={[]} tick={0} />);
+      fireEvent.click(screen.getByRole("button", { name: "Open" }));
+      other.focus();
+      rerender(<Menu items={["a"]} tick={0} />);
+      expect(document.activeElement).toBe(other);
+    } finally {
+      other.remove();
+    }
+  });
 });

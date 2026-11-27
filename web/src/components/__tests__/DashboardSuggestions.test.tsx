@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { DashboardSuggestions } from "../DashboardSuggestions";
 import { setServerDown } from "../../lib/connectionState";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
@@ -31,7 +32,9 @@ vi.mock("../../lib/api", () => ({
   updateSuggestionSource,
   updateSuggestionPrefs,
 }));
-vi.mock("../../hooks/useIsWideViewport", () => ({ useIsWideViewport: () => wide.value }));
+vi.mock("../../hooks/useIsWideViewport", () => ({
+  useIsWideViewport: () => wide.value,
+}));
 
 const mk = (n: number, over: Partial<SuggestionItem> = {}): SuggestionItem => ({
   id: `i${n}`,
@@ -73,10 +76,26 @@ const renderIt = (props: Partial<Parameters<typeof DashboardSuggestions>[0]> = {
   render(<DashboardSuggestions onPrepare={vi.fn()} onViewAll={vi.fn()} onOpenSession={vi.fn()} {...props} />);
 
 describe("DashboardSuggestions", () => {
+  it("counts one home use when it lists items", async () => {
+    fetchSuggestions.mockResolvedValue(snap([mk(1)]));
+    renderIt();
+    await screen.findByText("Item 1");
+    await waitFor(() => expect(reportFeatureUse).toHaveBeenCalledWith("suggest_from_home"));
+    expect(reportFeatureUse).toHaveBeenCalledTimes(1);
+  });
+
   it("says when every installed provider is off, and turns them on in one click", async () => {
     const off: SuggestionsSnapshot = {
       ...snap([]),
-      providers: [{ id: "github", name: "GitHub", status: "pending", enabled: false, sources: [] }],
+      providers: [
+        {
+          id: "github",
+          name: "GitHub",
+          status: "pending",
+          enabled: false,
+          sources: [],
+        },
+      ],
     };
     fetchSuggestions.mockResolvedValueOnce(off).mockResolvedValue(snap([mk(1)]));
     updateSuggestionPrefs.mockResolvedValue(ok);
@@ -86,7 +105,11 @@ describe("DashboardSuggestions", () => {
     );
     expect(screen.queryByText(/Getting your first suggestions|Nothing to suggest/)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Turn it on" }));
-    await waitFor(() => expect(updateSuggestionPrefs).toHaveBeenCalledWith({ provider_enabled: { github: true } }));
+    await waitFor(() =>
+      expect(updateSuggestionPrefs).toHaveBeenCalledWith({
+        provider_enabled: { github: true },
+      }),
+    );
     expect(await screen.findByText("Item 1")).toBeTruthy();
     expect(screen.queryByTestId("suggestions-off")).toBeNull();
   });
@@ -95,8 +118,20 @@ describe("DashboardSuggestions", () => {
     fetchSuggestions.mockResolvedValue({
       ...snap([]),
       providers: [
-        { id: "github", name: "GitHub", status: "pending", enabled: false, sources: [] },
-        { id: "linear", name: "Linear", status: "pending", enabled: false, sources: [] },
+        {
+          id: "github",
+          name: "GitHub",
+          status: "pending",
+          enabled: false,
+          sources: [],
+        },
+        {
+          id: "linear",
+          name: "Linear",
+          status: "pending",
+          enabled: false,
+          sources: [],
+        },
       ],
     });
     renderIt({ readOnly: true });
@@ -110,7 +145,14 @@ describe("DashboardSuggestions", () => {
     fetchSuggestions.mockResolvedValue({
       ...snap([]),
       providers: [
-        { id: "github", name: "GitHub", status: "error", error: "gh is not signed in", enabled: true, sources: [] },
+        {
+          id: "github",
+          name: "GitHub",
+          status: "error",
+          error: "gh is not signed in",
+          enabled: true,
+          sources: [],
+        },
       ],
     });
     renderIt();
@@ -134,7 +176,11 @@ describe("DashboardSuggestions", () => {
   });
 
   it("renders nothing without a provider", async () => {
-    fetchSuggestions.mockResolvedValue({ items: [], providers: [], prefs: PREFS });
+    fetchSuggestions.mockResolvedValue({
+      items: [],
+      providers: [],
+      prefs: PREFS,
+    });
     const { container } = renderIt();
     await waitFor(() => expect(fetchSuggestions).toHaveBeenCalled());
     await act(async () => {});
@@ -142,7 +188,10 @@ describe("DashboardSuggestions", () => {
   });
 
   it("renders nothing when the homepage setting is off", async () => {
-    fetchSuggestions.mockResolvedValue({ ...snap([mk(1)]), prefs: { ...PREFS, homepage: false } });
+    fetchSuggestions.mockResolvedValue({
+      ...snap([mk(1)]),
+      prefs: { ...PREFS, homepage: false },
+    });
     const { container } = renderIt();
     await waitFor(() => expect(fetchSuggestions).toHaveBeenCalled());
     await act(async () => {});
@@ -168,7 +217,11 @@ describe("DashboardSuggestions", () => {
 
   it("Start runs the preset without opening the wizard; Start with changes prepares the prefill", async () => {
     fetchSuggestions.mockResolvedValue(snap([mk(1)]));
-    startSuggestion.mockResolvedValue({ kind: "started", sessionId: "s1", title: "T" });
+    startSuggestion.mockResolvedValue({
+      kind: "started",
+      sessionId: "s1",
+      title: "T",
+    });
     const onPrepare = vi.fn();
     renderIt({ onPrepare });
     fireEvent.click(await screen.findByRole("button", { name: "Start" }));
@@ -192,7 +245,11 @@ describe("DashboardSuggestions", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /^Start with changes/ }));
     await waitFor(() => expect(onPrepare).toHaveBeenCalled());
     expect(prepareSuggestion).toHaveBeenCalledWith("github", "i1");
-    expect(onPrepare.mock.calls[0][0]).toMatchObject({ path: "/p", initialPrompt: "do it", tool: "claude" });
+    expect(onPrepare.mock.calls[0][0]).toMatchObject({
+      path: "/p",
+      initialPrompt: "do it",
+      tool: "claude",
+    });
   });
 
   it("Dismiss shows an undo bar that restores the item, and the bar expires after 10s", async () => {
@@ -218,7 +275,15 @@ describe("DashboardSuggestions", () => {
           name: "GitHub",
           status: "ok",
           enabled: true,
-          sources: [{ criterion: "assigned", label: "Assigned issues", description: "", enabled: true, variables: [] }],
+          sources: [
+            {
+              criterion: "assigned",
+              label: "Assigned issues",
+              description: "",
+              enabled: true,
+              variables: [],
+            },
+          ],
         },
       ],
     });
@@ -229,14 +294,22 @@ describe("DashboardSuggestions", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
     await screen.findByText(/Dismissed/);
     expect(screen.queryByText(/Settings › Suggestions/)).toBeNull();
-    fireEvent.click(await screen.findByRole("button", { name: "Stop suggesting assigned issues" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Stop suggesting assigned issues",
+      }),
+    );
     await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalledWith("github", "assigned", false));
     expect((await screen.findByText(/^Stopped suggesting assigned issues\./)).closest("div")!.textContent).toBe(
       "Stopped suggesting assigned issues.Undo·Turn it back on in Settings › Suggestions.",
     );
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
     await waitFor(() => expect(updateSuggestionSource).toHaveBeenLastCalledWith("github", "assigned", true));
-    expect(await screen.findByRole("button", { name: "Stop suggesting assigned issues" })).toBeTruthy();
+    expect(
+      await screen.findByRole("button", {
+        name: "Stop suggesting assigned issues",
+      }),
+    ).toBeTruthy();
     expect(screen.getByText(/Dismissed/)).toBeTruthy();
   });
 
@@ -250,7 +323,15 @@ describe("DashboardSuggestions", () => {
           name: "GitHub",
           status: "ok",
           enabled: true,
-          sources: [{ criterion: "assigned", label: "Assigned issues", description: "", enabled: true, variables: [] }],
+          sources: [
+            {
+              criterion: "assigned",
+              label: "Assigned issues",
+              description: "",
+              enabled: true,
+              variables: [],
+            },
+          ],
         },
       ],
     });
@@ -259,7 +340,11 @@ describe("DashboardSuggestions", () => {
     updateSuggestionSource.mockResolvedValue({ ok: false, error: "nope" });
     renderIt();
     fireEvent.click((await screen.findAllByRole("button", { name: "Dismiss" }))[0]!);
-    fireEvent.click(await screen.findByRole("button", { name: "Stop suggesting assigned issues" }));
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Stop suggesting assigned issues",
+      }),
+    );
     await waitFor(() => expect(updateSuggestionSource).toHaveBeenCalled());
     await act(async () => {});
     expect(screen.queryByText(/^Stopped suggesting/)).toBeNull();
@@ -304,7 +389,13 @@ describe("DashboardSuggestions", () => {
     expect((start as HTMLButtonElement).disabled).toBe(true);
     expect(start.getAttribute("title")).toBe("Read-only: can't create Sessions");
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
-    expect((screen.getByRole("button", { name: "Start options" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Start options",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
     // The Home page already says it is read-only.
     expect(screen.queryByText(/read-only/i)).toBeNull();
   });
@@ -366,10 +457,20 @@ describe("DashboardSuggestions", () => {
     fetchSuggestions.mockResolvedValue({
       ...snap([]),
       providers: [
-        { id: "github", name: "GitHub", status: "error", error: "gh is not signed in", enabled: true, sources: [] },
+        {
+          id: "github",
+          name: "GitHub",
+          status: "error",
+          error: "gh is not signed in",
+          enabled: true,
+          sources: [],
+        },
       ],
     });
-    refreshSuggestions.mockResolvedValue({ ok: false, error: "Refresh failed." });
+    refreshSuggestions.mockResolvedValue({
+      ok: false,
+      error: "Refresh failed.",
+    });
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
     expect((await screen.findByRole("alert")).textContent).toBe("Refresh failed. Try again");
@@ -390,12 +491,75 @@ describe("DashboardSuggestions", () => {
   it("clears a previous notice when Refresh starts", async () => {
     fetchSuggestions.mockResolvedValue(snap([]));
     refreshSuggestions
-      .mockResolvedValueOnce({ ok: false, error: "refresh failed", stale: false })
+      .mockResolvedValueOnce({
+        ok: false,
+        error: "refresh failed",
+        stale: false,
+      })
       .mockResolvedValueOnce(ok);
     renderIt();
     fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
     expect((await screen.findByRole("alert")).textContent).toBe("refresh failed Try again");
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("with only the built-in agent provider, explains how to get suggestions and offers a prompt", async () => {
+    fetchSuggestions.mockResolvedValue({
+      ...snap([]),
+      providers: [
+        {
+          id: "builtin.agent",
+          name: "Agent",
+          status: "ok",
+          enabled: true,
+          sources: [],
+        },
+      ],
+    });
+    renderIt();
+    expect((await screen.findByTestId("suggestions-agent-guide")).textContent).toContain("Ask any session to suggest");
+    expect(screen.queryByText(/Nothing to suggest|Refresh/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show a prompt to paste" }));
+    expect(screen.getByText(/call the suggest_session tool/)).toBeTruthy();
+  });
+
+  it("does not re-read the snapshot while it renders nothing", async () => {
+    vi.useFakeTimers();
+    try {
+      fetchSuggestions.mockResolvedValue({
+        ...snap([mk(1)]),
+        prefs: { ...PREFS, homepage: false },
+      });
+      renderIt();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(fetchSuggestions).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(65_000);
+      });
+      expect(fetchSuggestions).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("lists items an agent pushed without the guide", async () => {
+    fetchSuggestions.mockResolvedValue({
+      ...snap([mk(1, { provider_id: "builtin.agent", source_url: "" })]),
+      providers: [
+        {
+          id: "builtin.agent",
+          name: "Agent",
+          status: "ok",
+          enabled: true,
+          sources: [],
+        },
+      ],
+    });
+    renderIt();
+    await screen.findByText("Item 1");
+    expect(screen.queryByTestId("suggestions-agent-guide")).toBeNull();
   });
 });

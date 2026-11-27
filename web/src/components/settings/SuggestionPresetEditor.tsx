@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fetchAgents, putSuggestionPreset, resetSuggestionPreset } from "../../lib/api";
 import type {
   AgentInfo,
@@ -9,10 +9,15 @@ import type {
   SuggestionSource,
 } from "../../lib/types";
 import { shortRef } from "../../lib/suggestionPlan";
+import { AGENT_PROVIDER_ID } from "../../lib/suggestionProviders";
 import { expandTemplate } from "../../lib/suggestionTemplate";
 import { TemplateEditor } from "./TemplateEditor";
 import { SuggestionSwitch } from "./suggestionsShared";
 import { BUTTON_INLINE } from "../../lib/surfaces";
+import { SuggestionAutoStart } from "./SuggestionAutoStart";
+
+/** The Back button mounts once the draft is there, so focus follows the open. */
+const focusOnMount = (el: HTMLElement | null) => el?.focus();
 
 /** A kind to open in the editor; `returnToSuggestions` swaps Back for a link to the suggestions view. */
 export interface PresetFocus {
@@ -57,6 +62,14 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Back stays usable during a save, so a late one must not close whatever is open by then.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     let live = true;
@@ -89,7 +102,7 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
       return;
     }
     await onSaved();
-    onBack();
+    if (mounted.current) onBack();
   };
   const reset = async () => {
     setBusy(true);
@@ -101,7 +114,7 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
       return;
     }
     await onSaved();
-    onBack();
+    if (mounted.current) onBack();
   };
   const preview = item
     ? draft.prompt === null
@@ -114,7 +127,7 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
 
   return (
     <div className="space-y-4">
-      <button type="button" onClick={onBack} className="cursor-pointer text-sm text-brand-500">
+      <button ref={focusOnMount} type="button" onClick={onBack} className="cursor-pointer text-sm text-brand-500">
         &larr; {source.label}
       </button>
       <div>
@@ -204,11 +217,23 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
             </button>
           )}
         </p>
-        <p className="mt-1 break-words font-mono text-xs text-text-muted">
+        <p
+          data-testid="preset-preview"
+          className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-text-muted"
+        >
           {item ? `For ${shortRef(item.source_ref)}: ` : "Preview: "}
           {preview}
         </p>
       </div>
+      {provider.id !== AGENT_PROVIDER_ID && (
+        <SuggestionAutoStart
+          provider={provider}
+          source={source}
+          yolo={stored?.yolo ?? draft.yolo}
+          disabled={disabled}
+          onChanged={onSaved}
+        />
+      )}
       <div className="flex items-center gap-2">
         <button type="button" className={GHOST} disabled={off || !entry?.customized} onClick={() => void reset()}>
           Reset to {provider.name}&apos;s settings

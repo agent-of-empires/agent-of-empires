@@ -586,6 +586,25 @@ mod tests {
         assert_eq!(prompt(Some(&bomb)), Err(PrepareRefusal::PromptTooLong));
     }
 
+    /// A preset prompt keeps its line breaks and spacing through storage and expansion.
+    #[test]
+    #[serial_test::serial]
+    fn a_multi_line_preset_prompt_expands_with_its_whitespace_intact() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let template = "Review {repo}\n\n1. Find it.   Then run:\r\n2. Done\n";
+        let preset = Preset {
+            prompt: Some(template.to_string()),
+            ..default_preset(&crate::session::config::Config::default())
+        };
+        let stored: Preset =
+            serde_json::from_str(&serde_json::to_string(&preset).unwrap()).unwrap();
+        let prepared = prepare("default", &item("a", "assigned"), Some(&stored), None).unwrap();
+        assert_eq!(
+            prepared["initial_prompt"],
+            "Review acme/widgets\n\n1. Find it.   Then run:\r\n2. Done\n"
+        );
+    }
+
     #[test]
     fn prepare_refuses_a_stale_item() {
         let mut stale = item("a", "assigned");
