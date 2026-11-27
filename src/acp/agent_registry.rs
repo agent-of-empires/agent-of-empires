@@ -46,7 +46,7 @@ impl AgentRegistry {
         let claude_description =
             format!("Anthropic Claude via the official ACP adapter ({claude_install})");
         // (name, command, args, description)
-        let mut defaults: Vec<(&str, &str, &[&str], &str)> = vec![
+        let defaults: Vec<(&str, &str, &[&str], &str)> = vec![
             ("claude", "claude-agent-acp", &[], &claude_description),
             // Legacy alias from older session records.
             (
@@ -112,12 +112,16 @@ impl AgentRegistry {
             ),
         ];
         #[cfg(feature = "e2e-tests")]
-        defaults.push((
-            "fake-agent",
-            "claude-agent-acp",
-            &[],
-            "Test-only agent, served by the fake ACP adapter",
-        ));
+        let defaults = {
+            let mut defaults = defaults;
+            defaults.push((
+                "fake-agent",
+                "claude-agent-acp",
+                &[],
+                "Test-only agent, served by the fake ACP adapter",
+            ));
+            defaults
+        };
         let agents = defaults
             .into_iter()
             .map(|(name, command, args, description)| {
