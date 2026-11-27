@@ -80,6 +80,18 @@ fn build_backend() -> bool {
         })
 }
 
+/// Same rule as build.rs `maybe_install_web_deps`, which a build without `web` skips.
+#[cfg(unix)]
+fn web_deps_stale(web: &Path) -> bool {
+    let mtime = |path: &Path| path.metadata().and_then(|m| m.modified()).ok();
+    let Some(marker) = mtime(&web.join("node_modules/.package-lock.json")) else {
+        return true;
+    };
+    ["package.json", "package-lock.json"]
+        .iter()
+        .any(|file| mtime(&web.join(file)).is_some_and(|at| at > marker))
+}
+
 #[cfg(unix)]
 fn host_is_loopback(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.")
@@ -149,6 +161,18 @@ fn run_dev(args: DevArgs) {
 
     if !build_backend() {
         std::process::exit(1);
+    }
+
+    if web_deps_stale(Path::new("web")) {
+        eprintln!("[xtask dev] installing web dependencies (npm --prefix web ci)...");
+        let installed = Command::new("npm")
+            .args(["--prefix", "web", "ci"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !installed {
+            eprintln!("[xtask dev] `npm --prefix web ci` failed; run it directly to see why");
+            std::process::exit(1);
+        }
     }
 
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
@@ -784,8 +808,42 @@ mod skill_check_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::is_watch_relevant;
+    use super::{is_watch_relevant, web_deps_stale};
     use std::path::Path;
+
+    #[test]
+    fn web_deps_are_stale_when_the_npm_marker_is_missing_or_older() {
+        use std::time::{Duration, SystemTime};
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let new = old + Duration::from_secs(60);
+        // (marker mtime, lockfile mtime, stale)
+        let cases = [
+            (None, old, true),
+            (Some(old), new, true),
+            (Some(new), old, false),
+        ];
+        for (marker, lock, stale) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let touch = |rel: &str, at: SystemTime| {
+                let path = dir.path().join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_modified(at)
+                    .unwrap();
+            };
+            touch("package.json", old);
+            touch("package-lock.json", lock);
+            if let Some(at) = marker {
+                touch("node_modules/.package-lock.json", at);
+            }
+            assert_eq!(
+                web_deps_stale(dir.path()),
+                stale,
+                "marker {marker:?}, lock {lock:?}"
+            );
+        }
+    }
 
     #[test]
     fn only_rust_sources_and_cargo_manifests_trigger_a_rebuild() {
