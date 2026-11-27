@@ -74,16 +74,17 @@ impl LeaseTable {
         let mut lapsed = self.lapsed.lock().expect("lease table mutex poisoned");
         Self::expire(&mut held, &mut lapsed, now_ms);
         let was_open = held.contains_key(&key) || lapsed.contains(&key);
-        // The frame itself reports this id's state, so a lapse is stale.
-        lapsed.retain(|k| *k != key);
         match op.op {
             LeaseVerb::Release => {
+                lapsed.retain(|k| *k != key);
                 held.remove(&key);
             }
             LeaseVerb::Acquire | LeaseVerb::Renew => {
                 if !held.contains_key(&key) && held.len() >= MAX_LEASES {
                     return Err(LeaseTableFull);
                 }
+                // The frame itself reports this id's state, so a lapse is stale.
+                lapsed.retain(|k| *k != key);
                 let ttl = op.ttl_ms.unwrap_or(0).min(i64::MAX as u64) as i64;
                 held.insert(key, (op.kind, now_ms.saturating_add(ttl)));
             }
@@ -292,5 +293,28 @@ mod tests {
         let extra = op("extra", LeaseKind::Task, LeaseVerb::Acquire, Some(10));
         assert!(t.apply(&extra, 0).is_err());
         assert!(t.apply(&extra, 10).is_ok(), "expired entries free room");
+    }
+
+    #[test]
+    fn a_failed_acquire_keeps_the_pending_lapse() {
+        let t = LeaseTable::default();
+        let ns = LeaseNamespace::BackgroundTask;
+        t.apply_derived(ns, "d", RunState::Started, Some(10), 0)
+            .unwrap();
+        for i in 0..MAX_LEASES - 1 {
+            let hold = op(
+                &i.to_string(),
+                LeaseKind::Busy,
+                LeaseVerb::Acquire,
+                Some(1000),
+            );
+            t.apply(&hold, 0).unwrap();
+        }
+        // This apply expires "d" into the pending lapses and fills the table.
+        let last = op("last", LeaseKind::Busy, LeaseVerb::Acquire, Some(1000));
+        t.apply(&last, 10).unwrap();
+        let restart = t.apply_derived(ns, "d", RunState::Started, Some(10), 11);
+        assert!(restart.is_err(), "the table is full");
+        assert_eq!(t.drain_expired(11), vec![(ns, "d".to_string())]);
     }
 }
