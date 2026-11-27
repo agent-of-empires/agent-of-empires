@@ -2523,10 +2523,7 @@ async fn running_restart_respawns_while_start_remains_idempotent() -> anyhow::Re
     let restarted = restart_session(
         State(state.clone()),
         Path(id.clone()),
-        Ok(Some(Json(crate::daemon::RestartSessionBody {
-            wake_message: Some(String::new()),
-            ..Default::default()
-        }))),
+        Ok(Some(Json(crate::daemon::RestartSessionBody::default()))),
     )
     .await
     .into_response();
@@ -2571,69 +2568,6 @@ async fn running_restart_respawns_while_start_remains_idempotent() -> anyhow::Re
             .lifecycle_generation,
         outcome.lifecycle_generation
     );
-    Ok(())
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn restart_delivers_requested_wake_message_to_new_pane() -> anyhow::Result<()> {
-    if !crate::tmux::is_tmux_available() {
-        return Ok(());
-    }
-    let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::config::update_app_state(|state| {
-        state.has_acknowledged_agent_hooks = true;
-    })?;
-    let project = tempfile::tempdir()?;
-    let marker = project.path().join("wake-received");
-    let mut row = Instance::new("wake-on-restart", project.path().to_str().unwrap());
-    row.source_profile = "wake-profile".into();
-    row.status = Status::Running;
-    row.command = format!(
-        r#"sh -c 'read message; printf "%s" "$message" > {}; sleep 60'"#,
-        marker.display(),
-    );
-    let id = row.id.clone();
-    let name = crate::tmux::Session::generate_name(&id, &row.title);
-    let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
-    row.tmux_session()?.create(
-        project.path().to_str().unwrap(),
-        Some("sleep 60"),
-        "wake-profile",
-    )?;
-    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
-    let storage = Storage::new("wake-profile", state.file_watch.clone())?;
-    storage.update(|rows, _| {
-        rows.push(row);
-        Ok(())
-    })?;
-    *state.canonical_metadata.write().await =
-        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
-
-    let response = restart_session(
-        State(state.clone()),
-        Path(id),
-        Ok(Some(Json(crate::daemon::RestartSessionBody {
-            wake_message: Some("wake-message-verified".into()),
-            ..Default::default()
-        }))),
-    )
-    .await
-    .into_response();
-    assert_eq!(response.status(), StatusCode::OK);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if std::fs::read_to_string(&marker).ok().as_deref() == Some("wake-message-verified") {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "restart wake did not reach the new pane; marker={:?}; pane={:?}",
-            std::fs::read_to_string(&marker),
-            crate::tmux::Session::from_name(&name).capture_pane(30),
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
     Ok(())
 }
 
@@ -17123,7 +17057,6 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
         Box::pin(async move {
             for case in [
                 "parked",
-                "explicit",
                 "superseded",
                 "nothing-to-replay",
                 "pending-only",
@@ -17141,7 +17074,7 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                             .await
                             .unwrap(),
                         Known(None),
-                        "not parked: the wake message stays",
+                        "not parked: there is no quota continuation",
                     );
                     live.client.shutdown().await.unwrap();
                     continue;
@@ -17175,11 +17108,6 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                     state
                         .session_service
                         .set_pending_initial_turn(&id, "earlier continuation".into(), Vec::new(), crate::daemon::PromptOrigin::Unknown)
-                        .await;
-                } else if case == "explicit" {
-                    state
-                        .session_service
-                        .set_pending_initial_turn(&id, "newer continuation".into(), Vec::new(), crate::daemon::PromptOrigin::Unknown)
                         .await;
                 }
                 let row = state
@@ -17215,16 +17143,9 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                         })
                         .count()
                 };
-                let explicit = case == "explicit";
-                let prepared = if explicit {
-                    None
-                } else {
-                    Some(
-                        crate::server::acp_reconciler::resolve_continuation(&state, &id)
-                            .await
-                            .unwrap(),
-                    )
-                };
+                let prepared = crate::server::acp_reconciler::resolve_continuation(&state, &id)
+                    .await
+                    .unwrap();
                 let generation = row.lifecycle_generation + u64::from(case == "superseded");
                 let submission = state.session_service.prompt_submission(&id).await;
                 let selected = lifecycle::continue_interrupted_prompt(
@@ -17232,7 +17153,6 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                     &id,
                     generation,
                     resets_at,
-                    explicit,
                     &submission,
                     prepared,
                     None,
@@ -17242,21 +17162,9 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                 drop(submission);
                 match case {
                     "parked" => {
-                        assert!(
-                            selected,
-                            "interrupted prompt is next: suppress the default wake"
-                        );
+                        assert!(selected, "the interrupted prompt owns the next turn");
                         assert_eq!(pending().as_deref(), Some("finish the migration"));
                         assert_eq!(breadcrumbs(), 1);
-                    }
-                    "explicit" => {
-                        assert!(!selected, "the restart itself sends its explicit wake");
-                        assert_eq!(
-                            pending().as_deref(),
-                            Some("newer continuation"),
-                            "work installed after launch finalized is not the restart's to clear"
-                        );
-                        assert_eq!(breadcrumbs(), 1, "manual budget disarmed exactly once");
                     }
                     "superseded" => {
                         assert!(!selected);
@@ -17264,7 +17172,8 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
                         assert_eq!(breadcrumbs(), 0);
                     }
                     "nothing-to-replay" => {
-                        assert!(!selected, "no turn to deliver: keep the default wake");
+                        assert!(!selected, "there is no turn to deliver");
+                        assert_eq!(pending(), None);
                         assert_eq!(breadcrumbs(), 1);
                     }
                     "pending-only" => {
@@ -17316,9 +17225,8 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
                         &id,
                         generation,
                         resets_at,
-                        false,
                         &submission,
-                        Some(prepared),
+                        prepared,
                         None,
                     )
                     .await
@@ -17490,9 +17398,8 @@ async fn prepared_restart_uses_current_queue_after_original_detaches() {
                             &id,
                             generation,
                             crate::time::Timestamp::now(),
-                            false,
                             &submission,
-                            Some(prepared),
+                            prepared,
                             None,
                         )
                         .await
@@ -17620,9 +17527,8 @@ async fn quota_breadcrumb_write_failure_does_not_install_pending_input() {
                 &id,
                 row.lifecycle_generation,
                 crate::time::Timestamp::now(),
-                false,
                 &submission,
-                Some(prepared),
+                prepared,
                 None,
             )
             .await;
@@ -17863,43 +17769,6 @@ async fn a_required_terminal_swap_reads_the_target_profiles_resume_setting() {
     let live = state.instances.read().await[0].clone();
     assert_eq!(live.tool, "a");
     assert_eq!(live.source_profile, row.source_profile);
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn an_explicit_wake_discards_a_stale_continuation_before_the_worker_can_drain_it() {
-    let _home = crate::session::test_support::isolate_app_dir();
-    let project = tempfile::tempdir().unwrap();
-    let mut row = Instance::new("stale", project.path().to_str().unwrap());
-    row.id = "stale".into();
-    row.source_profile = "default".into();
-    row.view = crate::session::View::Structured;
-    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
-    let state = crate::server::test_support::build_test_app_state(vec![row]);
-    let pending = |state: &Arc<AppState>| {
-        let state = state.clone();
-        async move {
-            state.instances.read().await[0]
-                .pending_initial_turn
-                .as_ref()
-                .map(|turn| turn.text.clone())
-        }
-    };
-    state
-        .session_service
-        .set_pending_initial_turn(
-            "stale",
-            "old task".into(),
-            Vec::new(),
-            crate::daemon::PromptOrigin::Unknown,
-        )
-        .await;
-    for (parked, explicit) in [(false, true), (true, false)] {
-        lifecycle::discard_stale_continuation(&state, "stale", parked, explicit).await;
-        assert_eq!(pending(&state).await.as_deref(), Some("old task"));
-    }
-    lifecycle::discard_stale_continuation(&state, "stale", true, true).await;
-    assert_eq!(pending(&state).await, None);
 }
 
 #[tokio::test]

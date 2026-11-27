@@ -62,6 +62,7 @@ async fn list_with_spec(
         additional_dirs: Vec::new(),
         provider_env: Vec::new(),
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         host_environment,
         default_effort: None,
         default_effort_explicit: false,

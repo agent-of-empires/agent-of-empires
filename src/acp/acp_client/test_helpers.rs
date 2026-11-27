@@ -166,13 +166,13 @@ impl super::AcpClient {
     pub(crate) async fn spawn_with_test_options(
         config: SpawnConfig,
         session_id: crate::acp::state::AcpSessionId,
-        executable: std::path::PathBuf,
+        runner: impl Into<super::TestRunner>,
         options: SdkTestOptions,
     ) -> Result<Self, super::AcpError> {
         SDK_TEST_OPTIONS
             .scope(
                 std::sync::Mutex::new(Some(options)),
-                Self::spawn_with_test_runner(config, session_id, executable),
+                Self::spawn_with_test_runner(config, session_id, runner),
             )
             .await
     }
@@ -240,6 +240,7 @@ pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -292,6 +293,7 @@ pub(super) fn reset_fake_spawn_config(
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "codex".into(),
         tool: "codex".into(),

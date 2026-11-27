@@ -820,7 +820,7 @@ fn format_relative_age(ts: Option<Timestamp>) -> String {
 /// Format a remaining snooze as a compact countdown that fits `LAST_ACTIVITY_SLOT` (`23m`,
 /// `1h`, `5d`), falling back to `<1m` so a sub-minute remainder reads as "about to wake".
 /// The validator caps at 30 days, which the day branch covers.
-fn format_snooze_remaining(delta: crate::time::Duration) -> String {
+pub(super) fn format_snooze_remaining(delta: crate::time::Duration) -> String {
     let secs = delta.whole_seconds();
     if secs < 60 {
         return "<1m".to_string();
@@ -4687,18 +4687,16 @@ impl HomeView {
                 let (click, key) = bound(ActionId::Delete);
                 groups.push((3, click, mk(&key, "Del")));
             }
-            // Archive / Snooze render only in Attention sort: they shape the Attention queue
-            // and do nothing visible elsewhere, so they would just take footer space.
+            // Archive renders only in Attention sort: it shapes the Attention queue. Snooze
+            // works on a session row in every sort, so its hint follows the key.
             let in_attention = self.sort_order == SortOrder::Attention;
-            if in_attention && !on_suggested {
-                if !self.flat_items.is_empty() {
-                    let (click, key) = bound(ActionId::ToggleArchive);
-                    groups.push((1, click, mk(&key, "Archive")));
-                }
-                if self.selected_session.is_some() {
-                    let (click, key) = bound(ActionId::ToggleSnooze);
-                    groups.push((1, click, mk(&key, "Snooze")));
-                }
+            if in_attention && !on_suggested && !self.flat_items.is_empty() {
+                let (click, key) = bound(ActionId::ToggleArchive);
+                groups.push((1, click, mk(&key, "Archive")));
+            }
+            if self.selected_session.is_some() {
+                let (click, key) = bound(ActionId::ToggleSnooze);
+                groups.push((1, click, mk(&key, "Snooze")));
             }
             // Fav follows the key's own gate (`Context::FavoritesUsable`), so the footer
             // advertises it wherever `f` actually does something.

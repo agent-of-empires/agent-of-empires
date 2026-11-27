@@ -3,4 +3,5 @@ dist/
 test-results/
 playwright-report/
 playwright-live-report/
+playwright-showcase-report/
 test-report.junit.xml
