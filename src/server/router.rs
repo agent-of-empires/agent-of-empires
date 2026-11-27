@@ -342,6 +342,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/suggestions/prepare", post(api::prepare_suggestion))
         .route("/api/suggestions/start", post(api::start_suggestion))
+        .route("/api/suggestions/start-batch", post(api::start_suggestions))
         .route(
             "/api/suggestions/mappings",
             get(api::list_suggestion_mappings)

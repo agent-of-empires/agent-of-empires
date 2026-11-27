@@ -74,11 +74,7 @@ fn needs_nothing(
 
 /// The error code and message of a refused or failed start.
 async fn failure(response: axum::response::Response) -> (String, String) {
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .unwrap_or_default();
-    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    let (status, body) = super::response_json(response).await;
     (
         body["error"].as_str().unwrap_or_default().to_string(),
         body["message"].as_str().map_or_else(

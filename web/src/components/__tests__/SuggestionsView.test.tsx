@@ -13,6 +13,7 @@ const {
   refreshSuggestions,
   dismissSuggestion,
   startSuggestion,
+  startSuggestions,
   fetchProjects,
   fetchPresets,
   trashSession,
@@ -24,6 +25,7 @@ const {
   refreshSuggestions: vi.fn(),
   dismissSuggestion: vi.fn(),
   startSuggestion: vi.fn(),
+  startSuggestions: vi.fn(),
   fetchProjects: vi.fn(),
   fetchPresets: vi.fn(),
   trashSession: vi.fn(),
@@ -33,7 +35,9 @@ const {
 
 vi.mock("../../lib/api", () => ({
   fetchAgents: () => Promise.resolve(null),
+  START_BATCH_MAX: 25,
   startSuggestion,
+  startSuggestions,
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
@@ -153,11 +157,12 @@ describe("SuggestionsView", () => {
     expect(prepareSuggestion).not.toHaveBeenCalled();
   });
 
-  it("selected rows start one after another, a failure does not stop the rest, and the toast sums up", async () => {
-    startSuggestion
-      .mockResolvedValueOnce({ kind: "started", sessionId: "s1", title: "Fix lifecycle" })
-      .mockResolvedValueOnce({ kind: "failed", reason: "No sandbox", retryable: true })
-      .mockResolvedValueOnce({ kind: "started", sessionId: "s3", title: "Third" });
+  it("selected rows start in one batch request, a failure does not stop the rest, and the toast sums up", async () => {
+    startSuggestions.mockResolvedValueOnce([
+      { kind: "started", sessionId: "s1", title: "Fix lifecycle" },
+      { kind: "failed", reason: "No sandbox", retryable: true },
+      { kind: "started", sessionId: "s3", title: "Third" },
+    ]);
     const [info, infoAction] = [vi.fn(), vi.fn()];
     toastBus.handler = { push: vi.fn(), error: vi.fn(), info, openLink: vi.fn(), action: vi.fn(), infoAction };
     await open(
@@ -176,7 +181,13 @@ describe("SuggestionsView", () => {
       fireEvent.click(screen.getByRole("checkbox", { name: `Select ${title}` }));
     fireEvent.click(screen.getByRole("button", { name: "Start 3" }));
     await waitFor(() => expect(info).toHaveBeenCalledWith("Started 2, 1 could not start (see the rows)."));
-    expect(startSuggestion.mock.calls.map((c) => c[1])).toEqual(["issue-1", "issue-2", "issue-3"]);
+    expect(startSuggestions).toHaveBeenCalledTimes(1);
+    expect(startSuggestions.mock.calls[0]![0].map((i: { id: string }) => i.id)).toEqual([
+      "issue-1",
+      "issue-2",
+      "issue-3",
+    ]);
+    expect(startSuggestion).not.toHaveBeenCalled();
     expect(screen.getByText(/No sandbox/)).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Selected suggestions" })).toBeNull();
   });

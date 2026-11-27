@@ -3762,20 +3762,8 @@ export type StartResult =
   | { kind: "no_project" }
   | { kind: "error"; error: string };
 
-/** Starts a Session from a suggestion with its kind's preset; the server answers 201 once it exists. */
-export async function startSuggestion(
-  providerId: string,
-  id: string,
-  options: StartOptions = {},
-): Promise<StartResult> {
-  let res: Response;
-  let text: string;
-  try {
-    res = await fetch("/api/suggestions/start", jsonInit("POST", { provider_id: providerId, id, ...options }));
-    text = await res.text();
-  } catch (error) {
-    return { kind: "error", error: `Network error: ${error instanceof Error ? error.message : "connection failed"}` };
-  }
+/** What `POST /api/suggestions/start` answered (or `start-batch` for one item), as a {@link StartResult}. */
+function startResult(status: number, text: string): StartResult {
   let body: Record<string, unknown> = {};
   try {
     body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
@@ -3783,7 +3771,7 @@ export async function startSuggestion(
     // Handled below by status.
   }
   const str = (v: unknown) => (typeof v === "string" ? v : undefined);
-  if (res.ok) {
+  if (status >= 200 && status < 300) {
     const sessionId = str(body.session_id);
     if (!sessionId)
       return { kind: "error", error: "Unexpected response from the server. Reload to see the current state." };
@@ -3791,16 +3779,16 @@ export async function startSuggestion(
     return { kind: "started", sessionId, title: str(body.title) ?? "" };
   }
   const code = str(body.error);
-  if (res.status === 409 && code === "already_started") {
+  if (status === 409 && code === "already_started") {
     notifySuggestionsChanged();
     return { kind: "already_started", sessionId: str(body.session_id) ?? "" };
   }
-  if (res.status === 409 && code === "hooks_need_trust") {
+  if (status === 409 && code === "hooks_need_trust") {
     return { kind: code, review: body as unknown as StartHooksReview };
   }
-  if (res.status === 409 && code === "trust_changed") return { kind: "trust_changed" };
-  if (res.status === 409 && code === "stale_suggestion") return { kind: "stale" };
-  if (res.status === 422 && code === "start_failed") {
+  if (status === 409 && code === "trust_changed") return { kind: "trust_changed" };
+  if (status === 409 && code === "stale_suggestion") return { kind: "stale" };
+  if (status === 422 && code === "start_failed") {
     return {
       kind: "failed",
       reason: str(body.reason) ?? str(body.message) ?? "The Session could not be started.",
@@ -3808,8 +3796,55 @@ export async function startSuggestion(
       retryable: body.retryable !== false,
     };
   }
-  if (res.status === 400 && code === "no_project") return { kind: "no_project" };
-  return { kind: "error", error: parseApiErrorText(text, res.status) };
+  if (status === 400 && code === "no_project") return { kind: "no_project" };
+  return { kind: "error", error: parseApiErrorText(text, status) };
+}
+
+/** Starts a Session from a suggestion with its kind's preset; the server answers 201 once it exists. */
+export async function startSuggestion(
+  providerId: string,
+  id: string,
+  options: StartOptions = {},
+): Promise<StartResult> {
+  try {
+    const res = await fetch("/api/suggestions/start", jsonInit("POST", { provider_id: providerId, id, ...options }));
+    return startResult(res.status, await res.text());
+  } catch (error) {
+    return { kind: "error", error: `Network error: ${error instanceof Error ? error.message : "connection failed"}` };
+  }
+}
+
+/** Most items the daemon takes in one batch start. */
+export const START_BATCH_MAX = 25;
+
+/**
+ * Starts the items in one request, one after another on the daemon, never approving hooks.
+ * The results come back in the order sent, each as `startSuggestion` would have answered it.
+ */
+export async function startSuggestions(items: { provider_id: string; id: string }[]): Promise<StartResult[]> {
+  const failAll = (error: string): StartResult[] => items.map(() => ({ kind: "error", error }));
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch("/api/suggestions/start-batch", jsonInit("POST", { items }));
+    text = await res.text();
+  } catch (error) {
+    return failAll(`Network error: ${error instanceof Error ? error.message : "connection failed"}`);
+  }
+  let results: { status?: unknown; body?: unknown }[] | undefined;
+  try {
+    results = res.ok ? (JSON.parse(text) as { results: typeof results }).results : undefined;
+  } catch {
+    // Handled below.
+  }
+  if (!results || results.length !== items.length) {
+    return failAll(
+      res.ok
+        ? "Unexpected response from the server. Reload to see the current state."
+        : parseApiErrorText(text, res.status),
+    );
+  }
+  return results.map((r) => startResult(typeof r.status === "number" ? r.status : 0, JSON.stringify(r.body ?? {})));
 }
 
 export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | null> {

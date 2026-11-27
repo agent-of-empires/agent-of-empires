@@ -4,11 +4,14 @@ import {
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
+  START_BATCH_MAX,
   startSuggestion,
+  startSuggestions,
   trashSession,
   updateSuggestionSource,
   type StartHooksReview,
   type StartOptions,
+  type StartResult,
   type SuggestionResult,
 } from "../lib/api";
 import { useServerDown } from "../lib/connectionState";
@@ -144,6 +147,17 @@ export function useSuggestions(
     setStarting((s) => (s.includes(key) ? s : [...s, key]));
     setNotice(null);
     const result = await startSuggestion(item.provider_id, item.id, options);
+    return settle(item, result, options, batch);
+  };
+
+  // Shows what the daemon answered for `item`; `start` and `startMany` both end here.
+  const settle = async (
+    item: SuggestionItem,
+    result: StartResult,
+    options: StartOptions,
+    batch: boolean,
+  ): Promise<StartKind> => {
+    const key = suggestionKey(item);
     setStarting((s) => s.filter((k) => k !== key));
     if (!mounted.current) {
       // No row to show the reason on any more.
@@ -238,12 +252,20 @@ export function useSuggestions(
     return result.kind;
   };
 
-  // Starts the items one after another, each through `start`. A failure does not stop the rest;
+  // Starts the items through the daemon's batch start. A failure does not stop the rest;
   // a hooks review waits in the queue for its turn.
   const startMany = async (items: SuggestionItem[]) => {
+    const keys = items.map(suggestionKey);
+    setStarting((s) => [...s, ...keys.filter((k) => !s.includes(k))]);
+    setNotice(null);
+    const results: StartResult[] = [];
+    for (let i = 0; i < items.length; i += START_BATCH_MAX) {
+      const chunk = items.slice(i, i + START_BATCH_MAX).map(({ provider_id, id }) => ({ provider_id, id }));
+      results.push(...(await startSuggestions(chunk)));
+    }
     const tally = { started: 0, review: 0, attention: 0 };
-    for (const item of items) {
-      const kind = await start(item, {}, true);
+    for (const [i, item] of items.entries()) {
+      const kind = await settle(item, results[i]!, {}, true);
       if (kind === "started" || kind === "already_started") tally.started++;
       else if (kind === "hooks_need_trust") tally.review++;
       else tally.attention++;

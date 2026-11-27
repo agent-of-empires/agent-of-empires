@@ -634,6 +634,11 @@ async fn a_suggestion_request_for_another_profile_is_refused_untouched() {
         ),
         (
             Method::POST,
+            "/api/suggestions/start-batch".to_string(),
+            json!({ "items": [{ "provider_id": PROVIDER, "id": "a" }], "expected_profile": "other" }),
+        ),
+        (
+            Method::POST,
             "/api/suggestions/refresh".to_string(),
             other.clone(),
         ),
@@ -1099,6 +1104,70 @@ async fn start_refuses_an_unlinked_repo_and_shows_hooks_before_approval() {
         (status, code.as_str()),
         (StatusCode::BAD_REQUEST, "validation_failed")
     );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn start_batch_answers_each_item_and_one_refusal_never_stops_the_rest() {
+    let f = fixture();
+    f.seed_item("hooks", Some("acme/web"), "1");
+    f.seed_item("unlinked", Some("acme/other"), "2");
+    let repo = f.repo.to_string_lossy().into_owned();
+    f.call(
+        Method::PUT,
+        "/api/suggestions/mappings",
+        json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo] }),
+    )
+    .await;
+    std::fs::create_dir_all(f.repo.join(".agent-of-empires")).unwrap();
+    std::fs::write(
+        f.repo.join(".agent-of-empires/config.toml"),
+        "[hooks]\non_create = [\"npm ci\"]\n",
+    )
+    .unwrap();
+    let item = |id: &str| json!({ "provider_id": PROVIDER, "id": id });
+    let (status, _, body) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/start-batch",
+            json!({ "items": [item("hooks"), item("unlinked"), item("gone")] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results: Vec<(String, u64, Value)> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["id"].as_str().unwrap().to_string(),
+                r["status"].as_u64().unwrap(),
+                r["body"]["error"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        results,
+        [
+            ("hooks".to_string(), 409, json!("hooks_need_trust")),
+            ("unlinked".to_string(), 400, json!("no_project")),
+            ("gone".to_string(), 409, json!("stale_suggestion")),
+        ]
+    );
+
+    for items in [json!([]), json!(vec![item("x"); 26])] {
+        let (status, code, _) = f
+            .call(
+                Method::POST,
+                "/api/suggestions/start-batch",
+                json!({ "items": items }),
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::BAD_REQUEST, "validation_failed")
+        );
+    }
 }
 
 #[tokio::test]

@@ -1641,7 +1641,7 @@ fn a_prepare_answer_is_applied_when_a_prompt_error_changes_in_the_same_poll() {
 
 #[test]
 #[serial]
-fn marked_suggestions_start_one_after_another_and_say_how_many_started() {
+fn marked_suggestions_start_in_one_daemon_call_and_say_how_many_started() {
     let (mut env, requests) = expanded_env(3);
     with_authenticated_local_project_registry(&mut env.view, |view| {
         view.handle_key(key(KeyCode::Char(' ')), None);
@@ -1662,8 +1662,8 @@ fn marked_suggestions_start_one_after_another_and_say_how_many_started() {
         .collect();
     assert_eq!(
         starts,
-        ["start gh/i0", "start gh/i1"],
-        "the unmarked one stays a suggestion"
+        ["start-batch gh/i0 gh/i1"],
+        "one daemon call, and the unmarked one stays a suggestion"
     );
 }
 
@@ -1684,7 +1684,7 @@ fn a_failed_start_in_a_batch_does_not_stop_the_rest() {
         .try_iter()
         .filter(|r| r.starts_with("start"))
         .collect();
-    assert_eq!(starts, ["start gh/i0", "start gh/i1"]);
+    assert_eq!(starts, ["start-batch gh/i0 gh/i1"]);
 }
 
 #[test]

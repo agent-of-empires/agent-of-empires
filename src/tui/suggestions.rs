@@ -183,6 +183,11 @@ enum Req {
         review_fingerprint: Option<serde_json::Value>,
         origin: Option<Origin>,
     },
+    /// Starts the items with their presets in one daemon call, never approving hooks.
+    StartBatch {
+        items: Vec<ItemKey>,
+        origin: Option<Origin>,
+    },
     /// Turns on `pre_trust_agent_folders` through the daemon's settings API.
     PreTrust {
         origin: Option<Origin>,
@@ -207,6 +212,7 @@ impl Req {
             Req::Dismiss { origin, .. }
             | Req::Prepare { origin, .. }
             | Req::Start { origin, .. }
+            | Req::StartBatch { origin, .. }
             | Req::Refresh { origin }
             | Req::PreTrust { origin }
             | Req::ShowOnHome { origin, .. }
@@ -248,6 +254,8 @@ enum Res {
     Refreshed(Result<(), String>),
     Prepared(Result<Prepared, String>),
     Started(Result<StartAnswer, String>),
+    /// The answer to each item of a batch start, in the order sent.
+    StartedBatch(Result<Vec<(ItemKey, StartAnswer)>, String>),
     PreTrusted(Result<(), String>),
 }
 
@@ -260,6 +268,7 @@ impl Res {
             | Res::Refreshed(Err(e))
             | Res::Prepared(Err(e))
             | Res::Started(Err(e))
+            | Res::StartedBatch(Err(e))
             | Res::PreTrusted(Err(e)) => Some(e),
             _ => None,
         }
@@ -270,6 +279,7 @@ enum ResKind {
     Snapshot,
     Prepare,
     Start,
+    StartBatch,
     Other,
 }
 
@@ -277,6 +287,7 @@ fn failed(req: &Req, message: String) -> Res {
     match req {
         Req::Prepare { .. } => Res::Prepared(Err(message)),
         Req::Start { .. } => Res::Started(Err(message)),
+        Req::StartBatch { .. } => Res::StartedBatch(Err(message)),
         Req::Refresh { .. } => Res::Refreshed(Err(message)),
         Req::PreTrust { .. } => Res::PreTrusted(Err(message)),
         Req::Load | Req::Dismiss { .. } | Req::ShowOnHome { .. } | Req::AutoStart { .. } => {
@@ -394,6 +405,27 @@ async fn run(req: &Req) -> Res {
             },
             Err(e) => Res::Snapshot(Err(refusal(e))),
         },
+        Req::StartBatch { items, .. } => {
+            let body = serde_json::json!({
+                "expected_profile": expected,
+                "items": items
+                    .iter()
+                    .map(|(provider_id, id)| serde_json::json!({ "provider_id": provider_id, "id": id }))
+                    .collect::<Vec<_>>(),
+            });
+            Res::StartedBatch(
+                client
+                    .start_suggestions(&body, items.len())
+                    .await
+                    .map(|answers| {
+                        answers
+                            .into_iter()
+                            .map(|a| ((a.provider_id, a.id), start_answer(a.status, &a.body)))
+                            .collect()
+                    })
+                    .map_err(refusal),
+            )
+        }
         Req::Start {
             provider_id,
             id,
@@ -1718,7 +1750,10 @@ const FEED_RELOAD: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often the feed reloads while a provider shows "refreshing…".
 const REFRESHING_RELOAD: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// A set of marked suggestions started one after another through the one-click start.
+/// Most items the daemon takes in one batch start.
+const MAX_START_BATCH: usize = 25;
+
+/// A set of marked suggestions started through the daemon's batch start.
 struct Batch {
     pending: Vec<ItemKey>,
     started: usize,
@@ -1742,8 +1777,8 @@ pub(super) struct FeedPoll {
     pub refreshed: bool,
     /// A prepared suggestion, with its key.
     pub start: Option<(ItemKey, Start)>,
-    /// What the daemon answered to a start, with the item it was for.
-    pub started: Option<(ItemKey, StartAnswer)>,
+    /// What the daemon answered to each start, with the item it was for.
+    pub started: Vec<(ItemKey, StartAnswer)>,
     /// Failure of a user-initiated request; background reloads only log.
     pub error: Option<String>,
     /// The item whose prepare `error` belongs to; `None` for a reload, refresh or dismiss.
@@ -2221,6 +2256,14 @@ impl SuggestionsFeed {
                     let _ = sink.send(format!("start {provider_id}/{id}{approved}"));
                     Res::Started(Ok(started.clone()))
                 }
+                Req::StartBatch { items, .. } => {
+                    let keys: Vec<String> = items.iter().map(|(p, i)| format!("{p}/{i}")).collect();
+                    let _ = sink.send(format!("start-batch {}", keys.join(" ")));
+                    Res::StartedBatch(Ok(items
+                        .into_iter()
+                        .map(|k| (k, started.clone()))
+                        .collect()))
+                }
                 Req::Refresh { .. } => Res::Refreshed(Ok(())),
                 Req::PreTrust { .. } => {
                     let _ = sink.send("pre-trust".into());
@@ -2345,7 +2388,7 @@ impl SuggestionsFeed {
         Ok(())
     }
 
-    /// Starts every key one after another, each as a one-click start.
+    /// Starts every key through the daemon's batch start, each as a one-click start.
     pub(super) fn start_batch(&mut self, keys: Vec<ItemKey>) {
         let origin = self.origin();
         self.failed = None;
@@ -2356,8 +2399,11 @@ impl SuggestionsFeed {
             failed: 0,
             first_failure: None,
         });
-        for key in keys {
-            self.submit_start(key, None, origin.clone());
+        for items in keys.chunks(MAX_START_BATCH) {
+            self.submit(Req::StartBatch {
+                items: items.to_vec(),
+                origin: origin.clone(),
+            });
         }
     }
 
@@ -2526,7 +2572,7 @@ impl SuggestionsFeed {
             changed: self.expire_recent(),
             refreshed: false,
             start: None,
-            started: None,
+            started: Vec::new(),
             error: None,
             prepare_failed: None,
             pretrusted: false,
@@ -2551,6 +2597,7 @@ impl SuggestionsFeed {
             Res::Snapshot(_) => ResKind::Snapshot,
             Res::Prepared(_) => ResKind::Prepare,
             Res::Started(_) => ResKind::Start,
+            Res::StartedBatch(_) => ResKind::StartBatch,
             _ => ResKind::Other,
         };
         match res {
@@ -2596,14 +2643,22 @@ impl SuggestionsFeed {
                 }
             }
             Res::Started(Ok(answer)) => match self.start_key.take() {
-                Some(key) => out.started = Some((key, answer)),
+                Some(key) => out.started.push((key, answer)),
                 None => out.error = Some("Profile changed, suggestion not started".into()),
             },
+            Res::StartedBatch(Ok(answers)) => out.started.extend(answers),
             Res::Snapshot(Err(e))
             | Res::Refreshed(Err(e))
             | Res::Prepared(Err(e))
             | Res::Started(Err(e))
+            | Res::StartedBatch(Err(e))
             | Res::PreTrusted(Err(e)) => {
+                if matches!(req_kind, ResKind::StartBatch) {
+                    // None of it started; a later chunk would only be answered with no batch to join.
+                    self.batch = None;
+                    self.queued
+                        .retain(|req| !matches!(req, Req::StartBatch { .. }));
+                }
                 if matches!(req_kind, ResKind::Prepare) {
                     out.prepare_failed = self.prepare_key.take();
                 }
@@ -3155,7 +3210,7 @@ mod tests {
             changed: true,
             refreshed: false,
             start: None,
-            started: None,
+            started: Vec::new(),
             error: None,
             prepare_failed: None,
             pretrusted: false,
@@ -3232,7 +3287,7 @@ mod tests {
             changed: false,
             refreshed: false,
             start: None,
-            started: None,
+            started: Vec::new(),
             error: None,
             prepare_failed: None,
             pretrusted: false,

@@ -859,6 +859,86 @@ fn create_body(
     }))
 }
 
+/// Most items one batch start takes: each create can run for minutes.
+const MAX_START_BATCH: usize = 25;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBatchBody {
+    expected_profile: Option<String>,
+    items: Vec<StartBatchItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBatchItem {
+    provider_id: String,
+    id: String,
+}
+
+/// A handler's answer as its status and JSON body.
+pub(super) async fn response_json(
+    response: axum::response::Response,
+) -> (StatusCode, serde_json::Value) {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// Starts each item as `start_suggestion` would, one after another, without
+/// approving any hooks. The answer is 200 with each item's own status and body,
+/// so a failure or a hooks review in one never stops the rest.
+pub async fn start_suggestions(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<StartBatchBody>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    if body.items.is_empty() || body.items.len() > MAX_START_BATCH {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("items must hold 1 to {MAX_START_BATCH} suggestions"),
+        );
+    }
+    let mut results = Vec::with_capacity(body.items.len());
+    for StartBatchItem { provider_id, id } in body.items {
+        let response = start_suggestion(
+            State(state.clone()),
+            Ok(Json(StartBody {
+                expected_profile: None,
+                provider_id: provider_id.clone(),
+                id: id.clone(),
+                project: None,
+                approve_hooks: false,
+                review_fingerprint: None,
+            })),
+        )
+        .await;
+        let (status, answer) = response_json(response).await;
+        results.push(json!({
+            "provider_id": provider_id,
+            "id": id,
+            "status": status.as_u16(),
+            "body": answer,
+        }));
+    }
+    Json(json!({ "results": results })).into_response()
+}
+
 pub async fn start_suggestion(
     State(state): State<Arc<AppState>>,
     body: Result<Json<StartBody>, axum::extract::rejection::JsonRejection>,

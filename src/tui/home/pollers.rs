@@ -138,7 +138,7 @@ impl HomeView {
             self.update_selected();
             changed = true;
         }
-        if let Some((key, answer)) = polled.started {
+        for (key, answer) in polled.started {
             self.apply_start_answer(key, answer);
             changed = true;
         }
