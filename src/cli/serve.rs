@@ -3191,6 +3191,8 @@ mod tests {
             (b"/x/aoe-darwin-arm64 -p work serve --daemon-child", true),
             (b"/x/aoe-darwin-arm64 serve --daemon", false),
             (b"/x/aoe-darwin-arm64 serve", false),
+            (b"/x/aoe-darwin-arm64 serve --daemon --daemon-child", false),
+            (b"runner --label aoe serve --daemon-child", false),
             (b"runner --label aoe serve", false),
         ];
         for (command, expected) in cases {
