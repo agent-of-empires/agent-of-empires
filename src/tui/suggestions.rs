@@ -1460,15 +1460,19 @@ impl SuggestionsView {
             ));
         }
         let mut parts = vec![item.reason.clone()];
-        // A heading already names the Project.
-        if !(headed && item.group().is_some()) {
+        // A heading already names the Project (or "No project" when ungrouped).
+        if !headed {
             parts.push(
                 item.resolved_project
                     .as_ref()
                     .map(|p| p.name.clone())
                     .or_else(|| item.project.clone())
-                    .unwrap_or_else(|| "no project".to_string()),
+                    .unwrap_or_else(|| "No project".to_string()),
             );
+        } else if item.group().is_none() {
+            if let Some(project) = item.project.as_ref().filter(|p| !p.is_empty()) {
+                parts.push(project.clone());
+            }
         }
         if let Some(s) = &item.started_session {
             parts.push(if s.archived {
@@ -2654,9 +2658,45 @@ mod tests {
             "the window scrolled to the last group"
         );
         let flat = view_with(vec![item("x", None, false)], idle_worker());
+        let flat_text = render_text(&flat);
         assert!(
-            !render_text(&flat).contains("No project"),
-            "no headings without a resolved project"
+            !flat_text.contains("▾ No project"),
+            "no headings without a resolved project: {flat_text}"
+        );
+    }
+
+    #[test]
+    fn no_project_subtitle_omits_repeat_under_heading_and_matches_case_when_flat() {
+        let grouped = view_with(
+            vec![
+                in_project(item("w1", None, false), "web"),
+                item("loose", None, false),
+            ],
+            idle_worker(),
+        );
+        let grouped_text = render_text(&grouped);
+        assert!(grouped_text.contains("▾ No project"), "{grouped_text}");
+        let grouped_sub = grouped_text
+            .lines()
+            .skip_while(|line| !line.contains("loose"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("subtitle line after loose in {grouped_text}"));
+        assert!(
+            !grouped_sub.to_lowercase().contains("no project"),
+            "subtitle under 'No project' heading must not repeat it: {grouped_sub}"
+        );
+
+        let flat = view_with(vec![item("solo", None, false)], idle_worker());
+        let flat_text = render_text(&flat);
+        assert!(!flat_text.contains("▾ No project"), "{flat_text}");
+        let flat_sub = flat_text
+            .lines()
+            .skip_while(|line| !line.contains("solo"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("subtitle line after solo in {flat_text}"));
+        assert!(
+            flat_sub.contains("No project") && !flat_sub.contains("no project"),
+            "flat subtitle should match heading case ('No project'): {flat_sub}"
         );
     }
 
