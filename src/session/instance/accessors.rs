@@ -540,18 +540,6 @@ impl Instance {
         let Some(active) = &self.active_execution else {
             return self.resolved_session_support();
         };
-        // A launch that published through the hook sidecar is described by the
-        // declaration that launched it, even where the tool name also carries a
-        // built-in capture of its own. An execution that launched under the
-        // built-in backend keeps that backend.
-        let hook_sidecar_launch = active.binding.agent == self.tool
-            && matches!(active.capture, Some(CaptureContext::Hooks(_)));
-        if let Some(declared) = hook_sidecar_launch
-            .then(|| self.declared_session_support(active.container.is_some()))
-            .flatten()
-        {
-            return Some(declared);
-        }
         let Some(native) = crate::agents::native_definition(&active.binding.agent) else {
             if active.binding.agent != self.tool {
                 return None;
