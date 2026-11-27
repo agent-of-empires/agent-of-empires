@@ -1786,17 +1786,16 @@ impl App {
     }
 
     /// The Update key on a drawn sandbox image line: opens the pull prompt if that update is
-    /// still current and no pull is on the bar, and otherwise spends the key. On a failed or
-    /// cancelled pull it pulls again. Any other drawn line returns false, leaving the key to
-    /// the home Update action.
+    /// still current and no pull is on the bar, and otherwise spends the key. On a drawn failed
+    /// or cancelled pull it pulls again if that is still the line, and spends the key if not.
+    /// Any other drawn line returns false, leaving the key to the home Update action.
     fn pull_from_update_bar(&mut self) -> bool {
         match &self.drawn_bar {
-            Some(DrawnBar::Pull(drawn)) => {
-                if !self.pull.retries(drawn) {
-                    return false;
-                }
-                self.start_pull(self.pull_image.clone());
-            }
+            Some(DrawnBar::Pull(drawn)) => match self.pull.retry(drawn) {
+                None => return false,
+                Some(true) => self.start_pull(self.pull_image.clone()),
+                Some(false) => {}
+            },
             Some(DrawnBar::ImageUpdate { digest }) => {
                 if let Some(update) = self
                     .image_update
@@ -5837,6 +5836,62 @@ mod tests {
                 app.handle_key(ctrl_x, &mut terminal).await.unwrap();
                 assert_eq!(app.pull.line(), expected, "{kind}: Ctrl+X #{press}");
             }
+        }
+
+        // The Update key on a drawn failure that is no longer the line, before the next draw, is
+        // spent: it neither retries nor reaches the app updater behind the pull.
+        let update = bindings::key_event(bindings::ActionId::Update, false).unwrap();
+        for case in [
+            "Ctrl+X promoted a waiting pull",
+            "a second Update after the retry",
+        ] {
+            let (mut app, mut terminal) = key_app();
+            let sent = hold_pull_requests(&mut app);
+            app.update_info = Some(app_update());
+            app.start_pull(image_update().image);
+            answer_sent(
+                &mut app,
+                &sent,
+                0,
+                PullReport::State(PullState::Running(Default::default())),
+            );
+            answer_pull(
+                &mut app,
+                PullRequest::Poll,
+                PullReport::State(PullState::Failed {
+                    reason: crate::containers::image_pull::PullFailureReason::Network,
+                    message: String::new(),
+                    error: String::new(),
+                }),
+            );
+            if case == "Ctrl+X promoted a waiting pull" {
+                answer_pull(
+                    &mut app,
+                    PullRequest::Poll,
+                    PullReport::State(PullState::Running(Default::default())),
+                );
+            }
+            draw(&mut app);
+            let first = if case == "Ctrl+X promoted a waiting pull" {
+                ctrl_x
+            } else {
+                update
+            };
+            for key in [first, update] {
+                app.handle_key(key, &mut terminal).await.unwrap();
+            }
+            assert!(app.pull.running(), "{case}: the pull isn't on the line");
+            // The Start answered above has left the list, so only a retry's is in it.
+            let starts = sent_requests(&sent)
+                .iter()
+                .filter(|(request, _)| *request == PullRequest::Start)
+                .count();
+            let retried = usize::from(case == "a second Update after the retry");
+            assert_eq!(starts, retried, "{case}: a stale retry pulled again");
+            assert!(
+                !app.home.has_dialog() && app.update_status.is_none(),
+                "{case}: a stale retry reached the app updater"
+            );
         }
     }
 

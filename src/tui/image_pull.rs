@@ -388,9 +388,11 @@ impl PullWatch {
         true
     }
 
-    /// Whether the Update key on the drawn line retries the pull.
-    pub(crate) fn retries(&self, drawn: &DrawnPull) -> bool {
-        self.is_drawn(drawn) && matches!(drawn.line, PullLine::Failed(_) | PullLine::Cancelled)
+    /// The Update key on the drawn line: None when it offers no retry, otherwise whether that
+    /// offer is still the line's. A stale offer spends the key without retrying.
+    pub(crate) fn retry(&self, drawn: &DrawnPull) -> Option<bool> {
+        matches!(drawn.line, PullLine::Failed(_) | PullLine::Cancelled)
+            .then(|| self.is_drawn(drawn))
     }
 
     /// Whether a cancel may go out for this pull. After a Start with no reply, only a poll
@@ -890,7 +892,7 @@ mod tests {
             .drawn()
             .expect("the outcome shows though the pull was hidden");
         assert_eq!(watch.hidden_progress(), None);
-        assert!(watch.retries(&outcome));
+        assert_eq!(watch.retry(&outcome), Some(true));
         assert!(watch.dismiss(&outcome));
         assert_eq!(watch.line(), None);
         assert!(!watch.holds_line());
