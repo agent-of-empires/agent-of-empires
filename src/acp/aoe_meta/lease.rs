@@ -1,7 +1,7 @@
 //! Expiring leases: a dead proxy's holds drain on their own.
 
 use super::{LeaseKind, LeaseOp, LeaseVerb, RunState};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// More simultaneous leases than any real agent holds; a larger table is a
@@ -32,64 +32,68 @@ pub struct LeaseTable {
     lapsed: Mutex<Vec<Key>>,
 }
 
+/// The lease op a `started` or `ended` frame derives: `started` acquires or
+/// renews a task lease for `ttl_ms`; `ended` releases it.
+pub fn derived_op(id: &str, state: RunState, ttl_ms: Option<u64>) -> LeaseOp {
+    LeaseOp {
+        id: id.to_string(),
+        kind: LeaseKind::Task,
+        op: match state {
+            RunState::Started => LeaseVerb::Acquire,
+            RunState::Ended => LeaseVerb::Release,
+        },
+        ttl_ms,
+    }
+}
+
 impl LeaseTable {
-    /// A renew of an unknown or expired id re-acquires it: the renew can race
-    /// the expiry.
-    pub fn apply(&self, op: &LeaseOp, now_ms: i64) -> Result<(), LeaseTableFull> {
-        self.apply_in(LeaseNamespace::Explicit, op, now_ms)
-            .map(|_| ())
-    }
-
-    /// `started` acquires or renews a task lease for `ttl_ms`; `ended`
-    /// releases it. Returns whether the id was already open: held, or lapsed
-    /// and not yet reported.
-    pub fn apply_derived(
+    /// Applies the ops of one frame together: all, or none when the new keys do
+    /// not fit. Returns per op whether its id was already open: held, or
+    /// lapsed and not yet reported. A renew of an unknown or expired id
+    /// re-acquires it: the renew can race the expiry.
+    pub fn apply_all(
         &self,
-        namespace: LeaseNamespace,
-        id: &str,
-        state: RunState,
-        ttl_ms: Option<u64>,
+        ops: &[(LeaseNamespace, LeaseOp)],
         now_ms: i64,
-    ) -> Result<bool, LeaseTableFull> {
-        let op = LeaseOp {
-            id: id.to_string(),
-            kind: LeaseKind::Task,
-            op: match state {
-                RunState::Started => LeaseVerb::Acquire,
-                RunState::Ended => LeaseVerb::Release,
-            },
-            ttl_ms,
-        };
-        self.apply_in(namespace, &op, now_ms)
-    }
-
-    fn apply_in(
-        &self,
-        namespace: LeaseNamespace,
-        op: &LeaseOp,
-        now_ms: i64,
-    ) -> Result<bool, LeaseTableFull> {
-        let key = (namespace, op.id.clone());
+    ) -> Result<Vec<bool>, LeaseTableFull> {
         let mut held = self.held.lock().expect("lease table mutex poisoned");
         let mut lapsed = self.lapsed.lock().expect("lease table mutex poisoned");
         Self::expire(&mut held, &mut lapsed, now_ms);
-        let was_open = held.contains_key(&key) || lapsed.contains(&key);
-        match op.op {
-            LeaseVerb::Release => {
-                lapsed.retain(|k| *k != key);
-                held.remove(&key);
-            }
-            LeaseVerb::Acquire | LeaseVerb::Renew => {
-                if !held.contains_key(&key) && held.len() >= MAX_LEASES {
-                    return Err(LeaseTableFull);
+        let mut added = HashSet::new();
+        let mut freed = HashSet::new();
+        for (ns, op) in ops {
+            let key = (*ns, op.id.clone());
+            match op.op {
+                LeaseVerb::Release if held.contains_key(&key) => {
+                    freed.insert(key);
                 }
-                // The frame itself reports this id's state, so a lapse is stale.
-                lapsed.retain(|k| *k != key);
-                let ttl = op.ttl_ms.unwrap_or(0).min(i64::MAX as u64) as i64;
-                held.insert(key, (op.kind, now_ms.saturating_add(ttl)));
+                LeaseVerb::Acquire | LeaseVerb::Renew if !held.contains_key(&key) => {
+                    added.insert(key);
+                }
+                _ => {}
             }
         }
-        Ok(was_open)
+        if held.len() + added.len() - freed.len() > MAX_LEASES {
+            return Err(LeaseTableFull);
+        }
+        let mut open = Vec::with_capacity(ops.len());
+        for (ns, op) in ops {
+            let key = (*ns, op.id.clone());
+            open.push(held.contains_key(&key) || lapsed.contains(&key));
+            match op.op {
+                LeaseVerb::Release => {
+                    lapsed.retain(|k| *k != key);
+                    held.remove(&key);
+                }
+                LeaseVerb::Acquire | LeaseVerb::Renew => {
+                    // The frame itself reports this id's state, so a lapse is stale.
+                    lapsed.retain(|k| *k != key);
+                    let ttl = op.ttl_ms.unwrap_or(0).min(i64::MAX as u64) as i64;
+                    held.insert(key, (op.kind, now_ms.saturating_add(ttl)));
+                }
+            }
+        }
+        Ok(open)
     }
 
     fn expire(held: &mut HashMap<Key, (LeaseKind, i64)>, lapsed: &mut Vec<Key>, now_ms: i64) {
@@ -157,25 +161,41 @@ mod tests {
         }
     }
 
+    fn apply(t: &LeaseTable, op: &LeaseOp, now_ms: i64) -> Result<(), LeaseTableFull> {
+        let ops = [(LeaseNamespace::Explicit, op.clone())];
+        t.apply_all(&ops, now_ms).map(|_| ())
+    }
+
+    fn apply_derived(
+        t: &LeaseTable,
+        ns: LeaseNamespace,
+        id: &str,
+        state: RunState,
+        ttl_ms: Option<u64>,
+        now_ms: i64,
+    ) -> Result<bool, LeaseTableFull> {
+        let ops = [(ns, derived_op(id, state, ttl_ms))];
+        t.apply_all(&ops, now_ms).map(|open| open[0])
+    }
     #[test]
     fn lease_lifecycle() {
         use LeaseKind::*;
         use LeaseVerb::*;
         let t = LeaseTable::default();
-        t.apply(&op("a", Busy, Acquire, Some(1000)), 0).unwrap();
+        apply(&t, &op("a", Busy, Acquire, Some(1000)), 0).unwrap();
         assert!(t.working(999), "live before expiry");
         assert!(!t.working(1000), "expired with no further frames");
 
-        t.apply(&op("a", Busy, Acquire, Some(1000)), 0).unwrap();
-        t.apply(&op("a", Busy, Renew, Some(1000)), 900).unwrap();
+        apply(&t, &op("a", Busy, Acquire, Some(1000)), 0).unwrap();
+        apply(&t, &op("a", Busy, Renew, Some(1000)), 900).unwrap();
         assert!(t.working(1800), "renew extends the deadline");
         assert!(!t.working(1900));
 
-        t.apply(&op("b", Task, Acquire, Some(5000)), 0).unwrap();
-        t.apply(&op("b", Task, Release, None), 10).unwrap();
+        apply(&t, &op("b", Task, Acquire, Some(5000)), 0).unwrap();
+        apply(&t, &op("b", Task, Release, None), 10).unwrap();
         assert!(!t.live(Task, 11), "release drops it at once");
 
-        t.apply(&op("c", Compaction, Renew, Some(100)), 0).unwrap();
+        apply(&t, &op("c", Compaction, Renew, Some(100)), 0).unwrap();
         assert!(t.live(Compaction, 99), "renew of an unknown id re-acquires");
         assert!(!t.live(Task, 99), "compaction does not count as a task");
     }
@@ -185,12 +205,12 @@ mod tests {
         use LeaseNamespace::*;
         let t = LeaseTable::default();
         let started = |ns, id: &str, ttl, now| {
-            t.apply_derived(ns, id, RunState::Started, Some(ttl), now)
-                .unwrap()
+            apply_derived(&t, ns, id, RunState::Started, Some(ttl), now).unwrap()
         };
         let ended =
-            |ns, id: &str, now| t.apply_derived(ns, id, RunState::Ended, None, now).unwrap();
-        t.apply(
+            |ns, id: &str, now| apply_derived(&t, ns, id, RunState::Ended, None, now).unwrap();
+        apply(
+            &t,
             &op("x", LeaseKind::Compaction, LeaseVerb::Acquire, Some(5000)),
             0,
         )
@@ -222,13 +242,16 @@ mod tests {
         use LeaseNamespace::*;
         let t = LeaseTable::default();
         let start = |ns, id: &str, now| {
-            t.apply_derived(ns, id, RunState::Started, Some(100), now)
-                .unwrap()
+            apply_derived(&t, ns, id, RunState::Started, Some(100), now).unwrap()
         };
         start(BackgroundTask, "t", 0);
         start(WorkflowRun, "w", 0);
-        t.apply(&op("e", LeaseKind::Busy, LeaseVerb::Acquire, Some(100)), 0)
-            .unwrap();
+        apply(
+            &t,
+            &op("e", LeaseKind::Busy, LeaseVerb::Acquire, Some(100)),
+            0,
+        )
+        .unwrap();
         assert!(t.drain_expired(99).is_empty(), "nothing has expired yet");
         let mut got = t.drain_expired(100);
         got.sort_by_key(|(_, id)| id.clone());
@@ -248,8 +271,7 @@ mod tests {
         use LeaseNamespace::*;
         let t = LeaseTable::default();
         let apply = |id: &str, state, now| {
-            t.apply_derived(BackgroundTask, id, state, Some(100), now)
-                .unwrap()
+            apply_derived(&t, BackgroundTask, id, state, Some(100), now).unwrap()
         };
         apply("rel", RunState::Started, 0);
         apply("rel", RunState::Ended, 50);
@@ -264,10 +286,16 @@ mod tests {
         );
 
         let t = LeaseTable::default();
-        t.apply_derived(BackgroundTask, "gone", RunState::Started, Some(100), 0)
-            .unwrap();
-        t.apply_derived(BackgroundTask, "next", RunState::Started, Some(100), 200)
-            .unwrap();
+        apply_derived(&t, BackgroundTask, "gone", RunState::Started, Some(100), 0).unwrap();
+        apply_derived(
+            &t,
+            BackgroundTask,
+            "next",
+            RunState::Started,
+            Some(100),
+            200,
+        )
+        .unwrap();
         assert_eq!(
             t.drain_expired(250),
             [(BackgroundTask, "gone".to_string())],
@@ -279,7 +307,8 @@ mod tests {
     fn table_is_bounded() {
         let t = LeaseTable::default();
         for i in 0..MAX_LEASES {
-            t.apply(
+            apply(
+                &t,
                 &op(
                     &i.to_string(),
                     LeaseKind::Task,
@@ -291,16 +320,15 @@ mod tests {
             .unwrap();
         }
         let extra = op("extra", LeaseKind::Task, LeaseVerb::Acquire, Some(10));
-        assert!(t.apply(&extra, 0).is_err());
-        assert!(t.apply(&extra, 10).is_ok(), "expired entries free room");
+        assert!(apply(&t, &extra, 0).is_err());
+        assert!(apply(&t, &extra, 10).is_ok(), "expired entries free room");
     }
 
     #[test]
     fn a_failed_acquire_keeps_the_pending_lapse() {
         let t = LeaseTable::default();
         let ns = LeaseNamespace::BackgroundTask;
-        t.apply_derived(ns, "d", RunState::Started, Some(10), 0)
-            .unwrap();
+        apply_derived(&t, ns, "d", RunState::Started, Some(10), 0).unwrap();
         for i in 0..MAX_LEASES - 1 {
             let hold = op(
                 &i.to_string(),
@@ -308,13 +336,41 @@ mod tests {
                 LeaseVerb::Acquire,
                 Some(1000),
             );
-            t.apply(&hold, 0).unwrap();
+            apply(&t, &hold, 0).unwrap();
         }
         // This apply expires "d" into the pending lapses and fills the table.
         let last = op("last", LeaseKind::Busy, LeaseVerb::Acquire, Some(1000));
-        t.apply(&last, 10).unwrap();
-        let restart = t.apply_derived(ns, "d", RunState::Started, Some(10), 11);
+        apply(&t, &last, 10).unwrap();
+        let restart = apply_derived(&t, ns, "d", RunState::Started, Some(10), 11);
         assert!(restart.is_err(), "the table is full");
         assert_eq!(t.drain_expired(11), vec![(ns, "d".to_string())]);
+    }
+
+    #[test]
+    fn a_frame_that_does_not_fit_changes_nothing() {
+        use LeaseNamespace::*;
+        let t = LeaseTable::default();
+        apply_derived(&t, BackgroundTask, "t", RunState::Started, Some(10), 0).unwrap();
+        for i in 0..MAX_LEASES - 2 {
+            let hold = op(
+                &i.to_string(),
+                LeaseKind::Busy,
+                LeaseVerb::Acquire,
+                Some(1000),
+            );
+            apply(&t, &hold, 0).unwrap();
+        }
+        // "t" lapses here: the batch needs three slots and two are free.
+        let batch = [
+            (BackgroundTask, derived_op("t", RunState::Started, Some(10))),
+            (WorkflowRun, derived_op("w", RunState::Started, Some(10))),
+            (
+                Explicit,
+                op("x", LeaseKind::Busy, LeaseVerb::Acquire, Some(10)),
+            ),
+        ];
+        assert!(t.apply_all(&batch, 10).is_err());
+        assert_eq!(t.drain_expired(10), [(BackgroundTask, "t".to_string())]);
+        assert!(!t.live(LeaseKind::Task, 10), "nothing was admitted");
     }
 }

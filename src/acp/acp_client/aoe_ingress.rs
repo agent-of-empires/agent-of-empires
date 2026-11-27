@@ -1,7 +1,7 @@
 //! Consumes `_meta.aoe` on inbound `session/update` frames, in arrival order,
 //! before anything maps them to events.
 
-use crate::acp::aoe_meta::lease::{LeaseNamespace, LeaseTable, LeaseTableFull};
+use crate::acp::aoe_meta::lease::{derived_op, LeaseNamespace, LeaseTable, LeaseTableFull};
 use crate::acp::aoe_meta::ordering::{Arrival, ArrivalOrder};
 use crate::acp::aoe_meta::{self, Envelope};
 use crate::acp::state::{Event, IntegrationLostReason};
@@ -220,30 +220,31 @@ impl AoeIngress {
         finish_events(self.leases.drain_expired(now_ms))
     }
 
-    /// The explicit lease, then the task leases a background task or workflow
-    /// run derives. Returns whether the task and the run were already open.
+    /// The explicit lease and the task leases a background task or workflow run
+    /// derives, admitted together. Returns whether the task and the run were already open.
     fn apply_leases(
         &self,
         envelope: &Envelope,
         now_ms: i64,
     ) -> Result<(bool, bool), LeaseTableFull> {
+        let mut ops = Vec::new();
         if let Some(lease) = &envelope.lease {
-            self.leases.apply(lease, now_ms)?;
+            ops.push((LeaseNamespace::Explicit, lease.clone()));
         }
-        let mut open = (false, false);
+        let mut slots = (None, None);
         if let Some(task) = &envelope.background_task {
-            let ns = LeaseNamespace::BackgroundTask;
-            open.0 = self
-                .leases
-                .apply_derived(ns, &task.id, task.state, task.ttl_ms, now_ms)?;
+            slots.0 = Some(ops.len());
+            let op = derived_op(&task.id, task.state, task.ttl_ms);
+            ops.push((LeaseNamespace::BackgroundTask, op));
         }
         if let Some(run) = &envelope.workflow_run {
-            let ns = LeaseNamespace::WorkflowRun;
-            open.1 = self
-                .leases
-                .apply_derived(ns, &run.id, run.state, run.ttl_ms, now_ms)?;
+            slots.1 = Some(ops.len());
+            let op = derived_op(&run.id, run.state, run.ttl_ms);
+            ops.push((LeaseNamespace::WorkflowRun, op));
         }
-        Ok(open)
+        let was_open = self.leases.apply_all(&ops, now_ms)?;
+        let open = |slot: Option<usize>| slot.is_some_and(|i| was_open[i]);
+        Ok((open(slots.0), open(slots.1)))
     }
 
     /// Numbers `n` frames the session identity discarded before they got
@@ -726,25 +727,19 @@ mod tests {
 
         open_task(&i);
         // Lapsed in the table but not yet drained by the idle tick.
+        let derived = (
+            LeaseNamespace::BackgroundTask,
+            derived_op("stale", aoe_meta::RunState::Started, Some(1)),
+        );
+        i.leases.apply_all(&[derived], 0).unwrap();
+        let explicit = aoe_meta::LeaseOp {
+            id: "e".into(),
+            kind: aoe_meta::LeaseKind::Busy,
+            op: aoe_meta::LeaseVerb::Acquire,
+            ttl_ms: Some(10),
+        };
         i.leases
-            .apply_derived(
-                LeaseNamespace::BackgroundTask,
-                "stale",
-                aoe_meta::RunState::Started,
-                Some(1),
-                0,
-            )
-            .unwrap();
-        i.leases
-            .apply(
-                &aoe_meta::LeaseOp {
-                    id: "e".into(),
-                    kind: aoe_meta::LeaseKind::Busy,
-                    op: aoe_meta::LeaseVerb::Acquire,
-                    ttl_ms: Some(10),
-                },
-                100_000_000,
-            )
+            .apply_all(&[(LeaseNamespace::Explicit, explicit)], 100_000_000)
             .unwrap();
         assert_eq!(
             finished_ids(&i.begin_connection(true)),

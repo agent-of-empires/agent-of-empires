@@ -837,7 +837,9 @@ mod tests {
             op: LeaseVerb::Acquire,
             ttl_ms: Some(60_000),
         };
-        leases.apply(&acquire, 0).unwrap();
+        leases
+            .apply_all(&[(aoe_meta::lease::LeaseNamespace::Explicit, acquire)], 0)
+            .unwrap();
         // (now, idle since the lease frame, stop expected); grace is 30s.
         for (now, idle, stop) in [
             (31_000, 31_000, false),
