@@ -39,7 +39,8 @@ for (const c of [
       .poll(async () => (await assignedIds(serve, sessionId)).length, { timeout: 45_000, intervals: [500] })
       .toBeGreaterThan(0);
     const [firstId] = await assignedIds(serve, sessionId);
-    expect((await postPrompt(serve.baseUrl, sessionId, c.command)).status).toBe(202);
+    const reset = await postPrompt(serve.baseUrl, sessionId, c.command);
+    expect(reset.status, reset.ok ? undefined : await reset.text()).toBe(202);
 
     const resetDone = async () => {
       const freshId = (await assignedIds(serve, sessionId)).at(-1);
@@ -58,6 +59,8 @@ for (const c of [
       view: "structured",
       acp_session_id: freshId,
     });
+    const nativeRequests = readFileSync(join(serve.home, "fake-acp.log"), "utf8");
+    expect(nativeRequests.match(/handleRequest method=session\/new id=/g)).toHaveLength(2);
 
     if (!c.claude) {
       expect(JSON.stringify(await replayFrames(serve.baseUrl, sessionId))).not.toContain("unknown command");

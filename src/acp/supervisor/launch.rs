@@ -181,127 +181,167 @@ impl LiveFreshProposal {
         namespace: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<LiveFreshArm> {
-        tokio::task::spawn_blocking(move || {
-            use crate::acp::establishment::EstablishmentRefusal;
-            let _namespace = namespace;
-            let store = &self.admission.store;
-            let _native = store
-                .storage()
-                .acquire_instance_lifecycle_lock(self.lease.session_id())?;
-            self.check_current()?;
-            self.check_owner()?;
-            anyhow::ensure!(
-                tokio::time::Instant::now() < deadline
-                    && self
-                        .projection
-                        .applied()
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, &self.postimage))
-                    && self
-                        .projection
-                        .delivery()
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, &self.predecessor))
-                    && self.seal.matches(&self.receipt),
-                EstablishmentRefusal::Unconfirmed
-            );
-            // Clear/supersession can invalidate a seal while the command waits.
-            let seal = self.journal.establishment_seal(&self.receipt)?;
-            let mut mutation = |rows: &mut Vec<crate::session::Instance>,
-                                _: &mut Vec<crate::session::Group>|
-             -> anyhow::Result<()> {
-                let row = rows
-                    .iter_mut()
-                    .find(|row| row.id == self.lease.session_id())
-                    .ok_or(crate::session::SessionGone)?;
-                anyhow::ensure!(
-                    tokio::time::Instant::now() < deadline
-                        && !self.lease.cancellation().is_cancelled()
-                        && self.expected.matches(row, store.storage())?,
-                    EstablishmentRefusal::Superseded
-                );
-                row.install_prepared_acp_fresh(
-                    store.storage(),
-                    &self.expected,
-                    &self.attempt,
-                    self.lease.producer_id(),
-                )
-            };
-            let committed = store.commit(&mut mutation);
-            let row = store
-                .storage()
-                .load_instances_complete()?
-                .into_iter()
+        let original = Arc::clone(&self);
+        let (confirmed, prepared, _namespace) = tokio::task::spawn_blocking(move || {
+            let (confirmed, prepared) = original.commit_fresh(deadline)?;
+            anyhow::Ok((confirmed, prepared, namespace))
+        })
+        .await??;
+        let Some(prepared) = prepared else {
+            return Ok(LiveFreshArm {
+                begun: false,
+                admitted: false,
+                confirmed,
+            });
+        };
+
+        // The commit wakes runtime publication, which can be reading the worker
+        // lifecycle here. Wait without the native flock; do not repeat the CAS.
+        let admitted = self.install_fresh_admission(prepared, deadline).await;
+        Ok(LiveFreshArm {
+            begun: true,
+            admitted,
+            confirmed,
+        })
+    }
+
+    fn commit_fresh(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<(bool, Option<super::LaunchAdmission>)> {
+        use crate::acp::establishment::EstablishmentRefusal;
+        let store = &self.admission.store;
+        let _native = store
+            .storage()
+            .acquire_instance_lifecycle_lock(self.lease.session_id())?;
+        self.check_current()?;
+        self.check_owner()?;
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline
+                && self
+                    .projection
+                    .applied()
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &self.postimage))
+                && self
+                    .projection
+                    .delivery()
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &self.predecessor))
+                && self.seal.matches(&self.receipt),
+            EstablishmentRefusal::Unconfirmed
+        );
+        // Clear/supersession can invalidate a seal while the command waits.
+        let seal = self.journal.establishment_seal(&self.receipt)?;
+        let mut mutation = |rows: &mut Vec<crate::session::Instance>,
+                            _: &mut Vec<crate::session::Group>|
+         -> anyhow::Result<()> {
+            let row = rows
+                .iter_mut()
                 .find(|row| row.id == self.lease.session_id())
                 .ok_or(crate::session::SessionGone)?;
-            if !self.attempt.matches_pending(&row, store.storage())? {
-                committed?;
-                anyhow::bail!(EstablishmentRefusal::Superseded);
-            }
-            let confirmed = committed.is_ok();
-            if let Err(error) = committed {
-                warn!(target: "acp.establishment", %error,
-                    "live Fresh native write is present but unconfirmed");
-            }
-            let begun = self.projection.begin(
-                Arc::clone(&self.attempt),
-                &self.predecessor,
-                &self.postimage,
-                &seal,
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline
+                    && !self.lease.cancellation().is_cancelled()
+                    && self.expected.matches(row, store.storage())?,
+                EstablishmentRefusal::Superseded
             );
-            if !begun {
-                return Ok(LiveFreshArm {
-                    begun: false,
-                    admitted: false,
-                    confirmed,
-                });
-            }
-            let mut prepared = self.admission.clone();
-            prepared.generation = self.attempt.generation;
-            prepared.establishment = Some(Arc::clone(&self.attempt));
-            prepared.native_scope = Some(crate::acp::state::NativeObservationScope::capture(
-                &row,
+            row.install_prepared_acp_fresh(
                 store.storage(),
-            )?);
-            let admitted = (|| -> anyhow::Result<bool> {
-                let workers = self
-                    .workers
-                    .upgrade()
-                    .ok_or(EstablishmentRefusal::Superseded)?;
-                let lifecycle = self
-                    .lifecycle
-                    .upgrade()
-                    .ok_or(EstablishmentRefusal::Superseded)?;
-                let client = self
-                    .client
-                    .upgrade()
-                    .ok_or(EstablishmentRefusal::Superseded)?;
-                let workers = workers
-                    .try_lock()
-                    .map_err(|_| super::NativeObservationBusy)?;
-                let lifecycle = lifecycle
-                    .try_lock()
-                    .map_err(|_| super::NativeObservationBusy)?;
-                if !workers.get(self.lease.session_id()).is_some_and(|handle| {
-                    handle.lease == self.lease && Arc::ptr_eq(&handle.client, &client)
-                }) {
-                    return Ok(false);
+                &self.expected,
+                &self.attempt,
+                self.lease.producer_id(),
+            )
+        };
+        let committed = store.commit(&mut mutation);
+        let row = store
+            .storage()
+            .load_instances_complete()?
+            .into_iter()
+            .find(|row| row.id == self.lease.session_id())
+            .ok_or(crate::session::SessionGone)?;
+        if !self.attempt.matches_pending(&row, store.storage())? {
+            committed?;
+            anyhow::bail!(EstablishmentRefusal::Superseded);
+        }
+        let confirmed = committed.is_ok();
+        if let Err(error) = committed {
+            warn!(target: "acp.establishment", %error,
+                "live Fresh native write is present but unconfirmed");
+        }
+        let begun = self.projection.begin(
+            Arc::clone(&self.attempt),
+            &self.predecessor,
+            &self.postimage,
+            &seal,
+        );
+        if !begun {
+            return Ok((confirmed, None));
+        }
+        let mut prepared = self.admission.clone();
+        prepared.generation = self.attempt.generation;
+        prepared.establishment = Some(Arc::clone(&self.attempt));
+        prepared.native_scope = Some(crate::acp::state::NativeObservationScope::capture(
+            &row,
+            store.storage(),
+        )?);
+        Ok((confirmed, Some(prepared)))
+    }
+
+    async fn install_fresh_admission(
+        &self,
+        prepared: super::LaunchAdmission,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        let (Some(workers), Some(lifecycle), Some(client)) = (
+            self.workers.upgrade(),
+            self.lifecycle.upgrade(),
+            self.client.upgrade(),
+        ) else {
+            return false;
+        };
+        let cancellation = self.lease.cancellation();
+        loop {
+            {
+                let workers = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return false,
+                    result = tokio::time::timeout_at(deadline, workers.lock()) => match result {
+                        Ok(workers) => workers,
+                        Err(_) => return false,
+                    },
+                };
+                if tokio::time::Instant::now() >= deadline
+                    || !workers.get(self.lease.session_id()).is_some_and(|handle| {
+                        handle.lease == self.lease && Arc::ptr_eq(&handle.client, &client)
+                    })
+                    || client.ensure_available().is_err()
+                {
+                    return false;
                 }
-                Ok(lifecycle.replace_live_fresh_admission(
-                    &self.lease,
-                    self.owner,
-                    &self.admission,
-                    prepared,
-                ))
-            })()
-            .unwrap_or(false);
-            Ok(LiveFreshArm {
-                begun,
-                admitted,
-                confirmed,
-            })
-        })
-        .await?
+                let lifecycle = match lifecycle.try_lock() {
+                    Ok(lifecycle) => Some(lifecycle),
+                    Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                };
+                if let Some(lifecycle) = lifecycle {
+                    return lifecycle.replace_live_fresh_admission(
+                        &self.lease,
+                        self.owner,
+                        &self.admission,
+                        prepared,
+                    );
+                }
+            }
+            // Do not hold the worker table while waiting for the lifecycle table.
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return false,
+                _ = tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(2)),
+                ) => {}
+            }
+        }
     }
 
     /// A pre-arm refusal may keep old usability only with fresh positive proof.
@@ -3217,6 +3257,67 @@ pub(super) mod tests {
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use crate::daemon::AcpWorkerState;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn committed_live_fresh_waits_for_lifecycle_snapshot_without_rearming() {
+        managed::with_managed(|scope| {
+            Box::pin(async move {
+                let directory = scope.tempdir();
+                let (config, native) =
+                    scope.native_peer(directory.path().into(), "codex", "codex", |request| {
+                        let result = match request["method"].as_str()? {
+                            "initialize" => serde_json::json!({
+                                "protocolVersion": 1, "agentCapabilities": {}
+                            }),
+                            "session/new" => serde_json::json!({"sessionId": "initial-codex"}),
+                            other => panic!("unexpected native request: {other}"),
+                        };
+                        Some(
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                        )
+                    });
+                let client = scope
+                    .spawn(config, "codex-live-fresh-contention")
+                    .await
+                    .unwrap();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                let proposal = client.prepare_reset(deadline).await;
+                let original = Arc::clone(&proposal);
+                let (confirmed, prepared) =
+                    tokio::task::spawn_blocking(move || original.commit_fresh(deadline))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(confirmed);
+                let prepared = prepared.expect("the exact Fresh attempt committed");
+
+                let supervisor = &scope.state.acp_supervisor;
+                let install = proposal.install_fresh_admission(prepared, deadline);
+                tokio::pin!(install);
+                {
+                    let _snapshot = lock_recover(&supervisor.lifecycle);
+                    assert!(futures_util::poll!(&mut install).is_pending());
+                    assert!(!proposal
+                        .admission
+                        .store
+                        .storage()
+                        .instance_lifecycle_lock_is_held_for_test(&client.id));
+                    assert!(supervisor.workers.try_lock().is_ok());
+                }
+                assert!(install.await);
+                let admitted = client.lease.admission().unwrap().establishment.unwrap();
+                assert_eq!(admitted.id, proposal.attempt.id);
+                assert_eq!(
+                    native.requests(),
+                    ["initialize", "session/new"],
+                    "admission waits without issuing a second Native New"
+                );
+                client.shutdown().await.unwrap();
+            })
+        })
+        .await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
