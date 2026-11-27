@@ -12,17 +12,29 @@
  * the client as the proxy's own frames and the file is removed.
  */
 import { spawn } from "node:child_process";
-import { fstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  fstatSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
 const argv = process.argv.slice(2);
 const dir = process.env.FAKE_PROXY_RECORD_DIR;
+// Readers see a record whole or not at all.
+function publish(name, contents) {
+  const tmp = join(dir, `${name}.tmp`);
+  writeFileSync(tmp, contents);
+  renameSync(tmp, join(dir, name));
+}
 if (dir) {
-  writeFileSync(join(dir, "argv.json"), JSON.stringify(argv));
-  writeFileSync(join(dir, "pid"), String(process.pid));
-  writeFileSync(
-    join(dir, "env.json"),
+  publish("argv.json", JSON.stringify(argv));
+  publish("pid", String(process.pid));
+  publish(
+    "env.json",
     JSON.stringify({
       AOE_PROXY_LAUNCH_CONFIG: process.env.AOE_PROXY_LAUNCH_CONFIG ?? null,
     }),
@@ -38,21 +50,22 @@ if (sep < 0) {
   process.exit(2);
 }
 const [command, ...args] = argv.slice(sep + 1);
-// Pass every open fd above 2 through (the sandbox env fd rides one).
+// Pass every open fd above 2 through at its own number (the sandbox env fd
+// rides one); closed slots stay "ignore" so array index equals fd number.
 const extraFds = [];
 for (let fd = 3; fd < 16; fd++) {
   try {
     fstatSync(fd);
     extraFds.push(fd);
   } catch {
-    // Not open.
+    extraFds.push("ignore");
   }
 }
 const child = spawn(command, args, {
   stdio: ["pipe", "pipe", "inherit", ...extraFds],
 });
 
-if (dir) writeFileSync(join(dir, "adapter_pid"), String(child.pid));
+if (dir) publish("adapter_pid", String(child.pid));
 
 const hello = {
   plugin_id: mode === "bad-hello" ? "wrong-plugin" : "fake-proxy",

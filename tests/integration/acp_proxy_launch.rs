@@ -220,6 +220,65 @@ fn assert_no_orphans(session_id: &str, proxy_mode: &str, end: impl FnOnce(&str, 
     wait_until("adapter outlived the runner", || !pid_alive(&adapter_pid));
 }
 
+/// An inherited fd keeps its number through the proxy even when the fds below
+/// it are closed (`--env-file /dev/fd/9` names the number).
+#[test]
+#[serial]
+fn proxy_keeps_inherited_fd_numbers_across_closed_slots() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let temp = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _home = set_temp_home(temp.path());
+    let record_dir = temp.path().join("record");
+    std::fs::create_dir_all(&record_dir).unwrap();
+    let env_file = temp.path().join("env-file");
+    std::fs::write(&env_file, "SECRET=1").unwrap();
+    let out = record_dir.join("fd9");
+
+    let node = shim_node().expect("shim prerequisite");
+    let proxy = shim_path().with_file_name("fake-proxy.mjs");
+    let socket = worker_registry::socket_path_for("proxy-fd9").unwrap();
+    let file = std::fs::File::open(&env_file).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aoe"));
+    cmd.args(["__acp-runner", "--socket"])
+        .arg(&socket)
+        .args(["--session-id", "proxy-fd9", "--agent-name", "shim", "--cwd"])
+        .arg(temp.path())
+        .args(["--", node.to_str().unwrap(), proxy.to_str().unwrap()])
+        .args(["--", "sh", "-c", "cat /dev/fd/9 > \"$0\"; exec sleep 600"])
+        .arg(&out)
+        .env("FAKE_PROXY_RECORD_DIR", &record_dir)
+        .process_group(0);
+    let src = std::os::fd::AsRawFd::as_raw_fd(&file);
+    // SAFETY: only async-signal-safe libc calls between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(src, 9) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in 3..9 {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+    let mut runner = cmd.spawn().expect("spawn acp runner");
+    drop(file);
+
+    wait_until("adapter never read fd 9", || {
+        std::fs::read(&out).is_ok_and(|b| !b.is_empty())
+    });
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "SECRET=1");
+
+    signal("-TERM", &runner.id().to_string());
+    wait_until("runner did not exit", || {
+        runner.try_wait().unwrap().is_some()
+    });
+}
+
 fn signal(sig: &str, pid: &str) {
     assert!(Command::new("kill")
         .args([sig, pid])
