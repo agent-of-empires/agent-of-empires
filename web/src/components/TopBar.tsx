@@ -50,8 +50,7 @@ interface Props {
   unreadCount: number;
   /** Sessions waiting for input, across every workspace; shown as a badge on the sidebar toggle. */
   waitingCount: number;
-  /** Colors for the unread/waiting badges, derived from the app's single resolved-theme read (in `App`); computed
-   *  here instead, it would call `useResolvedTheme()` a second time and race that one (see the function's doc). */
+  /** Colors for the unread/waiting badges, from the resolved theme. */
   attentionBadgeColors: AttentionBadgeColors;
   /** When true, render a "DEV" badge (in the `status-waiting` amber) in the right-hand status zone so debug builds
    *  (port 8081 / `aoe_dev_` tmux / `~/.agent-of-empires-dev/`) are visually distinct from release builds at a

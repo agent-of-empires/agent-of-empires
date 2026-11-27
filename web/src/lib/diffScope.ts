@@ -11,7 +11,8 @@ export const DIFF_SCOPES: readonly { scope: DiffScope; label: string; title: str
   { scope: "last_turn", label: "Last turn", title: "Changes since the agent's latest turn started" },
 ];
 
-export const NO_LAST_TURN = "No turn has started since the daemon started";
+// The Daemon has no baseline: no turn since it started, or the latest turn came too soon after the last or its repo was too large to record.
+export const NO_LAST_TURN = "No recorded start for the latest turn";
 
 // Per-browser view state, like the open file: which comparison this browser is looking at for each
 // Session. The base branch it compares against stays a Daemon setting.

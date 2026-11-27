@@ -41,7 +41,7 @@ test("the scope picker switches the file list and the viewer between Branch, Unc
   await expect(page.getByRole("button", { name: /^Change diff base/ })).toBeVisible();
   const lastTurn = page.getByRole("radio", { name: "Last turn" });
   await expect(lastTurn).toBeDisabled();
-  await expect(lastTurn).toHaveAttribute("title", "No turn has started since the daemon started");
+  await expect(lastTurn).toHaveAttribute("title", "No recorded start for the latest turn");
 
   await page.getByRole("radio", { name: "Uncommitted" }).click();
   await expect(list.getByText("branch.ts")).toHaveCount(0);

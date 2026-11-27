@@ -1991,8 +1991,7 @@ function AppContent({
   const closePicker = useCallback(() => setPickerOpen(false), []);
   const handleDrawerSwipe = useCallback(
     (action: DrawerSwipeAction) => {
-      // Phones have no sidebar drawer: the opening swipe goes back from a Session to the list.
-      // With no Session open the list is the whole screen, so there is no drawer to move.
+      // A swipe opens or closes the session drawer over an open Session; with none open the list is the whole screen.
       if (action === "open-sidebar" || action === "close-sidebar") {
         if (!focusMode && activeSession) setSidebarOpen(action === "open-sidebar");
       } else if (action === "close-panels") setPickerOpen(false);

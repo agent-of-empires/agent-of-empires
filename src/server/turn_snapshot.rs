@@ -2,9 +2,10 @@
 //! dashboard's "Last turn" diff.
 //!
 //! The baseline is captured when a session settles (Idle, Starting, Stopped or Error), so it exists
-//! before the next turn can write. A turn starts when the Daemon's authoritative status goes to
-//! Running from a settled state, and publishes the baseline captured since the last settle. Waiting
-//! to Running resumes the same turn after an approval, so it does not start one. A turn that starts
+//! before the next turn can write. A turn starts when the Daemon's authoritative status leaves a
+//! settled state for Running, or for Waiting when it asks for approval first, and publishes the
+//! baseline captured since the last settle. Waiting to Running resumes the same turn, so it does not
+//! start one. A turn that starts
 //! with no finished baseline (the capture failed or was still running) clears Last turn rather than
 //! comparing against an older turn, and so does a lag that skips status events. The Daemon sees a
 //! turn start only at its next status poll, so a baseline that finished less than
@@ -47,8 +48,10 @@ fn is_settled(status: Status) -> bool {
     )
 }
 
+/// A turn leaves a settled state for Running, or for Waiting when it asks for approval before the
+/// status poll saw it run.
 pub(crate) fn is_turn_start(change: &StatusChange) -> bool {
-    change.new == Status::Running && is_settled(change.old)
+    matches!(change.new, Status::Running | Status::Waiting) && is_settled(change.old)
 }
 
 fn is_settle(change: &StatusChange) -> bool {
@@ -109,6 +112,12 @@ impl Baselines {
         }
     }
 
+    /// Forget sessions outside `live`. A running capture ends on its own; its result no longer matches a generation.
+    fn retain(&mut self, live: &std::collections::HashSet<String>) {
+        self.generation.retain(|id, _| live.contains(id));
+        self.ready.retain(|id, _| live.contains(id));
+    }
+
     /// Drop every baseline and in-flight capture: skipped events may have started and settled a turn since.
     fn forget_all(&mut self) {
         self.ready.clear();
@@ -166,6 +175,7 @@ pub fn spawn_recorder(state: Arc<AppState>) {
                     }
                 }
             } else if is_settle(&change) {
+                forget_removed(&task_state, &baselines).await;
                 let Some(mut generation) = lock(&baselines).settle(&id) else {
                     continue;
                 };
@@ -192,6 +202,23 @@ pub fn spawn_recorder(state: Arc<AppState>) {
             }
         }
     });
+}
+
+/// Drop what the recorder holds for sessions that no longer exist.
+async fn forget_removed(state: &AppState, baselines: &Mutex<Baselines>) {
+    let live: std::collections::HashSet<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .map(|i| i.id.clone())
+        .collect();
+    lock(baselines).retain(&live);
+    state
+        .turn_snapshots
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|id, _| live.contains(id));
 }
 
 /// After skipped events, no baseline or published snapshot is known to match a turn boundary.
@@ -258,6 +285,7 @@ mod tests {
             (Status::Starting, Status::Running, true),
             (Status::Stopped, Status::Running, true),
             (Status::Error, Status::Running, true),
+            (Status::Idle, Status::Waiting, true),
             (Status::Waiting, Status::Running, false),
             (Status::Unknown, Status::Running, false),
             (Status::Running, Status::Idle, false),
@@ -362,5 +390,16 @@ mod tests {
         assert_eq!(b.settle("s"), None);
         b.start_turn("s", Timestamp::now());
         assert_eq!(b.next_capture("s"), None);
+
+        // A deleted session's baseline is dropped, and a capture still running for it keeps nothing.
+        let g = b.settle("gone").unwrap();
+        b.retain(&["s".to_owned()].into());
+        b.finish(
+            "gone",
+            g,
+            Trees::from([("/r".to_owned(), git2::Oid::from_bytes(&[9; 20]).unwrap())]),
+            Timestamp::now(),
+        );
+        assert!(!b.ready.contains_key("gone") && !b.generation.contains_key("gone"));
     }
 }
