@@ -119,7 +119,7 @@ test.describe("Settings", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await pressShortcut(page, "s");
-    await expect(page.getByTestId("settings-header").getByRole("button", { name: "Back", exact: true })).toBeVisible();
+    await expect(page.getByRole("banner").getByRole("button", { name: "Back", exact: true })).toBeVisible();
   });
 });
 

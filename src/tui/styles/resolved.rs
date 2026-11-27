@@ -356,15 +356,25 @@ fn terminal_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProj
     };
     let lift_amt = 0.2;
 
+    // A light background flips black and white: programs written for dark terminals print their text in white, so
+    // white and bright white become mid greys and black the text colour, as light terminal palettes do.
+    let (black, white, bright_white) = match appearance {
+        ThemeAppearance::Dark => (theme.background, theme.text, theme.title),
+        ThemeAppearance::Light => (
+            theme.text,
+            mix(theme.text, theme.background, 0.3),
+            mix(theme.text, theme.background, 0.45),
+        ),
+    };
     let base = [
-        ("--term-color-0", theme.background),
+        ("--term-color-0", black),
         ("--term-color-1", theme.error),
         ("--term-color-2", theme.running),
         ("--term-color-3", theme.waiting),
         ("--term-color-4", theme.branch),
         ("--term-color-5", theme.accent),
         ("--term-color-6", theme.terminal_active),
-        ("--term-color-7", theme.text),
+        ("--term-color-7", white),
     ];
     for (name, color) in base {
         css.insert(name.into(), hex(color));
@@ -381,7 +391,7 @@ fn terminal_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProj
     for (name, color) in bright {
         css.insert(name.into(), hex(mix(color, lift, lift_amt)));
     }
-    css.insert("--term-color-15".into(), hex(theme.title));
+    css.insert("--term-color-15".into(), hex(bright_white));
 
     CssVarProjection { css_vars: css }
 }

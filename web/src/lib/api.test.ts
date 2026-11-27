@@ -178,7 +178,11 @@ const requestCases: RequestCase[] = [
     () => api.getProfileSettings("my work"),
     { respond: json({ description: "x" }), result: { description: "x" } },
   ],
-  ["GET /api/themes", () => api.fetchThemes(), { respond: json(["empire"]), result: ["empire"] }],
+  [
+    "GET /api/themes",
+    () => api.fetchThemes(),
+    { respond: json([{ name: "empire", label: "empire" }]), result: [{ name: "empire", label: "empire" }] },
+  ],
   ["GET /api/themes/My%20Theme", () => api.fetchResolvedTheme("My Theme")],
   ["GET /api/theme/current", () => api.fetchCurrentTheme()],
   [

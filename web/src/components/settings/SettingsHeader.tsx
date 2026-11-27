@@ -1,4 +1,6 @@
 import { ChevronLeft } from "lucide-react";
+import { createPortal } from "react-dom";
+import { useHeaderPageSlot } from "../../lib/headerSlot";
 import { SettingsSearch } from "./SettingsSearch";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import type { SettingsSearchHit } from "./settingsSearchIndex";
@@ -31,7 +33,8 @@ function SaveState({ saving, saveError }: Pick<Props, "saving" | "saveError">) {
 
 /**
  * A phone heads Settings as it heads the session list: a round back button beside a large title, and on the
- * section list a search pill under it. A wide screen keeps one quiet row: back, the page's name, and search.
+ * section list a search pill under it. A wide screen has no row of its own: the app header shows Back and the
+ * title, and this puts the save state and search in its middle.
  */
 export function SettingsHeader({
   onClose,
@@ -43,36 +46,37 @@ export function SettingsHeader({
   onBackToList,
   sectionLabel,
 }: Props) {
+  const slot = useHeaderPageSlot();
+  if (slot) {
+    return createPortal(
+      <>
+        <SaveState saving={saving} saveError={saveError} />
+        <div className="flex-1 min-w-0 max-w-sm">
+          <SettingsSearch schema={schema} loading={schemaLoading} onJump={onSearchJump} />
+        </div>
+      </>,
+      slot,
+    );
+  }
   return (
     <div
       data-testid="settings-header"
-      className="shrink-0 bg-surface-900 md:bg-transparent flex flex-wrap items-center gap-x-3 gap-y-3 px-4 pt-3 pb-3 md:flex-nowrap md:gap-x-2 md:h-12 md:px-3 md:py-0"
+      className="shrink-0 bg-surface-900 flex flex-wrap items-center gap-x-3 gap-y-3 px-4 pt-3 pb-3"
     >
       <button
         type="button"
         onClick={onBackToList ?? onClose}
         aria-label={onBackToList ? "All settings" : "Back"}
-        className="md:hidden w-10 h-10 shrink-0 flex items-center justify-center rounded-full float-control text-text-secondary cursor-pointer active:scale-95 transition-transform"
+        className="w-10 h-10 shrink-0 flex items-center justify-center rounded-full float-control text-text-secondary cursor-pointer active:scale-95 transition-transform"
       >
         <ChevronLeft className="size-5" strokeWidth={1.75} aria-hidden />
       </button>
-      <h1 className="md:hidden min-w-0 truncate text-[22px] font-semibold text-text-primary">
+      <h1 className="min-w-0 truncate text-[22px] font-semibold text-text-primary">
         {onBackToList ? sectionLabel : "Settings"}
       </h1>
-      <button
-        type="button"
-        onClick={onClose}
-        className="hidden md:flex h-8 pl-1.5 pr-2.5 items-center gap-0.5 rounded-md text-[13px] text-text-secondary hover:text-text-primary hover:bg-surface-800/60 cursor-pointer transition-colors"
-      >
-        <ChevronLeft className="size-4" strokeWidth={1.75} aria-hidden />
-        Back
-      </button>
-      <span className="hidden md:inline text-[13px] font-medium text-text-primary shrink-0">Settings</span>
       <SaveState saving={saving} saveError={saveError} />
-      {/* On a phone the list's search takes its own row under the title; a section page drops it. */}
-      <div
-        className={`basis-full md:basis-auto md:flex-1 md:min-w-0 md:max-w-sm md:ml-auto ${onBackToList ? "max-md:hidden" : ""}`}
-      >
+      {/* The list's search takes its own row under the title; a section page drops it. */}
+      <div className={`basis-full ${onBackToList ? "hidden" : ""}`}>
         <SettingsSearch schema={schema} loading={schemaLoading} onJump={onSearchJump} />
       </div>
     </div>

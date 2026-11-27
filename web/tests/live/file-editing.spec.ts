@@ -38,7 +38,7 @@ async function enableEditing(page: Page, serve: ServeHandle) {
   );
   await page.getByRole("checkbox", { name: "Edit project text files" }).check();
   await persisted;
-  await page.getByTestId("settings-header").getByRole("button", { name: /Back/ }).click();
+  await page.getByRole("banner").getByRole("button", { name: /Back/ }).click();
   await expect(page).toHaveURL(`${serve.baseUrl}/`);
 }
 

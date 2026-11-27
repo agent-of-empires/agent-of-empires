@@ -1815,11 +1815,21 @@ pub async fn mark_volume_ignores_globs_acknowledged(
 
 // --- Themes ---
 
-pub async fn list_themes() -> Json<Vec<String>> {
+#[derive(serde::Serialize)]
+pub struct ThemeChoice {
+    name: String,
+    /// What a picker shows: "Dark" and "Light" for the default pair, else the name.
+    label: String,
+}
+
+pub async fn list_themes() -> Json<Vec<ThemeChoice>> {
     Json(
         crate::tui::styles::available_themes()
             .into_iter()
-            .map(|s| s.to_string())
+            .map(|name| ThemeChoice {
+                label: crate::tui::styles::theme_label(&name).to_string(),
+                name,
+            })
             .collect(),
     )
 }

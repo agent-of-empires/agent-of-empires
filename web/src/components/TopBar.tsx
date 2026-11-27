@@ -1,5 +1,6 @@
 import { useMemo } from "react";
-import { Folder, LayoutGrid, Menu, type LucideIcon } from "lucide-react";
+import { setHeaderPageSlot } from "../lib/headerSlot";
+import { ChevronLeft, Folder, LayoutGrid, Menu, type LucideIcon } from "lucide-react";
 import { getStatusDotClass } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import type { RightPanelView } from "../lib/rightPanelView";
@@ -35,6 +36,9 @@ interface Props {
   onOpenSessionMenu?: (x: number, y: number) => void;
   /** A phone page with the session drawer: the header floats over the page with ☰ for the drawer. */
   phoneFloating?: boolean;
+  /** A wide screen's full page such as Settings: Back and its title replace the sidebar toggle, and the page fills
+   *  the header's middle through `useHeaderPageSlot`. */
+  page?: { title: string; onBack: () => void };
   /** A phone's views of the open Session, chosen from the ⋯; away from the agent, the pill names the view and
    *  back returns to the agent. */
   phoneViews?: {
@@ -86,6 +90,7 @@ export function TopBar({
   sessionItems,
   onOpenSessionMenu,
   phoneFloating = false,
+  page,
   phoneViews,
   appMenu,
   unreadCount,
@@ -174,6 +179,7 @@ export function TopBar({
           </button>
         )}
         <button
+          hidden={!!page}
           onClick={onExitFocusMode ?? onToggleSidebar}
           className={`h-8 flex items-center shrink-0 cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50 ${
             onExitFocusMode ? "pr-2.5" : "max-md:hidden"
@@ -253,6 +259,19 @@ export function TopBar({
             <span className={`font-mono text-xs leading-none truncate ${hideWordmark ? "md:hidden" : ""}`}>aoe</span>
           </button>
         )}
+        {page && (
+          <>
+            <button
+              type="button"
+              onClick={page.onBack}
+              className="h-8 pl-1.5 pr-2.5 flex items-center gap-0.5 rounded-md text-[13px] text-text-secondary hover:text-text-primary hover:bg-surface-800/60 cursor-pointer transition-colors"
+            >
+              <ChevronLeft className="size-4" strokeWidth={1.75} aria-hidden />
+              Back
+            </button>
+            <span className="text-[13px] font-medium text-text-primary truncate">{page.title}</span>
+          </>
+        )}
         {/* The left zone is content-sized unless the sidebar column is showing, so the chips are capped and hidden
            below md instead of pushing the core controls off-screen. Also hidden with the wordmark: the compact rail
            leaves no room beside the logo. */}
@@ -330,9 +349,13 @@ export function TopBar({
             </button>
           )}
           {/* Search lives in the sidebar on desktop with a Session open, and on the phone's session list. */}
-          <div className={activeSession ? "hidden" : "hidden md:contents"}>
-            <PaletteTriggerPill onClick={onOpenPalette} />
-          </div>
+          {page ? (
+            <div ref={setHeaderPageSlot} className="flex-1 min-w-0 flex items-center justify-end gap-3" />
+          ) : (
+            <div className={activeSession ? "hidden" : "hidden md:contents"}>
+              <PaletteTriggerPill onClick={onOpenPalette} />
+            </div>
+          )}
           <PluginPageButtons />
           <LiveSlowNotice sessionId={activeSession?.id ?? null} />
         </div>

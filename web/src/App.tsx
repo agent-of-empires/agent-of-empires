@@ -3193,6 +3193,7 @@ function AppContent({
       onOpenPalette={() => setShowPalette(true)}
       terminal={caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined}
       phoneFloating={singlePane && !fullPageView && !focusMode}
+      page={showSettings && isMdUp ? { title: "Settings", onBack: handleCloseSettings } : undefined}
       sessionItems={phoneSessionItems}
       onOpenSessionMenu={
         singlePane && activeSession
@@ -3270,7 +3271,7 @@ function AppContent({
               />
             )}
             {!phoneDrawer && (
-              // The phone's list carries the app's menu itself, and Settings heads its own page.
+              // A phone's Settings heads its own page; a wide one puts Back and its search in this header.
               <div className={showSettings ? "max-md:hidden" : undefined}>{topBar}</div>
             )}
             {/* A phone's pages host the banners under their own top controls. */}

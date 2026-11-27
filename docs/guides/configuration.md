@@ -64,7 +64,7 @@ color_mode = "truecolor"  # truecolor | palette (TUI only)
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `name` | `""` | Theme for the TUI and web dashboard. Builtins: `zinc`, `empire`, `phosphor`, `tokyo-night-storm`, `catppuccin-latte`, `dracula`, `rose-pine`, `deep-ocean`. Custom TOML themes appear in the picker. Empty means `zinc`. |
+| `name` | `""` | Theme for the TUI and web dashboard. Builtins: `zinc` and `light`, which the dashboard's pickers list first as **Dark** and **Light**, then `empire`, `phosphor`, `tokyo-night-storm`, `catppuccin-latte`, `dracula`, `rose-pine`, `deep-ocean`. Custom TOML themes appear in the picker. Empty means `zinc`. |
 | `color_mode` | `"truecolor"` | TUI only. `palette` downsamples to xterm-256 for transports that mangle 24-bit RGB (e.g. some `mosh` setups). The web dashboard always renders truecolor. |
 | `idle_decay_minutes` | `0` | TUI only. Minutes a freshly idle session keeps its highlight and breathing icon, and counts for the `w` jump. 0 turns it off. |
 

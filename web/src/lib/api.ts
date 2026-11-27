@@ -1533,8 +1533,14 @@ export async function updateProfileSettings(name: string, updates: Record<string
 
 import type { ResolvedTheme } from "./theme";
 
-export async function fetchThemes(): Promise<string[]> {
-  return (await fetchJson<string[]>("/api/themes")) ?? [];
+/** A theme the pickers offer: its config name, and what to call it ("Dark" and "Light" for the default pair). */
+export interface ThemeChoice {
+  name: string;
+  label: string;
+}
+
+export async function fetchThemes(): Promise<ThemeChoice[]> {
+  return (await fetchJson<ThemeChoice[]>("/api/themes")) ?? [];
 }
 
 /** Fetch the resolved theme projection (web CSS vars, terminal CSS

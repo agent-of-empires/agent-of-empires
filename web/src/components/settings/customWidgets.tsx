@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { fetchAgents, fetchThemes } from "../../lib/api";
+import { fetchAgents, fetchThemes, type ThemeChoice } from "../../lib/api";
 import { dispatchThemePickerChanged } from "../../hooks/useResolvedTheme";
 import type { AgentInfo, SettingsFieldDescriptor } from "../../lib/types";
 import { CAPTION_INLINE } from "../../lib/surfaces";
@@ -36,7 +36,7 @@ function useOneshotAgents(): AgentInfo[] {
 
 /** Theme picker; repaints only after the save succeeds. */
 export function ThemeNameWidget({ descriptor, value, save, row }: CustomWidgetProps) {
-  const [themes, setThemes] = useState<string[]>([]);
+  const [themes, setThemes] = useState<ThemeChoice[]>([]);
   useEffect(() => {
     fetchThemes()
       .then(setThemes)
@@ -52,7 +52,7 @@ export function ThemeNameWidget({ descriptor, value, save, row }: CustomWidgetPr
           dispatchThemePickerChanged(v || undefined);
         }
       }}
-      options={themes.map((t) => ({ value: t, label: t }))}
+      options={themes.map((t) => ({ value: t.name, label: t.label }))}
     />
   );
 }
