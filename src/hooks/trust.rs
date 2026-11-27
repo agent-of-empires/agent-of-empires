@@ -14,24 +14,44 @@ use super::config_io::{
 };
 use super::resolve_config_dir_override;
 
-/// Overwrites `path` through the same inode, never following a link, for a file a
-/// running container may already mount by inode.
-fn write_in_place(path: &Path, content: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    // A planted link is replaced, as the atomic write does, never written through.
-    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        std::fs::remove_file(path)?;
-    }
-    std::fs::OpenOptions::new()
+/// Opens `path` for an in-place write when it is a regular file with one link, else
+/// `None`. The open never blocks (a planted FIFO with no reader fails instead of
+/// hanging the launch) and never follows a link.
+fn open_regular_for_write(path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let opened = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
         .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .and_then(|mut file| file.write_all(content))
-        .with_context(|| format!("writing {} in place", path.display()))
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path);
+    match opened {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            Ok((metadata.is_file() && metadata.nlink() == 1).then_some(file))
+        }
+        // A symlink, or a FIFO nobody reads.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENXIO)) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("opening {}", path.display())),
+    }
+}
+
+/// Overwrites `path` through the same inode, for a file a running container may
+/// already mount by inode. Anything but a lone regular file (a link, a FIFO, a
+/// hardlink to another file) is unlinked and created fresh, never written through.
+fn write_in_place(path: &Path, content: &[u8]) -> Result<()> {
+    use std::io::Write;
+    for _ in 0..2 {
+        if let Some(mut file) = open_regular_for_write(path)? {
+            file.set_len(0)?;
+            return file
+                .write_all(content)
+                .with_context(|| format!("writing {} in place", path.display()));
+        }
+        std::fs::remove_file(path)
+            .with_context(|| format!("replacing the non-regular {}", path.display()))?;
+    }
+    anyhow::bail!("{} is not a regular file after replacement", path.display())
 }
 
 /// Merge-edits a JSON config under its lock, writing only when `edit` changed it.
@@ -806,5 +826,51 @@ mod tests {
         );
         assert!(!refused("shared/other.json", "example"));
         assert!(!refused(".example.json", "example"));
+    }
+
+    fn staged_trust() -> AgentTrustDeclaration {
+        declared_trust("/projects/{path}/trusted", AgentTrustValue::Bool(true))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_place_write_replaces_a_planted_fifo_without_blocking() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".example.json");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o644)).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let target = path.clone();
+        std::thread::spawn(move || {
+            let result = write_declared_trust_in_place(&target, &staged_trust(), "/repo");
+            let _ = done.send(result.map_err(|e| format!("{e:#}")));
+        });
+
+        let result = finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the write must not block on a FIFO");
+
+        result.unwrap();
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(read_json(&path)["projects"]["/repo"]["trusted"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_place_write_never_rewrites_a_hardlinked_file() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let other = tmp.path().join("other.json");
+        std::fs::write(&other, r#"{"keep":true}"#).unwrap();
+        let path = tmp.path().join(".example.json");
+        std::fs::hard_link(&other, &path).unwrap();
+
+        write_declared_trust_in_place(&path, &staged_trust(), "/repo").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), r#"{"keep":true}"#);
+        assert_eq!(std::fs::metadata(&path).unwrap().nlink(), 1);
+        assert_eq!(read_json(&path)["projects"]["/repo"]["trusted"], true);
     }
 }
