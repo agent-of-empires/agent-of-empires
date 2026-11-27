@@ -40,7 +40,7 @@ test.describe("Feature-use telemetry", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    const toggle = page.locator("[data-testid='sidebar-sort-toggle']");
+    const toggle = page.locator("[data-testid='sidebar-view-toggle']");
     await toggle.click();
     await page.locator("[data-testid='sidebar-sort-option-attention']").click();
     await expect(toggle).toHaveAttribute("data-sort-mode", "attention");

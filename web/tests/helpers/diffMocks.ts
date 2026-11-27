@@ -78,7 +78,7 @@ export async function openDiffSession(page: Page, title = "pinch-test") {
   await page.goto("/");
   await expect(page.locator("header")).toBeVisible();
   await clickSidebarSession(page, title);
-  await page.getByTestId("pane-toggle-diff").click();
+  await page.getByTestId("right-dock-toggle").click();
 }
 
 /** Click a row in the file list once it has rendered. */

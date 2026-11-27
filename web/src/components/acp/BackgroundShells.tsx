@@ -1,12 +1,15 @@
 // A backgrounded shell command's row, and its command and output.
 
 import { useEffect, useRef, useState } from "react";
-import { Maximize2, Terminal, X } from "lucide-react";
+import { Maximize2, Terminal } from "lucide-react";
 
 import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { fetchTaskOutput, type TaskOutput } from "../../lib/api";
 import type { BackgroundShell } from "../../lib/acpTypes";
+import { BACKDROP, DIALOG } from "../../lib/surfaces";
+import { BUTTON_GHOST_SM, CAPTION_INLINE, CODE_BLOCK } from "../../lib/surfaces";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
+import { CloseButton } from "../Dialog";
 
 const OUTPUT_POLL_MS = 2000;
 // Failed reads retried after the shell ended, before the modal gives up.
@@ -90,7 +93,7 @@ export function ShellDetailModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 animate-fade-in"
+      className={`fixed inset-0 z-50 flex items-center justify-center ${BACKDROP} animate-fade-in`}
       onClick={onClose}
       role="dialog"
       aria-modal="true"
@@ -99,26 +102,19 @@ export function ShellDetailModal({
       <div
         ref={panelRef}
         tabIndex={-1}
-        className="flex max-h-[85vh] w-[680px] max-w-[92vw] flex-col rounded-lg border border-surface-700/50 bg-surface-800 shadow-2xl"
+        className={`flex max-h-[85vh] w-[680px] max-w-[92vw] flex-col ${DIALOG}`}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center gap-2 border-b border-surface-700 px-4 py-3">
+        <div className="flex items-center gap-2 border-b border-surface-700/50 px-4 py-3">
           <Terminal className="h-4 w-4 shrink-0 text-text-dim" />
           <span className="min-w-0 flex-1 truncate text-sm font-semibold text-text-bright">Background shell</span>
           <span className="shrink-0 text-[11px] text-text-dim">{shell.finished ? "done" : "running"}</span>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="text-text-muted hover:text-text-secondary"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <CloseButton onClick={onClose} />
         </div>
         <div className="flex min-h-0 flex-col gap-3 overflow-y-auto px-4 py-3 text-[12px]">
           <div className="flex flex-col gap-0.5">
             <div className="flex items-center justify-between">
-              <span className="text-[10px] uppercase tracking-wider text-text-dim">command</span>
+              <span className={CAPTION_INLINE}>command</span>
               {shell.command && <CopyMarkdownButton compact source={shell.command} label="Copy command" />}
             </div>
             <pre className="whitespace-pre-wrap break-words font-mono text-text-secondary">
@@ -130,13 +126,8 @@ export function ShellDetailModal({
           )}
           <div className="flex flex-col gap-0.5">
             <div className="flex items-center justify-between">
-              <span className="text-[10px] uppercase tracking-wider text-text-dim">output</span>
-              <button
-                type="button"
-                onClick={() => setWrap((v) => !v)}
-                aria-pressed={wrap}
-                className="text-[11px] text-text-dim hover:text-text-secondary"
-              >
+              <span className={CAPTION_INLINE}>output</span>
+              <button type="button" onClick={() => setWrap((v) => !v)} aria-pressed={wrap} className={BUTTON_GHOST_SM}>
                 Wrap
               </button>
             </div>
@@ -156,7 +147,7 @@ export function ShellDetailModal({
                     const el = e.currentTarget;
                     pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
                   }}
-                  className={`max-h-[50vh] overflow-auto rounded border border-surface-700 bg-surface-900/40 p-2 font-mono text-text-secondary ${wrap ? "whitespace-pre-wrap break-words" : "whitespace-pre"}`}
+                  className={`${CODE_BLOCK} max-h-[50vh] ${wrap ? "whitespace-pre-wrap break-words" : "whitespace-pre"}`}
                 >
                   {out.output || "(no output yet)"}
                 </pre>

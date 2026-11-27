@@ -3,7 +3,7 @@
 use crate::session::{Instance, Item, LifecycleOperation, StartBlocked, Status};
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteAction, GroupDeleteOptions, InfoDialog};
 
-use super::{HomeView, PendingArchiveCursor};
+use super::{HomeView, PendingArchiveCursor, PendingSnoozeFlash};
 
 /// Membership predicate for a manual group: matches instances whose
 /// `group_path` equals `group_path` or nests beneath it, optionally scoped to
@@ -217,13 +217,17 @@ impl HomeView {
         let Some((dialog_title, state, verb)) = shelved else {
             return false;
         };
-        let key = if self.strict_hotkeys { "Z" } else { "z" };
-        self.info_dialog = Some(InfoDialog::new(
-            dialog_title,
-            &format!(
+        let key = self.key_label(super::bindings::ActionId::ToggleArchive);
+        let body = if key.is_empty() {
+            let mut verb = verb.to_string();
+            verb[..1].make_ascii_uppercase();
+            format!("This session is {state}; its agent stays stopped. {verb} it first.")
+        } else {
+            format!(
                 "This session is {state}; its agent stays stopped. Press {key} to {verb} it first."
-            ),
-        ));
+            )
+        };
+        self.info_dialog = Some(InfoDialog::new(dialog_title, &body));
         true
     }
 
@@ -607,12 +611,17 @@ impl HomeView {
             return Ok(());
         };
         if instance.is_snoozed() {
-            return self.session_feed.submit(
-                id,
+            self.session_feed.submit(
+                id.clone(),
                 crate::daemon::SessionMutation::Snooze(crate::daemon::UpdateSnoozeBody {
                     minutes: None,
                 }),
-            );
+            )?;
+            // No snooze marker shows outside the Attention sort, so confirm the wake.
+            if self.sort_order != crate::session::config::SortOrder::Attention {
+                self.queue_snooze_flash(id, false, "Unsnoozed");
+            }
+            return Ok(());
         }
         self.snooze_duration_dialog = Some(crate::tui::dialogs::SnoozeDurationDialog::new(
             &instance.title,
@@ -630,8 +639,47 @@ impl HomeView {
         )?;
         if self.sort_order == crate::session::config::SortOrder::Attention {
             self.select_top_attention(Some(id));
+        } else {
+            // No snooze marker shows outside the Attention sort, so confirm the park.
+            let message = format!(
+                "Snoozed for {}",
+                super::render::format_snooze_remaining(crate::time::Duration::minutes(i64::from(
+                    minutes
+                )))
+            );
+            self.queue_snooze_flash(id.to_owned(), true, message);
         }
         Ok(())
+    }
+
+    /// Hold the confirmation until the applied snapshot carries the snooze
+    /// change, since the flash would otherwise claim what the daemon has not
+    /// confirmed yet.
+    fn queue_snooze_flash(&mut self, id: String, snoozed: bool, message: impl Into<String>) {
+        self.pending_snooze_flash = Some(PendingSnoozeFlash {
+            id,
+            snoozed,
+            message: message.into(),
+        });
+    }
+
+    /// Flash a queued snooze confirmation once the row shows the new state.
+    /// Returns whether the message was shown.
+    pub(super) fn apply_pending_snooze_flash(&mut self) -> bool {
+        let Some(pending) = self.pending_snooze_flash.take() else {
+            return false;
+        };
+        let settled = self
+            .instances
+            .get(&pending.id)
+            .is_some_and(|inst| inst.is_snoozed() == pending.snoozed);
+        if !settled {
+            // The snapshot predates the change; the next one carries it.
+            self.pending_snooze_flash = Some(pending);
+            return false;
+        }
+        self.flash_status(pending.message);
+        true
     }
 
     /// Queue a favorite change; only canonical snapshots update the row.

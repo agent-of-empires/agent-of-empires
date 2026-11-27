@@ -1,17 +1,14 @@
 // @vitest-environment jsdom
 //
-// Coverage for the theme applicator. applyResolvedTheme writes both palettes'
-// CSS vars onto the document root via setProperty, stamps the dataset/
-// colorScheme, and caches the payload; readCachedResolvedTheme round-trips it
-// and tolerates corrupt JSON; dispatchThemeChanged broadcasts the typed event.
+// The theme store paints both palettes on <html>, caches the payload, and notifies subscribers.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
-  applyResolvedTheme,
+  getResolvedTheme,
   readCachedResolvedTheme,
-  dispatchThemeChanged,
-  THEME_CHANGED_EVENT,
+  setResolvedTheme,
+  subscribeTheme,
   type ResolvedTheme,
 } from "./theme";
 
@@ -36,9 +33,9 @@ beforeEach(() => {
 });
 afterEach(() => localStorage.clear());
 
-describe("applyResolvedTheme", () => {
+describe("setResolvedTheme", () => {
   it("sets web + terminal css vars, dataset, colorScheme, and caches", () => {
-    applyResolvedTheme(theme());
+    setResolvedTheme(theme());
     const root = document.documentElement;
     expect(root.style.getPropertyValue("--bg")).toBe("#000");
     expect(root.style.getPropertyValue("--fg")).toBe("#fff");
@@ -56,7 +53,7 @@ describe("readCachedResolvedTheme", () => {
   });
 
   it("round-trips an applied theme", () => {
-    applyResolvedTheme(theme({ name: "light", appearance: "light" }));
+    setResolvedTheme(theme({ name: "light", appearance: "light" }));
     const cached = readCachedResolvedTheme();
     expect(cached?.name).toBe("light");
     expect(cached?.appearance).toBe("light");
@@ -68,16 +65,20 @@ describe("readCachedResolvedTheme", () => {
   });
 });
 
-describe("dispatchThemeChanged", () => {
-  it("emits the typed theme-changed event with the payload as detail", () => {
-    let detail: ResolvedTheme | null = null;
-    const handler = (e: Event) => {
-      detail = (e as CustomEvent<ResolvedTheme>).detail;
-    };
-    window.addEventListener(THEME_CHANGED_EVENT, handler);
-    dispatchThemeChanged(theme({ name: "nord" }));
-    window.removeEventListener(THEME_CHANGED_EVENT, handler);
-    expect(detail).not.toBeNull();
-    expect(detail!.name).toBe("nord");
+describe("theme store", () => {
+  it("notifies subscribers and serves the new theme", () => {
+    const seen: string[] = [];
+    const stop = subscribeTheme(() => seen.push(getResolvedTheme()!.name));
+    setResolvedTheme(theme({ name: "nord" }));
+    stop();
+    setResolvedTheme(theme({ name: "zinc" }));
+    expect(seen).toEqual(["nord"]);
+    expect(getResolvedTheme()?.name).toBe("zinc");
+  });
+
+  it("does not rewrite the cache when told another window already did", () => {
+    setResolvedTheme(theme({ name: "nord" }), false);
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(document.documentElement.dataset.theme).toBe("nord");
   });
 });

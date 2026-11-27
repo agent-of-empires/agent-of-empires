@@ -60,7 +60,7 @@ pub struct AddArgs {
     /// Fork an existing session: resume its conversation context in a new,
     /// independent session that then diverges. Give the source session's id or
     /// title. Terminal fork; available for agents that support forking
-    /// (claude, codex, opencode, pi).
+    /// (claude, codex, opencode, pi, prime-agent, omp).
     #[arg(long = "fork-from")]
     fork_from: Option<String>,
 

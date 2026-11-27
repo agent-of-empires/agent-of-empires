@@ -42,7 +42,7 @@ function horizontalScroller(scrollLeft: number) {
   return el;
 }
 
-const CLOSED: DrawerSwipeState = { sidebarOpen: false, sidebarSide: "left", panelsOpen: false, panelsAvailable: true };
+const CLOSED: DrawerSwipeState = { sidebarOpen: false, panelsOpen: false, panelsAvailable: true };
 
 function mount(state: Partial<DrawerSwipeState> = {}) {
   const onAction = vi.fn();
@@ -66,8 +66,6 @@ describe("drawerSwipeAction", () => {
     ["swipe right on an open left sidebar does nothing", "right", { sidebarOpen: true }, null],
     ["swipe right closes the panels", "right", { panelsOpen: true }, "close-panels"],
     ["swipe left on open panels does nothing", "left", { panelsOpen: true }, null],
-    ["a right-side sidebar has no open swipe", "right", { sidebarSide: "right" }, null],
-    ["swipe right closes a right-side sidebar", "right", { sidebarSide: "right", sidebarOpen: true }, "close-sidebar"],
   ])("%s", (_label, dir, state, expected) => {
     expect(drawerSwipeAction(dir, { ...CLOSED, ...state })).toBe(expected);
   });

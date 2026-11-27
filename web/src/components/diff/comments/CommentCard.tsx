@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { BUTTON_DANGER_GHOST_SM, BUTTON_GHOST_SM } from "../../../lib/surfaces";
 import { CommentMarkdown } from "./CommentMarkdown";
 import { CommentForm } from "./CommentForm";
 import type { AnchoredComment } from "./types";
@@ -37,7 +38,7 @@ export function CommentCard({ anchored, onSave, onDelete }: Props) {
 
   return (
     <div className="border-y border-surface-700/40 bg-surface-850 px-3 py-2">
-      <div className="flex items-center gap-2 mb-1.5 text-[11px] font-mono">
+      <div className="flex items-center gap-2 mb-1.5 text-[12px] font-mono">
         <span className="text-text-dim">
           {range} ({comment.side})
         </span>
@@ -50,18 +51,10 @@ export function CommentCard({ anchored, onSave, onDelete }: Props) {
           </span>
         )}
         <div className="ml-auto flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setEditing(true)}
-            className="text-[10px] px-1.5 py-0.5 rounded text-text-dim hover:text-text-secondary hover:bg-surface-800 cursor-pointer transition-colors"
-          >
+          <button type="button" onClick={() => setEditing(true)} className={BUTTON_GHOST_SM}>
             Edit
           </button>
-          <button
-            type="button"
-            onClick={() => onDelete(comment.id)}
-            className="text-[10px] px-1.5 py-0.5 rounded text-text-dim hover:text-status-error hover:bg-surface-800 cursor-pointer transition-colors"
-          >
+          <button type="button" onClick={() => onDelete(comment.id)} className={BUTTON_DANGER_GHOST_SM}>
             Delete
           </button>
         </div>

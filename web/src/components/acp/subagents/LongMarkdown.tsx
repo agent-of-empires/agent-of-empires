@@ -5,6 +5,7 @@ import { useState } from "react";
 
 import { Markdown } from "../Markdown";
 import { previewParagraphs, revealLines, STEP_LINES } from "./longText";
+import { BUTTON_INLINE } from "../../../lib/surfaces";
 
 function Rendered({ text }: { text: string }) {
   return (
@@ -14,7 +15,7 @@ function Rendered({ text }: { text: string }) {
   );
 }
 
-const MORE_BUTTON = "mt-1 text-[11px] text-accent-600 hover:underline";
+const MORE_BUTTON = `${BUTTON_INLINE} mt-1`;
 
 /** A report: 40 lines at a time. */
 export function SteppedMarkdown({ text }: { text: string }) {

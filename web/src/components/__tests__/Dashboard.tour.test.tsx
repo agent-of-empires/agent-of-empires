@@ -6,16 +6,7 @@ import { Dashboard } from "../Dashboard";
 import { TOUR_ANCHORS, tourSelector } from "../../lib/tourSteps";
 
 function renderDashboard(readOnly: boolean) {
-  return render(
-    <Dashboard
-      sessions={[]}
-      onSelectSession={vi.fn()}
-      onNewSession={vi.fn()}
-      onCloneFromUrl={vi.fn()}
-      onToggleSidebar={vi.fn()}
-      readOnly={readOnly}
-    />,
-  );
+  return render(<Dashboard sessions={[]} onNewSession={vi.fn()} onCloneFromUrl={vi.fn()} readOnly={readOnly} />);
 }
 
 describe("Dashboard tour anchors", () => {

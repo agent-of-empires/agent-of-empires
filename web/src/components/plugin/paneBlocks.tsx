@@ -9,6 +9,7 @@ import { accentStyle, lucideIcon, toneTextClass, validTone } from "../../lib/plu
 import { isInternalHref } from "../../lib/pluginHref";
 import { lazyView } from "../../lib/lazyView";
 const BlockMarkdown = lazyView(() => import("./BlockMarkdown").then((m) => m.BlockMarkdown), null);
+import { BUTTON_PRIMARY_SM, BUTTON_SECONDARY_SM, CAPTION_INLINE } from "../../lib/surfaces";
 import { BadgeChip, Spinner } from "./SlotChrome";
 import { isObject, objectList, pluginLinkProps, renderIcon, safeHref, str, type Obj } from "./slotPayload";
 
@@ -237,11 +238,7 @@ function BlockAction({ block, pluginId, sessionId, stretch = false }: BlockProps
   if (!label || (!method && !safe && !disabled)) return null;
 
   const layout = stretch ? "w-full justify-center" : "self-start";
-  const skin =
-    str(block, "variant") === "primary"
-      ? "bg-brand-500 text-text-on-brand hover:bg-brand-400 font-semibold"
-      : "bg-surface-700/50 text-text-secondary hover:text-text-primary hover:bg-surface-700";
-  const className = `${layout} inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs cursor-pointer ${skin} disabled:opacity-50 disabled:cursor-default transition-colors`;
+  const className = `${layout} ${str(block, "variant") === "primary" ? BUTTON_PRIMARY_SM : BUTTON_SECONDARY_SM}`;
   const leading = busy ? <Spinner className="size-3.5" /> : renderIcon(icon, "size-3.5");
 
   // A disabled action must not stay clickable through its href.
@@ -295,7 +292,7 @@ function BlockCallout({ block, pluginId, sessionId }: BlockProps) {
   const toneText = accent ? "" : toneTextClass(tone);
   return (
     <div
-      className={`flex flex-col gap-2 rounded-md border p-2.5 ${(tone && TONE_BORDER[tone]) ?? "border-surface-700/60"} bg-surface-800/60`}
+      className={`flex flex-col gap-2 rounded-lg border p-2.5 ${(tone && TONE_BORDER[tone]) ?? "border-surface-700/50"} bg-surface-800/60`}
       data-testid="plugin-pane-callout"
     >
       <div className="flex items-start gap-2">
@@ -484,7 +481,7 @@ function BlockSection({ block, pluginId, sessionId, wrap }: BlockProps) {
   const icon = lucideIcon(str(block, "icon"));
   const value = str(block, "value");
   const badges = objectList(block, "badges") ?? [];
-  const titleClass = `text-[11px] font-semibold uppercase tracking-wide ${icon || tone ? toneTextClass(tone) : "text-text-dim"}`;
+  const titleClass = icon || tone ? CAPTION_INLINE.replace("text-text-dim", toneTextClass(tone)) : CAPTION_INLINE;
   const summary = (value || badges.length > 0) && (
     <span className={`ml-auto flex items-center gap-1.5 ${wrap ? "min-w-0 shrink flex-wrap" : "shrink-0"}`}>
       {value && (
@@ -508,7 +505,7 @@ function BlockSection({ block, pluginId, sessionId, wrap }: BlockProps) {
   );
   // Fixed cap class: a plugin must not size host chrome.
   const bodyClass = `flex flex-col gap-1 ${block.scroll === true ? "max-h-64 overflow-y-auto" : ""}`;
-  const shell = block.boxed === true ? "rounded-md border border-surface-700/60 bg-surface-800/40 p-2" : "";
+  const shell = block.boxed === true ? "rounded-lg border border-surface-700/50 bg-surface-800/40 p-2" : "";
   if (block.collapsible === true) {
     // Uncontrolled <details> so a re-push does not undo the user's fold.
     return (

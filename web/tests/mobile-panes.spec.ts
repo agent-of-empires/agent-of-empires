@@ -7,16 +7,11 @@ import { openPanelsByDefault } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 import { iPhone13 } from "./helpers/viewports";
+import { expectPhoneView, pickPhoneView } from "./helpers/phoneViews";
 import { liveContent, openLiveSession, openLiveTerminal } from "./helpers/liveTerminal";
 
 const liveTerminal = (page: Page) => page.locator("[data-live-terminal]").first();
 const picker = (page: Page) => page.getByTestId("mobile-right-panel-picker");
-const backToAgent = (page: Page) => page.getByTestId("mobile-back-to-agent");
-
-async function openPicker(page: Page) {
-  await page.getByRole("button", { name: "Toggle panels" }).click();
-  await expect(picker(page)).toBeVisible({ timeout: 5_000 });
-}
 
 /** One-finger horizontal swipe dispatched on the window, where useDrawerSwipe listens. */
 async function swipe(page: Page, fromX: number, toX: number, y: number) {
@@ -63,71 +58,88 @@ async function expectSafeAreaInset(page: Page, testId: string) {
   expect(inset).toContain("safe-area-inset-bottom");
 }
 
-// #1452: on mobile a picker promotes right-panel views into the single
-// full-viewport pane, so the paired terminal stays tall under the keyboard.
-test.describe("Mobile right panel picker (#1452)", () => {
+// #1452: on mobile a tab bar promotes the Session's views into the single full-viewport pane, so the paired
+// terminal stays tall under the keyboard; More holds the rest.
+test.describe("Mobile session view tabs (#1452)", () => {
   test.use(iPhone13);
 
-  test("swipe left from mid-screen opens a right-anchored drawer with thumb-reachable options; swipe right closes it", async ({
+  test("the header's ⋯ lists the Session's views, and a swipe right goes back", async ({ page }) => {
+    await openLiveTerminal(page, { mobile: true, settings: null });
+    const viewport = page.viewportSize()!;
+    await expectPhoneView(page, "Agent");
+    await page.locator("header").getByRole("button", { name: "More options" }).click();
+    // More panes shows only with something to hold, such as another Session's shell.
+    await expect(page.getByRole("menuitemradio")).toHaveText(["Agent", "Terminal", "Diff", "Files"]);
+    await expect(page.getByRole("menuitemradio", { name: "Agent" })).toHaveAttribute("aria-checked", "true");
+    await page.keyboard.press("Escape");
+    // The header holds no panels toggle: the ⋯ replaces it.
+    await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
+
+    // A swipe left opens the header's ⋯, which a tap outside closes; a swipe right opens the session drawer, and a
+    // swipe left closes it.
+    const y = viewport.height / 2;
+    const drawer = page.getByTestId("sidebar-new-session-pill");
+    await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
+    await expect(page.getByRole("menuitemradio", { name: "Agent" })).toBeVisible();
+    await expect(picker(page)).toBeHidden();
+    await expect(drawer).toBeHidden();
+    // The backdrop takes the closing tap, so it never lands on the Session beneath.
+    expect((await page.getByTestId("overflow-menu-backdrop").boundingBox())?.height).toBe(viewport.height);
+    await page.mouse.click(24, viewport.height - 120);
+    await expect(page.getByRole("menuitemradio", { name: "Agent" })).toBeHidden();
+    await swipe(page, viewport.width / 2 - 80, viewport.width / 2 + 80, y);
+    await expect(drawer).toBeInViewport();
+    await expect(page.getByTestId("sidebar-drawer-scrim")).toBeVisible();
+    await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
+    await expect(drawer).toBeHidden();
+    // A tap on the pushed Session's edge closes it too.
+    await page.getByTestId("topbar-menu").click();
+    await expect(drawer).toBeInViewport();
+    await page.getByTestId("sidebar-drawer-scrim").click();
+    await expect(drawer).toBeHidden();
+  });
+
+  test("the Session card follows a drawer drag, springs back from a short one, and a longer one opens", async ({
     page,
   }) => {
     await openLiveTerminal(page, { mobile: true, settings: null });
-    const viewport = page.viewportSize()!;
-    const y = viewport.height / 2;
+    const y = 400;
+    const touch = (type: "touchstart" | "touchmove" | "touchend", x: number) =>
+      page.evaluate(
+        ({ type, x, y }) => {
+          const t = new Touch({ identifier: 0, target: document.body, clientX: x, clientY: y });
+          document.body.dispatchEvent(
+            new TouchEvent(type, {
+              bubbles: true,
+              touches: type === "touchend" ? [] : [t],
+              changedTouches: [t],
+            }),
+          );
+        },
+        { type, x, y },
+      );
+    // Each move is its own round trip, and the last repeats, so the release is a hold, not a flick.
+    const drag = async (to: number) => {
+      await touch("touchstart", 100);
+      for (const x of [110, 120, (120 + to) / 2, to, to]) await touch("touchmove", x);
+    };
+    const card = page.getByTestId("topbar-menu").locator("xpath=ancestor::div[contains(@class,'max-md:z-10')][1]");
+    const drawer = page.getByTestId("sidebar-new-session-pill");
 
-    await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
-    await expect(picker(page)).toBeVisible();
-    // A full-height panel flush with the right edge, not a full-width bottom sheet.
-    await expect
-      .poll(async () => {
-        const box = await picker(page).boundingBox();
-        return box && { right: Math.round(box.x + box.width), top: box.y, narrow: box.width < viewport.width * 0.9 };
-      })
-      .toEqual({ right: viewport.width, top: 48, narrow: true });
-    // Tailwind v4 `translate-x-*` sets `translate`, so a transition on
-    // `transform` alone snaps the drawer instead of sliding it.
-    expect(await picker(page).evaluate((el) => getComputedStyle(el).transitionProperty)).toContain("translate");
-    // Options hug the bottom of the drawer, not its top.
-    const option = await page.getByTestId("mobile-right-panel-pick-agent").boundingBox();
-    expect(option!.y).toBeGreaterThan(viewport.height / 2);
+    await drag(160);
+    // Mid-drag the card sits where the finger is, with the drawer uncovered beneath it.
+    await expect.poll(() => card.evaluate((el) => (el as HTMLElement).style.translate)).toBe("60px");
+    await expect(drawer).toBeVisible();
+    await touch("touchend", 160);
+    await expect(drawer).toBeHidden();
 
-    await swipe(page, viewport.width / 2, viewport.width / 2 + 160, y);
-    await expect(picker(page)).toBeHidden();
-    // The same touchmove would have opened the sidebar, so it has committed by
-    // the time the picker hides.
-    await expect(page.locator('[data-tour="sidebar"]')).toHaveClass(/-translate-x-full/);
-
-    // The header stays reachable above the drawer; its sidebar toggle swaps drawers rather than stacking them.
-    await openPicker(page);
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(picker(page)).toBeHidden();
-    await expect(page.locator('[data-tour="sidebar"]')).not.toHaveClass(/-translate-x-full/);
+    await drag(260);
+    await touch("touchend", 260);
+    await expect(page.getByTestId("sidebar-drawer-scrim")).toBeVisible();
+    await expect(drawer).toBeVisible();
   });
 
-  for (const inset of [0, 40]) {
-    test(`drawer and backdrop start at the header bottom with a ${inset}px top safe-area inset`, async ({ page }) => {
-      await openLiveTerminal(page, { mobile: true, settings: null });
-      const cdp = await page.context().newCDPSession(page);
-      await cdp.send("Emulation.setSafeAreaInsetsOverride", { insets: { top: inset } });
-      await openPicker(page);
-
-      const headerBottom = await page
-        .locator("header")
-        .first()
-        .evaluate((el) => el.getBoundingClientRect().bottom);
-      expect(headerBottom).toBe(48 + inset);
-      await expect.poll(async () => (await picker(page).boundingBox())!.y).toBe(headerBottom);
-      const backdrop = page.getByTestId("mobile-right-panel-picker-backdrop");
-      expect((await backdrop.boundingBox())!.y).toBe(headerBottom);
-
-      // The toggle stays reachable: its click swaps drawers instead of hitting the backdrop.
-      await page.getByRole("button", { name: "Toggle sidebar" }).click();
-      await expect(picker(page)).toBeHidden();
-      await expect(page.locator('[data-tour="sidebar"]')).not.toHaveClass(/-translate-x-full/);
-    });
-  }
-
-  test("adjusting selected chat text does not open either drawer", async ({ page }) => {
+  test("adjusting selected chat text neither raises More nor opens the drawer", async ({ page }) => {
     await openLiveTerminal(page, { mobile: true, settings: null });
     const content = liveContent(page).first();
     await expect(content).toContainText("$ ready");
@@ -147,20 +159,20 @@ test.describe("Mobile right panel picker (#1452)", () => {
     ]) {
       await swipe(page, from, to, height / 2);
       await expect(picker(page)).toBeHidden();
-      await expect(page.locator('[data-tour="sidebar"]')).toHaveClass(/-translate-x-full/);
+      await expect(page.getByTestId("sidebar-new-session-pill")).toBeHidden();
       expect(await page.evaluate(() => document.getSelection()?.toString())).toBe(selected);
     }
     await page.evaluate(() => document.getSelection()?.removeAllRanges());
-    await swipe(page, width / 2 + 80, width / 2 - 80, height / 2);
-    await expect(picker(page)).toBeVisible();
+    await swipe(page, width / 2 - 80, width / 2 + 80, height / 2);
+    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
   });
 
-  test("picker promotes the paired terminal and it survives the keyboard", async ({ page }) => {
+  test("Terminal promotes the paired terminal, survives the keyboard, and stays mounted behind the agent", async ({
+    page,
+  }) => {
     await openLiveTerminal(page, { mobile: true, settings: { mobileFontSize: 10 } });
-    await openPicker(page);
-
-    await page.getByTestId("mobile-right-panel-pick-paired").click();
-    await expect(picker(page)).toBeHidden();
+    await pickPhoneView(page, "Terminal");
+    await expectPhoneView(page, "Terminal");
     const paired = page.locator('[data-term="paired"]');
     await paired.waitFor({ state: "visible", timeout: 10_000 });
     await expectSafeAreaInset(page, "mobile-paired-layer");
@@ -173,7 +185,8 @@ test.describe("Mobile right panel picker (#1452)", () => {
       .toBeGreaterThan(150);
 
     // Back to the agent: the paired shell stays mounted, keeping its PTY and scrollback.
-    await backToAgent(page).click();
+    await pickPhoneView(page, "Agent");
+    await expectPhoneView(page, "Agent");
     await expect(paired).toHaveCount(1);
     await expect(liveTerminal(page)).toBeVisible();
   });
@@ -184,11 +197,7 @@ test.describe("Mobile right panel picker (#1452)", () => {
     });
     await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
     await openLiveSession(page, handle, { mobile: true, settings: null, title: "acp-mobile", waitForLive: false });
-    await page.getByRole("button", { name: "Toggle panels" }).waitFor({ state: "visible", timeout: 10_000 });
-    await openPicker(page);
-
-    await page.getByTestId("mobile-right-panel-pick-paired").click();
-    await expect(picker(page)).toBeHidden();
+    await pickPhoneView(page, "Terminal");
     const paired = page.locator('[data-term="paired"]');
     await paired.waitFor({ state: "visible", timeout: 10_000 });
 
@@ -199,8 +208,8 @@ test.describe("Mobile right panel picker (#1452)", () => {
       })
       .toBeGreaterThan(150);
 
-    await backToAgent(page).click();
-    await expect(backToAgent(page)).toHaveCount(0);
+    await pickPhoneView(page, "Agent");
+    await expectPhoneView(page, "Agent");
   });
 });
 
@@ -216,8 +225,8 @@ test.describe("Desktop right panel split is unchanged (#1452)", () => {
     await expect(page).toHaveURL(/\/session\/pinch-test/, { timeout: 10_000 });
 
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();
-    await expect(page.getByTestId("activity-bar")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
+    await expect(page.getByTestId("panel-control")).toBeVisible();
+    await expect(page.getByTestId("session-title-pill")).toBeHidden();
     await expect(picker(page)).toBeHidden();
     await expect(page.getByRole("button", { name: "Compose", exact: true })).toHaveCount(0);
     await expect(page.getByRole("group", { name: "Arrow keys joystick" })).toHaveCount(0);
@@ -234,7 +243,7 @@ test.describe("Mobile agent pane", () => {
   test("no touch toolbar without a session; the agent pane renders the live view, not xterm", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
+    await expect(page.locator('[role="navigation"][aria-label="Sessions sidebar"]')).toBeAttached();
     await expect(page.getByRole("button", { name: /Arrow/ })).toHaveCount(0);
 
     await openLiveSession(page, handle, { mobile: true, settings: null });
@@ -337,7 +346,8 @@ test.describe("Mobile settings", () => {
 
     await list.getByRole("button", { name: /Notifications/ }).click();
     await expect(page).toHaveURL(/\/settings\/notifications$/);
-    await expect(page.getByRole("heading", { name: "Notifications", level: 2 })).toBeVisible();
+    // A phone titles the section in its header, beside the round back button.
+    await expect(page.getByRole("heading", { name: "Notifications", level: 1 })).toBeVisible();
     await expect(list).toHaveCount(0);
     await page.getByRole("button", { name: /All settings/ }).click();
     await expect(page).toHaveURL(/\/settings$/);

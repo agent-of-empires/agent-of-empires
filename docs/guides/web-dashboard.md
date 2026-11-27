@@ -37,7 +37,10 @@ The Daemon prints a URL carrying an auth token. Open it in a browser; the token 
 
 When a poll expires, the dashboard aborts its request and shows the server as
 unreachable while retaining the last session list and workspace order. A later
-successful poll restores the online state. A save acknowledgement alone does not
+successful poll restores the online state; **Try again** on the banner reloads
+at once. An installed dashboard that loads with no connection shows the last
+copy of the app it fetched, with that banner, or a page with **Try again** if it
+has none yet. A save acknowledgement alone does not
 clear a cancelled notification choice; it is reconciled against the
 affected session's canonical mutation result.
 

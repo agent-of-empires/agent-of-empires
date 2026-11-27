@@ -16,6 +16,7 @@ import {
   UndoBar,
 } from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 interface Props {
   readOnly?: boolean;
@@ -53,11 +54,7 @@ export function DashboardSuggestions({
       <section className="mb-4 mt-3 w-full max-w-2xl" aria-label="Suggested sessions">
         <p role="alert" className="px-1 text-xs text-status-error">
           Could not load suggestions.{" "}
-          <button
-            type="button"
-            onClick={() => void ctrl.load()}
-            className="cursor-pointer text-brand-500 hover:underline"
-          >
+          <button type="button" onClick={() => void ctrl.load()} className={BUTTON_INLINE}>
             Try again
           </button>
         </p>
@@ -84,7 +81,7 @@ export function DashboardSuggestions({
       aria-labelledby="suggested-sessions-heading"
       {...tourAnchor(TOUR_ANCHORS.dashboardSuggestions)}
     >
-      <div className="mb-2 flex items-baseline justify-between px-1">
+      <div className="mb-2 flex items-center justify-between px-1">
         <h2
           id="suggested-sessions-heading"
           className="text-[11px] font-mono uppercase tracking-[0.16em] text-text-muted"
@@ -98,7 +95,7 @@ export function DashboardSuggestions({
             e.preventDefault();
             onViewAll();
           }}
-          className="text-xs text-brand-500 hover:underline"
+          className={BUTTON_INLINE}
         >
           {active.length > 0 ? `View all (${active.length})` : "View all"}
         </a>
@@ -167,7 +164,7 @@ export function DashboardSuggestions({
                 type="button"
                 onClick={() => void refresh()}
                 disabled={busy !== null || refreshing}
-                className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+                className={BUTTON_INLINE}
               >
                 Refresh
               </button>
@@ -186,7 +183,7 @@ export function DashboardSuggestions({
                 type="button"
                 onClick={() => void (loadFailed ? ctrl.load() : refresh())}
                 disabled={busy !== null || refreshing}
-                className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+                className={BUTTON_INLINE}
               >
                 Try again
               </button>

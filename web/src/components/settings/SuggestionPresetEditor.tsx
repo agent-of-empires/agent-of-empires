@@ -12,6 +12,7 @@ import { shortRef } from "../../lib/suggestionPlan";
 import { expandTemplate } from "../../lib/suggestionTemplate";
 import { TemplateEditor } from "./TemplateEditor";
 import { SuggestionSwitch } from "./suggestionsShared";
+import { BUTTON_INLINE } from "../../lib/surfaces";
 
 /** A kind to open in the editor; `returnToSuggestions` swaps Back for a link to the suggestions view. */
 export interface PresetFocus {
@@ -198,12 +199,7 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
             ? `Uses ${provider.name}'s own prompt until you type one. `
             : "Words in {braces} are filled in from each suggestion. "}
           {draft.prompt !== null && (
-            <button
-              type="button"
-              disabled={off}
-              onClick={() => set("prompt", null)}
-              className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
-            >
+            <button type="button" disabled={off} onClick={() => set("prompt", null)} className={BUTTON_INLINE}>
               Reset to {provider.name}&apos;s prompt
             </button>
           )}

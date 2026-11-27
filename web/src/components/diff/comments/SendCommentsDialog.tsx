@@ -5,6 +5,12 @@ import { buildCommentsMarkdown, buildDiffCommentsPrompt } from "./buildPrompt";
 import type { DiffComment } from "./types";
 import { reportTelemetrySeen } from "../../../lib/api";
 import { hasFinePointer } from "../../../lib/platform";
+import { BUTTON_PRIMARY, INPUT } from "../../../lib/surfaces";
+import { CancelButton, CloseButton, Dialog } from "../../Dialog";
+import { FIELD_LABEL } from "../../../lib/surfaces";
+
+const LABEL = `${FIELD_LABEL} !mb-1`;
+const TEXTAREA = `${INPUT} font-mono resize-y`;
 
 interface Props {
   sessionId: string;
@@ -123,104 +129,80 @@ export function SendCommentsDialog({
   }, [busy, onClose, send]);
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div className="bg-surface-900 border border-surface-700 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
-        <div className="px-4 py-3 border-b border-surface-700/60 flex items-center gap-2">
-          <h2 className="text-sm font-semibold text-text-primary">Send diff comments</h2>
-          <span className="text-[11px] text-text-dim">
+    <Dialog
+      id="send-comments"
+      title="Send diff comments"
+      describedBy={false}
+      panelClassName="md:w-[42rem] md:max-h-[90vh]"
+      bodyClassName="space-y-3"
+      onDismiss={onClose}
+      dismissOn="mousedown"
+      headerEnd={
+        <>
+          <span className="shrink-0 text-[13px] md:text-[11px] text-text-dim">
             {comments.length} comment{comments.length === 1 ? "" : "s"}
           </span>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="ml-auto text-text-dim hover:text-text-secondary cursor-pointer"
-          >
-            ×
-          </button>
-        </div>
-        <div className="flex-1 overflow-auto px-4 py-3 space-y-3">
-          <section>
-            <label className="block text-[11px] text-text-dim mb-1">Intro (optional)</label>
-            <textarea
-              autoFocus={hasFinePointer()}
-              value={introDraft}
-              onChange={(e) => onChangeIntro(e.target.value)}
-              placeholder="Anything you want to say before the comments..."
-              rows={2}
-              className="w-full bg-surface-950 border border-surface-700 rounded px-2 py-1.5 text-[12px] font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none resize-y"
-            />
-          </section>
-
-          <section>
-            <div className="text-[11px] text-text-dim mb-1">Comments preview (auto-generated, read-only)</div>
-            <div className="border border-surface-700/60 rounded p-3 bg-surface-950 max-h-72 overflow-auto text-[13px]">
-              {preview ? (
-                <CommentMarkdown text={preview} />
-              ) : (
-                <span className="text-text-dim italic">No comments.</span>
-              )}
-            </div>
-          </section>
-
-          <section>
-            <label className="block text-[11px] text-text-dim mb-1">Outro</label>
-            <textarea
-              value={outroDraft}
-              onChange={(e) => onChangeOutro(e.target.value)}
-              placeholder="Please address these comments."
-              rows={2}
-              className="w-full bg-surface-950 border border-surface-700 rounded px-2 py-1.5 text-[12px] font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none resize-y"
-            />
-          </section>
-
-          {error && <div className="text-[12px] text-status-error bg-status-error/10 rounded p-2">{error}</div>}
-        </div>
-        <div className="px-4 py-3 border-t border-surface-700/60 flex items-center gap-3">
-          <label className="flex items-center gap-1.5 text-[11px] text-text-dim cursor-pointer">
+          <CloseButton onClick={onClose} />
+        </>
+      }
+      footer={
+        <>
+          <label className="mr-auto max-md:basis-full max-md:min-h-11 flex items-center gap-2 text-[13px] md:text-[11px] text-text-dim cursor-pointer">
             <input
               type="checkbox"
               checked={clearAfterSend}
               onChange={(e) => onChangeClearAfterSend(e.target.checked)}
-              className="cursor-pointer"
+              className="cursor-pointer accent-brand-600"
             />
             Clear comments after sending
           </label>
-          <div className="ml-auto flex items-center gap-2">
+          <CancelButton onClick={onClose} />
+          {/* Tooltip + `aria-disabled` rather than `title` + `disabled`: neither a `title` nor a focus ring
+              shows on a natively disabled button. `send()` re-checks every condition itself. */}
+          <Tooltip text={sendTooltip} multiline>
             <button
               type="button"
-              onClick={onClose}
-              className="text-[12px] px-3 py-1.5 rounded text-text-dim hover:text-text-secondary hover:bg-surface-800 cursor-pointer transition-colors"
+              onClick={() => void send()}
+              aria-disabled={sendBlocked}
+              className={`${BUTTON_PRIMARY} ${sendBlocked ? "opacity-40 !cursor-not-allowed" : ""}`}
             >
-              Cancel
+              {busy ? "Sending..." : "Send"}
             </button>
-            {/* Tooltip + `aria-disabled` rather than `title` + `disabled`, for
-                the reasons spelled out in `CommentsBanner`: the browser renders
-                neither a `title` nor a focus ring on a natively disabled
-                button, so both pointer and keyboard users were left without the
-                explanation. `send()` re-checks every condition itself. */}
-            <Tooltip text={sendTooltip} multiline>
-              <button
-                type="button"
-                onClick={() => void send()}
-                aria-disabled={sendBlocked}
-                className={`text-[12px] px-3 py-1.5 rounded-md transition-colors ${
-                  sendBlocked
-                    ? "bg-surface-700 text-text-dim cursor-not-allowed"
-                    : "bg-brand-600 text-white hover:bg-brand-500 cursor-pointer"
-                }`}
-              >
-                {busy ? "Sending..." : "Send"}
-              </button>
-            </Tooltip>
-          </div>
+          </Tooltip>
+        </>
+      }
+    >
+      <section>
+        <label className={LABEL}>Intro (optional)</label>
+        <textarea
+          autoFocus={hasFinePointer()}
+          value={introDraft}
+          onChange={(e) => onChangeIntro(e.target.value)}
+          placeholder="Anything you want to say before the comments..."
+          rows={2}
+          className={TEXTAREA}
+        />
+      </section>
+
+      <section>
+        <div className={LABEL}>Comments preview (auto-generated, read-only)</div>
+        <div className="border border-surface-700/60 rounded-lg p-3 bg-surface-950 max-h-72 overflow-auto text-[13px]">
+          {preview ? <CommentMarkdown text={preview} /> : <span className="text-text-dim italic">No comments.</span>}
         </div>
-      </div>
-    </div>
+      </section>
+
+      <section>
+        <label className={LABEL}>Outro</label>
+        <textarea
+          value={outroDraft}
+          onChange={(e) => onChangeOutro(e.target.value)}
+          placeholder="Please address these comments."
+          rows={2}
+          className={TEXTAREA}
+        />
+      </section>
+
+      {error && <div className="text-[13px] text-status-error bg-status-error/10 rounded-lg p-3">{error}</div>}
+    </Dialog>
   );
 }

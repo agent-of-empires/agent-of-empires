@@ -1,14 +1,11 @@
 import { lazy, Suspense, type ComponentType, type JSX, type ReactNode } from "react";
 import { ErrorBoundary } from "../components/ErrorBoundary";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 const loadFailed = (
   <div className="flex h-full flex-col items-center justify-center gap-3 bg-surface-900 text-text-dim">
     <div className="text-xs font-mono uppercase tracking-wide">Couldn't load this view.</div>
-    <button
-      type="button"
-      onClick={() => window.location.reload()}
-      className="text-xs font-mono uppercase tracking-wide underline cursor-pointer"
-    >
+    <button type="button" onClick={() => window.location.reload()} className={BUTTON_INLINE}>
       Reload
     </button>
   </div>

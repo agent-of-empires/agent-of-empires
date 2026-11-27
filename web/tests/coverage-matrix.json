@@ -116,6 +116,70 @@
       "notes": "The shell's Host/Container mode is per Session and terminal tab. Revealing it focuses at once only when it is shown and stays mounted; otherwise focus is latched and activateTab reveals the tab, opening a collapsed dock. The focus and the latch name that terminal, so with one shown in each dock, Cmd+` and Open Terminal never land in the other."
     },
     {
+      "id": "diff.scope",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/diff-scope.spec.ts",
+        "src/components/diff/__tests__/DiffScopePicker.test.tsx",
+        "src/hooks/useDiffFiles.test.ts",
+        "src/lib/__tests__/diffScope.test.ts"
+      ],
+      "components": [
+        "web/src/components/diff/DiffScopePicker.tsx",
+        "web/src/components/diff/DiffFileList.tsx",
+        "web/src/components/diff/DiffFileViewer.tsx",
+        "web/src/hooks/useDiffFiles.ts",
+        "web/src/hooks/useFileContents.ts",
+        "web/src/lib/diffScope.ts"
+      ],
+      "notes": "Branch and Uncommitted switch the file list and the viewer's request scope; the base picker shows only for Branch. The pick is remembered per Session in this browser. Server scopes are covered by git::diff and server::api::sessions Rust tests."
+    },
+    {
+      "id": "dock.review-panel",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/review-panel.spec.ts",
+        "src/components/__tests__/MainViewTabs.test.tsx",
+        "src/lib/__tests__/rightDockMode.test.ts",
+        "src/lib/__tests__/paneLayout.test.ts"
+      ],
+      "components": [
+        "web/src/components/MainViewTabs.tsx",
+        "web/src/components/ContentSplit.tsx",
+        "web/src/components/Dock.tsx",
+        "web/src/lib/rightDockMode.ts",
+        "web/src/lib/panes.ts"
+      ],
+      "notes": "The right dock keeps Diff, Files, Background, plugins, then terminals in that order. A file picked in Diff or Files opens behind an Agent | file tab strip in the main area; Agent keeps the file open, the file tab returns to it, and its close button closes it. The right dock maximizes over the main area and restores. Between 768px and 1100px it is a modal sheet that takes focus, closes on Escape or a backdrop click, returns focus to its opener, and closes when a file is picked."
+    },
+    {
+      "id": "terminal.paired-shell-switcher",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/terminal-switcher.spec.ts",
+        "src/components/__tests__/TerminalSwitcher.test.tsx",
+        "src/components/__tests__/MobileRightPanelPicker.test.tsx",
+        "src/components/__tests__/MobileMainPane.test.tsx",
+        "src/lib/__tests__/pairedShells.test.ts",
+        "src/lib/__tests__/paneLayout.test.ts",
+        "src/lib/__tests__/panes.test.ts"
+      ],
+      "components": [
+        "web/src/components/TerminalSwitcher.tsx",
+        "web/src/components/PairedTerminal.tsx",
+        "web/src/components/Dock.tsx",
+        "web/src/components/MobileRightPanelPicker.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/lib/pairedShells.ts",
+        "web/src/lib/paneLayout.ts",
+        "web/src/lib/panes.ts"
+      ],
+      "notes": "A terminal tab opens in the right dock, stacked below the review panes, or in whichever dock already holds a terminal. A terminal tab is bound to one Session's shell (terminal:<sessionId>:<n>) and stays, still showing that shell, when the sidebar selects another Session; every Session shows the shared terminal tabs while its other panels stay per Session. v3 layouts bind their terminal tabs to the Session they belonged to. The dock switcher and Cmd/Ctrl+Shift+` list every live paired shell from the Daemon's auxiliary observations, the selected Session first; picking one focuses its tab or opens one. The phone picker lists the same shells and shows the pick in the paired view, with Host/Container in its header for sandboxed Sessions."
+    },
+    {
       "id": "app-shell.docks",
       "kind": "vitest",
       "risk": "medium",
@@ -135,7 +199,7 @@
       "risk": "high",
       "specs": ["tests/pane-docking.spec.ts"],
       "components": [
-        "web/src/components/ActivityBar.tsx",
+        "web/src/components/PanelControl.tsx",
         "web/src/components/Dock.tsx",
         "web/src/components/DockGroups.tsx",
         "web/src/components/BottomDock.tsx",
@@ -149,7 +213,11 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/settings-panels.spec.ts"],
-      "components": ["web/src/components/McpServers.tsx", "web/src/components/McpServerForm.tsx"]
+      "components": [
+        "web/src/components/McpServers.tsx",
+        "web/src/components/McpServerForm.tsx",
+        "web/src/components/panelParts.tsx"
+      ]
     },
     {
       "id": "settings.mcp-servers.handlers",
@@ -227,11 +295,16 @@
       "components": ["web/src/components/Dashboard.tsx"]
     },
     {
-      "id": "dashboard.mobile-recent-sessions",
+      "id": "mobile.session-stack",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["src/components/__tests__/DashboardRecentSessions.test.tsx", "tests/dashboard.spec.ts"],
-      "components": ["web/src/components/Dashboard.tsx"]
+      "specs": ["tests/dashboard.spec.ts", "tests/mobile-panes.spec.ts"],
+      "components": [
+        "web/src/components/TopBar.tsx",
+        "web/src/components/OverflowMenu.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/App.tsx"
+      ]
     },
     {
       "id": "app-shell.dashboard-update-banner",
@@ -1469,8 +1542,8 @@
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/components/__tests__/ActivityBar.test.tsx", "src/components/__tests__/PaneIcon.test.tsx"],
-      "components": ["web/src/components/ActivityBar.tsx", "web/src/components/PaneIcon.tsx"]
+      "specs": ["src/components/__tests__/PanelControl.test.tsx", "src/components/__tests__/PaneIcon.test.tsx"],
+      "components": ["web/src/components/PanelControl.tsx", "web/src/components/PaneIcon.tsx"]
     },
     {
       "id": "app-shell.tips-badge",
@@ -2580,7 +2653,7 @@
       "kind": "mocked-playwright",
       "risk": "low",
       "specs": ["tests/sidebar-chrome.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SidebarNav.tsx"]
     },
     {
       "id": "sidebar.reorder-stationary-click",
@@ -2783,7 +2856,7 @@
       "specs": ["tests/sidebar-sort-mode.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/sidebar/SidebarViewMenu.tsx",
         "web/src/components/Tooltip.tsx",
         "web/src/components/sidebar/SidebarToolbar.tsx"
       ]
@@ -2792,9 +2865,9 @@
       "id": "sidebar.popup-escape-keeps-selection",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/SidebarSortPicker.test.tsx"],
+      "specs": ["src/components/__tests__/SidebarViewMenu.test.tsx"],
       "components": [
-        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/sidebar/SidebarViewMenu.tsx",
         "web/src/components/useOutsideDismiss.ts",
         "web/src/components/sidebar/useSidebarSelection.ts"
       ]
@@ -2804,7 +2877,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-sort-mode.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SidebarSortPicker.tsx"]
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SidebarViewMenu.tsx"]
     },
     {
       "id": "sidebar.plugin-sort-filter",
@@ -2813,7 +2886,7 @@
       "specs": ["tests/plugin-sort-filter.spec.ts"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/sidebar/SidebarViewMenu.tsx",
         "web/src/components/plugin/PluginSlots.tsx"
       ]
     },
@@ -2963,7 +3036,7 @@
       "risk": "high",
       "specs": ["tests/sidebar-grouping.spec.ts"],
       "components": [
-        "web/src/components/SidebarAxisPicker.tsx",
+        "web/src/components/sidebar/SidebarViewMenu.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/hooks/useStatusGroups.ts",
         "web/src/lib/sidebarGroups.ts"
@@ -3589,7 +3662,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/right-panel-persistence.spec.ts", "src/lib/__tests__/paneLayout.test.ts"],
-      "components": ["web/src/App.tsx", "web/src/components/ActivityBar.tsx", "web/src/components/TopBar.tsx"],
+      "components": ["web/src/App.tsx", "web/src/components/PanelControl.tsx", "web/src/components/TopBar.tsx"],
       "notes": "Diff and terminal follow the Daemon's web.auto_open_* defaults (off) until the user changes a Session's tabs; nothing is saved on view, so a changed default reaches Sessions already viewed. A closed Diff shows its changed-file count."
     },
     {
@@ -3652,6 +3725,14 @@
       "risk": "medium",
       "specs": ["tests/live/session-lifecycle.spec.ts"],
       "components": ["web/src/components/DisconnectBanner.tsx"]
+    },
+    {
+      "id": "connectivity.offline-shell",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/__tests__/sw.test.ts"],
+      "components": ["web/public/sw.js"],
+      "notes": "The service worker keeps the last app page a document navigation fetched and serves it, or a page with Try again, when the network fails; hashed /assets/ files are served from Cache Storage once fetched, and a Cache Storage failure never fails a fetched asset. Plugin page frames, /api/ navigations, non-GET and cross-origin requests go to the network."
     },
     {
       "id": "connectivity.lifecycle-fetch-toasts",
@@ -3845,7 +3926,8 @@
         "web/src/hooks/useAcpSession.ts",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/ElicitationAnswerCard.tsx",
-        "web/src/components/acp/StructuredView.tsx"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/UserReplyCard.tsx"
       ]
     },
     {
@@ -4758,7 +4840,7 @@
         "web/src/hooks/acpSession/stateCache.ts",
         "web/src/lib/acpTypes.ts"
       ],
-      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error that ends the Retry with the same cause, after spawn failed: or restart spawn failed: and any reason code, brings the banner back as <Agent> still couldn't start with Same error as before., then the cause's own fix and actions. A refused Retry request fails the same way without its HTTP status. A reload, or a later error with no Retry, reads as a first failure again."
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>…, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error that ends the Retry with the same cause, after spawn failed: or restart spawn failed: and any reason code, brings the banner back as <Agent> still couldn't start with Same error as before., then the cause's own fix and actions. A refused Retry request fails the same way without its HTTP status. A reload, or a later error with no Retry, reads as a first failure again."
     },
     {
       "id": "acp.startup-error-banner-retry-changed-cause",
@@ -4780,7 +4862,7 @@
         "web/src/hooks/acpSession/stateCache.ts",
         "web/src/lib/acpTypes.ts"
       ],
-      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error, or a refused Retry request, with a different cause brings the banner back as <Agent> still couldn't start with It failed differently this time: and the new cause's first line, then the new cause's fix and actions. Details hold the full error with Copy."
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>…, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error, or a refused Retry request, with a different cause brings the banner back as <Agent> still couldn't start with It failed differently this time: and the new cause's first line, then the new cause's fix and actions. Details hold the full error with Copy."
     },
     {
       "id": "acp.empty-state-not-running",
@@ -5087,7 +5169,7 @@
         "web/src/components/sidebar/GroupLists.tsx",
         "web/src/components/sidebar/keyboardNav.ts"
       ],
-      "notes": "Arrow keys over headers and rows on every axis, including nested and org lists; Left on a collapsed nested header goes to its parent; the Snoozed & archived toggle is a header for its rows; Archive all that empties a Group moves focus to the nearest remaining Group header, never the toggle, and not after focus moved elsewhere."
+      "notes": "Arrow keys over headers and rows on every axis, including nested and org lists; Left on a collapsed nested header goes to its parent; the Snoozed & archived toggle is a header for its rows; Archive all that empties a Group moves focus to the nearest remaining Group header, never the toggle, and not after focus moved elsewhere. Arrowing up a scrolled list keeps the focused row clear of the pinned title row."
     },
     {
       "id": "story.sidebar-plan-progress",
@@ -5254,6 +5336,14 @@
         "web/src/hooks/useResolvedTheme.ts",
         "web/src/lib/themeWrites.ts"
       ]
+    },
+    {
+      "id": "settings.theme-cross-window-sync",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/theme-switch.spec.ts", "src/hooks/useResolvedTheme.test.tsx"],
+      "components": ["web/src/hooks/useResolvedTheme.ts", "web/src/hooks/useShikiTheme.ts", "web/src/lib/theme.ts"],
+      "notes": "A theme picked in one window repaints every other open window of the browser at once, including already-mounted syntax highlighting; a window refetches the theme when it becomes visible."
     },
     {
       "id": "story.settings-logging-level",

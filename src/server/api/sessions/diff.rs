@@ -41,6 +41,32 @@ pub struct RepoBase {
     pub base_override: Option<String>,
 }
 
+/// What the diff endpoints compare the working tree against: `?scope=`, `branch` when omitted.
+#[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffScope {
+    /// The merge-base with the session's diff base branch.
+    #[default]
+    Branch,
+    /// HEAD: changes not yet committed.
+    Uncommitted,
+}
+
+#[derive(Deserialize, Default)]
+pub struct DiffFilesQuery {
+    #[serde(default)]
+    pub scope: DiffScope,
+}
+
+/// The tree a scope compares the working tree against.
+fn scope_base(scope: DiffScope, base_branch: &str) -> crate::git::diff::DiffBase<'_> {
+    use crate::git::diff::DiffBase;
+    match scope {
+        DiffScope::Branch => DiffBase::Branch(base_branch),
+        DiffScope::Uncommitted => DiffBase::Head,
+    }
+}
+
 #[derive(Serialize)]
 pub struct RichDiffFilesResponse {
     pub files: Vec<RichDiffFileInfo>,
@@ -251,6 +277,7 @@ pub(super) fn resolve_diff_base(
 pub async fn session_diff_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DiffFilesQuery>,
 ) -> impl IntoResponse {
     if let Some(resp) = crate::server::api::cityhall_block(&state) {
         return resp;
@@ -290,9 +317,12 @@ pub async fn session_diff_files(
                 config_default.as_deref(),
                 path,
             );
-            let warning = diff::check_merge_base_status(path, &base_branch);
+            let warning = match query.scope {
+                DiffScope::Branch => diff::check_merge_base_status(path, &base_branch),
+                DiffScope::Uncommitted => None,
+            };
             let changed = scan_state
-                .changed_files_cached(path, &base_branch)
+                .changed_files_cached(path, scope_base(query.scope, &base_branch))
                 .unwrap_or_default();
 
             for f in changed {
@@ -357,6 +387,8 @@ pub struct FileDiffQuery {
     /// single-repo URL keeps working (#1047).
     #[serde(default)]
     pub repo: Option<String>,
+    #[serde(default)]
+    pub scope: DiffScope,
 }
 
 /// Response for a rejected diff request (bad path, file not changed, etc.).
@@ -408,8 +440,9 @@ pub async fn session_diff_file(
             // Files in the changed set are diffed; an in-repo file with no
             // diff is served through the full-file fallback below. The
             // traversal and containment checks are the security boundary.
+            let base = scope_base(query.scope, &base_branch);
             let changed_files = scan_state
-                .changed_files_cached(repo_path, &base_branch)
+                .changed_files_cached(repo_path, base)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
             let (canonical_path, is_changed) =
                 match validate_diff_path(repo_path, file_path, &changed_files) {
@@ -467,7 +500,7 @@ pub async fn session_diff_file(
             // Hand the client raw old/new text plus a server-computed unified
             // patch, which it renders virtualized and off-main-thread without
             // re-running the diff algorithm.
-            let contents = diff::compute_file_contents(repo_path, file_path, &base_branch)
+            let contents = diff::compute_file_contents_against(repo_path, file_path, base)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
             // additions/deletions are not computed on this path; reuse the
             // counts the changed-files scan already produced.

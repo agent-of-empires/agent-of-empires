@@ -24,6 +24,7 @@ function mount(ready = true) {
     onToggleSidebar: vi.fn(),
     onToggleRightPanel: vi.fn(),
     onToggleTerminalFocus: vi.fn(),
+    onSwitchTerminal: vi.fn(),
   } satisfies ShortcutActions;
   return {
     actions,

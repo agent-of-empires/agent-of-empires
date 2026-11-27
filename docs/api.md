@@ -942,6 +942,10 @@ PUT accepts `{ "path", "version", "content" }` for an existing project UTF-8 tex
 
 Read-only and CityHall modes return 403. Escaping paths, binary files, and unverified or separate Sandbox volumes cannot be edited. The browser's opt-in setting and workflow are described in [Editing project files](guides/web/dashboard.md#editing-project-files).
 
+## GET /api/sessions/{id}/diff/files and /diff/file
+
+Both take `?scope=` for what the working tree is compared against: `branch` (the default) is the merge-base with the session's diff base branch, and `uncommitted` is HEAD. Any other value is a `400`. `/diff/file` also takes `?path=` and, for a workspace session, `?repo=`.
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's

@@ -1131,8 +1131,10 @@ impl SuggestionsView {
         theme: &Theme,
         store: &SuggestionsFeed,
         mutation_block: Option<MutationBlock>,
-        focused: bool,
+        // `None` while the pane has the keys; otherwise the key that gives it them.
+        focus_key: Option<&str>,
     ) {
+        let focused = focus_key.is_none();
         frame.render_widget(Clear, area);
         let border = if focused { theme.accent } else { theme.border };
         let block = Block::default()
@@ -1156,10 +1158,12 @@ impl SuggestionsView {
         let detail = self.detail_lines(store, theme, width as usize);
         let mut units = if self.help {
             vec!["any key closes".to_string()]
-        } else if focused {
-            self.row_keys(store, mutation_block)
         } else {
-            vec!["↵ browse".to_string()]
+            match focus_key {
+                None => self.row_keys(store, mutation_block),
+                Some("") => Vec::new(),
+                Some(key) => vec![format!("{key} browse")],
+            }
         };
         let mut footer: Vec<Line> = Vec::new();
         if let Some(error) = &self.error {
@@ -2417,7 +2421,7 @@ mod tests {
                     &Theme::default(),
                     &rig.store,
                     block,
-                    true,
+                    None,
                 )
             })
             .unwrap();
