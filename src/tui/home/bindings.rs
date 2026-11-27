@@ -496,7 +496,9 @@ pub(super) fn chord_from_parts(code: KeyCode, mods: KeyModifiers) -> Chord {
         code,
         ctrl: mods.contains(KeyModifiers::CONTROL),
         alt: mods.contains(KeyModifiers::ALT),
-        shift: shift && !matches!(code, KeyCode::Char(_)),
+        // A letter carries Shift in its case; other characters (Space, digits) keep the flag
+        // so `S-Space` does not collapse to bare Space.
+        shift: shift && !matches!(code, KeyCode::Char(c) if c.is_ascii_alphabetic()),
     }
 }
 
@@ -618,7 +620,7 @@ pub(super) fn format_chord(c: &Chord) -> String {
     // A bare letter keeps its lone-character form; every modified chord is spelled out, or
     // the help overlay and the palette show the new arrow bindings with no key at all.
     match c.code {
-        KeyCode::Char(ch) if ch != ' ' && !c.ctrl && !c.alt => return ch.to_string(),
+        KeyCode::Char(ch) if ch != ' ' && !c.ctrl && !c.alt && !c.shift => return ch.to_string(),
         _ => {}
     }
     // Shift on a letter lives in its uppercase code; spell it out once Ctrl or Alt joins it,
@@ -1603,6 +1605,8 @@ mod tests {
             ("Shift+PgDn", shift_code(KeyCode::PageDown).into()),
             ("C-Up", ctrl_code(KeyCode::Up).into()),
             ("Ctrl+Alt+K", chord(k('k'), true, true, false)),
+            ("S-Space", chord(k(' '), false, false, true)),
+            ("S-1", chord(k('1'), false, false, true)),
             ("", None),
             ("Ctrl+", None),
             ("Ctrl+K+J", None),
@@ -1635,6 +1639,13 @@ mod tests {
             assert!(parse_chord(spec).is_some(), "{spec:?}");
             assert!(keybind_matches(spec, &event), "{spec:?}");
         }
+        // Shift on a caseless key is kept, not dropped to the bare key.
+        assert!(!keybind_matches("S-Space", &key(' ')));
+        assert_eq!(
+            format_chord(&parse_chord("S-Space").unwrap()),
+            "Shift+Space"
+        );
+        assert_eq!(format_chord(&parse_chord("S-1").unwrap()), "Shift+1");
         // A modified chord is not claimed by the bare-letter binding it resembles.
         assert!(!core_shadows(&parse_chord("M-n").unwrap()));
         assert!(core_shadows(&parse_chord("M-Up").unwrap()));
