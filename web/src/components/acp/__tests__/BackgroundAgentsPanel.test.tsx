@@ -833,6 +833,20 @@ describe("BackgroundAgentsPanel generic workflow runs", () => {
     expect((bar?.firstElementChild as HTMLElement).style.width).toBe("25%");
   });
 
+  it("announces progress changes in a polite status region", () => {
+    const run = (completed: number): LifecycleRun => ({
+      runId: "r1",
+      progress: { label: "Indexing", completed, total: 4 },
+    });
+    lifecycleMock.mockReturnValue([run(1)]);
+    const { getByRole, rerender } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(getByRole("status").textContent).toBe("Indexing 1/4");
+    lifecycleMock.mockReturnValue([run(2)]);
+    rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(getByRole("status").textContent).toBe("Indexing 2/4");
+    expect(getByRole("status").getAttribute("aria-live")).toBe("polite");
+  });
+
   it("carries the full label in the row title", () => {
     const label = "Indexing a very long workflow label that the row truncates";
     lifecycleMock.mockReturnValue([{ runId: "r1", progress: { label, completed: 1, total: 4 } }]);

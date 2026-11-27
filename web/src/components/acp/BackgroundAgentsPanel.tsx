@@ -333,6 +333,10 @@ function LifecycleRunRow({ run }: { run: LifecycleRun }) {
         </span>
         {count && <span className="shrink-0 text-[11px] tabular-nums text-text-dim">{count}</span>}
       </div>
+      <span className="sr-only" role="status" aria-live="polite">
+        {label || run.runId}
+        {count ? ` ${count}` : ""}
+      </span>
       {percent != null && (
         <div
           role="progressbar"
