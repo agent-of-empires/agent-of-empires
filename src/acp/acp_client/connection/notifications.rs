@@ -325,15 +325,19 @@ impl Shared {
     async fn handle_ingested(&self, ingested: Ingested) {
         let (frames, lost) = match ingested {
             Ingested::Deliver(frames) => (frames, None),
-            Ingested::Lost(reason) => (Vec::new(), Some(reason)),
-            Ingested::DeliverThenLost(frames, reason) => (frames, Some(reason)),
+            Ingested::Lost(reason, finished) => (Vec::new(), Some((reason, finished))),
+            Ingested::DeliverThenLost(frames, reason, finished) => {
+                (frames, Some((reason, finished)))
+            }
         };
         for frame in frames {
             // Straight to the log: the `BackgroundTask*` interception in
             // `handle_adapter_notification` is for Claude's tool results.
+            let gate = self.aoe.lifecycle_gate.lock().await;
             for event in frame.lifecycle.iter().flat_map(lifecycle_events) {
                 self.emit(event).await;
             }
+            drop(gate);
             self.handle_adapter_notification(
                 frame.notification,
                 frame.local_prompt_signals,
@@ -341,7 +345,10 @@ impl Shared {
             )
             .await;
         }
-        if let Some(reason) = lost {
+        if let Some((reason, finished)) = lost {
+            for event in finished {
+                self.emit(event).await;
+            }
             tracing::warn!(
                 target: "acp.protocol",
                 session = %self.session_label,

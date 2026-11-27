@@ -21,23 +21,31 @@ struct Frame {
     envelope: Option<Envelope>,
 }
 
+/// An admitted envelope and which of its derived ids were already open.
+pub(super) struct Lifecycle {
+    pub(super) envelope: Envelope,
+    pub(super) task_open: bool,
+    pub(super) run_open: bool,
+}
+
 pub(super) struct Delivered {
     pub(super) notification: SessionNotification,
     pub(super) local_prompt_signals: bool,
     pub(super) epoch: u64,
-    /// The envelope, when its lifecycle primitives may be applied: live, not
-    /// replayed history.
-    pub(super) lifecycle: Option<Envelope>,
+    /// Set when its lifecycle primitives may be applied: live, not replayed
+    /// history, and the lease they derive was taken.
+    pub(super) lifecycle: Option<Lifecycle>,
 }
 
 pub(super) enum Ingested {
     /// Frames to process now, in order.
     Deliver(Vec<Delivered>),
-    /// A proxied agent broke the contract: stop interpreting its frames.
-    Lost(IntegrationLostReason),
+    /// A proxied agent broke the contract: stop interpreting its frames. The
+    /// events finish the derived tasks and runs left open.
+    Lost(IntegrationLostReason, Vec<Event>),
     /// The break came partway through a released batch: the frames before it
     /// arrived first, so they are processed before the loss.
-    DeliverThenLost(Vec<Delivered>, IntegrationLostReason),
+    DeliverThenLost(Vec<Delivered>, IntegrationLostReason, Vec<Event>),
 }
 
 /// Strictness depends on the hello: an agent that proved it is proxied is held
@@ -50,15 +58,20 @@ pub(super) struct AoeIngress {
     /// A `session/load` is replaying stored history, which holds no lease.
     loading_history: AtomicBool,
     order: Mutex<ArrivalOrder<Frame>>,
+    /// Orders lifecycle events with the lapse that closes them, so a stale
+    /// `Finished` cannot land after the `Started` of a renewal.
+    pub(super) lifecycle_gate: tokio::sync::Mutex<()>,
 }
 
 impl AoeIngress {
     /// Adapter frames are numbered per connection, so each starts clean.
-    pub(super) fn begin_connection(&self, proxied: bool) {
+    /// Returns the events finishing the tasks and runs the last one left open.
+    pub(super) fn begin_connection(&self, proxied: bool) -> Vec<Event> {
         self.proxied.store(proxied, Ordering::Relaxed);
         self.lost.store(false, Ordering::Relaxed);
-        self.leases.clear();
+        let finished = finish_events(self.leases.clear());
         *self.order.lock().expect("aoe ordering mutex poisoned") = ArrivalOrder::default();
+        finished
     }
 
     /// Whether this connection's agent sent a valid hello.
@@ -75,13 +88,16 @@ impl AoeIngress {
     /// integration is restored, matching the reducer clearing
     /// `integration_lost` on the new session. A lease acquired after the reset
     /// gate checked and before the commit must not hold the new session.
-    pub(super) fn session_reset(&self) {
+    /// Returns the events finishing the tasks and runs the old session left
+    /// open.
+    pub(super) fn session_reset(&self) -> Vec<Event> {
         self.lost.store(false, Ordering::Relaxed);
-        self.leases.clear();
+        let finished = finish_events(self.leases.clear());
         self.order
             .lock()
             .expect("aoe ordering mutex poisoned")
             .session_reset();
+        finished
     }
 
     pub(super) fn ingest(
@@ -162,14 +178,26 @@ impl AoeIngress {
         let proxied = self.proxied.load(Ordering::Relaxed);
         let mut deliver = Vec::with_capacity(released.len());
         for frame in released {
-            if let Some(envelope) = frame.envelope.as_ref().filter(|_| frame.admit_leases) {
-                if self.apply_leases(envelope, now_ms).is_err() && proxied {
-                    return match self.lose(IntegrationLostReason::LeaseOverflow) {
-                        Ingested::Lost(reason) if !deliver.is_empty() => {
-                            Ingested::DeliverThenLost(deliver, reason)
-                        }
-                        lost => lost,
-                    };
+            let mut lifecycle = None;
+            if let Some(envelope) = frame.envelope.clone().filter(|_| frame.admit_leases) {
+                match self.apply_leases(&envelope, now_ms) {
+                    Ok((task_open, run_open)) => {
+                        lifecycle = Some(Lifecycle {
+                            envelope,
+                            task_open,
+                            run_open,
+                        });
+                    }
+                    Err(LeaseTableFull) if proxied => {
+                        return match self.lose(IntegrationLostReason::LeaseOverflow) {
+                            Ingested::Lost(reason, finished) if !deliver.is_empty() => {
+                                Ingested::DeliverThenLost(deliver, reason, finished)
+                            }
+                            lost => lost,
+                        };
+                    }
+                    // Without a lease the task would never expire.
+                    Err(LeaseTableFull) => {}
                 }
             }
             if frame.envelope.as_ref().and_then(|e| e.ephemeral) == Some(true) {
@@ -179,45 +207,43 @@ impl AoeIngress {
                 notification: frame.notification,
                 local_prompt_signals: frame.local_prompt_signals,
                 epoch: frame.epoch,
-                lifecycle: frame.envelope.filter(|_| frame.admit_leases),
+                lifecycle,
             });
         }
         Ingested::Deliver(deliver)
     }
 
-    /// Finishes the tasks and runs whose lease expired with no `ended`.
+    /// Finishes the tasks and runs whose lease expired with no `ended`. Take
+    /// `lifecycle_gate` before calling and keep it while emitting: a renewal
+    /// racing the drain then emits its `Started` after the `Finished`.
     pub(super) fn lapsed_events(&self, now_ms: i64) -> Vec<Event> {
-        self.leases
-            .drain_expired(now_ms)
-            .into_iter()
-            .filter_map(|(ns, id)| match ns {
-                LeaseNamespace::BackgroundTask => Some(Event::BackgroundTaskFinished {
-                    task_id: id,
-                    ended_at: None,
-                }),
-                LeaseNamespace::WorkflowRun => Some(Event::WorkflowRunFinished { run_id: id }),
-                LeaseNamespace::Explicit => None,
-            })
-            .collect()
+        finish_events(self.leases.drain_expired(now_ms))
     }
 
     /// The explicit lease, then the task leases a background task or workflow
-    /// run derives.
-    fn apply_leases(&self, envelope: &Envelope, now_ms: i64) -> Result<(), LeaseTableFull> {
+    /// run derives. Returns whether the task and the run were already open.
+    fn apply_leases(
+        &self,
+        envelope: &Envelope,
+        now_ms: i64,
+    ) -> Result<(bool, bool), LeaseTableFull> {
         if let Some(lease) = &envelope.lease {
             self.leases.apply(lease, now_ms)?;
         }
+        let mut open = (false, false);
         if let Some(task) = &envelope.background_task {
             let ns = LeaseNamespace::BackgroundTask;
-            self.leases
+            open.0 = self
+                .leases
                 .apply_derived(ns, &task.id, task.state, task.ttl_ms, now_ms)?;
         }
         if let Some(run) = &envelope.workflow_run {
             let ns = LeaseNamespace::WorkflowRun;
-            self.leases
+            open.1 = self
+                .leases
                 .apply_derived(ns, &run.id, run.state, run.ttl_ms, now_ms)?;
         }
-        Ok(())
+        Ok(open)
     }
 
     /// Numbers `n` frames the session identity discarded before they got
@@ -242,9 +268,21 @@ impl AoeIngress {
     fn lose(&self, reason: IntegrationLostReason) -> Ingested {
         self.lost.store(true, Ordering::Relaxed);
         // Later frames are swallowed, so no release can arrive.
-        self.leases.clear();
-        Ingested::Lost(reason)
+        Ingested::Lost(reason, finish_events(self.leases.clear()))
     }
+}
+
+fn finish_events(open: Vec<(LeaseNamespace, String)>) -> Vec<Event> {
+    open.into_iter()
+        .filter_map(|(ns, id)| match ns {
+            LeaseNamespace::BackgroundTask => Some(Event::BackgroundTaskFinished {
+                task_id: id,
+                ended_at: None,
+            }),
+            LeaseNamespace::WorkflowRun => Some(Event::WorkflowRunFinished { run_id: id }),
+            LeaseNamespace::Explicit => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -377,7 +415,7 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert!(live[0]
             .as_ref()
-            .is_some_and(|e| e.background_task.is_some()));
+            .is_some_and(|l| l.envelope.background_task.is_some()));
 
         let aoe =
             json!({"v":2,"key":"k2","background_task":{"id":"b2","state":"started","ttl_ms":1000}});
@@ -413,7 +451,7 @@ mod tests {
         let over = json!({"v":2,"key":"over","background_task":{"id":"b","state":"started","ttl_ms":60000}});
         assert!(matches!(
             i.ingest(frame("o", over), true, 0, 0),
-            Ingested::Lost(IntegrationLostReason::LeaseOverflow)
+            Ingested::Lost(IntegrationLostReason::LeaseOverflow, _)
         ));
     }
 
@@ -433,7 +471,7 @@ mod tests {
             let i = ingress(proxied);
             let out = i.ingest(broken(), true, 0, 0);
             match (proxied, out) {
-                (true, Ingested::Lost(IntegrationLostReason::ContractViolation { .. })) => {
+                (true, Ingested::Lost(IntegrationLostReason::ContractViolation { .. }, _)) => {
                     // Once lost, nothing else is interpreted.
                     assert!(ids(i.ingest(frame("after", json!(null)), true, 0, 0)).is_empty());
                 }
@@ -454,7 +492,7 @@ mod tests {
         let aoe = json!({"v":2,"key":"over","after_adapter_sequence":u64::MAX});
         assert!(matches!(
             i.ingest(frame("h", aoe), true, 0, 0),
-            Ingested::Lost(IntegrationLostReason::HoldOverflow)
+            Ingested::Lost(IntegrationLostReason::HoldOverflow, _)
         ));
     }
 
@@ -501,7 +539,7 @@ mod tests {
         let i = ingress(true);
         assert!(matches!(
             i.ingest(frame("bad", json!({"v": 2})), true, 0, 0),
-            Ingested::Lost(_)
+            Ingested::Lost(..)
         ));
         assert!(ids(i.ingest(frame("a", json!(null)), true, 0, 0)).is_empty());
         i.session_reset();
@@ -513,7 +551,7 @@ mod tests {
         let i = ingress(true);
         assert!(matches!(
             i.ingest(frame("bad", json!({"v": 2})), true, 0, 0),
-            Ingested::Lost(_)
+            Ingested::Lost(..)
         ));
         // The bad frame was adapter frame 1; frames 2 and 3 arrive while lost.
         assert!(ids(i.ingest(frame("a", json!(null)), true, 0, 0)).is_empty());
@@ -531,7 +569,7 @@ mod tests {
         let bad = json!({"v":2,"key":"","after_adapter_sequence":9});
         assert!(matches!(
             i.ingest(frame("bad", bad.clone()), true, 0, 0),
-            Ingested::Lost(_)
+            Ingested::Lost(..)
         ));
         // Swallowed while lost: also uncounted.
         assert!(ids(i.ingest(frame("bad2", bad), true, 0, 0)).is_empty());
@@ -621,7 +659,7 @@ mod tests {
         assert!(ids(i.ingest(frame("tail", plain_tailer), true, 0, 0)).is_empty());
         let over = lease("over".into(), Some(next));
         assert!(ids(i.ingest(frame("over", over), true, 0, 0)).is_empty());
-        let Ingested::DeliverThenLost(frames, IntegrationLostReason::LeaseOverflow) =
+        let Ingested::DeliverThenLost(frames, IntegrationLostReason::LeaseOverflow, _) =
             i.ingest(frame("f", json!(null)), true, 0, 0)
         else {
             panic!("expected the batch before the overflow, then the loss");
@@ -644,8 +682,122 @@ mod tests {
         assert!(i.leases.any_live(1));
         assert!(matches!(
             i.ingest(frame("bad", json!({"v": 2})), true, 0, 1),
-            Ingested::Lost(_)
+            Ingested::Lost(..)
         ));
         assert!(!i.leases.any_live(1) && !i.leases.working(1));
+    }
+
+    fn open_task(i: &AoeIngress) {
+        let aoe = json!({"v":2,"key":"k0","background_task":{"id":"b","state":"started","ttl_ms":60000},
+            "workflow_run":{"id":"w","state":"started","ttl_ms":60000}});
+        ids(i.ingest(frame("a", aoe), true, 0, 0));
+    }
+
+    fn finished_ids(events: &[Event]) -> Vec<String> {
+        let mut out: Vec<String> = events
+            .iter()
+            .map(|e| match e {
+                Event::BackgroundTaskFinished { task_id, .. } => format!("task:{task_id}"),
+                Event::WorkflowRunFinished { run_id } => format!("run:{run_id}"),
+                _ => panic!("unexpected event"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn loss_finishes_open_tasks_and_runs() {
+        let i = ingress(true);
+        open_task(&i);
+        let Ingested::Lost(_, finished) = i.ingest(frame("bad", json!({"v": 2})), true, 0, 1)
+        else {
+            panic!("expected loss");
+        };
+        assert_eq!(finished_ids(&finished), ["run:w", "task:b"]);
+    }
+
+    #[test]
+    fn reset_and_reconnect_finish_open_tasks_and_runs_including_lapsed() {
+        let i = ingress(true);
+        open_task(&i);
+        assert_eq!(finished_ids(&i.session_reset()), ["run:w", "task:b"]);
+        assert!(i.session_reset().is_empty(), "reported once");
+
+        open_task(&i);
+        // Lapsed in the table but not yet drained by the idle tick.
+        i.leases
+            .apply_derived(
+                LeaseNamespace::BackgroundTask,
+                "stale",
+                aoe_meta::RunState::Started,
+                Some(1),
+                0,
+            )
+            .unwrap();
+        i.leases
+            .apply(
+                &aoe_meta::LeaseOp {
+                    id: "e".into(),
+                    kind: aoe_meta::LeaseKind::Busy,
+                    op: aoe_meta::LeaseVerb::Acquire,
+                    ttl_ms: Some(10),
+                },
+                100_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            finished_ids(&i.begin_connection(true)),
+            ["run:w", "task:b", "task:stale"],
+            "explicit leases are not reported"
+        );
+    }
+
+    #[test]
+    fn a_lease_overflow_loss_finishes_open_tasks() {
+        use crate::acp::aoe_meta::lease::MAX_LEASES;
+        let i = ingress(true);
+        for n in 0..MAX_LEASES {
+            let run = json!({"v":2,"key":format!("k{n}"),"workflow_run":{"id":format!("w{n}"),"state":"started","ttl_ms":60000}});
+            ids(i.ingest(frame("r", run), true, 0, 0));
+        }
+        let over = json!({"v":2,"key":"over","background_task":{"id":"b","state":"started","ttl_ms":60000}});
+        let Ingested::Lost(_, finished) = i.ingest(frame("o", over), true, 0, 0) else {
+            panic!("expected loss");
+        };
+        assert_eq!(finished.len(), MAX_LEASES);
+    }
+
+    #[test]
+    fn a_failed_derived_lease_delivers_no_lifecycle_to_a_plain_agent() {
+        use crate::acp::aoe_meta::lease::MAX_LEASES;
+        let i = ingress(false);
+        for n in 0..MAX_LEASES {
+            let run = json!({"v":2,"key":format!("k{n}"),"workflow_run":{"id":format!("w{n}"),"state":"started","ttl_ms":60000}});
+            ids(i.ingest(frame("r", run), true, 0, 0));
+        }
+        let over = json!({"v":2,"key":"over","background_task":{"id":"b","state":"started","ttl_ms":60000}});
+        let Ingested::Deliver(frames) = i.ingest(frame("o", over), true, 0, 0) else {
+            panic!("a plain agent keeps its frames");
+        };
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].lifecycle.is_none(), "no lease, no open task");
+    }
+
+    #[test]
+    fn a_renewal_does_not_restart_the_task_until_it_lapses() {
+        let i = ingress(true);
+        let started = |key: &str, now: i64| {
+            let aoe = json!({"v":2,"key":key,"background_task":{"id":"b","state":"started","ttl_ms":100}});
+            let Ingested::Deliver(mut frames) = i.ingest(frame("t", aoe), true, 0, now) else {
+                panic!("expected delivery");
+            };
+            frames.remove(0).lifecycle.expect("admitted").task_open
+        };
+        assert!(!started("k1", 0), "first start");
+        assert!(started("k2", 50), "renewal");
+        assert!(i.lapsed_events(149).is_empty(), "renewed, still live");
+        assert_eq!(finished_ids(&i.lapsed_events(150)), ["task:b"]);
+        assert!(!started("k3", 170), "a renewal after the lapse restarts it");
     }
 }

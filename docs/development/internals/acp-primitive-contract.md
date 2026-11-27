@@ -50,11 +50,11 @@ Read on any update kind, and forbidden together with `ephemeral: true`. Replayed
 
 `started` requires `ttl_ms` (1 to 3,600,000) and `ended` forbids it. `completed` may not exceed `total`. Ids must not be blank.
 
-A `started` repeated for the same id renews the task lease and is idempotent in the reducer.
+A `started` repeated for an id that is still open renews the task lease and emits no `Started` again (a `workflow_run` renewal still emits its `progress`).
 
 ### Derived leases
 
-`background_task` and `workflow_run` hold a `task` lease for `ttl_ms`: `started` acquires or renews it, `ended` releases it. A lease that expires without an `ended` finishes its task or run. These leases live in their own namespaces, so a derived lease never collides with an explicit lease of the same id, and they share the 256 lease bound and its `LeaseOverflow` failure.
+`background_task` and `workflow_run` hold a `task` lease for `ttl_ms`: `started` acquires or renews it, `ended` releases it. A lease that expires without an `ended` finishes its task or run when the session is next idle between prompts, so a lease that lapses mid-turn finishes after the turn. A conversation reset, a re-hello and a lost integration finish every open task and run. These leases live in their own namespaces, so a derived lease never collides with an explicit lease of the same id, and they share the 256 lease bound and its `LeaseOverflow` failure.
 
 ## Failure
 

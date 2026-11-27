@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 /// More simultaneous leases than any real agent holds; a larger table is a
-/// contract violation.
+/// contract violation. Explicit and derived leases share it.
 pub const MAX_LEASES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -37,10 +37,12 @@ impl LeaseTable {
     /// the expiry.
     pub fn apply(&self, op: &LeaseOp, now_ms: i64) -> Result<(), LeaseTableFull> {
         self.apply_in(LeaseNamespace::Explicit, op, now_ms)
+            .map(|_| ())
     }
 
     /// `started` acquires or renews a task lease for `ttl_ms`; `ended`
-    /// releases it.
+    /// releases it. Returns whether the id was already open: held, or lapsed
+    /// and not yet reported.
     pub fn apply_derived(
         &self,
         namespace: LeaseNamespace,
@@ -48,7 +50,7 @@ impl LeaseTable {
         state: RunState,
         ttl_ms: Option<u64>,
         now_ms: i64,
-    ) -> Result<(), LeaseTableFull> {
+    ) -> Result<bool, LeaseTableFull> {
         let op = LeaseOp {
             id: id.to_string(),
             kind: LeaseKind::Task,
@@ -66,11 +68,12 @@ impl LeaseTable {
         namespace: LeaseNamespace,
         op: &LeaseOp,
         now_ms: i64,
-    ) -> Result<(), LeaseTableFull> {
+    ) -> Result<bool, LeaseTableFull> {
         let key = (namespace, op.id.clone());
         let mut held = self.held.lock().expect("lease table mutex poisoned");
         let mut lapsed = self.lapsed.lock().expect("lease table mutex poisoned");
         Self::expire(&mut held, &mut lapsed, now_ms);
+        let was_open = held.contains_key(&key) || lapsed.contains(&key);
         // The frame itself reports this id's state, so a lapse is stale.
         lapsed.retain(|k| *k != key);
         match op.op {
@@ -85,7 +88,7 @@ impl LeaseTable {
                 held.insert(key, (op.kind, now_ms.saturating_add(ttl)));
             }
         }
-        Ok(())
+        Ok(was_open)
     }
 
     fn expire(held: &mut HashMap<Key, (LeaseKind, i64)>, lapsed: &mut Vec<Key>, now_ms: i64) {
@@ -106,11 +109,15 @@ impl LeaseTable {
         std::mem::take(&mut *lapsed)
     }
 
-    pub fn clear(&self) {
+    /// Drops every lease and returns the derived ones still open: held, or
+    /// lapsed and not yet reported.
+    pub fn clear(&self) -> Vec<(LeaseNamespace, String)> {
         let mut held = self.held.lock().expect("lease table mutex poisoned");
         let mut lapsed = self.lapsed.lock().expect("lease table mutex poisoned");
-        held.clear();
-        lapsed.clear();
+        let mut open = std::mem::take(&mut *lapsed);
+        open.extend(held.drain().map(|(key, _)| key));
+        open.retain(|(ns, _)| *ns != LeaseNamespace::Explicit);
+        open
     }
 
     /// Any lease of any kind.

@@ -15,6 +15,7 @@ use agent_client_protocol::v1::schema::{
 };
 use tracing::debug;
 
+use super::aoe_ingress::Lifecycle;
 use super::config_options::map_acp_config_option;
 use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
 use super::plan::{map_plan_status, plan_from_markdown, plan_status_to_str};
@@ -34,34 +35,38 @@ pub(super) static SYNTHETIC_TOOL_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Events for the lifecycle primitives of an admitted envelope, from any
-/// update kind. A repeated `started` is a lease renewal: the reducers are
-/// idempotent on the id.
-pub(super) fn lifecycle_events(envelope: &aoe_meta::Envelope) -> Vec<Event> {
+/// update kind. A `started` for an id already open is a lease renewal and
+/// emits no `Started`.
+pub(super) fn lifecycle_events(lifecycle: &Lifecycle) -> Vec<Event> {
     use aoe_meta::RunState;
+    let envelope = &lifecycle.envelope;
     let mut events = Vec::new();
     if let Some(task) = &envelope.background_task {
-        events.push(match task.state {
-            RunState::Started => Event::BackgroundTaskStarted {
+        match task.state {
+            RunState::Started if lifecycle.task_open => {}
+            RunState::Started => events.push(Event::BackgroundTaskStarted {
                 task_id: task.id.clone(),
                 tool_call_id: None,
                 description: None,
                 workflow: None,
                 started_at: None,
-            },
-            RunState::Ended => Event::BackgroundTaskFinished {
+            }),
+            RunState::Ended => events.push(Event::BackgroundTaskFinished {
                 task_id: task.id.clone(),
                 ended_at: None,
-            },
-        });
+            }),
+        }
     }
     if let Some(run) = &envelope.workflow_run {
         let run_id = run.id.clone();
         match run.state {
             RunState::Started => {
-                events.push(Event::WorkflowRunStarted {
-                    run_id: run_id.clone(),
-                    started_at: Some(crate::time::Timestamp::now()),
-                });
+                if !lifecycle.run_open {
+                    events.push(Event::WorkflowRunStarted {
+                        run_id: run_id.clone(),
+                        started_at: Some(crate::time::Timestamp::now()),
+                    });
+                }
                 if let Some(p) = &run.progress {
                     events.push(Event::WorkflowRunProgress {
                         run_id,
@@ -2091,9 +2096,30 @@ mod tests {
 
     use serde_json::json;
 
-    fn envelope(aoe: serde_json::Value) -> aoe_meta::Envelope {
+    fn open_lifecycle(aoe: serde_json::Value, task_open: bool, run_open: bool) -> Lifecycle {
         let meta = json!({ "aoe": aoe }).as_object().cloned().unwrap();
-        aoe_meta::Envelope::from_meta(&meta).unwrap().unwrap()
+        Lifecycle {
+            envelope: aoe_meta::Envelope::from_meta(&meta).unwrap().unwrap(),
+            task_open,
+            run_open,
+        }
+    }
+
+    fn envelope(aoe: serde_json::Value) -> Lifecycle {
+        open_lifecycle(aoe, false, false)
+    }
+
+    #[test]
+    fn a_renewal_of_an_open_id_does_not_restart_it() {
+        let aoe = json!({
+            "v": 2, "key": "k",
+            "background_task": {"id": "b", "state": "started", "ttl_ms": 5},
+            "workflow_run": {"id": "w", "state": "started", "ttl_ms": 5,
+                             "progress": {"label": "step", "completed": 2, "total": 3}},
+        });
+        let events = lifecycle_events(&open_lifecycle(aoe, true, true));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], Event::WorkflowRunProgress { run_id, .. } if run_id == "w"));
     }
 
     #[test]

@@ -331,8 +331,11 @@ impl Session {
     /// then end so the drain loop drops the worker and the reaper can resume it.
     async fn between_prompt_idle_tick(&self) -> bool {
         let shared = &self.shared;
-        for event in shared.aoe.lapsed_events(now_ms()) {
-            shared.emit(event).await;
+        {
+            let _gate = shared.aoe.lifecycle_gate.lock().await;
+            for event in shared.aoe.lapsed_events(now_ms()) {
+                shared.emit(event).await;
+            }
         }
         shared.expire_silent_subagents(now_ms()).await;
         let Some(cost_seen) = shared.between_prompt.take_idle_fire(
@@ -483,7 +486,9 @@ impl Session {
                 // session/new is the irreversible commit; the loop picks the
                 // id back up from the ingress on its next iteration.
                 self.session_from_storage = false;
-                self.shared.aoe.session_reset();
+                for event in self.shared.aoe.session_reset() {
+                    self.shared.emit(event).await;
+                }
                 self.shared.settle_discarded().await;
                 self.channels = SessionChannels::new(
                     new_session.modes.as_ref(),

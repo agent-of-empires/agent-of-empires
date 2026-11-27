@@ -210,7 +210,9 @@ pub(super) async fn establish(
             return Ok(None);
         }
     };
-    shared.aoe.begin_connection(proxied);
+    for event in shared.aoe.begin_connection(proxied) {
+        shared.emit(event).await;
+    }
     if let Some(control) = ctx.control.as_ref().filter(|_| proxied) {
         control.mark_proxied();
     }
