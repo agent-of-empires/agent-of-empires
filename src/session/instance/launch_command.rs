@@ -1742,9 +1742,7 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
-        // Resolve the host fallback binary once so a concurrent availability
-        // refresh cannot clear login-shell discovery between hook identity
-        // construction and launch command assembly.
+        // Capture the fallback binary once so a concurrent refresh cannot clear it before launch.
         let selected_host_binary = if self.command.is_empty() && execution.is_none() {
             agent
                 .filter(|a| !a.fallback_binaries.is_empty())

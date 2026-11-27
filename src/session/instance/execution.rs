@@ -1487,11 +1487,7 @@ pub(super) fn hook_session_observation(
     Some(observation)
 }
 
-/// Refreshes sandbox nested-agent ancestry variables from the resolved native
-/// executable. `AOE_AGENT_PROGRAM` stays restricted to declared fallback
-/// binaries, while `AOE_AGENT_EXE` records the canonical executable path only
-/// for direct agent launches so a declared wrapper binary is never counted as
-/// an agent process.
+/// Syncs sandbox `AOE_AGENT_PROGRAM` (fallback only) and `AOE_AGENT_EXE` (direct launches only).
 fn sync_sandbox_agent_identity_env(
     docker_env: &mut crate::session::environment::DockerExecEnv,
     environment: &mut std::collections::HashMap<String, String>,
@@ -1568,11 +1564,7 @@ impl Instance {
                 .env
                 .push((crate::hooks::SESSION_SOURCE_ENV.into(), source.to_owned()));
         }
-        // The container has no launch pid, so the session-id hook identifies a
-        // nested agent by this binary name (and any declared fallback binary)
-        // instead. Declared wrappers (e.g. `company-claude`) are intentionally
-        // excluded so a native wrapper that spawns the foreground agent as a
-        // child is not counted as a second agent.
+        // Identify nested agents by primary/fallback binary name while excluding declared wrappers.
         if let Some(agent) = agent {
             environment
                 .env

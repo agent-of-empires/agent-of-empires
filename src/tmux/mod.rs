@@ -3453,21 +3453,52 @@ fn partition_cached_agents<'a>(
 pub(crate) fn probe_agents_available(
     agents: &[&crate::agents::AgentDef<'_>],
 ) -> std::collections::HashSet<String> {
-    probe_agents_available_inner(agents, None, false)
+    probe_agents_available_inner(agents, None, false).0
+}
+
+fn snapshot_discovered_binaries(
+    agents: &[&crate::agents::AgentDef<'_>],
+    found: &HashSet<String>,
+) -> HashMap<String, String> {
+    let mut discovered = HashMap::new();
+    if let Ok(cache) = DISCOVERED_AGENT_BINARIES.read() {
+        if let Some(map) = cache.as_ref() {
+            for name in found {
+                if let Some(bin) = map.get(name) {
+                    discovered.insert(name.clone(), bin.clone());
+                }
+            }
+        }
+    }
+    for agent in agents {
+        if found.contains(agent.name)
+            && !agent.fallback_binaries.is_empty()
+            && !discovered.contains_key(agent.name)
+        {
+            if let Some(bin) = agent
+                .candidate_binaries()
+                .find(|candidate| which::which(candidate).is_ok())
+            {
+                discovered.insert(agent.name.to_string(), bin.to_string());
+            }
+        }
+    }
+    discovered
 }
 
 fn probe_agents_available_inner(
     agents: &[&crate::agents::AgentDef<'_>],
     cancel: Option<&tokio_util::sync::CancellationToken>,
     force: bool,
-) -> std::collections::HashSet<String> {
+) -> (std::collections::HashSet<String>, HashMap<String, String>) {
     let (mut found, uncached) = if force {
         (HashSet::new(), agents.to_vec())
     } else {
         partition_cached_agents(agents)
     };
     if uncached.is_empty() {
-        return found;
+        let discovered = snapshot_discovered_binaries(agents, &found);
+        return (found, discovered);
     }
 
     #[cfg(test)]
@@ -3480,7 +3511,8 @@ fn probe_agents_available_inner(
     let _probe_guard = if let Some(cancel) = cancel {
         loop {
             if cancel.is_cancelled() {
-                return found;
+                let discovered = snapshot_discovered_binaries(agents, &found);
+                return (found, discovered);
             }
             match AGENT_PROBE_LOCK.try_lock() {
                 Ok(guard) => break guard,
@@ -3504,7 +3536,8 @@ fn probe_agents_available_inner(
     let (already_found, uncached) = partition_cached_agents(&uncached);
     found.extend(already_found);
     if uncached.is_empty() {
-        return found;
+        let discovered = snapshot_discovered_binaries(agents, &found);
+        return (found, discovered);
     }
 
     // Pass 1 is cheap per agent (`which` / a version run on the inherited
@@ -3513,7 +3546,8 @@ fn probe_agents_available_inner(
     let mut needs_shell: Vec<&crate::agents::AgentDef<'_>> = Vec::new();
     for agent in uncached {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            return found;
+            let discovered = snapshot_discovered_binaries(agents, &found);
+            return (found, discovered);
         }
         match agent_available_direct(agent, cancel) {
             Some(ok) => results.push((agent.name, ok)),
@@ -3522,7 +3556,8 @@ fn probe_agents_available_inner(
     }
     let shell_found = login_shell_probe(&needs_shell, cancel);
     if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        return found;
+        let discovered = snapshot_discovered_binaries(agents, &found);
+        return (found, discovered);
     }
     for agent in needs_shell {
         results.push((agent.name, shell_found.contains(agent.name)));
@@ -3540,80 +3575,30 @@ fn probe_agents_available_inner(
             found.insert(name.to_string());
         }
     }
-    found
+    let discovered = snapshot_discovered_binaries(agents, &found);
+    (found, discovered)
 }
 
 pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef<'_>) -> bool {
     probe_agents_available(&[agent]).contains(agent.name)
 }
 
-/// Resolve the host executable name for an agent with fallback binaries,
-/// probing through the login shell if the cache is cold, and capturing the
-/// owned binary name before releasing `AGENT_PROBE_LOCK` so a concurrent
-/// `Recheck` cannot clear discovery between selection and use.
+/// Resolve and capture the host executable name for an agent with fallback binaries.
 pub(crate) fn probe_agent_discovered_binary(agent: &crate::agents::AgentDef<'_>) -> Option<String> {
     if agent.fallback_binaries.is_empty() {
         return None;
     }
-    if which::which(agent.binary).is_ok() {
-        return Some(agent.binary.to_string());
-    }
     if let Some(found) = agent
-        .fallback_binaries
-        .iter()
-        .copied()
+        .candidate_binaries()
         .find(|bin| which::which(bin).is_ok())
     {
         return Some(found.to_string());
     }
-    if let (Ok(avail), Ok(binaries)) = (AGENT_AVAILABILITY.read(), DISCOVERED_AGENT_BINARIES.read())
-    {
-        if let Some((ok, at)) = avail.as_ref().and_then(|map| map.get(agent.name)) {
-            if at.elapsed() < AGENT_AVAILABILITY_TTL {
-                if !*ok {
-                    return None;
-                }
-                if let Some(bin) = binaries.as_ref().and_then(|map| map.get(agent.name)) {
-                    return Some(bin.clone());
-                }
-            }
-        }
-    }
-    let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (already_found, uncached) = partition_cached_agents(&[agent]);
-    if uncached.is_empty() {
-        return if already_found.contains(agent.name) {
-            discovered_agent_binary(agent.name)
-        } else {
-            None
-        };
-    }
-    let (ok, discovered) = match agent_available_direct(agent, None) {
-        Some(true) => {
-            let bin = agent
-                .candidate_binaries()
-                .find(|candidate| which::which(candidate).is_ok())
-                .map(str::to_owned);
-            (true, bin)
-        }
-        Some(false) => (false, None),
-        None => {
-            let shell_found = login_shell_probe(&[agent], None);
-            (
-                shell_found.contains(agent.name),
-                discovered_agent_binary(agent.name),
-            )
-        }
-    };
-    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
-        let map = cache.get_or_insert_with(HashMap::new);
-        map.insert(agent.name.to_string(), (ok, std::time::Instant::now()));
-    }
-    if ok {
-        discovered
-    } else {
-        None
-    }
+    let (found, mut discovered) = probe_agents_available_inner(&[agent], None, false);
+    found
+        .contains(agent.name)
+        .then(|| discovered.remove(agent.name))
+        .flatten()
 }
 
 /// A nonblocking UI snapshot: cached answers, with local PATH lookups for misses.
@@ -3704,7 +3689,7 @@ impl AvailableTools {
             .iter()
             .chain(crate::plugin::bundled_agents::available())
             .collect();
-        let found = probe_agents_available_inner(&refs, Some(cancel), force);
+        let (found, _) = probe_agents_available_inner(&refs, Some(cancel), force);
         let session = crate::session::config::Config::load()
             .ok()
             .map(load_session);
