@@ -235,7 +235,7 @@ status = "running"
         let _app = crate::session::test_support::isolate_app_dir_at(app.path());
         let manifest = aoe_plugin_api::PluginManifest::from_toml_str(&format!(
             "id = \"acme.claude-shaped\"\nname = \"Claude shaped\"\nversion = \"1.0.0\"\n\
-             api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
              command = \"claude\"\n\
              [agent_integrations.launch.container_env]\nCLAUDE_CONFIG_DIR = \"/root/.claude\"\n\
              {CLAUDE_SHAPED_HOOKS}"

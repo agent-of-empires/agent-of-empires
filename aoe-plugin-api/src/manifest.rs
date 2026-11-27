@@ -1621,8 +1621,8 @@ impl PluginManifest {
                 ("trust", integration.trust.is_some()),
             ] {
                 check(
-                    self.api_version >= 26 || !declared,
-                    format!("agent_integrations[{i}].{table} requires api_version >= 26"),
+                    self.api_version >= 28 || !declared,
+                    format!("agent_integrations[{i}].{table} requires api_version >= 28"),
                 );
             }
             if let Some(delay) = integration

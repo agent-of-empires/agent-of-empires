@@ -7622,7 +7622,7 @@ codex-work = "{}"
 id = "acme.declared-sandbox"
 name = "Declared sandbox"
 version = "1.0.0"
-api_version = 26
+api_version = 28
 
 [[agent_integrations]]
 tool = "example-helper"

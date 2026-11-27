@@ -1469,7 +1469,7 @@ mod tests {
         crate::session::test_support::install_agent_plugin(
             "acme.declared-claude-command",
             "id = \"acme.declared-claude-command\"\nname = \"Declared\"\nversion = \"1.0.0\"\n\
-             api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
              command = \"claude\"\n[agent_integrations.hooks]\n\
              settings_rel_path = \".example/settings.json\"\nformat = \"json_settings\"\n\
              [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n",
@@ -1510,7 +1510,7 @@ mod tests {
         let manifest = |settings: &str, trust_file: &str| {
             format!(
                 "id = \"acme.declared-launch\"\nname = \"Declared launch\"\nversion = \"1.0.0\"\n\
-                 api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+                 api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
                  command = \"example-helper\"\n[agent_integrations.hooks]\n\
                  settings_rel_path = \"{settings}\"\nformat = \"json_settings\"\n\
                  [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n\

@@ -260,7 +260,7 @@ mod tests {
         crate::session::test_support::install_agent_plugin(
             "acme.trust-only",
             "id = \"acme.trust-only\"\nname = \"Trust only\"\nversion = \"1.0.0\"\n\
-             api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
              command = \"example-helper\"\n[agent_integrations.trust]\n\
              file = \".example.json\"\nlocation = \"config_dir_or_home\"\n\
              pointer = \"/projects/{path}/trusted\"\nvalue = true\nsandbox = \"always\"\n",

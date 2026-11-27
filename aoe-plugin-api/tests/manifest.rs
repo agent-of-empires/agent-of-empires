@@ -945,7 +945,7 @@ fn agent(tables: &str) -> String {
 #[test]
 fn hooks_and_trust_require_api_26() {
     let body = agent(&format!("{HOOKS}{TRUST}"));
-    let parsed = parse(26, &body);
+    let parsed = parse(28, &body);
     let integration = &parsed.agent_integrations[0];
     assert_eq!(integration.hooks.as_ref().unwrap().events.len(), 2);
     assert!(integration.trust.is_some());
@@ -956,9 +956,9 @@ fn hooks_and_trust_require_api_26() {
         *integration
     );
 
-    let errors = invalid(25, &body);
+    let errors = invalid(27, &body);
     for table in ["hooks", "trust"] {
-        let want = format!("agent_integrations[0].{table} requires api_version >= 26");
+        let want = format!("agent_integrations[0].{table} requires api_version >= 28");
         assert!(
             errors.iter().any(|error| error.contains(&want)),
             "{errors:?}"
@@ -1004,13 +1004,13 @@ fn hooks_declarations_are_validated() {
         ),
     ];
     for (body, want) in cases {
-        match PluginManifest::from_toml_str(&manifest(26, &body)) {
+        match PluginManifest::from_toml_str(&manifest(28, &body)) {
             Err(error) => assert!(error.to_string().contains(want), "{want}: {error}"),
             Ok(_) => panic!("{want}: should be rejected\n{body}"),
         }
     }
     // The same event may repeat with different matchers.
-    parse(26, &agent(&format!("{HOOKS}[[agent_integrations.hooks.events]]\nevent = \"Notification\"\nmatcher = \"idle_prompt\"\nstatus = \"idle\"\n")));
+    parse(28, &agent(&format!("{HOOKS}[[agent_integrations.hooks.events]]\nevent = \"Notification\"\nmatcher = \"idle_prompt\"\nstatus = \"idle\"\n")));
 }
 
 #[test]
@@ -1029,7 +1029,7 @@ fn trust_declarations_are_validated() {
     for pointer in pointers {
         let body = with("/projects/{path}/trusted", pointer);
         assert!(
-            PluginManifest::from_toml_str(&manifest(26, &body))
+            PluginManifest::from_toml_str(&manifest(28, &body))
                 .unwrap_err()
                 .to_string()
                 .contains("trust.pointer"),
@@ -1039,7 +1039,7 @@ fn trust_declarations_are_validated() {
     for file in ["sub/.example.json", "../x.json", "/abs.json", ".."] {
         let body = with(".example.json", file);
         assert!(
-            PluginManifest::from_toml_str(&manifest(26, &body))
+            PluginManifest::from_toml_str(&manifest(28, &body))
                 .unwrap_err()
                 .to_string()
                 .contains("trust.file"),
@@ -1059,12 +1059,12 @@ fn trust_declarations_are_validated() {
         ),
         ("value = true", "value = 3", "data did not match"),
     ] {
-        let error = PluginManifest::from_toml_str(&manifest(26, &with(from, to))).unwrap_err();
+        let error = PluginManifest::from_toml_str(&manifest(28, &with(from, to))).unwrap_err();
         assert!(error.to_string().contains(want), "{want}: {error}");
     }
-    parse(26, &with("value = true", "value = \"TRUST_FOLDER\""));
-    parse(26, &with("/projects/{path}/trusted", "/{path}"));
-    parse(26, &with("sandbox = \"always\"", "sandbox = \"yolo_only\""));
+    parse(28, &with("value = true", "value = \"TRUST_FOLDER\""));
+    parse(28, &with("/projects/{path}/trusted", "/{path}"));
+    parse(28, &with("sandbox = \"always\"", "sandbox = \"yolo_only\""));
 }
 
 #[test]
@@ -1151,7 +1151,7 @@ fn declaration_bounds_each_reject() {
         ),
     ];
     for (body, want) in cases {
-        match PluginManifest::from_toml_str(&manifest(26, &body)) {
+        match PluginManifest::from_toml_str(&manifest(28, &body)) {
             Err(error) => assert!(error.to_string().contains(want), "{want}: {error}"),
             Ok(_) => panic!("{want}: should be rejected\n{body}"),
         }
@@ -1159,7 +1159,7 @@ fn declaration_bounds_each_reject() {
 
     // Another file in the shared directory is fine.
     parse(
-        26,
+        28,
         &agent(&format!(
             "{HOOKS}{}",
             TRUST.replace(".example.json", "other.json")
@@ -1183,7 +1183,7 @@ fn declaration_bounds_each_reject() {
     ] {
         for tables in [HOOKS, TRUST] {
             let body = with_env(tables, var, "/opt/example");
-            let error = PluginManifest::from_toml_str(&manifest(26, &body))
+            let error = PluginManifest::from_toml_str(&manifest(28, &body))
                 .map(|_| ())
                 .expect_err(var);
             assert!(
@@ -1194,7 +1194,7 @@ fn declaration_bounds_each_reject() {
     }
     let undeclared =
         format!("[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n{HOOKS}");
-    assert!(PluginManifest::from_toml_str(&manifest(26, &undeclared))
+    assert!(PluginManifest::from_toml_str(&manifest(28, &undeclared))
         .unwrap_err()
         .to_string()
         .contains("launch.container_env key"));
@@ -1219,7 +1219,7 @@ fn declaration_bounds_each_reject() {
         &too_long,
     ] {
         let body = with_env(HOOKS, "EXAMPLE_CONFIG_DIR", dir);
-        let error = PluginManifest::from_toml_str(&manifest(26, &body))
+        let error = PluginManifest::from_toml_str(&manifest(28, &body))
             .map(|_| ())
             .expect_err(dir);
         assert!(
@@ -1228,7 +1228,7 @@ fn declaration_bounds_each_reject() {
         );
     }
     for dir in ["/opt/example", "/root/.example", "/home/agent/.cfg"] {
-        parse(26, &with_env(HOOKS, "EXAMPLE_CONFIG_DIR", dir));
+        parse(28, &with_env(HOOKS, "EXAMPLE_CONFIG_DIR", dir));
     }
 }
 
@@ -1252,7 +1252,7 @@ fn identity_hooks_need_a_bare_executable_name() {
         "FOO=bar ex@mple",
         "ex,ample",
     ] {
-        let error = PluginManifest::from_toml_str(&manifest(26, &body(command, true)))
+        let error = PluginManifest::from_toml_str(&manifest(28, &body(command, true)))
             .map(|_| ())
             .expect_err(command);
         assert!(
@@ -1260,13 +1260,13 @@ fn identity_hooks_need_a_bare_executable_name() {
             "{command}: {error}"
         );
         // Without an identity event there is no publisher guard to lose.
-        parse(26, &body(command, false));
+        parse(28, &body(command, false));
     }
     for command in [
         "example-cli",
         "example.v2 --flag",
         "PATH_HINT=x example_cli",
     ] {
-        parse(26, &body(command, true));
+        parse(28, &body(command, true));
     }
 }

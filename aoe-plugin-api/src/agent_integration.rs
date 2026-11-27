@@ -27,10 +27,10 @@ pub struct AgentIntegrationContribution {
     /// Requires API 22 and a host that implements the capture protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<AgentSessionIdDeclaration>,
-    /// Requires API 26: where and which status hooks the host installs for the agent.
+    /// Requires API 28: where and which status hooks the host installs for the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<AgentHooksDeclaration>,
-    /// Requires API 26: the folder-trust record the host writes before launch.
+    /// Requires API 28: the folder-trust record the host writes before launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<AgentTrustDeclaration>,
 }

@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `27`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `28`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 27
+api_version = 28
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `27`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `28`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
@@ -38,7 +38,7 @@ capabilities = ["runtime.worker"]
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 23` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, the session-id capture extension requires API 22, and the `hooks` and `trust` tables require API 26, each with a host implementing them. Provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, the session-id capture extension requires API 22, and the `hooks` and `trust` tables require API 28, each with a host implementing them. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
@@ -135,9 +135,9 @@ A report is not tied to a launch. The host mints no launch token and the call ca
 
 For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
 
-### Hooks and folder trust (API 26)
+### Hooks and folder trust (API 28)
 
-`[agent_integrations.hooks]` and `[agent_integrations.trust]` let a declared agent get the status hooks and pre-trusted folders a built-in agent has. Both require `api_version >= 26` and a nonblank `command`; a manifest below 26 that declares either is rejected. The host runs its own installer and writer, so the plugin supplies data, never code. The approval prompt shows the declared paths as `~/...` or `$VAR/...` templates, without resolving a session `agent_config_dir`. `aoe hooks status` lists the resolved hooks files, and the resolved trust files that are written only when `session.pre_trust_agent_folders` is on.
+`[agent_integrations.hooks]` and `[agent_integrations.trust]` let a declared agent get the status hooks and pre-trusted folders a built-in agent has. Both require `api_version >= 28` and a nonblank `command`; a manifest below 28 that declares either is rejected. The host runs its own installer and writer, so the plugin supplies data, never code. The approval prompt shows the declared paths as `~/...` or `$VAR/...` templates, without resolving a session `agent_config_dir`. `aoe hooks status` lists the resolved hooks files, and the resolved trust files that are written only when `session.pre_trust_agent_folders` is on.
 
 ```toml
 [agent_integrations.launch.container_env]

@@ -537,7 +537,7 @@ mod tests {
         let _env = EnvGuard::unset(&["EXAMPLE_CONFIG_DIR"]);
         let manifest =
             "id = \"acme.declared-hooks\"\nname = \"Declared hooks\"\nversion = \"1.0.0\"\n\
-            api_version = 26\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+            api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
             command = \"example-helper\"\n\
             [agent_integrations.launch.container_env]\nEXAMPLE_CONFIG_DIR = \"/opt/example\"\n\
             [agent_integrations.hooks]\nsettings_rel_path = \".example/settings.json\"\n\
