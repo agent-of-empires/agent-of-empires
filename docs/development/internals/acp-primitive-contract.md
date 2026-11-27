@@ -54,7 +54,7 @@ A `started` repeated for the same id renews the task lease and is idempotent in 
 
 ### Derived leases
 
-`background_task` and `workflow_run` hold a `task` lease for `ttl_ms`: `started` acquires or renews it, `ended` releases it. These leases live in their own namespaces, so a derived lease never collides with an explicit lease of the same id, and they share the 256 lease bound and its `LeaseOverflow` failure.
+`background_task` and `workflow_run` hold a `task` lease for `ttl_ms`: `started` acquires or renews it, `ended` releases it. A lease that expires without an `ended` finishes its task or run. These leases live in their own namespaces, so a derived lease never collides with an explicit lease of the same id, and they share the 256 lease bound and its `LeaseOverflow` failure.
 
 ## Failure
 

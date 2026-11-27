@@ -27,6 +27,9 @@ type Key = (LeaseNamespace, String);
 #[derive(Debug, Default)]
 pub struct LeaseTable {
     held: Mutex<HashMap<Key, (LeaseKind, i64)>>,
+    /// Derived leases that expired and are not yet reported by `drain_expired`.
+    /// Always locked after `held`.
+    lapsed: Mutex<Vec<Key>>,
 }
 
 impl LeaseTable {
@@ -66,7 +69,10 @@ impl LeaseTable {
     ) -> Result<(), LeaseTableFull> {
         let key = (namespace, op.id.clone());
         let mut held = self.held.lock().expect("lease table mutex poisoned");
-        held.retain(|_, (_, deadline)| *deadline > now_ms);
+        let mut lapsed = self.lapsed.lock().expect("lease table mutex poisoned");
+        Self::expire(&mut held, &mut lapsed, now_ms);
+        // The frame itself reports this id's state, so a lapse is stale.
+        lapsed.retain(|k| *k != key);
         match op.op {
             LeaseVerb::Release => {
                 held.remove(&key);
@@ -82,11 +88,29 @@ impl LeaseTable {
         Ok(())
     }
 
+    fn expire(held: &mut HashMap<Key, (LeaseKind, i64)>, lapsed: &mut Vec<Key>, now_ms: i64) {
+        held.retain(|key, (_, deadline)| {
+            let live = *deadline > now_ms;
+            if !live && key.0 != LeaseNamespace::Explicit {
+                lapsed.push(key.clone());
+            }
+            live
+        });
+    }
+
+    /// Derived leases that expired without an `ended`, each reported once.
+    pub fn drain_expired(&self, now_ms: i64) -> Vec<(LeaseNamespace, String)> {
+        let mut held = self.held.lock().expect("lease table mutex poisoned");
+        let mut lapsed = self.lapsed.lock().expect("lease table mutex poisoned");
+        Self::expire(&mut held, &mut lapsed, now_ms);
+        std::mem::take(&mut *lapsed)
+    }
+
     pub fn clear(&self) {
-        self.held
-            .lock()
-            .expect("lease table mutex poisoned")
-            .clear();
+        let mut held = self.held.lock().expect("lease table mutex poisoned");
+        let mut lapsed = self.lapsed.lock().expect("lease table mutex poisoned");
+        held.clear();
+        lapsed.clear();
     }
 
     /// Any lease of any kind.
@@ -183,6 +207,64 @@ mod tests {
         assert!(t.working(1800), "a repeated started renews");
         assert!(t.live(LeaseKind::Task, 1899));
         assert!(!t.live(LeaseKind::Task, 1900), "and it expires on its own");
+    }
+
+    #[test]
+    fn expired_derived_leases_are_reported_once() {
+        use LeaseNamespace::*;
+        let t = LeaseTable::default();
+        let start = |ns, id: &str, now| {
+            t.apply_derived(ns, id, RunState::Started, Some(100), now)
+                .unwrap()
+        };
+        start(BackgroundTask, "t", 0);
+        start(WorkflowRun, "w", 0);
+        t.apply(&op("e", LeaseKind::Busy, LeaseVerb::Acquire, Some(100)), 0)
+            .unwrap();
+        assert!(t.drain_expired(99).is_empty(), "nothing has expired yet");
+        let mut got = t.drain_expired(100);
+        got.sort_by_key(|(_, id)| id.clone());
+        assert_eq!(
+            got,
+            [
+                (BackgroundTask, "t".to_string()),
+                (WorkflowRun, "w".to_string())
+            ],
+            "the explicit lease is not reported"
+        );
+        assert!(t.drain_expired(200).is_empty(), "reported once");
+    }
+
+    #[test]
+    fn released_or_revived_derived_leases_are_not_reported() {
+        use LeaseNamespace::*;
+        let t = LeaseTable::default();
+        let apply = |id: &str, state, now| {
+            t.apply_derived(BackgroundTask, id, state, Some(100), now)
+                .unwrap()
+        };
+        apply("rel", RunState::Started, 0);
+        apply("rel", RunState::Ended, 50);
+        assert!(t.drain_expired(500).is_empty(), "normal release");
+
+        apply("pruned", RunState::Started, 0);
+        apply("other", RunState::Started, 500);
+        apply("pruned", RunState::Started, 500);
+        assert!(
+            t.drain_expired(550).is_empty(),
+            "a lapse pruned by apply is dropped once the id is revived"
+        );
+
+        let t = LeaseTable::default();
+        t.apply_derived(BackgroundTask, "gone", RunState::Started, Some(100), 0)
+            .unwrap();
+        t.apply_derived(BackgroundTask, "next", RunState::Started, Some(100), 200)
+            .unwrap();
+        assert_eq!(
+            t.drain_expired(250),
+            [(BackgroundTask, "gone".to_string())],
+            "a lapse pruned by apply is not lost"
+        );
     }
 
     #[test]

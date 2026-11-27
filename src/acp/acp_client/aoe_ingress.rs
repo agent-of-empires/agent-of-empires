@@ -4,7 +4,7 @@
 use crate::acp::aoe_meta::lease::{LeaseNamespace, LeaseTable, LeaseTableFull};
 use crate::acp::aoe_meta::ordering::{Arrival, ArrivalOrder};
 use crate::acp::aoe_meta::{self, Envelope};
-use crate::acp::state::IntegrationLostReason;
+use crate::acp::state::{Event, IntegrationLostReason};
 use agent_client_protocol::v1::schema::SessionNotification;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -185,6 +185,22 @@ impl AoeIngress {
         Ingested::Deliver(deliver)
     }
 
+    /// Finishes the tasks and runs whose lease expired with no `ended`.
+    pub(super) fn lapsed_events(&self, now_ms: i64) -> Vec<Event> {
+        self.leases
+            .drain_expired(now_ms)
+            .into_iter()
+            .filter_map(|(ns, id)| match ns {
+                LeaseNamespace::BackgroundTask => Some(Event::BackgroundTaskFinished {
+                    task_id: id,
+                    ended_at: None,
+                }),
+                LeaseNamespace::WorkflowRun => Some(Event::WorkflowRunFinished { run_id: id }),
+                LeaseNamespace::Explicit => None,
+            })
+            .collect()
+    }
+
     /// The explicit lease, then the task leases a background task or workflow
     /// run derives.
     fn apply_leases(&self, envelope: &Envelope, now_ms: i64) -> Result<(), LeaseTableFull> {
@@ -234,6 +250,7 @@ impl AoeIngress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::acp_client::update_events::lifecycle_events;
     use agent_client_protocol::v1::schema::{SessionUpdate, ToolCall};
     use serde_json::json;
 
@@ -292,6 +309,47 @@ mod tests {
         assert!(i.leases.working(3800), "a repeated started renews");
         ids(i.ingest(frame("d", task("k4", "ended", None)), true, 0, 3000));
         assert!(!i.leases.working(3001), "ended releases at once");
+    }
+
+    #[test]
+    fn an_expired_task_and_run_finish_and_clear_state() {
+        use crate::acp::state::AcpState;
+        let i = ingress(true);
+        let aoe = json!({"v":2,"key":"k1","background_task":{"id":"b","state":"started","ttl_ms":1000},
+            "workflow_run":{"id":"w","state":"started","ttl_ms":1000}});
+        let Ingested::Deliver(frames) = i.ingest(frame("a", aoe), true, 0, 0) else {
+            panic!("expected delivery");
+        };
+        let mut state = AcpState::default();
+        let mut seq = 0;
+        let mut apply = |event| {
+            seq += 1;
+            state.apply_event(seq, event).unwrap();
+        };
+        for event in frames
+            .iter()
+            .flat_map(|d| d.lifecycle.iter().flat_map(lifecycle_events))
+        {
+            apply(event);
+        }
+        assert!(i.lapsed_events(999).is_empty());
+        let finished = i.lapsed_events(1000);
+        assert_eq!(finished.len(), 2);
+        for event in finished {
+            apply(event);
+        }
+        assert!(i.lapsed_events(2000).is_empty(), "reported once");
+        assert!(state.background_tasks.is_empty());
+        assert!(!state.has_active_background_agent());
+    }
+
+    #[test]
+    fn replayed_frames_leave_nothing_to_expire() {
+        let i = ingress(true);
+        let aoe =
+            json!({"v":2,"key":"k1","background_task":{"id":"b","state":"started","ttl_ms":10}});
+        ids(i.ingest(frame("a", aoe), false, 0, 0));
+        assert!(i.lapsed_events(1000).is_empty());
     }
 
     #[test]
