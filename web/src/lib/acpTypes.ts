@@ -1423,6 +1423,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.agentUnresponsive = false;
     next.agentOrphaned = false;
     next.rateLimit = null;
+    // A degraded worker re-asserts the notice after assignment.
+    next.sessionNotices = next.sessionNotices.filter((n) => n.id !== PROXY_DEGRADED_NOTICE_ID);
     next.rateLimitParked = false;
     return next;
   }

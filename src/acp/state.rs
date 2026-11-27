@@ -1361,6 +1361,9 @@ impl AcpState {
                 self.startup_error = None;
                 self.integration_lost = None;
                 self.rate_limit = None;
+                // A degraded worker re-asserts the notice after assignment.
+                let degraded = notice_id(Some(PROXY_DEGRADED_NOTICE_KEY), 0);
+                self.session_notices.retain(|n| n.id != degraded);
                 self.heal_sidebar_phase();
             }
             Event::RateLimitAutoResumed { .. } => self.heal_sidebar_phase(),
@@ -2047,6 +2050,24 @@ mod tests {
             titles(&applied([degraded, notice("stale"), prompt("next")])),
             ["Fake features unavailable"],
             "a degraded proxy's banner outlives the turn"
+        );
+        let degraded = || Event::SessionNotice {
+            severity: "warning".into(),
+            title: "Fake features unavailable".into(),
+            description: None,
+            key: Some(PROXY_DEGRADED_NOTICE_KEY.into()),
+        };
+        let assigned = Event::AcpSessionAssigned {
+            acp_session_id: "acp-2".into(),
+        };
+        assert_eq!(
+            titles(&applied([degraded(), assigned.clone(), degraded()])),
+            ["Fake features unavailable"],
+            "a degraded worker re-asserts the notice after assignment"
+        );
+        assert!(
+            titles(&applied([degraded(), assigned])).is_empty(),
+            "a healthy worker's assignment retires the degraded notice"
         );
         assert!(
             titles(&applied([

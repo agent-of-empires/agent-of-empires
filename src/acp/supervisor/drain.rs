@@ -325,6 +325,23 @@ impl<S: BroadcastSink> Drain<S> {
                 self.sink
                     .publish_from_worker(&self.session_id, seq, &event, generation)
             });
+            // A new connection retires the degraded notice, so a degraded worker re-asserts it.
+            if matches!(event, Event::AcpSessionAssigned { .. }) {
+                let degraded = worker_registry::load(&self.session_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.degraded);
+                if let Some(name) = degraded {
+                    publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
+                        self.sink.publish_from_worker(
+                            &self.session_id,
+                            seq,
+                            &proxy_degraded_notice(&name),
+                            generation,
+                        )
+                    });
+                }
+            }
         }
         end.established = established;
         end
@@ -1401,6 +1418,62 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::daemon::AcpWorkerState;
+
+    /// The session-assigned event retires the degraded notice, so a degraded
+    /// worker's drain must publish it after the assignment, never before.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_degraded_worker_reasserts_its_notice_after_each_session_assignment() {
+        let (_home, _tmp) = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242);
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone()).with_process_control(control);
+        let id = "s-degraded-assigned";
+        let socket = worker_registry::socket_path_for(id).unwrap();
+        let mut record = worker_record(id, 4242, socket.clone());
+        record.degraded = Some("Fake".into());
+        worker_registry::save(&record).unwrap();
+        let lease = sup
+            .test_install_runner(
+                id,
+                runner_config(socket),
+                Some(RunnerIdentity::unattested(4242, 0)),
+            )
+            .await;
+        let (tx, rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task(id.into(), lease, rx, None);
+        for sid in ["acp-1", "acp-2"] {
+            tx.send(Event::AcpSessionAssigned {
+                acp_session_id: sid.into(),
+            })
+            .await
+            .unwrap();
+        }
+        let tags = || -> Vec<&'static str> {
+            sink.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, _, event)| match event {
+                    Event::AcpSessionAssigned { .. } => Some("assigned"),
+                    Event::SessionNotice { key, .. }
+                        if key.as_deref() == Some(crate::acp::state::PROXY_DEGRADED_NOTICE_KEY) =>
+                    {
+                        Some("degraded")
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tags().len() < 4 && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(tags(), ["assigned", "degraded", "assigned", "degraded"]);
+        drain.abort();
+    }
 
     #[tokio::test]
     #[serial_test::serial]

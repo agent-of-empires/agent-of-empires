@@ -644,4 +644,17 @@ describe("integration lost", () => {
     );
     expect(state.sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable"]);
   });
+
+  it("a worker assignment retires the degraded-proxy banner until the notice is re-asserted", () => {
+    const notice = (seq: number, title: string, key?: string) =>
+      frame(seq, { SessionNotice: { severity: "warning", title, description: null, key } });
+    const assigned = frame(2, { AcpSessionAssigned: { acp_session_id: "a" } });
+    const degraded = notice(1, "Fake features unavailable", "proxy-degraded");
+    expect(run(empty(), degraded, assigned).sessionNotices).toEqual([]);
+    expect(
+      run(empty(), degraded, assigned, notice(3, "Fake features unavailable", "proxy-degraded")).sessionNotices.map(
+        (n) => n.title,
+      ),
+    ).toEqual(["Fake features unavailable"]);
+  });
 });
