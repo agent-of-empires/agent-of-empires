@@ -422,6 +422,21 @@ mod attach {
         std::fs::rename(staged, file).unwrap();
     }
 
+    /// Waits until the runner reports it has read `count` adapter frames.
+    async fn wait_for_adapter_frames(file: &std::path::Path, count: u64) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while std::fs::read_to_string(file)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                != Some(count)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the runner never read the adapter frames");
+    }
+
     async fn next_chunk(client: &mut AcpClient) -> String {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -463,7 +478,14 @@ mod attach {
         }
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("emit");
-        let env = [("FAKE_PROXY_EMIT_FILE", file.display().to_string())];
+        let ingested = dir.path().join("adapter-frames");
+        let env = [
+            ("FAKE_PROXY_EMIT_FILE", file.display().to_string()),
+            (
+                "AOE_E2E_ADAPTER_FRAMES_FILE",
+                ingested.display().to_string(),
+            ),
+        ];
         let id = "proxy-reattach-count";
         let (socket, _runner) = spawn_runner(id, &env, &proxy_argv()).await;
 
@@ -488,6 +510,7 @@ mod attach {
 
         // Frames sent while detached are replayed and counted once.
         emit(&file, &acp, &[("a4", None), ("t5", Some(5))]);
+        wait_for_adapter_frames(&ingested, 4).await;
         let mut client = connect(socket, id, &acp).await.expect("second reattach");
         assigned_id(&mut client).await;
         assert_eq!(next_chunk(&mut client).await, "a4");

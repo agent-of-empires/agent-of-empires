@@ -720,6 +720,13 @@ impl RunnerShared {
                 }
                 if adapter_frame {
                     channel.adapter_frames += 1;
+                    #[cfg(debug_assertions)]
+                    if let Some(path) = std::env::var_os("AOE_E2E_ADAPTER_FRAMES_FILE") {
+                        let staged = std::path::Path::new(&path).with_extension("staged");
+                        std::fs::write(&staged, channel.adapter_frames.to_string())
+                            .and_then(|()| std::fs::rename(&staged, &path))
+                            .expect("publish e2e adapter frame count");
+                    }
                 }
                 if channel.make_room(wire.len()) {
                     // Read under the lock, after shedding, so it matches the
