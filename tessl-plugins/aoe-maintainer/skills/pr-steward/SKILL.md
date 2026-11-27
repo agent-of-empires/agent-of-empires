@@ -176,27 +176,25 @@ whose `run_attempt` is 2 or more, and never act on a run whose
    ```sh
    gh run view -R $REPO --job <job> --log-failed > job.log
    grep -E '(FAIL|TIMEOUT) \[' job.log | grep -oE '[A-Za-z0-9_:]+$' | sort -u        # nextest test path
-   grep -oE 'panicked at [A-Za-z0-9_./-]+\.rs' job.log | grep -oE '[A-Za-z0-9_./-]+\.rs$' | sort -u   # nextest source file
+   grep -oE 'test [A-Za-z0-9_:]+ \.\.\. FAILED' job.log | awk '{print $2}' | sort -u   # libtest (cargo test) test path
    grep -oE 'FAIL  src/[A-Za-z0-9_./-]+\.test\.tsx?' job.log | grep -oE 'src/[A-Za-z0-9_./-]+$' | sort -u   # Vitest file
    grep -F '[chromium] ' job.log | grep -oE '[A-Za-z0-9_./-]+\.spec\.ts(:[0-9]+)?' | sort -u   # Playwright spec
    ```
 
 2. Keep an id only when it matches its strict pattern, and drop any other:
-   - nextest test path: `^[A-Za-z0-9_:]+$`. Keep the test function name,
-     the last `::` segment.
-   - nextest source file: `^[A-Za-z0-9_./-]+\.rs$`.
+   - nextest or libtest test path: `^[A-Za-z0-9_:]+$`. Keep the full path.
    - Vitest file, relative to `web/`: `^src/[A-Za-z0-9_./-]+\.test\.tsx?$`.
    - Playwright spec, relative to its test directory:
      `^[A-Za-z0-9_./-]+\.spec\.ts(:[0-9]+)?$`.
 3. For a fork PR (`isCrossRepository` true), also keep an id only when it
-   exists in this checkout: `git grep -n -w -F -e '<function>' -- '*.rs'`
-   for a nextest test, `git ls-files --error-unmatch -- '<file>'` for a
-   nextest source file, `git ls-files --error-unmatch -- 'web/<path>'` for
+   exists in this checkout: `git grep -n -w -F -e '<last :: segment>' -- '*.rs'`
+   for a test path, `git ls-files --error-unmatch -- 'web/<path>'` for
    Vitest, and `git ls-files -- 'web/tests/<spec>' 'web/tests/*/<spec>'`
    printing a file, with `:<line>` removed, for Playwright. Never quote a
    fork log anywhere, not even a short excerpt.
-4. An id matches a known flaky issue when that issue's title or body names
-   the same test function or file path.
+4. A test path matches a known flaky issue only when that issue's title or
+   body names the full path. A Vitest or Playwright id matches when the
+   issue names the same file.
 5. Rerun only when every failed job gave at least one id and every id
    matches a known flaky issue. A failed job with no test id (a build,
    lint or infrastructure failure) or any unmatched id means no rerun.
