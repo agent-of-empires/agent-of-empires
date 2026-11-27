@@ -828,7 +828,9 @@ describe("BackgroundAgentsPanel generic workflow runs", () => {
   it("fills the bar to the completed share", () => {
     lifecycleMock.mockReturnValue([{ runId: "r1", progress: { completed: 1, total: 4 } }]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    expect(container.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("25");
+    const bar = container.querySelector('[role="progressbar"]');
+    expect(bar?.getAttribute("aria-valuenow")).toBe("25");
+    expect((bar?.firstElementChild as HTMLElement).style.width).toBe("25%");
   });
 
   it("carries the full label in the row title", () => {
