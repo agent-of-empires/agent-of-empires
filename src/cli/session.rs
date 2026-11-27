@@ -1429,22 +1429,6 @@ fn pick_targets_for_restart_all(
         .collect()
 }
 
-/// Type the restart wake message under the input lock, so an archive or trash that landed after
-/// the relaunch wins and nothing is typed into the shelved pane.
-fn send_restart_wake(
-    working: &Instance,
-    tmux_session: &crate::tmux::Session,
-    wake_msg: &str,
-) -> Result<bool> {
-    if !tmux_session.exists() {
-        return Ok(false);
-    }
-    let _input_lock = working.lock_for_input()?;
-    let delay = working.send_keys_enter_delay();
-    tmux_session.send_keys_with_delay(wake_msg, delay)?;
-    Ok(true)
-}
-
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
@@ -1464,32 +1448,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     }
     let title = working.title.clone();
     let session_id = working.id.clone();
-    let tool = working.tool.clone();
-
-    let wake_msg = crate::session::resolve_config(profile)
-        .map(|c| c.session.restart_wake_message.clone())
-        .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
-
-    let mut wake_succeeded = false;
-    if !wake_msg.is_empty()
-        && matches!(
-            outcome,
-            StartOutcome::Fresh
-                | StartOutcome::Resumed
-                | StartOutcome::FreshAfterFailedResume { .. }
-        )
-    {
-        let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
-        tmux_session.wait_until_ready(
-            std::time::Duration::from_secs(5),
-            crate::agents::ready_markers(&tool),
-        );
-
-        match send_restart_wake(&working, &tmux_session, &wake_msg) {
-            Ok(sent) => wake_succeeded = sent,
-            Err(e) => eprintln!("Warning: failed to send wake-up message: {}", e),
-        }
-    }
 
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
@@ -1505,9 +1463,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
             stored.merge_post_restart(&working);
-            if wake_succeeded {
-                stored.touch_after_input();
-            }
             Ok(true)
         } else {
             tracing::warn!(
@@ -3389,62 +3344,9 @@ mod target_filter_tests {
 /// #4116: CLI start and restart refuse an archived or trashed session.
 #[cfg(test)]
 mod start_blocked_tests {
-    use super::{
-        archive_session, restart_session, send_restart_wake, start_session, ArchiveArgs,
-        SessionIdArgs,
-    };
+    use super::{archive_session, restart_session, start_session, ArchiveArgs, SessionIdArgs};
     use crate::session::{Instance, Storage};
     use serial_test::serial;
-
-    /// The restart wake runs after the relaunch released its locks; a peer archive that landed
-    /// since wins, so nothing is typed into the pane and the row stays archived.
-    #[test]
-    #[serial]
-    fn restart_wake_is_not_typed_into_a_row_archived_since_the_relaunch() {
-        if crate::tmux::tmux_command().arg("-V").output().is_err() {
-            eprintln!("tmux not available; skipping");
-            return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let profile = "restart-wake-archived";
-        let mut working = Instance::new("restart-wake", "/tmp/x");
-        working.source_profile = profile.to_string();
-        let mut peer = working.clone();
-        peer.archive();
-        Storage::new_unwatched(profile)
-            .unwrap()
-            .update(|rows, _| {
-                *rows = vec![peer];
-                Ok(())
-            })
-            .unwrap();
-        let pane = crate::tmux::Session::generate_name(&working.id, &working.title);
-        let created = crate::tmux::tmux_command()
-            .args(["new-session", "-d", "-s", &pane, "cat"])
-            .status();
-        if !created.map(|s| s.success()).unwrap_or(false) {
-            eprintln!("tmux new-session failed; skipping");
-            return;
-        }
-        crate::tmux::refresh_session_cache();
-
-        let session = crate::tmux::Session::new(&working.id, &working.title).unwrap();
-        let result = send_restart_wake(&working, &session, "wake-4116");
-        let captured = crate::tmux::tmux_command()
-            .args(["capture-pane", "-p", "-t", &pane])
-            .output()
-            .unwrap();
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &pane])
-            .output();
-
-        let err = result.expect_err("an archived row takes no wake message");
-        assert_eq!(err.to_string(), "session is archived; unarchive it first");
-        assert!(!String::from_utf8_lossy(&captured.stdout).contains("wake-4116"));
-        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert!(stored[0].is_archived());
-    }
 
     #[tokio::test]
     #[serial]

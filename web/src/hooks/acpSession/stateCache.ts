@@ -85,7 +85,6 @@ function toPersistedState(state: AcpState, durable: (id: string) => boolean): Ac
   const base: AcpState =
     state.optimisticRows.length > 0 ||
     state.inflightPromptIds.length > 0 ||
-    Object.keys(state.promptRecoveries).length > 0 ||
     state.restartInFlight ||
     state.restartStoppedSent ||
     state.restartFailure !== null ||
@@ -94,7 +93,6 @@ function toPersistedState(state: AcpState, durable: (id: string) => boolean): Ac
           ...state,
           optimisticRows: [],
           inflightPromptIds: [],
-          promptRecoveries: {},
           restartInFlight: false,
           restartStoppedSent: false,
           restartFailure: null,

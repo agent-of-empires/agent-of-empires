@@ -207,11 +207,7 @@ fn invalid<T>(message: impl Into<String>) -> std::result::Result<T, McpWriteErro
 }
 
 fn validate_name(name: &str) -> std::result::Result<(), McpWriteError> {
-    let mut chars = name.chars();
-    let ok = name.len() <= 128
-        && chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
+    if aoe_plugin_api::is_valid_mcp_server_name(name) {
         Ok(())
     } else {
         invalid("server name must be 1-128 chars of letters, digits, '.', '_' or '-', starting with a letter or digit")

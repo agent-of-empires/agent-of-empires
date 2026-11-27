@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -70,16 +69,6 @@ fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
-fn disable_restart_wake_message(h: &TuiTestHarness) {
-    let config_path = crate::harness::app_dir_in(h.home_path()).join("config.toml");
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(&config_path)
-        .unwrap_or_else(|e| panic!("failed to open {}: {}", config_path.display(), e));
-    file.write_all(b"\n[session]\nrestart_wake_message = \"\"\n")
-        .expect("disable restart wake message");
-}
-
 fn read_log_lines(path: &Path) -> Vec<String> {
     fs::read_to_string(path)
         .unwrap_or_default()
@@ -139,7 +128,6 @@ impl Drop for StopSessionOnDrop<'_> {
 fn migrated_unknown_restart_resumes_the_stored_conversation() {
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("resume_unknown_restart");
-    disable_restart_wake_message(&h);
     let log = install_fake_agent(&mut h, false);
     let project = h.project_path();
     let add = h.run_cli(&[
