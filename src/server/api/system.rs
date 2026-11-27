@@ -1818,7 +1818,7 @@ pub async fn mark_volume_ignores_globs_acknowledged(
 #[derive(serde::Serialize)]
 pub struct ThemeChoice {
     name: String,
-    /// What a picker shows: "Dark" and "Light" for the default pair, else the name.
+    /// What a picker shows: "dark" (zinc) and "light" for the default pair, else the name.
     label: String,
 }
 

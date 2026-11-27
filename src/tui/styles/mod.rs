@@ -28,12 +28,12 @@ pub struct BuiltinTheme {
 pub const BUILTIN_THEMES: &[BuiltinTheme] = &[
     BuiltinTheme {
         name: "zinc",
-        label: Some("Dark"),
+        label: Some("dark"),
         source: include_str!("../../../themes/builtin/zinc.toml"),
     },
     BuiltinTheme {
         name: "light",
-        label: Some("Light"),
+        label: Some("light"),
         source: include_str!("../../../themes/builtin/light.toml"),
     },
     BuiltinTheme {

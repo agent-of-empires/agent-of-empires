@@ -156,7 +156,7 @@ export function ToggleField({
       className={`relative inline-flex h-[26px] w-[44px] shrink-0 items-center rounded-full transition-colors duration-200 cursor-pointer ${checked ? "bg-brand-600" : "bg-surface-600"}`}
     >
       <span
-        className={`inline-block h-[22px] w-[22px] rounded-full bg-white shadow-[0_1px_3px_rgb(0_0_0/0.35)] transition-transform duration-200 ${checked ? "translate-x-[20px]" : "translate-x-[2px]"}`}
+        className={`inline-block h-[22px] w-[22px] rounded-full bg-white shadow-(--bubble-shadow) transition-transform duration-200 ${checked ? "translate-x-[20px]" : "translate-x-[2px]"}`}
       />
     </button>
   );

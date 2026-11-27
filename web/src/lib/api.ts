@@ -1533,7 +1533,7 @@ export async function updateProfileSettings(name: string, updates: Record<string
 
 import type { ResolvedTheme } from "./theme";
 
-/** A theme the pickers offer: its config name, and what to call it ("Dark" and "Light" for the default pair). */
+/** A theme the pickers offer: its config name, and what to call it ("dark" for zinc). */
 export interface ThemeChoice {
   name: string;
   label: string;

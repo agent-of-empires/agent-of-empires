@@ -590,7 +590,7 @@ export function WorkspaceSidebar(props: Props) {
               title="New session"
               {...tourAnchor(TOUR_ANCHORS.dashboardNewSession)}
               data-testid="sidebar-new-session-pill"
-              className="md:hidden w-11 h-11 shrink-0 flex items-center justify-center rounded-full bg-text-primary text-surface-950 shadow-[0_1px_2px_rgb(0_0_0/0.3),0_10px_24px_-8px_rgb(0_0_0/0.7)] cursor-pointer active:scale-95 transition-transform disabled:opacity-40"
+              className="md:hidden w-11 h-11 shrink-0 flex items-center justify-center rounded-full bg-text-primary text-surface-950 shadow-(--pill-shadow) cursor-pointer active:scale-95 transition-transform disabled:opacity-40"
             >
               <SquarePen className="size-[19px]" strokeWidth={1.9} aria-hidden />
             </button>

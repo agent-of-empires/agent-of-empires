@@ -44,7 +44,7 @@ export const MENU_PHONE = "max-md:glass-menu max-md:rounded-2xl";
 
 /** A phone's bottom sheet: menus that dock there, the More panes sheet, compose. */
 export const SHEET =
-  "rounded-t-[28px] bg-surface-800 chrome-drawer border-t border-surface-600/40 shadow-[0_-12px_40px_-12px_rgb(0_0_0/0.6)]";
+  "rounded-t-[28px] bg-surface-800 chrome-drawer border-t border-surface-600/40 shadow-(--sheet-shadow)";
 
 /** The grab handle at the top of a sheet. */
 export const SHEET_HANDLE = "mx-auto mt-2 h-1 w-9 shrink-0 rounded-full bg-surface-600";
