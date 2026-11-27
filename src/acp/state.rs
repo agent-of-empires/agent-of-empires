@@ -1042,7 +1042,7 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
         /// The Bash command, or the workflow's name. A `_meta.aoe` task has
-        /// none and is not listed as a shell.
+        /// none and is listed as a commandless shell row labelled with its id.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1773,6 +1773,8 @@ impl AcpState {
         self.config_options = Vec::new();
         self.config_option_switch_failed = None;
         self.subagents = Vec::new();
+        self.pending_wakeup = None;
+        self.armed_monitor = None;
         self.last_agent_switch = Some(AgentSwitchInfo {
             from,
             to,
@@ -3210,12 +3212,28 @@ mod tests {
                 reason: "reset".into(),
             },
             Event::SessionCleared,
+            Event::AgentSwitched {
+                from: "claude".into(),
+                to: "codex".into(),
+                reason: "user".into(),
+            },
         ] {
             let mut s = applied(scheduled());
             assert!(s.pending_wakeup.is_some() && s.armed_monitor.is_some());
             s.apply_event(s.last_seq + 1, end).unwrap();
             assert!(s.pending_wakeup.is_none() && s.armed_monitor.is_none());
         }
+        let mut bare = applied([]);
+        bare.apply_event(
+            bare.last_seq + 1,
+            Event::AgentSwitched {
+                from: "claude".into(),
+                to: "codex".into(),
+                reason: "user".into(),
+            },
+        )
+        .unwrap();
+        assert!(bare.pending_wakeup.is_none() && bare.armed_monitor.is_none());
     }
 
     #[test]
