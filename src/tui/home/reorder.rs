@@ -242,7 +242,11 @@ impl HomeView {
         let headers = if self.group_by == GroupByMode::Group {
             self.displayed_headers(&profile)
         } else {
-            self.displayed_nested_headers(&profile)
+            let Some(headers) = self.displayed_nested_headers(&profile) else {
+                self.flash_status("Pick Custom first: the Groups can't keep this order");
+                return Ok(());
+            };
+            headers
         };
         let (freeze, switch) = self.frozen_order(order, &profile, repositories);
         self.submit_namespace_intent(
@@ -262,22 +266,35 @@ impl HomeView {
         )
     }
 
-    /// `profile`'s Groups nested under Repository headers, in the order the list shows them.
-    fn displayed_nested_headers(&self, profile: &str) -> Vec<String> {
+    /// `profile`'s Groups nested under Repository headers, in the order the list shows them,
+    /// or None when two Repositories show them in orders no one profile-wide order keeps.
+    fn displayed_nested_headers(&self, profile: &str) -> Option<Vec<String>> {
         let tree = self.group_trees.get(profile);
-        let mut headers: Vec<String> = Vec::new();
+        let mut shown: Vec<(&str, Vec<&str>)> = Vec::new();
         for item in &self.flat_items {
             let Item::Group { path, .. } = item else {
                 continue;
             };
-            if let (_, Some(path)) = super::rows::split_project_view_path(path) {
-                if tree.is_some_and(|t| t.group_exists(path)) && !headers.iter().any(|h| h == path)
-                {
-                    headers.push(path.to_owned());
+            if let (repository, Some(path)) = super::rows::split_project_view_path(path) {
+                if tree.is_some_and(|t| t.group_exists(path)) {
+                    match shown.iter_mut().find(|(r, _)| *r == repository) {
+                        Some((_, paths)) => paths.push(path),
+                        None => shown.push((repository, vec![path])),
+                    }
                 }
             }
         }
-        headers
+        let mut headers: Vec<String> = Vec::new();
+        for path in shown.iter().flat_map(|(_, paths)| paths) {
+            if !headers.iter().any(|h| h == path) {
+                headers.push((*path).to_owned());
+            }
+        }
+        let rank = |path: &str| headers.iter().position(|h| h == path);
+        shown
+            .iter()
+            .all(|(_, paths)| paths.windows(2).all(|w| rank(w[0]) < rank(w[1])))
+            .then_some(headers)
     }
 
     /// `profile`'s group headers in the order the list shows them.
@@ -1910,6 +1927,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Under Repository a freeze is refused once two Repositories show the Groups in orders
+    /// one profile-wide order cannot keep, as the dashboard refuses it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_freeze_refuses_repositories_that_disagree_on_the_group_order() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let row = |title: &str, repo: &str, group: &str, age: i64| {
+            let mut row = Instance::new(title, repo);
+            row.group_path = group.into();
+            row.created_at = crate::time::Timestamp::now() - crate::time::Duration::hours(age);
+            row
+        };
+        // Newest first shows alpha above beta under x, and beta above alpha under y.
+        let rows = vec![
+            row("x1", "/tmp/x", "alpha", 0),
+            row("x2", "/tmp/x", "alpha", 1),
+            row("x3", "/tmp/x", "beta", 2),
+            row("y1", "/tmp/y", "beta", 3),
+            row("y2", "/tmp/y", "alpha", 4),
+        ];
+        storage
+            .update(|stored, groups| {
+                *stored = rows.clone();
+                *groups = ["alpha", "beta"]
+                    .map(|path| crate::session::Group::new(path, path))
+                    .into();
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["reorder"]).await;
+        let mut view = HomeView::new_for_test(
+            Some("reorder".into()),
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        apply_published(&mut view, &state).await;
+        view.sort_order = SortOrder::Newest;
+        view.group_by = GroupByMode::Project;
+        view.flat_items = view.build_flat_items();
+        let nested: Vec<&str> = view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Group { path, depth: 1, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nested, ["x/alpha", "x/beta", "y/beta", "y/alpha"]);
+        view.select_session_by_id(&rows[0].id);
+        let mut capture = view.session_feed.namespace_capture_for_test();
+        view.move_row_at_cursor(1).unwrap();
+        assert!(capture().is_none());
+        assert_eq!(
+            view.status_flash.as_ref().map(|f| f.text.as_str()),
+            Some("Pick Custom first: the Groups can't keep this order")
+        );
+        assert_eq!(view.sort_order, SortOrder::Newest);
     }
 
     /// A move under Custom places only its header's rows, so other rows stay newest first.
