@@ -15,7 +15,9 @@ use tracing::{debug, info, warn};
 use super::errors::{acp_error_from_value, acp_internal_error, AcpError};
 use super::lifecycle::TerminalClaim;
 use super::runner::runner_socket_deadline;
-use super::session_identity::{SessionIngress, CONTROL_FRAME_BYTES_FIELD};
+use super::session_identity::{
+    SessionIngress, ADAPTER_FRAMES_SHED_METHOD, CONTROL_FRAME_BYTES_FIELD,
+};
 
 /// Cancels a socket handshake abandoned mid-construction. Closing this exact
 /// channel cancels only its own runner.
@@ -482,8 +484,19 @@ pub(super) async fn connect_runner_control_v3(
                             return;
                         }
                     }
+                    // Relayed in stream position: crediting it here would run ahead
+                    // of earlier frames still buffered for the crate.
                     Ok(Some((ControlBody::AdapterFramesShed { count }, _))) => {
-                        reader_ingress.skip_adapter_frames(count);
+                        let line = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": ADAPTER_FRAMES_SHED_METHOD,
+                            "params": { "count": count },
+                        });
+                        if !shim_write_line_releasing(&reader_shim_write, &line, &reader_settled)
+                            .await
+                        {
+                            return;
+                        }
                     }
                     Ok(Some((ControlBody::PromptStarted { prompt_req_id }, _))) => {
                         let mut completion =
@@ -1397,10 +1410,10 @@ mod tests {
         fake.await.unwrap();
     }
 
-    /// A marker for frames the runner shed from its queue counts them as
-    /// adapter frames the connection never received.
+    /// A shed marker keeps its place among the buffered adapter frames, so it
+    /// credits only after the frames sent before it.
     #[tokio::test]
-    async fn a_shed_marker_advances_the_ingress_adapter_count() {
+    async fn a_shed_marker_keeps_its_stream_position() {
         let tmp = tempfile::tempdir().unwrap();
         let (control, listener) = bind(&tmp);
         let fake = tokio::spawn(async move {
@@ -1410,28 +1423,42 @@ mod tests {
                 control_protocol::CONTROL_PROTOCOL_VERSION,
             )
             .await;
+            for n in 1..=2 {
+                let body = ControlBody::Notify {
+                    method: "x/frame".into(),
+                    params: serde_json::json!({ "n": n }),
+                };
+                control_protocol::write_frame(&mut peer, &body)
+                    .await
+                    .unwrap();
+            }
             control_protocol::write_frame(&mut peer, &ControlBody::AdapterFramesShed { count: 3 })
                 .await
                 .unwrap();
             peer
         });
-        let (client, _crate_side) =
-            connect(&control, "shed", Arc::new(TerminalClaim::new()), false)
-                .await
-                .unwrap();
+        let (client, crate_side) = connect(&control, "shed", Arc::new(TerminalClaim::new()), false)
+            .await
+            .unwrap();
         let _peer = fake.await.unwrap();
-        let counted = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let n = client.ingress.take_discarded_adapter_frames();
-                if n > 0 {
-                    return n;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the reader applies the marker");
-        assert_eq!(counted, 3);
+        let mut lines = BufReader::new(crate_side).lines();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("the reader relays every frame")
+                .unwrap()
+                .expect("stream open");
+            seen.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+        }
+        let methods: Vec<_> = seen.iter().map(|v| v["method"].as_str().unwrap()).collect();
+        assert_eq!(methods, ["x/frame", "x/frame", ADAPTER_FRAMES_SHED_METHOD]);
+        assert_eq!(seen[2]["params"]["count"], 3);
+        assert_eq!(
+            client.ingress.take_discarded_adapter_frames(),
+            0,
+            "the reader credits nothing itself"
+        );
     }
 
     #[tokio::test]
@@ -2132,7 +2159,8 @@ mod tests {
                                             adopted_tx.send(outcome).unwrap();
                                         }
                                     }
-                                    SessionIngressNotification::AuthStatus(_) => {}
+                                    SessionIngressNotification::AuthStatus(_)
+                                    | SessionIngressNotification::AdapterFramesShed(_) => {}
                                     SessionIngressNotification::Update(_) => {
                                         let (entered, release) =
                                             gate.lock().await.recv().await.unwrap();

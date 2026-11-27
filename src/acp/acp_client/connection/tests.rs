@@ -1464,6 +1464,42 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
     fake.connection.abort();
 }
 
+/// Shed frames credit where they sit in the stream: an update anchored after
+/// adapter frame 2 releases after A2, and one anchored after 3 waits for the
+/// marker that stands for the shed A3.
+#[tokio::test]
+async fn shed_adapter_frames_credit_in_stream_order() {
+    let (ready, mut fake) =
+        spawn_fake_connection_raw("s-h", GOOD_HELLO, None, None, None, |_| vec![]).await;
+    ready.expect("valid hello accepted");
+    let shed = r#"{"jsonrpc":"2.0","method":"_aoe/adapter_frames_shed","params":{"count":1}}"#;
+    let frames = [
+        tool_call_frame("h3", r#"{"v":1,"key":"k3","after_adapter_sequence":3}"#),
+        tool_call_frame("h2", r#"{"v":1,"key":"k2","after_adapter_sequence":2}"#),
+        tool_call_frame("a1", ""),
+        tool_call_frame("a2", ""),
+        shed.to_string(),
+    ];
+    for frame in &frames {
+        write_line(&fake.agent_write, frame).await;
+    }
+    let mut started = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while started.len() < 4 {
+            if let Event::ToolCallStarted { tool_call } =
+                fake.event_rx.recv().await.expect("connection remains open")
+            {
+                started.push(tool_call.id);
+            }
+        }
+    })
+    .await
+    .expect("every frame is released");
+    assert_eq!(started, ["a1", "a2", "h2", "h3"]);
+    fake.agent.abort();
+    fake.connection.abort();
+}
+
 /// A proxy that exits after a valid hello but before the connection is ready
 /// is a lost integration; reporting it as a spawn failure would make the
 /// supervisor relaunch the session without the proxy.

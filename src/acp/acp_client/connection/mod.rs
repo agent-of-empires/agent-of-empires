@@ -248,6 +248,11 @@ pub(super) async fn run_connection_task<W, R>(
                                     .await;
                                 return Ok(());
                             }
+                            SessionIngressNotification::AdapterFramesShed(count) => {
+                                shared.ingress.skip_adapter_frames(count);
+                                shared.settle_discarded().await;
+                                return Ok(());
+                            }
                             SessionIngressNotification::Update(params) => params,
                         };
                         let (notification, wire_bytes) = SessionIngressNotification::decode_update(
