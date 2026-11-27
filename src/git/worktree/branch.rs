@@ -807,19 +807,28 @@ mod tests {
         let mut name = b"wt-".to_vec();
         name.push(0xFF);
         let foreign = main.join(OsString::from_vec(name));
+        if std::fs::create_dir(&foreign).is_err() {
+            return; // filesystem rejects non-UTF-8 names
+        }
+        std::fs::remove_dir(&foreign).unwrap();
         let created = std::process::Command::new("git")
             .current_dir(main)
             .args(["worktree", "add", "-b", "foreign"])
             .arg(&foreign)
             .output()
             .unwrap();
-        if !created.status.success() || !foreign.exists() {
-            return; // filesystem rejects non-UTF-8 names
-        }
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
 
+        // git reports the canonical path; TMPDIR may sit behind a symlink.
         assert_eq!(
-            git.live_checkout_for_branch("foreign").unwrap(),
-            Some(foreign)
+            git.live_checkout_for_branch("foreign")
+                .unwrap()
+                .map(|p| p.canonicalize().unwrap()),
+            Some(foreign.canonicalize().unwrap())
         );
     }
 }
