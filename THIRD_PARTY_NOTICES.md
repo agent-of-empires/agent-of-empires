@@ -33,4 +33,4 @@ The Unix Mio consumer retains fetched control events across early returns and
 refreshes TTY readiness before polling again instead of reading a saved hint.
 The upstream parser and other backends are unchanged. Maintenance, archive
 identity, and release checks are documented in
-[`docs/development/releases.md`](docs/development/releases.md#vendored-terminal-dependency).
+[`docs/development/releases.md`](docs/development/releases.md#experimental-terminal-dependency).

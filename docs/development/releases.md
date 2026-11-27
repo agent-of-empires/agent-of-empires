@@ -67,7 +67,8 @@ The Crossterm patch is an experiment in [draft PR #5593](https://github.com/agen
 not an approved fork or supported-release commitment.
 The Unix Mio reader and wake socket track [Crossterm #1179 at `e409fa05`](https://github.com/crossterm-rs/crossterm/pull/1179/commits/e409fa05aa9e7d446d773a1ad3f78f2c8db319c2).
 The 0.29 import layout and the draft's test probes are local adaptations. The
-event reader and stream changes remain separate experiments.
+prototype also includes filtered-event preservation and `EventStream` delivery
+changes that are not part of upstream #1179.
 Keep the PR draft until maintainers choose an official dependency that satisfies
 the required behavior, redesign the affected change without the patch, or approve
 a separate temporary exception. An exception must name a willing owner, exact
