@@ -106,10 +106,13 @@ if [[ $RUN == *" 3 "* ]]; then
 echo "== 3. xtask dev rebuild"
 "$DISK"
 cargo build --features web -q
-hyperfine --runs 5 --export-markdown "$OUT/3-xtask-dev.md" \
+mkdir -p "$B/empty-dist"
+# Toggling AOE_WEB_DIST reruns build.rs, so each row gets a warm-up run.
+hyperfine --runs 5 --warmup 1 --export-markdown "$OUT/3-xtask-dev.md" \
   -n 'web, Rust edit' --prepare "\"$DISK\" && touch src/lib.rs" 'cargo build --features web -q' \
   -n 'web, Rust edit after a frontend edit' --prepare "\"$DISK\" && touch web/src/main.tsx src/lib.rs" 'cargo build --features web -q' \
-  -n 'no web, Rust edit' --prepare "\"$DISK\" && touch src/lib.rs" 'cargo build -q'
+  -n 'web, empty bundle, Rust edit after a frontend edit' --prepare "\"$DISK\" && touch web/src/main.tsx src/lib.rs" \
+  "env AOE_WEB_DIST=\"$B/empty-dist\" cargo build --features web -q"
 fi
 
 for f in "$OUT"/*; do echo "--- $(basename "$f")"; cat "$f"; done
