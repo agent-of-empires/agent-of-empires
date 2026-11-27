@@ -48,7 +48,7 @@ pub(super) struct DaemonControlClient {
     settled: Arc<std::sync::Mutex<VecDeque<CompletionDelivery>>>,
     raw_fd: RawFd,
     closed_locally: Arc<AtomicBool>,
-    loss: Arc<std::sync::OnceLock<ControlLoss>>,
+    loss: Arc<std::sync::OnceLock<(Option<std::io::ErrorKind>, bool)>>,
     /// The agent sent a valid proxy hello on this connection.
     proxied: Arc<AtomicBool>,
     pub(super) disconnected: tokio_util::sync::CancellationToken,
@@ -62,23 +62,24 @@ pub(crate) struct ControlLoss {
     pub(crate) io_error: Option<std::io::ErrorKind>,
     pub(crate) turn_in_flight: bool,
     /// A proxied agent was behind the channel, so its loss is the proxy's.
-    /// Set from the validated hello when read through [`ControlLossHandle`],
-    /// never at EOF, which can beat the hello's handoff.
+    /// Read from the validated hello when the loss is read, never at EOF,
+    /// which can beat the hello's handoff.
     pub(crate) proxied: bool,
 }
 
 #[derive(Clone)]
 pub(super) struct ControlLossHandle {
-    loss: Arc<std::sync::OnceLock<ControlLoss>>,
+    loss: Arc<std::sync::OnceLock<(Option<std::io::ErrorKind>, bool)>>,
     proxied: Arc<AtomicBool>,
 }
 
 impl ControlLossHandle {
     pub(super) fn get(&self) -> Option<ControlLoss> {
-        let loss = self.loss.get()?;
+        let &(io_error, turn_in_flight) = self.loss.get()?;
         Some(ControlLoss {
+            io_error,
+            turn_in_flight,
             proxied: self.proxied.load(AtomicOrdering::Acquire),
-            ..*loss
         })
     }
 }
@@ -468,19 +469,15 @@ pub(super) async fn connect_runner_control_v3(
             if reader_closed_locally.load(AtomicOrdering::Acquire) {
                 return;
             }
-            let loss = ControlLoss {
-                io_error,
-                turn_in_flight: reader_prompt_in_flight.load(AtomicOrdering::Relaxed),
-                proxied: false,
-            };
+            let turn_in_flight = reader_prompt_in_flight.load(AtomicOrdering::Relaxed);
             warn!(
                 target: "acp.protocol",
                 session = %reader_session,
-                io_error = ?loss.io_error,
-                turn_in_flight = loss.turn_in_flight,
+                io_error = ?io_error,
+                turn_in_flight,
                 "runner closed the control channel"
             );
-            let _ = reader_loss.set(loss);
+            let _ = reader_loss.set((io_error, turn_in_flight));
         };
         async {
             loop {

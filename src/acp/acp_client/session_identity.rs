@@ -35,7 +35,8 @@ const MAX_CHILDREN: usize = 256;
 // Only the daemon control reader writes this synthetic transport field.
 pub(super) const CONTROL_FRAME_BYTES_FIELD: &str = "__aoe_control_frame_bytes";
 
-// Only the daemon control reader writes this synthetic notification.
+// Shares the adapter stream: a forged marker only misorders that adapter's own
+// transcript, within the adapter's trust domain.
 pub(super) const ADAPTER_FRAMES_SHED_METHOD: &str = "_aoe/adapter_frames_shed";
 
 /// Every agent-side notification the connection admits, on one handler.
@@ -446,7 +447,8 @@ impl SessionIngress {
     /// Frames the runner numbered before this connection received any: they
     /// count like frames dropped here, ahead of every frame that follows.
     pub(super) fn skip_adapter_frames(&self, n: u64) {
-        self.state.lock().unwrap().discarded_adapter_frames += n;
+        let mut state = self.state.lock().unwrap();
+        state.discarded_adapter_frames = state.discarded_adapter_frames.saturating_add(n);
     }
 
     /// The adapter frames dropped since the last call.

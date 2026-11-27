@@ -106,7 +106,7 @@ impl<T> ArrivalOrder<T> {
     /// Numbers `n` adapter frames that core never saw, for example old-session
     /// frames dropped at a reset, and returns the held frames they release.
     pub fn skip_frames(&mut self, n: u64) -> Vec<T> {
-        self.adapter_frames += n;
+        self.adapter_frames = self.adapter_frames.saturating_add(n);
         self.release_due()
     }
 
