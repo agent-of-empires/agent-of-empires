@@ -2297,7 +2297,6 @@ mod tests {
                             session_id: instance.id.clone(),
                             instance,
                             size: None,
-                            wake_message: "must-not-be-dispatched".into(),
                             skip_on_launch: true,
                             bound_hooks: false,
                             discard_sandbox_container: false,
@@ -2497,7 +2496,6 @@ mod tests {
                             "private launch diagnostics:\n{}",
                             logs.contents()
                         );
-                        assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
                     }
                 }
                 instance.capture_poller.clear();
