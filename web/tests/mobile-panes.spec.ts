@@ -109,11 +109,14 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await expect(page.getByRole("menuitem", { name: /Copy branch/ })).toBeVisible();
 
     const items = page.getByRole("menu").locator('[role^="menuitem"]');
+    // The item box and the icon and label inside it, since a child can overflow a box that fits.
     const boxes = await items.evaluateAll((els) =>
-      els.map((el) => {
-        const r = el.getBoundingClientRect();
-        return { label: el.textContent, left: r.left, right: r.right };
-      }),
+      els.flatMap((el) =>
+        [el, ...el.querySelectorAll("svg, span")].map((part) => {
+          const r = part.getBoundingClientRect();
+          return { label: `${el.textContent} <${part.tagName.toLowerCase()}>`, left: r.left, right: r.right };
+        }),
+      ),
     );
     for (const box of boxes) {
       expect.soft(box.left, `${box.label} left edge`).toBeGreaterThanOrEqual(0);
