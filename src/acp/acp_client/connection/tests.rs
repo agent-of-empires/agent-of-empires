@@ -1621,3 +1621,31 @@ async fn closing_the_transport_after_a_hello_loses_the_integration() {
         );
     }
 }
+
+/// A task that never reports `ended` finishes when its lease lapses, from the
+/// idle tick alone with no further frames. The lease clock is wall time, so
+/// the ttl is real and the wait is a deadline-bounded event wait.
+#[tokio::test]
+async fn an_idle_tick_finishes_a_lapsed_background_task() {
+    let (ready, mut fake) =
+        spawn_fake_connection_raw("s-h", GOOD_HELLO, None, None, None, |_| vec![]).await;
+    ready.expect("valid hello accepted");
+    let aoe = r#"{"v":2,"key":"k1","background_task":{"id":"b1","state":"started","ttl_ms":50}}"#;
+    write_line(&fake.agent_write, &tool_call_frame("t1", aoe)).await;
+
+    let mut order = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !matches!(order.last(), Some(&"finished")) {
+            match fake.event_rx.recv().await.expect("connection remains open") {
+                Event::BackgroundTaskStarted { .. } => order.push("started"),
+                Event::BackgroundTaskFinished { .. } => order.push("finished"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the idle tick finishes the lapsed task");
+    assert_eq!(order, ["started", "finished"]);
+    fake.agent.abort();
+    fake.connection.abort();
+}
