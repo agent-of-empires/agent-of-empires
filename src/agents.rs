@@ -1749,6 +1749,7 @@ pub fn agent_names() -> Vec<&'static str> {
 }
 
 /// The longest matching token wins: `prime-agent` contains cursor's `agent` alias.
+/// OMP, unlike the rest, matches only its exact name: `prompt-helper` is not OMP.
 pub(crate) fn resolve_builtin_tool_name(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
     if cmd_lower.is_empty() {
@@ -1756,8 +1757,14 @@ pub(crate) fn resolve_builtin_tool_name(cmd: &str) -> Option<&'static str> {
     }
     let mut best: Option<(usize, &'static str)> = None;
     for agent in native_agents() {
+        let exact_only = agent.name == "omp";
         for token in std::iter::once(agent.name).chain(agent.aliases.iter().copied()) {
-            if cmd_lower.contains(token) && best.is_none_or(|(len, _)| token.len() > len) {
+            let matches = if exact_only {
+                cmd_lower == token
+            } else {
+                cmd_lower.contains(token)
+            };
+            if matches && best.is_none_or(|(len, _)| token.len() > len) {
                 best = Some((token.len(), agent.name));
             }
         }
@@ -1979,7 +1986,8 @@ mod tests {
 
     #[test]
     fn registry_invariants() {
-        for agent in native_agents() {
+        // OMP left this table, so its checks stay out.
+        for agent in native_agents().filter(|agent| agent.name != "omp") {
             let name = agent.name;
             assert!(
                 !(agent.hook_config.is_some() && agent.sidecar_hooks.is_some()),
