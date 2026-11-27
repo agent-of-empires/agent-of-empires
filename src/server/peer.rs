@@ -91,13 +91,8 @@ impl Drop for SocketLease {
 pub(super) async fn bind_private(
     path: &std::path::Path,
 ) -> anyhow::Result<(OwnerUnixListener, SocketLease)> {
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-    anyhow::ensure!(
-        path.as_os_str().as_bytes().len() < 104,
-        "Daemon Unix socket path is too long: {}",
-        path.display()
-    );
+    crate::daemon::transport::ensure_socket_path_fits(path)?;
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Daemon socket has no directory"))?;

@@ -1178,9 +1178,9 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
         .rsplit(|byte| *byte == b'/')
         .next()
         .unwrap_or(executable);
-    if !matches!(basename, b"aoe" | b"agent-of-empires") {
-        return false;
-    }
+    // A renamed release binary (`aoe-darwin-arm64`) is only trusted as the
+    // daemon child, whose argv `daemon_child_args` always starts `serve --daemon-child`.
+    let known_name = matches!(basename, b"aoe" | b"agent-of-empires");
 
     // The top-level globals declared on `Cli` in `src/cli/definition.rs`, so a
     // value like `--profile work` is not mistaken for the subcommand.
@@ -1202,7 +1202,7 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
             {
                 index += 1;
             }
-            b"serve" => return true,
+            b"serve" => return known_name || args.get(index + 1) == Some(&&b"--daemon-child"[..]),
             _ => return false,
         }
     }
@@ -2096,6 +2096,9 @@ async fn start_daemon(
     if let Some(existing) = tokio::task::spawn_blocking(daemon_pid).await? {
         bail!("aoe serve daemon already running (PID {existing}); not starting another");
     }
+    crate::daemon::transport::ensure_socket_path_fits(
+        &crate::daemon::transport::local_socket_path()?,
+    )?;
     let exe = std::env::current_exe()?;
     let instance_id = uuid::Uuid::new_v4().to_string();
     let mut cmd = Command::new(exe);
@@ -3184,6 +3187,10 @@ mod tests {
             (b"aoe --profile serve update", false),
             (b"aoe --some-option serve update", false),
             (b"/tmp/aoe-helper serve", false),
+            (b"/x/aoe-darwin-arm64\0serve\0--daemon-child\0", true),
+            (b"/x/aoe-darwin-arm64 -p work serve --daemon-child", true),
+            (b"/x/aoe-darwin-arm64 serve --daemon", false),
+            (b"/x/aoe-darwin-arm64 serve", false),
             (b"runner --label aoe serve", false),
         ];
         for (command, expected) in cases {
