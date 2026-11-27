@@ -600,24 +600,25 @@ impl Instance {
         crate::session::skills_model::log_sync_outcomes(&self.tool, &outcomes);
     }
 
-    /// Runs `use_agent` with the agent this launch's hooks and trust belong to: a
-    /// built-in or bundled one, else the session's active plugin declaration.
+    /// Runs `use_agent` with the agent this launch's hooks and trust belong to: the
+    /// session's active plugin declaration, else a built-in or bundled one.
     pub(super) fn with_hook_agent<R>(
         &mut self,
         use_agent: impl FnOnce(&mut Self, Option<&crate::agents::AgentDef<'_>>) -> R,
     ) -> R {
-        if let Some(agent) = self.status_agent() {
-            return use_agent(self, Some(agent));
-        }
         let Some(declared) = self.declared_agent() else {
-            return use_agent(self, None);
+            let agent = self.status_agent();
+            return use_agent(self, agent);
         };
         let mut use_agent = Some(use_agent);
         let result = declared
             .with_definition(|agent| (use_agent.take().expect("called once"))(self, Some(agent)));
         match result {
             Some(result) => result,
-            None => (use_agent.take().expect("declaration yielded no agent"))(self, None),
+            None => {
+                let agent = self.status_agent();
+                (use_agent.take().expect("declaration yielded no agent"))(self, agent)
+            }
         }
     }
 
@@ -1530,6 +1531,33 @@ mod tests {
             tmp.path().to_str().unwrap(),
         ));
         assert!(disclosed.join(".example.json").exists());
+    }
+
+    /// A declared agent aliased to a built-in through `detect_as` still gets its own
+    /// hooks and trust on a host launch.
+    #[test]
+    #[serial_test::serial]
+    fn a_declared_agent_is_selected_before_its_detect_as_alias() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.aliased-declared",
+            "id = \"acme.aliased-declared\"\nname = \"Aliased\"\nversion = \"1.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             command = \"example-helper\"\n[agent_integrations.hooks]\n\
+             settings_rel_path = \".example/settings.json\"\nformat = \"json_settings\"\n\
+             [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n\
+             [agent_integrations.trust]\nfile = \".example.json\"\nlocation = \"config_dir_or_home\"\n\
+             pointer = \"/projects/{path}/trusted\"\nvalue = true\nsandbox = \"always\"\n",
+        );
+        let mut instance = tool_instance("example-helper", tmp.path().to_str().unwrap());
+        instance.detect_as = "claude".into();
+
+        let name = instance.with_hook_agent(|_, agent| agent.map(|a| a.name.to_string()));
+
+        assert_eq!(name.as_deref(), Some("example-helper"));
     }
 
     /// A declaration whose command is a built-in binary is disclosed as the
