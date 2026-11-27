@@ -309,11 +309,14 @@ jobs:
             await gate({ github, context, core, queueRef: process.env.QUEUE_REF });
 
   cargo-macos:
-    # Push always runs; a failed gate also runs it rather than pass unchecked.
+    # Push runs once the Linux legs finish, whatever they report; a failed
+    # gate also runs it rather than pass unchecked. PR and queue runs need
+    # Linux to pass, so a run that fails or is superseded there never holds
+    # one of the few macOS runners.
     # Both Cargo steps share e2e-tests; no frontend build is needed on macOS.
     name: Cargo Test (macos)
-    needs: macos-gate
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.macos-gate.result != 'success' || needs.macos-gate.outputs.run == 'true') }}
+    needs: [macos-gate, cargo-linux]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.macos-gate.result != 'success' || needs.macos-gate.outputs.run == 'true') && (github.event_name == 'push' || needs.cargo-linux.result == 'success') }}
     runs-on: macos-latest
     permissions:
       contents: read
