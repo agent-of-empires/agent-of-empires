@@ -1197,6 +1197,8 @@ Admitted stop work survives HTTP cancellation; its committed native fence surviv
 
 A new prompt sent from the dashboard, TUI or CLI to a stopped session (`POST /api/sessions/{id}/acp/prompt` without `no_revive` or a queued prompt id) starts it. If a newer stop wins that start, the answer is `409` with header `aoe-error-code: resume_failed` and a `stop_fenced: ...` body. The prompt is not queued, so do not retry it automatically. Prompts from other origins stay queued behind the stop until an explicit start.
 
+ACP prompt responses classified as `503 worker_not_ready` carry `aoe-error-code: worker_not_ready`. Capacity errors and generic `503` responses do not carry that code.
+
 If a write commits but canonical publication fails, the stop remains durable and the response reports an unconfirmed outcome. Unproven retirement remains pending rather than reporting success. Daemon detach, idle shutdown and internal provider teardown do not independently create user-stop intent. Reversible stop preserves native transcript history.
 
 ## POST /api/sessions/{id}/acp/subagents/{child_id}/cancel

@@ -236,6 +236,10 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
         .expect("handler must finish once the reservation drops")
         .expect("handler task must not panic");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        crate::daemon::ApiErrorCode::from_headers(response.status(), response.headers(), false),
+        Some(crate::daemon::ApiErrorCode::WorkerNotReady)
+    );
     assert!(!published(&state, &id, |e| matches!(
         e,
         Event::UserPromptSent { .. }

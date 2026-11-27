@@ -61,6 +61,15 @@ fn session_not_found() -> Response {
     (StatusCode::NOT_FOUND, "session not found").into_response()
 }
 
+fn worker_not_ready_response(body: impl IntoResponse) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        crate::daemon::ApiErrorCode::WorkerNotReady.header(),
+        body,
+    )
+        .into_response()
+}
+
 /// Plain-text status mapping for a `SupervisorError`. The dashboard matches
 /// body prefixes (`worker_not_ready`, `rate_limited`, `spawn_cancelled`).
 fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
@@ -92,11 +101,9 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
         | SupervisorError::NativeStoreUnavailable => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }
-        // The worker is mid-restart (e.g. a force stop); the client re-queues.
-        SupervisorError::Acp(AcpError::AgentExited | AcpError::NotRunning) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("worker_not_ready: {context}: {err}"),
-        ),
+        SupervisorError::Acp(AcpError::AgentExited | AcpError::NotRunning) => {
+            return worker_not_ready_response(format!("worker_not_ready: {context}: {err}"));
+        }
         SupervisorError::Acp(AcpError::RateLimited(_)) => (
             StatusCode::TOO_MANY_REQUESTS,
             format!("rate_limited: {context}: {err}"),
@@ -376,13 +383,18 @@ mod tests {
             );
         }
 
-        // The composer re-queues on a 503 body starting with this prefix.
-        let body = supervisor_error_response(
+        let response = supervisor_error_response(
             "prompt failed",
             &SupervisorError::Acp(AcpError::AgentExited),
-        )
-        .into_body();
-        let bytes = axum::body::to_bytes(body, 4096).await.unwrap();
+        );
+        assert_eq!(
+            crate::daemon::ApiErrorCode::from_headers(response.status(), response.headers(), false),
+            Some(crate::daemon::ApiErrorCode::WorkerNotReady)
+        );
+        // The dashboard still relies on the body prefix.
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&bytes).starts_with("worker_not_ready"));
     }
 

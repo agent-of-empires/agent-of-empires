@@ -227,16 +227,16 @@ fn daemon_breadcrumbs_reach_per_session_log() {
     assert!(body.contains("acp.protocol"), "daemon target:\n{body}");
 }
 
-/// The daemon fails the first fresh-spawn handshake while the runner stays
-/// registered; the reconciler must readopt it so prompts are accepted (#1890).
+/// A failed initial handshake must not prevent a subsequent turn from reaching the worker.
 #[test]
 #[parallel]
-fn acp_recovers_orphaned_runner_after_failed_first_handshake() {
+fn acp_delivers_prompt_after_failed_first_handshake() {
     require_tmux!();
     require_node!();
     let mut h = TuiTestHarness::new_acp(
         "acp_orphan_recovery",
-        r#"{ "turns": [ { "updates": [], "stopReason": "end_turn" } ] }"#,
+        r#"{"turns":[{"updates":[{"sessionUpdate":"agent_message_chunk",
+        "content":{"type":"text","text":"recovered-handshake-reply"}}],"stopReason":"end_turn"}]}"#,
     );
     h.set_env("AOE_ACP_TEST_FAIL_FIRST_HANDSHAKES", "1");
     let (_, session_id) = h.start_structured_session("orphan-recovery");
@@ -254,6 +254,20 @@ fn acp_recovers_orphaned_runner_after_failed_first_handshake() {
             "acp prompt failed with an unexpected error before recovery.\nstderr: {stderr}"
         );
         Err(format!("worker never recovered.\nstderr: {stderr}"))
+    });
+
+    // A successful prompt command can mean queued, not delivered.
+    wait_until(Duration::from_secs(20), Duration::from_millis(250), || {
+        let out = h.run_cli(&["acp", "history", &session_id, "--json"]);
+        let history = String::from_utf8_lossy(&out.stdout);
+        if out.status.success() && history.contains("recovered-handshake-reply") {
+            Ok(())
+        } else {
+            Err(format!(
+                "worker did not answer the prompt.\nstdout: {history}\nstderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
     });
 }
 

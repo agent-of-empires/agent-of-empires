@@ -40,6 +40,7 @@ pub enum ApiErrorCode {
     FavoriteSelectionRefused,
     FavoriteNamespaceBusy,
     OutcomeUnconfirmed,
+    WorkerNotReady,
     /// The project path is not a directory on the Daemon host.
     WorkingDirMissing,
     /// A worktree checkout named a branch that exists neither locally nor on a remote.
@@ -91,6 +92,7 @@ impl ApiErrorCode {
             Self::FavoriteSelectionRefused => "favorite_selection_refused",
             Self::FavoriteNamespaceBusy => "favorite_namespace_busy",
             Self::OutcomeUnconfirmed => "outcome_unconfirmed",
+            Self::WorkerNotReady => "worker_not_ready",
             Self::WorkingDirMissing => "working_dir_missing",
             Self::BranchNotFound => "branch_not_found",
             Self::AgentHooksNotApproved => "agent_hooks_not_approved",
@@ -150,7 +152,7 @@ impl ApiErrorCode {
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::StartFailed | Self::SandboxMigrationFailed => StatusCode::INTERNAL_SERVER_ERROR,
             Self::FavoriteSelectionRefused => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::OutcomeUnconfirmed => StatusCode::SERVICE_UNAVAILABLE,
+            Self::OutcomeUnconfirmed | Self::WorkerNotReady => StatusCode::SERVICE_UNAVAILABLE,
             Self::TerminalSwitchRefused(
                 TerminalSwitchReason::HandoffPending | TerminalSwitchReason::ContextUnconfirmed,
             ) => StatusCode::SERVICE_UNAVAILABLE,
@@ -205,6 +207,7 @@ impl ApiErrorCode {
             b"favorite_selection_refused" => Self::FavoriteSelectionRefused,
             b"favorite_namespace_busy" => Self::FavoriteNamespaceBusy,
             b"outcome_unconfirmed" => Self::OutcomeUnconfirmed,
+            b"worker_not_ready" => Self::WorkerNotReady,
             b"agent_hooks_not_approved" => Self::AgentHooksNotApproved,
             b"resume_failed" => Self::ResumeFailed,
             b"managed_resume_refused" => Self::ManagedResumeRefused(managed_resume_cause(headers)),
