@@ -1768,13 +1768,13 @@ fn is_safe_agent_name(name: &str) -> bool {
 /// A declared integration paces through `Instance::send_keys_enter_delay`,
 /// which keeps this table as the fallback for every program it does not own.
 pub fn send_keys_enter_delay(tool: &str) -> u64 {
-    get_agent(tool)
+    native_definition(tool)
         .map(|a| a.send_keys_enter_delay_ms)
         .unwrap_or(0)
 }
 
 pub fn ready_markers(tool: &str) -> &'static [&'static str] {
-    get_agent(tool).map_or(&[], |a| a.ready_markers)
+    native_definition(tool).map_or(&[], |a| a.ready_markers)
 }
 
 pub fn agent_names() -> Vec<&'static str> {
@@ -2695,6 +2695,7 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
     }
 
     #[test]
+    #[serial_test::serial]
     fn native_agents_keep_claude_first_and_the_bundled_fallbacks_around_the_table() {
         let names: Vec<_> = native_agents().map(|agent| agent.name).collect();
         assert_eq!(names.first(), Some(&"claude"));
@@ -2711,6 +2712,7 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_settings_index_roundtrip() {
         assert_eq!(settings_index_from_name(None), 0);
         assert_eq!(settings_index_from_name(Some("unknown")), 0);
