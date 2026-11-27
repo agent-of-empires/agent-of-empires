@@ -3515,6 +3515,8 @@ sandbox = "unsupported"
             return;
         }
         let temp = tempfile::tempdir().unwrap();
+        // Its own hook base, never the per-user one.
+        let (_hooks, _, _hook_tmp) = crate::hooks::test_support::BaseGuard::ready();
         let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
