@@ -605,6 +605,18 @@ fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusC
     }
 }
 
+/// Title and body prefix of a status push; `agent` is the session's agent display name.
+fn status_push_text(event: NotificationEvent, agent: Option<&str>) -> (String, &'static str) {
+    match event {
+        NotificationEvent::Waiting => (
+            format!("{} is waiting", agent.unwrap_or("Agent")),
+            "Waiting for input",
+        ),
+        NotificationEvent::Idle => ("Session finished".to_string(), "Agent is idle"),
+        NotificationEvent::Error => ("Session error".to_string(), "Agent errored"),
+    }
+}
+
 /// Resolve whether a given event type should fire for a given instance,
 /// combining server-wide defaults with per-session overrides.
 fn should_fire(
@@ -783,11 +795,12 @@ async fn fire_due_pushes(
             "status push fired"
         );
 
-        let (title, body_prefix) = match event {
-            NotificationEvent::Waiting => ("Claude is waiting", "Waiting for input"),
-            NotificationEvent::Idle => ("Session finished", "Agent is idle"),
-            NotificationEvent::Error => ("Session error", "Agent errored"),
-        };
+        let (title, body_prefix) = status_push_text(
+            event,
+            crate::agents::labels_for(&instance.tool)
+                .as_ref()
+                .map(|(name, _)| name.as_str()),
+        );
         let body = if instance_title.is_empty() {
             body_prefix.to_string()
         } else {
@@ -1428,6 +1441,30 @@ pub async fn test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn waiting_push_title_names_the_session_agent() {
+        for tool in ["claude", "codex", "opencode"] {
+            let name = crate::agents::labels_for(tool).unwrap().0;
+            assert_eq!(
+                status_push_text(NotificationEvent::Waiting, Some(&name)).0,
+                format!("{name} is waiting")
+            );
+        }
+        assert_eq!(
+            status_push_text(NotificationEvent::Waiting, Some("Zeta")).0,
+            "Zeta is waiting"
+        );
+        assert_eq!(
+            status_push_text(NotificationEvent::Waiting, None).0,
+            "Agent is waiting"
+        );
+        assert_eq!(
+            status_push_text(NotificationEvent::Idle, Some("Codex")).0,
+            "Session finished"
+        );
+        assert!(crate::agents::labels_for("not-an-agent").is_none());
+    }
+
     #[test]
     fn publish_status_change_carries_the_profile_and_skips_a_no_op() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);

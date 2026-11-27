@@ -575,7 +575,8 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
         }
         "default-tool" => {
             let mut options = vec!["Auto (first available)".to_string()];
-            options.extend(crate::agents::agent_names().iter().map(|n| n.to_string()));
+            options
+                .extend(crate::agents::listed_agents().map(|agent| agent.display_name.to_string()));
             let selected = crate::agents::settings_index_from_name(current.as_str());
             FieldValue::Select { selected, options }
         }
@@ -1794,13 +1795,10 @@ mod tests {
         };
         // Skip the leading "Auto" entry; the rest must mirror the registry.
         let tool_options: Vec<&str> = options.iter().skip(1).map(|s| s.as_str()).collect();
-        let agent_names = crate::agents::agent_names();
-        for name in &agent_names {
-            assert!(tool_options.contains(name), "missing agent {name}");
-        }
-        for option in &tool_options {
-            assert!(agent_names.contains(option), "unknown agent {option}");
-        }
+        let display_names: Vec<&str> = crate::agents::listed_agents()
+            .map(|agent| agent.display_name)
+            .collect();
+        assert_eq!(tool_options, display_names);
     }
 
     #[test]

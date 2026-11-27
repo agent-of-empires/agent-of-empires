@@ -139,6 +139,7 @@ impl<'a> DefinitionData<'a> {
         });
         Some(AgentDef {
             name: &entry.tool,
+            display_name: entry.display_name.as_deref().unwrap_or(&entry.tool),
             binary,
             launch_subcommand: None,
             aliases: &self.aliases,

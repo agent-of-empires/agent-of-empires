@@ -63,6 +63,7 @@ static OMP: LazyLock<AgentDef<'static>> = LazyLock::new(|| {
     let mut definition = OMP_DATA
         .definition(&OMP_MANIFEST.agent_integrations[0], false)
         .expect("bundled OMP fallback must declare a command");
+    definition.display_name = "Oh My Pi";
     definition.detect_status = crate::tmux::status_detection::detect_omp_status;
     definition.fork_strategy = ForkStrategy::ValueFlag("--fork");
     definition.fork_host_only = true;

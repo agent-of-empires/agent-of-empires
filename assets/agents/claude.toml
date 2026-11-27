@@ -2,10 +2,11 @@
 id = "aoe.claude-fallback"
 name = "Claude offline fallback"
 version = "1.0.0"
-api_version = 28
+api_version = 29
 
 [[agent_integrations]]
 tool = "claude"
+display_name = "Claude Code"
 command = "claude"
 
 [agent_integrations.launch]

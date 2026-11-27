@@ -402,6 +402,8 @@ pub enum SidecarFormat {
 
 pub struct AgentDef<'a> {
     pub name: &'a str,
+    /// How copy names the agent; `name` is the tool id.
+    pub display_name: &'a str,
     pub binary: &'a str,
     /// Must not be combined with `ResumeStrategy::Subcommand`, which inserts after the binary.
     pub launch_subcommand: Option<&'a str>,
@@ -608,6 +610,7 @@ const fn agent(
 ) -> AgentDef<'static> {
     AgentDef {
         name,
+        display_name: name,
         binary,
         launch_subcommand: None,
         aliases: &[],
@@ -674,6 +677,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
                 KeyToken::Named("Enter"),
             ],
         }),
+        display_name: "OpenCode",
         ..agent(
             "opencode",
             "opencode",
@@ -687,6 +691,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         yolo: Some(YoloMode::CliFlag("--agent auto-approve")),
         detect_status: status_detection::detect_vibe_status,
         session_support: resume_only(ResumeStrategy::Flag("--resume")),
+        display_name: "Mistral Vibe",
         ..agent("vibe", "vibe", "pip install mistral-vibe")
     },
     AgentDef {
@@ -718,6 +723,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             allow_always: Some(&[KeyToken::Literal("a")]),
             deny: &[KeyToken::Literal("d")],
         }),
+        display_name: "Codex",
         ..agent("codex", "codex", "npm install -g @openai/codex")
     },
     AgentDef {
@@ -740,6 +746,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             note: "consumer accounts cut off by Google; enterprise/API-key remain valid",
             replacement: Some("antigravity"),
         },
+        display_name: "Gemini CLI",
         ..agent("gemini", "gemini", "npm install -g @google/gemini-cli")
     },
     AgentDef {
@@ -765,6 +772,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::PaneScoped,
             SessionCaptureContext::PaneScoped,
         ),
+        display_name: "Cursor",
         ..agent("cursor", "agent", "see https://docs.cursor.com/cli")
     },
     AgentDef {
@@ -774,6 +782,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         detect_status: status_detection::detect_copilot_status,
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
         session_support: resume_only(ResumeStrategy::Flag("--session-id")),
+        display_name: "Copilot CLI",
         ..agent(
             "copilot",
             "copilot",
@@ -795,6 +804,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::PaneScoped,
         ),
         fork_strategy: ForkStrategy::PiFork,
+        display_name: "Pi",
         ..agent(
             "pi",
             "pi",
@@ -805,6 +815,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         aliases: &["factory-droid"],
         yolo: Some(YoloMode::CliFlag("--skip-permissions-unsafe")),
         detect_status: status_detection::detect_droid_status,
+        display_name: "Factory Droid",
         ..agent("droid", "droid", "npm install -g droid")
     },
     AgentDef {
@@ -823,6 +834,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             post_install_note: None,
         }),
         host_only: true,
+        display_name: "Settl",
         ..agent(
             "settl",
             "settl",
@@ -854,6 +866,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::PaneScoped,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
+        display_name: "Hermes",
         ..agent(
             "hermes",
             "hermes",
@@ -880,6 +893,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             sibling_settings: &[],
             post_install_note: Some(crate::hooks::KIRO_DEFAULT_AGENT_NOTE),
         }),
+        display_name: "Kiro CLI",
         ..agent(
             "kiro",
             "kiro-cli",
@@ -895,12 +909,14 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             QWEN_HOOK_EVENTS,
             HookFormat::JsonSettings,
         ),
+        display_name: "Qwen Code",
         ..agent("qwen", "qwen", "npm install -g @qwen-code/qwen-code")
     },
     AgentDef {
         aliases: &["agy"],
         yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
         detect_status: status_detection::detect_antigravity_status,
+        display_name: "Antigravity CLI",
         ..agent(
             "antigravity",
             "agy",
@@ -930,6 +946,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
+        display_name: "Kimi Code",
         ..agent(
             "kimi",
             "kimi",
@@ -952,6 +969,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::ManagedExclusiveStore,
         ),
         fork_strategy: ForkStrategy::ValueFlag("--fork"),
+        display_name: "Prime Agent",
         ..agent(
             "prime-agent",
             "prime-agent",
@@ -962,6 +980,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
     #[cfg(feature = "e2e-tests")]
     AgentDef {
         host_only: true,
+        display_name: "Fake Agent",
         ..agent("fake-agent", "fake-agent", "test-only agent, nothing to install")
     },
 ];
@@ -1519,6 +1538,20 @@ pub(crate) fn listed_agents() -> impl Iterator<Item = &'static AgentDef<'static>
     let registry = crate::plugin::registry();
     native_agents()
         .filter(move |agent| !crate::plugin::bundled_agents::taken_over(&registry, agent.name))
+}
+
+/// Display name and install hint of `tool`: the listed native agent, else the
+/// approved plugin declaration that provides it.
+pub(crate) fn labels_for(tool: &str) -> Option<(String, String)> {
+    if let Some(agent) = get_agent(tool) {
+        return Some((agent.display_name.to_owned(), agent.install_hint.to_owned()));
+    }
+    crate::plugin::agent_integration::declared_agent(
+        crate::plugin::registry(),
+        tool,
+        std::iter::empty(),
+    )?
+    .with_definition(|agent| (agent.display_name.to_owned(), agent.install_hint.to_owned()))
 }
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef<'static>> {

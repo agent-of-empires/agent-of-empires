@@ -81,7 +81,9 @@ pub fn run() -> Result<()> {
 
     if installed_count == 0 {
         println!("\nInstall at least one agent to get started.");
-        println!("Recommended: npm install -g @anthropic-ai/claude-code");
+        if let Some((name, hint)) = crate::agents::labels_for("claude") {
+            println!("Recommended: {name}: {hint}");
+        }
     }
 
     Ok(())

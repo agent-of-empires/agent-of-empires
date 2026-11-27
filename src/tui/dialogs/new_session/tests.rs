@@ -569,7 +569,7 @@ fn reselecting_the_current_tool_keeps_its_edits() {
 
     // The footer and row advertise the digits while the Tool row has focus.
     let screen = screen_of(&mut dialog, 100, 40);
-    assert!(screen.contains("[2] opencode  →"), "{screen}");
+    assert!(screen.contains("[2] OpenCode  →"), "{screen}");
     assert!(screen.contains("1-3 pick"), "{screen}");
 }
 

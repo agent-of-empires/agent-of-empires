@@ -178,29 +178,12 @@ pub fn runs_always_yolo(
 /// The name users know a registry agent by, for headlines such as
 /// "Codex couldn't start".
 pub fn display_name_for(agent: &str) -> Option<&'static str> {
-    Some(match agent {
-        "claude" | "claude-code" => "Claude Code",
-        "opencode" => "OpenCode",
-        "gemini" => "Gemini CLI",
-        "cursor" => "Cursor",
-        "copilot" => "Copilot CLI",
-        "droid" => "Factory Droid",
-        "settl" => "Settl",
-        "hermes" => "Hermes",
-        "kiro" => "Kiro CLI",
-        "qwen" => "Qwen Code",
-        "antigravity" => "Antigravity CLI",
-        "codex" => "Codex",
-        "vibe" => "Mistral Vibe",
-        "pi" => "Pi",
-        "omp" => "Oh My Pi",
-        "kimi" => "Kimi Code",
-        "prime-agent" => "Prime Agent",
-        "aoe-agent" => "aoe-agent",
-        #[cfg(feature = "e2e-tests")]
-        "fake-agent" => "Fake Agent",
-        _ => return None,
-    })
+    match agent {
+        "claude-code" => crate::agents::native_definition("claude"),
+        "aoe-agent" => return Some("aoe-agent"),
+        _ => crate::agents::native_definition(agent),
+    }
+    .map(|def| def.display_name)
 }
 
 /// The agent a structured-view session of `tool` spawns as: an explicit

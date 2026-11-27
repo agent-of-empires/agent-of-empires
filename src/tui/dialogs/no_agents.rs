@@ -86,7 +86,7 @@ impl NoAgentsDialog {
             .constraints([Constraint::Min(1), Constraint::Length(2)])
             .split(inner);
 
-        let content = vec![
+        let mut content = vec![
             Line::from(Span::styled(
                 "No AI coding agents detected.",
                 Style::default().fg(theme.title).bold(),
@@ -106,33 +106,28 @@ impl NoAgentsDialog {
                 Style::default().fg(theme.hint).italic(),
             )),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("  Claude Code  ", Style::default().fg(theme.title).bold()),
-                Span::styled(
-                    "npm install -g @anthropic-ai/claude-code",
-                    Style::default().fg(theme.dimmed),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Codex CLI    ", Style::default().fg(theme.title).bold()),
-                Span::styled(
-                    "npm install -g @openai/codex",
-                    Style::default().fg(theme.dimmed),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Gemini CLI   ", Style::default().fg(theme.title).bold()),
-                Span::styled(
-                    "npm install -g @google/gemini-cli",
-                    Style::default().fg(theme.dimmed),
-                ),
-            ]),
+        ];
+        content.extend(
+            ["claude", "codex", "gemini"]
+                .into_iter()
+                .filter_map(crate::agents::labels_for)
+                .map(|(name, hint)| {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {name:<14}"),
+                            Style::default().fg(theme.title).bold(),
+                        ),
+                        Span::styled(hint, Style::default().fg(theme.dimmed)),
+                    ])
+                }),
+        );
+        content.extend([
             Line::from(""),
             Line::from(Span::styled(
                 "Run `aoe agents` for a full list with install commands.",
                 Style::default().fg(theme.dimmed),
             )),
-        ];
+        ]);
 
         let paragraph = Paragraph::new(content).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, chunks[0]);

@@ -597,6 +597,7 @@ mod tests {
         assert_eq!(target.events.len(), 1);
 
         let lines = crate::plugin::agent_integration::consent_lines(
+            "acme.example",
             &aoe_plugin_api::PluginManifest::from_toml_str(manifest)
                 .unwrap()
                 .agent_integrations[0],

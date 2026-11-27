@@ -3196,6 +3196,8 @@ fn plugin_command_available(
         plugin: "availability-test",
         tool: binary,
         command,
+        display_name: binary,
+        icon: None,
     };
     plugin_agents_available(&[agent], login_shell, cancel, false).contains(binary)
 }
@@ -3937,11 +3939,15 @@ mod tests {
                 plugin: "plugin-a",
                 tool: "session-agent",
                 command: "TOKEN=local login-agent",
+                display_name: "session-agent",
+                icon: None,
             },
             crate::plugin::agent_integration::PluginAgent {
                 plugin: "plugin-b",
                 tool: "worker-agent",
                 command: "TOKEN=other login-agent --ignored",
+                display_name: "worker-agent",
+                icon: None,
             },
         ];
         std::fs::remove_file(home.path().join("probes")).ok();
@@ -3997,11 +4003,15 @@ mod tests {
                 plugin: "plugin",
                 tool: "direct-agent",
                 command: "direct-agent",
+                display_name: "direct-agent",
+                icon: None,
             },
             crate::plugin::agent_integration::PluginAgent {
                 plugin: "plugin",
                 tool: "login-agent",
                 command: "login-agent",
+                display_name: "login-agent",
+                icon: None,
             },
         ];
         let expected = HashSet::from(["direct-agent".to_owned()]);

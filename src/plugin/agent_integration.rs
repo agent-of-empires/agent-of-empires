@@ -111,6 +111,13 @@ fn reserved_builtin(tool: &str) -> Option<&'static str> {
 /// Whether `entry` of an active `plugin` is a usable launch declaration. A
 /// bundled fallback is replaced only by a reserved-namespace API 21 launch
 /// declaration for its exact tool name; every other name is unrestricted.
+/// Whether `entry` is a complete launch declaration for a bundled fallback's tool.
+fn claims_bundled(entry: &AgentIntegrationContribution) -> bool {
+    super::bundled_agents::contains(&entry.tool)
+        && entry.launch.is_some()
+        && entry.command.is_some()
+}
+
 fn launch_declaration_applies(
     plugin: &super::LoadedPlugin,
     entry: &AgentIntegrationContribution,
@@ -118,7 +125,7 @@ fn launch_declaration_applies(
     if !super::bundled_agents::contains(&entry.tool) {
         return true;
     }
-    if plugin.manifest.api_version < 21 || entry.launch.is_none() || entry.command.is_none() {
+    if plugin.manifest.api_version < 21 || !claims_bundled(entry) {
         return false;
     }
     if !plugin.manifest.id.is_reserved_namespace() {
@@ -134,17 +141,19 @@ pub struct PluginAgent<'a> {
     pub plugin: &'a str,
     pub tool: &'a str,
     pub command: &'a str,
+    pub display_name: &'a str,
+    pub icon: Option<&'a str>,
 }
 
 fn unique_candidates<'a, 'b, 'c>(
-    candidates: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+    candidates: impl IntoIterator<Item = PluginAgent<'a>>,
     builtin_names: impl IntoIterator<Item = &'b str>,
     custom_names: impl IntoIterator<Item = &'c str>,
 ) -> Vec<PluginAgent<'a>> {
     let mut candidate_counts = HashMap::<&str, usize>::new();
     let candidates: Vec<_> = candidates.into_iter().collect();
-    for (_, tool, _) in &candidates {
-        *candidate_counts.entry(tool).or_default() += 1;
+    for candidate in &candidates {
+        *candidate_counts.entry(candidate.tool).or_default() += 1;
     }
     for name in builtin_names {
         candidate_counts.remove(name);
@@ -152,21 +161,15 @@ fn unique_candidates<'a, 'b, 'c>(
     for name in custom_names {
         candidate_counts.remove(name);
     }
-    for (plugin, tool, _) in &candidates {
-        if let Some(builtin) = reserved_builtin(tool) {
-            warn_reserved(plugin, tool, builtin);
-            candidate_counts.remove(tool);
+    for candidate in &candidates {
+        if let Some(builtin) = reserved_builtin(candidate.tool) {
+            warn_reserved(candidate.plugin, candidate.tool, builtin);
+            candidate_counts.remove(candidate.tool);
         }
     }
     candidates
         .into_iter()
-        .filter_map(|(plugin, tool, command)| {
-            (candidate_counts.get(tool) == Some(&1)).then_some(PluginAgent {
-                plugin,
-                tool,
-                command,
-            })
-        })
+        .filter(|candidate| candidate_counts.get(candidate.tool) == Some(&1))
         .collect()
 }
 
@@ -183,10 +186,13 @@ pub fn catalog<'a, 'b, 'c>(
             .iter()
             .filter(move |entry| launch_declaration_applies(plugin, entry))
             .filter_map(move |entry| {
-                entry
-                    .command
-                    .as_deref()
-                    .map(|command| (plugin.id(), entry.tool.as_str(), command))
+                entry.command.as_deref().map(|command| PluginAgent {
+                    plugin: plugin.id(),
+                    tool: entry.tool.as_str(),
+                    command,
+                    display_name: entry.display_name.as_deref().unwrap_or(&entry.tool),
+                    icon: entry.icon.as_deref(),
+                })
             })
     });
     unique_candidates(candidates, builtin_names, custom_names)
@@ -412,7 +418,7 @@ pub fn display_command(command: &str) -> String {
 }
 
 /// Display every declaration without interpreting its contents as terminal control sequences.
-pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> {
+pub fn consent_lines(plugin_id: &str, integration: &AgentIntegrationContribution) -> Vec<String> {
     let mut lines = vec![format!(
         "{}: {}",
         display_command(&integration.tool),
@@ -422,6 +428,19 @@ pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> 
             .map(display_command)
             .unwrap_or_else(|| "No launch command declared".to_string())
     )];
+    if let Some(name) = &integration.display_name {
+        lines.push(format!("  display name: {}", display_command(name)));
+    }
+    let takes_over = claims_bundled(integration)
+        && aoe_plugin_api::PluginId::new(plugin_id).is_ok_and(|id| id.is_reserved_namespace());
+    if let Some(bundled) =
+        super::bundled_agents::definition(&integration.tool).filter(|_| takes_over)
+    {
+        lines.push(format!(
+            "  Replaces bundled {} support",
+            display_command(bundled.display_name)
+        ));
+    }
     if let Some(launch) = &integration.launch {
         let mut flags = Vec::new();
         for (name, flag) in [
@@ -1445,34 +1464,37 @@ oneshot_flag = "-p"
         );
     }
 
+    fn candidate<'a>(plugin: &'a str, tool: &'a str, command: &'a str) -> PluginAgent<'a> {
+        PluginAgent {
+            plugin,
+            tool,
+            command,
+            display_name: tool,
+            icon: None,
+        }
+    }
+
     #[test]
     fn catalog_suppresses_duplicate_provider_and_custom_or_builtin_collisions() {
         let entries = unique_candidates(
             [
-                ("plugin-a", "duplicate", "a"),
-                ("plugin-b", "duplicate", "b"),
-                ("plugin-c", "builtin-agent", "c"),
-                ("plugin-d", "custom-agent", "d"),
-                ("plugin-e", "unique-helper", "e"),
+                candidate("plugin-a", "duplicate", "a"),
+                candidate("plugin-b", "duplicate", "b"),
+                candidate("plugin-c", "builtin-agent", "c"),
+                candidate("plugin-d", "custom-agent", "d"),
+                candidate("plugin-e", "unique-helper", "e"),
             ],
             ["builtin-agent"],
             ["custom-agent"],
         );
-        assert_eq!(
-            entries,
-            [PluginAgent {
-                plugin: "plugin-e",
-                tool: "unique-helper",
-                command: "e",
-            }]
-        );
+        assert_eq!(entries, [candidate("plugin-e", "unique-helper", "e")]);
     }
 
     #[test]
     fn builtin_substring_aliases_are_reserved_from_plugins() {
         for tool in ["claude-yolo", "session-agent"] {
             assert!(
-                unique_candidates([("plugin", tool, "agent")], [], []).is_empty(),
+                unique_candidates([candidate("plugin", tool, "agent")], [], []).is_empty(),
                 "built-in alias should reserve {tool}"
             );
         }
@@ -3016,7 +3038,7 @@ command = "acme-omp-shim"
             }),
             ..Default::default()
         };
-        let lines = consent_lines(&integration).join("\n");
+        let lines = consent_lines("acme.helper", &integration).join("\n");
         assert!(!lines.contains('\u{202e}') && !lines.contains('\u{1b}'));
         assert!(lines.contains("\\u{202e}") && lines.contains("\\u{1b}"));
     }
@@ -3035,13 +3057,52 @@ command = "acme-omp-shim"
             }),
             ..Default::default()
         };
-        let lines = consent_lines(&integration);
+        let lines = consent_lines("acme.helper", &integration);
         assert!(
             lines
                 .iter()
                 .any(|line| line.contains("enter delay: 150 ms")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn consent_names_a_replaced_bundled_agent_only_for_a_reserved_takeover() {
+        use aoe_plugin_api::agent_integration::AgentLaunchDeclaration;
+        let declaration = |tool: &str, launch: bool| AgentIntegrationContribution {
+            tool: tool.into(),
+            command: Some(format!("{tool}-next")),
+            launch: launch.then(AgentLaunchDeclaration::default),
+            ..Default::default()
+        };
+        let replaces = |id: &str, entry: &AgentIntegrationContribution| {
+            consent_lines(id, entry)
+                .into_iter()
+                .find(|line| line.contains("Replaces bundled"))
+        };
+        assert_eq!(
+            replaces("aoe.x", &declaration("claude", true)).as_deref(),
+            Some("  Replaces bundled Claude Code support")
+        );
+        assert_eq!(
+            replaces("aoe.x", &declaration("omp", true)).as_deref(),
+            Some("  Replaces bundled Oh My Pi support")
+        );
+        for (id, entry) in [
+            ("acme.x", declaration("claude", true)),
+            ("aoe.x", declaration("claude", false)),
+            ("aoe.x", declaration("codex", true)),
+            ("aoe.x", declaration("zeta", true)),
+        ] {
+            assert_eq!(replaces(id, &entry), None, "{id} {}", entry.tool);
+        }
+        let named = AgentIntegrationContribution {
+            display_name: Some("Z\u{1b}eta".into()),
+            ..declaration("zeta", true)
+        };
+        assert!(consent_lines("acme.x", &named)
+            .iter()
+            .any(|line| line == "  display name: Z\\u{1b}eta"));
     }
 
     #[test]
