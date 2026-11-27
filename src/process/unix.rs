@@ -61,7 +61,7 @@ fn reopen_terminal_output(
     Ok(file)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 #[test]
 fn unnamed_terminal_fallback_keeps_independent_output_flags() {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
