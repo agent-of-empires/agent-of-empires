@@ -585,18 +585,26 @@ last_seen_version = "{}"
 
     /// Hide host-installed agent CLIs: the system PATH shrinks to symlinks for
     /// the tools aoe needs, so tool auto-selection only sees the fake agent.
-    pub fn isolate_host_path(&mut self) {
-        let bin = self.home_path().join("sys-bin");
-        std::fs::create_dir_all(&bin).expect("create sys-bin");
+    /// Returns false, leaving the PATH untouched, when a needed tool is missing.
+    pub fn isolate_host_path(&mut self) -> bool {
         let system_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut tools = Vec::new();
         for tool in ["tmux", "git", "sh", "which"] {
-            let real = std::env::split_paths(&system_path)
+            let Some(real) = std::env::split_paths(&system_path)
                 .map(|dir| dir.join(tool))
                 .find(|candidate| candidate.is_file())
-                .unwrap_or_else(|| panic!("{tool} not found on PATH"));
+            else {
+                return false;
+            };
+            tools.push((tool, real));
+        }
+        let bin = self.home_path().join("sys-bin");
+        std::fs::create_dir_all(&bin).expect("create sys-bin");
+        for (tool, real) in tools {
             std::os::unix::fs::symlink(real, bin.join(tool)).expect("symlink system tool");
         }
         self.isolate_host_path = true;
+        true
     }
 
     /// Tear the TUI's own tmux session down so a test can `spawn_tui` again and assert on
