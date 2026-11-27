@@ -15,6 +15,15 @@ fn detection_content<'a>(
     fresh.or(reuse.map(|(reused, _)| reused))
 }
 
+/// One capture of `pane` for a readiness read, `lines` deep.
+fn readiness_capture(session: &tmux::Session, pane: &str, lines: usize) -> Option<String> {
+    #[cfg(test)]
+    if tmux::test_helpers::screen_capture_fails(pane) {
+        return None;
+    }
+    session.try_capture_pane_in(pane, lines).ok()
+}
+
 /// The last `height` rows of `capture`, a `capture-pane` of the scrollback and the screen below it.
 fn visible_rows(capture: &str, height: usize) -> &str {
     let body = capture.strip_suffix('\n').unwrap_or(capture);
@@ -783,9 +792,10 @@ impl Instance {
     }
 
     /// [`Self::detect_pane_now`] of `pane` and what its input box holds, both from one capture,
-    /// so a frame change can't pair one screen's status with another's box. The box is read from
-    /// the capture's visible rows, as [`Self::input_line_in`] reads it: one left in the
-    /// scrollback is no box.
+    /// so a frame change can't pair one screen's status with another's box. A failed capture is
+    /// retried once, and both are read from the one that succeeds. The box is read from the
+    /// capture's visible rows, as [`Self::input_line_in`] reads it: one left in the scrollback is
+    /// no box.
     pub(crate) fn detect_pane_and_input_line_now(
         &self,
         profile: &str,
@@ -795,10 +805,24 @@ impl Instance {
         let alias = tmux::status_rules::effective_detect_as(profile, &self.tool, &self.detect_as);
         let manifest_tool: &str = if alias.is_empty() { &self.tool } else { &alias };
         let rules_tool = tmux::status_rules::detection_tool(profile, &self.tool, &self.detect_as);
-        let lines = tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)
+        let plan = tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool);
+        let lines = plan
+            .as_ref()
             .map_or(0, |plan| plan.capture_policy().scope.lines());
-        let Ok(capture) = session.try_capture_pane_in(pane, lines) else {
-            let status = self.detect_pane_now(profile, session, None, Some(pane));
+        let Some(capture) = (0..2).find_map(|_| readiness_capture(session, pane, lines)) else {
+            // Without a manifest, or with an integration owning it, the status never reads the
+            // screen, so it is decided as usual; any other status is unreadable.
+            let needs_no_screen = plan.is_none()
+                || crate::plugin::agent_integration::owned_status(
+                    self,
+                    tmux::utils::is_pane_dead_at(pane),
+                )
+                .is_some();
+            let status = if needs_no_screen {
+                self.detect_pane_now(profile, session, None, Some(pane))
+            } else {
+                Some((None, CAPTURE_FAILED_RULE))
+            };
             return (status, tmux::InputLine::Unknown);
         };
         #[cfg(test)]

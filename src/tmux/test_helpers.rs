@@ -251,6 +251,27 @@ pub(crate) fn after_screen_captured(pane: &str) {
     }
 }
 
+static FAILED_SCREEN_CAPTURES: std::sync::Mutex<Vec<(String, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Makes the next `count` readiness captures of `pane` fail.
+pub(crate) fn fail_screen_captures(pane: &str, count: usize) {
+    FAILED_SCREEN_CAPTURES
+        .lock()
+        .unwrap()
+        .push((pane.to_string(), count));
+}
+
+/// Whether this readiness capture of `pane` is one [`fail_screen_captures`] asked to fail.
+pub(crate) fn screen_capture_fails(pane: &str) -> bool {
+    let mut failing = FAILED_SCREEN_CAPTURES.lock().unwrap();
+    let Some(entry) = failing.iter_mut().find(|(p, n)| p == pane && *n > 0) else {
+        return false;
+    };
+    entry.1 -= 1;
+    true
+}
+
 static TEXT_TYPED_HOOKS: HookRegistry = std::sync::Mutex::new(Vec::new());
 
 /// Runs `hook` once, after a checked-pane send has typed its text into `pane` and before its
