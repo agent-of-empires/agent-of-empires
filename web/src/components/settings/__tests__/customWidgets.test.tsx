@@ -14,7 +14,12 @@ import {
 
 const ROW = { labelId: "row-label", controlId: "row-control" };
 
-const fetchThemes = vi.fn(() => Promise.resolve(["dark", "light"]));
+const fetchThemes = vi.fn(() =>
+  Promise.resolve([
+    { name: "dark", label: "Dark" },
+    { name: "light", label: "Light" },
+  ]),
+);
 const dispatchThemePickerChanged = vi.fn();
 const agent = (name: string, installed: boolean, oneshot_capable: boolean) => ({
   name,
@@ -120,7 +125,8 @@ describe("ThemeNameWidget", () => {
     [false, 0],
   ])("repaints only when the save succeeds (%s)", async (ok, repaints) => {
     const { save } = mount(ThemeNameWidget, "Theme", "dark", ok);
-    await screen.findByText("light");
+    // Options show labels and save names.
+    await screen.findByText("Light");
     fireEvent.change(screen.getByRole("combobox", { name: "Theme" }), { target: { value: "light" } });
     expect(save).toHaveBeenCalledWith("light");
     await Promise.resolve();

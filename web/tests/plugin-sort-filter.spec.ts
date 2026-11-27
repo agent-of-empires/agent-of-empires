@@ -80,7 +80,7 @@ async function readWorkspaceTitles(page: Page): Promise<string[]> {
   });
 }
 
-const TOGGLE = "[data-testid='sidebar-sort-toggle']";
+const TOGGLE = "[data-testid='sidebar-view-toggle']";
 
 const SESSIONS: MockSession[] = [
   { id: "s-low", title: "low-ws", branch: "feature/low", created_at: "2025-01-01T00:00:00Z" },
@@ -125,6 +125,7 @@ test.describe("Plugin sort-key and filter-facet slots (#2401)", () => {
     await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(3, { timeout: 8000 });
 
     // Open the facet panel and select "running".
+    await page.locator(TOGGLE).click();
     await page.locator("[data-testid='sidebar-facet-toggle']").click();
     await page.locator("[data-testid='sidebar-facet-option-by-status-running']").click();
 

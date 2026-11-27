@@ -203,6 +203,16 @@ impl PluginHost {
         }))
     }
 
+    /// Wakes [`Self::wait_suggestions_published`]; for publishes that bypass a worker.
+    pub(crate) fn notify_suggestions_published(&self) {
+        self.api.notify_published();
+    }
+
+    /// Resolves after a publish since the last wait, or at once if one is already pending.
+    pub(crate) async fn wait_suggestions_published(&self) {
+        self.api.wait_published().await;
+    }
+
     /// The profile workers publish suggestions under; takes no lock.
     pub(crate) fn suggestions_profile(&self) -> String {
         self.api.suggestions_profile()

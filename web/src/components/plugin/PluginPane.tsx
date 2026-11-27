@@ -47,7 +47,9 @@ export function PluginPaneBody({
         ) : (
           <>
             {title && <div className="font-semibold text-sm text-text-primary">{title}</div>}
-            {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
+            {body && (
+              <div className="mt-1 text-[13px] leading-normal text-text-secondary whitespace-pre-wrap">{body}</div>
+            )}
           </>
         )}
       </div>
@@ -62,7 +64,7 @@ function PaneFooter({ footer }: { footer: Obj }) {
   if (!text && !value) return null;
   return (
     <div
-      className="flex shrink-0 items-center gap-1.5 border-t border-surface-700/60 px-3 py-1.5 font-mono text-[10px] text-text-dim"
+      className="flex shrink-0 items-center gap-1.5 border-t border-surface-700/50 px-3 py-1.5 font-mono text-[11px] text-text-dim"
       data-testid="plugin-pane-footer"
     >
       {renderIcon(lucideIcon(str(footer, "icon")), "size-3 shrink-0")}

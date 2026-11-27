@@ -1396,6 +1396,16 @@ impl HomeView {
                 self.suggestions_feed.approve_held_trust();
                 None
             }
+            "suggestion_auto_start" => {
+                let turned = self.suggestions_feed.confirm_auto_start();
+                if let Some(view) = &mut self.suggestions_view {
+                    match turned {
+                        Ok(()) => view.set_notice("Turning on auto start…"),
+                        Err(reason) => view.set_error(reason),
+                    }
+                }
+                None
+            }
             "suggestion_pre_trust" => {
                 let turned = self.suggestions_feed.turn_on_pre_trust();
                 if let Some(view) = &mut self.suggestions_view {
@@ -2328,6 +2338,30 @@ impl HomeView {
                             "Suggestions are not loaded, so pre-trust was not turned on.",
                         );
                     }
+                }
+                SuggestionsAction::ConfirmAutoStart {
+                    provider_id,
+                    criterion,
+                    yolo,
+                } => {
+                    self.suggestions_feed
+                        .hold_auto_start(provider_id, criterion);
+                    let yolo = if yolo {
+                        "\n\nThis kind runs in YOLO mode, so its suggestions are never auto started."
+                    } else {
+                        ""
+                    };
+                    self.confirm_dialog = Some(
+                        ConfirmDialog::new(
+                            "Turn on auto start",
+                            &format!(
+                                "Auto start launches an agent on text written by others (issue and PR content) with no human check.{yolo}\n\nFrom the next refresh, new suggestions of this kind start with their preset, up to 3 per refresh and once each. A suggestion whose repo is not linked to one Project, or whose hooks need a review, stays a normal suggestion with a note.\n\nTurn it on?"
+                            ),
+                            "suggestion_auto_start",
+                        )
+                        .neutral()
+                        .buttons("Turn on auto start", "Cancel"),
+                    );
                 }
                 SuggestionsAction::TurnOnPreTrust => {
                     self.confirm_dialog = Some(

@@ -1,4 +1,6 @@
 import { IS_MAC, SHORTCUTS, SHORTCUTS_BY_ID, formatHelpShortcut } from "../lib/shortcuts";
+import { CAPTION } from "../lib/surfaces";
+import { CloseButton, Dialog } from "./Dialog";
 
 interface Props {
   onClose: () => void;
@@ -26,69 +28,52 @@ export function HelpOverlay({ onClose }: Props) {
   }));
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in" onClick={onClose}>
-      <div
-        className="bg-surface-800 border border-surface-700/50 rounded-lg w-[480px] max-w-[90vw] shadow-2xl animate-slide-up"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-surface-700">
-          <h2 className="text-sm font-semibold text-text-bright">Help</h2>
-          <button onClick={onClose} className="text-text-muted hover:text-text-secondary cursor-pointer">
-            &times;
-          </button>
-        </div>
+    <Dialog
+      id="help-overlay"
+      title={<span className="text-text-bright">Help</span>}
+      describedBy={false}
+      panelClassName="md:w-[480px] md:max-h-[90vh]"
+      bodyClassName="space-y-5"
+      onDismiss={onClose}
+      headerEnd={<CloseButton onClick={onClose} />}
+      footer={
+        <p className="mr-auto text-[13px] md:text-sm text-text-dim">
+          Single-key shortcuts are disabled when typing in inputs.{" "}
+          {formatHelpShortcut(SHORTCUTS_BY_ID.palette.chord, IS_MAC)} works everywhere.
+        </p>
+      }
+    >
+      <ShortcutGroup title="Dashboard" rows={shortcuts} keyClassName="text-brand-500 min-w-[32px]" />
+      <ShortcutGroup title="Terminal" rows={TERMINAL_SHORTCUTS} keyClassName="text-accent-600 min-w-[32px]" />
+      <ShortcutGroup title="Mobile gestures" rows={MOBILE_GESTURES} keyClassName="text-accent-600 whitespace-nowrap" />
+    </Dialog>
+  );
+}
 
-        <div className="p-5">
-          <div className="mb-5">
-            <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">Dashboard</h3>
-            <div className="space-y-1">
-              {shortcuts.map((s) => (
-                <div key={s.key} className="flex items-center gap-3">
-                  <kbd className="font-mono text-sm bg-surface-900 border border-surface-700 rounded px-1.5 py-0.5 text-brand-500 min-w-[32px] text-center">
-                    {s.key}
-                  </kbd>
-                  <span className="text-sm text-text-secondary">{s.desc}</span>
-                </div>
-              ))}
-            </div>
+function ShortcutGroup({
+  title,
+  rows,
+  keyClassName,
+}: {
+  title: string;
+  rows: { key: string; desc: string }[];
+  keyClassName: string;
+}) {
+  return (
+    <section>
+      <h3 className={CAPTION}>{title}</h3>
+      <div className="space-y-1.5">
+        {rows.map((s) => (
+          <div key={s.key} className="flex items-center gap-3">
+            <kbd
+              className={`font-mono text-[13px] md:text-xs bg-surface-900 border border-surface-700 rounded-md px-1.5 py-0.5 text-center ${keyClassName}`}
+            >
+              {s.key}
+            </kbd>
+            <span className="text-[15px] md:text-sm text-text-secondary">{s.desc}</span>
           </div>
-
-          <div className="mb-5">
-            <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">Terminal</h3>
-            <div className="space-y-1">
-              {TERMINAL_SHORTCUTS.map((s) => (
-                <div key={s.key} className="flex items-center gap-3">
-                  <kbd className="font-mono text-sm bg-surface-900 border border-surface-700 rounded px-1.5 py-0.5 text-accent-600 min-w-[32px] text-center">
-                    {s.key}
-                  </kbd>
-                  <span className="text-sm text-text-secondary">{s.desc}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-2">Mobile gestures</h3>
-            <div className="space-y-1">
-              {MOBILE_GESTURES.map((g) => (
-                <div key={g.key} className="flex items-center gap-3">
-                  <kbd className="font-mono text-xs bg-surface-900 border border-surface-700 rounded px-1.5 py-0.5 text-accent-600 text-center whitespace-nowrap">
-                    {g.key}
-                  </kbd>
-                  <span className="text-sm text-text-secondary">{g.desc}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="px-5 py-3 border-t border-surface-700">
-          <p className="text-sm text-text-dim">
-            Single-key shortcuts are disabled when typing in inputs.{" "}
-            {formatHelpShortcut(SHORTCUTS_BY_ID.palette.chord, IS_MAC)} works everywhere.
-          </p>
-        </div>
+        ))}
       </div>
-    </div>
+    </section>
   );
 }

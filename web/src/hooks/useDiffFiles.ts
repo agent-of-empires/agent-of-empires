@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getSessionDiffFiles, reportTelemetrySeen } from "../lib/api";
+import type { DiffScope } from "../lib/diffScope";
 import type { RepoBase, RichDiffFile } from "../lib/types";
 
 const POLL_INTERVAL = 10_000;
@@ -12,10 +13,17 @@ interface UseDiffFilesResult {
   loading: boolean;
   revision: number;
   refresh: () => void;
+  /** The scope the shown files were computed for. */
+  scope: DiffScope;
 }
 
-export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDiffFilesResult {
+export function useDiffFiles(
+  sessionId: string | null,
+  enabled: boolean,
+  requestedScope: DiffScope = "branch",
+): UseDiffFilesResult {
   const [files, setFiles] = useState<RichDiffFile[]>([]);
+  const [scope, setScope] = useState<DiffScope>(requestedScope);
   const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>(DEFAULT_BASES);
   const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -30,7 +38,8 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
     const capturedSessionId = sessionId;
     if (capturedSessionId !== currentSessionIdRef.current) return;
     const reqId = ++requestIdRef.current;
-    const resp = await getSessionDiffFiles(capturedSessionId);
+    const shown = requestedScope;
+    const resp = await getSessionDiffFiles(capturedSessionId, shown);
     if (reqId !== requestIdRef.current || capturedSessionId !== currentSessionIdRef.current) return;
     if (resp) {
       // Include bases and warning: a base change can leave the file list identical (#3329).
@@ -38,9 +47,11 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
         files: resp.files,
         per_repo_bases: resp.per_repo_bases,
         warning: resp.warning ?? null,
+        scope: shown,
       });
       if (fingerprint !== lastFingerprintRef.current) {
         lastFingerprintRef.current = fingerprint;
+        setScope(shown);
         setFiles(resp.files);
         setPerRepoBases(resp.per_repo_bases);
         setWarning(resp.warning ?? null);
@@ -48,7 +59,7 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
       }
     }
     setLoading(false);
-  }, [sessionId]);
+  }, [sessionId, requestedScope]);
 
   const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
   if (sessionId !== trackedSessionId) {
@@ -99,5 +110,6 @@ export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDif
     loading,
     revision,
     refresh: fetchFiles,
+    scope,
   };
 }
