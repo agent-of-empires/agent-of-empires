@@ -221,7 +221,7 @@ fn validate_items(
     }
     let mut ids = HashSet::new();
     for item in &items {
-        validate_item(spec, item)?;
+        validate_item(spec, item, false)?;
         if !ids.insert(item.id.as_str()) {
             return Err(format!("duplicate suggestion id {:?}", item.id));
         }
@@ -232,7 +232,13 @@ fn validate_items(
         .collect())
 }
 
-fn validate_item(spec: &SuggestionsSpec, item: &Suggestion) -> Result<(), String> {
+/// `link_optional` lets an item with no `source_url` through: the built-in
+/// provider's items come from a session, not a web page.
+pub(super) fn validate_item(
+    spec: &SuggestionsSpec,
+    item: &Suggestion,
+    link_optional: bool,
+) -> Result<(), String> {
     let id = &item.id;
     let source = spec
         .sources
@@ -275,7 +281,7 @@ fn validate_item(spec: &SuggestionsSpec, item: &Suggestion) -> Result<(), String
     if let Some(key) = &item.mapping_key {
         check_mapping_key(key).map_err(|e| format!("suggestion {id:?}: {e}"))?;
     }
-    if !is_http_url(&item.source_url) {
+    if !(link_optional && item.source_url.is_empty()) && !is_http_url(&item.source_url) {
         return Err(format!(
             "suggestion {id:?}: source_url must be an http(s) URL"
         ));

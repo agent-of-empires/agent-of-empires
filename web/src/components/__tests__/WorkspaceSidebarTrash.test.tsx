@@ -208,7 +208,8 @@ describe("WorkspaceSidebar Trash control", () => {
 
   it("stays reachable while a filter hides every live row (#2512)", () => {
     withTrash();
-    fireEvent.click(screen.getByLabelText("Filter sessions"));
+    fireEvent.click(screen.getByTestId("sidebar-view-toggle"));
+    fireEvent.click(screen.getByTestId("sidebar-filter-toggle"));
     fireEvent.change(screen.getByTestId("sidebar-filter-input"), { target: { value: "zzz-no-match" } });
     click("sidebar-trash-toggle");
     expect(query("sidebar-trash-row")).not.toBeNull();

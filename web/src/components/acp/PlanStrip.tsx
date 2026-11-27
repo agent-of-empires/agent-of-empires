@@ -38,10 +38,10 @@ export function PlanStrip({ plan }: { plan: Plan | null }) {
   const allDone = completed === totalSteps;
 
   return (
-    <div data-testid="plan-strip" className="border-b border-surface-800 bg-surface-900/95 backdrop-blur">
+    <div data-testid="plan-strip" className="border-b border-surface-700/50 bg-surface-900/95 backdrop-blur">
       <button
         type="button"
-        className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm hover:bg-surface-800/40"
+        className="flex w-full items-center gap-3 px-4 py-2 max-md:py-3 text-left text-sm hover:bg-surface-800/40"
         onClick={() => setExpanded((v) => !v)}
       >
         <ListChecks className="h-3.5 w-3.5 shrink-0 text-text-dim" />
@@ -60,7 +60,7 @@ export function PlanStrip({ plan }: { plan: Plan | null }) {
       </button>
 
       {expanded && (
-        <div className="max-h-64 overflow-y-auto border-t border-surface-800 px-4 py-2 text-sm">
+        <div className="max-h-64 overflow-y-auto border-t border-surface-700/50 px-4 py-2 text-sm">
           <ul className="space-y-1">
             {plan.steps.map((step) => {
               const [glyphClass, glyph] = STEP_GLYPHS[step.status] ?? STEP_GLYPHS.Pending;

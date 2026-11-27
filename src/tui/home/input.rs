@@ -1479,6 +1479,16 @@ impl HomeView {
                 self.suggestions_feed.approve_held_trust();
                 None
             }
+            "suggestion_auto_start" => {
+                let turned = self.suggestions_feed.confirm_auto_start();
+                if let Some(view) = &mut self.suggestions_view {
+                    match turned {
+                        Ok(()) => view.set_notice("Turning on auto start…"),
+                        Err(reason) => view.set_error(reason),
+                    }
+                }
+                None
+            }
             "suggestion_pre_trust" => {
                 let turned = self.suggestions_feed.turn_on_pre_trust();
                 if let Some(view) = &mut self.suggestions_view {
@@ -2437,6 +2447,30 @@ impl HomeView {
                             "Suggestions are not loaded, so pre-trust was not turned on.",
                         );
                     }
+                }
+                SuggestionsAction::ConfirmAutoStart {
+                    provider_id,
+                    criterion,
+                    yolo,
+                } => {
+                    self.suggestions_feed
+                        .hold_auto_start(provider_id, criterion);
+                    let yolo = if yolo {
+                        "\n\nThis kind runs in YOLO mode, so its suggestions are never auto started."
+                    } else {
+                        ""
+                    };
+                    self.confirm_dialog = Some(
+                        ConfirmDialog::new(
+                            "Turn on auto start",
+                            &format!(
+                                "Auto start launches an agent on text written by others (issue and PR content) with no human check.{yolo}\n\nFrom the next refresh, new suggestions of this kind start with their preset, up to 3 per refresh and once each. A suggestion whose repo is not linked to one Project, or whose hooks need a review, stays a normal suggestion with a note.\n\nTurn it on?"
+                            ),
+                            "suggestion_auto_start",
+                        )
+                        .neutral()
+                        .buttons("Turn on auto start", "Cancel"),
+                    );
                 }
                 SuggestionsAction::TurnOnPreTrust => {
                     self.confirm_dialog = Some(
@@ -3478,39 +3512,6 @@ impl HomeView {
                 SidebarPosition::Left => self.grow_list(),
                 SidebarPosition::Right => self.shrink_list(),
             },
-            KeyCode::Enter => {
-                if self.focus_suggestions_pane() {
-                    return None;
-                }
-                if self.selected_session.is_some() {
-                    return self.activate_selected_session();
-                } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
-                    let path = path.clone();
-                    self.toggle_group_collapsed(&path);
-                }
-            }
-            // Tab is the activation key's complement: whichever of live-send and tmux
-            // attach `Enter` doesn't do. Only fires when `live_send` is None.
-            KeyCode::Tab => {
-                if self.selected_is_trashed() {
-                    return None;
-                }
-                let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
-                // Neither Tab meaning has a pane to reach in a structured view, so the
-                // press takes the session's native view through the same activation as
-                // Enter: that dismisses System Health, which would otherwise leave the
-                // composer it focuses behind a panel the next key cannot reach.
-                if live_key == Some(None) {
-                    return self.activate_selected_session();
-                }
-                if live_key == Some(Some(LiveKey::Enter)) {
-                    if let Some(action) = self.tab_attach_action() {
-                        return Some(action);
-                    }
-                } else if let Some(action) = self.start_live_send() {
-                    return Some(action);
-                }
-            }
             KeyCode::Left | KeyCode::Char('h') => {
                 if let Some(Item::Group {
                     path, collapsed, ..
@@ -3670,6 +3671,7 @@ impl HomeView {
                     | ActionId::PreviewScrollUp
                     | ActionId::PreviewScrollDown
                     | ActionId::DismissUpdateBanner
+                    | ActionId::Activate
             )
         {
             return None;
@@ -3679,6 +3681,31 @@ impl HomeView {
         }
         match id {
             ActionId::Quit => return Some(Action::Quit),
+            ActionId::Activate => {
+                if self.focus_suggestions_pane() {
+                    return None;
+                }
+                if self.selected_session.is_some() {
+                    return self.activate_selected_session();
+                } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
+                    let path = path.clone();
+                    self.toggle_group_collapsed(&path);
+                }
+            }
+            ActionId::ActivateAlt => {
+                let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
+                // Neither meaning has a pane to reach in a structured view, so the press
+                // takes the session's native view through the same activation as
+                // `Activate`: that dismisses System Health, which would otherwise leave the
+                // composer it focuses behind a panel the next key cannot reach.
+                if live_key == Some(None) {
+                    return self.activate_selected_session();
+                }
+                if live_key == Some(Some(LiveKey::Enter)) {
+                    return self.tab_attach_action();
+                }
+                return self.start_live_send();
+            }
             ActionId::ResolveIndeterminate => {
                 if self.pending_indeterminate_queue.is_empty()
                     && !self.session_feed.namespace_indeterminate()
@@ -4184,7 +4211,8 @@ impl HomeView {
                 Err(denied) => {
                     let dialog_title = match denied {
                         crate::session::ForkDenied::AgentCannotFork { .. }
-                        | crate::session::ForkDenied::ChildNotCapturable { .. } => {
+                        | crate::session::ForkDenied::ChildNotCapturable { .. }
+                        | crate::session::ForkDenied::SandboxedParent { .. } => {
                             "Fork not supported"
                         }
                         crate::session::ForkDenied::NoParentSession
@@ -4660,6 +4688,7 @@ impl HomeView {
             view_mode: self.view_mode.clone(),
             sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
+            session_selected: self.selected_session.is_some(),
             project_group_selected: self.project_group_at_cursor().is_some(),
             preview_scroll: live_send || (self.selected_is_trashed() && !self.system_health_open),
         }
@@ -4668,15 +4697,8 @@ impl HomeView {
     /// The jump and preview-scroll actions live-send takes from the agent; every other
     /// registry chord relays to the pane.
     fn live_send_action(&self, key: &KeyEvent) -> Option<ActionId> {
-        bindings::resolve(key, self.strict_hotkeys, &self.bindings_ctx(true)).filter(|id| {
-            matches!(
-                id,
-                ActionId::JumpPrevFinished
-                    | ActionId::JumpNextFinished
-                    | ActionId::PreviewScrollUp
-                    | ActionId::PreviewScrollDown
-            )
-        })
+        bindings::resolve(key, self.strict_hotkeys, &self.bindings_ctx(true))
+            .filter(|id| super::keybinds::is_live_action(*id))
     }
 
     fn open_command_palette(&mut self) {
@@ -5277,19 +5299,22 @@ impl HomeView {
     /// Info-dialog copy for a rename/delete attempted on a header derived automatically
     /// (Project/Org/Status), where there is no user-owned group to act on. `None` for `Manual`,
     /// where the caller proceeds with its normal flow.
-    fn automatic_group_hint(&self) -> Option<(String, String)> {
+    pub(super) fn automatic_group_hint(&self) -> Option<(String, String)> {
         let mode_label = match self.group_by {
             GroupByMode::Manual => return None,
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
             GroupByMode::Status => "Status",
         };
-        let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
+        let toggle = self.key_label(ActionId::GroupBy);
+        let how = if toggle.is_empty() {
+            "Pick Manual grouping".to_string()
+        } else {
+            format!("Press {toggle} and pick Manual")
+        };
         Some((
             format!("Cannot Modify {mode_label} Groups"),
-            format!(
-                "{mode_label} groups are automatic. Press {toggle} and pick Manual to manage groups."
-            ),
+            format!("{mode_label} groups are automatic. {how} to manage groups."),
         ))
     }
 
@@ -5840,11 +5865,9 @@ impl HomeView {
                         .unwrap_or((false, false, false)),
                     _ => (false, false, false),
                 };
-                // Snooze is an Attention-sort triage primitive: the `'h'`
-                // keybinding only fires in Attention sort, so the menu omits
-                // the Snooze row everywhere else to keep the mouse and keyboard
-                // paths in step.
-                let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
+                // Snooze acts on a session row in any sort order, matching `'h'`.
+                // A group header has no session, so it keeps `h` for collapse.
+                let snooze = matches!(self.flat_items[idx], super::Item::Session { .. })
                     .then_some(is_snoozed);
                 // The unread toggle is always-on (any sort), so it shows
                 // whenever the feature is enabled.
@@ -7645,10 +7668,16 @@ impl HomeView {
     pub(super) fn note_live_takeover(&mut self, taken: live_send::TakenLive) {
         if !self.show_shortcut_bar {
             let label = taken.taker.label();
-            self.flash_status(match self.live_key(&taken.session_id) {
-                Some(LiveKey::Tab) => format!("{label}: Tab to take it back"),
-                Some(LiveKey::Enter) => format!("{label}: Enter to take it back"),
-                None => label.to_string(),
+            let id = match self.live_key(&taken.session_id) {
+                Some(LiveKey::Tab) => Some(ActionId::ActivateAlt),
+                Some(LiveKey::Enter) => Some(ActionId::Activate),
+                None => None,
+            };
+            let key = id.map_or_else(String::new, |id| bindings::label(id, self.strict_hotkeys));
+            self.flash_status(if key.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label}: {key} to take it back")
             });
         }
         self.live_takeover = Some(taken);

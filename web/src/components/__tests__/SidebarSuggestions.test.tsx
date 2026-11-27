@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { reportFeatureUse } from "../../lib/featureUse";
 import { SidebarSuggestions } from "../sidebar/SidebarSuggestions";
-import { updateSuggestionPrefs } from "../../lib/api";
+import { refreshSuggestions, updateSuggestionPrefs } from "../../lib/api";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
 const { fetchSuggestions, startSuggestion, dismissSuggestion, fetchSuggestionProjects } = vi.hoisted(() => ({
@@ -63,6 +64,20 @@ const renderIt = (props: Partial<Parameters<typeof SidebarSuggestions>[0]> = {})
 };
 
 describe("SidebarSuggestions", () => {
+  it("counts one sidebar use when it lists items, none while the pref is off", async () => {
+    fetchSuggestions.mockResolvedValue(snap(ITEMS, false));
+    renderIt();
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(reportFeatureUse).not.toHaveBeenCalled();
+    cleanup();
+    fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
+    renderIt();
+    await screen.findByTestId("sidebar-suggested-toggle");
+    await waitFor(() => expect(reportFeatureUse).toHaveBeenCalledWith("suggest_from_sidebar"));
+    expect(reportFeatureUse).toHaveBeenCalledTimes(1);
+  });
+
   it("appears once the sidebar pref is turned on elsewhere, without a remount", async () => {
     fetchSuggestions.mockResolvedValue(snap(ITEMS, false));
     renderIt();
@@ -101,6 +116,33 @@ describe("SidebarSuggestions", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("re-reads an idle snapshot, so later provider results show", async () => {
+    vi.useFakeTimers();
+    try {
+      fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
+      renderIt();
+      await act(async () => {});
+      expect(fetchSuggestions).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(61_000);
+      });
+      expect(fetchSuggestions).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reloads when another view asks for a refresh", async () => {
+    fetchSuggestions.mockResolvedValue(snap(ITEMS, true));
+    renderIt();
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(1));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 200 })));
+    await act(async () => {
+      await refreshSuggestions();
+    });
+    await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(2));
   });
 
   it("starts collapsed, then lists up to 3 items and View all", async () => {

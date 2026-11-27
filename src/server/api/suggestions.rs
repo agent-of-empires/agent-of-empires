@@ -11,9 +11,15 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
+mod auto;
+
 use super::{api_error, AppState};
 use crate::plugin::suggestions::{self, PrepareRefusal, Preset, Provider};
 use axum::http::StatusCode;
+
+pub(crate) use auto::spawn as spawn_auto_start;
+#[cfg(test)]
+pub(crate) use auto::sweep as sweep_auto_start;
 
 /// Optional body of the routes that take none: the profile the caller selected
 /// its target under.
@@ -73,6 +79,17 @@ pub struct SourceBody {
     provider_id: String,
     criterion: String,
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoStartBody {
+    expected_profile: Option<String>,
+    provider_id: String,
+    criterion: String,
+    enabled: bool,
+    /// Items one refresh may start; the default when omitted.
+    cap: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -163,8 +180,10 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
         let registered = crate::session::projects::load_merged(&profile)?;
         let (mut snapshot, mappings, links, presets) =
             host.with_suggestions_db(|conn, profile| {
+                let mut snapshot = suggestions::snapshot(conn, profile, &providers)?;
+                suggestions::attach_auto(conn, profile, &mut snapshot)?;
                 Ok::<_, anyhow::Error>((
-                    suggestions::snapshot(conn, profile, &providers)?,
+                    snapshot,
                     suggestions::load_mappings(conn, profile)?,
                     suggestions::links(conn, profile)?,
                     suggestions::presets(conn, profile)?,
@@ -191,6 +210,8 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
             suggestions::attach_started(&mut snapshot, &started);
             suggestions::attach_refreshing(&mut snapshot, &refreshing);
             snapshot["profile"] = json!(reported_profile);
+            snapshot["setup_offered"] = json!(crate::plugin::featured::FeaturedIndex::load()
+                .is_ok_and(|index| index.offers_suggestions()));
             Json(snapshot).into_response()
         }
         Ok(Err(error)) => internal(error),
@@ -301,10 +322,97 @@ async fn set_dismissed(
     })
     .await;
     match result {
-        Ok(Ok(true)) => Json(json!({ "ok": true })).into_response(),
+        Ok(Ok(true)) => {
+            use crate::telemetry::feature_use::{record, FeatureUse};
+            record(if dismissed {
+                FeatureUse::SuggestDismiss
+            } else {
+                FeatureUse::SuggestRestore
+            });
+            Json(json!({ "ok": true })).into_response()
+        }
         Ok(Ok(false)) => stale_item(),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushBody {
+    expected_profile: Option<String>,
+    id: Option<String>,
+    title: String,
+    #[serde(default)]
+    reason: String,
+    prompt: String,
+    project: Option<String>,
+    /// Shown as the item's source reference; defaults to "Agent".
+    pushed_by: Option<String>,
+}
+
+/// Adds or replaces one built-in agent suggestion; the HTTP route and the
+/// `suggest_session` MCP tool both call it.
+pub(crate) async fn push_agent_suggestion(
+    state: &Arc<AppState>,
+    input: suggestions::AgentPush,
+) -> Result<String, (StatusCode, &'static str, String)> {
+    let Some(host) = state.plugin_host.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "Plugin host is unavailable".into(),
+        ));
+    };
+    let notify = host.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| suggestions::push_agent(conn, profile, input))
+    })
+    .await;
+    if matches!(result, Ok(Ok(_))) {
+        notify.notify_suggestions_published();
+    }
+    match result {
+        Ok(Ok(value)) => Ok(value["id"].as_str().unwrap_or_default().to_string()),
+        Ok(Err(error)) if error.code == crate::plugin::protocol::codes::INVALID_PARAMS => {
+            Err((StatusCode::BAD_REQUEST, "validation_failed", error.message))
+        }
+        Ok(Err(error)) => Err((StatusCode::INTERNAL_SERVER_ERROR, "internal", error.message)),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            error.to_string(),
+        )),
+    }
+}
+
+pub async fn push_suggestion(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<PushBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    if let Some(host) = &state.plugin_host {
+        if let Some(refused) = wrong_profile(host, body.expected_profile.as_deref()) {
+            return refused;
+        }
+    }
+    let input = suggestions::AgentPush {
+        id: body.id,
+        title: body.title,
+        reason: body.reason,
+        prompt: body.prompt,
+        project: body.project,
+        pushed_by: body.pushed_by.unwrap_or_else(|| "Agent".into()),
+    };
+    match push_agent_suggestion(&state, input).await {
+        Ok(id) => Json(json!({ "ok": true, "id": id })).into_response(),
+        Err((status, code, message)) => api_error(status, code, message),
     }
 }
 
@@ -382,7 +490,13 @@ pub async fn update_suggestion_source(
         .await
     };
     match stored {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            if !body.enabled {
+                crate::telemetry::feature_use::record(
+                    crate::telemetry::feature_use::FeatureUse::SuggestStopKind,
+                );
+            }
+        }
         Ok(Err(error)) => return internal(error),
         Err(error) => return internal(error),
     }
@@ -393,6 +507,76 @@ pub async fn update_suggestion_source(
         "enabled": body.enabled,
     }))
     .into_response()
+}
+
+/// Turns auto start on or off for one kind. It acts from the next refresh on.
+pub async fn put_suggestion_auto_start(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<AutoStartBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    // A kind a plugin no longer declares stays switchable off.
+    if body.enabled {
+        if body.provider_id == suggestions::AGENT_PROVIDER_ID {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "Auto start is not available for agent suggestions",
+            );
+        }
+        if let Err(response) = check_declared(find_provider(&body.provider_id), &body.criterion) {
+            return response;
+        }
+    }
+    let cap = body.cap.unwrap_or(suggestions::DEFAULT_CAP);
+    if !(1..=suggestions::MAX_CAP).contains(&cap) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("cap must be between 1 and {}", suggestions::MAX_CAP),
+        );
+    }
+    let stored = {
+        let (host, provider_id, criterion) = (
+            host.clone(),
+            body.provider_id.clone(),
+            body.criterion.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            host.with_suggestions_db(|conn, profile| {
+                suggestions::set_auto_start(
+                    conn,
+                    profile,
+                    &provider_id,
+                    &criterion,
+                    body.enabled.then_some(cap),
+                )
+            })
+        })
+        .await
+    };
+    match stored {
+        Ok(Ok(())) => Json(json!({
+            "provider_id": body.provider_id,
+            "criterion": body.criterion,
+            "auto_start": body.enabled.then(|| json!({ "cap": cap })),
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal(error),
+        Err(error) => internal(error),
+    }
 }
 
 pub async fn patch_suggestion_prefs(
@@ -588,6 +772,16 @@ async fn start_outcome(
     if status == StatusCode::CONFLICT && matches!(code, "already_started" | "stale_suggestion") {
         return (status, Json(body)).into_response();
     }
+    {
+        use crate::telemetry::feature_use::{record, FeatureUse};
+        record(match code {
+            "creation_trust_changed" | "hooks_need_trust" | "agent_hooks_not_approved" => {
+                FeatureUse::SuggestFailHooks
+            }
+            "sandbox_unavailable" => FeatureUse::SuggestFailSandbox,
+            _ => FeatureUse::SuggestFailOther,
+        });
+    }
     if code == "creation_trust_changed" {
         return api_error(
             StatusCode::CONFLICT,
@@ -623,10 +817,17 @@ async fn start_outcome(
         ),
         _ => "Try again, or use Start with changes to see the full error.".to_string(),
     };
-    let reason = body["message"]
+    let mut reason = body["message"]
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| format!("The Session could not be created ({status})"));
+    if code == "sandbox_unavailable" {
+        // The hint repeats the create reason's own "Start {runtime}, then try again."
+        let runtime = crate::containers::get_container_runtime().display_name();
+        if let Some(cause) = reason.strip_suffix(&format!(" Start {runtime}, then try again.")) {
+            reason = cause.to_string();
+        }
+    }
     start_failed(reason, &hint)
 }
 
@@ -658,6 +859,86 @@ fn create_body(
     }))
 }
 
+/// Most items one batch start takes: each create can run for minutes.
+const MAX_START_BATCH: usize = 25;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBatchBody {
+    expected_profile: Option<String>,
+    items: Vec<StartBatchItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBatchItem {
+    provider_id: String,
+    id: String,
+}
+
+/// A handler's answer as its status and JSON body.
+pub(super) async fn response_json(
+    response: axum::response::Response,
+) -> (StatusCode, serde_json::Value) {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// Starts each item as `start_suggestion` would, one after another, without
+/// approving any hooks. The answer is 200 with each item's own status and body,
+/// so a failure or a hooks review in one never stops the rest.
+pub async fn start_suggestions(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<StartBatchBody>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.clone() else {
+        return unavailable();
+    };
+    if let Some(refused) = wrong_profile(&host, body.expected_profile.as_deref()) {
+        return refused;
+    }
+    if body.items.is_empty() || body.items.len() > MAX_START_BATCH {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("items must hold 1 to {MAX_START_BATCH} suggestions"),
+        );
+    }
+    let mut results = Vec::with_capacity(body.items.len());
+    for StartBatchItem { provider_id, id } in body.items {
+        let response = start_suggestion(
+            State(state.clone()),
+            Ok(Json(StartBody {
+                expected_profile: None,
+                provider_id: provider_id.clone(),
+                id: id.clone(),
+                project: None,
+                approve_hooks: false,
+                review_fingerprint: None,
+            })),
+        )
+        .await;
+        let (status, answer) = response_json(response).await;
+        results.push(json!({
+            "provider_id": provider_id,
+            "id": id,
+            "status": status.as_u16(),
+            "body": answer,
+        }));
+    }
+    Json(json!({ "results": results })).into_response()
+}
+
 pub async fn start_suggestion(
     State(state): State<Arc<AppState>>,
     body: Result<Json<StartBody>, axum::extract::rejection::JsonRejection>,
@@ -678,6 +959,7 @@ pub async fn start_suggestion(
     let Some(provider) = find_provider(&body.provider_id) else {
         return unknown_provider();
     };
+    let start_in = body.project.is_some();
     let StartBody {
         provider_id,
         id,
@@ -784,7 +1066,13 @@ pub async fn start_suggestion(
         },
     )
     .await;
-    start_outcome(response, profile, path).await
+    let outcome = start_outcome(response, profile, path).await;
+    if start_in && outcome.status() == StatusCode::CREATED {
+        crate::telemetry::feature_use::record(
+            crate::telemetry::feature_use::FeatureUse::SuggestStartIn,
+        );
+    }
+    outcome
 }
 
 pub async fn prepare_suggestion(
@@ -980,7 +1268,12 @@ pub async fn put_suggestion_preset(
     })
     .await;
     match result {
-        Ok(Ok(Ok(body))) => Json(body).into_response(),
+        Ok(Ok(Ok(body))) => {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestPresetEdit,
+            );
+            Json(body).into_response()
+        }
         Ok(Ok(Err(response))) => response,
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
@@ -1013,7 +1306,12 @@ pub async fn delete_suggestion_preset(
     })
     .await;
     match result {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(())) => {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestPresetReset,
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
     }
@@ -1103,7 +1401,12 @@ pub async fn put_suggestion_mapping(
     })
     .await;
     match result {
-        Ok(Ok(Ok(stored))) => Json(stored).into_response(),
+        Ok(Ok(Ok(stored))) => {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestMappingAdd,
+            );
+            Json(stored).into_response()
+        }
         Ok(Ok(Err(message))) => api_error(StatusCode::BAD_REQUEST, "validation_failed", message),
         Ok(Err(error)) => internal(error),
         Err(error) => internal(error),
@@ -1244,5 +1547,31 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert!(body["hint"].as_str().unwrap().contains(needle), "{body}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_docker_down_start_gives_the_instruction_once() {
+        let runtime = crate::containers::get_container_runtime().display_name();
+        let create_reason = format!(
+            "{runtime} isn't running, so the Sandbox can't start. Start {runtime}, then try again."
+        );
+        let refused = api_error(
+            StatusCode::from_u16(422).unwrap(),
+            "sandbox_unavailable",
+            &create_reason,
+        );
+        let response = start_outcome(refused, "default".into(), "/repo".into()).await;
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["reason"],
+            format!("{runtime} isn't running, so the Sandbox can't start.")
+        );
+        assert_eq!(
+            body["hint"],
+            format!("Start {runtime} and try again, or use Start with changes to run without the sandbox.")
+        );
     }
 }

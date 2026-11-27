@@ -400,6 +400,15 @@ impl HomeView {
             {
                 self.pending_archive_cursor = None;
             }
+            // A rejected change never reaches a snapshot that carries it, so
+            // drop the queued confirmation rather than leave it waiting.
+            if self
+                .pending_snooze_flash
+                .as_ref()
+                .is_some_and(|pending| pending.id == error.id)
+            {
+                self.pending_snooze_flash = None;
+            }
             if error.marks_unread && self.manual_unread_hold.as_deref() == Some(&error.id) {
                 self.manual_unread_hold = None;
             }
@@ -897,6 +906,7 @@ impl HomeView {
             }
         }
         let archive_cursor_changed = snapshot_applied && self.apply_pending_archive_cursor();
+        let snooze_flash_shown = snapshot_applied && self.apply_pending_snooze_flash();
         let drained = self.session_feed.drain_command_errors();
         let command_error = self.present_command_errors(drained);
         let epoch = self.session_feed.applied_epoch();
@@ -936,6 +946,7 @@ impl HomeView {
             || command_error
             || diff_changed
             || archive_cursor_changed
+            || snooze_flash_shown
             || outcomes_changed
             || pending_before != pending_after
     }

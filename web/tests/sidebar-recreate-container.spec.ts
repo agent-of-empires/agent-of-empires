@@ -23,7 +23,10 @@ async function confirmRecreate(page: Page, shot: string) {
   await page.locator("[data-testid='sidebar-session-row']").first().click({ button: "right" });
   await page.getByTestId("sidebar-context-menu-more").click();
   const item = page.getByTestId("sidebar-context-menu-recreate-container");
-  await expect(item).toBeInViewport({ ratio: 1 });
+  // A phone sheet with More open can run past its height cap and scroll.
+  await item.scrollIntoViewIfNeeded();
+  // Sub-pixel rounding at the sheet's scroll edge.
+  await expect(item).toBeInViewport({ ratio: 0.99 });
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/${shot}-menu.png`, animations: "disabled" });
   await item.click();
 

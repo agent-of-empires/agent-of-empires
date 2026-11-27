@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { fetchAcpAgents, fetchContextPrimer, switchAcpAgent, type AcpAgentInfo } from "../../lib/api";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { effectiveLifecycle } from "../../lib/agentProfiles";
+import { CancelButton, ConfirmButton, Dialog } from "../Dialog";
+import { CHOICE, CHOICE_SELECTED } from "../../lib/surfaces";
 
 /** Hands the session to another ACP agent, then prefills (never sends) a handoff
  *  message with a recap from before the switch and any prompt the old agent never
@@ -134,135 +136,114 @@ export function SwitchAgentModal({
   const hasAlternatives = agents.some((a) => a.name !== currentAgent);
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="switch-agent-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
-      onClick={(e) => {
-        if (e.target === e.currentTarget && !submitting) onClose();
-      }}
-    >
-      <div className="w-full max-w-lg rounded-lg border border-surface-700 bg-surface-900 p-5 shadow-xl text-text-primary">
-        <h2 id="switch-agent-title" className="text-base font-semibold">
-          {title}
-        </h2>
-        <p className="mt-1 text-xs text-text-muted">
-          {rateLimited ? (
-            <>
-              {currentName} reached its usage limit. The Agent you pick continues this Session: the composer is
-              pre-filled with a recap of the recent turns for you to review before sending. The full history isn&apos;t
-              carried over.
-            </>
-          ) : (
-            <>
-              Hand this session off from {currentAgent ?? "the current agent"} to a different installed ACP backend,
-              keeping the transcript. We will pre-fill the composer with a recap of the recent turns for you to review
-              before sending.
-            </>
-          )}
-        </p>
-
-        {loading ? (
-          <div className="mt-4 text-xs text-text-muted">Loading agents...</div>
-        ) : agents.length === 0 ? (
-          <div className="mt-4 text-xs text-status-error">
-            No structured view agents are registered. Install one (e.g. `npm i -g
-            @agentclientprotocol/codex-acp@latest`) and try again.
-          </div>
-        ) : (
-          <>
-            <ul className="mt-4 max-h-64 space-y-1 overflow-y-auto">
-              {agents.map((a) => {
-                const isCurrent = a.name === currentAgent;
-                return (
-                  <li key={a.name}>
-                    <label
-                      className={`flex items-start gap-3 rounded border px-3 py-2 transition-colors ${
-                        isCurrent
-                          ? "cursor-not-allowed border-surface-700 bg-surface-800/40 opacity-60"
-                          : selected === a.name
-                            ? "cursor-pointer border-brand-500 bg-brand-900/30"
-                            : "cursor-pointer border-surface-700 hover:bg-surface-800"
-                      }`}
-                    >
-                      <input
-                        type="radio"
-                        name="acp-agent-target"
-                        value={a.name}
-                        checked={selected === a.name}
-                        onChange={() => {
-                          if (!isCurrent) setSelected(a.name);
-                        }}
-                        className="mt-0.5 disabled:cursor-not-allowed"
-                        disabled={submitting || isCurrent}
-                      />
-                      <span className="flex-1">
-                        <span className="block text-sm">
-                          {agentName(a.name)}
-                          {isCurrent && (
-                            <span className="ml-2 text-xs text-text-muted">
-                              {rateLimited ? "current · limit reached" : "(current)"}
-                            </span>
-                          )}
-                          {effectiveLifecycle(a, a.name).state === "deprecated" && (
-                            <span
-                              className="ml-2 text-xs text-status-warning"
-                              data-testid={`switch-agent-deprecated-${a.name}`}
-                            >
-                              (deprecated)
-                            </span>
-                          )}
-                        </span>
-                        {a.description !== agentName(a.name) && (
-                          <span className="block text-xs text-text-muted">{a.description}</span>
-                        )}
-                      </span>
-                    </label>
-                  </li>
-                );
-              })}
-            </ul>
-            {!hasAlternatives && (
-              <div className="mt-3 text-xs text-status-error">
-                No other structured view agents are registered. Install one (e.g. `npm i -g
-                @agentclientprotocol/codex-acp@latest`) and try again.
-              </div>
-            )}
-          </>
-        )}
-
-        {error && (
-          <div className="mt-3 text-xs text-status-error" role="alert">
-            {error}
-          </div>
-        )}
-
-        <div className="mt-5 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              if (!submitting) onClose();
-            }}
-            disabled={submitting}
-            className="rounded border border-surface-700 px-3 py-1 text-xs font-medium hover:bg-surface-800 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            Cancel
-          </button>
-          <button
-            ref={confirmRef}
-            type="button"
+    <Dialog
+      id="switch-agent"
+      testId="switch-agent-modal"
+      title={title}
+      describedBy={false}
+      panelClassName="md:w-[32rem] md:max-h-[90vh]"
+      onDismiss={submitting ? undefined : onClose}
+      footer={
+        <>
+          <CancelButton onClick={() => !submitting && onClose()} disabled={submitting} />
+          <ConfirmButton
+            buttonRef={confirmRef}
             onClick={handleConfirm}
             disabled={!selected || submitting || !hasAlternatives}
-            className="rounded border border-brand-700 bg-brand-900/40 px-3 py-1 text-xs font-medium text-brand-100 hover:bg-brand-900/60 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {submitting
               ? "Switching..."
               : `${rateLimited ? "Continue in" : "Switch to"} ${selected ? agentName(selected) : ""}`}
-          </button>
+          </ConfirmButton>
+        </>
+      }
+    >
+      <p className="text-[13px] md:text-xs text-text-muted">
+        {rateLimited ? (
+          <>
+            {currentName} reached its usage limit. The Agent you pick continues this Session: the composer is pre-filled
+            with a recap of the recent turns for you to review before sending. The full history isn&apos;t carried over.
+          </>
+        ) : (
+          <>
+            Hand this session off from {currentAgent ?? "the current agent"} to a different installed ACP backend,
+            keeping the transcript. We will pre-fill the composer with a recap of the recent turns for you to review
+            before sending.
+          </>
+        )}
+      </p>
+
+      {loading ? (
+        <div className="mt-4 text-xs text-text-muted">Loading agents...</div>
+      ) : agents.length === 0 ? (
+        <div className="mt-4 text-xs text-status-error">
+          No structured view agents are registered. Install one (e.g. `npm i -g @agentclientprotocol/codex-acp@latest`)
+          and try again.
         </div>
-      </div>
-    </div>
+      ) : (
+        <>
+          <ul className="mt-4 max-h-64 space-y-1.5 overflow-y-auto">
+            {agents.map((a) => {
+              const isCurrent = a.name === currentAgent;
+              return (
+                <li key={a.name}>
+                  <label
+                    className={`${selected === a.name ? CHOICE_SELECTED : CHOICE} flex items-start gap-3 ${
+                      isCurrent ? "cursor-not-allowed opacity-60" : "cursor-pointer"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="acp-agent-target"
+                      value={a.name}
+                      checked={selected === a.name}
+                      onChange={() => {
+                        if (!isCurrent) setSelected(a.name);
+                      }}
+                      className="mt-0.5 disabled:cursor-not-allowed"
+                      disabled={submitting || isCurrent}
+                    />
+                    <span className="flex-1">
+                      <span className="block text-[15px] md:text-sm">
+                        {agentName(a.name)}
+                        {isCurrent && (
+                          <span className="ml-2 text-xs text-text-muted">
+                            {rateLimited ? "current · limit reached" : "(current)"}
+                          </span>
+                        )}
+                        {effectiveLifecycle(a, a.name).state === "deprecated" && (
+                          <span
+                            className="ml-2 text-xs text-status-warning"
+                            data-testid={`switch-agent-deprecated-${a.name}`}
+                          >
+                            (deprecated)
+                          </span>
+                        )}
+                      </span>
+                      {a.description !== agentName(a.name) && (
+                        <span className="block text-xs text-text-muted">{a.description}</span>
+                      )}
+                    </span>
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+          {!hasAlternatives && (
+            <div className="mt-3 text-xs text-status-error">
+              No other structured view agents are registered. Install one (e.g. `npm i -g
+              @agentclientprotocol/codex-acp@latest`) and try again.
+            </div>
+          )}
+        </>
+      )}
+
+      {error && (
+        <div className="mt-3 text-xs text-status-error" role="alert">
+          {error}
+        </div>
+      )}
+    </Dialog>
   );
 }
 

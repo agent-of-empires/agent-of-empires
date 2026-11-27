@@ -1,4 +1,5 @@
 import { startMenuFor } from "../lib/suggestionPlan";
+import { reportFeatureUse } from "../lib/featureUse";
 import { suggestionKey, type useSuggestions } from "../hooks/useSuggestions";
 import type { SuggestionItem, SuggestionPresetEntry, SuggestionsSnapshot } from "../lib/types";
 import { SuggestionActions } from "./SuggestionRow";
@@ -72,7 +73,10 @@ export function SuggestionItemActions({
       started={
         item.started_session && {
           onOpen: () => onOpenSession(item.started_session!.id),
-          onStartAnother: () => void ctrl.startWithChanges(item, true),
+          onStartAnother: () => {
+            reportFeatureUse("suggest_start_another");
+            void ctrl.startWithChanges(item, true);
+          },
           providerName,
           sourceUrl: item.source_url,
         }

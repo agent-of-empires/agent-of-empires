@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { recreateSessionContainer } from "../../lib/api";
 import { reportInfo } from "../../lib/toastBus";
-import { CancelButton, ConfirmButton, DANGER_BUTTON, Dialog } from "../Dialog";
+import { CancelButton, ConfirmButton, Dialog } from "../Dialog";
 import { useConfirmKeys, useDialogFocus } from "../dialogHooks";
 
 /** Confirms the one action that discards a sandboxed session's container; it stays open on a refusal. */
@@ -54,7 +54,7 @@ export function RecreateContainerDialog({
             onClick={() => void confirm()}
             busy={busy}
             testId="recreate-container-confirm"
-            className={DANGER_BUTTON}
+            tone="danger"
           >
             {busy ? "Recreating…" : "Recreate container"}
           </ConfirmButton>

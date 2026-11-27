@@ -169,6 +169,39 @@ pub(super) fn seed_pending_tool_targets(
     }
 }
 
+/// Extra paired terminals (`_t<N>`) live for `id`, so a Daemon restart still
+/// lists the shells a dashboard opened earlier. [`observe_auxiliary`] then
+/// resolves each by its full name shape.
+fn live_extra_terminals(
+    id: &str,
+    panes: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+) -> Vec<crate::session::AuxiliaryTarget> {
+    use crate::session::AuxiliaryTarget;
+    use crate::tmux::SessionKind;
+    let tail = format!("_{}_t", crate::cli::truncate_id(id, 8));
+    let mut targets: Vec<_> = panes
+        .iter()
+        .filter_map(|(name, pane)| {
+            let (_, digits) = name.rsplit_once(&tail)?;
+            let index = digits
+                .parse::<u32>()
+                .ok()
+                .filter(|index| (1..=MAX_TERMINAL_INDEX).contains(index))?;
+            match SessionKind::of(name, pane.session_kind.as_deref())? {
+                SessionKind::Terminal => Some(AuxiliaryTarget::Host { index }),
+                SessionKind::ContainerTerminal => Some(AuxiliaryTarget::Container { index }),
+                _ => None,
+            }
+        })
+        .collect();
+    targets.sort_by_key(|target| match target {
+        AuxiliaryTarget::Host { index } => (0, *index),
+        AuxiliaryTarget::Container { index } => (1, *index),
+        AuxiliaryTarget::Tool { .. } => (2, 0),
+    });
+    targets
+}
+
 pub(super) fn sample_panes(
     instance: &mut crate::session::Instance,
     tools: &[String],
@@ -179,12 +212,16 @@ pub(super) fn sample_panes(
     use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PanePresence};
     instance.agent_pane = observe_agent(instance, panes);
     let sandboxed = instance.is_sandboxed();
+    let extra = panes
+        .map(|panes| live_extra_terminals(&instance.id, panes))
+        .unwrap_or_default();
     for target in [
         Some(AuxiliaryTarget::Host { index: 0 }),
         sandboxed.then_some(AuxiliaryTarget::Container { index: 0 }),
     ]
     .into_iter()
     .flatten()
+    .chain(extra)
     {
         if !instance
             .auxiliary
@@ -949,6 +986,61 @@ async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_lists_live_extra_terminals() {
+        use crate::session::{AuxiliaryTarget, PanePresence};
+        let mut row = crate::session::Instance::new("extras", "/tmp");
+        let pane = |kind: &str, dead: bool| crate::tmux::PaneMetadata {
+            server: None,
+            session_id: "$1".into(),
+            pane_id: "%1".into(),
+            session_kind: Some(kind.into()),
+            tool_owner: crate::tmux::ToolPaneOwner::Unmarked,
+            pane_dead: dead,
+            pane_current_command: None,
+            pane_start_command_is_protected: false,
+            pane_pid: None,
+            first_window: true,
+            pane_title: None,
+            window_activity: None,
+            window_size: None,
+        };
+        let host =
+            |index| crate::tmux::TerminalSession::generate_name_indexed(&row.id, &row.title, index);
+        let other = crate::session::Instance::new("other", "/tmp");
+        let panes = std::collections::HashMap::from([
+            (host(2), pane("term", false)),
+            (host(5), pane("term", true)),
+            (host(40), pane("term", false)),
+            (
+                crate::tmux::TerminalSession::generate_name_indexed(&other.id, &other.title, 3),
+                pane("term", false),
+            ),
+        ]);
+        sample_panes(&mut row, &[], Some(&panes), None, None);
+        let observed: Vec<_> = row
+            .auxiliary
+            .iter()
+            .map(|observation| (observation.target.clone(), observation.pane.state))
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                (AuxiliaryTarget::Host { index: 0 }, PanePresence::Absent),
+                (AuxiliaryTarget::Host { index: 2 }, PanePresence::Alive),
+                (AuxiliaryTarget::Host { index: 5 }, PanePresence::Dead),
+            ]
+        );
+        sample_panes(
+            &mut row,
+            &[],
+            Some(&std::collections::HashMap::new()),
+            None,
+            None,
+        );
+        assert_eq!(row.auxiliary.len(), 1, "a gone extra terminal is dropped");
+    }
 
     #[tokio::test]
     #[serial_test::serial]

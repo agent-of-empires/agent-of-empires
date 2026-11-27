@@ -69,7 +69,13 @@ vi.mock("../../lib/api", () => ({
   deleteProfile: vi.fn(() => Promise.resolve(true)),
   updateSettings: (updates: Record<string, unknown>, profile?: string) => updateSettings(updates, profile),
   updateTheme: (patch: Record<string, unknown>) => updateTheme(patch),
-  fetchThemes: vi.fn(() => Promise.resolve(["empire", "dracula", "nord"])),
+  fetchThemes: vi.fn(() =>
+    Promise.resolve([
+      { name: "empire", label: "empire" },
+      { name: "dracula", label: "dracula" },
+      { name: "nord", label: "nord" },
+    ]),
+  ),
 }));
 
 const dispatchThemePickerChanged = vi.fn();

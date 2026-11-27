@@ -93,7 +93,9 @@ fn intro_walkthrough_persists_attach_theme_and_consent_choices() {
     h.send_keys("Enter");
     h.wait_for("(5/6)");
     h.assert_screen_contains("Pick a theme");
-    // BUILTIN_THEMES is ordered `default, empire, ...`.
+    // BUILTIN_THEMES is ordered `zinc, light, empire, ...`.
+    h.send_keys("Down");
+    h.wait_for("▶ light");
     h.send_keys("Down");
     h.wait_for("▶ empire");
     h.send_keys("Enter");

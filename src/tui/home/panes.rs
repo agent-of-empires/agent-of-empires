@@ -354,7 +354,6 @@ impl HomeView {
                     })
                 }),
                 skip_on_launch,
-                wake_message: Some(String::new()),
                 ..Default::default()
             };
             self.session_feed.restart_agent(id.into(), body)

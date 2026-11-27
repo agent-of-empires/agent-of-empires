@@ -1,6 +1,8 @@
 import type { Ref } from "react";
 import type { ProjectInfo } from "../../../lib/types";
 import type { RecentProject } from "./projectPicker";
+import { CAPTION, INPUT } from "../../../lib/surfaces";
+import { CHOICE, CHOICE_SELECTED } from "../../../lib/surfaces";
 
 function timeAgo(ts: string | null): string {
   if (!ts) return "";
@@ -46,31 +48,27 @@ export function ProjectSearchList({
         onChange={(e) => onQueryChange(e.target.value)}
         placeholder="Search projects by name or path"
         aria-label="Search projects"
-        className="w-full px-3 py-2.5 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600"
+        className={INPUT}
       />
 
       {filteredSaved.length === 0 && filteredRecent.length === 0 && (
-        <p className="text-sm text-text-dim">{emptyMessage}</p>
+        <p className="text-[15px] md:text-sm text-text-dim">{emptyMessage}</p>
       )}
 
       {filteredSaved.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim">Projects</p>
+          <p className={`${CAPTION} !mb-0.5`}>Projects</p>
           {filteredSaved.map((s) => (
             <button
               key={`saved:${s.scope}:${s.path}`}
               type="button"
               onClick={() => onSelect(s.path)}
               title={s.path}
-              className={`flex items-center gap-3 px-3 py-2.5 rounded-md border transition-colors text-left cursor-pointer ${
-                isSelected(s.path)
-                  ? "border-brand-600 bg-surface-900"
-                  : "border-surface-700/40 bg-surface-900 hover:border-surface-700 hover:bg-surface-850"
-              }`}
+              className={`${isSelected(s.path) ? CHOICE_SELECTED : CHOICE} flex items-center gap-3 cursor-pointer`}
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium text-text-primary truncate">{s.name}</span>
+                  <span className="text-[15px] md:text-sm font-medium text-text-primary truncate">{s.name}</span>
                   <span className="text-[10px] font-mono text-text-dim shrink-0">{s.scope}</span>
                 </div>
                 <div className="flex items-center gap-2 mt-0.5">
@@ -84,24 +82,18 @@ export function ProjectSearchList({
 
       {filteredRecent.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          {filteredSaved.length > 0 && (
-            <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim">Recent</p>
-          )}
+          {filteredSaved.length > 0 && <p className={`${CAPTION} !mb-0.5`}>Recent</p>}
           {filteredRecent.map((r) => (
             <button
               key={r.path}
               type="button"
               onClick={() => onSelect(r.path)}
               title={r.path}
-              className={`flex items-center gap-3 px-3 py-2.5 rounded-md border transition-colors text-left cursor-pointer ${
-                isSelected(r.path)
-                  ? "border-brand-600 bg-surface-900"
-                  : "border-surface-700/40 bg-surface-900 hover:border-surface-700 hover:bg-surface-850"
-              }`}
+              className={`${isSelected(r.path) ? CHOICE_SELECTED : CHOICE} flex items-center gap-3 cursor-pointer`}
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="text-sm font-medium text-text-primary truncate">{r.displayName}</span>
+                  <span className="text-[15px] md:text-sm font-medium text-text-primary truncate">{r.displayName}</span>
                   <span className="text-[10px] font-mono text-text-dim shrink-0">{r.tool}</span>
                 </div>
                 <div className="flex items-center gap-2 mt-0.5">
