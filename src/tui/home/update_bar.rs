@@ -159,14 +159,17 @@ impl PullLine {
                     shorten(&short, &keys, width)
                 }
             }
-            Self::Done => [
-                " ✓ Sandbox image updated. Applies to new Sessions.",
-                " ✓ Sandbox image updated.",
-            ]
-            .into_iter()
-            .find(|text| text.width() <= width)
-            .unwrap_or(" ✓ Image updated.")
-            .to_string(),
+            Self::Done => {
+                const SHORTEST: &str = " ✓ Image updated.";
+                [
+                    " ✓ Sandbox image updated. Applies to new Sessions.",
+                    " ✓ Sandbox image updated.",
+                    SHORTEST,
+                ]
+                .into_iter()
+                .find(|text| text.width() <= width)
+                .map_or_else(|| cut(SHORTEST, width), str::to_string)
+            }
             Self::Cancelled => shorten(
                 " Update cancelled. Sessions keep the current image.",
                 &format!("  [{update}] update  [{hide}] dismiss"),
@@ -463,6 +466,7 @@ mod tests {
                 (default_gated.clone(), 40, vec![" Pulls are off. Run: docker pull", "…"], vec![]),
                 // Narrower than the keys: the whole line is cut to the width.
                 (PullLine::Cancelled, 12, vec!["…"], vec![update.as_str()]),
+                (PullLine::Done, 12, vec!["✓ Image", "…"], vec!["updated."]),
                 (PullLine::Running(downloading), 3, vec!["…"], vec![]),
                 (PullLine::Cancelled, 0, vec![], vec!["…"]),
             ];
