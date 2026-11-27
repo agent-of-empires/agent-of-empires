@@ -8017,14 +8017,14 @@ sandbox = "SANDBOX"
         };
         let manifest = |trust: &str| {
             format!(
-                "id = \"acme.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+                "id = \"aoe.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
                  api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
                  command = \"claude-next\"\n[agent_integrations.launch]\n\
                  oneshot_flag = \"-p\"\n{trust}"
             )
         };
 
-        crate::session::test_support::install_agent_plugin("acme.claude", &manifest(""));
+        crate::session::test_support::install_agent_plugin("aoe.claude", &manifest(""));
         assert!(crate::agents::get_agent("claude").is_none());
         trust("takeover");
         assert!(
@@ -8037,7 +8037,7 @@ sandbox = "SANDBOX"
             .exists());
 
         crate::session::test_support::install_agent_plugin(
-            "acme.claude",
+            "aoe.claude",
             &manifest(
                 "[agent_integrations.trust]\nfile = \".claude-next.json\"\n\
                  location = \"config_dir_or_home\"\npointer = \"/projects/{path}/trusted\"\n\
@@ -9168,10 +9168,10 @@ sandbox = "SANDBOX"
 
         let plugin = crate::plugin::plugins_dir()
             .unwrap()
-            .join("acme.omp-cutover");
+            .join("aoe.omp-cutover");
         fs::remove_dir_all(&plugin).unwrap();
         crate::session::update_config(|config| {
-            config.plugins.remove("acme.omp-cutover");
+            config.plugins.remove("aoe.omp-cutover");
         })
         .unwrap();
         crate::plugin::reload_registry();
@@ -9245,10 +9245,10 @@ sandbox = "SANDBOX"
 
         let plugin = crate::plugin::plugins_dir()
             .unwrap()
-            .join("acme.omp-cutover");
+            .join("aoe.omp-cutover");
         fs::remove_dir_all(&plugin).unwrap();
         crate::session::update_config(|config| {
-            config.plugins.remove("acme.omp-cutover");
+            config.plugins.remove("aoe.omp-cutover");
         })
         .unwrap();
         crate::plugin::reload_registry();

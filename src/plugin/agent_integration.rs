@@ -108,6 +108,26 @@ fn reserved_builtin(tool: &str) -> Option<&'static str> {
         .filter(|_| !super::bundled_agents::contains(tool))
 }
 
+/// Whether `entry` of an active `plugin` is a usable launch declaration. A
+/// bundled fallback is replaced only by a reserved-namespace API 21 launch
+/// declaration for its exact tool name; every other name is unrestricted.
+fn launch_declaration_applies(
+    plugin: &super::LoadedPlugin,
+    entry: &AgentIntegrationContribution,
+) -> bool {
+    if !super::bundled_agents::contains(&entry.tool) {
+        return true;
+    }
+    if plugin.manifest.api_version < 21 || entry.launch.is_none() || entry.command.is_none() {
+        return false;
+    }
+    if !plugin.manifest.id.is_reserved_namespace() {
+        warn_reserved(plugin.id(), &entry.tool, &entry.tool);
+        return false;
+    }
+    true
+}
+
 /// An active plugin-provided agent that does not collide with a built-in or custom agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginAgent<'a> {
@@ -161,12 +181,7 @@ pub fn catalog<'a, 'b, 'c>(
             .manifest
             .agent_integrations
             .iter()
-            .filter(move |entry| {
-                // Only the fallback's own tool is gated: the bundled contract is
-                // replaced solely by an API 21 launch declaration for that name.
-                !super::bundled_agents::contains(&entry.tool)
-                    || (plugin.manifest.api_version >= 21 && entry.launch.is_some())
-            })
+            .filter(move |entry| launch_declaration_applies(plugin, entry))
             .filter_map(move |entry| {
                 entry
                     .command
@@ -301,11 +316,11 @@ impl DeclaredAgent {
 /// Cheap enough to rule out a declaration before resolving config for it.
 pub(crate) fn registry_declares(registry: &super::PluginRegistry, tool: &str) -> bool {
     registry.active().any(|plugin| {
-        plugin
-            .manifest
-            .agent_integrations
-            .iter()
-            .any(|entry| entry.tool == tool && entry.command.is_some())
+        plugin.manifest.agent_integrations.iter().any(|entry| {
+            entry.tool == tool
+                && entry.command.is_some()
+                && launch_declaration_applies(plugin, entry)
+        })
     })
 }
 
@@ -348,12 +363,10 @@ pub(crate) fn declared_agent<'a>(
             continue;
         }
         for (entry_index, entry) in plugin.manifest.agent_integrations.iter().enumerate() {
-            if super::bundled_agents::contains(tool)
-                && (plugin.manifest.api_version < 21 || entry.launch.is_none())
+            if entry.tool == tool
+                && entry.command.is_some()
+                && launch_declaration_applies(plugin, entry)
             {
-                continue;
-            }
-            if entry.tool == tool && entry.command.is_some() {
                 if selected.is_some() {
                     return None;
                 }
@@ -1602,10 +1615,16 @@ send_keys_enter_delay_ms = {delay_ms}
         let dir = super::super::plugins_dir().unwrap().join(plugin_id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        // A reserved id loads only as a local dev plugin.
+        let reserved = aoe_plugin_api::PluginId::new(plugin_id.to_owned())
+            .unwrap()
+            .is_reserved_namespace();
         crate::session::update_config(|config| {
             config.plugins.insert(
                 plugin_id.to_string(),
                 PluginConfig {
+                    dev: reserved,
+                    source: reserved.then(|| "local".to_owned()),
                     grant: Some(CapabilityGrant {
                         manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
                             manifest.as_bytes(),
@@ -1633,7 +1652,7 @@ send_keys_enter_delay_ms = {delay_ms}
         let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
         let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let manifest = r#"
-id = "acme.omp"
+id = "aoe.omp"
 name = "OMP"
 version = "2.0.0"
 api_version = 21
@@ -1643,13 +1662,15 @@ command = "omp-next"
 [agent_integrations.launch]
 oneshot_flag = "-p"
 "#;
-        let dir = super::super::plugins_dir().unwrap().join("acme.omp");
+        let dir = super::super::plugins_dir().unwrap().join("aoe.omp");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
         crate::session::update_config(|config| {
             config.plugins.insert(
-                "acme.omp".into(),
+                "aoe.omp".into(),
                 crate::session::PluginConfig {
+                    dev: true,
+                    source: Some("local".into()),
                     grant: Some(crate::session::CapabilityGrant {
                         manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
                             manifest.as_bytes(),
@@ -1846,7 +1867,7 @@ oneshot_flag = "-p"
         ]);
         let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
         let manifest = r#"
-id = "acme.omp-owner"
+id = "aoe.omp-owner"
 name = "OMP integration"
 version = "1.0.0"
 api_version = 21
@@ -1873,7 +1894,7 @@ sandbox = "unsupported"
 [agent_integrations.detection]
 mode = "native_only"
 "#;
-        let dir = super::super::plugins_dir().unwrap().join("acme.omp-owner");
+        let dir = super::super::plugins_dir().unwrap().join("aoe.omp-owner");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
         let mut instance = Instance::new("omp-declaration", temp.path().to_str().unwrap());
@@ -1902,8 +1923,10 @@ mode = "native_only"
         fallback(); // Present but not approved.
         crate::session::update_config(|config| {
             config.plugins.insert(
-                "acme.omp-owner".into(),
+                "aoe.omp-owner".into(),
                 crate::session::PluginConfig {
+                    dev: true,
+                    source: Some("local".into()),
                     grant: Some(crate::session::CapabilityGrant {
                         manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
                             manifest.as_bytes(),
@@ -1949,14 +1972,14 @@ mode = "native_only"
             Some((crate::session::Status::Unknown, false))
         );
         crate::session::update_config(|config| {
-            config.plugins.get_mut("acme.omp-owner").unwrap().enabled = false;
+            config.plugins.get_mut("aoe.omp-owner").unwrap().enabled = false;
         })
         .unwrap();
         super::super::reload_registry();
         assert!(declared.while_current(|| ()).is_none());
         fallback();
         crate::session::update_config(|config| {
-            let plugin = config.plugins.get_mut("acme.omp-owner").unwrap();
+            let plugin = config.plugins.get_mut("aoe.omp-owner").unwrap();
             plugin.enabled = true;
             plugin.grant = None;
         })

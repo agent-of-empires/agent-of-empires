@@ -4212,7 +4212,7 @@ mod tests {
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _home = crate::session::test_support::isolate_app_dir();
         let manifest = r#"
-id = "acme.takeover"
+id = "aoe.takeover"
 name = "Takeover"
 version = "1.0.0"
 api_version = 21
@@ -4227,13 +4227,15 @@ instruction_flag = "--prompt={}"
 tool = "zzzeta"
 command = "zzzeta"
 "#;
-        let dir = crate::plugin::plugins_dir().unwrap().join("acme.takeover");
+        let dir = crate::plugin::plugins_dir().unwrap().join("aoe.takeover");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
         crate::session::update_config(|config| {
             config.plugins.insert(
-                "acme.takeover".into(),
+                "aoe.takeover".into(),
                 crate::session::PluginConfig {
+                    dev: true,
+                    source: Some("local".into()),
                     grant: Some(crate::session::CapabilityGrant {
                         manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
                             manifest.as_bytes(),

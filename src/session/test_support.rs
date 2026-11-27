@@ -532,7 +532,7 @@ pub(crate) fn launch_owed_handoff(
 pub(crate) fn install_omp_takeover(command: &str) {
     let manifest = format!(
         r#"
-id = "acme.omp-cutover"
+id = "aoe.omp-cutover"
 name = "OMP cutover"
 version = "1.0.0"
 api_version = 21
@@ -551,19 +551,25 @@ host = "pane_scoped"
 sandbox = "pane_scoped"
 "#
     );
-    install_agent_plugin("acme.omp-cutover", &manifest);
+    install_agent_plugin("aoe.omp-cutover", &manifest);
 }
 
-/// Installs an approved plugin from `manifest`. Bind an isolated app directory and
-/// `crate::plugin::ReloadRegistryOnDrop` around the caller.
+/// Installs an approved plugin from `manifest`; a reserved-namespace id installs as a
+/// local dev plugin, the only unverified way to load one. Bind an isolated app
+/// directory and `crate::plugin::ReloadRegistryOnDrop` around the caller.
 pub(crate) fn install_agent_plugin(id: &str, manifest: &str) {
     let dir = crate::plugin::plugins_dir().unwrap().join(id);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+    let reserved = aoe_plugin_api::PluginId::new(id.to_owned())
+        .unwrap()
+        .is_reserved_namespace();
     crate::session::update_config(|config| {
         config.plugins.insert(
             id.into(),
             crate::session::PluginConfig {
+                dev: reserved,
+                source: reserved.then(|| "local".to_owned()),
                 grant: Some(crate::session::CapabilityGrant {
                     manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
                     capabilities: Vec::new(),

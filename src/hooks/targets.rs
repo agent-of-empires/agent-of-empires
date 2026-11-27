@@ -537,8 +537,8 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir_at(app.path());
         let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         crate::session::test_support::install_agent_plugin(
-            "acme.claude",
-            "id = \"acme.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+            "aoe.claude",
+            "id = \"aoe.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
              api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
              command = \"claude-next\"\n[agent_integrations.launch]\noneshot_flag = \"-p\"\n",
         );

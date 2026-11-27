@@ -2289,13 +2289,13 @@ mod tests {
 
         let manifest = |trust: &str| {
             format!(
-                "id = \"acme.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+                "id = \"aoe.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
                  api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
                  command = \"claude-next\"\n[agent_integrations.launch]\n\
                  oneshot_flag = \"-p\"\n{trust}"
             )
         };
-        crate::session::test_support::install_agent_plugin("acme.claude", &manifest(""));
+        crate::session::test_support::install_agent_plugin("aoe.claude", &manifest(""));
         assert_eq!(trust(), (false, false));
         assert!(
             !record.exists(),
@@ -2303,7 +2303,7 @@ mod tests {
         );
 
         crate::session::test_support::install_agent_plugin(
-            "acme.claude",
+            "aoe.claude",
             &manifest(
                 "[agent_integrations.trust]\nfile = \".claude-next.json\"\n\
                  location = \"config_dir_or_home\"\npointer = \"/projects/{path}/trusted\"\n\
