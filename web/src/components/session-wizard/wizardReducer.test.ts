@@ -90,7 +90,7 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
 
   it("a remembered tool the list drops is reset without blocking a late defaults apply", () => {
     const state = makeState();
-    state.data.tool = "gone";
+    Object.assign(state.data, { tool: "gone", agentModel: "m", agentEffort: "high" });
     const reset = reducer(state, {
       type: "SET_AGENTS",
       agents: [],
@@ -98,7 +98,7 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
       agentsProject: "",
       resetTool: "claude",
     });
-    expect(reset.data).toMatchObject({ tool: "claude", profileDirty: false });
+    expect(reset.data).toMatchObject({ tool: "claude", agentModel: "", agentEffort: "", profileDirty: false });
     expect(reducer(reset, defaults({ yoloMode: true })).data.yoloMode).toBe(true);
   });
 

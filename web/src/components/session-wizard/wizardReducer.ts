@@ -320,7 +320,9 @@ function reduce(state: WizardState, action: Action): WizardState {
     case "SET_AGENTS":
       return {
         ...state,
-        data: action.resetTool ? { ...state.data, tool: action.resetTool } : state.data,
+        data: action.resetTool
+          ? { ...state.data, tool: action.resetTool, agentModel: "", agentEffort: "" }
+          : state.data,
         agents: action.agents,
         agentsStatus: "ready",
         agentsFor: action.agentsFor,
