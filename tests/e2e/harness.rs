@@ -425,6 +425,8 @@ pub struct TuiTestHarness {
     extra_env_remove: Vec<String>,
     /// Prepended to PATH ahead of the stub dir.
     extra_path_dirs: Vec<PathBuf>,
+    /// Replace the inherited system PATH with `<home>/sys-bin`.
+    isolate_host_path: bool,
     /// Stop structured view workers and attempt daemon shutdown during teardown.
     stop_daemon_on_drop: bool,
     /// When true, `install_acp_shim` bakes `FAKE_ACP_FORK_FAIL=1` into the shim
@@ -557,6 +559,7 @@ last_seen_version = "{}"
             ],
             extra_env_remove: Vec::new(),
             extra_path_dirs: Vec::new(),
+            isolate_host_path: false,
             stop_daemon_on_drop: false,
             acp_fork_fail: false,
         }
@@ -565,7 +568,11 @@ last_seen_version = "{}"
     /// Build the PATH with `extra_path_dirs` first, then the stub directory,
     /// so installed shims shadow the exit-0 stubs.
     fn env_path(&self) -> String {
-        let system_path = std::env::var("PATH").unwrap_or_default();
+        let system_path = if self.isolate_host_path {
+            self.home_path().join("sys-bin").display().to_string()
+        } else {
+            std::env::var("PATH").unwrap_or_default()
+        };
         let mut parts: Vec<String> = self
             .extra_path_dirs
             .iter()
@@ -574,6 +581,22 @@ last_seen_version = "{}"
         parts.push(self.stub_path.display().to_string());
         parts.push(system_path);
         parts.join(":")
+    }
+
+    /// Hide host-installed agent CLIs: the system PATH shrinks to symlinks for
+    /// the tools aoe needs, so tool auto-selection only sees the fake agent.
+    pub fn isolate_host_path(&mut self) {
+        let bin = self.home_path().join("sys-bin");
+        std::fs::create_dir_all(&bin).expect("create sys-bin");
+        let system_path = std::env::var_os("PATH").unwrap_or_default();
+        for tool in ["tmux", "git", "sh", "which"] {
+            let real = std::env::split_paths(&system_path)
+                .map(|dir| dir.join(tool))
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| panic!("{tool} not found on PATH"));
+            std::os::unix::fs::symlink(real, bin.join(tool)).expect("symlink system tool");
+        }
+        self.isolate_host_path = true;
     }
 
     /// Tear the TUI's own tmux session down so a test can `spawn_tui` again and assert on

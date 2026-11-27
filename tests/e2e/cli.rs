@@ -734,6 +734,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
         }
         if case.clear_default_tool {
             h.clear_default_tool();
+            h.isolate_host_path();
         }
         if !case.config.is_empty() {
             h.append_config(case.config);
