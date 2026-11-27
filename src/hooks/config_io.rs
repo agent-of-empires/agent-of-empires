@@ -86,7 +86,7 @@ pub(super) fn write_json(path: &Path, value: &Value) -> Result<()> {
 }
 
 /// Where a write to `path` lands: a symlink chain is followed even when it dangles,
-/// then a missing file resolves through its parent, so an alias of a directory or of
+/// then the nearest existing ancestor is resolved, so an alias of a directory or of
 /// a file not created yet is seen before the installer creates it.
 pub(super) fn resolved(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
@@ -98,12 +98,20 @@ pub(super) fn resolved(path: &Path) -> PathBuf {
         };
         current = current.parent().map_or(link.clone(), |dir| dir.join(&link));
     }
-    std::fs::canonicalize(&current)
-        .or_else(|error| {
-            let parent = std::fs::canonicalize(current.parent().ok_or(error)?)?;
-            Ok::<_, std::io::Error>(parent.join(current.file_name().unwrap_or_default()))
-        })
-        .unwrap_or(current)
+    // The nearest existing ancestor is resolved, and the components that do not exist
+    // yet are appended, so an alias above a missing directory is still seen.
+    let mut missing = Vec::new();
+    let mut base = current.as_path();
+    while std::fs::symlink_metadata(base).is_err() {
+        let (Some(name), Some(parent)) = (base.file_name(), base.parent()) else {
+            return current;
+        };
+        missing.push(name);
+        base = parent;
+    }
+    let mut resolved = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    resolved.extend(missing.iter().rev());
+    resolved
 }
 
 /// Parses a JSON config, treating malformed content as empty so a torn file

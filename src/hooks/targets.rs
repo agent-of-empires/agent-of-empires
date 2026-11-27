@@ -705,4 +705,30 @@ mod tests {
             &Default::default()
         ));
     }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn builtin_hook_ownership_sees_an_alias_above_missing_directories() {
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR", "CODEX_HOME"]);
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        // `.claude` does not exist, so only the alias can reveal the owner.
+        std::os::unix::fs::symlink(home, home.join("alias")).unwrap();
+
+        assert!(is_other_builtin_hook_path(
+            &home.join("alias/.claude/settings.json"),
+            "example",
+            home,
+            &[],
+            &Default::default()
+        ));
+        assert!(!is_other_builtin_hook_path(
+            &home.join("alias/.example/settings.json"),
+            "example",
+            home,
+            &[],
+            &Default::default()
+        ));
+    }
 }
