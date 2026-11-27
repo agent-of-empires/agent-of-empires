@@ -2570,7 +2570,7 @@ describe("SessionWizard suggestion source", () => {
     vi.mocked(fetchSettings).mockResolvedValue({ worktree: { enabled: false } } as never);
     renderWizard({ path: "/tmp/proj", tool: "claude", useWorktree: true });
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
-    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(await screen.findByText("Profile"));
     fireEvent.click(await screen.findByRole("radio", { name: /work/ }));
     await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
     await waitFor(() =>
