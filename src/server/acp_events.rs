@@ -3914,18 +3914,26 @@ mod tests {
                         .find(|row| row.id == id)
                         .unwrap()
                         .status = Status::Stopped;
-                    seed_acp_statuses(live.state.clone()).await;
-                    assert_eq!(
-                        live.state
-                            .instances
-                            .read()
-                            .await
-                            .iter()
-                            .find(|row| row.id == id)
-                            .unwrap()
-                            .status,
-                        Status::Running,
-                    );
+                    // The seed deliberately skips observations when an actor holds a guard.
+                    // Retry with a fresh fold while the fixture keeps the resource running.
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            seed_acp_statuses(live.state.clone()).await;
+                            if live
+                                .state
+                                .instances
+                                .read()
+                                .await
+                                .iter()
+                                .any(|row| row.id == id && row.status == Status::Running)
+                            {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("the seeded background task keeps the session running");
                     finish_projection_resource(&mut live, &path, false).await;
                     live.state.acp_control_cache.forget(&id);
                     seed_acp_statuses(live.state.clone()).await;
