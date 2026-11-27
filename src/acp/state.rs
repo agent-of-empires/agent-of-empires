@@ -1487,12 +1487,16 @@ impl AcpState {
             Event::RateLimitAutoResumed { .. } => self.heal_sidebar_phase(),
             Event::SessionContextReset { .. } => {
                 self.lifecycle_runs.clear();
+                self.pending_wakeup = None;
+                self.armed_monitor = None;
                 self.usage = None;
             }
             // Clears the conversation; adapter-scoped commands, modes and
             // selectors are never re-announced, so they stay.
             Event::SessionCleared => {
                 self.lifecycle_runs.clear();
+                self.pending_wakeup = None;
+                self.armed_monitor = None;
                 self.usage = None;
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
@@ -3184,6 +3188,30 @@ mod tests {
         assert!(worked(stopped("end")).armed_monitor.is_none());
         assert!(worked(prompt("hi")).armed_monitor.is_none());
         assert!(applied([armed(), prompt("hi")]).armed_monitor.is_none());
+    }
+
+    #[test]
+    fn a_reset_or_clear_drops_the_pending_wakeup_and_monitor() {
+        let scheduled = || {
+            [
+                Event::WakeupScheduled {
+                    at: Timestamp::now(),
+                    reason: None,
+                },
+                Event::MonitorArmed { description: None },
+            ]
+        };
+        for end in [
+            Event::SessionContextReset {
+                reason: "reset".into(),
+            },
+            Event::SessionCleared,
+        ] {
+            let mut s = applied(scheduled());
+            assert!(s.pending_wakeup.is_some() && s.armed_monitor.is_some());
+            s.apply_event(s.last_seq + 1, end).unwrap();
+            assert!(s.pending_wakeup.is_none() && s.armed_monitor.is_none());
+        }
     }
 
     #[test]
