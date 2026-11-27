@@ -1389,6 +1389,7 @@ mod tests {
                 let id = live.id().to_owned();
                 reap_orphaned_turn_runner(&mut live).await;
                 assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(true));
+                let launch_guard = live.state.instance_lock(&id).await.lock_owned().await;
                 let trigger = trigger_resume_background(&live.state.session_service, &id,
                     crate::process::worker_registry::ResumeAuthority::Explicit, crate::server::sandbox_login::LaunchOrigin::Interactive, None).await.unwrap();
                 assert!(matches!(trigger, ResumeTrigger::Started));
@@ -1401,6 +1402,7 @@ mod tests {
                     }
                 }).await.expect("the admitted wake closes the genuine orphan before replacement");
                 assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(false));
+                stop_orphan_replacement_before_spawn(&live.state, &id, launch_guard).await;
             })).await;
         }
     }
@@ -1435,6 +1437,7 @@ mod tests {
                 assert!(!live.state.acp_supervisor.is_running(&id).await, "nothing spawned");
                 live.state.acp_event_store.test_set_unavailable(false);
                 assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(true));
+                let launch_guard = live.state.instance_lock(&id).await.lock_owned().await;
                 let trigger = trigger_resume_background(&live.state.session_service, &id, authority, crate::server::sandbox_login::LaunchOrigin::Interactive, None).await.unwrap();
                 assert!(matches!(trigger, ResumeTrigger::Started));
                 tokio::time::timeout(Duration::from_secs(10), async {
@@ -1446,7 +1449,38 @@ mod tests {
                     }
                 }).await.expect("recovery closes the actual orphan rather than losing its history");
                 assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(false));
+                stop_orphan_replacement_before_spawn(&live.state, &id, launch_guard).await;
         })).await;
+    }
+
+    async fn stop_orphan_replacement_before_spawn(
+        state: &AppState,
+        id: &str,
+        launch_guard: tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        // These tests cover orphan closure, not a replacement conversation handshake.
+        let generation = {
+            let mut rows = state.instances.write().await;
+            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+            let generation = row.lifecycle_generation;
+            row.lifecycle_generation += 1;
+            generation
+        };
+        drop(launch_guard);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while state.acp_supervisor.worker_state(id).await
+                == crate::daemon::AcpWorkerState::Resuming
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replacement launch settles before fixture teardown");
+        let mut rows = state.instances.write().await;
+        rows.iter_mut()
+            .find(|row| row.id == id)
+            .unwrap()
+            .lifecycle_generation = generation;
     }
 
     /// A session that left the live set after the snapshot is never spawned.
