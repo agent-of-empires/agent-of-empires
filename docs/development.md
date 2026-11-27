@@ -63,7 +63,7 @@ AOE_TERMINAL_TRACE=1 cargo run
 aoe logs
 ```
 
-`cargo xtask dev` runs a debug backend on 8081 built without the `web` feature (API only; Vite serves the dashboard) and Vite with HMR on 5173; `--watch` rebuilds and restarts the backend when Rust inputs change, leaving the previous backend running if a rebuild fails.
+`cargo xtask dev` runs a `--features web` debug backend on 8081, without the embedded bundle, and Vite with HMR on 5173; `--watch` rebuilds and restarts the backend when Rust inputs change, leaving the previous backend running if a rebuild fails.
 
 Use explicit dotted tracing area targets so per-target logging overrides affect
 native and dashboard failures consistently. Every `target:` root used in `src/`

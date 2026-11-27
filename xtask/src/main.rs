@@ -66,12 +66,22 @@ fn run_dev(_args: DevArgs) {
     std::process::exit(1);
 }
 
+/// Vite serves the dashboard, so an empty `AOE_WEB_DIST` skips the npm bundle
+/// while `web` keeps `aoe.web` registered.
 #[cfg(unix)]
-fn build_backend() -> bool {
+fn build_backend(target_dir: &Path) -> bool {
     use std::process::Command;
-    eprintln!("[xtask dev] building aoe...");
+    let empty_dist = target_dir.join("xtask-empty-web-dist");
+    if let Err(e) = fs::create_dir_all(&empty_dist) {
+        eprintln!("[xtask dev] failed to create {}: {e}", empty_dist.display());
+        return false;
+    }
+    eprintln!(
+        "[xtask dev] building aoe --features web (bundle skipped, Vite serves the dashboard)..."
+    );
     Command::new("cargo")
-        .arg("build")
+        .args(["build", "--features", "web"])
+        .env("AOE_WEB_DIST", empty_dist)
         .status()
         .map(|s| s.success())
         .unwrap_or_else(|e| {
@@ -174,7 +184,9 @@ fn run_dev(args: DevArgs) {
         std::process::exit(1);
     }
 
-    if !build_backend() {
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
+    let target_dir = Path::new(&target_dir);
+    if !build_backend(target_dir) {
         std::process::exit(1);
     }
 
@@ -190,8 +202,7 @@ fn run_dev(args: DevArgs) {
         }
     }
 
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
-    let bin = Path::new(&target_dir).join("debug").join("aoe");
+    let bin = target_dir.join("debug").join("aoe");
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -348,7 +359,7 @@ fn run_dev(args: DevArgs) {
                 if Instant::now() >= at {
                     rebuild_at = None;
                     eprintln!("[xtask dev] change detected; rebuilding aoe...");
-                    if build_backend() {
+                    if build_backend(target_dir) {
                         if let Some(mut old) = serve.take() {
                             terminate_group(&mut old, Duration::from_secs(2));
                         }
