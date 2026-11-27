@@ -1091,11 +1091,10 @@ function AppContent({
     revision,
     refresh: refreshDiffFiles,
     scope: diffScope,
-    lastTurnAt,
   } = useDiffFiles(activeSessionId, diffPanelActive, requestedDiffScope);
   const diffScopeState = useMemo<DiffScopeState>(
-    () => ({ scope: diffScope, requested: requestedDiffScope, lastTurnAt, onChange: pickDiffScope }),
-    [diffScope, requestedDiffScope, lastTurnAt, pickDiffScope],
+    () => ({ scope: diffScope, onChange: pickDiffScope }),
+    [diffScope, pickDiffScope],
   );
   // Dock tabs name a count beside the label, as Conductor's `Changes 74` does.
   const dockDescriptor = useCallback(

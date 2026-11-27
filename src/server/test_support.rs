@@ -308,7 +308,6 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
             entries: HashMap::new(),
         }),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
-        turn_snapshots: Default::default(),
         remote_owner_cache: RwLock::new(HashMap::new()),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
         lifecycle: crate::server::lifecycle_feed::LifecycleFeed::new(),

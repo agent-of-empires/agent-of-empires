@@ -133,7 +133,7 @@
         "web/src/hooks/useFileContents.ts",
         "web/src/lib/diffScope.ts"
       ],
-      "notes": "Branch, Uncommitted and Last turn switch the file list and the viewer's request scope; the base picker shows only for Branch. Last turn is disabled with its reason until the server reports a turn snapshot, and a refused Last turn request falls back to Branch. The pick is remembered per Session in this browser. Server scopes are covered by git::diff and server::api::sessions Rust tests."
+      "notes": "Branch and Uncommitted switch the file list and the viewer's request scope; the base picker shows only for Branch. The pick is remembered per Session in this browser. Server scopes are covered by git::diff and server::api::sessions Rust tests."
     },
     {
       "id": "dock.review-panel",

@@ -276,8 +276,6 @@ pub struct AppState {
     /// burst of file switches reuses one branch scan. See `ChangedFilesEntry`.
     pub(super) changed_files_cache:
         std::sync::RwLock<std::collections::HashMap<(String, String), ChangedFilesEntry>>,
-    /// Each session's working tree when its latest turn started. See `turn_snapshot`.
-    pub(crate) turn_snapshots: crate::server::turn_snapshot::TurnSnapshots,
     /// Broadcasts session status transitions to consumers (currently the
     /// push-notification module). Emitted from `status_poll_loop` after
     /// each tmux scrape when `old != new`. Keep the Sender around even
@@ -444,7 +442,6 @@ impl AppState {
             match base {
                 DiffBase::Branch(branch) => format!("branch:{branch}"),
                 DiffBase::Head => "head".to_string(),
-                DiffBase::Tree(oid) => format!("tree:{oid}"),
             },
         );
         if let Ok(cache) = self.changed_files_cache.read() {

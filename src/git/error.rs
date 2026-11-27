@@ -32,9 +32,6 @@ pub enum GitError {
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-
-    #[error("{files} new or changed files ({bytes} bytes) exceed the working tree snapshot limit")]
-    SnapshotTooLarge { files: usize, bytes: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, GitError>;

@@ -944,9 +944,7 @@ Read-only and CityHall modes return 403. Escaping paths, binary files, and unver
 
 ## GET /api/sessions/{id}/diff/files and /diff/file
 
-Both take `?scope=` for what the working tree is compared against: `branch` (the default) is the merge-base with the session's diff base branch, `uncommitted` is HEAD, and `last_turn` is the working tree recorded when the agent's latest turn started. `/diff/file` also takes `?path=` and, for a workspace session, `?repo=`.
-
-The `/diff/files` response carries `last_turn_at`, when that recording was taken, and omits it while the latest turn has none; a client offers the Last turn scope only when it is set. A `last_turn` request for a session with no recording returns `409` with `AoE-Error-Code: no_turn_snapshot`. A workspace repo the recording missed is named in the response's `warning` instead of listing files. How the recording is taken, and what it writes to the repo's object store, is in the [dashboard guide](guides/web/dashboard.md).
+Both take `?scope=` for what the working tree is compared against: `branch` (the default) is the merge-base with the session's diff base branch, and `uncommitted` is HEAD. Any other value is a `400`. `/diff/file` also takes `?path=` and, for a workspace session, `?repo=`.
 
 ## POST /api/sessions/{id}/send
 

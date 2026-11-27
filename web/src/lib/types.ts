@@ -255,8 +255,6 @@ export interface RepoBase {
 
 export interface RichDiffFilesResponse {
   files: RichDiffFile[];
-  /** When the agent's latest turn started, if the Daemon snapshotted the tree then. */
-  last_turn_at?: string | null;
   /** One entry per repo; workspace members can have different defaults. */
   per_repo_bases: RepoBase[];
   warning: string | null;

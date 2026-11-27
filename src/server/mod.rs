@@ -56,7 +56,6 @@ mod test_helpers;
 pub mod test_support;
 pub(crate) mod token;
 pub mod tunnel;
-pub(crate) mod turn_snapshot;
 
 /// Re-export of the broadcast frame defined in `crate::acp::protocol`, kept under
 /// `crate::server::` so existing supervisor/WS call sites keep resolving without churn.

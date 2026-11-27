@@ -3,16 +3,12 @@ import { createContext, useContext } from "react";
 import { safeGetItem, safeSetItem } from "./safeStorage";
 
 /** What the Diff pane compares the working tree against; the server's `?scope=`. */
-export type DiffScope = "branch" | "uncommitted" | "last_turn";
+export type DiffScope = "branch" | "uncommitted";
 
 export const DIFF_SCOPES: readonly { scope: DiffScope; label: string; title: string }[] = [
   { scope: "branch", label: "Branch", title: "Changes on this branch since it left its base" },
   { scope: "uncommitted", label: "Uncommitted", title: "Changes not yet committed" },
-  { scope: "last_turn", label: "Last turn", title: "Changes since the agent's latest turn started" },
 ];
-
-// The Daemon has no baseline: no turn since it started, or the latest turn came too soon after the last or its repo was too large to record.
-export const NO_LAST_TURN = "No recorded start for the latest turn";
 
 // Per-browser view state, like the open file: which comparison this browser is looking at for each
 // Session. The base branch it compares against stays a Daemon setting.
@@ -51,17 +47,11 @@ export function sweepOrphanDiffScopes(live: ReadonlySet<string>): void {
 export interface DiffScopeState {
   /** The scope the file list and viewer show now. */
   scope: DiffScope;
-  /** The scope the user picked, which falls back to Branch while Last turn has no snapshot. */
-  requested: DiffScope;
-  /** When the latest turn's snapshot was taken; null hides Last turn behind {@link NO_LAST_TURN}. */
-  lastTurnAt: string | null;
   onChange?: (scope: DiffScope) => void;
 }
 
 export const DiffScopeContext = createContext<DiffScopeState>({
   scope: "branch",
-  requested: "branch",
-  lastTurnAt: null,
 });
 
 export function useDiffScopeContext(): DiffScopeState {

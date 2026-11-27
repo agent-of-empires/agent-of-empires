@@ -14,9 +14,8 @@ interface UseDiffFilesResult {
   loading: boolean;
   revision: number;
   refresh: () => void;
-  /** The scope the files were computed for: Branch while a requested Last turn has no snapshot. */
+  /** The scope the shown files were computed for. */
   scope: DiffScope;
-  lastTurnAt: string | null;
 }
 
 export function useDiffFiles(
@@ -26,7 +25,6 @@ export function useDiffFiles(
 ): UseDiffFilesResult {
   const [files, setFiles] = useState<RichDiffFile[]>([]);
   const [scope, setScope] = useState<DiffScope>(requestedScope);
-  const [lastTurnAt, setLastTurnAt] = useState<string | null>(null);
   const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>(DEFAULT_BASES);
   const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -42,14 +40,8 @@ export function useDiffFiles(
     const capturedSessionId = sessionId;
     if (capturedSessionId !== currentSessionIdRef.current) return;
     const reqId = ++requestIdRef.current;
-    let shown = requestedScope;
-    let resp = await getSessionDiffFiles(capturedSessionId, shown);
-    // Only a missing baseline falls back to Branch; any other failure keeps the shown comparison.
-    if (resp === "no_turn_snapshot") {
-      shown = "branch";
-      resp = await getSessionDiffFiles(capturedSessionId, shown);
-    }
-    if (resp === "no_turn_snapshot") resp = null;
+    const shown = requestedScope;
+    const resp = await getSessionDiffFiles(capturedSessionId, shown);
     if (reqId !== requestIdRef.current || capturedSessionId !== currentSessionIdRef.current) return;
     if (resp) {
       // Include bases and warning: a base change can leave the file list identical (#3329).
@@ -58,12 +50,10 @@ export function useDiffFiles(
         per_repo_bases: resp.per_repo_bases,
         warning: resp.warning ?? null,
         scope: shown,
-        last_turn_at: resp.last_turn_at ?? null,
       });
       if (fingerprint !== lastFingerprintRef.current) {
         lastFingerprintRef.current = fingerprint;
         setScope(shown);
-        setLastTurnAt(resp.last_turn_at ?? null);
         setFiles(resp.files);
         setPerRepoBases(resp.per_repo_bases);
         setWarning(resp.warning ?? null);
@@ -83,7 +73,6 @@ export function useDiffFiles(
     setFiles([]);
     setPerRepoBases(DEFAULT_BASES);
     setWarning(null);
-    setLastTurnAt(null);
     if (sessionId === null) {
       setLoading(false);
       setRevision(0);
@@ -121,6 +110,5 @@ export function useDiffFiles(
     revision,
     refresh: fetchFiles,
     scope,
-    lastTurnAt,
   };
 }

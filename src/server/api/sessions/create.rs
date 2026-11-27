@@ -2402,8 +2402,7 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, S
             | GitError::CloneFailed(_)
             | GitError::WorktreeNotFound(_)
             | GitError::Git2Error(_)
-            | GitError::IoError(_)
-            | GitError::SnapshotTooLarge { .. } => {}
+            | GitError::IoError(_) => {}
         }
     }
     ("create_failed", "Failed to create session".to_string())

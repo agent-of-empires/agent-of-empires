@@ -8069,10 +8069,10 @@ async fn handlers_take_instance_lock_before_snapshot() {
     }
 }
 
-/// `?scope=` picks what the working tree is compared against; Last turn needs a turn snapshot.
+/// `?scope=` picks what the working tree is compared against.
 #[tokio::test]
 #[serial_test::serial]
-async fn diff_scopes_compare_against_the_branch_head_or_last_turn() {
+async fn diff_scopes_compare_against_the_branch_or_head() {
     use axum::body::to_bytes;
     use axum::extract::Query;
 
@@ -8115,79 +8115,20 @@ async fn diff_scopes_compare_against_the_branch_head_or_last_turn() {
                         .collect()
                 })
                 .unwrap_or_default();
-            (status, paths, body["last_turn_at"].is_string())
+            (status, paths)
         }
     };
     assert_eq!(
         files(DiffScope::Branch).await,
         (
             StatusCode::OK,
-            vec!["before.txt".into(), "branch.txt".into()],
-            false
+            vec!["before.txt".into(), "branch.txt".into()]
         )
     );
     assert_eq!(
         files(DiffScope::Uncommitted).await,
-        (StatusCode::OK, vec!["before.txt".into()], false)
+        (StatusCode::OK, vec!["before.txt".into()])
     );
-    assert_eq!(files(DiffScope::LastTurn).await.0, StatusCode::CONFLICT);
-
-    let tree = crate::git::diff::snapshot_worktree(dir.path()).unwrap();
-    state.turn_snapshots.write().unwrap().insert(
-        id.clone(),
-        crate::server::turn_snapshot::TurnSnapshot {
-            at: crate::time::Timestamp::now(),
-            trees: [(dir.path().to_str().unwrap().to_string(), tree)].into(),
-        },
-    );
-    std::fs::write(dir.path().join("during.txt"), "during\n").unwrap();
-    // The scan cache keys on the base, so the new file shows despite the short TTL.
-    assert_eq!(
-        files(DiffScope::LastTurn).await,
-        (StatusCode::OK, vec!["during.txt".into()], true)
-    );
-
-    let resp = session_diff_file(
-        State(state.clone()),
-        Path(id.clone()),
-        Query(FileDiffQuery {
-            path: "during.txt".into(),
-            repo: None,
-            scope: DiffScope::LastTurn,
-        }),
-    )
-    .await
-    .into_response();
-    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        (body["old_content"].as_str(), body["new_content"].as_str()),
-        (Some(""), Some("during\n"))
-    );
-
-    // A repo the snapshot missed is flagged, not reported as clean.
-    state.turn_snapshots.write().unwrap().insert(
-        id.clone(),
-        crate::server::turn_snapshot::TurnSnapshot {
-            at: crate::time::Timestamp::now(),
-            trees: [("/elsewhere".to_string(), tree)].into(),
-        },
-    );
-    let resp = session_diff_files(
-        State(state.clone()),
-        Path(id.clone()),
-        Query(DiffFilesQuery {
-            scope: DiffScope::LastTurn,
-        }),
-    )
-    .await
-    .into_response();
-    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["files"], serde_json::json!([]));
-    assert!(body["warning"]
-        .as_str()
-        .is_some_and(|w| w.contains("no Last turn baseline")));
 }
 
 /// An unknown scope is a client error, not a silent Branch diff.
@@ -8198,7 +8139,8 @@ fn an_unknown_diff_scope_is_rejected() {
         axum::extract::Query::<DiffFilesQuery>::try_from_uri(&uri).map(|q| q.0.scope)
     };
     assert_eq!(parse("").unwrap(), DiffScope::Branch);
-    assert_eq!(parse("scope=last_turn").unwrap(), DiffScope::LastTurn);
+    assert_eq!(parse("scope=uncommitted").unwrap(), DiffScope::Uncommitted);
+    assert!(parse("scope=last_turn").is_err());
     assert!(parse("scope=yesterday").is_err());
 }
 

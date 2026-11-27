@@ -88,8 +88,6 @@ pub enum DiffBase<'a> {
     Branch(&'a str),
     /// HEAD, so only uncommitted changes show.
     Head,
-    /// A tree recorded earlier by [`snapshot_worktree`].
-    Tree(git2::Oid),
 }
 
 fn base_tree<'r>(repo: &'r git2::Repository, base: DiffBase<'_>) -> Result<git2::Tree<'r>> {
@@ -103,58 +101,7 @@ fn base_tree<'r>(repo: &'r git2::Repository, base: DiffBase<'_>) -> Result<git2:
             }
             Err(e) => Err(e.into()),
         },
-        DiffBase::Tree(oid) => Ok(repo.find_tree(oid)?),
     }
-}
-
-/// The most new or changed content [`snapshot_worktree`] writes: a turn's baseline that would
-/// copy more, such as build output nobody ignored, is refused rather than taken in part.
-pub const SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
-pub const SNAPSHOT_MAX_FILES: usize = 20_000;
-
-/// The working tree as a tree object, untracked files included and ignored ones not.
-///
-/// Like `git stash create`, it stages into a copy of the index that is never saved, so the user's
-/// index, refs and stash are untouched; only the tree and its new blobs are written to the object
-/// store, unreferenced until garbage collection. Fails with [`GitError::SnapshotTooLarge`] past
-/// [`SNAPSHOT_MAX_FILES`] or [`SNAPSHOT_MAX_BYTES`] of new or changed files, before writing any.
-pub fn snapshot_worktree(repo_path: &Path) -> Result<git2::Oid> {
-    snapshot_worktree_within(repo_path, SNAPSHOT_MAX_FILES, SNAPSHOT_MAX_BYTES)
-}
-
-fn snapshot_worktree_within(
-    repo_path: &Path,
-    max_files: usize,
-    max_bytes: u64,
-) -> Result<git2::Oid> {
-    let repo = super::open_repo_at(repo_path)?;
-    let mut opts = git2::StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_ignored(false);
-    let changed = git2::Status::WT_NEW | git2::Status::WT_MODIFIED | git2::Status::WT_TYPECHANGE;
-    let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?.to_path_buf();
-    let (mut files, mut bytes) = (0usize, 0u64);
-    for entry in repo.statuses(Some(&mut opts))?.iter() {
-        if !entry.status().intersects(changed) {
-            continue;
-        }
-        files += 1;
-        // Bytes, not `path()`, so a non-UTF-8 name still counts toward the bound.
-        #[cfg(unix)]
-        let path =
-            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(entry.path_bytes());
-        #[cfg(not(unix))]
-        let path = String::from_utf8_lossy(entry.path_bytes()).into_owned();
-        bytes += std::fs::symlink_metadata(workdir.join(path)).map_or(0, |m| m.len());
-        if files > max_files || bytes > max_bytes {
-            return Err(GitError::SnapshotTooLarge { files, bytes });
-        }
-    }
-    let mut index = repo.index()?;
-    index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
-    index.update_all(["*"], None)?;
-    Ok(index.write_tree()?)
 }
 
 /// Changed files between a base branch and the working directory, from the
@@ -177,13 +124,8 @@ pub fn compute_changed_files_against(
     opts.include_untracked(true);
     opts.recurse_untracked_dirs(true);
 
-    // Base tree to working directory. A commit base goes through the index, as `git diff <base>`
-    // does. A snapshot holds untracked files the index lacks, which would read as deleted then
-    // re-added, so it compares the working directory directly.
-    let diff = match base {
-        DiffBase::Tree(_) => repo.diff_tree_to_workdir(Some(&base_tree), Some(&mut opts))?,
-        _ => repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))?,
-    };
+    // Base tree to working directory through the index, as `git diff <base>` does.
+    let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))?;
 
     // Find renames/copies
     let mut find_opts = git2::DiffFindOptions::new();
@@ -907,15 +849,6 @@ mod tests {
         fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
         fs::write(dir.path().join("ignored.txt"), "never\n").unwrap();
 
-        let index_before = fs::read(dir.path().join(".git/index")).unwrap();
-        let snapshot = snapshot_worktree(dir.path()).unwrap();
-        // Staging into a copy leaves the user's index, stash and refs as they were.
-        assert_eq!(
-            fs::read(dir.path().join(".git/index")).unwrap(),
-            index_before
-        );
-        assert!(repo.find_reference("refs/stash").is_err());
-        fs::write(dir.path().join("untracked.txt"), "new\nedited this turn\n").unwrap();
         fs::write(dir.path().join("turn.txt"), "made this turn\n").unwrap();
         fs::remove_file(dir.path().join("test.txt")).unwrap();
 
@@ -946,24 +879,6 @@ mod tests {
                 ("untracked.txt".into(), Untracked),
             ]
         );
-        assert_eq!(
-            paths(DiffBase::Tree(snapshot)),
-            [
-                ("test.txt".into(), Deleted),
-                ("turn.txt".into(), Untracked),
-                ("untracked.txt".into(), Modified),
-            ]
-        );
-        let contents = compute_file_contents_against(
-            dir.path(),
-            Path::new("untracked.txt"),
-            DiffBase::Tree(snapshot),
-        )
-        .unwrap();
-        assert_eq!(
-            (contents.old_content.as_str(), contents.new_content.as_str()),
-            ("new\n", "new\nedited this turn\n")
-        );
     }
 
     #[test]
@@ -983,41 +898,6 @@ mod tests {
         )
         .unwrap();
         assert!(compute_changed_files_against(dir.path(), DiffBase::Head).is_err());
-    }
-
-    #[test]
-    fn a_snapshot_past_its_limit_is_refused_before_writing_anything() {
-        let (dir, repo) = setup_test_repo();
-        fs::write(dir.path().join("big.bin"), vec![7u8; 4096]).unwrap();
-        let blob = git2::Oid::hash_object(git2::ObjectType::Blob, &[7u8; 4096]).unwrap();
-        for (max_files, max_bytes) in [(0, u64::MAX), (usize::MAX, 4095)] {
-            assert!(matches!(
-                snapshot_worktree_within(dir.path(), max_files, max_bytes),
-                Err(GitError::SnapshotTooLarge { .. })
-            ));
-            assert!(
-                repo.find_blob(blob).is_err(),
-                "{max_files} files, {max_bytes} bytes"
-            );
-        }
-        snapshot_worktree_within(dir.path(), 1, 4096).unwrap();
-        assert!(repo.find_blob(blob).is_ok());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_non_utf8_name_counts_toward_the_snapshot_limit() {
-        use std::os::unix::ffi::OsStrExt;
-        let (dir, _repo) = setup_test_repo();
-        let name = std::ffi::OsStr::from_bytes(b"big\xff.bin");
-        if fs::write(dir.path().join(name), vec![7u8; 4096]).is_err() {
-            eprintln!("skipping: the filesystem refuses non-UTF-8 names");
-            return;
-        }
-        assert!(matches!(
-            snapshot_worktree_within(dir.path(), usize::MAX, 4095),
-            Err(GitError::SnapshotTooLarge { .. })
-        ));
     }
 
     /// Only tracked blobs are served: an untracked secret (#1810) and `.git`
