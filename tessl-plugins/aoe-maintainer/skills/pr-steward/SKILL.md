@@ -141,15 +141,17 @@ For each PR with `mergeable` `CONFLICTING` whose author is not a bot
 ## 4. Rerun known flaky failures
 
 Load the known flaky issues once. A flaky issue is known when it is open,
-has `flaky` in its title, and its author's user id is in `MAINTAINER_IDS`.
-An issue written by `$ME` or by any bot never authorizes a rerun:
+has `flaky` in its title, and its author is a maintainer (user id in
+`MAINTAINER_IDS`) or `$ME`, which files flaky-hunt's issues. Reruns run
+only a same-repo PR's own code, so a flaky-hunt issue fed by fork runs
+can cost at most one extra CI run:
 
 ```sh
 gh api -X GET search/issues --paginate --slurp \
   -f q="repo:$REPO is:issue is:open flaky in:title" -f per_page=100 \
   | jq --arg ids "$MAINTAINER_IDS" --arg me "$ME" '[.[].items[]
-      | select(.user.login != $me and .user.type != "Bot")
-      | select((.user.id | tostring) as $id | $ids | split(" ") | index($id))
+      | select(.user.login == $me
+          or ((.user.id | tostring) as $id | $ids | split(" ") | index($id)))
       | {number, title, body}]'
 ```
 
