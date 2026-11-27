@@ -261,20 +261,32 @@ pub(crate) fn run_with_timeout_limit(
     label: &str,
     max_stdout_bytes: usize,
 ) -> Result<Vec<u8>> {
-    run_with_deadline_limit(
+    capture_stdout(
         cmd,
         std::time::Instant::now() + timeout,
         label,
         max_stdout_bytes,
+        false,
     )
 }
 
 /// The caller's deadline covers command execution and stdout delivery.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn run_with_deadline_limit(
+    cmd: std::process::Command,
+    deadline: std::time::Instant,
+    label: &str,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>> {
+    capture_stdout(cmd, deadline, label, max_stdout_bytes, true)
+}
+
+fn capture_stdout(
     mut cmd: std::process::Command,
     deadline: std::time::Instant,
     label: &str,
     max_stdout_bytes: usize,
+    require_complete_stdout: bool,
 ) -> Result<Vec<u8>> {
     anyhow::ensure!(std::time::Instant::now() < deadline, "{} timed out", label);
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
@@ -288,9 +300,8 @@ pub(crate) fn run_with_deadline_limit(
         let mut buf = Vec::new();
         let result = stdout_pipe
             .take(max_stdout_bytes.saturating_add(1) as u64)
-            .read_to_end(&mut buf)
-            .map(|_| buf);
-        let _ = stdout_tx.send(result);
+            .read_to_end(&mut buf);
+        let _ = stdout_tx.send((buf, result));
     });
 
     let status = loop {
@@ -316,9 +327,15 @@ pub(crate) fn run_with_deadline_limit(
     // A grandchild holding the stdout pipe would block the drain forever, so it
     // is bounded by the remaining deadline and the reader thread is left detached.
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let stdout_bytes = stdout_rx
-        .recv_timeout(remaining)
-        .with_context(|| format!("Failed to collect {} stdout before deadline", label))??;
+    let stdout = stdout_rx.recv_timeout(remaining);
+    let stdout_bytes = if require_complete_stdout {
+        let (bytes, result) = stdout
+            .with_context(|| format!("Failed to collect {} stdout before deadline", label))?;
+        result.with_context(|| format!("Failed to read {} stdout", label))?;
+        bytes
+    } else {
+        stdout.map(|(bytes, _)| bytes).unwrap_or_default()
+    };
     if stdout_bytes.len() > max_stdout_bytes {
         anyhow::bail!("{} exceeded its stdout limit", label);
     }
@@ -509,39 +526,54 @@ mod tests {
                 .is_empty()
         );
 
-        let fifo = directory.path().join("release");
-        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
-        let _reader = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&fifo)
-            .unwrap();
-        let mut release = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-        let finished = directory.path().join("stdout-closed");
-        let mut command = std::process::Command::new("sh");
-        command
-            .args([
-                "-c",
-                "(IFS= read -r release < \"$1\"; exec 1>&-; : > \"$2\") & printf done",
-                "sh",
-            ])
-            .arg(&fifo)
-            .arg(&finished);
-        let result = run_with_timeout_limit(command, Duration::from_millis(500), "held-pipe", 1024);
-        writeln!(release, "release").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !finished.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "the pipe holder must close stdout"
-            );
-            std::thread::yield_now();
+        for strict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let fifo = directory.path().join("release");
+            let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+            let _reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap();
+            let mut release = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            let finished = directory.path().join("stdout-closed");
+            let mut command = std::process::Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "(IFS= read -r release < \"$1\"; exec 1>&-; : > \"$2\") & printf done",
+                    "sh",
+                ])
+                .arg(&fifo)
+                .arg(&finished);
+            let timeout = Duration::from_millis(500);
+            let result = if strict {
+                run_with_deadline_limit(command, Instant::now() + timeout, "held-pipe", 1024)
+            } else {
+                run_with_timeout_limit(command, timeout, "held-pipe", 1024)
+            };
+            writeln!(release, "release").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !finished.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the pipe holder must close stdout"
+                );
+                std::thread::yield_now();
+            }
+            if strict {
+                let error = result.expect_err("missing stdout must not certify an empty census");
+                assert!(
+                    error.to_string().contains("stdout before deadline"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    result.unwrap().is_empty(),
+                    "legacy capture tolerates a held pipe"
+                );
+            }
         }
-        let error = result.expect_err("missing stdout must not become a successful empty census");
-        assert!(
-            error.to_string().contains("stdout before deadline"),
-            "{error}"
-        );
     }
 }

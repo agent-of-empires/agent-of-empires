@@ -9,6 +9,23 @@ pub(super) use super::unix::{
     restore_environment_value, terminate_process_group, try_wait_group_status,
 };
 
+pub(super) fn reopen_terminal_fd(
+    fd: std::os::fd::BorrowedFd<'_>,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut path = [0; 4096];
+    // SAFETY: the buffer is writable and larger than Darwin's MAXPATHLEN.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let path = std::ffi::CStr::from_bytes_until_nul(&path)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    super::unix::open_terminal_path(std::path::Path::new(std::ffi::OsStr::from_bytes(
+        path.to_bytes(),
+    )))
+}
+
 pub(super) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
 {
     std::iter::once(("pbcopy", &[] as &'static [&'static str]))

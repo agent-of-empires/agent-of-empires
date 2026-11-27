@@ -11,6 +11,12 @@ pub(super) use super::unix::{
     restore_environment_value, terminate_process_group, try_wait_group_status,
 };
 
+pub(super) fn reopen_terminal_fd(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    super::unix::open_terminal_path(Path::new(&path))
+}
+
 /// Mount points of this mount namespace; an error when `/proc` is unavailable.
 pub(crate) fn mount_points() -> std::io::Result<std::collections::HashSet<std::path::PathBuf>> {
     read_mount_points(Path::new("/proc/self/mountinfo"))

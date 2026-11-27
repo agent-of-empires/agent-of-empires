@@ -1,28 +1,51 @@
 use std::process::{Child, Command};
 
 pub(super) fn independent_terminal_output() -> std::io::Result<std::fs::File> {
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
-    use std::os::unix::fs::MetadataExt;
+    use std::os::fd::{AsFd, AsRawFd};
+    let stdout = std::io::stdout();
+    let output = stdout.as_fd();
     let mut name = [0 as libc::c_char; 4096];
     // SAFETY: ttyname_r writes only into the supplied live buffer.
-    let error = unsafe { libc::ttyname_r(libc::STDOUT_FILENO, name.as_mut_ptr(), name.len()) };
-    if error != 0 {
-        return Err(std::io::Error::from_raw_os_error(error));
-    }
-    // Opening the terminal, not dup(), gives this writer independent status flags.
-    // SAFETY: ttyname_r supplied a NUL-terminated path.
-    let descriptor = unsafe {
-        libc::open(
-            name.as_ptr(),
-            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
-        )
+    let error = unsafe { libc::ttyname_r(output.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    let path = if error == 0 {
+        // SAFETY: successful ttyname_r NUL-terminated the buffer.
+        Some(unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) })
+    } else {
+        // SAFETY: stdout is still borrowed above.
+        if unsafe { libc::isatty(output.as_raw_fd()) } != 1 {
+            return Err(std::io::Error::from_raw_os_error(error));
+        }
+        None
     };
-    if descriptor < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: this successful open transfers one newly owned descriptor.
-    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
-    let output = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
+    reopen_terminal_output(output, path)
+}
+
+pub(super) fn open_terminal_path(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+}
+
+fn reopen_terminal_output(
+    output: std::os::fd::BorrowedFd<'_>,
+    path: Option<&std::ffi::CStr>,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    let file = match path {
+        Some(path) => open_terminal_path(std::path::Path::new(std::ffi::OsStr::from_bytes(
+            path.to_bytes(),
+        )))?,
+        None => super::platform::reopen_terminal_fd(output).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("cannot reopen terminal stdout independently: {error}"),
+            )
+        })?,
+    };
+    let output = std::fs::File::from(output.try_clone_to_owned()?);
     let actual = file.metadata()?;
     let expected = output.metadata()?;
     // SAFETY: both descriptors remain open throughout verification.
@@ -36,6 +59,26 @@ pub(super) fn independent_terminal_output() -> std::io::Result<std::fs::File> {
         ));
     }
     Ok(file)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn unnamed_terminal_fallback_keeps_independent_output_flags() {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use std::io::Write;
+    use std::os::fd::AsFd;
+
+    let (mut master, slave) = crate::tui::terminal_output::tests::private_terminal();
+    fcntl(&slave, FcntlArg::F_SETFL(OFlag::empty())).unwrap();
+    let mut output = reopen_terminal_output(slave.as_fd(), None).unwrap();
+    let original = OFlag::from_bits_truncate(fcntl(&slave, FcntlArg::F_GETFL).unwrap());
+    let reopened = OFlag::from_bits_truncate(fcntl(&output, FcntlArg::F_GETFL).unwrap());
+    assert!(!original.contains(OFlag::O_NONBLOCK));
+    assert!(reopened.contains(OFlag::O_NONBLOCK));
+    output.write_all(b"fallback").unwrap();
+    let mut bytes = Vec::new();
+    crate::tui::terminal_output::tests::read_terminal_until(&mut master, &mut bytes, b"fallback");
+    assert_eq!(bytes, b"fallback");
 }
 
 pub(super) fn validate_recovery_file(file: &std::fs::File) -> anyhow::Result<()> {
