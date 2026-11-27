@@ -577,6 +577,8 @@ pub struct HomeView {
 
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
     pub(super) default_terminal_mode: TerminalMode,
+    /// `sandbox.enabled_by_default`: with it on, new sessions use a sandbox.
+    pub(in crate::tui) sandbox_by_default: bool,
 
     pub(super) idle_decay_window: std::time::Duration,
 

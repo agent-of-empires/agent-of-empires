@@ -99,6 +99,7 @@ impl HomeView {
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
         self.strict_hotkeys = config.session.strict_hotkeys;
+        self.sandbox_by_default = config.sandbox.enabled_by_default;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.host_tab_title = config.session.host_tab_title;
         self.row_tag_mode = config.session.row_tag;

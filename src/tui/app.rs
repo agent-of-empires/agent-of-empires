@@ -1851,14 +1851,21 @@ impl App {
         self.pull_rx = Some((request, (self.pull_runner)(request, image, flight)));
     }
 
-    /// Reads the Daemon's pull state and offer on an interval, whatever this TUI's update
-    /// checks are: the Daemon's answer decides the offer, and shows a pull started elsewhere.
+    /// Reads the Daemon's pull state and offer on an interval while a sandbox is in use or a pull
+    /// holds the line, whatever this TUI's update checks are: the Daemon decides the offer.
     fn schedule_pull_poll(&mut self, now: std::time::Instant) {
         if now < self.next_pull_poll {
             return;
         }
         self.next_pull_poll = now + image_pull::poll_interval(self.pull.running());
-        self.request_pull(PullRequest::Poll, self.pull_image.clone());
+        if self.pull.holds_line() || self.sandbox_in_use() {
+            self.request_pull(PullRequest::Poll, self.pull_image.clone());
+        }
+    }
+
+    /// Whether the sandbox image matters here: the dashboard's banner shows only then too.
+    fn sandbox_in_use(&self) -> bool {
+        self.home.sandbox_by_default || self.home.instances().any(|i| i.is_sandboxed())
     }
 
     /// A dismissal the Daemon didn't save still hides the update, until aoe restarts.
@@ -5928,22 +5935,76 @@ mod tests {
         }
     }
 
-    /// The Daemon's state is read with this TUI's update checks off and no sandbox in use: the
-    /// Daemon decides what to offer, and a pull started elsewhere still shows.
+    /// The Daemon's state is read, with this TUI's update checks off, only while a sandbox is in
+    /// use here or a pull holds the line, as the dashboard shows its banner.
     #[tokio::test]
     #[serial_test::serial]
-    async fn the_pull_poll_runs_whatever_the_update_checks_are() {
+    async fn the_pull_poll_runs_while_a_sandbox_is_in_use() {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::session::get_profile_dir("test").unwrap();
         crate::session::update_config(|c| {
             c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
-            c.sandbox.enabled_by_default = false;
         })
         .unwrap();
-        let (mut app, _terminal) = key_app();
-        let sent = record_pull_requests(&mut app);
-        app.schedule_pull_poll(app.next_pull_poll);
-        assert_eq!(*sent.lock().unwrap(), [PullRequest::Poll]);
+        // (case, sandbox by default, a sandboxed session, a pull on the line, polled)
+        for (case, by_default, sandboxed, pulling, polled) in [
+            (
+                "no sandbox in use: no image-status request",
+                false,
+                false,
+                false,
+                false,
+            ),
+            ("sandbox on by default", true, false, false, true),
+            ("a sandboxed session", false, true, false, true),
+            ("a pull on the line", false, false, true, true),
+        ] {
+            let mut inst = crate::session::Instance::new("boxed", "/tmp");
+            inst.sandbox_info = Some(crate::session::SandboxInfo {
+                provider: None,
+                enabled: sandboxed,
+                container_id: None,
+                image: "ubuntu:latest".into(),
+                container_name: "boxed".into(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                container_workdir: None,
+            });
+            crate::session::Storage::new_unwatched("test")
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            crate::session::update_config(|c| c.sandbox.enabled_by_default = by_default).unwrap();
+            let (mut app, _terminal) = key_app();
+            assert_eq!(
+                app.home.instances().len(),
+                1,
+                "{case}: the session didn't load"
+            );
+            let sent = record_pull_requests(&mut app);
+            if pulling {
+                app.pull.start();
+            }
+            app.schedule_pull_poll(app.next_pull_poll);
+            let want: &[PullRequest] = if polled { &[PullRequest::Poll] } else { &[] };
+            assert_eq!(sent.lock().unwrap().as_slice(), want, "{case}");
+            if case.starts_with("no sandbox") {
+                crate::session::update_config(|c| c.sandbox.enabled_by_default = true).unwrap();
+                app.home
+                    .refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Interactive);
+                app.schedule_pull_poll(app.next_pull_poll);
+                assert_eq!(
+                    sent.lock().unwrap().as_slice(),
+                    [PullRequest::Poll],
+                    "turning sandbox on by default didn't start the poll"
+                );
+            }
+        }
     }
 
     /// A refusal carries no command, so the gated line takes the last poll's for the image it
