@@ -321,3 +321,94 @@ fn update_check_hint_respects_disabled_update_checks() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(!stderr.contains("nightly"), "stderr was: {stderr}");
 }
+
+/// Serves `bytes` at `route` on a fixture thread; returns the base URL.
+fn spawn_tarball_server(route: String, bytes: Vec<u8>) -> String {
+    let (port_tx, port_rx) = mpsc::channel::<u16>();
+    thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tarball server runtime");
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind tarball port");
+            port_tx
+                .send(listener.local_addr().expect("local_addr").port())
+                .expect("port channel");
+            let app = axum::Router::new().route(
+                &route,
+                axum::routing::get(move || {
+                    let body = bytes.clone();
+                    async move { axum::body::Bytes::from(body) }
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+    });
+    format!("http://127.0.0.1:{}", port_rx.recv().expect("tarball port"))
+}
+
+/// A stable tarball install switches to the newest nightly: the migration warning prints and
+/// the binary on disk is replaced. `-y` stands in for the `Proceed?` answer because the prompt
+/// needs a TTY.
+#[test]
+#[serial_test::parallel]
+fn update_channel_nightly_replaces_a_tarball_install() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const NIGHTLY: &str = "999.0.0-nightly.29990102";
+    let platform = agent_of_empires::update::install::current_platform_string().unwrap();
+
+    let build = tempfile::TempDir::new().unwrap();
+    let script = build.path().join(format!("aoe-{platform}"));
+    std::fs::write(&script, format!("#!/bin/sh\necho 'aoe {NIGHTLY}'\n")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tarball = build.path().join("aoe.tar.gz");
+    let tar = Command::new("tar")
+        .arg("czf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(build.path())
+        .arg(format!("aoe-{platform}"))
+        .status()
+        .unwrap();
+    assert!(tar.success(), "tar czf failed");
+    let download_base = spawn_tarball_server(
+        format!("/nightly-29990102/aoe-{platform}.tar.gz"),
+        std::fs::read(&tarball).unwrap(),
+    );
+
+    let home = tempfile::TempDir::new().unwrap();
+    let bin_dir = home.path().join(".local").join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let installed = bin_dir.join("aoe");
+    std::fs::copy(aoe_binary(), &installed).unwrap();
+
+    let fixture = stable_and_nightly_fixture();
+    let output = Command::new(&installed)
+        .args(["update", "--channel", "nightly", "-y"])
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .env("AOE_UPDATE_API_BASE", &fixture.base_url)
+        .env("AOE_UPDATE_BASE_URL", &download_base)
+        .output()
+        .expect("running aoe update");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("WARNING: moving to a nightly"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Updated to v{NIGHTLY}")),
+        "{stdout}"
+    );
+
+    let version = Command::new(&installed).arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout);
+    assert!(version.contains(NIGHTLY), "version output: {version}");
+}
