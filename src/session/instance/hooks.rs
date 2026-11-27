@@ -870,6 +870,29 @@ impl Instance {
                 &environment,
                 config_dir.as_deref(),
             );
+            // `aoe hooks status` discloses the path the profile resolves; a
+            // `before_session` redirect must not move the write elsewhere.
+            let profile_environment = self.profile_host_environment();
+            let disclosed = host_home(&profile_environment).map(|profile_home| {
+                crate::hooks::declared_trust_path(
+                    trust,
+                    &profile_home,
+                    &profile_environment,
+                    config
+                        .session
+                        .agent_config_dir_for(&self.tool, &profile_home)
+                        .as_deref(),
+                )
+            });
+            if disclosed
+                .as_deref()
+                .is_some_and(|disclosed| !same_hook_target(disclosed, &path))
+            {
+                tracing::warn!(target: "session.store",
+                    "Not pre-trusting {} for {}: before_session moved the trust file to {}, which was not disclosed",
+                    project_path, agent.name, path.display());
+                return;
+            }
             if crate::hooks::is_other_builtin_trust_file(
                 &path,
                 agent.name,
@@ -1460,6 +1483,53 @@ mod tests {
             "hooks landed outside the store the launch routes to"
         );
         assert!(inst.identity_publisher_launched);
+    }
+
+    /// A `before_session` redirect of the declared trust path is not written to,
+    /// since the path it resolves to was never disclosed.
+    #[test]
+    #[serial_test::serial]
+    fn a_redirected_declared_trust_path_is_not_written() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = EnvGuard::unset(&["EXAMPLE_CONFIG_DIR"]);
+        crate::session::test_support::install_agent_plugin(
+            "acme.redirected-trust",
+            "id = \"acme.redirected-trust\"\nname = \"Redirected\"\nversion = \"1.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             command = \"example-helper\"\n[agent_integrations.launch.container_env]\n\
+             EXAMPLE_CONFIG_DIR = \"/opt/example\"\n[agent_integrations.trust]\n\
+             file = \".example.json\"\nlocation = \"config_dir_or_home\"\n\
+             config_dir_env_var = \"EXAMPLE_CONFIG_DIR\"\n\
+             pointer = \"/projects/{path}/trusted\"\nvalue = true\nsandbox = \"always\"\n",
+        );
+        let disclosed = tmp.path().join("disclosed");
+        let redirected = tmp.path().join("redirected");
+        crate::session::config::update_config(|config| {
+            config.session.pre_trust_agent_folders = true;
+            config.environment = vec![format!("EXAMPLE_CONFIG_DIR={}", disclosed.display())];
+        })
+        .unwrap();
+        let trust = |inst: &mut Instance| {
+            inst.with_hook_agent(|this, agent| this.ensure_host_folder_trust(agent))
+        };
+
+        let mut redirect = tool_instance("example-helper", tmp.path().to_str().unwrap());
+        redirect.pending_host_env = vec![(
+            "EXAMPLE_CONFIG_DIR".to_string(),
+            redirected.to_string_lossy().into_owned(),
+        )];
+        trust(&mut redirect);
+        assert!(!redirected.join(".example.json").exists());
+        assert!(!disclosed.join(".example.json").exists());
+
+        trust(&mut tool_instance(
+            "example-helper",
+            tmp.path().to_str().unwrap(),
+        ));
+        assert!(disclosed.join(".example.json").exists());
     }
 
     /// A declaration whose command is a built-in binary is disclosed as the
