@@ -12,8 +12,9 @@ use tracing::{debug, info, warn};
 use super::agents::log_wrapper_substitution;
 use super::launch::{
     admit_stored_row, apply_claude_store_pin, apply_declared_config_dir,
-    await_resume_to_completion, before_session_env, discovery_key, overlay_env, publish_rejection,
-    refresh_spawn_model_effort, resolve_mcp_servers, McpHostEnv, McpPaths, McpSandboxScope,
+    await_resume_to_completion, before_session_env, discovery_key, neutral_boot_fallback,
+    overlay_env, proxy_degraded_notice, publish_rejection, refresh_spawn_model_effort,
+    resolve_mcp_servers, McpHostEnv, McpPaths, McpSandboxScope,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
@@ -903,7 +904,24 @@ impl<S: BroadcastSink> Drain<S> {
         }
         // Like spawn_inner, keep the cooperative handshake result so a
         // concurrent permanent stop can retire its adapter-side session.
-        let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
+        let mut launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
+        let mut degraded = None;
+        if let Err(err) = &launched {
+            if let Some(name) = neutral_boot_fallback(
+                &self.lifecycle,
+                &*self.process_control,
+                &respawn_lease,
+                &config,
+                err,
+            )
+            .await
+            {
+                config.proxy = None;
+                config.degraded = Some(name.clone());
+                degraded = Some(name);
+                launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
+            }
+        }
         let mut client = match launched {
             Ok(client) => client,
             Err(e) => {
@@ -979,6 +997,10 @@ impl<S: BroadcastSink> Drain<S> {
                         handle.client = Arc::clone(&client);
                         handle.lease = respawn_lease.clone();
                         handle.native_session_id = None;
+                        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
+                            spawn_config.proxy.clone_from(&config.proxy);
+                            spawn_config.degraded.clone_from(&config.degraded);
+                        }
                         None
                     }
                     None => Some(InstallError::Stale),
@@ -1036,6 +1058,9 @@ impl<S: BroadcastSink> Drain<S> {
         );
         lock_recover(&self.incompatible_binaries).remove(session_id);
         lock_recover(&self.respawned_in_place).insert(session_id.clone());
+        if let Some(name) = &degraded {
+            self.publish(proxy_degraded_notice(name));
+        }
         Some((respawn_lease, inbound))
     }
 
@@ -4284,5 +4309,167 @@ mod tests {
             }
         }
         peer.abort();
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ProxyRespawn {
+        Plain,
+        Cancelled,
+        StuckRunner,
+    }
+
+    struct ProxyRespawnRun {
+        replacement: bool,
+        configs: Vec<SpawnConfig>,
+        stored: Option<SpawnConfig>,
+        notices: Vec<String>,
+    }
+
+    /// Respawn a Runner worker holding a proxy under `policy`; each launch pops its outcome,
+    /// and a failed launch owns a runner (pid 4400 + launch number).
+    async fn respawn_with_proxy(
+        id: &str,
+        policy: crate::acp::acp_client::ProxyFailurePolicy,
+        outcomes: Vec<Result<(), AcpError>>,
+        case: ProxyRespawn,
+    ) -> ProxyRespawnRun {
+        let (_home, _tmp) = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4343);
+        if case == ProxyRespawn::StuckRunner {
+            control.immortal(4401);
+        }
+        let seen: Arc<std::sync::Mutex<Vec<SpawnConfig>>> = Default::default();
+        let outcomes = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            outcomes,
+        )));
+        let sink = VecSink::new();
+        let base = Supervisor::new(sink.clone()).with_process_control(control.clone());
+        let lifecycle = Arc::clone(&base.lifecycle);
+        let sup =
+            base.with_launcher(Arc::new({
+                let (seen, control) = (seen.clone(), control.clone());
+                move |config: SpawnConfig, session_id| {
+                    let launch = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(config.clone());
+                        seen.len() as u32
+                    };
+                    let outcome = outcomes.lock().unwrap().pop_front().expect("outcome");
+                    let (control, lifecycle) = (control.clone(), Arc::clone(&lifecycle));
+                    Box::pin(async move {
+                        let lease = config.launch_lease.clone().expect("respawn lease");
+                        lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
+                        if let Err(err) = outcome {
+                            let pid = 4400 + launch;
+                            assert!(
+                                lease.record_runner(attested_test_identity(pid, config.generation))
+                            );
+                            save_attested_test_record(&session_id.0, pid, config.generation);
+                            control.alive(pid);
+                            if case == ProxyRespawn::Cancelled {
+                                lock_recover(&lifecycle).begin_stop(
+                                    &session_id.0,
+                                    "user_stopped",
+                                    false,
+                                );
+                            }
+                            return Err(err);
+                        }
+                        assert!(
+                            lease.record_runner(attested_test_identity(4343, config.generation))
+                        );
+                        save_attested_test_record(&session_id.0, 4343, config.generation);
+                        let (client, _tx) = AcpClient::fake_for_test(session_id);
+                        Ok(client.with_runner_pid(4343))
+                    })
+                }
+            }));
+        let mut config = runner_config(worker_registry::socket_path_for(id).unwrap());
+        config.proxy = Some(crate::acp::acp_client::ProxySpec {
+            plugin_id: "fake".into(),
+            command: "/bin/proxy".into(),
+            args: Vec::new(),
+            failure_policy: policy,
+            display_name: "Fake".into(),
+            compat: Default::default(),
+        });
+        save_attested_test_record(id, 4343, 0);
+        let lease = sup
+            .test_install_runner(id, config.clone(), Some(attested_test_identity(4343, 0)))
+            .await;
+        let driver = recovery_test_drain(&sup, id);
+        let replacement = driver.respawn(&lease, config).await.is_some();
+        let stored = match sup.workers.lock().await.get(id).map(|handle| &handle.kind) {
+            Some(WorkerKind::Runner { spawn_config }) => Some((**spawn_config).clone()),
+            _ => None,
+        };
+        let notices = sink
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, _, event)| match event {
+                Event::SessionNotice { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .collect();
+        let configs = seen.lock().unwrap().clone();
+        ProxyRespawnRun {
+            replacement,
+            configs,
+            stored,
+            notices,
+        }
+    }
+
+    fn bad_proxy_hello() -> AcpError {
+        let detail = crate::acp::state::StartupErrorDetail::InvalidProxyHello {
+            reason: "no hello".into(),
+        };
+        AcpError::IncompatibleAgent(Box::new(crate::acp::acp_client::IncompatibleAgentError {
+            message: detail.user_message(),
+            detail,
+        }))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_retries_a_neutral_boot_proxy_failure_raw_and_stays_degraded() {
+        use crate::acp::acp_client::ProxyFailurePolicy::NeutralBoot;
+        let run = respawn_with_proxy(
+            "s-respawn-neutral",
+            NeutralBoot,
+            vec![Err(bad_proxy_hello()), Ok(())],
+            ProxyRespawn::Plain,
+        )
+        .await;
+        assert!(run.replacement, "the raw relaunch installs");
+        assert_eq!(run.configs.len(), 2);
+        assert!(run.configs[0].proxy.is_some() && run.configs[0].degraded.is_none());
+        assert!(run.configs[1].proxy.is_none());
+        assert_eq!(run.configs[1].degraded.as_deref(), Some("Fake"));
+        assert_eq!(run.notices, ["Fake features unavailable"]);
+        let stored = run.stored.expect("the replacement keeps its handle");
+        assert!(stored.proxy.is_none());
+        assert_eq!(stored.degraded.as_deref(), Some("Fake"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_does_not_retry_when_policy_or_state_forbids_it() {
+        use crate::acp::acp_client::ProxyFailurePolicy::{NeutralBoot, Refuse};
+        for (id, policy, case) in [
+            ("s-respawn-refuse", Refuse, ProxyRespawn::Plain),
+            ("s-respawn-cancel", NeutralBoot, ProxyRespawn::Cancelled),
+            ("s-respawn-stuck", NeutralBoot, ProxyRespawn::StuckRunner),
+        ] {
+            let run =
+                respawn_with_proxy(id, policy, vec![Err(bad_proxy_hello()), Ok(())], case).await;
+            assert!(!run.replacement, "{id}: the session is not replaced");
+            assert_eq!(run.configs.len(), 1, "{id}: one launch only");
+            assert!(run.notices.is_empty(), "{id}: no degraded notice");
+        }
     }
 }

@@ -19,7 +19,9 @@ use super::{
 use crate::acp::acp_client::{AcpClient, AcpError, ProxyFailurePolicy, SpawnConfig};
 use crate::acp::agent_policy::AgentPolicy;
 use crate::acp::mcp_config::PluginCredentials;
-use crate::acp::runner_lifecycle::{AdmitError, InstallError, Lease, RunnerIdentity};
+use crate::acp::runner_lifecycle::{
+    AdmitError, InstallError, Lease, LifecycleTable, ProcessControl, RunnerIdentity,
+};
 use crate::acp::state::{AcpSessionId, Event, StartupErrorDetail, PROXY_DEGRADED_NOTICE_KEY};
 use crate::process::worker_registry;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
@@ -348,7 +350,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             (self.launcher)(config.clone(), AcpSessionId(session_id.to_string())).await;
         let mut degraded = None;
         if let Err(err) = &launched {
-            if let Some(name) = self.neutral_boot_fallback(&lease, &config, err).await {
+            if let Some(name) = neutral_boot_fallback(
+                &self.lifecycle,
+                &*self.process_control,
+                &lease,
+                &config,
+                err,
+            )
+            .await
+            {
                 config.proxy = None;
                 config.degraded = Some(name.clone());
                 degraded = Some(name);
@@ -453,40 +463,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             apply_mode(&client, session_id, mode_id, "spawn").await;
         }
         Ok(())
-    }
-
-    /// Retire a `neutral_boot` proxy's failed runner so the launch can run once more without
-    /// it. `Some` names the dropped proxy; `None` leaves the failure to the ordinary path.
-    async fn neutral_boot_fallback(
-        &self,
-        lease: &Lease,
-        config: &SpawnConfig,
-        err: &AcpError,
-    ) -> Option<String> {
-        let proxy = config
-            .proxy
-            .as_ref()
-            .filter(|proxy| proxy.failure_policy == ProxyFailurePolicy::NeutralBoot)?;
-        if !is_proxy_failure(err)
-            || lock_recover(&self.lifecycle)
-                .cancel_requested(lease)
-                .is_some()
-        {
-            return None;
-        }
-        warn!(
-            target: "acp.supervisor",
-            session = %lease.session_id(),
-            plugin = %proxy.plugin_id,
-            error = %err,
-            "plugin proxy failed before a valid hello; relaunching without it"
-        );
-        let settled = super::teardown::tear_down_lease(&*self.process_control, lease, false).await;
-        if settled != crate::acp::runner_lifecycle::Settlement::Proven {
-            return None;
-        }
-        lease.release_torn_down_runner();
-        Some(proxy.display_name.clone())
     }
 
     async fn cancelled_spawn(&self, lease: &Lease) -> SupervisorError {
@@ -1157,8 +1133,39 @@ pub(super) fn blames_adapter_binary(err: &AcpError) -> bool {
     }
 }
 
+/// Retire a `neutral_boot` proxy's failed runner so the launch can run once more without
+/// it. `Some` names the dropped proxy; `None` leaves the failure to the ordinary path.
+pub(super) async fn neutral_boot_fallback(
+    lifecycle: &std::sync::Mutex<LifecycleTable>,
+    process_control: &dyn ProcessControl,
+    lease: &Lease,
+    config: &SpawnConfig,
+    err: &AcpError,
+) -> Option<String> {
+    let proxy = config
+        .proxy
+        .as_ref()
+        .filter(|proxy| proxy.failure_policy == ProxyFailurePolicy::NeutralBoot)?;
+    if !is_proxy_failure(err) || lock_recover(lifecycle).cancel_requested(lease).is_some() {
+        return None;
+    }
+    warn!(
+        target: "acp.supervisor",
+        session = %lease.session_id(),
+        plugin = %proxy.plugin_id,
+        error = %err,
+        "plugin proxy failed before a valid hello; relaunching without it"
+    );
+    let settled = super::teardown::tear_down_lease(process_control, lease, false).await;
+    if settled != crate::acp::runner_lifecycle::Settlement::Proven {
+        return None;
+    }
+    lease.release_torn_down_runner();
+    Some(proxy.display_name.clone())
+}
+
 /// Keyed, so every re-assertion replaces the same notice.
-fn proxy_degraded_notice(display_name: &str) -> Event {
+pub(super) fn proxy_degraded_notice(display_name: &str) -> Event {
     Event::SessionNotice {
         severity: "warning".into(),
         title: format!("{display_name} features unavailable"),
