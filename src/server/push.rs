@@ -795,12 +795,7 @@ async fn fire_due_pushes(
             "status push fired"
         );
 
-        let (title, body_prefix) = status_push_text(
-            event,
-            crate::agents::labels_for(&instance.tool)
-                .as_ref()
-                .map(|(name, _)| name.as_str()),
-        );
+        let (title, body_prefix) = status_push_text(event, agent_display_name(instance).as_deref());
         let body = if instance_title.is_empty() {
             body_prefix.to_string()
         } else {
@@ -1439,6 +1434,16 @@ pub async fn test(
     }))
 }
 
+/// The wrapper's base agent name, so `work-claude` reads as Claude.
+fn agent_display_name(instance: &crate::session::Instance) -> Option<String> {
+    let tool = crate::tmux::status_rules::detection_tool(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    crate::agents::labels_for(&tool).map(|(name, _)| name)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1463,6 +1468,17 @@ mod tests {
             "Session finished"
         );
         assert!(crate::agents::labels_for("not-an-agent").is_none());
+
+        let mut wrapper = crate::session::Instance::new("w", "/tmp/push-title");
+        wrapper.tool = "work-claude".to_string();
+        wrapper.detect_as = "claude".to_string();
+        let claude = crate::agents::labels_for("claude").unwrap().0;
+        assert_eq!(agent_display_name(&wrapper), Some(claude));
+        wrapper.detect_as.clear();
+        wrapper.tool = "codex".to_string();
+        assert_eq!(agent_display_name(&wrapper).as_deref(), Some("Codex"));
+        wrapper.tool = "unknown-wrapper".to_string();
+        assert_eq!(agent_display_name(&wrapper), None);
     }
 
     #[test]
