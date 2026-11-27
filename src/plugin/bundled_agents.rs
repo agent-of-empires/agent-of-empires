@@ -134,19 +134,75 @@ mod tests {
         assert_eq!(hooks.settings_rel_path, ".claude/settings.json");
         assert_eq!(hooks.config_dir_env_var, Some("CLAUDE_CONFIG_DIR"));
         assert!(!hooks.strict);
-        let events: Vec<_> = hooks.events.iter().map(|event| event.name).collect();
+        use crate::agents::HookIdentityField::SessionId;
+        use crate::agents::HookStatus::{Idle, Running, Waiting};
+        let events: Vec<_> = crate::agents::resolved_hook_events(claude, &Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|event| {
+                (
+                    event.name,
+                    event.matcher,
+                    event.status,
+                    event.identity_field,
+                    event.waiting_tools,
+                )
+            })
+            .collect();
+        let row = |name: &str, matcher, status, identity, waiting: &[&str]| {
+            (
+                name.to_string(),
+                Option::<&str>::map(matcher, str::to_string),
+                status,
+                identity,
+                waiting
+                    .iter()
+                    .map(|tool| tool.to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
         assert_eq!(
             events,
             [
-                "SessionStart",
-                "PreToolUse",
-                "PostToolUse",
-                "UserPromptSubmit",
-                "Stop",
-                "StopFailure",
-                "Notification",
-                "Notification",
-                "ElicitationResult",
+                row("SessionStart", None, None, Some(SessionId), &[]),
+                row(
+                    "PreToolUse",
+                    None,
+                    Some(Running),
+                    None,
+                    &["AskUserQuestion"]
+                ),
+                row(
+                    "PostToolUse",
+                    Some("AskUserQuestion"),
+                    Some(Running),
+                    None,
+                    &[]
+                ),
+                row(
+                    "UserPromptSubmit",
+                    None,
+                    Some(Running),
+                    Some(SessionId),
+                    &[]
+                ),
+                row("Stop", None, Some(Idle), None, &[]),
+                row("StopFailure", None, Some(Idle), None, &[]),
+                row(
+                    "Notification",
+                    Some("permission_prompt|elicitation_dialog|agent_needs_input"),
+                    Some(Waiting),
+                    None,
+                    &[]
+                ),
+                row(
+                    "Notification",
+                    Some("idle_prompt|agent_completed"),
+                    Some(Idle),
+                    None,
+                    &[]
+                ),
+                row("ElicitationResult", None, Some(Running), None, &[]),
             ]
         );
 
