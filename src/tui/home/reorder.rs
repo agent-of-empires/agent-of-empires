@@ -51,6 +51,8 @@ pub(in crate::tui) enum OrderChange {
     SwitchToCustom {
         undo: OrderUndo,
         expected: (Vec<String>, Vec<String>),
+        /// `sort_changes` when the move began.
+        sort_changes: u64,
     },
     /// Undo writing back this order; its sort follows once it commits.
     Undo(OrderUndo),
@@ -271,6 +273,7 @@ impl HomeView {
         let change = (self.sort_order != SortOrder::Custom).then(|| OrderChange::SwitchToCustom {
             undo: self.order_undo_point(),
             expected: Default::default(),
+            sort_changes: self.sort_changes,
         });
         self.write_order(order, repositories, change)
     }
@@ -326,10 +329,21 @@ impl HomeView {
                     epoch,
                 });
                 if let Some((profile, before)) = frozen {
-                    if let Some(anchor) = self.group_order_anchor(&profile) {
-                        let order = written.0;
-                        return self
-                            .undo_frozen_groups(anchor, profile, before, order, groups, change);
+                    match self.group_order_anchor(&profile) {
+                        Some(anchor) => {
+                            let order = written.0;
+                            return self.undo_frozen_groups(
+                                anchor, profile, before, order, groups, change,
+                            );
+                        }
+                        // Only a move puts a Group order back, and it needs a row to name.
+                        None if before != groups => {
+                            self.flash_status(
+                                "Undo needs a listed session in that profile to put its Groups back",
+                            );
+                            return Ok(());
+                        }
+                        None => {}
                     }
                 }
                 return self.write_order(Some(written.0), Some(written.1), Some(change));
@@ -521,6 +535,7 @@ impl HomeView {
                 ..self.order_undo_point()
             },
             expected: (order.clone(), base.repositories.clone()),
+            sort_changes: self.sort_changes,
         };
         (
             crate::daemon::FrozenOrder {
@@ -566,15 +581,20 @@ impl HomeView {
         receipt: &crate::daemon::RuntimeCursor,
     ) {
         match change {
-            OrderChange::SwitchToCustom { undo, expected } => {
+            OrderChange::SwitchToCustom {
+                undo,
+                expected,
+                sort_changes,
+            } => {
                 let base = self.ordering_base();
                 let kept = self
                     .session_feed
                     .applied_snapshot()
                     .is_some_and(|snapshot| snapshot.cursor == *receipt)
                     && (&base.order, &base.repositories) == (&expected.0, &expected.1);
-                // A sort picked since the move started wins.
-                if self.sort_order != undo.sort && self.sort_order != SortOrder::Custom {
+                // A sort picked since the move started wins, even one back on the same value.
+                let picked = self.sort_changes != sort_changes || self.sort_order != undo.sort;
+                if picked && self.sort_order != SortOrder::Custom {
                     self.order_undo = None;
                     self.flash_status("Order saved, the sort picked since stays");
                     return;
@@ -658,21 +678,28 @@ impl HomeView {
 
     /// The repository path behind a top-level Repository header, keyed by its label. Two
     /// repositories can share a label; the one whose live session places the header, as
-    /// `build_flat_items_by_project` ranks them, is the one a move rewrites.
+    /// `build_flat_items_by_project` ranks them in the current view and sort, is the one a
+    /// move rewrites.
     fn repository_path_for_header(&self, label: &str) -> Option<String> {
         if crate::session::is_synthetic_project_header(label) || label.contains('/') {
             return None;
         }
         let rank = |repo: &str| {
-            self.repository_order
-                .iter()
-                .position(|r| r.trim_end_matches('/') == repo)
+            (self.sort_order == SortOrder::Custom)
+                .then(|| {
+                    self.repository_order
+                        .iter()
+                        .position(|r| r.trim_end_matches('/') == repo)
+                })
+                .flatten()
         };
+        let profile = self.active_profile.as_deref();
         // An empty header is a pinned project's, chosen as the renderer chooses it.
         self.instances
             .values()
             .filter(|inst| {
-                !inst.scratch
+                profile.is_none_or(|p| inst.source_profile == p)
+                    && !inst.scratch
                     && !inst.is_archived()
                     && !inst.is_trashed()
                     && project_group_key(inst) == label
@@ -1017,7 +1044,7 @@ mod tests {
         };
         let flash = |view: &HomeView| view.status_flash.as_ref().map(|f| f.text.clone());
         let repositories = vec!["/r/b".to_string(), "/r/a".to_string()];
-        let switch = |expected: Vec<String>| OrderChange::SwitchToCustom {
+        let switch = |expected: Vec<String>, sort_changes: u64| OrderChange::SwitchToCustom {
             undo: OrderUndo {
                 order: Vec::new(),
                 repositories: Vec::new(),
@@ -1025,18 +1052,39 @@ mod tests {
                 groups: None,
             },
             expected: (Vec::new(), expected),
+            sort_changes,
         };
         let at = publish(&mut view, "e", 2, &["/r/b", "/r/a"]);
+        // A Group order to put back needs a listed row to anchor its move.
+        view.order_undo = Some(UndoPoint::Order {
+            restore: OrderUndo {
+                order: Vec::new(),
+                repositories: Vec::new(),
+                sort: SortOrder::Name,
+                groups: Some(("default".into(), vec!["gone".into()])),
+            },
+            order: Vec::new(),
+            repositories: repositories.clone(),
+            groups: view.stored_groups("default"),
+            epoch: "e".into(),
+        });
+        view.undo_order_change().unwrap();
+        assert_eq!(
+            flash(&view).as_deref(),
+            Some("Undo needs a listed session in that profile to put its Groups back")
+        );
+        assert!(capture().is_none() && view.order_undo.is_some());
+        view.order_undo = None;
         let earlier = RuntimeCursor {
             revision: 1,
             ..at.clone()
         };
         for (receipt, expected) in [(&earlier, repositories.clone()), (&at, Vec::new())] {
-            view.order_change_committed(switch(expected), receipt);
+            view.order_change_committed(switch(expected, view.sort_changes), receipt);
             assert!(view.order_undo.is_none(), "{receipt:?}");
             assert_eq!(flash(&view).as_deref(), Some("Switched to Custom"));
         }
-        view.order_change_committed(switch(repositories.clone()), &at);
+        view.order_change_committed(switch(repositories.clone(), view.sort_changes), &at);
         assert_eq!(
             flash(&view).as_deref(),
             Some("Switched to Custom (Undo in Ctrl+K)")
@@ -1053,7 +1101,7 @@ mod tests {
         // Daemon's frame then overtakes.
         publish(&mut view, "e", 4, &["/r/b", "/r/a"]);
         view.order_change_committed(
-            switch(repositories.clone()),
+            switch(repositories.clone(), view.sort_changes),
             &RuntimeCursor {
                 epoch: "e".into(),
                 revision: 4,
@@ -1086,7 +1134,7 @@ mod tests {
             epoch: "new".into(),
             revision: 1,
         };
-        view.order_change_committed(switch(repositories.clone()), &restarted);
+        view.order_change_committed(switch(repositories.clone(), view.sort_changes), &restarted);
         view.undo_order_change().unwrap();
         capture()
             .expect("the restoring order")
@@ -1173,10 +1221,23 @@ mod tests {
 
         // A sort picked since the move started wins.
         view.sort_order = SortOrder::Newest;
-        view.order_change_committed(switch(repositories.clone()), &restarted);
+        view.order_change_committed(switch(repositories.clone(), view.sort_changes), &restarted);
         assert!(capture().is_none());
         assert_eq!(view.sort_order, SortOrder::Newest);
         assert!(view.order_undo.is_none());
+        assert_eq!(
+            flash(&view).as_deref(),
+            Some("Order saved, the sort picked since stays")
+        );
+
+        // So does one picked away and back before the receipt.
+        view.show_sidebar_view(view.group_by, SortOrder::Name);
+        let began = view.sort_changes;
+        view.show_sidebar_view(view.group_by, SortOrder::Newest);
+        view.show_sidebar_view(view.group_by, SortOrder::Name);
+        view.order_change_committed(switch(repositories.clone(), began), &restarted);
+        assert!(capture().is_none());
+        assert_eq!(view.sort_order, SortOrder::Name);
         assert_eq!(
             flash(&view).as_deref(),
             Some("Order saved, the sort picked since stays")
@@ -1209,6 +1270,39 @@ mod tests {
             view.repository_path_for_header("app").as_deref(),
             Some("/team-b/app")
         );
+    }
+
+    /// Two repositories sharing a label resolve to the one the renderer seeds the header
+    /// from: the newest session's under Name or Newest first, an unplaced one's under Custom.
+    #[test]
+    #[serial_test::serial]
+    fn a_shared_label_names_the_repository_the_sort_shows() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut view = HomeView::new_for_test(
+            None,
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let placed = Instance::new("placed", "/a/app");
+        let mut unplaced = Instance::new("unplaced", "/b/app");
+        unplaced.created_at = placed.created_at - crate::time::Duration::days(1);
+        for inst in [placed, unplaced] {
+            view.instances.insert(inst.id.clone(), inst);
+        }
+        view.repository_order = vec!["/a/app".to_string()];
+        for (sort, expected) in [
+            (SortOrder::Name, "/a/app"),
+            (SortOrder::Newest, "/a/app"),
+            (SortOrder::Custom, "/b/app"),
+        ] {
+            view.sort_order = sort;
+            assert_eq!(
+                view.repository_path_for_header("app").as_deref(),
+                Some(expected),
+                "{sort:?}"
+            );
+        }
     }
 
     /// A Custom header move places only the two headers it swaps; an unplaced one above them

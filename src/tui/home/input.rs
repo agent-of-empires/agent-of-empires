@@ -5171,6 +5171,8 @@ impl HomeView {
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
         if new_order != self.sort_order {
             crate::tui::telemetry::report_feature_use(new_order.into());
+        } else {
+            self.sort_changes += 1;
         }
         self.show_sidebar_view(self.group_by, new_order);
         let _ = self.save_sidebar_view(crate::daemon::SidebarViewPatch {
@@ -5189,6 +5191,9 @@ impl HomeView {
     }
 
     pub(super) fn show_sidebar_view(&mut self, group_by: GroupByMode, sort_order: SortOrder) {
+        if sort_order != self.sort_order {
+            self.sort_changes += 1;
+        }
         self.group_by = group_by;
         self.sort_order = sort_order;
         if self.search_active && !self.search_query.value().is_empty() {

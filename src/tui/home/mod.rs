@@ -309,6 +309,9 @@ pub struct HomeView {
     order_undo: Option<reorder::UndoPoint>,
     /// The sort an Undo is writing back, kept until that write settles.
     sort_restore: Option<reorder::SortRestore>,
+    /// Bumped by each sort shown or picked, so a move can tell a sort picked since it began
+    /// even when the value came back.
+    sort_changes: u64,
     session_feed_reload_retry_at: Option<std::time::Instant>,
     session_feed_failed_cursor: Option<crate::daemon::RuntimeCursor>,
     canonical_metadata_lag: Option<CanonicalMetadataLagState>,
