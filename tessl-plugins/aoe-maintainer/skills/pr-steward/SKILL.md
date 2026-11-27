@@ -164,10 +164,11 @@ gh api "repos/$REPO/actions/runs?head_sha=<headRefOid>&per_page=100" \
 
 Take each run with `conclusion` `failure` and `run_attempt` 1. Skip a run
 whose `run_attempt` is 2 or more, and never act on a run whose
-`conclusion` is `action_required`. Rerun only same-repo PRs
-(`isCrossRepository` false). A fork log can print test-shaped text for a
-test that never ran, so for a fork PR that passes item 4 below, list it under
-Reruns as `no (fork, rerun by hand)` and rerun nothing.
+`conclusion` is `action_required`. Rerun only a run whose own
+`head_repo_id` is 1131238324, on a same-repo PR (`isCrossRepository`
+false). A fork log can print test-shaped text for a test that never ran,
+so list any other run that passes item 4 below under Reruns as
+`no (fork, rerun by hand)` and rerun nothing.
 
 1. Never read a failed log, whole or in part. For each failed job
    (`gh api "repos/$REPO/actions/runs/<id>/jobs?filter=latest&per_page=100" --jq '.jobs[] | select(.conclusion == "failure") | .id'`),
@@ -180,6 +181,7 @@ Reruns as `no (fork, rerun by hand)` and rerun nothing.
    grep -oE 'test [A-Za-z0-9_:]+ \.\.\. FAILED' job.log | awk '{print $2}' | sort -u   # libtest (cargo test) test path
    grep -oE 'FAIL  src/[A-Za-z0-9_./-]+\.test\.tsx?' job.log | grep -oE 'src/[A-Za-z0-9_./-]+$' | sort -u   # Vitest file
    grep -F '[chromium] ' job.log | grep -oE '[A-Za-z0-9_./-]+\.spec\.ts(:[0-9]+)?' | sort -u   # Playwright spec
+   grep -cE '(FAIL|TIMEOUT) \[| \.\.\. FAILED' job.log   # Rust failure lines
    ```
 
 2. Keep an id only when it matches its strict pattern, and drop any other:
@@ -193,8 +195,10 @@ Reruns as `no (fork, rerun by hand)` and rerun nothing.
    issue names the same file.
 4. Rerun only when every failed job gave at least one id and every id
    matches a known flaky issue. A failed job with no test id (a build,
-   lint or infrastructure failure), any unmatched id, or any extracted
-   line dropped by the pattern check means no rerun.
+   lint or infrastructure failure), any unmatched id, any extracted
+   line dropped by the pattern check, or a Rust failure-line count above
+   the number of test-path ids that passed the pattern check means no
+   rerun.
 
    ```sh
    gh run rerun <id> -R $REPO --failed
