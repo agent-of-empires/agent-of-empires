@@ -71,7 +71,7 @@ import { useLatestRef } from "../../hooks/useLatestRef";
 import { PULL_GATED_HINT, PULL_LATEST_HINT, pullLatestChecked, pullLatestOffer } from "./pullLatestImage";
 import { CopyCommand } from "../SandboxImageBanner";
 import { notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
-import { BUTTON_SECONDARY } from "../../lib/surfaces";
+import { BUTTON_INLINE, BUTTON_SECONDARY } from "../../lib/surfaces";
 import { CloseButton, DialogHeader, ModalFrame } from "../Dialog";
 import { DIALOG_BODY } from "../../lib/surfaces";
 
@@ -1304,11 +1304,7 @@ export function SessionWizard({
             <p data-testid="wizard-template" className="pb-2 text-[11px] text-text-dim">
               From the {prefill.source?.kindLabel ?? prefill.template.criterion} preset
               {" \u00b7 "}
-              <button
-                type="button"
-                onClick={() => onEditPreset(prefill.template!)}
-                className="cursor-pointer text-brand-500 hover:underline"
-              >
+              <button type="button" onClick={() => onEditPreset(prefill.template!)} className={BUTTON_INLINE}>
                 Edit preset
               </button>
             </p>
@@ -1402,7 +1398,7 @@ export function SessionWizard({
               type="button"
               disabled={resolvingServedProfile || !onRetryServedProfile}
               onClick={() => void retryServedProfile()}
-              className="ml-2 text-brand-400 hover:underline cursor-pointer disabled:opacity-50"
+              className={`${BUTTON_INLINE} ml-2`}
             >
               Retry server profile
             </button>

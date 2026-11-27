@@ -110,7 +110,6 @@ import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
 import { SuggestionsView } from "./components/SuggestionsView";
-import { DashboardSuggestions } from "./components/DashboardSuggestions";
 import { PluginSessionMenu, type SessionMenuRequest } from "./components/plugin/PluginSessionMenu";
 import {
   deleteWorkspaceSessions,
@@ -236,7 +235,7 @@ import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
 import { MainViewTabs } from "./components/MainViewTabs";
-import type { OverflowItem } from "./components/OverflowMenu";
+import { OPEN_HEADER_MENU_EVENT, type OverflowItem } from "./components/OverflowMenu";
 import { TopBar, type PhoneViewChoice } from "./components/TopBar";
 import { appMenuItems } from "./lib/appMenu";
 import { PHONE_BANNER_CARD } from "./lib/surfaces";
@@ -1990,12 +1989,15 @@ function AppContent({
   const closePicker = useCallback(() => setPickerOpen(false), []);
   const handleDrawerSwipe = useCallback(
     (action: DrawerSwipeAction) => {
-      // A swipe opens or closes the session drawer over an open Session; with none open the list is the whole screen.
+      // On a phone page a right swipe opens the session drawer and a left swipe the header's ⋯.
+      const phonePage = !focusMode && !fullPageView;
       if (action === "open-sidebar" || action === "close-sidebar") {
-        if (!focusMode && activeSession) setSidebarOpen(action === "open-sidebar");
-      } else if (action === "close-panels") setPickerOpen(false);
+        if (phonePage) setSidebarOpen(action === "open-sidebar");
+      } else if (action === "open-panels") {
+        if (phonePage) window.dispatchEvent(new Event(OPEN_HEADER_MENU_EVENT));
+      } else setPickerOpen(false);
     },
-    [focusMode, activeSession],
+    [focusMode, fullPageView],
   );
   // The Session card a phone's drawer pushes aside, and the dim over it.
   const cardRef = useRef<HTMLDivElement>(null);
@@ -2047,16 +2049,16 @@ function AppContent({
     };
   }, []);
 
-  const phoneDrawerTracking = singlePane && !!activeSession && !fullPageView && !focusMode;
+  const phoneDrawerTracking = singlePane && !fullPageView && !focusMode;
   useDrawerSwipe(
     {
       sidebarOpen,
       panelsOpen: pickerOpen,
-      // More panes opens from the header's ⋯; a sideways swipe raising a bottom sheet is no gesture people expect.
-      panelsAvailable: false,
+      // A left swipe opens the header's ⋯, which holds More panes and the rest.
+      panelsAvailable: phoneDrawerTracking,
     },
     handleDrawerSwipe,
-    // Only a phone's session drawer, which a Session card covers, follows the finger.
+    // Only a phone's session drawer, which the page card covers, follows the finger.
     phoneDrawerTracking ? trackDrawerDrag : undefined,
   );
 
@@ -2880,8 +2882,7 @@ function AppContent({
             setWizardPrefill(prefill);
             setShowSessionWizard(true);
           }}
-          // A phone lists them on its home, the session list, instead.
-          onViewAllSuggestions={singlePane ? undefined : () => requestNavigate("/suggestions")}
+          onViewAllSuggestions={() => requestNavigate("/suggestions")}
           onOpenSuggestionsMarketplace={() => requestNavigate("/settings/plugins?marketplace=suggestions")}
           tourActive={tour.isTourActive}
         />
@@ -3171,36 +3172,13 @@ function AppContent({
     return <Navigate to="/setup" replace />;
   }
 
-  // A phone is a two-screen stack, as Claude's app is: the session list is home, and a Session opens over it.
-  const phoneHome = singlePane && !activeSession && !fullPageView && !focusMode;
-  // With a Session open, a phone's session list is a drawer that pushes the Session aside as a card.
-  const phoneDrawer = singlePane && !!activeSession && !fullPageView && !focusMode;
+  // A phone shows one page at a time, the landing page or a Session, with the session list in a drawer that pushes
+  // the page aside as a card, as Muse and Claude's app do.
+  const phoneDrawer = singlePane && !fullPageView && !focusMode;
+  const phoneHome = phoneDrawer && !activeSession;
   const drawerPushed = phoneDrawer && sidebarOpen;
-  const phonePagesHostBanners = phoneDrawer || phoneHome || (singlePane && showSettings);
+  const phonePagesHostBanners = phoneDrawer || (singlePane && showSettings);
 
-  // The Dashboard's Suggested sessions, which a phone lists on its home, the session list, instead.
-  const phoneSuggestions = (
-    <DashboardSuggestions
-      readOnly={caps.readOnly || !caps.canManageSuggestions}
-      cityhall={!caps.canManageSuggestions}
-      onPrepare={(prefill) => {
-        setWizardPrefill(prefill);
-        setShowSessionWizard(true);
-      }}
-      onEditPreset={
-        caps.canManageSuggestions
-          ? (providerId, criterion) =>
-              requestNavigate(
-                `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
-              )
-          : undefined
-      }
-      canLink={!caps.nameOnlyWizard}
-      onViewAll={() => requestNavigate("/suggestions")}
-      onOpenSession={handleSelectSession}
-      sessions={sessions}
-    />
-  );
   const bannerStack = (
     <BannerStack
       onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
@@ -3214,6 +3192,7 @@ function AppContent({
       onToggleSidebar={handleToggleSidebar}
       onOpenPalette={() => setShowPalette(true)}
       terminal={caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined}
+      phoneFloating={singlePane && !fullPageView && !focusMode}
       sessionItems={phoneSessionItems}
       onOpenSessionMenu={
         singlePane && activeSession
@@ -3274,7 +3253,7 @@ function AppContent({
           <div
             // The session drawer's colour on a phone: its home, and behind a Session card the drawer pushes aside, so
             // nothing lighter shows past the card's rounded edge.
-            className={`h-(--app-height) flex flex-col ${phoneHome || phoneDrawer ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
+            className={`h-(--app-height) flex flex-col ${phoneDrawer ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
             // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
             style={
               phoneDrawer ? ({ "--phone-header-h": "76px", "--phone-overlay-top": "76px" } as CSSProperties) : undefined
@@ -3286,13 +3265,13 @@ function AppContent({
               // visible viewport while the keyboard pans the page.
               <div
                 className={`md:hidden fixed inset-x-0 top-[var(--vv-offset-top,0px)] z-30 h-[env(safe-area-inset-top)] transition-colors duration-[400ms] [mask-image:linear-gradient(to_bottom,#000_calc(100%-0.375rem),transparent)] ${
-                  drawerPushed ? "bg-surface-950" : "bg-surface-900"
+                  drawerPushed || phoneHome ? "bg-surface-950" : "bg-surface-900"
                 }`}
               />
             )}
             {!phoneDrawer && (
               // The phone's list carries the app's menu itself, and Settings heads its own page.
-              <div className={phoneHome || showSettings ? "max-md:hidden" : undefined}>{topBar}</div>
+              <div className={showSettings ? "max-md:hidden" : undefined}>{topBar}</div>
             )}
             {/* A phone's pages host the banners under their own top controls. */}
             {!phonePagesHostBanners && bannerStack}
@@ -3303,12 +3282,16 @@ function AppContent({
             <div className="flex flex-1 min-h-0">
               {!fullPageView && !focusMode && (
                 <WorkspaceSidebar
-                  asPage={phoneHome}
-                  pageBanner={phoneHome ? bannerStack : undefined}
-                  pageSection={phoneHome ? phoneSuggestions : undefined}
                   drawer={phoneDrawer}
+                  onHome={
+                    phoneDrawer
+                      ? () => {
+                          setSidebarOpen(false);
+                          handleGoDashboard();
+                        }
+                      : undefined
+                  }
                   menuItems={appMenu}
-                  pageTop={setupBanner}
                   observedById={observedById}
                   runtimeEpoch={runtimeEpoch}
                   onSessionMutation={applySessionMutation}
@@ -3378,14 +3361,13 @@ function AppContent({
                 />
               )}
 
-              {/* The phone home is the session list, so the dashboard behind it stays out of the way. */}
               <div
                 ref={cardRef}
                 // With a Session open on a phone this is a card over the session drawer: the drawer pushes it aside
                 // whole, header and all, as clawbolt's and Claude's apps do.
-                className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${phoneHome ? "max-md:hidden" : ""} ${
+                className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${phoneHome ? "max-md:pt-[var(--phone-header-h)]" : ""} ${
                   phoneDrawer
-                    ? "max-md:relative max-md:z-10 max-md:bg-surface-900 max-md:has-[>[data-phone-banner]:not(:empty)]:[--phone-overlay-top:0px]"
+                    ? `max-md:relative max-md:z-10 ${phoneHome ? "max-md:bg-surface-950" : "max-md:bg-surface-900"} max-md:has-[>[data-phone-banner]:not(:empty)]:[--phone-overlay-top:0px]`
                     : ""
                 } ${
                   drawerPushed
@@ -3404,7 +3386,7 @@ function AppContent({
                   // views below it start right under it instead of clearing the header themselves.
                   <div
                     data-phone-banner
-                    className={`md:hidden shrink-0 mx-3 mt-[var(--phone-header-h)] mb-2 ${PHONE_BANNER_CARD}`}
+                    className={`md:hidden shrink-0 mx-3 mb-2 ${phoneHome ? "" : "mt-[var(--phone-header-h)]"} ${PHONE_BANNER_CARD}`}
                   >
                     {bannerStack}
                   </div>

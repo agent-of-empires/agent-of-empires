@@ -14,7 +14,7 @@ import {
 } from "../../lib/switchAccountTrigger";
 import { reportError } from "../../lib/toastBus";
 import { formatDurationSecondsShort } from "../sidebar/format";
-import { BUTTON_PRIMARY_SM, BUTTON_SECONDARY_SM } from "../../lib/surfaces";
+import { BUTTON_INLINE, BUTTON_PRIMARY_SM, BUTTON_SECONDARY_SM } from "../../lib/surfaces";
 import { SwitchAccountModal } from "./SwitchAccountModal";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 
@@ -119,7 +119,7 @@ export function UsageLimitBanner({
               {settingsHref && (
                 <>
                   {" "}
-                  <Link to={settingsHref} className="font-medium text-brand-400 underline-offset-2 hover:underline">
+                  <Link to={settingsHref} className={BUTTON_INLINE}>
                     Turn on
                   </Link>
                 </>

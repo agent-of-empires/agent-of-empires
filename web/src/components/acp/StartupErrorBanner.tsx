@@ -7,7 +7,7 @@ import type { AcpWorkerState } from "../../lib/types";
 import type { StartupCause } from "../../lib/acpTypes";
 import { SandboxLoginDialog } from "../SandboxLoginDialog";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
-import { BUTTON_SECONDARY_SM } from "../../lib/surfaces";
+import { BUTTON_INLINE, BUTTON_SECONDARY_SM } from "../../lib/surfaces";
 import { CommandBlock, InlineCode, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 import { ApiKeyAlternative } from "./SignInPopover";
 import { signInSteps } from "./signInSteps";
@@ -239,6 +239,7 @@ export function StartupErrorBanner({
     onClick: () => void retry(),
     testId: "startup-error-banner-retry",
     disabled: busy,
+    busy: retryState === "retrying",
   };
   const installAction: RecoveryAction = {
     label:
@@ -250,6 +251,7 @@ export function StartupErrorBanner({
     onClick: () => void install.install(),
     testId: "startup-error-banner-install",
     disabled: busy,
+    busy: install.state === "installing",
   };
   const loginAction: RecoveryAction = {
     label: "Log in",
@@ -336,7 +338,7 @@ export function StartupErrorBanner({
           data-testid="startup-error-banner-details"
           aria-expanded={detailsOpen}
           onClick={() => setDetailsOpen(!detailsOpen)}
-          className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+          className={BUTTON_INLINE}
         >
           Details
         </button>
@@ -347,7 +349,7 @@ export function StartupErrorBanner({
               type="button"
               data-testid="startup-error-banner-copy"
               onClick={() => void copy()}
-              className="mt-1 text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+              className={`${BUTTON_INLINE} mt-1`}
             >
               {copied === message ? "Copied" : "Copy"}
             </button>
@@ -436,7 +438,7 @@ function AgentLogDisclosure({ sessionId }: { sessionId: string }) {
           onClick={handleToggle}
           data-testid="acp-agent-log-toggle"
           aria-expanded={open}
-          className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+          className={BUTTON_INLINE}
         >
           {open ? "Hide agent log" : "Open agent log"}
         </button>

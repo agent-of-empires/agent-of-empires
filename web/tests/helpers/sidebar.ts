@@ -37,15 +37,32 @@ export async function dragSidebarHandle(page: Page, ...xs: number[]) {
   await page.mouse.up();
 }
 
-/** Show the phone's session list: the home screen, or with a Session open the drawer ☰ opens. */
+/** Show the phone's session list, in the drawer ☰ opens. */
 export async function openMobileSidebar(page: Page) {
   const menu = page.getByTestId("topbar-menu");
   const row = page.getByTestId("sidebar-session-row").first();
-  await expect.poll(async () => (await menu.isVisible()) || (await row.isVisible()), { timeout: 10_000 }).toBe(true);
-  if (await menu.isVisible()) await menu.click();
+  const drawer = page.locator('[role="navigation"][aria-label="Sessions sidebar"]');
+  // Read once its slide settles: a closing drawer stays `visible` until its transition ends.
+  const open = () =>
+    drawer
+      .evaluate(async (el) => {
+        await Promise.all(el.getAnimations().map((a) => a.finished.catch(() => undefined)));
+        return getComputedStyle(el).visibility === "visible";
+      })
+      .catch(() => false);
+  await expect.poll(async () => (await menu.isVisible()) || (await open()), { timeout: 10_000 }).toBe(true);
+  // Already open: ☰ sits under the drawer's scrim, and a second tap would close it.
+  if (!(await open())) await menu.click();
   await expect(row).toBeVisible({ timeout: 10_000 });
-  // The drawer slides out from under the Session card; wait for the card to clear the row.
-  await expect.poll(async () => (await row.boundingBox())?.x ?? -1).toBeGreaterThanOrEqual(0);
+  // The drawer sits under the page card, which slides aside: wait until a tap on the row reaches the row.
+  await expect
+    .poll(() =>
+      row.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+      }),
+    )
+    .toBe(true);
 }
 
 /** Session row titles in DOM order, read from the label span so row chips are ignored. */

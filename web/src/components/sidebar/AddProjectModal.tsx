@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { BUTTON_GHOST, BUTTON_PRIMARY, INPUT } from "../../lib/surfaces";
+import { BUTTON_GHOST, BUTTON_INLINE, BUTTON_PRIMARY, INPUT } from "../../lib/surfaces";
 import type { AttachProjectResult } from "../../lib/api";
 import { ProjectSearchList } from "../session-wizard/steps/ProjectSearchList";
 import { useProjectPicker } from "../session-wizard/steps/projectPicker";
@@ -85,7 +85,7 @@ export function AddProjectModal({
           {projectsError && (
             <div role="alert" className="text-sm text-status-warning">
               Projects could not be loaded. You can still enter a path.
-              <button type="button" onClick={retry} className="ml-2 text-brand-400 hover:underline cursor-pointer">
+              <button type="button" onClick={retry} className={`${BUTTON_INLINE} ml-2`}>
                 Retry
               </button>
             </div>

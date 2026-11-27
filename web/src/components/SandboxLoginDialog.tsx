@@ -2,7 +2,7 @@
 // The code lives only in component state, is cleared on submit and close, and never reaches a URL, storage or log.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { BUTTON_PRIMARY } from "../lib/surfaces";
+import { BUTTON_INLINE, BUTTON_PRIMARY } from "../lib/surfaces";
 import { createPortal } from "react-dom";
 
 import {
@@ -284,12 +284,7 @@ export function SandboxLoginDialog({
         </p>
         <div className="mt-3 flex items-center gap-2">
           {isHttps(phase.url) && (
-            <a
-              href={phase.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-sm text-brand-500 underline hover:text-brand-400"
-            >
+            <a href={phase.url} target="_blank" rel="noopener noreferrer" className={BUTTON_INLINE}>
               Open the page to sign in
             </a>
           )}

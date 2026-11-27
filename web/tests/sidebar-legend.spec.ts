@@ -98,7 +98,9 @@ test.describe("sidebar legend on a phone", () => {
   });
 
   test("⋯ › Symbol legend opens a sheet that the backdrop closes", async ({ page }) => {
-    const more = page.getByRole("button", { name: "More options" });
+    const more = page
+      .getByRole("navigation", { name: "Sessions sidebar" })
+      .getByRole("button", { name: "More options" });
     await more.tap();
     await page.getByRole("menuitem", { name: "Symbol legend" }).tap();
     const legend = page.getByTestId("sidebar-legend");

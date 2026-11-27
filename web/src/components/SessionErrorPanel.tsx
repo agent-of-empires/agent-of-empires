@@ -49,6 +49,7 @@ export function SessionErrorPanel({ session, readOnly }: Props) {
     onClick: () => void onRestart(),
     testId: "session-error-restart",
     disabled: restart.state === "restarting",
+    busy: restart.state === "restarting",
   };
   const copyAction: RecoveryAction = {
     label: copied ? "Copied" : "Copy error",

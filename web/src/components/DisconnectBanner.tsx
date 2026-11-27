@@ -1,5 +1,6 @@
 import type { ConnectionBannerState } from "../hooks/useConnectionBanner";
 import { StrokeIcon } from "./icons";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 /** Full-width banner shown when the Daemon is unreachable. */
 export function DisconnectBanner({ state }: { state: ConnectionBannerState }) {
@@ -25,11 +26,7 @@ export function DisconnectBanner({ state }: { state: ConnectionBannerState }) {
       <span className="w-1.5 h-1.5 rounded-full bg-status-error animate-pulse shrink-0" />
       <span>{navigator.onLine === false ? "Offline. Reconnecting…" : "Daemon unreachable. Reconnecting…"}</span>
       {/* The list polls every few seconds on its own; this is for whoever would rather not wait. */}
-      <button
-        type="button"
-        onClick={() => window.location.reload()}
-        className="ml-1 min-h-8 px-2 -my-1 rounded-md font-medium underline underline-offset-2 cursor-pointer hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-      >
+      <button type="button" onClick={() => window.location.reload()} className={`${BUTTON_INLINE} ml-1 -my-1`}>
         Try again
       </button>
     </div>

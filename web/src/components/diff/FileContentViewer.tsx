@@ -11,7 +11,7 @@ import { lazyView } from "../../lib/lazyView";
 const FullFileViewer = lazyView(() => import("./FullFileViewer").then((m) => m.FullFileViewer), null);
 const MarkdownFileView = lazyView(() => import("./MarkdownFileView").then((m) => m.MarkdownFileView), null);
 import { BackButton, Centered, MarkdownToggle, TooLarge } from "./viewerChrome";
-import { BUTTON_SECONDARY_SM } from "../../lib/surfaces";
+import { BUTTON_INLINE, BUTTON_SECONDARY_SM } from "../../lib/surfaces";
 
 interface Props {
   sessionId: string;
@@ -111,7 +111,7 @@ function SessionFileViewer({ sessionId, filePath, onBack, structured }: Props) {
           {structured ? (
             <button
               type="button"
-              className="underline cursor-pointer"
+              className={BUTTON_INLINE}
               onClick={() => {
                 requestComposerPrefill(
                   sessionId,

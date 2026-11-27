@@ -151,27 +151,31 @@ test.describe("Phone session stack", () => {
     await page.setViewportSize({ width: 375, height: 812 });
   });
 
-  test("the session list is home; a Session pushes it into a drawer that ☰ brings back", async ({ page }) => {
+  test("the landing page is home; ☰ opens the session drawer, whose Home goes back to it", async ({ page }) => {
     await page.goto("/");
-    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
-    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeHidden();
-    await expect(page.getByTestId("sidebar-row-status-line").first()).toBeVisible();
+    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
+    const drawer = page.getByTestId("sidebar-new-session-pill");
+    await expect(drawer).toBeHidden();
+    // Beta waits, so ☰ carries the count.
+    const menu = page.getByTestId("topbar-menu");
+    await expect(menu).toHaveAccessibleName("Show sessions, 1 waiting for your input");
 
+    await menu.click();
+    await expect(drawer).toBeInViewport();
+    await expect(page.getByTestId("sidebar-row-status-line").first()).toBeVisible();
     await page.getByTestId("sidebar-session-row").filter({ hasText: "Alpha" }).click();
     await expect(page).toHaveURL(/\/session\/alpha$/);
     const pill = page.getByTestId("session-title-pill");
     await expect(pill).toContainText("Alpha");
     await expect(pill).toContainText("shop");
-    await expect(page.getByTestId("sidebar-new-session-pill")).toBeHidden();
-    // Beta waits elsewhere, so ☰ carries the count.
-    const menu = page.getByTestId("topbar-menu");
-    await expect(menu).toHaveAccessibleName("Show sessions, 1 waiting for your input");
+    await expect(drawer).toBeHidden();
 
     await menu.click();
-    await expect(page.getByTestId("sidebar-new-session-pill")).toBeInViewport();
-    await page.getByTestId("sidebar-session-row").filter({ hasText: "Beta" }).click();
-    await expect(page).toHaveURL(/\/session\/beta$/);
-    await expect(page.getByTestId("sidebar-new-session-pill")).toBeHidden();
+    await expect(drawer).toBeInViewport();
+    await page.getByTestId("sidebar-home").click();
+    await expect(page).toHaveURL(/\/$/);
+    await expect(drawer).toBeHidden();
+    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
   });
 
   test("tapping the title pill opens the Session's menu; its folder drops out where it repeats the title", async ({

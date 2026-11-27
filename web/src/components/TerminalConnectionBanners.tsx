@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { useConnectionBanner } from "../hooks/useConnectionBanner";
+import { BUTTON_INLINE } from "../lib/surfaces";
+import { Spinner } from "./Dialog";
 
 // Connection banners for every terminal surface: Reconnecting while the socket redials, and a manual retry once
 // the budget is spent.
@@ -15,7 +17,8 @@ interface Props {
   onRetry: () => void;
   /** The pane's process exited; Restart re-ensures the session instead of just redialing. */
   paneDead?: boolean;
-  onRestart?: () => void;
+  /** Restart shows a spinner until the returned promise settles. */
+  onRestart?: () => Promise<unknown> | void;
 }
 
 export function TerminalConnectionBanners({
@@ -29,6 +32,7 @@ export function TerminalConnectionBanners({
 }: Props) {
   const daemon = useConnectionBanner();
   const [slow, setSlow] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   useEffect(() => {
     if (!reconnecting) return;
     const timer = setTimeout(() => setSlow(true), RECONNECTING_GRACE_MS);
@@ -38,12 +42,26 @@ export function TerminalConnectionBanners({
     };
   }, [reconnecting]);
   if (connected) return null;
+  const restart = () => {
+    const pending = onRestart?.();
+    if (!pending) return;
+    setRestarting(true);
+    const done = () => setRestarting(false);
+    void pending.then(done, done);
+  };
   if (paneDead) {
     return (
       <div className="max-md:mt-[var(--phone-overlay-top,0px)] bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
         <span className="text-xs text-status-error">Agent exited</span>
         {onRestart && (
-          <button onClick={onRestart} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
+          <button
+            type="button"
+            onClick={restart}
+            disabled={restarting}
+            aria-busy={restarting}
+            className={BUTTON_INLINE}
+          >
+            {restarting && <Spinner />}
             Restart
           </button>
         )}
@@ -63,7 +81,7 @@ export function TerminalConnectionBanners({
     return (
       <div className="max-md:mt-[var(--phone-overlay-top,0px)] bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
         <span className="text-xs text-status-error">Connection lost</span>
-        <button onClick={onRetry} className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline">
+        <button type="button" onClick={onRetry} className={BUTTON_INLINE}>
           Retry
         </button>
       </div>

@@ -1,6 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import type { SettingsIntroId } from "../../lib/settingsIntros";
-import { CARD } from "../../lib/surfaces";
+import { BUTTON_INLINE, CARD } from "../../lib/surfaces";
 
 // Copy explains what a tab is for and never states a setting's current value.
 const INTROS: Record<SettingsIntroId, { summary: ReactNode; details: string }> = {
@@ -41,21 +41,17 @@ export function SettingsIntro({ id, onFold }: { id: SettingsIntroId; onFold: () 
       >
         {details}
       </p>
-      <div className="mt-2 flex flex-wrap gap-x-5">
+      <div className="mt-2 flex flex-wrap gap-2">
         <button
           type="button"
           aria-expanded={open}
           aria-controls={detailsId}
           onClick={() => setOpen((o) => !o)}
-          className="min-h-8 max-md:min-h-11 cursor-pointer font-medium text-text-primary underline-offset-4 hover:underline"
+          className={BUTTON_INLINE}
         >
           Details <span aria-hidden="true">{open ? "⌄" : "›"}</span>
         </button>
-        <button
-          type="button"
-          onClick={onFold}
-          className="min-h-8 max-md:min-h-11 cursor-pointer font-medium text-text-primary underline-offset-4 hover:underline"
-        >
+        <button type="button" onClick={onFold} className={BUTTON_INLINE}>
           Got it
         </button>
       </div>

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
@@ -25,7 +25,6 @@ import { sessionWorkspaces } from "../lib/sessionWorkspace";
 import { ProjectsSection } from "./ProjectsSection";
 import { FoldChevron, PlusIcon, StrokeIcon } from "./icons";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
-import { PHONE_BANNER_CARD } from "../lib/surfaces";
 import { Search, SquarePen } from "lucide-react";
 import { usePersistedFlag } from "./usePersistedFlag";
 import { NAV_ITEM, ROWS, onSidebarArrowKey } from "./sidebar/keyboardNav";
@@ -88,16 +87,10 @@ interface Props {
   onNew: (prefill?: { group?: string }) => void;
   /** Opens the command palette from the sidebar's Search row. */
   onOpenPalette?: () => void;
-  /** Phone home: render as the full-width page rather than a column. */
-  asPage?: boolean;
-  /** Shown above the list on the phone page, such as the setup banner. */
-  pageTop?: ReactNode;
-  /** The app's banners on the phone page, under its title row. */
-  pageBanner?: ReactNode;
-  /** A section the phone page lists above the sessions, scrolling with them, such as Suggested sessions. */
-  pageSection?: ReactNode;
-  /** Phone with a Session open: the list is a drawer from the left, opened and closed through `open`. */
+  /** Phone: the list is a drawer from the left, opened and closed through `open`. */
   drawer?: boolean;
+  /** Phone: the drawer's title is a Home button that calls this. */
+  onHome?: () => void;
   /** The app's ⋯ items, which a phone's list carries in its title row. */
   menuItems?: OverflowItem[];
   onCreateSession: (repoPath: string) => void;
@@ -338,21 +331,18 @@ export function WorkspaceSidebar(props: Props) {
     props.onOpenPalette?.();
   };
 
-  // A phone lists sessions as Muse does: the whole screen with no Session open, else a drawer under the Session,
-  // which slides aside to uncover it and hides once it has slid back. Both run the full height on a solid colour,
-  // which iOS 26 extends under its bars.
-  const phoneClass = props.asPage
-    ? "max-md:flex-1 max-md:!w-full max-md:bg-surface-950"
-    : props.drawer
-      ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 max-md:transition-[visibility] ${DRAWER_MOTION} ${
-          open ? "" : "max-md:invisible"
-        }`
-      : "max-md:hidden";
+  // A phone lists sessions as Muse does, in a drawer under the page, which slides aside to uncover it and hides once
+  // it has slid back. It runs the full height on a solid colour, which iOS 26 extends under its bars.
+  const phoneClass = props.drawer
+    ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 max-md:transition-[visibility] ${DRAWER_MOTION} ${
+        open ? "" : "max-md:invisible"
+      }`
+    : "max-md:hidden";
   return (
     <SidebarCompactContext.Provider value={compact}>
       <div
         // A phone's list fills the screen, leaving the tour no room beside it, so its title takes the anchor.
-        {...(props.asPage || props.drawer ? {} : tourAnchor(TOUR_ANCHORS.sidebar))}
+        {...(props.drawer ? {} : tourAnchor(TOUR_ANCHORS.sidebar))}
         role="navigation"
         aria-label="Sessions sidebar"
         tabIndex={-1}
@@ -360,10 +350,9 @@ export function WorkspaceSidebar(props: Props) {
         style={{ width: effectiveWidth }}
         data-compact={compact ? "true" : undefined}
         className={`${phoneClass} flex flex-col h-full min-h-0 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
-          open || props.asPage ? "" : "md:hidden"
+          open ? "" : "md:hidden"
         }`}
       >
-        {props.asPage && props.pageTop}
         <SidebarNav compact={compact} offline={offline} onNew={() => props.onNew()} onSearch={props.onOpenPalette} />
         <SidebarToolbar
           compact={compact}
@@ -380,14 +369,14 @@ export function WorkspaceSidebar(props: Props) {
           onToggleFacets={() => setFacetOpen((o) => !o)}
           filterOpen={filterOpen}
           onToggleFilter={toggleFilter}
-          headingAnchored={!!(props.asPage || props.drawer)}
+          headingAnchored={!!props.drawer}
+          onHome={props.onHome}
           phoneMenu={
             props.menuItems && (
               <OverflowMenu items={props.menuItems} phoneFloating triggerDataTour={TOUR_ANCHORS.topbarMore} />
             )
           }
         />
-        {props.pageBanner && <div className={`mx-3 mb-2 ${PHONE_BANNER_CARD}`}>{props.pageBanner}</div>}
 
         {filterOpen && !compact && (
           <div className="px-3 pb-2">
@@ -415,7 +404,6 @@ export function WorkspaceSidebar(props: Props) {
         )}
 
         <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/40 px-2 pt-1">
-          {props.pageSection && <div className="px-1">{props.pageSection}</div>}
           {isNested ? (
             <NestedGroupList
               ctx={ctx}

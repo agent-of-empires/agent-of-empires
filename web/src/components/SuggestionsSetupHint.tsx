@@ -4,6 +4,7 @@ import { loadFeaturedSuggestionSources, sourceLabel, type FeaturedSources } from
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { isWebUiStateHydrated, onWebUiStateHydrated } from "../lib/webUiHydration";
 import { SuggestionsSetupSheet } from "./SuggestionsSetupSheet";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 /** Synced to the server (see webUiSync), so one dismissal covers every device. */
 const DISMISSED_KEY = "aoe-suggestions-hint-dismissed";
@@ -92,11 +93,7 @@ export function SuggestionsSetupHint({
         data-testid="suggestions-hint-error"
       >
         Couldn&apos;t look up suggestion sources: {featured.message.replace(/[.!]$/, "")}.
-        <button
-          type="button"
-          className="min-h-8 cursor-pointer font-medium text-brand-500 hover:underline"
-          onClick={() => void retry()}
-        >
+        <button type="button" className={BUTTON_INLINE} onClick={() => void retry()}>
           Try again
         </button>
         <DismissButton onClick={dismiss} />
@@ -115,7 +112,7 @@ export function SuggestionsSetupHint({
         <span>Want AoE to suggest what to work on next, based on your {names} issues and PRs?</span>
         <button
           type="button"
-          className="min-h-8 cursor-pointer font-medium text-brand-500 hover:underline"
+          className={BUTTON_INLINE}
           onClick={() => setSheetOpen(true)}
           data-testid="suggestions-hint-open"
         >

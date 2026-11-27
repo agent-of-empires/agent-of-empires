@@ -1,11 +1,13 @@
 import { makePatch } from "./helpers/patch";
 import { test, expect, observeFor } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
-import { clickSidebarSession } from "./helpers/sidebar";
+import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 import { openPanelsByDefault } from "./helpers/apiMocks";
 
 async function openSession(page: Page) {
+  // A phone keeps the list in the drawer ☰ opens.
+  if ((page.viewportSize()?.width ?? 1280) < 768) await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await expect(page.locator('[data-term="agent"]')).toHaveCount(1);
   await expect(

@@ -11,6 +11,7 @@ import type { SuggestionSetupCheck, SuggestionsSnapshot } from "../lib/types";
 import { PluginInstallConsentModal } from "./settings/PluginInstallConsentModal";
 import { PluginJobProgressModal } from "./settings/PluginJobProgressModal";
 import { sourceFromCommand, usePluginMarketplace, type PluginJobRef } from "./settings/pluginFlows";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 interface Props {
   /** Featured providers that declare `[suggestions]` and are not installed yet. */
@@ -24,7 +25,6 @@ interface Props {
 type Step = "pick" | "checks" | "done";
 
 const POLL_MS = 2000;
-const LINK = "cursor-pointer text-brand-500 hover:underline";
 const GHOST = "h-8 rounded-md px-3 text-xs text-text-secondary hover:bg-surface-800 disabled:opacity-50";
 const PRIMARY =
   "h-8 rounded-md bg-brand-500 px-3 text-xs font-medium text-black hover:bg-brand-400 disabled:opacity-50";
@@ -226,7 +226,7 @@ function PickStep(p: {
       <div className="border-t border-surface-700/40 px-4 py-3 text-xs">
         <button
           type="button"
-          className={LINK}
+          className={BUTTON_INLINE}
           title="Opens Settings › Plugins › Marketplace. Other sources there, like Linear, are unvetted"
           onClick={p.onOpenMarketplace}
           data-testid="suggestions-setup-marketplace"

@@ -81,6 +81,9 @@ export const BUTTON_PRIMARY_SM = compact(BUTTON_PRIMARY);
 export const BUTTON_SECONDARY_SM = compact(BUTTON_SECONDARY);
 export const BUTTON_GHOST_SM = compact(BUTTON_GHOST);
 
+/** A small action set in a banner, notice or sentence, held at the 32px desktop floor. */
+export const BUTTON_INLINE = `${BUTTON_SECONDARY_SM} min-h-8 align-middle shrink-0 whitespace-nowrap`;
+
 /** An action on a warning-tinted strip or card. */
 export const BUTTON_WARNING_SM = BUTTON_SECONDARY_SM.replace(
   "border-surface-600/70 bg-surface-800 text-text-primary hover:bg-surface-700/60",

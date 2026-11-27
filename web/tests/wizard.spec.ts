@@ -252,7 +252,7 @@ test.describe("mobile", () => {
   test("opening starts focus inside the wizard, on Close, without a field", async ({ page }) => {
     await mockWizardApis(page);
     await page.goto("/");
-    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeAttached();
     await openWizard(page);
     await expect(wizard(page).getByRole("button", { name: "Close" })).toBeFocused();
   });
@@ -261,7 +261,7 @@ test.describe("mobile", () => {
     await mockWizardApis(page);
     await page.goto("/");
     // The `n` shortcut is live once the dashboard has loaded its sessions.
-    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeAttached();
     await openWizard(page);
     await selectProject(page, "/tmp/example");
     const w = wizard(page);
@@ -283,7 +283,7 @@ test.describe("mobile", () => {
       projects: Array.from({ length: 30 }, (_, i) => ({ name: `proj-${i}`, path: `/tmp/proj-${i}`, scope: "global" })),
     });
     await page.goto("/");
-    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeAttached();
     await openWizard(page);
     const box = (await wizard(page).boundingBox())!;
     expect(box.y).toBeGreaterThanOrEqual(0);

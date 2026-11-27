@@ -7,6 +7,7 @@
 import { test, expect } from "./helpers/mockedTest";
 import { sessionResponse as baseSession } from "./helpers/sessions";
 import { mockStaticApis } from "./helpers/apiMocks";
+import { openMobileSidebar } from "./helpers/sidebar";
 import { Page } from "@playwright/test";
 
 const LONG_TITLE = "this-is-a-deliberately-very-long-session-name-that-eats-the-whole-row-width-on-mobile";
@@ -79,6 +80,7 @@ test.describe("Plugin row slots on a mobile sidebar (#2514)", () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await mockApis(page);
     await page.goto("/");
+    await openMobileSidebar(page);
 
     await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(1, { timeout: 8000 });
 
@@ -111,6 +113,7 @@ test.describe("Plugin row slots on a mobile sidebar (#2514)", () => {
       },
     ]);
     await page.goto("/");
+    await openMobileSidebar(page);
     await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(1, { timeout: 8000 });
 
     const chip = page.locator("button[data-plugin-slot='row-badge']");

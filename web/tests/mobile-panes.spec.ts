@@ -75,12 +75,16 @@ test.describe("Mobile session view tabs (#1452)", () => {
     // The header holds no panels toggle: the ⋯ replaces it.
     await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
 
-    // A swipe left raises nothing; a swipe right opens the session drawer, and a swipe left closes it.
+    // A swipe left opens the header's ⋯, which a tap outside closes; a swipe right opens the session drawer, and a
+    // swipe left closes it.
     const y = viewport.height / 2;
     const drawer = page.getByTestId("sidebar-new-session-pill");
     await swipe(page, viewport.width / 2 + 80, viewport.width / 2 - 80, y);
+    await expect(page.getByRole("menuitemradio", { name: "Agent" })).toBeVisible();
     await expect(picker(page)).toBeHidden();
     await expect(drawer).toBeHidden();
+    await page.mouse.click(24, viewport.height - 120);
+    await expect(page.getByRole("menuitemradio", { name: "Agent" })).toBeHidden();
     await swipe(page, viewport.width / 2 - 80, viewport.width / 2 + 80, y);
     await expect(drawer).toBeInViewport();
     await expect(page.getByTestId("sidebar-drawer-scrim")).toBeVisible();
@@ -237,7 +241,7 @@ test.describe("Mobile agent pane", () => {
   test("no touch toolbar without a session; the agent pane renders the live view, not xterm", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await page.goto("/");
-    await expect(page.getByRole("navigation", { name: "Sessions sidebar" })).toBeVisible();
+    await expect(page.locator('[role="navigation"][aria-label="Sessions sidebar"]')).toBeAttached();
     await expect(page.getByRole("button", { name: /Arrow/ })).toHaveCount(0);
 
     await openLiveSession(page, handle, { mobile: true, settings: null });

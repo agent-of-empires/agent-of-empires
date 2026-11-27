@@ -472,7 +472,7 @@ test("a read-only server sends no telemetry seen-ping", async ({ page }) => {
   const mock = await mockAcpSession(page, { about: { read_only: true } });
 
   await page.goto("/");
-  await expect(page.getByRole("navigation", { name: "Sessions sidebar" })).toBeVisible();
+  await expect(page.locator('[role="navigation"][aria-label="Sessions sidebar"]')).toBeAttached();
   await waitForResponseBody(page, "/api/about");
   await expect(page.getByTestId("sidebar-session-row")).toHaveCount(1);
   await observeFor(page, 500, async () => {

@@ -10,7 +10,7 @@ import {
   type MockSessionInput,
   type SidebarMockHandle,
 } from "./helpers/sidebarMocks";
-import { dragRow, readVisibleSessionTitles } from "./helpers/sidebar";
+import { dragRow, openMobileSidebar, readVisibleSessionTitles } from "./helpers/sidebar";
 
 const WRAPPERS = "[aria-roledescription='Press and hold to reorder']";
 
@@ -231,6 +231,7 @@ test.describe("touch rows", () => {
   async function openMobile(page: Page, sessions = threeSessionsInOneRepo()) {
     const handle = await installSidebarMocks(page, { sessions });
     await page.goto("/");
+    await openMobileSidebar(page);
     const rows = page.getByTestId("sidebar-session-row");
     await expect(rows).toHaveCount(3);
     await page.waitForFunction(

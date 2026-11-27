@@ -6,6 +6,7 @@ import { RATTLES } from "../../lib/rattles";
 import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ContainerGoneBanner, type NewSessionLike } from "./ContainerGoneBanner";
 import { BUTTON_SECONDARY_SM, BUTTON_WARNING_SM } from "../../lib/surfaces";
+import { Spinner } from "../Dialog";
 import { WarningStrip } from "../panelParts";
 import { StartupErrorBanner } from "./StartupErrorBanner";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
@@ -257,8 +258,10 @@ export function StartupWaitLine({
           onClick={() => void restart()}
           disabled={restartState === "retrying"}
           aria-describedby={cost ? costId : undefined}
+          aria-busy={restartState === "retrying"}
           className={`${BUTTON_SECONDARY_SM} shrink-0`}
         >
+          {restartState === "retrying" && <Spinner />}
           {restartState === "retrying" ? "Restarting…" : `Restart ${agent}`}
         </button>
       )}

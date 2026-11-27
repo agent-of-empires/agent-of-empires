@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { House } from "lucide-react";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import type { SidebarAxis } from "../../lib/sidebarAxis";
 import { SidebarViewMenu } from "./SidebarViewMenu";
@@ -33,6 +34,7 @@ export function SidebarToolbar({
   onToggleFilter,
   headingAnchored = false,
   phoneMenu,
+  onHome,
 }: {
   compact: boolean;
   axis: SidebarAxis;
@@ -52,6 +54,8 @@ export function SidebarToolbar({
   headingAnchored?: boolean;
   /** The app's ⋯, which a phone's title row carries. */
   phoneMenu?: ReactNode;
+  /** A phone's drawer titles itself with a Home button, back to the landing page. */
+  onHome?: () => void;
 }) {
   const axisHeading = AXIS_HEADING[axis];
   return (
@@ -66,10 +70,25 @@ export function SidebarToolbar({
           <span
             {...(headingAnchored ? tourAnchor(TOUR_ANCHORS.sidebar) : {})}
             data-testid="sidebar-axis-heading"
-            className="text-[12px] font-medium text-text-dim max-md:text-[22px] max-md:font-semibold max-md:text-text-primary flex-1"
+            className={`text-[12px] font-medium text-text-dim max-md:text-[22px] max-md:font-semibold max-md:text-text-primary flex-1 ${
+              onHome ? "max-md:hidden" : ""
+            }`}
           >
             {axisHeading}
           </span>
+          {onHome && (
+            <span className="md:hidden flex-1 flex">
+              <button
+                type="button"
+                onClick={onHome}
+                data-testid="sidebar-home"
+                className="h-10 pl-3 pr-4 -ml-1 flex items-center gap-2 rounded-full float-control text-[15px] font-semibold text-text-primary cursor-pointer active:scale-95 transition-transform"
+              >
+                <House className="size-[18px]" strokeWidth={1.75} aria-hidden />
+                Home
+              </button>
+            </span>
+          )}
           <SidebarViewMenu
             axis={axis}
             onAxisChange={onAxisChange}

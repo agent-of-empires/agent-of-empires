@@ -5,7 +5,7 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import type { RightPanelView } from "../lib/rightPanelView";
 import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
-import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
+import { OPEN_HEADER_MENU_EVENT, OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { PluginPageButtons } from "./plugin/PluginPageButtons";
@@ -33,6 +33,8 @@ interface Props {
   sessionItems?: OverflowItem[];
   /** Opens the Session's actions, as a long press on its row does; a phone's title pill calls it when tapped. */
   onOpenSessionMenu?: (x: number, y: number) => void;
+  /** A phone page with the session drawer: the header floats over the page with ☰ for the drawer. */
+  phoneFloating?: boolean;
   /** A phone's views of the open Session, chosen from the ⋯; away from the agent, the pill names the view and
    *  back returns to the agent. */
   phoneViews?: {
@@ -83,6 +85,7 @@ export function TopBar({
   panels,
   sessionItems,
   onOpenSessionMenu,
+  phoneFloating = false,
   phoneViews,
   appMenu,
   unreadCount,
@@ -118,7 +121,7 @@ export function TopBar({
       group.map((item, i) => (g > 0 && i === 0 ? { ...item, separated: true } : item)),
     );
   }, [phoneViews, sessionItems, appMenu]);
-  const phoneSession = !!activeSession && !onExitFocusMode;
+  const phoneFloat = phoneFloating && !onExitFocusMode;
   const idleDecayWindowMs = useIdleDecayWindowMs();
 
   // The left zone only borrows the sidebar's width while that column is visible, so the compact rail only crowds
@@ -134,7 +137,7 @@ export function TopBar({
       // Muse; elsewhere it stays a sticky, solid box so iOS 26 tints the status bar from it rather than blurring.
       className={`h-12 md:bg-transparent flex items-stretch shrink-0 ${
         // Over a Session it sits lower, clear of the faint band iOS still shades just under the status bar.
-        phoneSession
+        phoneFloat
           ? "max-md:h-[68px] max-md:pt-3 max-md:bg-transparent"
           : "max-md:h-14 bg-surface-900 max-md:sticky max-md:top-0 max-md:z-30"
       }`}
@@ -146,7 +149,7 @@ export function TopBar({
           sidebarColumnVisible ? "md:w-[var(--aoe-sidebar-width)]" : ""
         }`}
       >
-        {phoneSession && (
+        {phoneFloat && (
           // A phone opens the session list as a drawer from here, as Muse and Claude's app do, carrying its counts.
           <button
             onClick={onToggleSidebar}
@@ -240,7 +243,7 @@ export function TopBar({
           <button
             onClick={onGoDashboard}
             className={`flex items-center gap-1.5 shrink-0 text-text-muted hover:text-text-secondary transition-colors cursor-pointer ${
-              phoneSession ? "max-md:hidden" : ""
+              phoneFloat ? "max-md:hidden" : ""
             }`}
             aria-label="Go to dashboard"
           >
@@ -345,7 +348,7 @@ export function TopBar({
         {isDevBuild && (
           <span
             className={`font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-status-waiting/15 text-status-waiting ring-1 ring-status-waiting/30 ${
-              phoneSession ? "max-md:hidden" : ""
+              phoneFloat ? "max-md:hidden" : ""
             }`}
             title="Debug build (cfg!(debug_assertions)); distinguishes the dev instance from a concurrent release build. See issue #1055."
             aria-label="Debug build"
@@ -362,7 +365,12 @@ export function TopBar({
           </>
         )}
 
-        <OverflowMenu items={menuItems} triggerDataTour={TOUR_ANCHORS.topbarMore} phoneFloating />
+        <OverflowMenu
+          items={menuItems}
+          triggerDataTour={TOUR_ANCHORS.topbarMore}
+          phoneFloating
+          openOn={phoneFloat ? OPEN_HEADER_MENU_EVENT : undefined}
+        />
       </div>
     </header>
   );

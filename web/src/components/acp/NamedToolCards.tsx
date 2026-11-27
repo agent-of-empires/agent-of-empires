@@ -53,6 +53,7 @@ import {
   type ToolCardProps,
 } from "./ToolCardChrome";
 import { ToolErrorBody } from "./ToolErrorBody";
+import { BUTTON_INLINE } from "../../lib/surfaces";
 
 const ICON = "h-3.5 w-3.5";
 const TABULAR_META = "hidden md:inline text-[11px] text-text-dim tabular-nums";
@@ -232,7 +233,7 @@ export function WorkflowToolCard({ tool, result }: ToolCardProps) {
                 );
               })}
               {openPane && (
-                <button type="button" onClick={() => openPane()} className="mt-1.5 text-accent-500 hover:underline">
+                <button type="button" onClick={() => openPane()} className={`${BUTTON_INLINE} mt-1.5 self-start`}>
                   Open Background
                 </button>
               )}

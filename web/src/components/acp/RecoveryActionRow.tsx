@@ -3,12 +3,15 @@ import { useState, type ComponentProps, type ReactNode } from "react";
 import { writeClipboard } from "../../lib/clipboard";
 import { BUTTON_DANGER, BUTTON_SECONDARY, CARD } from "../../lib/surfaces";
 import { BUTTON_SECONDARY_SM } from "../../lib/surfaces";
+import { Spinner } from "../Dialog";
 
 export interface RecoveryAction {
   label: string;
   onClick: () => void;
   testId: string;
   disabled?: boolean;
+  /** In flight: shows a spinner beside the label. */
+  busy?: boolean;
   title?: string;
   /** Id of the text that says why the action is disabled. */
   describedBy?: string;
@@ -59,8 +62,10 @@ export function RecoveryActionRow({
             disabled={action.disabled}
             title={action.title}
             aria-describedby={action.describedBy}
+            aria-busy={action.busy || undefined}
             className={action === primary ? `${PRIMARY} w-full sm:w-auto` : BUTTON_SECONDARY}
           >
+            {action.busy && <Spinner />}
             {action.label}
           </button>
         ))}

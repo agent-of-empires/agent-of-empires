@@ -12,6 +12,8 @@ import { useWebSettings } from "../hooks/useWebSettings";
 import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { SessionErrorPanel } from "./SessionErrorPanel";
+import { Spinner } from "./Dialog";
+import { BUTTON_INLINE } from "../lib/surfaces";
 import { ensureSession, ensureTerminal, isStartRefusal, pasteImage } from "../lib/api";
 import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
 import type { ArmedClipboardWrite } from "../lib/clipboard";
@@ -353,7 +355,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     [session.id, surface, terminalIndex],
   );
 
-  const retryEnsure = useCallback(() => {
+  // Resolves once this ensure settles; undefined when none was sent.
+  const retryEnsure = useCallback((): Promise<void> | undefined => {
     const policy = policyRef.current;
     if (
       policy.readOnly ||
@@ -373,7 +376,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
         : ensureTerminal(session.id, terminalIndex, surface === "paired-container", controller.signal);
-    ensure
+    return ensure
       .then((res) => {
         if (controller.signal.aborted) return;
         if (res.ok) {
@@ -402,7 +405,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
       if (consumePendingTerminalFocus(focusTarget, focusIndex, focusSession)) focusSelf();
       return;
     }
-    retryEnsure();
+    void retryEnsure();
   }, [
     session.id,
     shelved,
@@ -457,7 +460,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
     if (surface === "agent" && paneDead && startedRef.current) {
       startedRef.current = false;
-      retryEnsure();
+      void retryEnsure();
     }
   }, [session.id, session.status, sessionActive, paneDead, connected, surface, retryEnsure, readOnly]);
 
@@ -475,7 +478,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
 
   if (!readOnly && ensureState === "pending") {
     return (
-      <div className="flex-1 flex items-center justify-center bg-surface-950 text-text-dim">
+      <div className="flex-1 flex items-center justify-center gap-2 bg-surface-950 text-text-dim">
+        <Spinner />
         <span className="text-xs">Starting session...</span>
       </div>
     );
@@ -488,10 +492,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           {ensureError ?? "Could not start session."}
         </span>
         {ensureRetryable && (
-          <button
-            onClick={retryEnsure}
-            className="text-xs text-brand-500 hover:text-brand-400 cursor-pointer underline"
-          >
+          <button type="button" onClick={() => void retryEnsure()} className={BUTTON_INLINE}>
             Retry
           </button>
         )}

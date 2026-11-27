@@ -7,7 +7,7 @@ import { CloneRepoForm } from "./CloneRepoForm";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
 import type { WizardData } from "../wizardReducer";
-import { BUTTON_SECONDARY } from "../../../lib/surfaces";
+import { BUTTON_INLINE, BUTTON_SECONDARY } from "../../../lib/surfaces";
 
 type Tab = "recent" | "browse" | "clone" | "import" | "scratch";
 
@@ -109,7 +109,7 @@ export function ProjectStep({
           className="mb-4 rounded-lg border border-status-warning/40 bg-status-warning/5 px-3 py-2 text-[15px] md:text-sm text-text-secondary"
         >
           Projects could not be loaded. Browse and Clone are still available.
-          <button type="button" onClick={retry} className="ml-2 text-brand-400 hover:underline cursor-pointer">
+          <button type="button" onClick={retry} className={`${BUTTON_INLINE} ml-2`}>
             Retry
           </button>
         </div>

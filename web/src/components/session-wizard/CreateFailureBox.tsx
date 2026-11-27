@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { writeClipboard } from "../../lib/clipboard";
 import type { CreateFailure } from "../../lib/types";
-import { BUTTON_PRIMARY, BUTTON_SECONDARY } from "../../lib/surfaces";
+import { BUTTON_INLINE, BUTTON_PRIMARY, BUTTON_SECONDARY } from "../../lib/surfaces";
 import { FAILURE_ACTION_LABEL, type FailureAction, type FailureView } from "./createFailureView";
 
 const OUTPUT_LINES = 8;
@@ -75,7 +75,7 @@ export function CreateFailureBox({
           <button
             type="button"
             onClick={() => void writeClipboard(failure.reference!).then(setCopied)}
-            className="font-medium text-brand-400 hover:underline cursor-pointer"
+            className={BUTTON_INLINE}
           >
             {copied ? "Copied" : "Copy"}
           </button>

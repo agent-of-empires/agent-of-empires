@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TerminalConnectionBanners } from "../TerminalConnectionBanners";
@@ -22,5 +22,23 @@ describe("TerminalConnectionBanners", () => {
     expect(screen.getByText("Reconnecting…")).toBeTruthy();
     act(() => setServerDown(true));
     expect(screen.queryByText("Reconnecting…")).toBeNull();
+  });
+
+  it("spins and disables Restart until the restart settles", async () => {
+    let settle!: () => void;
+    const onRestart = vi.fn(() => new Promise<void>((resolve) => (settle = resolve)));
+    render(<TerminalConnectionBanners {...props} reconnecting={false} paneDead onRestart={onRestart} />);
+    const button = screen.getByRole("button", { name: "Restart" }) as HTMLButtonElement;
+    expect(button.querySelector(".animate-spin")).toBeNull();
+
+    fireEvent.click(button);
+    expect(onRestart).toHaveBeenCalledTimes(1);
+    expect(button.disabled).toBe(true);
+    expect(button.getAttribute("aria-busy")).toBe("true");
+    expect(button.querySelector(".animate-spin")).not.toBeNull();
+
+    await act(async () => settle());
+    expect(button.disabled).toBe(false);
+    expect(button.querySelector(".animate-spin")).toBeNull();
   });
 });

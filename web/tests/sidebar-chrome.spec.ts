@@ -196,7 +196,8 @@ test.describe("resize handle and compact rail (#2288)", () => {
     const panel = page.locator('[role="navigation"][aria-label="Sessions sidebar"]');
     await expect(panel).not.toHaveAttribute("data-compact", "true");
     await expect(page.locator(COUNT).first()).toBeVisible();
-    expect((await panel.boundingBox())!.width).toBe(390);
+    // The drawer's own width, 85% of the phone, not the saved 480.
+    expect((await panel.boundingBox())!.width).toBeCloseTo(390 * 0.85, 0);
 
     await page.setViewportSize({ width: 1280, height: 720 });
     await expect(panel).toHaveAttribute("data-compact", "true");
@@ -366,7 +367,10 @@ test.describe("session list on a notched phone", () => {
     await page.goto("/");
     await openMobileSidebar(page);
 
-    const menu = (await page.getByRole("button", { name: "More options" }).boundingBox())!;
+    const menu = (await page
+      .getByRole("navigation", { name: "Sessions sidebar" })
+      .getByRole("button", { name: "More options" })
+      .boundingBox())!;
     expect(menu.y).toBeGreaterThanOrEqual(47);
     const settings = (await page.getByRole("button", { name: "Settings" }).boundingBox())!;
     expect(settings.y + settings.height).toBeLessThanOrEqual(page.viewportSize()!.height - 34);

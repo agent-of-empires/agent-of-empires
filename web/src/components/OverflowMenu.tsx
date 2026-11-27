@@ -16,6 +16,9 @@ export interface OverflowItem {
   checked?: boolean;
 }
 
+/** Opens the menu whose `openOn` names it, as a phone's left swipe opens the header's ⋯. */
+export const OPEN_HEADER_MENU_EVENT = "aoe:open-header-menu";
+
 interface Props {
   items: OverflowItem[];
   /** Phones show the trigger as a round floating control and the menu as a larger frosted list. */
@@ -23,24 +26,34 @@ interface Props {
   /** Tour anchor attached to the trigger button (the stable, always-rendered
    *  element), so the tour can point at the menu without it being open. */
   triggerDataTour?: TourAnchorId;
+  /** A window event that opens the menu. */
+  openOn?: string;
 }
 
-export function OverflowMenu({ items, triggerDataTour, phoneFloating = false }: Props) {
+export function OverflowMenu({ items, triggerDataTour, phoneFloating = false, openOn }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    if (!openOn) return;
+    const show = () => setOpen(true);
+    window.addEventListener(openOn, show);
+    return () => window.removeEventListener(openOn, show);
+  }, [openOn]);
+
+  useEffect(() => {
     if (!open) return;
-    const onDocClick = (e: MouseEvent) => {
+    // A pointer, not a mouse, event: iOS fires no mousedown for a tap on something that isn't clickable.
+    const onDocClick = (e: PointerEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
     const onKeydown = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
     };
-    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("pointerdown", onDocClick);
     document.addEventListener("keydown", onKeydown);
     return () => {
-      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("pointerdown", onDocClick);
       document.removeEventListener("keydown", onKeydown);
     };
   }, [open]);
@@ -66,6 +79,15 @@ export function OverflowMenu({ items, triggerDataTour, phoneFloating = false }: 
         </StrokeIcon>
       </button>
 
+      {open && phoneFloating && (
+        // On a phone the tap that closes the menu lands here, not on whatever is under it.
+        <div
+          aria-hidden
+          data-testid="overflow-menu-backdrop"
+          className="md:hidden fixed inset-0 z-40 pointer-events-auto"
+          onClick={() => setOpen(false)}
+        />
+      )}
       {open && (
         <DropdownMenu
           phoneGlass={phoneFloating}

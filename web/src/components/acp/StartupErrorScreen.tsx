@@ -5,7 +5,7 @@ import type { IncompatibleAgentDetail } from "../../lib/acpTypes";
 import { fetchAgentInstallInfo, type AgentInstallInfo, type InstallAgentResponse } from "../../lib/api";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { splitInstallHint, useAdapterInstall } from "./adapterRecovery";
-import { CAPTION_INLINE } from "../../lib/surfaces";
+import { BUTTON_INLINE, CAPTION_INLINE } from "../../lib/surfaces";
 import { CommandBlock, InlineCode, RecoveryActionRow, RecoveryScreen, type RecoveryAction } from "./RecoveryActionRow";
 import { RecreateContainerDialog } from "../sidebar/RecreateContainerDialog";
 
@@ -101,6 +101,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
     onClick: () => void respawn(),
     testId: "startup-error-restart",
     disabled: busy,
+    busy: respawnState === "retrying",
   };
   const update: RecoveryAction = {
     label: updating ? "Updating…" : updateFailed ? "Try again" : "Update & restart",
@@ -110,6 +111,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
       }),
     testId: "startup-error-update-restart",
     disabled: busy || !allowed,
+    busy: updating,
     describedBy: allowed ? undefined : stepOneId,
   };
   const startContainer: RecoveryAction = {
@@ -117,6 +119,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
     onClick: () => void respawn(),
     testId: "startup-error-start-container",
     disabled: busy,
+    busy: respawnState === "retrying",
   };
   const primary = containerDown ? startContainer : webInstall ? update : checkAgain;
   const allowStep = (
@@ -294,7 +297,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
           data-testid="startup-error-details"
           aria-expanded={detailsOpen}
           onClick={() => setDetailsOpen(!detailsOpen)}
-          className="text-xs font-medium text-text-primary underline-offset-2 hover:underline"
+          className={BUTTON_INLINE}
         >
           Details
         </button>

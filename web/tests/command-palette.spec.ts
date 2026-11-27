@@ -68,6 +68,8 @@ test.describe("Command palette", () => {
   test("mobile: the session list's search pill opens the palette", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
+    await page.getByTestId("topbar-menu").click();
+    await expect(page.getByTestId("sidebar-search-pill")).toBeInViewport();
     await page.getByTestId("sidebar-search-pill").click();
     const search = page.getByPlaceholder("Search actions, sessions, settings…");
     // Focused, so a phone's keyboard comes up with it.

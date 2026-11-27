@@ -7,6 +7,7 @@ import { test, expect } from "./helpers/mockedTest";
 import { mockStaticApis } from "./helpers/apiMocks";
 import { sessionResponse } from "./helpers/sessions";
 import { DESKTOP } from "./helpers/viewports";
+import { openMobileSidebar } from "./helpers/sidebar";
 
 const ERROR = "resume failed for sid 55fd0b02; preserved for explicit retry\nsecond line of detail";
 
@@ -55,6 +56,7 @@ test.describe("An Error Session's recorded error (#5636)", () => {
       await context.grantPermissions(["clipboard-read", "clipboard-write"]);
       const state = await mockErrorSession(page, ERROR);
       await page.goto("/");
+      await openMobileSidebar(page);
       await page.getByTestId("sidebar-session-row").tap();
 
       const panel = page.getByTestId("session-error-panel");
