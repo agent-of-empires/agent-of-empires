@@ -55,7 +55,8 @@ export function agentIntegrationDetails(agent: PluginAgentIntegration, sandboxRe
     if (launch.install_hint) details.push(`install: ${launch.install_hint}`);
   }
   if (agent.detection) details.push(`detection: ${agent.detection.mode}`);
-  if (sandboxReportDir) details.push(`sandbox reports: ${sandboxReportDir}/<session id>`);
+  // A host-only declaration has no sandbox to report from.
+  if (sandboxReportDir && !launch?.host_only) details.push(`sandbox reports: ${sandboxReportDir}/<session id>`);
   if (agent.provider_versions?.length) details.push(`provider versions: ${agent.provider_versions.join(", ")}`);
   details.push(`native replies: ${agent.replies ? "yes" : "no"}`);
   if (agent.reply_fallback) {

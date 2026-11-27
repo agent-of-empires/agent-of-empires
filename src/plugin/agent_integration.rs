@@ -487,10 +487,17 @@ pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> 
     if let Some(detection) = &integration.detection {
         lines.push(format!("  detection: {:?}", detection.mode));
     }
-    lines.push(format!(
-        "  sandbox reports: {}/<session id>",
-        crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
-    ));
+    // A host-only declaration has no sandbox to report from.
+    if !integration
+        .launch
+        .as_ref()
+        .is_some_and(|launch| launch.host_only)
+    {
+        lines.push(format!(
+            "  sandbox reports: {}/<session id>",
+            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+        ));
+    }
     if !integration.provider_versions.is_empty() {
         lines.push(format!(
             "  provider versions: {}",
@@ -923,7 +930,7 @@ fn check_file(meta: &std::fs::Metadata, sandboxed: bool) -> Result<()> {
     let mode = meta.mode() & 0o7777;
     ensure!(
         mode == 0o600 || (sandboxed && mode == 0o644),
-        "integration report must be mode 0600"
+        "integration report must be mode 0600 or 0644"
     );
     ensure!(
         meta.len() <= MAX_REPORT_BYTES as u64,

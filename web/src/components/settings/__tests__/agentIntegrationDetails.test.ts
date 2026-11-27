@@ -41,7 +41,6 @@ describe("agentIntegrationDetails", () => {
       "host only",
       "install: install \\u{202e}now",
       "detection: native_only",
-      "sandbox reports: /tmp/aoe-hooks/<session id>",
       "provider versions: ^1.0",
       "native replies: no",
       'reply fallback: allow ["y"], deny [Escape], allow always [Enter]',
@@ -78,6 +77,13 @@ describe("agentIntegrationDetails", () => {
       "resume: subcommand resume",
       "sandbox reports: /tmp/aoe-hooks/<session id>",
       "native replies: yes",
+    ]);
+  });
+
+  it("omits the sandbox report path for a host-only declaration", () => {
+    expect(agentIntegrationDetails({ tool: "agent", launch: { host_only: true } }, "/tmp/aoe-hooks")).toEqual([
+      "host only",
+      "native replies: no",
     ]);
   });
 

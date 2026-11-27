@@ -1423,25 +1423,18 @@ impl NativeLaunchInputs {
 
     fn hook_capture_context(&self, instance_id: &str) -> Result<Option<CaptureContext>> {
         let leaf = crate::hooks::session_id_leaf(Some(&self.launch_id))?;
-        let sidecar = hook_sidecar_path(self.container.is_some(), instance_id, leaf.as_ref());
-        let path = self.canonical_path(&sidecar)?;
+        // A container reaches this directory through the launch's bind mount,
+        // whose target is the container-side base; the host base is a different
+        // path the mount does not create.
+        let base = if self.container.is_some() {
+            PathBuf::from(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
+        } else {
+            crate::hooks::hook_base_path()
+        };
+        let path = self.canonical_path(&base.join(instance_id).join(leaf.as_ref()))?;
         let location = self.physical_location(&path);
         Ok((location.filesystem == "host").then_some(CaptureContext::Hooks(location.path)))
     }
-}
-
-/// The hook sidecar's path as the execution sees it. A container reaches the
-/// directory through the launch's bind mount, whose target is the container-side
-/// base; the host base is a different path that the mount does not create, so
-/// resolving it inside the container finds nothing and the capture context is
-/// lost.
-fn hook_sidecar_path(sandboxed: bool, instance_id: &str, leaf: &str) -> PathBuf {
-    let base = if sandboxed {
-        PathBuf::from(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
-    } else {
-        crate::hooks::hook_base_path()
-    };
-    base.join(instance_id).join(leaf)
 }
 
 pub(super) fn hook_session_observation(
@@ -3605,33 +3598,6 @@ impl Instance {
 mod tests {
     use super::*;
 
-    /// A sandbox reaches the hook directory through a bind mount whose target is
-    /// the container-side base, so its sidecar path cannot be built from the host
-    /// base. The two are deliberately different here: a host base under a
-    /// tempdir, and the container's `/tmp/aoe-hooks`.
-    #[test]
-    #[serial_test::serial]
-    fn a_sandbox_hook_sidecar_uses_the_mount_target_not_the_host_base() {
-        let (_guard, host_base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
-        let leaf = "session_id.7d442dd2-7b10-4cc4-9207-123456789abc";
-
-        let host = hook_sidecar_path(false, "instance-a", leaf);
-        assert_eq!(host, host_base.join("instance-a").join(leaf));
-
-        let sandbox = hook_sidecar_path(true, "instance-a", leaf);
-        assert_eq!(
-            sandbox,
-            PathBuf::from(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
-                .join("instance-a")
-                .join(leaf)
-        );
-        assert_ne!(sandbox, host, "the container target is not the host path");
-        assert!(
-            !sandbox.starts_with(&host_base),
-            "the sandbox path must not be spelled under the host base: {sandbox:?}"
-        );
-    }
-
     #[test]
     fn claude_store_must_be_the_config_root_holding_the_transcript() {
         let root = tempfile::tempdir().unwrap();
@@ -4567,6 +4533,71 @@ sandbox = "pane_scoped"
         assert!(bound
             .execution
             .is_some_and(|execution| execution.stores.is_empty()));
+    }
+
+    /// A declaration for `omp` hides the bundled definition from listings, so
+    /// the launch resolves through the declaration and publishes through the hook
+    /// sidecar. Capture must follow that launch, not the tool name's built-in
+    /// reader, or an OMP session with the plugin installed stops capturing.
+    #[test]
+    #[serial_test::serial]
+    fn an_omp_sidecar_launch_captures_through_its_declaration() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp",
+            "#!/bin/sh\nexit 0\n",
+        );
+        install_declared_sidecar_plugin("omp");
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = Instance::new("omp-sidecar-launch", project.to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp".into();
+
+        let execution = instance
+            .resolve_native_execution(None)
+            .expect("a declared OMP sidecar resolves");
+        assert_eq!(execution.binding.agent, "omp");
+        assert!(execution.binding.stores.is_empty());
+        assert!(
+            matches!(execution.capture, Some(CaptureContext::Hooks(_))),
+            "the declaration publishes through the hook sidecar"
+        );
+        instance.active_execution = Some(ActiveExecution {
+            launch_id: execution.inputs.launch_id.clone(),
+            binding: execution.binding.clone(),
+            capture: execution.capture.clone(),
+            container: None,
+        });
+        assert_eq!(
+            instance
+                .source_session_support()
+                .map(|(capture, context)| (capture.backend, context)),
+            Some((
+                crate::agents::SessionCaptureBackend::ExtensionSidecar,
+                crate::agents::SessionCaptureContext::PaneScoped
+            ))
+        );
+        assert!(instance.capture_reads_hook_sidecar());
+
+        // A launch the same tool ran under its built-in reader keeps that reader.
+        instance.active_execution.as_mut().unwrap().capture = None;
+        assert_eq!(
+            instance
+                .source_session_support()
+                .map(|(capture, _)| capture.backend),
+            Some(crate::agents::SessionCaptureBackend::Omp)
+        );
     }
 
     /// Installs an OMP-backed declaration for `example-helper` in the isolated
