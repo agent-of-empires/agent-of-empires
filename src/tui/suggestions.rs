@@ -643,7 +643,7 @@ pub(super) enum SuggestionsAction {
     TurnOnPreTrust,
     /// Trash the item's Session, whose prompt was blocked, then start it again.
     TryAgain(ItemKey, String),
-    /// Ask before turning on auto start for a kind; `yolo` says its preset runs without prompts.
+    /// Ask before turning on auto start for a kind; `yolo` says its preset is never auto started.
     ConfirmAutoStart {
         provider_id: String,
         criterion: String,

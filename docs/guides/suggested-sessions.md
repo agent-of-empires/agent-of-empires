@@ -53,12 +53,12 @@ Tick the checkbox on each row (or **Select all shown**), then **Start N** in the
 
 ### Auto start
 
-Off by default. In **Settings › Suggestions**, a kind's preset has an **Auto start** switch. Turning it on asks first: auto start launches an agent on text written by others (issue and PR content) with no human check, and says so again when the preset has Yolo on (no approval prompts). Pick a per-refresh cap from 1 to 10 (default 3).
+Off by default. In **Settings › Suggestions**, a kind's preset has an **Auto start** switch. Turning it on asks first: auto start launches an agent on text written by others (issue and PR content) with no human check, and says so again when the preset has Yolo on, since such a kind is never auto started. Pick a per-refresh cap from 1 to 10 (default 3).
 
 After each provider publish, AoE starts up to the cap of that kind's items that:
 
 - are not stale or dismissed and have no Session linked yet,
-- have exactly one linked Project and need no hooks or MCP review,
+- have exactly one linked Project, need no hooks or MCP review, and use a preset with Yolo off,
 - were never auto started before (each item is tried once, even if the start fails).
 
 Nothing runs when you turn the switch on, only after the next publish, and only when the daemon accepts changes (not on a read-only dashboard). Items left alone show a "Not auto started: <reason>" note while the switch is on. A failed start keeps "Auto start failed: <reason>. Start it by hand." on the row and is not retried.

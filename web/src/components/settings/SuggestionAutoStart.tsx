@@ -14,7 +14,7 @@ const GHOST =
 interface Props {
   provider: SuggestionProvider;
   source: SuggestionSource;
-  /** The saved preset's yolo mode, which auto started Sessions run with. */
+  /** The saved preset's yolo mode; auto start leaves such a kind alone. */
   yolo: boolean;
   disabled: boolean;
   /** The setting changed on the server; reload the snapshot. */
@@ -92,7 +92,7 @@ export function SuggestionAutoStart({ provider, source, yolo, disabled, onChange
           <p className="font-medium">
             Auto start launches an agent on text written by others (issue and PR content) with no human check.
           </p>
-          {yolo && <p className="mt-1">This kind runs in YOLO mode, so the agent runs without approval prompts.</p>}
+          {yolo && <p className="mt-1">This kind runs in YOLO mode, so its suggestions are never auto started.</p>}
           <p className="mt-1 text-text-secondary">
             It starts from the next refresh, with this kind&apos;s preset. A suggestion whose repo is not linked to one
             Project, or whose Project&apos;s hooks need a review, stays a normal suggestion with a note.

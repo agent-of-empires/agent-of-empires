@@ -1353,6 +1353,48 @@ async fn auto_start_is_validated_and_leaves_what_needs_the_user_with_a_note() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn auto_start_never_starts_a_yolo_preset() {
+    let f = fixture();
+    f.seed_item("a", Some("acme/web"), "42");
+    let repo = f.repo.to_string_lossy().into_owned();
+    f.call(
+        Method::PUT,
+        "/api/suggestions/mappings",
+        json!({ "provider_id": PROVIDER, "mapping_key": "acme/web", "projects": [repo] }),
+    )
+    .await;
+    f.host.with_suggestions_db(|conn, profile| {
+        let mut preset = crate::plugin::suggestions::default_preset(
+            &crate::session::config::profile_config::resolve_config_or_warn(profile),
+        );
+        preset.yolo = true;
+        crate::plugin::suggestions::set_preset(conn, profile, PROVIDER, "assigned", &preset)
+            .unwrap();
+    });
+    f.call(
+        Method::PUT,
+        "/api/suggestions/auto-start",
+        json!({ "provider_id": PROVIDER, "criterion": "assigned", "enabled": true }),
+    )
+    .await;
+    super::suggestions::sweep_auto_start(&f.state).await;
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    let note = items_by_id(&snapshot)["a"]["auto_note"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(note.contains("YOLO"), "{note}");
+    let attempted: i64 = f.host.with_suggestions_db(|conn, _| {
+        conn.query_row("SELECT COUNT(*) FROM suggestion_auto_started", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    });
+    assert_eq!(attempted, 0);
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn auto_start_attempts_each_item_once_and_stops_at_the_cap() {
     let f = fixture();
     for id in ["a", "b", "c"] {

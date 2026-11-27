@@ -2,7 +2,7 @@
 //! `start_suggestion`, the same path a click takes.
 //!
 //! An item is started only when the Start button would need nothing from the
-//! user: one linked project, no hooks review. Anything else stays a suggestion
+//! user: one linked project, no hooks review, no YOLO preset. Anything else stays a suggestion
 //! with a note. Each item is attempted at most once; see `plugin::suggestions::auto`.
 use super::*;
 
@@ -55,6 +55,9 @@ fn needs_nothing(
     let Some(path) = prefill["project"]["path"].as_str() else {
         return Err("its repo is not linked to a project".into());
     };
+    if prefill["yolo"].as_bool().unwrap_or(false) {
+        return Err("its preset runs the agent in YOLO mode, which needs your approval".into());
+    }
     if prefill["extra_projects"]
         .as_array()
         .is_some_and(|extras| !extras.is_empty())

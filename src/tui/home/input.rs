@@ -2347,7 +2347,7 @@ impl HomeView {
                     self.suggestions_feed
                         .hold_auto_start(provider_id, criterion);
                     let yolo = if yolo {
-                        "\n\nThis kind runs in YOLO mode, so the agent runs without approval prompts."
+                        "\n\nThis kind runs in YOLO mode, so its suggestions are never auto started."
                     } else {
                         ""
                     };
