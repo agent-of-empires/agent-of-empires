@@ -152,7 +152,9 @@ impl RateLimitInfo {
 
     /// The limit an agent-initiated turn reports only as message text, such as
     /// `You've hit your 5-hour limit · resets 10pm (America/New_York)` (#5990).
-    /// The text is kept verbatim as the status; no reset time is read from it.
+    /// Only a provider quota window or Claude's own notice matches, so a
+    /// context limit or a negated notice never parks. The text is kept
+    /// verbatim as the status; no reset time is read from it.
     /// Longer text is never a limit sentence.
     pub const AGENT_TEXT_MAX_CHARS: usize = 200;
 
@@ -170,8 +172,27 @@ impl RateLimitInfo {
             .next()
             .unwrap_or_default()
             .trim();
-        let matched = (clause.starts_with("you've hit your ") && clause.ends_with(" limit"))
-            || clause.ends_with(" usage limit reached");
+        const WINDOWS: [&str; 8] = [
+            "5-hour",
+            "five-hour",
+            "session",
+            "daily",
+            "weekly",
+            "monthly",
+            "usage",
+            "opus",
+        ];
+        let named_window = clause
+            .strip_prefix("you've hit your")
+            .and_then(|rest| rest.strip_suffix("limit"))
+            .is_some_and(|name| name.split_whitespace().all(|word| WINDOWS.contains(&word)));
+        let matched = named_window
+            || matches!(
+                clause,
+                "usage limit reached"
+                    | "claude usage limit reached"
+                    | "claude ai usage limit reached"
+            );
         matched.then(|| Self {
             status: text.to_string(),
             resets_at: None,
@@ -1744,7 +1765,12 @@ mod tests {
             ),
             ("You\u{2019}ve hit your weekly limit ∙ resets Nov 18, 12am", true),
             ("  You've hit your limit · resets 3pm\n", true),
+            ("You've hit your weekly Opus limit · resets Mon", true),
             ("Context limit reached", false),
+            ("You've hit your context limit", false),
+            ("You've hit your token limit · try a shorter prompt", false),
+            ("No usage limit reached", false),
+            ("Claude AI usage limit not reached", false),
             ("Claude AI usage limit reached|1700000000", true),
             ("You've hit your limit on retries; trying another approach.", false),
             ("I fixed the rate limit handling.", false),
