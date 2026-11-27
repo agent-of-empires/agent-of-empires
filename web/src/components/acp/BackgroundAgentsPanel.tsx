@@ -328,7 +328,9 @@ function LifecycleRunRow({ run }: { run: LifecycleRun }) {
       <div className="flex items-center gap-2">
         <StatusDot status="running" />
         <Workflow className="h-3.5 w-3.5 shrink-0 text-text-dim" />
-        <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">{label || run.runId}</span>
+        <span className="min-w-0 flex-1 truncate text-xs text-text-secondary" title={label || run.runId}>
+          {label || run.runId}
+        </span>
         {count && <span className="shrink-0 text-[11px] tabular-nums text-text-dim">{count}</span>}
       </div>
       {percent != null && (

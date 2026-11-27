@@ -830,4 +830,11 @@ describe("BackgroundAgentsPanel generic workflow runs", () => {
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     expect(container.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow")).toBe("25");
   });
+
+  it("carries the full label in the row title", () => {
+    const label = "Indexing a very long workflow label that the row truncates";
+    lifecycleMock.mockReturnValue([{ runId: "r1", progress: { label, completed: 1, total: 4 } }]);
+    const { getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(getByTitle(label).textContent).toBe(label);
+  });
 });
