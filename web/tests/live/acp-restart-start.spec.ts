@@ -3,7 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect } from "../helpers/liveTest";
-import { listSessions, waitForSessions } from "../helpers/aoeServe";
+import { appDirFor, listSessions, resolveAoeBinary, waitForSessions } from "../helpers/aoeServe";
 import { replayJson, waitForAcpReady } from "../helpers/acp";
 
 test("Restart on the startup line replaces a start stuck in session/new, again if the replacement stalls too", async ({
@@ -28,6 +28,18 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
           .split("\n")
           .filter((l) => l.includes("session/prompt") && l.includes(PROMPT)).length
       : 0;
+  const snapshots = new Map<string, Record<string, unknown>>();
+  page.on("websocket", (socket) => {
+    if (!new URL(socket.url()).pathname.endsWith("/acp/ws")) return;
+    socket.on("framereceived", ({ payload }) => {
+      const frame = JSON.parse(payload.toString()) as {
+        kind: string;
+        session_id: string;
+        state: Record<string, unknown>;
+      };
+      if (frame.kind === "reduced_state") snapshots.set(frame.session_id, frame.state);
+    });
+  });
   await page.clock.install();
   await page.goto(serve.baseUrl);
   await page.getByRole("button", { name: "New session", exact: true }).first().click();
@@ -37,10 +49,26 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   await expect(wizard.getByRole("radio", { name: "Structured view" })).toBeChecked({ timeout: 10_000 });
   await wizard.getByRole("button", { name: /Launch session/ }).click();
   const [session] = await waitForSessions(serve.baseUrl);
+  const registry = join(
+    appDirFor(serve.home, serve.env.XDG_CONFIG_HOME!, resolveAoeBinary()),
+    "acp-workers",
+    `${session!.id}.json`,
+  );
+  const owner = () => {
+    const raw = readFileSync(registry, "utf8");
+    const { pid, runner_identity: birth } = JSON.parse(raw) as { pid: number; runner_identity: unknown };
+    // The epoch is a u64; do not compare JSON.parse's rounded numbers.
+    const generation = raw.match(/"generation"\s*:\s*(\d+)/)?.[1];
+    expect(pid).toBeGreaterThan(1);
+    expect(birth).toEqual(expect.any(Object));
+    expect(generation).toMatch(/^\d+$/);
+    return { process: { pid, birth }, generation };
+  };
 
   const line = page.getByTestId("startup-wait-line");
   await expect(line).toBeVisible({ timeout: 15_000 });
   await expect.poll(stalls, { timeout: 15_000 }).toBe(1);
+  const originalOwner = owner();
   const restart = line.getByTestId("startup-wait-restart");
   await expect(restart).toHaveCount(0);
 
@@ -50,9 +78,18 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   await expect(page.getByRole("button", { name: "Pending until Claude Code is ready", exact: true })).toBeEnabled({
     timeout: 15_000,
   });
+  await expect.poll(() => snapshots.get(session!.id)).toMatchObject({
+    connection_ready: false,
+    connection_unavailable: null,
+    prompt_wake_eligible: true,
+    host_prompt_intent: null,
+  });
   // Stop and the caption are optimistic; the response proves the daemon took the prompt before Restart.
   const admitted = page.waitForResponse(
-    (r) => r.url().endsWith("/acp/prompt") && r.request().postDataJSON()?.text === PROMPT,
+    (r) =>
+      r.url().endsWith(`/api/sessions/${session!.id}/acp/prompt`) &&
+      r.request().method() === "POST" &&
+      r.request().postDataJSON()?.text === PROMPT,
   );
   await composer.press("Enter");
   const admission = await admitted;
@@ -60,6 +97,7 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   const dispatch = (await admission.json()) as { disposition?: string; queued_id?: string };
   expect(dispatch.disposition).toBe("sent");
   expect(dispatch.queued_id).toBeUndefined();
+  expect(owner()).toEqual(originalOwner);
   const stopButton = page.getByRole("button", { name: "Stop", exact: true });
   await expect(stopButton).toBeVisible();
 
@@ -81,6 +119,9 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   // The restart's own stop has reached this dashboard, and the replacement is stuck as well.
   await expect(stopButton).toHaveCount(0, { timeout: 15_000 });
   await expect.poll(stalls, { timeout: 30_000 }).toBe(2);
+  const replacementOwner = owner();
+  expect(replacementOwner.process).not.toEqual(originalOwner.process);
+  expect(replacementOwner.generation).not.toEqual(originalOwner.generation);
   await expect(line).toBeVisible();
   await expect(page.getByText("Structured view worker stopped")).toHaveCount(0);
   await expect(restart).toHaveCount(0);
@@ -119,6 +160,9 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   await expect(page.getByText(PROMPT)).toBeVisible();
   await expect(composer).toBeEnabled();
   await waitForAcpReady(serve.baseUrl, session!.id);
+  const finalOwner = owner();
+  expect(finalOwner.process).not.toEqual(replacementOwner.process);
+  expect(finalOwner.generation).not.toEqual(replacementOwner.generation);
   // The transcript's row for that empty turn doesn't carry the stop reason, so the event log is the check.
   const events = (JSON.parse(await replayJson(serve.baseUrl, session!.id)) as { event: Record<string, unknown> }[]).map(
     ({ event }) => event,

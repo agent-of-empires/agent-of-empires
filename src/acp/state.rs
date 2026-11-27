@@ -874,10 +874,7 @@ impl CurrentNativeAvailability {
         &mut self,
         row: &crate::session::Instance,
         storage: &crate::session::Storage,
-    ) -> Result<
-        Option<Arc<crate::acp::establishment::EstablishmentAttempt>>,
-        crate::acp::establishment::EstablishmentRefusal,
-    > {
+    ) -> anyhow::Result<Option<Arc<crate::acp::establishment::EstablishmentAttempt>>> {
         use crate::acp::establishment::{
             AcpEstablishment, CreationStage, EstablishmentAttempt, EstablishmentOrigin,
             EstablishmentRefusal,
@@ -950,13 +947,9 @@ impl CurrentNativeAvailability {
             _ => false,
         };
         if !matches
-            || !self
-                .refresh(&row.id, matches)
-                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            || !self.refresh(&row.id, matches)?
             || self.unavailable.is_some()
-            || !self
-                .qualify_owner(&row.id)
-                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            || !self.qualify_owner(&row.id)?
         {
             return Ok(None);
         }
@@ -964,6 +957,8 @@ impl CurrentNativeAvailability {
     }
 }
 
+#[derive(thiserror::Error)]
+#[error("native observation is contended")]
 pub(crate) struct NativeObservationWait {
     pub context: NativeEventContext,
     lock: NativeObservationLock,
@@ -1002,6 +997,43 @@ impl NativeObservationWait {
         })
         .await
         .unwrap_or(false)
+    }
+
+    /// Unlike an observation stream, a prompt has an admission deadline. Do not
+    /// spawn a blocking lock waiter that can outlive that deadline or hold the
+    /// fence cache while it waits for the physical lifecycle flock.
+    pub(crate) async fn settle_before(self, deadline: tokio::time::Instant) -> bool {
+        use std::sync::TryLockError;
+        use std::time::Duration;
+        let mut interval = Duration::from_millis(2);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            let available = match &self.lock {
+                NativeObservationLock::Native(fence) => fence
+                    .try_lock_observation_matching(|_| true)
+                    .map(|guard| guard.is_some()),
+                NativeObservationLock::Lifecycle(lifecycle) => match lifecycle.try_lock() {
+                    Ok(_) => return true,
+                    Err(TryLockError::WouldBlock) => Ok(false),
+                    Err(TryLockError::Poisoned(_)) => return false,
+                },
+                NativeObservationLock::Registry(session_id) => {
+                    crate::process::worker_registry::try_registry_lock(session_id)
+                        .map(|guard| guard.is_some())
+                }
+            };
+            match available {
+                Ok(true) => return true,
+                Err(_) => return false,
+                Ok(false) => {
+                    tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + interval))
+                        .await;
+                    interval = (interval * 2).min(Duration::from_millis(50));
+                }
+            }
+        }
     }
 }
 

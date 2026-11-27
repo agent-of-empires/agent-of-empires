@@ -176,54 +176,78 @@ impl<S: BroadcastSink> Supervisor<S> {
         attachments: &[crate::acp::event_store::AttachmentBlob],
     ) -> Result<Option<crate::acp::acp_client::PreparedInitialPrompt>, SupervisorError> {
         use crate::acp::establishment::EstablishmentRefusal;
-        let mut current = self
+        use crate::acp::state::NativeObservationWait;
+        let unconfirmed = || AcpError::Establishment(EstablishmentRefusal::Unconfirmed);
+        let original = self
             .current_native_availability(session_id)
             .await
-            .ok_or_else(|| SupervisorError::UnknownSession(session_id.to_owned()))?;
-        let fence = Arc::clone(&current.scope.fence);
-        let expected = {
-            let observed = fence
-                .lock_observation_project(
-                    |row, storage| {
-                        let expected = current.initial_prompt_attempt(row, storage)?;
-                        if expected.is_some()
-                            && !(current.ready && row.require_resolved_acp_selection().is_ok())
-                        {
-                            return Ok(expected);
+            .ok_or(EstablishmentRefusal::Superseded)?;
+        let frozen = original
+            .lease
+            .admission()
+            .and_then(|permit| permit.establishment);
+        let deadline = tokio::time::Instant::now() + WORKER_READY_TIMEOUT;
+        let mut current = original.clone();
+        let expected = loop {
+            let fence = Arc::clone(&current.scope.fence);
+            let observed = fence.lock_observation_project(
+                |row, storage| {
+                    let expected = current.initial_prompt_attempt(row, storage)?;
+                    let admitted = current
+                        .lease
+                        .admission()
+                        .and_then(|permit| permit.establishment);
+                    anyhow::ensure!(admitted == frozen, EstablishmentRefusal::Superseded);
+                    if expected.is_some()
+                        && !(current.ready && row.require_resolved_acp_selection().is_ok())
+                    {
+                        return Ok(expected);
+                    }
+                    row.require_resolved_acp_selection()?;
+                    let selected = current
+                        .scope
+                        .choice
+                        .as_ref()
+                        .is_some_and(|choice| choice.matches(row));
+                    if !current.refresh(session_id, selected)?
+                        || !current.ready
+                        || !current.qualify_owner(session_id)?
+                    {
+                        anyhow::bail!(EstablishmentRefusal::Unconfirmed);
+                    }
+                    Ok(None)
+                },
+                true,
+            );
+            // Only lock contention can wait. Release the fence and then requalify the
+            // same client, physical runner, and durable creation permit.
+            let wait = match observed {
+                Ok(Some((_guard, expected))) => break expected,
+                Ok(None) => NativeObservationWait::native(&current.scope),
+                Err(error) => match error.downcast::<NativeObservationWait>() {
+                    Ok(wait) => wait,
+                    Err(error) => {
+                        let refusal = error.downcast_ref::<EstablishmentRefusal>().copied();
+                        if refusal.is_none() {
+                            debug!(target: "acp.supervisor", session = %session_id, %error,
+                                "could not qualify initial prompt admission");
                         }
-                        row.require_resolved_acp_selection()?;
-                        let selected = current
-                            .scope
-                            .choice
-                            .as_ref()
-                            .is_some_and(|choice| choice.matches(row));
-                        if !current
-                            .refresh(session_id, selected)
-                            .map_err(|_| EstablishmentRefusal::Unconfirmed)?
-                            || !current.ready
-                            || !current
-                                .qualify_owner(session_id)
-                                .map_err(|_| EstablishmentRefusal::Unconfirmed)?
-                        {
-                            anyhow::bail!(EstablishmentRefusal::Unconfirmed);
-                        }
-                        Ok(None)
-                    },
-                    true,
-                )
-                .map_err(|error| {
-                    error
-                        .downcast_ref::<EstablishmentRefusal>()
-                        .map_or(SupervisorError::NativeStoreUnavailable, |refusal| {
-                            SupervisorError::Acp(AcpError::Establishment(*refusal))
-                        })
-                })?;
-            let Some((_guard, expected)) = observed else {
-                return Err(SupervisorError::Acp(AcpError::Establishment(
-                    EstablishmentRefusal::Unconfirmed,
-                )));
+                        return Err(AcpError::Establishment(
+                            refusal.unwrap_or(EstablishmentRefusal::Unconfirmed),
+                        )
+                        .into());
+                    }
+                },
             };
-            expected
+            if !wait.settle_before(deadline).await {
+                return Err(unconfirmed().into());
+            }
+            current =
+                tokio::time::timeout_at(deadline, self.current_native_availability(session_id))
+                    .await
+                    .map_err(|_| unconfirmed())?
+                    .filter(|current| original.same_actor(current))
+                    .ok_or(EstablishmentRefusal::Superseded)?;
         };
         let Some(expected) = expected else {
             return Ok(None);

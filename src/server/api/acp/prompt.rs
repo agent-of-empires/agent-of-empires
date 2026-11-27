@@ -31,11 +31,12 @@ pub struct PromptDispatchResponse {
     pub seq: Option<u64>,
 }
 
-/// Transient resume failures are 503; typed channel refusal is not queue permission.
+/// Transient resume failures are 503; typed admission refusals are not queue permission.
 fn resume_failed_response(err: &SupervisorError) -> Response {
     if matches!(
         err,
-        SupervisorError::Acp(AcpError::ConnectionUnavailable(_))
+        SupervisorError::Acp(AcpError::ConnectionUnavailable(_) | AcpError::Establishment(_))
+            | SupervisorError::Establishment(_)
     ) {
         return supervisor_error_response("worker unavailable", err);
     }
