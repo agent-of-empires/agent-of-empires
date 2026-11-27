@@ -71,6 +71,9 @@ import { useLatestRef } from "../../hooks/useLatestRef";
 import { PULL_GATED_HINT, PULL_LATEST_HINT, pullLatestChecked, pullLatestOffer } from "./pullLatestImage";
 import { CopyCommand } from "../SandboxImageBanner";
 import { notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
+import { BUTTON_INLINE, BUTTON_SECONDARY } from "../../lib/surfaces";
+import { CloseButton, DialogHeader, ModalFrame } from "../Dialog";
+import { DIALOG_BODY } from "../../lib/surfaces";
 
 // Validated against ACP_CAPABLE_TOOLS on read, since another install may have written it.
 const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
@@ -1301,11 +1304,7 @@ export function SessionWizard({
             <p data-testid="wizard-template" className="pb-2 text-[11px] text-text-dim">
               From the {prefill.source?.kindLabel ?? prefill.template.criterion} preset
               {" \u00b7 "}
-              <button
-                type="button"
-                onClick={() => onEditPreset(prefill.template!)}
-                className="cursor-pointer text-brand-500 hover:underline"
-              >
+              <button type="button" onClick={() => onEditPreset(prefill.template!)} className={BUTTON_INLINE}>
                 Edit preset
               </button>
             </p>
@@ -1344,130 +1343,120 @@ export function SessionWizard({
 
   const creating = state.isSubmitting && showProgress && !globConfirm && !hooksTrust;
 
+  const footerClass = "px-5 max-md:px-4 py-3 border-t border-surface-700/50";
+
   // Portaled to the body: under the app shell's fixed layers its z-[60] would only rank
   // inside theirs, and body-level z-50 layers (hover tooltips) would paint over it.
   return createPortal(
-    <div className="fixed inset-0 z-[60] flex items-end md:items-center md:justify-center">
-      <div className="absolute inset-0 bg-black/60" onClick={creating ? undefined : onClose} />
-      <div
-        ref={panelRef}
-        data-testid="session-wizard"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="session-wizard-title"
-        style={{ paddingBottom: keyboardHeight || undefined }}
-        // Phones get a bottom sheet sized to its content, so Launch sits under the last row
-        // within thumb reach; a long panel grows it to just below the notch and scrolls.
-        className="relative w-full max-h-[calc(100dvh-env(safe-area-inset-top))] md:max-w-lg bg-surface-800 border-t border-surface-700/30 rounded-t-lg md:border md:rounded-lg flex flex-col md:max-h-[min(720px,90vh)]"
-      >
-        <div className="flex items-center justify-between px-4 md:px-5 py-3 border-b border-surface-700/20">
-          <h1 id="session-wizard-title" className="text-sm font-medium text-text-secondary">
-            {creating ? "Creating session" : "New session"}
-          </h1>
-          <button
-            ref={closeRef}
-            onClick={creating ? handleBackground : onClose}
-            className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-700/50 transition-colors"
-            aria-label="Close"
-          >
-            &times;
-          </button>
-        </div>
-        <div data-wizard-scroll className="flex-1 overflow-y-auto px-4 md:px-5 py-4">
-          {!nameOnly && !state.data.profile && !servedProfile && (
-            <div
-              role="alert"
-              className="mb-4 rounded-md border border-status-warning/40 px-3 py-2 text-sm text-text-secondary"
-            >
-              The server profile could not be loaded. Session defaults cannot be resolved yet.
-              <button
-                type="button"
-                disabled={resolvingServedProfile || !onRetryServedProfile}
-                onClick={() => void retryServedProfile()}
-                className="ml-2 text-brand-400 hover:underline cursor-pointer disabled:opacity-50"
-              >
-                Retry server profile
-              </button>
-            </div>
+    <ModalFrame
+      layer="z-[60]"
+      onBackdrop={creating ? undefined : onClose}
+      // Phones get a bottom sheet sized to its content, so Launch sits under the last row
+      // within thumb reach; a long panel grows it to just below the notch and scrolls.
+      panelClassName="md:max-w-lg md:max-h-[min(720px,90vh)]"
+      panelProps={{
+        ref: panelRef,
+        "data-testid": "session-wizard",
+        role: "dialog",
+        "aria-modal": true,
+        "aria-labelledby": "session-wizard-title",
+        style: { paddingBottom: keyboardHeight || undefined },
+      }}
+      outside={
+        <>
+          {globConfirm && (
+            <VolumeIgnoresGlobDialog globs={globConfirm.globs} onConfirm={handleGlobConfirm} onCancel={cancelPending} />
           )}
-          {creating ? (
-            <CreateProgressView progress={progress} />
-          ) : panel ? (
-            <>
-              <PanelHeader title={PANEL_TITLE[panel]} onBack={() => setPanel(null)} />
-              {renderPanel(panel)}
-            </>
-          ) : (
-            form
-          )}
-        </div>
-        {!panel || creating ? (
-          <div
-            className="px-4 md:px-5 pt-3 border-t border-surface-700/20"
-            style={{ paddingBottom: keyboardHeight ? "0.75rem" : "max(0.75rem, env(safe-area-inset-bottom))" }}
-          >
-            <LaunchFooter
-              data={d}
-              isSubmitting={state.isSubmitting}
-              held={rechecking}
-              failure={
-                state.failure &&
-                failed && (
-                  <CreateFailureBox
-                    key={state.failure.reference ?? ""}
-                    failure={state.failure}
-                    view={failed}
-                    output={progress?.output ?? []}
-                    onAction={(action) => void handleFailureAction(action)}
-                    busy={rechecking}
-                    blocked={resendBlocked}
-                  />
-                )
-              }
-              error={
-                state.error ??
-                // A deleted Profile also fails the project lookup, which reselecting can't fix.
-                (!nameOnly && agentsStatus === "missing" ? profileMissingError(agentsKey) : null) ??
-                (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
-                (!nameOnly && agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
-                (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
-              }
-              onSubmit={() => void handleSubmit()}
-              nameOnly={nameOnly}
-              defaultsReady={formReady && !(d.sandboxEnabled && !state.dockerChecked)}
-              onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
+          {hooksTrust && (
+            <HooksTrustDialog
+              onCreate={hooksTrust.info.onCreate}
+              onLaunch={hooksTrust.info.onLaunch}
+              onDestroy={hooksTrust.info.onDestroy}
+              needsMcpTrust={hooksTrust.info.needsMcpTrust}
+              mcpSummaries={hooksTrust.mcpSummaries}
+              onConfirm={handleHooksTrustConfirm}
+              onCancel={cancelPending}
             />
-          </div>
-        ) : (
+          )}
+        </>
+      }
+    >
+      <DialogHeader
+        as="h1"
+        titleId="session-wizard-title"
+        title={creating ? "Creating session" : "New session"}
+        end={<CloseButton buttonRef={closeRef} onClick={creating ? handleBackground : onClose} />}
+      />
+      <div data-wizard-scroll className={DIALOG_BODY}>
+        {!nameOnly && !state.data.profile && !servedProfile && (
           <div
-            className="px-4 md:px-5 pt-3 border-t border-surface-700/20"
-            style={{ paddingBottom: keyboardHeight ? "0.75rem" : "max(0.75rem, env(safe-area-inset-bottom))" }}
+            role="alert"
+            className="mb-4 rounded-lg border border-status-warning/40 bg-status-warning/5 px-3 py-2 text-[15px] md:text-sm text-text-secondary"
           >
+            The server profile could not be loaded. Session defaults cannot be resolved yet.
             <button
               type="button"
-              onClick={() => setPanel(null)}
-              className="w-full py-2.5 rounded-lg text-sm font-medium text-text-primary bg-surface-700 hover:bg-surface-600 cursor-pointer transition-colors"
+              disabled={resolvingServedProfile || !onRetryServedProfile}
+              onClick={() => void retryServedProfile()}
+              className={`${BUTTON_INLINE} ml-2`}
             >
-              Done
+              Retry server profile
             </button>
           </div>
         )}
+        {creating ? (
+          <CreateProgressView progress={progress} />
+        ) : panel ? (
+          <>
+            <PanelHeader title={PANEL_TITLE[panel]} onBack={() => setPanel(null)} />
+            {renderPanel(panel)}
+          </>
+        ) : (
+          form
+        )}
       </div>
-      {globConfirm && (
-        <VolumeIgnoresGlobDialog globs={globConfirm.globs} onConfirm={handleGlobConfirm} onCancel={cancelPending} />
+      {!panel || creating ? (
+        <div className={footerClass}>
+          <LaunchFooter
+            data={d}
+            isSubmitting={state.isSubmitting}
+            held={rechecking}
+            failure={
+              state.failure &&
+              failed && (
+                <CreateFailureBox
+                  key={state.failure.reference ?? ""}
+                  failure={state.failure}
+                  view={failed}
+                  output={progress?.output ?? []}
+                  onAction={(action) => void handleFailureAction(action)}
+                  busy={rechecking}
+                  blocked={resendBlocked}
+                />
+              )
+            }
+            error={
+              state.error ??
+              // A deleted Profile also fails the project lookup, which reselecting can't fix.
+              (!nameOnly && agentsStatus === "missing" ? profileMissingError(agentsKey) : null) ??
+              (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
+              (!nameOnly && agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
+              (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
+            }
+            onSubmit={() => void handleSubmit()}
+            nameOnly={nameOnly}
+            defaultsReady={formReady && !(d.sandboxEnabled && !state.dockerChecked)}
+            onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
+          />
+        </div>
+      ) : (
+        <div className={footerClass}>
+          <button type="button" onClick={() => setPanel(null)} className={`${BUTTON_SECONDARY} w-full`}>
+            Done
+          </button>
+        </div>
       )}
-      {hooksTrust && (
-        <HooksTrustDialog
-          onCreate={hooksTrust.info.onCreate}
-          onLaunch={hooksTrust.info.onLaunch}
-          onDestroy={hooksTrust.info.onDestroy}
-          needsMcpTrust={hooksTrust.info.needsMcpTrust}
-          mcpSummaries={hooksTrust.mcpSummaries}
-          onConfirm={handleHooksTrustConfirm}
-          onCancel={cancelPending}
-        />
-      )}
-    </div>,
+    </ModalFrame>,
     document.body,
   );
 }

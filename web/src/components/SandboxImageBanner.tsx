@@ -1,6 +1,7 @@
 import { useId, useRef, useState, type ReactNode } from "react";
 import type { SandboxImageBannerView } from "../hooks/useSandboxImageBanner";
 import { writeClipboard } from "../lib/clipboard";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 const WHY =
   "Sandboxed sessions run in a container image that AoE doesn't update automatically. Newer AoE versions can need a newer image; without it, Structured view sessions stop with an adapter error.";
@@ -14,8 +15,6 @@ const TONES = {
   failed: { bar: "bg-status-error/10 border-status-error/30 text-text-primary", dot: "bg-status-error" },
 };
 
-const linkButton = "min-h-8 underline cursor-pointer hover:opacity-80";
-
 /** Top-of-app banner for a newer sandbox image, with the pull and its outcome. */
 export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
   switch (view.kind) {
@@ -24,7 +23,7 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
         <Bar tone="brand" label="Sandbox image update available" onDismiss={view.onDismiss}>
           <span>Sandbox image update available</span>
           <Image name={view.image} />
-          <button type="button" onClick={view.onUpdate} className={linkButton}>
+          <button type="button" onClick={view.onUpdate} className={BUTTON_INLINE}>
             Update now
           </button>
           <Disclosure label="Why?">{WHY}</Disclosure>
@@ -67,7 +66,7 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
       return (
         <Bar tone="failed" label="Couldn't download the sandbox image" onDismiss={view.onDismiss}>
           <span>Couldn&apos;t download the sandbox image</span>
-          <button type="button" onClick={view.onRetry} className={linkButton}>
+          <button type="button" onClick={view.onRetry} className={BUTTON_INLINE}>
             Retry
           </button>
           <Disclosure label="Details">
@@ -117,7 +116,7 @@ function Image({ name }: { name: string }) {
   return <span className="text-text-subtle break-all">· {name}</span>;
 }
 
-/** A link-styled toggle with its panel below the banner; Escape closes it. */
+/** A toggle with its panel below the banner; Escape closes it. */
 function Disclosure({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const panelId = useId();
@@ -128,7 +127,7 @@ function Disclosure({ label, children }: { label: string; children: ReactNode })
         aria-expanded={open}
         aria-controls={panelId}
         onClick={() => setOpen((o) => !o)}
-        className={linkButton}
+        className={BUTTON_INLINE}
       >
         {label}
       </button>
@@ -164,7 +163,7 @@ export function CopyCommand({ command }: { command: string }) {
       <code ref={codeRef} className="whitespace-pre-wrap break-all text-text-primary">
         {command}
       </code>
-      <button type="button" onClick={() => void copy()} className={linkButton} aria-label={`Copy ${command}`}>
+      <button type="button" onClick={() => void copy()} className={BUTTON_INLINE} aria-label={`Copy ${command}`}>
         Copy
       </button>
       {/* Callers put it inside a live region, so this is announced without a nested one. */}

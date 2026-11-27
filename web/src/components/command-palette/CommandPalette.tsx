@@ -7,6 +7,11 @@ import type { CommandAction, CommandActionGroup } from "./types";
 import { matchCheat, type CheatEffect } from "../../lib/cheats";
 import { reportInfo } from "../../lib/toastBus";
 import { reportFeatureUse } from "../../lib/featureUse";
+import { BACKDROP, DIALOG } from "../../lib/surfaces";
+
+const KBD = "font-mono text-[10px] px-1.5 py-0.5 rounded-md bg-surface-900 border border-surface-700 text-text-muted";
+// MENU_ITEM's rows, as cmdk items: cmdk marks the highlighted one with data-selected.
+const ITEM = "flex items-center gap-2 px-3 h-9 max-md:h-11 rounded-lg text-[13px] max-md:text-[15px]";
 
 // The cmdk item value; the pre-filter and <Command.Item> must use the same string.
 function actionValue(a: CommandAction): string {
@@ -68,7 +73,8 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
     return () => {
       clearTimeout(t);
       const prev = previousFocusRef.current;
-      if (prev?.isConnected) prev.focus();
+      // A focus primer only carried the tap's gesture so iOS would raise the keyboard; refocusing it reopens it.
+      if (prev?.isConnected && !prev.hasAttribute("data-focus-primer")) prev.focus();
     };
   }, [open]);
 
@@ -136,7 +142,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
       role="dialog"
       aria-modal="true"
       aria-label="Command palette"
-      className="fixed inset-0 z-[60] flex items-start justify-center bg-black/80 backdrop-blur-sm animate-fade-in pt-[15vh] px-3"
+      className={`fixed inset-0 z-[60] flex items-start justify-center ${BACKDROP} animate-fade-in pt-[15vh] max-md:pt-[max(12px,env(safe-area-inset-top))] px-3`}
       onClick={onClose}
       onKeyDown={onKeyDown}
       data-testid="command-palette-backdrop"
@@ -145,10 +151,10 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
         label="Command palette"
         loop
         filter={(value, searchText) => scoreValue(value, searchText)}
-        className="w-full max-w-[600px] bg-surface-800 border border-surface-700/50 rounded-lg shadow-2xl overflow-hidden animate-slide-up"
+        className={`${DIALOG} w-full max-w-[600px] overflow-hidden animate-slide-up`}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center gap-2 px-4 h-12 border-b border-surface-700/50">
+        <div className="flex items-center gap-2 px-4 h-12 max-md:h-14 border-b border-surface-700/50">
           <svg
             width="16"
             height="16"
@@ -168,18 +174,16 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
             value={search}
             onValueChange={handleSearchChange}
             placeholder="Search actions, sessions, settings…"
-            className="flex-1 bg-transparent outline-none text-[15px] text-text-primary placeholder:text-text-muted"
+            className="flex-1 min-w-0 bg-transparent outline-none text-[16px] md:text-[15px] text-text-primary placeholder:text-text-dim"
           />
-          <kbd className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-surface-900 border border-surface-700 text-text-muted">
-            esc
-          </kbd>
+          <kbd className={`${KBD} max-md:hidden`}>esc</kbd>
         </div>
 
         {tabs.length > 2 && (
           <div
             role="tablist"
             aria-label="Result categories"
-            className="flex items-center gap-1 px-2 h-9 border-b border-surface-700/50"
+            className="flex items-center gap-1 px-2 h-9 max-md:h-11 border-b border-surface-700/50 overflow-x-auto"
           >
             {tabs.map((tab) => (
               <button
@@ -188,7 +192,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
                 role="tab"
                 aria-selected={activeTab === tab}
                 onClick={() => setActiveTab(tab)}
-                className={`px-2.5 py-1 rounded text-xs font-medium ${
+                className={`shrink-0 px-2.5 py-1 max-md:py-2 rounded-md text-xs max-md:text-[13px] font-medium transition-colors ${
                   activeTab === tab
                     ? "bg-surface-700 text-text-bright"
                     : "text-text-muted hover:text-text-primary hover:bg-surface-700/50"
@@ -198,13 +202,11 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
               </button>
             ))}
             <span className="flex-1" />
-            <kbd className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-surface-900 border border-surface-700 text-text-muted">
-              tab
-            </kbd>
+            <kbd className={`${KBD} max-md:hidden`}>tab</kbd>
           </div>
         )}
 
-        <Command.List className="max-h-[50vh] overflow-y-auto p-1">
+        <Command.List className="max-h-[50vh] max-md:max-h-[50dvh] overflow-y-auto p-1">
           <Command.Empty className="px-4 py-8 text-center text-sm text-text-muted">No matches</Command.Empty>
 
           {visibleGroups.map((groupName) => {
@@ -215,14 +217,11 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
               <Command.Group
                 key={groupName}
                 heading={groupName}
-                className="mb-1 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:pt-2 [&_[cmdk-group-heading]]:pb-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-mono [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider [&_[cmdk-group-heading]]:text-text-muted"
+                // MENU_HEADING, applied to cmdk's own heading element.
+                className="mb-1 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:pt-2 [&_[cmdk-group-heading]]:pb-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-[0.06em] [&_[cmdk-group-heading]]:text-text-dim"
               >
                 {showSpinner && (
-                  <Command.Item
-                    value="conversation:__loading__"
-                    disabled
-                    className="flex items-center gap-2 px-3 h-9 rounded-md text-sm text-text-muted"
-                  >
+                  <Command.Item value="conversation:__loading__" disabled className={`${ITEM} text-text-muted`}>
                     <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-text-muted border-t-transparent" />
                     <span>Searching conversations…</span>
                   </Command.Item>
@@ -232,7 +231,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
                     key={action.id}
                     value={actionValue(action)}
                     onSelect={() => run(action)}
-                    className="flex items-center gap-2 px-3 h-9 rounded-md cursor-pointer text-sm text-text-primary data-[selected=true]:bg-surface-700 data-[selected=true]:text-text-bright"
+                    className={`${ITEM} cursor-pointer text-text-secondary data-[selected=true]:bg-surface-700/60 data-[selected=true]:text-text-primary`}
                   >
                     {action.status && (
                       <span className="font-mono text-text-muted w-4 shrink-0 text-center">
@@ -243,11 +242,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
                     <span className="truncate">{action.title}</span>
                     {action.subtitle && <span className="truncate text-text-muted text-xs">{action.subtitle}</span>}
                     <span className="flex-1" />
-                    {action.shortcut && (
-                      <kbd className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-surface-900 border border-surface-700 text-text-muted">
-                        {action.shortcut}
-                      </kbd>
-                    )}
+                    {action.shortcut && <kbd className={`${KBD} max-md:hidden`}>{action.shortcut}</kbd>}
                   </Command.Item>
                 ))}
               </Command.Group>
@@ -255,7 +250,7 @@ export function CommandPalette({ open, onClose, actions, onSearchChange, searchi
           })}
         </Command.List>
 
-        <div className="flex items-center justify-between px-4 h-8 border-t border-surface-700/50 text-[11px] font-mono text-text-muted">
+        <div className="flex items-center justify-between px-4 h-8 border-t border-surface-700/50 text-[11px] font-mono text-text-dim max-md:hidden">
           <span>↑↓ navigate · ↵ select · esc close</span>
           <span>
             {visibleCount} action{visibleCount === 1 ? "" : "s"}

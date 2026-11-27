@@ -8,10 +8,13 @@ import type { AcpState, PromptAttachmentInput } from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { resolveModeChannel } from "../../lib/modeChannel";
 import { badgeLabel, badgeTone, resolveSkillSource, type SkillIndex } from "../../lib/skillProvenance";
+import { MENU, MENU_HEADING, MENU_OPTION_ROW } from "../../lib/surfaces";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { ProvenanceBadge } from "../ProvenanceBadge";
 import { Tooltip } from "../Tooltip";
 import { SignInButton, type SignInContext } from "./SignInPopover";
+
+/** A menu row with a second line of description, so its marker sits by the first line. */
 
 /** Flat item list shared by the `@` and `/` popovers; `/` passes a skill index for provenance badges. */
 export function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIndex?: SkillIndex }) {
@@ -19,7 +22,7 @@ export function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIn
     <ComposerPrimitive.Unstable_TriggerPopoverItems className="max-h-64 overflow-y-auto">
       {(items) =>
         items.length === 0 ? (
-          <div className="px-3 py-2 text-xs italic text-text-dim">No matches</div>
+          <div className="px-3 py-2 text-[13px] text-text-dim">No matches</div>
         ) : (
           items.map((item, i) => {
             const source = skillIndex ? resolveSkillSource(skillIndex, item.id) : null;
@@ -28,22 +31,16 @@ export function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIn
                 key={item.id}
                 item={item}
                 index={i}
-                className={[
-                  "group flex w-full items-start gap-2 px-3 py-2 text-left text-xs",
-                  "hover:bg-surface-800/60",
-                  "data-highlighted:bg-brand-600/20",
-                ].join(" ")}
+                className={`group ${MENU_OPTION_ROW} data-highlighted:bg-surface-700/60 data-highlighted:text-text-primary`}
               >
-                <span className="font-mono text-text-dim group-data-highlighted:text-text-primary">{trigger}</span>
+                <span className="font-mono text-text-dim group-data-highlighted:text-text-secondary">{trigger}</span>
                 <span className="min-w-0 flex-1">
                   <span className="flex items-center gap-1.5">
                     <span className="block truncate font-medium text-text-primary">{item.label}</span>
                     {source && <ProvenanceBadge label={badgeLabel(source)} tone={badgeTone(source)} />}
                   </span>
                   {item.description && (
-                    <span className="block truncate text-[11px] text-text-dim group-data-highlighted:text-text-primary">
-                      {item.description}
-                    </span>
+                    <span className="block truncate text-[12px] text-text-dim">{item.description}</span>
                   )}
                 </span>
               </ComposerPrimitive.Unstable_TriggerPopoverItem>
@@ -224,13 +221,8 @@ export function ModePicker({
         <ChevronUp className="h-3 w-3 opacity-70" />
       </button>
       {open && (
-        <div
-          className="absolute bottom-full left-0 z-30 mb-1 w-56 overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
-          role="menu"
-        >
-          <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
-            {channel.label}
-          </div>
+        <div className={`absolute bottom-full left-0 z-30 mb-1 w-60 overflow-hidden ${MENU}`} role="menu">
+          <div className={MENU_HEADING}>{channel.label}</div>
           {channel.modes.map((opt) => {
             const isPending = opt.id === channel.pendingId;
             const isActive = opt.id === channel.activeId;
@@ -241,11 +233,7 @@ export function ModePicker({
                 role="menuitem"
                 disabled={isPending}
                 onClick={() => select(opt.id)}
-                className={[
-                  "flex w-full items-start gap-2 px-3 py-2 text-left text-xs hover:bg-surface-800",
-                  isActive ? "bg-surface-800/60" : "",
-                  isPending ? "cursor-not-allowed opacity-50" : "",
-                ].join(" ")}
+                className={`${MENU_OPTION_ROW} ${isActive ? "bg-surface-700/40" : ""}`}
               >
                 <span
                   className={[
@@ -255,9 +243,9 @@ export function ModePicker({
                 />
                 <span className="min-w-0 flex-1">
                   <span className="block font-medium text-text-primary">{opt.name}</span>
-                  {opt.description && <span className="block text-[11px] text-text-dim">{opt.description}</span>}
+                  {opt.description && <span className="block text-[12px] text-text-dim">{opt.description}</span>}
                 </span>
-                {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
+                {isPending && <span className="text-[11px] text-text-dim">…</span>}
               </button>
             );
           })}

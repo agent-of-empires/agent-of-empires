@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { OverflowMenu } from "../OverflowMenu";
 
@@ -20,14 +20,21 @@ describe("OverflowMenu", () => {
     expect(screen.queryByRole("menu")).toBeNull();
   });
 
-  it("closes on outside mousedown and on Escape", () => {
+  it("closes on an outside pointer down, which a tap on plain content also fires, and on Escape", () => {
     render(<OverflowMenu items={[{ label: "X", onClick: () => {} }]} />);
     fireEvent.click(screen.getByRole("button", { name: "More options" }));
     expect(screen.getByRole("menu")).toBeTruthy();
-    fireEvent.mouseDown(document.body);
+    fireEvent.pointerDown(document.body);
     expect(screen.queryByRole("menu")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "More options" }));
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("opens on its window event, as a phone's left swipe sends it", () => {
+    render(<OverflowMenu items={[{ label: "X", onClick: () => {} }]} openOn="test:open" />);
+    expect(screen.queryByRole("menu")).toBeNull();
+    act(() => void window.dispatchEvent(new Event("test:open")));
+    expect(screen.getByRole("menu")).toBeTruthy();
   });
 });

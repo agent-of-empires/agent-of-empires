@@ -838,7 +838,7 @@ A `pane` entry renders a dockable tool-window, pushed with `ui.state.set`:
 | `body` | string | The simple form: plain text, used only when `blocks` is absent. |
 | `blocks` | array | The block list (below). Takes precedence over `body`. |
 | `default_location` | string | `right` or `bottom`. The dock it first opens in; the user can move it after. |
-| `icon` | string | Lucide name for the activity-bar / dock-tab icon. A manifest `icon_asset` outranks it. |
+| `icon` | string | Lucide name for the pane-menu and dock-tab icon. A manifest `icon_asset` outranks it. |
 | `footer` | table | A status line pinned below the scrolling block list: `text` left, tone-colored `value` right, plus an optional `icon`. Requires `api_version >= 12`. |
 
 The payload is capped at 64 KiB. Everything but `blocks` is validated strictly; `blocks` is opaque JSON, and **each surface renders the kinds it knows and drops the rest.** That forward-compatibility contract cuts both ways: a new kind needs no host change, but an older host renders nothing for it, so a pane that depends on a newer kind should say so with `api_version` and `aoe_version`.

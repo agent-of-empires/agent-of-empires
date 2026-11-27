@@ -5,6 +5,7 @@ import { updateSuggestionPrefs, type SuggestionResult } from "../lib/api";
 import type { StartedSession, SuggestionProvider } from "../lib/types";
 import { agoLabel } from "../lib/suggestionTime";
 import { MENU_ITEM, MenuPopover, StartInMenu, StartMenu, type StartMenuProps } from "./SuggestionStartMenu";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 /** Buttons look 32px; on a phone an invisible 44px area around them takes the tap. */
 export const TAP =
@@ -358,12 +359,7 @@ export function SuggestionsOffNote({
       {readOnly ? (
         `Read-only: this dashboard can't turn ${one ? "it" : "them"} on.`
       ) : (
-        <button
-          type="button"
-          onClick={() => void turnOn()}
-          disabled={disabled}
-          className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
-        >
+        <button type="button" onClick={() => void turnOn()} disabled={disabled} className={BUTTON_INLINE}>
           {one ? "Turn it on" : "Turn them on"}
         </button>
       )}
@@ -420,7 +416,7 @@ export function UndoBar({
 }) {
   const [stopped, setStopped] = useState(false);
   return (
-    <div className="mt-2 flex w-max max-w-full flex-wrap items-baseline gap-x-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
+    <div className="mt-2 flex w-max max-w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
       {stopped ? (
         <>
           <span>Stopped suggesting {stopLabel}.</span>
@@ -430,7 +426,7 @@ export function UndoBar({
                 type="button"
                 onClick={() => void onResume().then((ok) => setStopped(!ok))}
                 disabled={disabled}
-                className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+                className={`${BUTTON_INLINE} flex-none`}
               >
                 Undo
               </button>
@@ -442,12 +438,7 @@ export function UndoBar({
       ) : (
         <>
           <span className="max-w-full truncate">Dismissed &ldquo;{title}&rdquo;.</span>
-          <button
-            type="button"
-            onClick={onUndo}
-            disabled={disabled}
-            className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
-          >
+          <button type="button" onClick={onUndo} disabled={disabled} className={`${BUTTON_INLINE} flex-none`}>
             Undo
           </button>
           {onStop && stopLabel && (
@@ -457,7 +448,7 @@ export function UndoBar({
                 type="button"
                 onClick={() => void onStop().then(setStopped)}
                 disabled={disabled}
-                className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+                className={`${BUTTON_INLINE} flex-none`}
               >
                 Stop suggesting {stopLabel}
               </button>

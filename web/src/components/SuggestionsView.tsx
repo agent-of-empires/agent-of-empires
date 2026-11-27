@@ -21,6 +21,7 @@ import {
   UndoBar,
 } from "./SuggestionRow";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 interface Props {
   readOnly?: boolean;
@@ -242,7 +243,7 @@ export function SuggestionsView({
             {!notice && (
               <>
                 {" "}
-                <button type="button" onClick={() => void load()} className="cursor-pointer underline">
+                <button type="button" onClick={() => void load()} className={BUTTON_INLINE}>
                   Try again
                 </button>
               </>
@@ -476,11 +477,7 @@ export function SuggestionsView({
                         ? `${p.name} suggestions are hidden because ${p.name} is off. Read-only: this dashboard can't turn it on.`
                         : `${p.name} suggestions are hidden because ${p.name} is off in Settings › Suggestions. `}
                       {!readOnly && onOpenSettings && (
-                        <button
-                          type="button"
-                          onClick={onOpenSettings}
-                          className="cursor-pointer text-brand-500 hover:underline"
-                        >
+                        <button type="button" onClick={onOpenSettings} className={BUTTON_INLINE}>
                           Turn it on
                         </button>
                       )}

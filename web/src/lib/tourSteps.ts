@@ -83,6 +83,16 @@ export function tourSelector(anchor: TourAnchorId): string {
   return `[data-tour="${anchor}"]:not([inert] *)`;
 }
 
+/** The first shown match: a phone hides one layout's anchors while the other shows its own, and its closed session
+ *  drawer stays rendered with `visibility: hidden`. */
+export function findTourAnchor(anchor: TourAnchorId): HTMLElement | null {
+  if (typeof document === "undefined") return null;
+  for (const el of document.querySelectorAll<HTMLElement>(tourSelector(anchor))) {
+    if (typeof el.checkVisibility !== "function" || el.checkVisibility({ visibilityProperty: true })) return el;
+  }
+  return null;
+}
+
 /** The only sanctioned way to attach a tour anchor; spread it onto the element. */
 export function tourAnchor(anchor: TourAnchorId): {
   "data-tour": TourAnchorId;
@@ -139,8 +149,8 @@ export const TOUR_STEPS: readonly TourStep[] = [
     id: "right-panel",
     anchor: TOUR_ANCHORS.diffToggle,
     scopes: ["session", "structured-view"],
-    title: "Diff and review",
-    body: "Open the diff here to review the agent's file changes and send comments back without leaving the session.",
+    title: "Review panel",
+    body: "Open the review panel here to see the agent's file changes and send comments back without leaving the session. Its pane menu adds Files and other panes.",
     shortcutHints: [
       { id: "diff", verb: "toggles the diff" },
       { id: "rightPanel", verb: "toggles the panel" },
@@ -197,8 +207,7 @@ export function isStepEligible(
 }
 
 function defaultHasAnchor(anchor: TourAnchorId): boolean {
-  if (typeof document === "undefined") return false;
-  return document.querySelector(tourSelector(anchor)) !== null;
+  return findTourAnchor(anchor) !== null;
 }
 
 /** Metadata eligibility, then DOM presence, in TOUR_STEPS order. */

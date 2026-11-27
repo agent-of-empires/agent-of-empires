@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useFocusTrap } from "../../hooks/useFocusTrap";
+import { CancelButton, ConfirmButton, Dialog } from "../Dialog";
 
 interface Props {
   /** Prefix for the `-dialog` and `-proceed` test ids. */
@@ -56,60 +57,28 @@ export function ConfirmCreateDialog({ id, title, confirmLabel, onConfirm, onCanc
   }, [onCancel, handleConfirm, confirming]);
 
   return (
-    <div
-      ref={dialogRef}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby={`${id}-dialog-title`}
-      data-testid={`${id}-dialog`}
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
-      onClick={onCancel}
-    >
-      <div
-        className="bg-surface-800 border border-surface-700/50 rounded-lg w-[460px] max-w-[90vw] shadow-2xl animate-slide-up"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-5 py-4 border-b border-surface-700">
-          <h2 id={`${id}-dialog-title`} className="text-sm font-semibold text-status-warning">
-            {title}
-          </h2>
-        </div>
-
-        <div className="px-5 py-4 space-y-3">{children}</div>
-
-        <div className="flex justify-end gap-3 px-5 py-3 border-t border-surface-700">
-          <button
-            onClick={onCancel}
-            disabled={confirming}
-            className="px-3 py-1.5 text-sm text-text-secondary hover:text-text-primary rounded-md hover:bg-surface-700/50 cursor-pointer transition-colors disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            ref={confirmButtonRef}
+    <Dialog
+      id={`${id}-dialog`}
+      title={title}
+      titleClassName="text-status-warning"
+      rootRef={dialogRef}
+      bodyClassName="space-y-3"
+      onDismiss={onCancel}
+      footer={
+        <>
+          <CancelButton onClick={onCancel} disabled={confirming} />
+          <ConfirmButton
+            buttonRef={confirmButtonRef}
             onClick={handleConfirm}
-            disabled={confirming}
-            data-testid={`${id}-proceed`}
-            className="px-3 py-1.5 text-sm text-surface-900 bg-green-500 hover:bg-green-600 active:bg-green-700 rounded-md cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-2"
+            busy={confirming}
+            testId={`${id}-proceed`}
           >
-            {confirming && (
-              <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24">
-                <circle
-                  className="opacity-25"
-                  cx="12"
-                  cy="12"
-                  r="10"
-                  stroke="currentColor"
-                  strokeWidth="4"
-                  fill="none"
-                />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-            )}
             {confirming ? "Creating..." : confirmLabel}
-          </button>
-        </div>
-      </div>
-    </div>
+          </ConfirmButton>
+        </>
+      }
+    >
+      {children}
+    </Dialog>
   );
 }

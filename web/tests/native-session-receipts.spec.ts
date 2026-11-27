@@ -204,7 +204,7 @@ for (const staleKind of ["same epoch", "abandoned epoch"] as const) {
     await consume(page, await next(), good, 10n, "current-boot");
     await expect.poll(() => readVisibleSessionTitles(page)).toEqual(["alpha", "beta"]);
     await (await next()).fulfill({ status: 503 });
-    const offline = page.locator('[title="Disconnected from backend"]');
+    const offline = page.getByText("Daemon unreachable. Reconnecting…");
     await expect(offline).toBeVisible();
     const poisoned = {
       ...initialA,
@@ -254,7 +254,7 @@ test("a hung sessions poll aborts at its deadline and the next canonical poll re
     timeout: 20_000,
   });
   await failed;
-  await expect(page.locator('[title="Disconnected from backend"]')).toBeVisible();
+  await expect(page.getByText("Daemon unreachable. Reconnecting…")).toBeVisible();
   await expect(row(page, "alpha")).toBeVisible();
   await consume(
     page,
@@ -262,7 +262,7 @@ test("a hung sessions poll aborts at its deadline and the next canonical poll re
     { sessions: [{ ...initialA, title: "recovered-after-deadline" }, B], workspace_ordering: [] },
     2n,
   );
-  await expect(page.locator('[title="Disconnected from backend"]')).toHaveCount(0);
+  await expect(page.getByText("Daemon unreachable. Reconnecting…")).toHaveCount(0);
   await expect(row(page, "recovered-after-deadline")).toBeVisible();
   await menu(page, "recovered-after-deadline");
   await expect(page.getByTestId("sidebar-context-menu-notify-all")).toBeEnabled();

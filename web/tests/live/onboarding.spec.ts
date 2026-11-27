@@ -294,7 +294,7 @@ test.describe("telemetry signals", () => {
     await expect(sessionRow).toBeVisible({ timeout: 10_000 });
     await sessionRow.click();
     // Diff starts closed; the signal fires once it shows.
-    await page.getByTestId("pane-toggle-diff").first().click();
+    await page.getByTestId("right-dock-toggle").first().click();
     for (const surface of ["web_terminal", "diff_panel"]) {
       await expect.poll(() => pings().some((p) => p.surface === surface), { timeout: 10_000 }).toBe(true);
     }

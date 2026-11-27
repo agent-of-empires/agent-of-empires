@@ -33,7 +33,6 @@ export interface WebSettings {
   markdownPreview: "rendered" | "raw";
   fileEditing: boolean;
   collapsedDiffDirs: string[];
-  sidebarSide: "left" | "right";
   sidebarCompact: boolean;
   /** Ordered key row above the soft keyboard in the live terminal. */
   mobileToolbarKeys: ToolbarKeyId[];
@@ -60,7 +59,6 @@ function getDefaults(): WebSettings {
     markdownPreview: "rendered",
     fileEditing: false,
     collapsedDiffDirs: [],
-    sidebarSide: "left",
     sidebarCompact: false,
     mobileToolbarKeys: [...DEFAULT_TOOLBAR_KEYS],
     showArrowJoystick: true,

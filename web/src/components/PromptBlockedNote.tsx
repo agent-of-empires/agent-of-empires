@@ -2,6 +2,7 @@ import { useState } from "react";
 import { updateSettings } from "../lib/api";
 import { copyPrompt } from "../lib/suggestionPlan";
 import type { StartedSession } from "../lib/types";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 const FOLDER = "agent_folder_not_trusted";
 
@@ -11,8 +12,6 @@ const PLAIN: Record<string, string> = {
   agent_bypass_not_accepted:
     "Claude Code is waiting for Bypass Permissions to be accepted once. Open the Session and accept it.",
 };
-
-const LINK = "cursor-pointer text-brand-500 hover:underline disabled:opacity-50";
 
 /**
  * Why a Session's initial prompt was not typed. For an untrusted folder it offers to turn on
@@ -71,7 +70,7 @@ export function PromptBlockedNote({
           {onCopyPrompt && !disabled && (
             <>
               {" "}
-              <button type="button" className={LINK} onClick={onCopyPrompt}>
+              <button type="button" className={BUTTON_INLINE} onClick={onCopyPrompt}>
                 Copy prompt
               </button>
             </>
@@ -82,7 +81,7 @@ export function PromptBlockedNote({
         <p className="text-text-secondary">
           {step === "failed" && <span>Couldn&apos;t turn on pre-trust. </span>}
           Or trust every folder AoE starts Claude Code in:{" "}
-          <button type="button" className={LINK} onClick={() => setStep("confirm")}>
+          <button type="button" className={BUTTON_INLINE} onClick={() => setStep("confirm")}>
             Turn on pre-trust
           </button>
         </p>
@@ -92,10 +91,16 @@ export function PromptBlockedNote({
           This turns on Pre-trust agent folders: Claude Code will trust each folder AoE starts it in, which also runs
           the repo&apos;s own .claude/settings.json hooks.{" "}
           {/* Focus follows the step, since the button that had it is gone. */}
-          <button type="button" className={LINK} disabled={step === "saving"} onClick={() => void turnOn()} autoFocus>
+          <button
+            type="button"
+            className={BUTTON_INLINE}
+            disabled={step === "saving"}
+            onClick={() => void turnOn()}
+            autoFocus
+          >
             Turn on
           </button>{" "}
-          <button type="button" className={LINK} disabled={step === "saving"} onClick={() => setStep("idle")}>
+          <button type="button" className={BUTTON_INLINE} disabled={step === "saving"} onClick={() => setStep("idle")}>
             Cancel
           </button>
         </p>
@@ -105,7 +110,13 @@ export function PromptBlockedNote({
         (onTryAgain ? (
           <p className="text-text-secondary">
             Pre-trust is on.{" "}
-            <button type="button" className={LINK} disabled={retrying} onClick={() => void tryAgain()} autoFocus>
+            <button
+              type="button"
+              className={BUTTON_INLINE}
+              disabled={retrying}
+              onClick={() => void tryAgain()}
+              autoFocus
+            >
               Try again
             </button>{" "}
             moves this Session to Trash and starts a new one.
