@@ -949,8 +949,7 @@ async fn with_managed_configured<F>(
                     .lock()
                     .unwrap()
                     .push(NativeLaunch { lease, inspection });
-                AcpClient::spawn_with_test_options(actual, session_id, candidate, first.options)
-                    .await
+                AcpClient::spawn_with_test_options(actual, session_id, command, first.options).await
             })
         })
     };

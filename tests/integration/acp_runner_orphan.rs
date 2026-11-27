@@ -68,7 +68,8 @@ fn spawn_runner_and_wait_for_record(test_name: &str, session_id: &str) -> (Owned
     let record_path = worker_registry::workers_dir()
         .unwrap()
         .join(format!("{session_id}.json"));
-    let child = Command::new(executable)
+    let mut runner = Command::new(launch.executable());
+    runner
         .arg("__acp-runner")
         .arg("--socket")
         .arg(&socket)
