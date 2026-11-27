@@ -611,32 +611,50 @@ impl SettingsView {
         Ok(())
     }
 
-    /// Ensure the selected field is visible within the given viewport height.
-    /// Call this after changing `selected_field`.
-    pub(super) fn ensure_field_visible(&mut self, viewport_height: u16) {
+    /// Content-space top and height of the selected field.
+    fn selected_field_span(&self) -> (u16, u16) {
         let mut y = 0u16;
-        let mut selected_y = 0u16;
-        let mut selected_h = 0u16;
-
         for (i, field) in self.fields.iter().enumerate() {
             let h = self.field_height(field, i);
             if i == self.selected_field {
-                selected_y = y;
-                selected_h = h;
-                break;
+                return (y, h);
             }
             y += h + 1; // +1 spacing
         }
+        (y, 0)
+    }
 
-        // Scroll up if field starts above viewport
-        if selected_y < self.fields_scroll_offset {
-            self.fields_scroll_offset = selected_y;
-        }
-        // Scroll down if field ends below viewport
+    /// Ensure the selected field is visible within the given viewport height.
+    /// Call this after changing `selected_field`. A field taller than the
+    /// viewport shows from its top, so its label stays in view.
+    pub(super) fn ensure_field_visible(&mut self, viewport_height: u16) {
+        let (selected_y, selected_h) = self.selected_field_span();
         let field_bottom = selected_y + selected_h;
-        if field_bottom > self.fields_scroll_offset + viewport_height {
+        if selected_y < self.fields_scroll_offset || selected_h > viewport_height {
+            self.fields_scroll_offset = selected_y;
+        } else if field_bottom > self.fields_scroll_offset + viewport_height {
             self.fields_scroll_offset = field_bottom.saturating_sub(viewport_height);
         }
+    }
+
+    /// Scroll one line through a selected field taller than the viewport,
+    /// so the keyboard reaches all of it before Up/Down leaves it. Returns
+    /// false when the field fits or its edge in that direction is in view.
+    pub(super) fn scroll_within_selected_field(&mut self, up: bool) -> bool {
+        let viewport = self.fields_viewport_height;
+        let (top, height) = self.selected_field_span();
+        if height <= viewport {
+            return false;
+        }
+        if up && self.fields_scroll_offset > top {
+            self.fields_scroll_offset -= 1;
+            return true;
+        }
+        if !up && self.fields_scroll_offset + viewport < top + height {
+            self.fields_scroll_offset += 1;
+            return true;
+        }
+        false
     }
 
     /// Total height of all field rows plus inter-row spacing, in the same

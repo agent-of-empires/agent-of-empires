@@ -198,6 +198,9 @@ impl SettingsView {
                         }
                     }
                     SettingsFocus::Fields => {
+                        if self.scroll_within_selected_field(true) {
+                            return SettingsAction::Continue;
+                        }
                         let mut idx = self.selected_field;
                         while idx > 0 {
                             idx -= 1;
@@ -226,6 +229,9 @@ impl SettingsView {
                         }
                     }
                     SettingsFocus::Fields => {
+                        if self.scroll_within_selected_field(false) {
+                            return SettingsAction::Continue;
+                        }
                         let mut idx = self.selected_field + 1;
                         while idx < self.fields.len() {
                             if !self.fields[idx].is_section_header() {

@@ -1772,6 +1772,52 @@ mod status_message_tests {
         );
     }
 
+    /// A field taller than the panel opens at its label, and j/k scroll through it
+    /// line by line before moving to the next field.
+    #[test]
+    #[serial]
+    fn keyboard_reaches_all_of_a_field_taller_than_the_panel() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_temp, _guard, mut view) = fresh_view();
+        view.fields = vec![
+            bool_field("FieldA", "alpha"),
+            bool_field("FieldB", &"word ".repeat(40)),
+            bool_field("FieldC", "charlie"),
+        ];
+        view.focus = super::super::SettingsFocus::Fields;
+        view.selected_field = 0;
+        view.fields_scroll_offset = 0;
+        view.fields_content_width = 20;
+        view.fields_viewport_height = 4;
+        let b_top = view.field_height(&view.fields[0], 0) + 1;
+        let b_height = view.field_height(&view.fields[1], 1);
+        assert!(b_height > 4, "FieldB must overflow the panel");
+        let press = |view: &mut super::super::SettingsView, code| {
+            view.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(view.selected_field, 1);
+        assert_eq!(view.fields_scroll_offset, b_top, "opens at the label");
+        for _ in 0..b_height - 4 {
+            press(&mut view, KeyCode::Char('j'));
+            assert_eq!(view.selected_field, 1, "scrolls within the field first");
+        }
+        assert_eq!(view.fields_scroll_offset, b_top + b_height - 4);
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(view.selected_field, 2);
+
+        press(&mut view, KeyCode::Char('k'));
+        assert_eq!(view.selected_field, 1);
+        assert_eq!(view.fields_scroll_offset, b_top);
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(view.fields_scroll_offset, b_top + 1);
+        press(&mut view, KeyCode::Char('k'));
+        assert_eq!(view.fields_scroll_offset, b_top, "k scrolls back up");
+        press(&mut view, KeyCode::Char('k'));
+        assert_eq!(view.selected_field, 0);
+    }
+
     /// The status has its own footer row beneath the key hints, so it can
     /// never collide with field content.
     #[test]
