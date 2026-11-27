@@ -476,6 +476,9 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
 #[cfg(unix)]
 static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Longest symlink chain followed when resolving a config file.
+pub(crate) const MAX_SYMLINK_HOPS: usize = 32;
+
 /// Resolve `path` through a symlink chain to the underlying target file. Used
 /// for user-facing config files where users symlink to a dotfiles repo:
 /// `rename(2)` would otherwise replace the symlink instead of updating the
@@ -486,8 +489,6 @@ static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// path so the caller materialises a regular file there. Caps recursion at
 /// 32 hops, well below typical kernel MAXSYMLINKS limits (40 on Linux, 32 on
 /// Darwin); deeper chains are almost certainly loops.
-pub(crate) const MAX_SYMLINK_HOPS: usize = 32;
-
 pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
     let mut current = path.to_path_buf();
     let mut hops: usize = 0;

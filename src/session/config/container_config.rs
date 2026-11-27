@@ -2386,7 +2386,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
             // could not blank it must not go on to reuse that container.
             Err(e) if !applies => {
                 return Err(e.context(format!(
-                    "cannot revoke the staged sandbox trust file for {tool}; refusing to reuse the container"
+                    "cannot revoke the staged sandbox trust file for {tool}; refusing to reuse the container; make the file writable or remove the session's container and relaunch"
                 )))
             }
             Err(e) => tracing::warn!(target: "session.profile",
