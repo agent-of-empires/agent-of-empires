@@ -639,11 +639,13 @@ impl SettingsView {
 
     /// Scroll one line through a selected field taller than the viewport,
     /// so the keyboard reaches all of it before Up/Down leaves it. Returns
-    /// false when the field fits or its edge in that direction is in view.
+    /// false when the panel has no field rows, the field fits, or its edge in
+    /// that direction is in view.
     pub(super) fn scroll_within_selected_field(&mut self, up: bool) -> bool {
         let viewport = self.fields_viewport_height;
         let (top, height) = self.selected_field_span();
-        if height <= viewport {
+        // Every field is at least one row, so an empty panel would scroll forever.
+        if viewport == 0 || height <= viewport {
             return false;
         }
         // The wheel or scrollbar moved the view off the field: reveal it first.

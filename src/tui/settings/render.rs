@@ -1846,6 +1846,30 @@ mod status_message_tests {
         }
     }
 
+    /// A panel with no rows for fields, before the first render or under a
+    /// warning banner that fills it, must not trap the selection on one field.
+    #[test]
+    #[serial]
+    fn empty_field_panel_still_moves_the_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_temp, _guard, mut view) = fresh_view();
+        view.fields = vec![
+            bool_field("FieldA", "alpha"),
+            bool_field("FieldB", &"word ".repeat(40)),
+        ];
+        view.focus = super::super::SettingsFocus::Fields;
+        view.selected_field = 0;
+        view.fields_viewport_height = 0;
+        let press = |view: &mut super::super::SettingsView, code| {
+            view.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(view.selected_field, 1, "j moves on with no rows to scroll");
+        press(&mut view, KeyCode::Char('k'));
+        assert_eq!(view.selected_field, 0);
+    }
+
     /// A list editor taller than the panel keeps its header and selected item in
     /// view, and closing it leaves the collapsed field on screen.
     #[test]
