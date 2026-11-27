@@ -590,12 +590,19 @@ mod tests {
     use super::*;
 
     /// Every sandboxed restart stops its launch in the container, found by its execution or by
-    /// the record a launch with no execution left; a failed stop doesn't block the restart, and
-    /// an unmarked launch execs nothing.
+    /// the record a launch with no execution left, also when its pane already died (the relaunch
+    /// of a remain-on-exit pane); a failed stop doesn't block the restart, and an unmarked launch
+    /// execs nothing.
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial_test::serial]
     fn a_sandboxed_restart_stops_its_launch_in_the_container() {
+        use crate::tmux::test_helpers::{
+            only_pane_id, pane_field, tmux_available, TmuxTestSession,
+        };
+
         let bin = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(bin.path());
         let mut inst = Instance::new("sandboxed restart", "/tmp/aoe-sandboxed-restart");
         inst.tool = "claude".into();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
@@ -610,11 +617,48 @@ mod tests {
             before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
-        for (record, name, tail) in [
-            ("execution", "stops", "echo 'survived 0'"),
-            ("sandbox_launch", "recorded", "echo 'survived 0'"),
-            ("execution", "fails", "exit 1"),
+        let tmux = tmux_available();
+        let session = inst.tmux_session().unwrap().name().to_owned();
+        let _pane = TmuxTestSession::from_name(&session);
+        for (record, name, tail, dead_pane) in [
+            ("execution", "stops", "echo 'survived 0'", false),
+            ("sandbox_launch", "recorded", "echo 'survived 0'", false),
+            ("execution", "fails", "exit 1", false),
+            ("execution", "dead-pane", "echo 'survived 0'", true),
         ] {
+            if dead_pane {
+                if !tmux {
+                    continue;
+                }
+                let tmux_ok = |args: &[&str]| {
+                    assert!(crate::tmux::tmux_command()
+                        .args(args)
+                        .output()
+                        .unwrap()
+                        .status
+                        .success());
+                };
+                tmux_ok(&[
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session,
+                    "exec /bin/sleep 60",
+                ]);
+                let pane = only_pane_id(&session);
+                tmux_ok(&["set-option", "-t", &session, "remain-on-exit", "on"]);
+                tmux_ok(&["respawn-pane", "-k", "-t", &pane, "exit 17"]);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while pane_field(&pane, "#{pane_dead}") != "1" {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "fixture pane did not exit"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
             let _ = std::fs::remove_file(bin.path().join("argv"));
             let container = crate::containers::launch_stop::fake_container(bin.path(), name, tail);
             (inst.active_execution, inst.sandbox_launch) = match record {
@@ -655,6 +699,9 @@ mod tests {
                 ],
                 "{name}"
             );
+            if dead_pane {
+                assert!(!inst.tmux_session().unwrap().exists_live(), "{name}");
+            }
         }
 
         std::fs::remove_file(bin.path().join("argv")).unwrap();
@@ -662,6 +709,7 @@ mod tests {
         inst.kill_for_restart().unwrap();
         assert!(!bin.path().join("argv").exists());
     }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[serial_test::serial]
