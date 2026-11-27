@@ -109,6 +109,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, ToolSessionConfig>,
 
+    /// TUI home-view key overrides: action name to chords in the
+    /// `live_send_leader` grammar, replacing that action's keys in both
+    /// hotkey modes. `[]` unbinds. Global only; outside the settings schema
+    /// because the TUI page that lists it is read-only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keybinds: BTreeMap<String, Vec<String>>,
+
     /// Per-plugin configuration keyed by plugin id (`[plugins."aoe.web"]`).
     /// An explicit typed map rather than a root-level flatten, so plugin
     /// enable-state survives every save without a root catch-all quietly

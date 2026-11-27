@@ -181,13 +181,20 @@ impl HomeView {
         let Some(view) = &self.suggestions_view else {
             return false;
         };
+        let activate_key = match super::bindings::label(
+            super::bindings::ActionId::Activate,
+            self.strict_hotkeys,
+        ) {
+            label if label == "Enter" => "↵".to_string(),
+            label => label,
+        };
         view.render(
             frame,
             area,
             theme,
             &self.suggestions_feed,
             self.session_feed.mutation_block(),
-            self.suggestions_focused,
+            (!self.suggestions_focused).then_some(activate_key.as_str()),
         );
         self.preview_outer_area = area;
         self.preview_area = area;

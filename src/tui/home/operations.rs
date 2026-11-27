@@ -217,13 +217,17 @@ impl HomeView {
         let Some((dialog_title, state, verb)) = shelved else {
             return false;
         };
-        let key = if self.strict_hotkeys { "Z" } else { "z" };
-        self.info_dialog = Some(InfoDialog::new(
-            dialog_title,
-            &format!(
+        let key = self.key_label(super::bindings::ActionId::ToggleArchive);
+        let body = if key.is_empty() {
+            let mut verb = verb.to_string();
+            verb[..1].make_ascii_uppercase();
+            format!("This session is {state}; its agent stays stopped. {verb} it first.")
+        } else {
+            format!(
                 "This session is {state}; its agent stays stopped. Press {key} to {verb} it first."
-            ),
-        ));
+            )
+        };
+        self.info_dialog = Some(InfoDialog::new(dialog_title, &body));
         true
     }
 

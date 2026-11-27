@@ -606,10 +606,10 @@ fn render_placeholder(frame: &mut Frame, area: Rect, theme: &Theme, placeholder:
     frame.render_widget(para, area);
 }
 
-fn press_hint(theme: &Theme, key: &'static str, tail: &'static str) -> Line<'static> {
+fn press_hint(theme: &Theme, key: impl Into<String>, tail: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled("Press ", Style::default().fg(theme.dimmed)),
-        Span::styled(key, Style::default().fg(theme.hint).bold()),
+        Span::styled(key.into(), Style::default().fg(theme.hint).bold()),
         Span::styled(tail, Style::default().fg(theme.dimmed)),
     ])
 }
@@ -2532,17 +2532,22 @@ impl HomeView {
                 .get_instance(&id)
                 .is_some_and(|inst| self.paired_terminal_running_for_display(inst))
         {
-            let key = if self.strict_hotkeys { "Ctrl+T" } else { "T" };
-            // Live mode forwards `T` to the agent; only the leader reaches the swap.
+            let key = self.key_label(ActionId::AttachTerminal);
+            // Live mode forwards the attach key to the agent; only the leader reaches the swap.
             let how = match self.live_send.as_ref().map(|state| state.leader) {
                 Some(Some(leader)) => {
-                    format!("Press {} then t", live_send::display_chord(leader))
+                    Some(format!("Press {} then t", live_send::display_chord(leader)))
                 }
-                Some(None) => format!("Exit live mode, then press {key}"),
-                None => format!("Press {key}"),
+                _ if key.is_empty() => None,
+                Some(None) => Some(format!("Exit live mode, then press {key}")),
+                None => Some(format!("Press {key}")),
+            };
+            let text = match how {
+                Some(how) => format!("No terminal running. {how} to start one."),
+                None => "No terminal running.".to_string(),
             };
             frame.render_widget(
-                Paragraph::new(format!("No terminal running. {how} to start one."))
+                Paragraph::new(text)
                     .style(Style::default().fg(theme.dimmed))
                     .alignment(Alignment::Center),
                 rect,
@@ -2606,6 +2611,7 @@ impl HomeView {
                 theme,
                 compact,
                 false,
+                &super::bindings::label(ActionId::Activate, self.strict_hotkeys),
             );
         }
         frame.buffer_mut().set_style(
@@ -3375,8 +3381,8 @@ impl HomeView {
             // Advertise the info-header toggle: `i` gates the header in every view mode
             // (Agent's worktree-flavored one, Terminal/Tool's minimal one), so the hint
             // applies everywhere except the compact branch, whose title is taken.
-            let key = if self.strict_hotkeys { "I" } else { "i" };
-            let hint_text = if split.is_some() {
+            let key = self.key_label(ActionId::TogglePreviewInfo);
+            let hint_text = if split.is_some() || key.is_empty() {
                 String::new()
             } else if show_info {
                 format!(" hide info with {key} ")
@@ -3770,6 +3776,7 @@ impl HomeView {
                             theme,
                             compact,
                             show_info,
+                            &super::bindings::label(ActionId::Activate, self.strict_hotkeys),
                         );
                     }
                 } else {
@@ -3828,6 +3835,7 @@ impl HomeView {
                             theme,
                             compact,
                             show_info,
+                            &super::bindings::label(ActionId::Activate, self.strict_hotkeys),
                         );
                     }
                 } else {
@@ -4116,7 +4124,7 @@ impl HomeView {
             return;
         }
 
-        let key = if self.strict_hotkeys { "Z" } else { "z" };
+        let key = self.key_label(ActionId::ToggleArchive);
         let parked = if title.is_empty() {
             "This session is parked. Its agent was stopped.".to_string()
         } else {
@@ -4130,7 +4138,7 @@ impl HomeView {
                 heading: "Archived",
                 body: parked.into(),
                 inst,
-                hint: Some(press_hint(theme, key, " to unarchive it.")),
+                hint: (!key.is_empty()).then(|| press_hint(theme, key, " to unarchive it.")),
                 wrap: true,
             },
         );
@@ -4229,6 +4237,17 @@ impl HomeView {
         }
     }
 
+    /// The action's primary key in the active hotkey mode, or "" when it is unbound.
+    pub(super) fn key_label(&self, id: ActionId) -> String {
+        super::bindings::label(id, self.strict_hotkeys)
+    }
+
+    /// "Press <activate key> {tail}", or nothing when activation is unbound.
+    fn activate_hint(&self, theme: &Theme, tail: &'static str) -> Option<Line<'static>> {
+        let key = self.key_label(ActionId::Activate);
+        (!key.is_empty()).then(|| press_hint(theme, key, tail))
+    }
+
     /// Calm placeholder for a pane that is simply gone (the generic gone-error), in
     /// place of the red crash error; the row's status icon still signals the state.
     fn render_stopped_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -4240,7 +4259,7 @@ impl HomeView {
                 heading: "Stopped",
                 body: "This session isn't running.".into(),
                 inst: None,
-                hint: Some(press_hint(theme, "Enter", " to start it.")),
+                hint: self.activate_hint(theme, " to start it."),
                 wrap: false,
             },
         );
@@ -4277,7 +4296,7 @@ impl HomeView {
                 heading: "Structured view",
                 body: body.into(),
                 inst: None,
-                hint: Some(press_hint(theme, "Enter", " to open the transcript.")),
+                hint: self.activate_hint(theme, " to open the transcript."),
                 wrap: false,
             },
         );
@@ -4509,10 +4528,18 @@ impl HomeView {
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
-        // Key a footer button synthesizes on click, for the few entries outside the registry.
-        let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        // The activation keys, shown as one-cell glyphs while on their defaults.
+        let activation = |id: ActionId, default: &str, glyph: &str| {
+            let label = super::bindings::label(id, strict);
+            let label = if label == default {
+                glyph.to_string()
+            } else {
+                label.replace("Ctrl+", "^")
+            };
+            (super::bindings::key_event(id, strict), label)
+        };
+        let (kenter, enter_label) = activation(ActionId::Activate, "Enter", "↵");
+        let (ktab, tab_label) = activation(ActionId::ActivateAlt, "Tab", "⇥ ");
         // Click key and compact label (`^G`) for an action's chord in the active mode.
         let bound = |id: ActionId| {
             (
@@ -4607,21 +4634,24 @@ impl HomeView {
                 ));
                 // No key hint where neither key enters live mode; the row's hints stay.
                 let (click, key) = match self.live_key(self.selected_session.as_deref()?)? {
-                    live_send::LiveKey::Tab => (ktab, "Tab"),
-                    live_send::LiveKey::Enter => (kenter, "↵"),
+                    live_send::LiveKey::Tab => (
+                        ktab,
+                        super::bindings::label(ActionId::ActivateAlt, strict).replace("Ctrl+", "^"),
+                    ),
+                    live_send::LiveKey::Enter => (kenter, enter_label.clone()),
                 };
-                groups.push((0, click, mk(key, "take control")));
+                click?;
+                groups.push((0, click, mk(&key, "take control")));
                 Some(click)
             });
-            if let Some(enter_action_text) = enter_action_text {
-                // U+21B5 keeps Enter to one display cell without shortening its action label.
+            if let (Some(enter_action_text), Some(_)) = (enter_action_text, kenter) {
                 if live_key != Some(kenter) {
-                    groups.push((0, kenter, mk("↵", enter_action_text)));
+                    groups.push((0, kenter, mk(&enter_label, enter_action_text)));
                 }
             }
-            if let Some(tab_action_text) = tab_action_text {
+            if let (Some(tab_action_text), Some(_)) = (tab_action_text, ktab) {
                 if live_key != Some(ktab) {
-                    groups.push((2, ktab, mk("⇥ ", tab_action_text)));
+                    groups.push((2, ktab, mk(&tab_label, tab_action_text)));
                 }
             }
 
@@ -4652,16 +4682,22 @@ impl HomeView {
                 }
             }
 
-            // New session: bare `n` is the usual chord, but while a committed search borrows
-            // `n` for cycling, advertise Shift+N (which still creates, #3038). Strict mode
-            // already uses `N`.
-            let new_uses_shift = committed_search && !strict;
-            let (click, key) = if new_uses_shift {
-                (kc('N'), "N".to_string())
-            } else {
-                bound(ActionId::NewSession)
+            // New session: while a committed search claims a New chord for cycling, advertise
+            // one it leaves free, else new-from-selection (Shift+N by default), which still
+            // creates (#3038) but only from a selected session or group.
+            let new_key = |id| {
+                let shadow = committed_search.then_some(ActionId::SearchNext);
+                super::bindings::key_event_unshadowed(id, shadow, strict)
             };
-            groups.push((1, click, mk(&key, "New")));
+            let has_selection = self.selected_session.is_some() || self.selected_group.is_some();
+            let new = new_key(ActionId::NewSession).or_else(|| {
+                has_selection
+                    .then(|| new_key(ActionId::NewFromSelection))
+                    .flatten()
+            });
+            if let Some((event, label)) = new {
+                groups.push((1, Some(event), mk(&label.replace("Ctrl+", "^"), "New")));
+            }
 
             // Priority 1 is the core daily workflow (new, message, the web dashboard), which
             // survives the greedy pack at ~80 cols; del stays at p3 and can drop first.
@@ -4684,17 +4720,21 @@ impl HomeView {
                 groups.push((2, click, mk(&key, "Fav")));
             }
 
-            // Committed-search cue: `n` cycles matches and `Esc` clears (#3038). The `[i/N]`
-            // counter lives on the search bar, so it isn't duplicated here. Priority 0 so it
-            // survives the pack; clicking it cycles to the next match.
+            // Committed-search cue: search-next cycles matches and `Esc` clears (#3038). The
+            // `[i/N]` counter lives on the search bar, so it isn't duplicated here. Priority 0
+            // so it survives the pack; clicking it cycles to the next match, or clears the
+            // search when search-next is unbound.
             if committed_search {
-                let hint = vec![
-                    Span::styled("n", key_style),
-                    Span::styled(" next ", desc_style),
-                    Span::styled("Esc", key_style),
-                    Span::styled(" clear", desc_style),
-                ];
-                groups.push((0, kc('n'), hint));
+                let (click, key) = bound(ActionId::SearchNext);
+                let mut hint = Vec::new();
+                if click.is_some() {
+                    hint.push(Span::styled(key, key_style));
+                    hint.push(Span::styled(" next ", desc_style));
+                }
+                hint.push(Span::styled("Esc", key_style));
+                hint.push(Span::styled(" clear", desc_style));
+                let esc = Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                groups.push((0, click.or(esc), hint));
             }
 
             let (click, key) = bound(ActionId::SearchStart);
@@ -4725,7 +4765,9 @@ impl HomeView {
                     mk("Esc", "Sessions"),
                 ));
             } else {
-                groups.push((0, kenter, mk("↵", "Read")));
+                if kenter.is_some() {
+                    groups.push((0, kenter, mk(&enter_label, "Read")));
+                }
                 let (click, key) = bound(ActionId::ToggleArchive);
                 groups.push((0, click, mk(&key, "Restore")));
                 let (click, key) = bound(ActionId::Delete);
