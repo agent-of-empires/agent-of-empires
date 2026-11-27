@@ -282,12 +282,14 @@ jobs:
 
   macos-gate:
     # Decides on Linux whether macOS runs, so a skip holds no macOS runner.
-    # It runs for macOS-sensitive changes or the ci-macos label. After adding
-    # the label, re-run this job; GitHub re-runs its dependents with it.
+    # It runs for macOS-sensitive changes or the ci-macos label, except in the
+    # first queue entry when its PR already passed it. After adding the label,
+    # re-run this job; GitHub re-runs its dependents with it.
     name: macOS gate
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     permissions:
+      checks: read
       contents: read
       pull-requests: read
     outputs:

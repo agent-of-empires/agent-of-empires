@@ -90,7 +90,8 @@ A skipped macOS check is not coverage. The `macOS gate` job in
 potentially incomplete file data; when adding macOS-specific code or tests
 outside its covered paths, extend the sensitive-file list in
 [macos-gate.cjs](.github/scripts/macos-gate.cjs). To force a run, add
-`ci-macos` and re-run the `macOS gate` job.
+`ci-macos` and re-run the `macOS gate` job. The first merge-queue entry skips
+macOS when its PR already passed it on the same head, label or not.
 
 Releases ship from a release-plz PR, with daily nightlies of `main`.
 Maintainer instructions live in
