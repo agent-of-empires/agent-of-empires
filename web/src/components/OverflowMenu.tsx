@@ -92,7 +92,9 @@ export function OverflowMenu({ items, triggerDataTour, phoneFloating = false, op
         <DropdownMenu
           phoneGlass={phoneFloating}
           className={`absolute right-0 top-full mt-1 min-w-[180px] z-50 ${
-            phoneFloating ? "max-md:mt-2 max-md:min-w-[240px] max-md:max-h-[calc(100dvh-7rem)]" : ""
+            phoneFloating
+              ? "max-md:mt-2 max-md:min-w-[240px] max-md:max-w-[calc(100vw-1.5rem)] max-md:max-h-[calc(100dvh-7rem)]"
+              : ""
           }`}
         >
           {items.map(({ label, onClick, detail, icon: Icon, separated, checked }) => (

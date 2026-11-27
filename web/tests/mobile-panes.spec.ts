@@ -99,6 +99,38 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await expect(drawer).toBeHidden();
   });
 
+  test("the header's ⋯ menu stays inside the viewport for a long branch name (#6136)", async ({ page }) => {
+    const handle = await mockTerminalApis(page, {
+      sessionFields: { branch: "feat/lifecycle-primitives-for-background-tasks-workflows-and-wakeups" },
+    });
+    await openLiveSession(page, handle, { mobile: true, settings: null });
+    const viewport = page.viewportSize()!;
+    await page.locator("header").getByRole("button", { name: "More options" }).click();
+    await expect(page.getByRole("menuitem", { name: /Copy branch/ })).toBeVisible();
+
+    const items = page.locator('[role^="menuitem"]');
+    const boxes = await items.evaluateAll((els) =>
+      els.map((el) => {
+        const r = el.getBoundingClientRect();
+        return { label: el.textContent, left: r.left, right: r.right };
+      }),
+    );
+    for (const box of boxes) {
+      expect.soft(box.left, `${box.label} left edge`).toBeGreaterThanOrEqual(0);
+      expect
+        .soft(box.right, `${box.label} right edge (viewport ${viewport.width})`)
+        .toBeLessThanOrEqual(viewport.width);
+    }
+    const menu = await page.getByRole("menu").boundingBox();
+    expect.soft(menu!.x, "menu left edge").toBeGreaterThanOrEqual(0);
+    expect
+      .soft(menu!.x + menu!.width, `menu right edge (viewport ${viewport.width})`)
+      .toBeLessThanOrEqual(viewport.width);
+    expect
+      .soft(menu!.y + menu!.height, `menu bottom (viewport ${viewport.height})`)
+      .toBeLessThanOrEqual(viewport.height);
+  });
+
   test("the Session card follows a drawer drag, springs back from a short one, and a longer one opens", async ({
     page,
   }) => {
