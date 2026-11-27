@@ -1245,14 +1245,19 @@ mod tests {
         read_only.shutdown.cancel();
         server.await.unwrap();
 
-        // Nothing listens on a port just freed.
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", closed.local_addr().unwrap());
-        drop(closed);
+        // A port this test keeps, where each connection is dropped unanswered.
+        let hangup = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", hangup.local_addr().unwrap());
+        let hangups = tokio::spawn(async move {
+            while let Ok((connection, _)) = hangup.accept().await {
+                drop(connection);
+            }
+        });
         let gone = PullSource::Daemon(
             HttpClient::new(DaemonEndpoint::new(base, None, crate::daemon::Source::Env)).unwrap(),
         );
         assert!(!gone.dismiss(&digest).await, "transport error");
+        hangups.abort();
         assert!(!PullSource::Unavailable.dismiss(&digest).await, "no Daemon");
         assert_eq!(stored(), None, "a refused dismissal wrote nothing");
     }

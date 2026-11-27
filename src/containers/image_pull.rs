@@ -675,7 +675,12 @@ mod tests {
         assert!(stale > 1_577_836_800_000_000, "ids aren't seeded: {stale}");
 
         assert_eq!(cancel(&replaced, Some(stale), DEADLINE), Err(Replaced));
-        assert!(matches!(state(&replaced), PullState::Running(_)));
+        // None once its kill is cancelled, which a killed pull's still-Running state can't show.
+        assert_eq!(
+            running_flight_id(&replaced),
+            Some(current),
+            "the stale cancel killed the replacement"
+        );
         assert_eq!(
             cancel(&replaced, Some(current), DEADLINE),
             Ok(PullState::Cancelled)
