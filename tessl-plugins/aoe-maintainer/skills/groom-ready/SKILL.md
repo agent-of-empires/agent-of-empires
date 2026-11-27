@@ -107,7 +107,8 @@ id for the `Mismatched findings` line of the digest.
   "observations": [
     {
       "observedAt": "<date -u +%Y-%m-%dT%H:%M:%SZ>",
-      "runId": "<$TESSL_LAUNCH_RUN_ID, omit the key if unset>",
+      "runId": "<$TESSL_LAUNCH_RUN_ID; omit runId and loopId unless both are non-empty>",
+      "loopId": "<jq -r '.[0].payload.loop.id // empty' .cloud-launch/trigger-events.json; same rule as runId>",
       "evidence": ["<issue URL>", "<path of a file to change>"]
     }
   ]
