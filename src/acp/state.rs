@@ -540,6 +540,28 @@ pub struct WorkflowRunRecord {
     pub ended_at: Option<Timestamp>,
 }
 
+/// Progress a `_meta.aoe` workflow run reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
+/// An open workflow run a `_meta.aoe` primitive reported, with its latest
+/// progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleRunRecord {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<WorkflowProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
+}
+
 /// Finished shells kept for the Background panel's Recent group.
 pub const MAX_FINISHED_BACKGROUND_SHELLS: usize = 20;
 
@@ -745,6 +767,9 @@ pub struct AcpState {
     pub background_shells: Vec<BackgroundShellRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_runs: Vec<WorkflowRunRecord>,
+    /// Open workflow runs reported through `_meta.aoe`, not a Claude `Workflow`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_runs: Vec<LifecycleRunRecord>,
 
     /// Whether the main turn is in flight. Dispatch (`acp::dispatch::decide`)
     /// and the queue drain gate on this directly, so it tracks only the main
@@ -994,8 +1019,10 @@ pub enum Event {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
-        /// The Bash command, or the workflow's name.
-        description: String,
+        /// The Bash command, or the workflow's name. A `_meta.aoe` task has
+        /// none and is not listed as a shell.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow: Option<WorkflowLaunch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1149,6 +1176,20 @@ pub enum Event {
         text: String,
         summarized_until_seq: u64,
     },
+    /// A `_meta.aoe` workflow run started; a repeat for an open run is a
+    /// lease renewal.
+    WorkflowRunStarted {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<Timestamp>,
+    },
+    WorkflowRunProgress {
+        run_id: String,
+        progress: WorkflowProgress,
+    },
+    WorkflowRunFinished {
+        run_id: String,
+    },
 }
 
 impl AcpState {
@@ -1173,6 +1214,7 @@ impl AcpState {
     /// done like any other (#4001).
     pub fn has_active_background_agent(&self) -> bool {
         !self.background_tasks.is_empty()
+            || !self.lifecycle_runs.is_empty()
             || self.background_agents.iter().any(|a| a.ended_at.is_none())
             || self.subagents.iter().any(|s| s.state.is_active())
     }
@@ -1421,10 +1463,14 @@ impl AcpState {
                 self.heal_sidebar_phase();
             }
             Event::RateLimitAutoResumed { .. } => self.heal_sidebar_phase(),
-            Event::SessionContextReset { .. } => self.usage = None,
+            Event::SessionContextReset { .. } => {
+                self.lifecycle_runs.clear();
+                self.usage = None;
+            }
             // Clears the conversation; adapter-scoped commands, modes and
             // selectors are never re-announced, so they stay.
             Event::SessionCleared => {
+                self.lifecycle_runs.clear();
                 self.usage = None;
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
@@ -1531,10 +1577,10 @@ impl AcpState {
                 // A reused task id replaces whatever run held it.
                 self.close_workflow_run(&task_id, None);
                 self.background_shells.retain(|s| s.task_id != task_id);
-                if workflow.is_none() {
+                if let (None, Some(command)) = (&workflow, description) {
                     self.background_shells.push(BackgroundShellRecord {
                         task_id: task_id.clone(),
-                        command: description,
+                        command,
                         started_at,
                         ended_at: None,
                         finished: false,
@@ -1571,6 +1617,28 @@ impl AcpState {
                         self.background_shells.remove(i);
                     }
                 }
+            }
+            Event::WorkflowRunStarted { run_id, started_at } => {
+                if !self.lifecycle_runs.iter().any(|r| r.run_id == run_id) {
+                    self.lifecycle_runs.push(LifecycleRunRecord {
+                        run_id,
+                        progress: None,
+                        started_at,
+                    });
+                }
+            }
+            Event::WorkflowRunProgress { run_id, progress } => {
+                match self.lifecycle_runs.iter_mut().find(|r| r.run_id == run_id) {
+                    Some(run) => run.progress = Some(progress),
+                    None => self.lifecycle_runs.push(LifecycleRunRecord {
+                        run_id,
+                        progress: Some(progress),
+                        started_at: None,
+                    }),
+                }
+            }
+            Event::WorkflowRunFinished { run_id } => {
+                self.lifecycle_runs.retain(|r| r.run_id != run_id);
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
             Event::AgentMessageChunk { .. } => self.sidebar_phase = SidebarPhase::Active,
@@ -2024,7 +2092,7 @@ mod tests {
                     Event::BackgroundTaskStarted {
                         task_id: "task-1".into(),
                         tool_call_id: None,
-                        description: "sleep".into(),
+                        description: Some("sleep".into()),
                         workflow: None,
                         started_at: None,
                     },
@@ -3002,7 +3070,7 @@ mod tests {
         let started = |id: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: None,
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -3023,11 +3091,93 @@ mod tests {
     }
 
     #[test]
+    fn a_generic_background_task_is_idempotent_and_lists_no_shell() {
+        let started = Event::BackgroundTaskStarted {
+            task_id: "g".into(),
+            tool_call_id: None,
+            description: None,
+            workflow: None,
+            started_at: None,
+        };
+        let mut s = applied([prompt("go"), started.clone(), started, stopped("end")]);
+        assert_eq!(s.background_tasks, ["g"], "a renewal adds no second entry");
+        assert!(s.background_shells.is_empty());
+        assert!(s.workflow_runs.is_empty());
+        assert!(s.has_active_background_agent());
+        s.apply_event(
+            s.last_seq + 1,
+            Event::BackgroundTaskFinished {
+                task_id: "g".into(),
+                ended_at: None,
+            },
+        )
+        .unwrap();
+        assert!(!s.has_active_background_agent());
+    }
+
+    #[test]
+    fn lifecycle_runs_track_progress_and_clear_on_end_and_reset() {
+        let started = |id: &str| Event::WorkflowRunStarted {
+            run_id: id.into(),
+            started_at: None,
+        };
+        let progress = |id: &str, completed| Event::WorkflowRunProgress {
+            run_id: id.into(),
+            progress: WorkflowProgress {
+                label: Some("step".into()),
+                completed: Some(completed),
+                total: Some(3),
+            },
+        };
+        let finished = |id: &str| Event::WorkflowRunFinished { run_id: id.into() };
+        let mut s = applied([prompt("go"), started("a"), progress("a", 1), stopped("end")]);
+        assert!(s.has_active_background_agent(), "an open run keeps it busy");
+
+        s.apply_event(s.last_seq + 1, started("a")).unwrap();
+        s.apply_event(s.last_seq + 1, started("b")).unwrap();
+        assert_eq!(s.lifecycle_runs.len(), 2, "a repeated start adds no run");
+        assert_eq!(
+            s.lifecycle_runs[0]
+                .progress
+                .as_ref()
+                .and_then(|p| p.completed),
+            Some(1),
+            "a renewal keeps the latest progress"
+        );
+        s.apply_event(s.last_seq + 1, progress("a", 2)).unwrap();
+        assert_eq!(
+            s.lifecycle_runs[0]
+                .progress
+                .as_ref()
+                .and_then(|p| p.completed),
+            Some(2)
+        );
+
+        s.apply_event(s.last_seq + 1, finished("a")).unwrap();
+        assert_eq!(s.lifecycle_runs.len(), 1);
+        assert!(s.has_active_background_agent());
+        s.apply_event(
+            s.last_seq + 1,
+            Event::SessionContextReset {
+                reason: "reset".into(),
+            },
+        )
+        .unwrap();
+        assert!(s.lifecycle_runs.is_empty());
+        assert!(!s.has_active_background_agent());
+
+        s.apply_event(s.last_seq + 1, started("c")).unwrap();
+        s.apply_event(s.last_seq + 1, Event::SessionCleared)
+            .unwrap();
+        assert!(s.lifecycle_runs.is_empty());
+    }
+
+    #[test]
     fn background_shells_keep_command_and_outlive_their_task() {
         let started = |id: &str, workflow: Option<WorkflowLaunch>| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: None,
-            description: format!("cmd {id}"),
+            description: Some(format!("cmd {id}")),
             workflow,
             started_at: None,
         };
@@ -3070,7 +3220,7 @@ mod tests {
         let workflow = |id: &str, call: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: Some(call.into()),
-            description: "drafts".into(),
+            description: Some("drafts".into()),
             workflow: Some(WorkflowLaunch {
                 run_id: "wf_1".into(),
                 name: "drafts".into(),
@@ -3104,7 +3254,7 @@ mod tests {
             Event::BackgroundTaskStarted {
                 task_id: "wfx".into(),
                 tool_call_id: Some("toolu_bash".into()),
-                description: "sleep".into(),
+                description: Some("sleep".into()),
                 workflow: None,
                 started_at: None,
             },

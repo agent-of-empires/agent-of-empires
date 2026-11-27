@@ -474,7 +474,7 @@ export type AcpEvent =
       BackgroundTaskStarted: {
         task_id: string;
         tool_call_id?: string;
-        description: string;
+        description?: string | null;
         workflow?: { run_id: string; name: string; summary?: string | null } | null;
         started_at?: string | null;
       };
@@ -1603,7 +1603,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     const { task_id: id, tool_call_id: toolCallId, workflow, description, started_at } = event.BackgroundTaskStarted;
     if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
     next.backgroundShells = next.backgroundShells.filter((s) => s.taskId !== id);
-    if (!workflow) {
+    if (!workflow && description != null) {
       next.backgroundShells = [
         ...next.backgroundShells,
         { taskId: id, command: description, startedAt: started_at ?? null, endedAt: null, finished: false },

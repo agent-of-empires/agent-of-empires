@@ -1613,7 +1613,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "original-task".into(),
                     tool_call_id: None,
-                    description: "work".into(),
+                    description: Some("work".into()),
                     workflow: None,
                     started_at: None,
                 },
@@ -1785,7 +1785,7 @@ mod tests {
             .send(Event::BackgroundTaskStarted {
                 task_id: "original-task".into(),
                 tool_call_id: None,
-                description: "work".into(),
+                description: Some("work".into()),
                 workflow: None,
                 started_at: None,
             })
@@ -1903,7 +1903,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "replacement-task".into(),
                     tool_call_id: None,
-                    description: "new work".into(),
+                    description: Some("new work".into()),
                     workflow: None,
                     started_at: None,
                 },
@@ -2388,7 +2388,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "task-1".into(),
                     tool_call_id: None,
-                    description: "sleep".into(),
+                    description: Some("sleep".into()),
                     workflow: None,
                     started_at: None,
                 },
@@ -2521,7 +2521,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "task-1".into(),
                     tool_call_id: None,
-                    description: "sleep".into(),
+                    description: Some("sleep".into()),
                     workflow: None,
                     started_at: None,
                 },
@@ -2689,7 +2689,7 @@ mod tests {
             .send(Event::BackgroundTaskStarted {
                 task_id: "inflight".into(),
                 tool_call_id: None,
-                description: "sleep".into(),
+                description: Some("sleep".into()),
                 workflow: None,
                 started_at: None,
             })
@@ -2777,7 +2777,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "open".into(),
                     tool_call_id: None,
-                    description: "sleep".into(),
+                    description: Some("sleep".into()),
                     workflow: None,
                     started_at: None,
                 },

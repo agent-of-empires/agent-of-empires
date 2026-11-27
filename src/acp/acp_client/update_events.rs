@@ -6,7 +6,7 @@ use crate::acp::aoe_meta;
 use crate::acp::approvals::is_destructive;
 use crate::acp::state::{
     AvailableCommand, ConfigOptionDescriptor, Event, MemoryRecall, Plan, PlanStep, SessionMode,
-    SessionUsage, ToolCall, UsageCost,
+    SessionUsage, ToolCall, UsageCost, WorkflowProgress,
 };
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v1::schema::{
@@ -32,6 +32,65 @@ use super::tool_output::{
 /// Keeps synthetic tool-call ids minted in the same millisecond distinct.
 pub(super) static SYNTHETIC_TOOL_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Events for the lifecycle primitives of an admitted envelope, from any
+/// update kind. A repeated `started` is a lease renewal: the reducers are
+/// idempotent on the id.
+pub(super) fn lifecycle_events(envelope: &aoe_meta::Envelope) -> Vec<Event> {
+    use aoe_meta::RunState;
+    let mut events = Vec::new();
+    if let Some(task) = &envelope.background_task {
+        events.push(match task.state {
+            RunState::Started => Event::BackgroundTaskStarted {
+                task_id: task.id.clone(),
+                tool_call_id: None,
+                description: None,
+                workflow: None,
+                started_at: None,
+            },
+            RunState::Ended => Event::BackgroundTaskFinished {
+                task_id: task.id.clone(),
+                ended_at: None,
+            },
+        });
+    }
+    if let Some(run) = &envelope.workflow_run {
+        let run_id = run.id.clone();
+        match run.state {
+            RunState::Started => {
+                events.push(Event::WorkflowRunStarted {
+                    run_id: run_id.clone(),
+                    started_at: Some(crate::time::Timestamp::now()),
+                });
+                if let Some(p) = &run.progress {
+                    events.push(Event::WorkflowRunProgress {
+                        run_id,
+                        progress: WorkflowProgress {
+                            label: p.label.clone(),
+                            completed: p.completed,
+                            total: p.total,
+                        },
+                    });
+                }
+            }
+            RunState::Ended => events.push(Event::WorkflowRunFinished { run_id }),
+        }
+    }
+    if let Some(wakeup) = &envelope.wakeup {
+        if let Ok(at) = crate::time::Timestamp::parse_rfc3339(&wakeup.at) {
+            events.push(Event::WakeupScheduled {
+                at,
+                reason: wakeup.reason.clone(),
+            });
+        }
+    }
+    if let Some(monitor) = &envelope.monitor {
+        events.push(Event::MonitorArmed {
+            description: monitor.description.clone(),
+        });
+    }
+    events
+}
 
 /// Agents without typed `compaction_update`s surface `/compact` only as plain
 /// text chunks (#1050). Markers are matched as strings; a miss or false hit
@@ -872,7 +931,7 @@ mod tests {
             .raw_input(json!({ "plan": "- a\n- b" }));
         let mut proposal = AcpToolCall::new("tc-proposal", "Tool");
         proposal.meta =
-            json!({"aoe": {"v": 1, "key": "k", "plan_proposal": {"markdown": "- a\n- b"}}})
+            json!({"aoe": {"v": 2, "key": "k", "plan_proposal": {"markdown": "- a\n- b"}}})
                 .as_object()
                 .cloned();
         let checklist = ["tool_call_started", "plan_updated", "tool_call_completed"];
@@ -1999,7 +2058,7 @@ mod tests {
         }
         let path = || vec![ToolCallLocation::new("/m/a.md")];
         let aoe = |primitive: serde_json::Value| {
-            let mut aoe = json!({"v": 1, "key": "k1"});
+            let mut aoe = json!({"v": 2, "key": "k1"});
             aoe.as_object_mut()
                 .unwrap()
                 .extend(primitive.as_object().unwrap().clone());
@@ -2028,5 +2087,55 @@ mod tests {
             );
             assert_eq!(stable(aoe_events), stable(claude_events), "{name}");
         }
+    }
+
+    use serde_json::json;
+
+    fn envelope(aoe: serde_json::Value) -> aoe_meta::Envelope {
+        let meta = json!({ "aoe": aoe }).as_object().cloned().unwrap();
+        aoe_meta::Envelope::from_meta(&meta).unwrap().unwrap()
+    }
+
+    #[test]
+    fn lifecycle_primitives_map_to_events() {
+        let events = lifecycle_events(&envelope(json!({
+            "v": 2, "key": "k",
+            "background_task": {"id": "b", "state": "started", "ttl_ms": 5},
+            "workflow_run": {"id": "w", "state": "started", "ttl_ms": 5,
+                             "progress": {"label": "step", "completed": 1, "total": 3}},
+            "wakeup": {"at": "2026-01-01T00:00:00Z", "reason": "check"},
+            "monitor": {"description": "ci"},
+        })));
+        assert!(matches!(
+            &events[0],
+            Event::BackgroundTaskStarted { task_id, tool_call_id: None, description: None, workflow: None, .. }
+                if task_id == "b"
+        ));
+        assert!(matches!(&events[1], Event::WorkflowRunStarted { run_id, .. } if run_id == "w"));
+        assert!(matches!(
+            &events[2],
+            Event::WorkflowRunProgress { run_id, progress }
+                if run_id == "w" && progress.completed == Some(1) && progress.total == Some(3)
+        ));
+        assert!(matches!(
+            &events[3],
+            Event::WakeupScheduled { reason, .. } if reason.as_deref() == Some("check")
+        ));
+        assert!(matches!(
+            &events[4],
+            Event::MonitorArmed { description } if description.as_deref() == Some("ci")
+        ));
+        assert_eq!(events.len(), 5);
+
+        let ended = lifecycle_events(&envelope(json!({
+            "v": 2, "key": "k",
+            "background_task": {"id": "b", "state": "ended"},
+            "workflow_run": {"id": "w", "state": "ended"},
+        })));
+        assert!(
+            matches!(&ended[0], Event::BackgroundTaskFinished { task_id, .. } if task_id == "b")
+        );
+        assert!(matches!(&ended[1], Event::WorkflowRunFinished { run_id } if run_id == "w"));
+        assert!(lifecycle_events(&envelope(json!({"v": 2, "key": "k"}))).is_empty());
     }
 }

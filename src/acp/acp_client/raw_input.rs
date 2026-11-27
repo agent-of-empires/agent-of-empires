@@ -110,7 +110,7 @@ pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Optio
         "Bash" => Some(Event::BackgroundTaskStarted {
             task_id: tr.get("backgroundTaskId")?.as_str()?.to_string(),
             tool_call_id,
-            description: String::new(),
+            description: Some(String::new()),
             workflow: None,
             started_at: Some(crate::time::Timestamp::now()),
         }),
@@ -120,7 +120,7 @@ pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Optio
             Some(Event::BackgroundTaskStarted {
                 task_id: str_field("taskId")?.to_string(),
                 tool_call_id,
-                description: name.clone(),
+                description: Some(name.clone()),
                 workflow: Some(WorkflowLaunch {
                     run_id: str_field("runId")?.to_string(),
                     name,
@@ -301,7 +301,7 @@ mod tests {
             }) => {
                 assert_eq!(task_id, "wfgxmundi");
                 assert_eq!(tool_call_id.as_deref(), Some("toolu_1"));
-                assert_eq!(description, "acp-0991-issue-drafts");
+                assert_eq!(description.as_deref(), Some("acp-0991-issue-drafts"));
                 assert_eq!(
                     workflow,
                     Some(WorkflowLaunch {

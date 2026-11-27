@@ -29,8 +29,8 @@ use crate::acp::acp_client::tool_context::{
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
-    map_update_to_events, qualify_compaction_id, restored_wake_tool_event, AgentMessageDedup,
-    CompactionFold, CompactionTracker,
+    lifecycle_events, map_update_to_events, qualify_compaction_id, restored_wake_tool_event,
+    AgentMessageDedup, CompactionFold, CompactionTracker,
 };
 use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
 use crate::acp::acp_client::SessionState;
@@ -329,6 +329,11 @@ impl Shared {
             Ingested::DeliverThenLost(frames, reason) => (frames, Some(reason)),
         };
         for frame in frames {
+            // Straight to the log: the `BackgroundTask*` interception in
+            // `handle_adapter_notification` is for Claude's tool results.
+            for event in frame.lifecycle.iter().flat_map(lifecycle_events) {
+                self.emit(event).await;
+            }
             self.handle_adapter_notification(
                 frame.notification,
                 frame.local_prompt_signals,
@@ -539,7 +544,7 @@ impl Shared {
             } = &mut event
             {
                 if let Some(command) = shell_command(&self.tool_context_cache, call) {
-                    *description = command;
+                    *description = Some(command);
                 }
             }
             if let Event::BackgroundTaskStarted {

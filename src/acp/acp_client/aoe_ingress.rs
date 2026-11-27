@@ -1,7 +1,7 @@
 //! Consumes `_meta.aoe` on inbound `session/update` frames, in arrival order,
 //! before anything maps them to events.
 
-use crate::acp::aoe_meta::lease::LeaseTable;
+use crate::acp::aoe_meta::lease::{LeaseNamespace, LeaseTable, LeaseTableFull};
 use crate::acp::aoe_meta::ordering::{Arrival, ArrivalOrder};
 use crate::acp::aoe_meta::{self, Envelope};
 use crate::acp::state::IntegrationLostReason;
@@ -25,6 +25,9 @@ pub(super) struct Delivered {
     pub(super) notification: SessionNotification,
     pub(super) local_prompt_signals: bool,
     pub(super) epoch: u64,
+    /// The envelope, when its lifecycle primitives may be applied: live, not
+    /// replayed history.
+    pub(super) lifecycle: Option<Envelope>,
 }
 
 pub(super) enum Ingested {
@@ -119,6 +122,7 @@ impl AoeIngress {
                     notification,
                     local_prompt_signals,
                     epoch,
+                    lifecycle: None,
                 }]);
             }
             Err(_) => None,
@@ -143,6 +147,7 @@ impl AoeIngress {
                 notification: frame.notification,
                 local_prompt_signals,
                 epoch,
+                lifecycle: None,
             }]);
         }
         let released = order.arrive(arrival, frame);
@@ -157,13 +162,8 @@ impl AoeIngress {
         let proxied = self.proxied.load(Ordering::Relaxed);
         let mut deliver = Vec::with_capacity(released.len());
         for frame in released {
-            if let Some(lease) = frame
-                .envelope
-                .as_ref()
-                .and_then(|e| e.lease.as_ref())
-                .filter(|_| frame.admit_leases)
-            {
-                if self.leases.apply(lease, now_ms).is_err() && proxied {
+            if let Some(envelope) = frame.envelope.as_ref().filter(|_| frame.admit_leases) {
+                if self.apply_leases(envelope, now_ms).is_err() && proxied {
                     return match self.lose(IntegrationLostReason::LeaseOverflow) {
                         Ingested::Lost(reason) if !deliver.is_empty() => {
                             Ingested::DeliverThenLost(deliver, reason)
@@ -179,9 +179,29 @@ impl AoeIngress {
                 notification: frame.notification,
                 local_prompt_signals: frame.local_prompt_signals,
                 epoch: frame.epoch,
+                lifecycle: frame.envelope.filter(|_| frame.admit_leases),
             });
         }
         Ingested::Deliver(deliver)
+    }
+
+    /// The explicit lease, then the task leases a background task or workflow
+    /// run derives.
+    fn apply_leases(&self, envelope: &Envelope, now_ms: i64) -> Result<(), LeaseTableFull> {
+        if let Some(lease) = &envelope.lease {
+            self.leases.apply(lease, now_ms)?;
+        }
+        if let Some(task) = &envelope.background_task {
+            let ns = LeaseNamespace::BackgroundTask;
+            self.leases
+                .apply_derived(ns, &task.id, task.state, task.ttl_ms, now_ms)?;
+        }
+        if let Some(run) = &envelope.workflow_run {
+            let ns = LeaseNamespace::WorkflowRun;
+            self.leases
+                .apply_derived(ns, &run.id, run.state, run.ttl_ms, now_ms)?;
+        }
+        Ok(())
     }
 
     /// Numbers `n` frames the session identity discarded before they got
@@ -247,23 +267,109 @@ mod tests {
     #[test]
     fn an_expired_lease_clears_busy_with_no_further_frames() {
         let i = ingress(true);
-        let lease = json!({"v":1,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":1000}});
+        let lease = json!({"v":2,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":1000}});
         assert_eq!(ids(i.ingest(frame("t1", lease), true, 0, 0)), ["t1"]);
         assert!(i.leases.working(999));
         assert!(!i.leases.working(1000));
     }
 
     #[test]
+    fn a_background_task_holds_working_until_it_ends_or_expires() {
+        let i = ingress(true);
+        let task = |key: &str, state: &str, ttl: Option<u64>| {
+            let mut t = json!({"id":"b1","state":state});
+            if let Some(ttl) = ttl {
+                t["ttl_ms"] = json!(ttl);
+            }
+            json!({"v":2,"key":key,"background_task":t})
+        };
+        ids(i.ingest(frame("a", task("k1", "started", Some(1000))), true, 0, 0));
+        assert!(i.leases.working(999));
+        assert!(!i.leases.working(1000), "expires with no further frames");
+
+        ids(i.ingest(frame("b", task("k2", "started", Some(1000))), true, 0, 2000));
+        ids(i.ingest(frame("c", task("k3", "started", Some(1000))), true, 0, 2900));
+        assert!(i.leases.working(3800), "a repeated started renews");
+        ids(i.ingest(frame("d", task("k4", "ended", None)), true, 0, 3000));
+        assert!(!i.leases.working(3001), "ended releases at once");
+    }
+
+    #[test]
+    fn a_derived_lease_does_not_release_an_explicit_one_of_the_same_id() {
+        let i = ingress(true);
+        let busy = json!({"v":2,"key":"l1","lease":{"id":"x","kind":"busy","ttl_ms":60000}});
+        ids(i.ingest(frame("a", busy), true, 0, 0));
+        let ended = json!({"v":2,"key":"k2","background_task":{"id":"x","state":"ended"}});
+        ids(i.ingest(frame("b", ended), true, 0, 1));
+        assert!(i.leases.working(2), "the explicit lease stays");
+    }
+
+    #[test]
+    fn lifecycle_is_delivered_for_live_frames_only() {
+        let i = ingress(true);
+        let aoe =
+            json!({"v":2,"key":"k","background_task":{"id":"b","state":"started","ttl_ms":1000}});
+        let lifecycle = |ingested| match ingested {
+            Ingested::Deliver(frames) => {
+                frames.into_iter().map(|d| d.lifecycle).collect::<Vec<_>>()
+            }
+            _ => panic!("expected delivery"),
+        };
+        let live = lifecycle(i.ingest(frame("a", aoe.clone()), true, 0, 0));
+        assert_eq!(live.len(), 1);
+        assert!(live[0]
+            .as_ref()
+            .is_some_and(|e| e.background_task.is_some()));
+
+        let aoe =
+            json!({"v":2,"key":"k2","background_task":{"id":"b2","state":"started","ttl_ms":1000}});
+        let replayed = lifecycle(i.ingest(frame("b", aoe.clone()), false, 0, 0));
+        assert!(replayed[0].is_none(), "replay emits no lifecycle");
+        i.set_loading_history(true);
+        let aoe =
+            json!({"v":2,"key":"k3","background_task":{"id":"b3","state":"started","ttl_ms":1000}});
+        let loading = lifecycle(i.ingest(frame("c", aoe), true, 0, 0));
+        assert!(loading[0].is_none(), "a load emits no lifecycle");
+    }
+
+    #[test]
+    fn replayed_task_and_run_frames_take_no_lease() {
+        let i = ingress(true);
+        let task =
+            json!({"v":2,"key":"k1","background_task":{"id":"b","state":"started","ttl_ms":1000}});
+        let run =
+            json!({"v":2,"key":"k2","workflow_run":{"id":"w","state":"started","ttl_ms":1000}});
+        ids(i.ingest(frame("a", task), false, 0, 0));
+        ids(i.ingest(frame("b", run), false, 0, 0));
+        assert!(!i.leases.any_live(1));
+    }
+
+    #[test]
+    fn derived_leases_share_the_table_bound() {
+        use crate::acp::aoe_meta::lease::MAX_LEASES;
+        let i = ingress(true);
+        for n in 0..MAX_LEASES {
+            let run = json!({"v":2,"key":format!("k{n}"),"workflow_run":{"id":format!("w{n}"),"state":"started","ttl_ms":60000}});
+            ids(i.ingest(frame("r", run), true, 0, 0));
+        }
+        let over = json!({"v":2,"key":"over","background_task":{"id":"b","state":"started","ttl_ms":60000}});
+        assert!(matches!(
+            i.ingest(frame("o", over), true, 0, 0),
+            Ingested::Lost(IntegrationLostReason::LeaseOverflow)
+        ));
+    }
+
+    #[test]
     fn replayed_frames_do_not_hold_leases() {
         let i = ingress(true);
-        let lease = json!({"v":1,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":1000}});
+        let lease = json!({"v":2,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":1000}});
         ids(i.ingest(frame("t1", lease), false, 0, 0));
         assert!(!i.leases.working(1));
     }
 
     #[test]
     fn contract_breaks_end_a_proxied_integration_only() {
-        let broken = || frame("t", json!({"v": 1}));
+        let broken = || frame("t", json!({"v": 2}));
         // (name, proxied)
         for (name, proxied) in [("proxied", true), ("plain agent", false)] {
             let i = ingress(proxied);
@@ -284,10 +390,10 @@ mod tests {
         use crate::acp::aoe_meta::ordering::MAX_HELD;
         let i = ingress(true);
         for n in 0..MAX_HELD {
-            let aoe = json!({"v":1,"key":format!("k{n}"),"after_adapter_sequence":u64::MAX});
+            let aoe = json!({"v":2,"key":format!("k{n}"),"after_adapter_sequence":u64::MAX});
             assert!(ids(i.ingest(frame("h", aoe), true, 0, 0)).is_empty());
         }
-        let aoe = json!({"v":1,"key":"over","after_adapter_sequence":u64::MAX});
+        let aoe = json!({"v":2,"key":"over","after_adapter_sequence":u64::MAX});
         assert!(matches!(
             i.ingest(frame("h", aoe), true, 0, 0),
             Ingested::Lost(IntegrationLostReason::HoldOverflow)
@@ -297,7 +403,7 @@ mod tests {
     #[test]
     fn a_held_frame_keeps_the_epoch_it_arrived_in() {
         let i = ingress(true);
-        let held = json!({"v":1,"key":"k","after_adapter_sequence":1});
+        let held = json!({"v":2,"key":"k","after_adapter_sequence":1});
         assert!(ids(i.ingest(frame("t", held), true, 7, 0)).is_empty());
         let Ingested::Deliver(out) = i.ingest(frame("a", json!(null)), true, 9, 0) else {
             panic!("expected delivery");
@@ -310,19 +416,19 @@ mod tests {
         use crate::acp::aoe_meta::ordering::MAX_HELD;
         let i = ingress(false);
         for n in 0..MAX_HELD {
-            let aoe = json!({"v":1,"key":format!("k{n}"),"after_adapter_sequence":u64::MAX});
+            let aoe = json!({"v":2,"key":format!("k{n}"),"after_adapter_sequence":u64::MAX});
             assert!(ids(i.ingest(frame("h", aoe), true, 0, 0)).is_empty());
         }
-        let aoe = json!({"v":1,"key":"over","after_adapter_sequence":u64::MAX});
+        let aoe = json!({"v":2,"key":"over","after_adapter_sequence":u64::MAX});
         assert_eq!(ids(i.ingest(frame("over", aoe), true, 0, 0)), ["over"]);
     }
 
     #[test]
     fn a_session_reset_forgets_keys_and_held_frames() {
         let i = ingress(true);
-        let held = json!({"v":1,"key":"old","after_adapter_sequence":9});
+        let held = json!({"v":2,"key":"old","after_adapter_sequence":9});
         assert!(ids(i.ingest(frame("old", held), true, 0, 0)).is_empty());
-        let keyed = json!({"v":1,"key":"k"});
+        let keyed = json!({"v":2,"key":"k"});
         assert_eq!(ids(i.ingest(frame("a", keyed.clone()), true, 0, 0)), ["a"]);
         i.session_reset();
         assert_eq!(
@@ -336,7 +442,7 @@ mod tests {
     fn a_session_reset_restores_a_lost_integration() {
         let i = ingress(true);
         assert!(matches!(
-            i.ingest(frame("bad", json!({"v": 1})), true, 0, 0),
+            i.ingest(frame("bad", json!({"v": 2})), true, 0, 0),
             Ingested::Lost(_)
         ));
         assert!(ids(i.ingest(frame("a", json!(null)), true, 0, 0)).is_empty());
@@ -348,14 +454,14 @@ mod tests {
     fn frames_lost_integration_swallows_still_advance_the_adapter_count() {
         let i = ingress(true);
         assert!(matches!(
-            i.ingest(frame("bad", json!({"v": 1})), true, 0, 0),
+            i.ingest(frame("bad", json!({"v": 2})), true, 0, 0),
             Ingested::Lost(_)
         ));
         // The bad frame was adapter frame 1; frames 2 and 3 arrive while lost.
         assert!(ids(i.ingest(frame("a", json!(null)), true, 0, 0)).is_empty());
         assert!(ids(i.ingest(frame("b", json!(null)), true, 0, 0)).is_empty());
         i.session_reset();
-        let anchored = json!({"v":1,"key":"t","after_adapter_sequence":3});
+        let anchored = json!({"v":2,"key":"t","after_adapter_sequence":3});
         assert_eq!(ids(i.ingest(frame("t", anchored), true, 0, 0)), ["t"]);
     }
 
@@ -364,7 +470,7 @@ mod tests {
         let i = ingress(true);
         assert_eq!(ids(i.ingest(frame("f1", json!(null)), true, 0, 0)), ["f1"]);
         // Anchored but with an empty key: invalid, yet still a tailer frame.
-        let bad = json!({"v":1,"key":"","after_adapter_sequence":9});
+        let bad = json!({"v":2,"key":"","after_adapter_sequence":9});
         assert!(matches!(
             i.ingest(frame("bad", bad.clone()), true, 0, 0),
             Ingested::Lost(_)
@@ -372,7 +478,7 @@ mod tests {
         // Swallowed while lost: also uncounted.
         assert!(ids(i.ingest(frame("bad2", bad), true, 0, 0)).is_empty());
         i.session_reset();
-        let anchored = json!({"v":1,"key":"t","after_adapter_sequence":2});
+        let anchored = json!({"v":2,"key":"t","after_adapter_sequence":2});
         assert!(
             ids(i.ingest(frame("t", anchored), true, 0, 0)).is_empty(),
             "held for frame 2"
@@ -387,9 +493,9 @@ mod tests {
     fn a_plain_agent_invalid_anchored_frame_takes_no_adapter_frame_number() {
         let i = ingress(false);
         assert_eq!(ids(i.ingest(frame("f1", json!(null)), true, 0, 0)), ["f1"]);
-        let bad = json!({"v":1,"key":"","after_adapter_sequence":9});
+        let bad = json!({"v":2,"key":"","after_adapter_sequence":9});
         assert_eq!(ids(i.ingest(frame("bad", bad), true, 0, 0)), ["bad"]);
-        let anchored = json!({"v":1,"key":"t","after_adapter_sequence":2});
+        let anchored = json!({"v":2,"key":"t","after_adapter_sequence":2});
         assert!(
             ids(i.ingest(frame("t", anchored), true, 0, 0)).is_empty(),
             "held for frame 2"
@@ -403,13 +509,13 @@ mod tests {
     #[test]
     fn a_session_reset_releases_leases_taken_before_the_commit() {
         let i = ingress(true);
-        let lease = json!({"v":1,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":60000}});
+        let lease = json!({"v":2,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":60000}});
         assert_eq!(ids(i.ingest(frame("t1", lease), true, 0, 0)), ["t1"]);
         assert!(i.leases.working(1) && i.leases.any_live(1));
         i.session_reset();
         assert!(!i.leases.working(1) && !i.leases.any_live(1));
         // The new session can still take its own.
-        let again = json!({"v":1,"key":"l2","lease":{"id":"bg2","kind":"task","ttl_ms":60000}});
+        let again = json!({"v":2,"key":"l2","lease":{"id":"bg2","kind":"task","ttl_ms":60000}});
         ids(i.ingest(frame("t2", again), true, 0, 2));
         assert!(i.leases.working(3));
     }
@@ -418,7 +524,7 @@ mod tests {
     fn history_replayed_by_a_load_takes_no_lease() {
         let i = ingress(true);
         let lease = |key: &str, anchor: Option<u64>| {
-            let mut aoe = json!({"v":1,"key":key,"lease":{"id":key,"kind":"busy","ttl_ms":60000}});
+            let mut aoe = json!({"v":2,"key":key,"lease":{"id":key,"kind":"busy","ttl_ms":60000}});
             if let Some(n) = anchor {
                 aoe["after_adapter_sequence"] = json!(n);
             }
@@ -443,7 +549,7 @@ mod tests {
         use crate::acp::aoe_meta::lease::MAX_LEASES;
         let i = ingress(true);
         let lease = |key: String, anchor: Option<u64>| {
-            let mut aoe = json!({"v":1,"key":key,"lease":{"id":key,"kind":"task","ttl_ms":60000}});
+            let mut aoe = json!({"v":2,"key":key,"lease":{"id":key,"kind":"task","ttl_ms":60000}});
             if let Some(n) = anchor {
                 aoe["after_adapter_sequence"] = json!(n);
             }
@@ -453,7 +559,7 @@ mod tests {
             ids(i.ingest(frame("l", lease(format!("l{n}"), None)), true, 0, 0));
         }
         let next = MAX_LEASES as u64 + 1;
-        let plain_tailer = json!({"v":1,"key":"plain","after_adapter_sequence":next});
+        let plain_tailer = json!({"v":2,"key":"plain","after_adapter_sequence":next});
         assert!(ids(i.ingest(frame("tail", plain_tailer), true, 0, 0)).is_empty());
         let over = lease("over".into(), Some(next));
         assert!(ids(i.ingest(frame("over", over), true, 0, 0)).is_empty());
@@ -475,11 +581,11 @@ mod tests {
     #[test]
     fn a_lost_integration_drops_its_leases() {
         let i = ingress(true);
-        let lease = json!({"v":1,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":3600000}});
+        let lease = json!({"v":2,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":3600000}});
         ids(i.ingest(frame("t1", lease), true, 0, 0));
         assert!(i.leases.any_live(1));
         assert!(matches!(
-            i.ingest(frame("bad", json!({"v": 1})), true, 0, 1),
+            i.ingest(frame("bad", json!({"v": 2})), true, 0, 1),
             Ingested::Lost(_)
         ));
         assert!(!i.leases.any_live(1) && !i.leases.working(1));

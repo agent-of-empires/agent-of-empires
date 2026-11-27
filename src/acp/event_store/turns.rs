@@ -916,7 +916,7 @@ mod tests {
         let started = Event::BackgroundTaskStarted {
             task_id: "t".into(),
             tool_call_id: None,
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -1337,7 +1337,7 @@ mod tests {
         let task = |id: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: None,
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -1428,7 +1428,7 @@ mod tests {
             record(Event::BackgroundTaskStarted {
                 task_id: format!("t{i}"),
                 tool_call_id: None,
-                description: "sleep".into(),
+                description: Some("sleep".into()),
                 workflow: None,
                 started_at: None,
             });
@@ -1442,7 +1442,7 @@ mod tests {
             record(Event::BackgroundTaskStarted {
                 task_id: format!("open{i}"),
                 tool_call_id: None,
-                description: "sleep".into(),
+                description: Some("sleep".into()),
                 workflow: None,
                 started_at: None,
             });
@@ -1491,7 +1491,7 @@ mod tests {
         record(Event::BackgroundTaskStarted {
             task_id: "shell".into(),
             tool_call_id: None,
-            description: "make build".into(),
+            description: Some("make build".into()),
             workflow: None,
             started_at: None,
         });
@@ -1500,7 +1500,7 @@ mod tests {
             record(Event::BackgroundTaskStarted {
                 task_id: format!("wf{i}"),
                 tool_call_id: Some(format!("call-{i}")),
-                description: "drafts".into(),
+                description: Some("drafts".into()),
                 workflow: Some(WorkflowLaunch {
                     run_id: format!("wf_{i}"),
                     name: "drafts".into(),
@@ -1536,7 +1536,7 @@ mod tests {
         let started = |tool_call_id: &str| Event::BackgroundTaskStarted {
             task_id: "t".into(),
             tool_call_id: Some(tool_call_id.into()),
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -1574,7 +1574,7 @@ mod tests {
         let started = |id: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: None,
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -1630,7 +1630,7 @@ mod tests {
                 Event::BackgroundTaskStarted {
                     task_id: "wfx".into(),
                     tool_call_id: Some("toolu_wf".into()),
-                    description: "drafts".into(),
+                    description: Some("drafts".into()),
                     workflow: Some(launch.clone()),
                     started_at: None,
                 },

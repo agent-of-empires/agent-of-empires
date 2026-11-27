@@ -5002,7 +5002,7 @@ time.sleep(60)
                 &Event::BackgroundTaskStarted {
                     task_id: task_id.into(),
                     tool_call_id: Some("toolu_task".into()),
-                    description: "sleep".into(),
+                    description: Some("sleep".into()),
                     workflow: None,
                     started_at: None,
                 },
