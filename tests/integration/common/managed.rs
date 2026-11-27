@@ -1448,7 +1448,11 @@ socket.on('error', error => { console.error(error); process.exit(1); });
     }
 
     pub fn tempdir(&mut self) -> Arc<tempfile::TempDir> {
-        let directory = Arc::new(tempfile::tempdir_in("/tmp").expect("managed fixture directory"));
+        // Match the factory's canonical cwd on macOS without using the longer TMPDIR.
+        static ROOT: std::sync::LazyLock<PathBuf> =
+            std::sync::LazyLock::new(|| Path::new("/tmp").canonicalize().expect("canonical /tmp"));
+        let directory =
+            Arc::new(tempfile::tempdir_in(ROOT.as_path()).expect("managed fixture directory"));
         self.directories.lock().unwrap().push(directory.clone());
         directory
     }
