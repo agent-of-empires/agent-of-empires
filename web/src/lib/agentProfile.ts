@@ -61,6 +61,11 @@ export const DEFAULT_AGENT_PROFILE: AgentProfile = {
   fullscreen: false,
 };
 
+/** The profile when its `v` is known, else the default. */
+export function usableAgentProfile(profile: AgentProfile | null | undefined): AgentProfile {
+  return profile?.v === 1 ? profile : DEFAULT_AGENT_PROFILE;
+}
+
 /** Mirror of `AgentProfile::is_clear_command` in src/acp/agent_profiles.rs. */
 export function isClearAlias(text: string, aliases: ReadonlyArray<string>): boolean {
   const trimmed = text.trim();

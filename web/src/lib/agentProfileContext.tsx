@@ -3,14 +3,14 @@
 
 import { createContext, useContext, useState, type ReactNode } from "react";
 
-import { DEFAULT_AGENT_PROFILE, type AgentProfile } from "./agentProfile";
+import { DEFAULT_AGENT_PROFILE, usableAgentProfile, type AgentProfile } from "./agentProfile";
 
 const AgentProfileContext = createContext<AgentProfile>(DEFAULT_AGENT_PROFILE);
 
 /** An unknown `v` falls back to the default; equal content keeps the previous object, as the session poll
  *  deserializes a fresh one each time. */
 export function useStableAgentProfile(profile: AgentProfile | null | undefined): AgentProfile {
-  const usable = profile?.v === 1 ? profile : DEFAULT_AGENT_PROFILE;
+  const usable = usableAgentProfile(profile);
   const json = JSON.stringify(usable);
   const [held, setHeld] = useState({ json, profile: usable });
   if (held.json === json) return held.profile;

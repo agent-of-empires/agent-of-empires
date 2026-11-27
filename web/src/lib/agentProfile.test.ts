@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { isClearAlias } from "./agentProfile";
+import { DEFAULT_AGENT_PROFILE, isClearAlias, usableAgentProfile, type AgentProfile } from "./agentProfile";
 
 it.each<[string, string[], boolean]>([
   ["/clear", ["/clear"], true],
@@ -15,4 +15,11 @@ it.each<[string, string[], boolean]>([
   ["/new", ["/clear"], false],
 ])("isClearAlias(%j, %j) is %s", (text, aliases, expected) => {
   expect(isClearAlias(text, aliases)).toBe(expected);
+});
+
+it("usableAgentProfile ignores a profile with an unknown version", () => {
+  const monitor = { ...DEFAULT_AGENT_PROFILE, mobile_monitor_only: true };
+  expect(usableAgentProfile(monitor).mobile_monitor_only).toBe(true);
+  expect(usableAgentProfile({ ...monitor, v: 2 } as unknown as AgentProfile)).toBe(DEFAULT_AGENT_PROFILE);
+  expect(usableAgentProfile(undefined)).toBe(DEFAULT_AGENT_PROFILE);
 });
