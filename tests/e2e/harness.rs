@@ -423,7 +423,7 @@ pub struct TuiTestHarness {
     /// Exported on every spawned process (tmux session and `run_cli`).
     extra_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     extra_env_remove: Vec<String>,
-    /// Prepended to PATH ahead of the `claude` stub.
+    /// Prepended to PATH ahead of the stub dir.
     extra_path_dirs: Vec<PathBuf>,
     /// Stop structured view workers and attempt daemon shutdown during teardown.
     stop_daemon_on_drop: bool,
@@ -441,8 +441,8 @@ const ESCAPE_CSI_U: &[&str] = &["1b", "5b", "32", "37", "75"];
 
 #[allow(dead_code)]
 impl TuiTestHarness {
-    /// Create a new harness with an isolated `$HOME` and a fake `claude` stub
-    /// so tool detection succeeds.
+    /// Create a new harness with an isolated `$HOME`, a `fake-agent` PATH stub,
+    /// and `fake-agent` as the default tool.
     pub fn new(test_name: &str) -> Self {
         let home_dir = TempDir::new().expect("failed to create temp home");
         Self::with_home(test_name, home_dir)
@@ -469,17 +469,15 @@ impl TuiTestHarness {
         // Path to unique tmux socket for this test.
         let socket_path = home_dir.path().join("tmux.sock");
 
-        // Create fake `claude` and `fake-agent` scripts so `which` succeeds.
+        // Create a `fake-agent` script so `which` succeeds.
         let stub_path = stub_dir.path().to_path_buf();
-        for name in ["claude", "fake-agent"] {
-            let stub = stub_path.join(name);
-            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write agent stub");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod agent stub");
-            }
+        let stub = stub_path.join("fake-agent");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write agent stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod agent stub");
         }
 
         // Pre-seed config.toml to skip the welcome dialog and update checks.
@@ -496,6 +494,9 @@ impl TuiTestHarness {
         let config_content = format!(
             r#"[updates]
 update_check_mode = "off"
+
+[session]
+default_tool = "fake-agent"
 
 [acp]
 structured_view = "off"
@@ -561,10 +562,8 @@ last_seen_version = "{}"
         }
     }
 
-    /// Build the PATH with structured view shim dirs (if any) and the stub
-    /// directory prepended so the fake agent / fake `claude` is found.
-    /// `extra_path_dirs` come first so an installed ACP shim shadows the
-    /// exit-0 `claude` stub.
+    /// Build the PATH with `extra_path_dirs` first, then the stub directory,
+    /// so installed shims shadow the exit-0 stubs.
     fn env_path(&self) -> String {
         let system_path = std::env::var("PATH").unwrap_or_default();
         let mut parts: Vec<String> = self
@@ -623,11 +622,11 @@ last_seen_version = "{}"
         self.acp_fork_fail = true;
     }
 
-    /// Install the shared Node fake-ACP agent as the `claude`,
+    /// Install the shared Node fake-ACP agent as the `fake-agent`, `claude`,
     /// `claude-agent-acp`, and `aoe-agent` commands on PATH. The structured view
-    /// supervisor resolves the `claude` tool key to the `claude-agent-acp`
-    /// command via `AgentRegistry`, so all three names must point at the
-    /// fake. `FAKE_ACP_SCRIPT` / `FAKE_ACP_DEBUG_LOG` are baked into the
+    /// supervisor resolves a tool key to its ACP command via `AgentRegistry`
+    /// (`fake-agent` falls back to `claude-agent-acp`), so every name must
+    /// point at the fake. `FAKE_ACP_SCRIPT` / `FAKE_ACP_DEBUG_LOG` are baked into the
     /// shim (the daemon -> runner -> node spawn chain does not reliably
     /// propagate process env). Also sets the runner-socket timeout high
     /// so a contended CI box doesn't trip the spawn deadline.
@@ -682,7 +681,7 @@ last_seen_version = "{}"
             node.display(),
             fake_agent.display(),
         );
-        for name in ["claude", "claude-agent-acp", "aoe-agent"] {
+        for name in ["fake-agent", "claude", "claude-agent-acp", "aoe-agent"] {
             let path = bin.join(name);
             std::fs::write(&path, &script).expect("write acp shim");
             #[cfg(unix)]
@@ -778,7 +777,7 @@ last_seen_version = "{}"
         parse_session_id(&self.run_cli_ok(&[&["add"], args].concat()))
     }
 
-    /// Start a daemon and add a `claude --structured-view` session titled
+    /// Start a daemon and add a `fake-agent --structured-view` session titled
     /// `title` over a fresh git project; returns the daemon port and session id.
     pub fn start_structured_session(&self, title: &str) -> (u16, String) {
         let project = self.project_path();
@@ -789,7 +788,7 @@ last_seen_version = "{}"
             "-t",
             title,
             "-c",
-            "claude",
+            "fake-agent",
             "--structured-view",
         ]);
         (port, id)
