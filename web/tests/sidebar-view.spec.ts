@@ -134,8 +134,13 @@ test.describe("shared sidebar view (#5896)", () => {
       await expect(menu).toBeVisible();
       await expect(current).toBeChecked();
       const newGroup = menu.getByRole("menuitem", { name: "+ New group…" });
+      await page.keyboard.press("ArrowDown");
+      await expect(newGroup).toBeFocused();
       if (canCreate) await expect(newGroup).toBeEnabled();
-      else await expect(newGroup).toBeDisabled();
+      else {
+        await expect(newGroup).toBeDisabled();
+        await expect(newGroup).toHaveAccessibleDescription(reason);
+      }
       expect(handle.viewPatches).toEqual([]);
     });
   }

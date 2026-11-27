@@ -31,6 +31,28 @@ const boxes = () =>
     .map((b) => [b.closest("label")!.textContent, (b as HTMLInputElement).checked]);
 
 describe("NewGroupDialog", () => {
+  it.each<[string, boolean, string[]]>([
+    ["offers only Sessions the Daemon can move", false, ["alpha", "terminal"]],
+    ["offers only Structured view Sessions under CityHall", true, ["alpha"]],
+  ])("%s", (_, structuredOnly, offered) => {
+    const sessions = [
+      makeSession({ id: "a", title: "alpha", group_path: "", view: "structured" }),
+      makeSession({ id: "t", title: "terminal", group_path: "", view: "terminal" }),
+      makeSession({ id: "c", title: "creating", group_path: "", view: "structured", status: "Creating" }),
+      makeSession({ id: "d", title: "deleting", group_path: "", view: "structured", status: "Deleting" }),
+    ];
+    render(
+      <NewGroupDialog
+        sessions={sessions}
+        selectedId="t"
+        structuredOnly={structuredOnly}
+        onCancel={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+    expect(boxes().map(([label]) => label)).toEqual(offered);
+  });
+
   it("starts with the selected Session checked, in its profile, and creates the Group with the picks", async () => {
     const { spy, onCreated } = setup(() => new Response(JSON.stringify({ ok: true }), { status: 201 }));
     expect(boxes()).toEqual([

@@ -68,6 +68,7 @@ export function SidebarViewMenu({
   lockReason = null,
   onNewGroup,
   newGroupDisabled = false,
+  newGroupLocked = false,
   filterOpen,
   filterActive = false,
   onToggleFilter,
@@ -87,7 +88,10 @@ export function SidebarViewMenu({
   lockReason?: string | null;
   /** Opens New group, which asks for a name and the Sessions to put in it. */
   onNewGroup: () => void;
+  /** Unavailable while offline, so it says nothing. */
   newGroupDisabled?: boolean;
+  /** Refused by a read-only Daemon: reachable and described by the lock reason, like the choices. */
+  newGroupLocked?: boolean;
   filterOpen: boolean;
   /** A filter applies while its panel is closed, such as Needs you. */
   filterActive?: boolean;
@@ -191,7 +195,8 @@ export function SidebarViewMenu({
             role="menuitem"
             tabIndex={-1}
             testId="sidebar-view-new-group"
-            disabled={newGroupDisabled}
+            disabled={newGroupDisabled && !(newGroupLocked && lockReason)}
+            disabledBy={newGroupLocked && lockReason ? reasonId : undefined}
             onClick={() => {
               setOpen(false);
               onNewGroup();

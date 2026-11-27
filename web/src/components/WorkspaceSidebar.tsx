@@ -372,7 +372,8 @@ export function WorkspaceSidebar(props: Props) {
               lockReason={lockReason}
               // CityHall allows creating Groups.
               onNewGroup={() => setNewGroupOpen(true)}
-              newGroupDisabled={!!readOnly || offline}
+              newGroupDisabled={offline}
+              newGroupLocked={!!readOnly}
               pluginSorts={pluginSorts}
               pluginSortRef={props.pluginSortRef}
               onPluginSortChange={props.onPluginSortChange}
@@ -607,6 +608,7 @@ export function WorkspaceSidebar(props: Props) {
         <NewGroupDialog
           sessions={[...new Map(rows.flatMap((v) => v.workspace.sessions).map((s) => [s.id, s])).values()]}
           selectedId={activeSessionId}
+          structuredOnly={props.canArrangeView === false}
           onCancel={() => setNewGroupOpen(false)}
           onCreated={() => {
             setNewGroupOpen(false);

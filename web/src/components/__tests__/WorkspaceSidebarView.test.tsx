@@ -100,7 +100,11 @@ describe("the sidebar view button", () => {
     fireEvent.click(within(menu).getByText("Groups"));
     expect(onGroupByChange).not.toHaveBeenCalled();
     const newGroup = within(menu).getByRole("menuitem", { name: "+ New group…" });
-    expect((newGroup as HTMLButtonElement).disabled).toBe(!canCreate);
+    // A read-only Daemon keeps it reachable, described by the reason, as the choices are.
+    expect([(newGroup as HTMLButtonElement).disabled, newGroup.getAttribute("aria-disabled")]).toEqual([
+      false,
+      canCreate ? null : "true",
+    ]);
     fireEvent.click(newGroup);
     expect(!!screen.queryByRole("dialog", { name: "New group" })).toBe(canCreate);
   });

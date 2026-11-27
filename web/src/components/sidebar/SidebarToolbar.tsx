@@ -22,6 +22,7 @@ export function SidebarToolbar({
   lockReason,
   onNewGroup,
   newGroupDisabled,
+  newGroupLocked,
   hasFacets,
   facetsActive,
   facetOpen,
@@ -45,6 +46,7 @@ export function SidebarToolbar({
   lockReason: string | null;
   onNewGroup: () => void;
   newGroupDisabled: boolean;
+  newGroupLocked: boolean;
   hasFacets: boolean;
   facetsActive: boolean;
   facetOpen: boolean;
@@ -103,6 +105,7 @@ export function SidebarToolbar({
             lockReason={lockReason}
             onNewGroup={onNewGroup}
             newGroupDisabled={newGroupDisabled}
+            newGroupLocked={newGroupLocked}
             filterOpen={filterOpen}
             filterActive={filterActive}
             onToggleFilter={onToggleFilter}

@@ -29,18 +29,31 @@ function refusal(result: Exclude<CreateGroupResult, { ok: true }>): string {
 export function NewGroupDialog({
   sessions,
   selectedId,
+  structuredOnly = false,
   onCancel,
   onCreated,
 }: {
   sessions: SessionResponse[];
   /** The selected Session, checked to start with. */
   selectedId: string | null;
+  /** CityHall, where the Daemon groups only Structured view Sessions. */
+  structuredOnly?: boolean;
   onCancel: () => void;
   onCreated: () => void;
 }) {
+  // Only Sessions the Daemon will move: not trashed, not being created or deleted, and Structured under CityHall.
   const live = useMemo(
-    () => sessions.filter((s) => s.trashed_at == null).sort((a, b) => a.title.localeCompare(b.title)),
-    [sessions],
+    () =>
+      sessions
+        .filter(
+          (s) =>
+            s.trashed_at == null &&
+            s.status !== "Creating" &&
+            s.status !== "Deleting" &&
+            (!structuredOnly || s.view === "structured"),
+        )
+        .sort((a, b) => a.title.localeCompare(b.title)),
+    [sessions, structuredOnly],
   );
   const profiles = useMemo(() => [...new Set(live.map((s) => s.profile))].sort(), [live]);
   const selected = live.find((s) => s.id === selectedId);
