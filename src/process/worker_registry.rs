@@ -76,7 +76,7 @@ impl WorkerRecord {
     ) -> Self {
         Self {
             runner_version: RUNNER_VERSION,
-            build_version: crate::build_info::BUILD_VERSION.to_string(),
+            build_version: crate::build_info::build_version().to_string(),
             session_id,
             pid,
             runner_identity: crate::process::process_birth_identity(pid).ok().flatten(),
@@ -657,7 +657,7 @@ pub fn is_runner_current(rec: &WorkerRecord) -> bool {
 
 /// Not folded into `is_record_live`: a busy stale worker must not look dead.
 pub fn is_build_current(rec: &WorkerRecord) -> bool {
-    rec.build_version == crate::build_info::BUILD_VERSION
+    rec.build_version == crate::build_info::build_version()
 }
 
 pub(crate) fn worker_state_label(rec: &WorkerRecord, live: bool) -> &'static str {
@@ -1354,7 +1354,7 @@ mod tests {
             assert_eq!(loaded.agent_name, "claude-agent-acp");
             assert_eq!(loaded.agent_key, "claude");
             assert_eq!(loaded.source_profile.as_deref(), Some("personal"));
-            assert_eq!(loaded.build_version, crate::build_info::BUILD_VERSION);
+            assert_eq!(loaded.build_version, crate::build_info::build_version());
             assert!(is_build_current(&loaded));
 
             let mut stale = loaded;
