@@ -10,7 +10,7 @@ fn create_profile_with_session(h: &TuiTestHarness, profile: &str, title: &str) {
     std::fs::create_dir_all(&profile_dir).expect("create profile dir");
 
     let session = format!(
-        r#"[{{"id":"test_{profile}","title":"{title}","project_path":"/tmp/{profile}","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}}]"#,
+        r#"[{{"id":"test_{profile}","title":"{title}","project_path":"/tmp/{profile}","group_path":"","command":"","tool":"fake-agent","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}}]"#,
     );
     std::fs::write(profile_dir.join("sessions.json"), session).expect("write sessions.json");
 }

@@ -16,7 +16,7 @@ fn add_session(h: &TuiTestHarness, title: &str) {
         "-g",
         "work",
         "-c",
-        "claude",
+        "fake-agent",
     ]);
     assert!(
         out.status.success(),
@@ -61,8 +61,8 @@ fn test_tui_custom_sort_reorders_and_persists() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("custom_order_tui");
-    let bin = h.install_path_command("claude");
-    std::fs::write(bin.join("claude"), "#!/bin/sh\nsleep 600\n").expect("write fake claude");
+    let bin = h.install_path_command("fake-agent");
+    std::fs::write(bin.join("fake-agent"), "#!/bin/sh\nsleep 600\n").expect("write fake agent");
 
     add_session(&h, "alpha-one");
     add_session(&h, "beta-two");
