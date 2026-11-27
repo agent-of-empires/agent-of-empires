@@ -603,6 +603,8 @@ fn cli_add_resolves_tool_and_command_from_config() {
         config: &'static str,
         /// Installed on PATH before the add, for availability checks.
         path_command: Option<&'static str>,
+        /// Drop the harness-seeded default so auto-selection is exercised.
+        clear_default_tool: bool,
         args: &'static [&'static str],
         expect: Vec<(&'static str, Value)>,
     }
@@ -611,6 +613,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "no config picks the only available tool",
             config: "",
             path_command: None,
+            clear_default_tool: true,
             args: &[],
             expect: vec![("tool", json!("fake-agent"))],
         },
@@ -618,6 +621,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "default_tool sets tool and command",
             config: "[session]\ndefault_tool = \"opencode\"",
             path_command: None,
+            clear_default_tool: false,
             args: &[],
             expect: vec![("tool", json!("opencode")), ("command", json!("opencode"))],
         },
@@ -625,6 +629,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "--cmd overrides default_tool",
             config: "[session]\ndefault_tool = \"opencode\"",
             path_command: None,
+            clear_default_tool: false,
             args: &["--cmd", "fake-agent"],
             expect: vec![("tool", json!("fake-agent"))],
         },
@@ -634,6 +639,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
                      agent_extra_args = { fake-agent = \"--verbose --debug\" }\n\
                      agent_command_override = { fake-agent = \"my-custom-agent\" }",
             path_command: None,
+            clear_default_tool: false,
             args: &[],
             expect: vec![
                 ("extra_args", json!("--verbose --debug")),
@@ -646,6 +652,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
                      agent_extra_args = { fake-agent = \"--from-config\" }\n\
                      agent_command_override = { fake-agent = \"config-agent\" }",
             path_command: None,
+            clear_default_tool: false,
             args: &[
                 "--extra-args",
                 "from-cli-extra",
@@ -662,6 +669,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "--cmd availability uses the override binary",
             config: "[session]\nagent_command_override = { qwen = \"qwen-plannotator\" }",
             path_command: Some("qwen-plannotator"),
+            clear_default_tool: false,
             args: &["--cmd", "qwen"],
             expect: vec![
                 ("tool", json!("qwen")),
@@ -672,6 +680,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "yolo_mode_default",
             config: "[session]\nyolo_mode_default = true",
             path_command: None,
+            clear_default_tool: false,
             args: &[],
             expect: vec![("yolo_mode", json!(true))],
         },
@@ -679,6 +688,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "--yolo flag",
             config: "",
             path_command: None,
+            clear_default_tool: false,
             args: &["--yolo"],
             expect: vec![("yolo_mode", json!(true))],
         },
@@ -687,6 +697,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             config: "[session]\ncustom_agents = { custom = \"bash -lc true\" }\n\
                      agent_detect_as = { custom = \"fake-agent\" }",
             path_command: None,
+            clear_default_tool: false,
             args: &["--tool", "custom", "--extra-args", "--flag value"],
             expect: vec![
                 ("tool", json!("custom")),
@@ -699,6 +710,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "custom agent without a detect_as mapping",
             config: "[session]\ncustom_agents = { custom = \"bash -lc true\" }",
             path_command: None,
+            clear_default_tool: false,
             args: &["--tool", "custom"],
             expect: vec![("tool", json!("custom")), ("detect_as", json!(""))],
         },
@@ -706,6 +718,7 @@ fn cli_add_resolves_tool_and_command_from_config() {
             name: "built-in --tool accepts --cmd-override",
             config: "",
             path_command: None,
+            clear_default_tool: false,
             args: &["--tool", "fake-agent", "--cmd-override", "custom-agent"],
             expect: vec![
                 ("tool", json!("fake-agent")),
@@ -718,6 +731,9 @@ fn cli_add_resolves_tool_and_command_from_config() {
         let mut h = TuiTestHarness::new("cli_add_config");
         if let Some(command) = case.path_command {
             h.install_path_command(command);
+        }
+        if case.clear_default_tool {
+            h.clear_default_tool();
         }
         if !case.config.is_empty() {
             h.append_config(case.config);

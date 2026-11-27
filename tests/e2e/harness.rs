@@ -842,6 +842,21 @@ last_seen_version = "{}"
         std::fs::write(&path, merged).expect("write config.toml");
     }
 
+    /// Remove the seeded `session.default_tool` so tests can exercise tool
+    /// auto-selection.
+    pub fn clear_default_tool(&self) {
+        let path = app_dir_in(self.home_path()).join("config.toml");
+        let mut config: toml::Table = std::fs::read_to_string(&path)
+            .expect("read seeded config")
+            .parse()
+            .expect("parse seeded config");
+        if let Some(toml::Value::Table(session)) = config.get_mut("session") {
+            session.remove("default_tool");
+        }
+        std::fs::write(&path, toml::to_string(&config).expect("serialize config"))
+            .expect("write config.toml");
+    }
+
     pub fn sessions_path(&self) -> PathBuf {
         app_dir_in(self.home_path())
             .join("profiles")
