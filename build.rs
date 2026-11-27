@@ -25,6 +25,8 @@ fn warn_on_deprecated_serve_feature() {
 /// `CARGO_PKG_VERSION`.
 fn emit_build_version() {
     if !stamps_git(&std::env::var("PROFILE").unwrap_or_default()) {
+        // Mask an exported AOE_BUILD_VERSION so `option_env!` cannot see it.
+        println!("cargo:rustc-env=AOE_BUILD_VERSION=");
         return;
     }
     let repo_dir = std::path::Path::new(".");

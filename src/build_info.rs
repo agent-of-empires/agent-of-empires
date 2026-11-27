@@ -14,11 +14,16 @@ use std::sync::LazyLock;
 /// Build identity of this binary. `main` calls it at startup so a debug
 /// identity describes the executable that started, not a later rebuild.
 pub fn build_version() -> &'static str {
-    if let Some(stamped) = option_env!("AOE_BUILD_VERSION") {
+    if let Some(stamped) = stamp(option_env!("AOE_BUILD_VERSION")) {
         return stamped;
     }
     static EXE: LazyLock<String> = LazyLock::new(exe_identity);
     &EXE
+}
+
+/// `build.rs` stamps an empty value in debug builds.
+fn stamp(raw: Option<&'static str>) -> Option<&'static str> {
+    raw.filter(|s| !s.is_empty())
 }
 
 fn exe_identity() -> String {
@@ -32,4 +37,20 @@ fn exe_identity() -> String {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |since| since.as_nanos());
     format!("{version}+exe.{mtime}.{}", meta.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stamp;
+
+    #[test]
+    fn an_empty_stamp_counts_as_unset() {
+        for (raw, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("1.0.0+gabc"), Some("1.0.0+gabc")),
+        ] {
+            assert_eq!(stamp(raw), expected, "{raw:?}");
+        }
+    }
 }
