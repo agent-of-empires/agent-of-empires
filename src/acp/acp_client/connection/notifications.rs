@@ -304,6 +304,7 @@ impl Shared {
         // still proves the agent is alive.
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
         self.settle_discarded().await;
+        let _gate = self.aoe.lifecycle_gate.lock().await;
         let epoch = self.prompt_epoch.load(Ordering::Relaxed);
         let ingested = self
             .aoe
@@ -317,11 +318,14 @@ impl Shared {
     pub(super) async fn settle_discarded(&self) {
         let skipped = self.ingress.take_discarded_adapter_frames();
         if skipped > 0 {
+            let _gate = self.aoe.lifecycle_gate.lock().await;
             let ingested = self.aoe.skip_frames(skipped, now_ms());
             self.handle_ingested(ingested).await;
         }
     }
 
+    /// The caller holds `lifecycle_gate` from before `ingest` admitted the
+    /// leases until the last event is emitted.
     async fn handle_ingested(&self, ingested: Ingested) {
         let (frames, lost) = match ingested {
             Ingested::Deliver(frames) => (frames, None),
@@ -333,11 +337,9 @@ impl Shared {
         for frame in frames {
             // Straight to the log: the `BackgroundTask*` interception in
             // `handle_adapter_notification` is for Claude's tool results.
-            let gate = self.aoe.lifecycle_gate.lock().await;
             for event in frame.lifecycle.iter().flat_map(lifecycle_events) {
                 self.emit(event).await;
             }
-            drop(gate);
             self.handle_adapter_notification(
                 frame.notification,
                 frame.local_prompt_signals,

@@ -214,8 +214,8 @@ impl AoeIngress {
     }
 
     /// Finishes the tasks and runs whose lease expired with no `ended`. Take
-    /// `lifecycle_gate` before calling and keep it while emitting: a renewal
-    /// racing the drain then emits its `Started` after the `Finished`.
+    /// `lifecycle_gate` before calling and keep it while emitting: a frame
+    /// admitted by `ingest` then emits its `Started` before a drain's `Finished`.
     pub(super) fn lapsed_events(&self, now_ms: i64) -> Vec<Event> {
         finish_events(self.leases.drain_expired(now_ms))
     }
