@@ -108,9 +108,6 @@ fn reserved_builtin(tool: &str) -> Option<&'static str> {
         .filter(|_| !super::bundled_agents::contains(tool))
 }
 
-/// Whether `entry` of an active `plugin` is a usable launch declaration. A
-/// bundled fallback is replaced only by a reserved-namespace API 21 launch
-/// declaration for its exact tool name; every other name is unrestricted.
 /// Whether `entry` is a complete launch declaration for a bundled fallback's tool.
 fn claims_bundled(entry: &AgentIntegrationContribution) -> bool {
     super::bundled_agents::contains(&entry.tool)
@@ -118,6 +115,9 @@ fn claims_bundled(entry: &AgentIntegrationContribution) -> bool {
         && entry.command.is_some()
 }
 
+/// Whether `entry` of an active `plugin` is a usable launch declaration. A
+/// bundled fallback is replaced only by a reserved-namespace API 21 launch
+/// declaration for its exact tool name; every other name is unrestricted.
 fn launch_declaration_applies(
     plugin: &super::LoadedPlugin,
     entry: &AgentIntegrationContribution,
