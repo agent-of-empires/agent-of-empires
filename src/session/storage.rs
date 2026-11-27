@@ -486,6 +486,8 @@ static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// path so the caller materialises a regular file there. Caps recursion at
 /// 32 hops, well below typical kernel MAXSYMLINKS limits (40 on Linux, 32 on
 /// Darwin); deeper chains are almost certainly loops.
+pub(crate) const MAX_SYMLINK_HOPS: usize = 32;
+
 pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
     let mut current = path.to_path_buf();
     let mut hops: usize = 0;
@@ -500,7 +502,7 @@ pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
             Ok(_) => {}
         }
 
-        if hops >= 32 {
+        if hops >= MAX_SYMLINK_HOPS {
             return Err(anyhow!("Symlink chain too deep: {}", path.display()));
         }
 

@@ -218,7 +218,7 @@ pub(crate) use storage::{
     replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage,
     GroupMovePlan, LaunchConfig, LockedDataFile, NativeStoreUnavailable, ProfileMoveRejected,
     SessionCommitApplied, SessionMutation, SessionStore, StorageFlock, StorageTransition,
-    STORAGE_LOCK_FILENAME,
+    MAX_SYMLINK_HOPS, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

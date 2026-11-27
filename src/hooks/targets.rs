@@ -680,4 +680,29 @@ mod tests {
             "defaults still count"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn builtin_hook_ownership_follows_chains_as_deep_as_the_writer() {
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR", "CODEX_HOME"]);
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join("links")).unwrap();
+        // 20 links, the last dangling at Claude's missing settings file.
+        let link = |n: usize| home.join(format!("links/l{n}"));
+        std::os::unix::fs::symlink(home.join(".claude/settings.json"), link(19)).unwrap();
+        for n in (0..19).rev() {
+            std::os::unix::fs::symlink(link(n + 1), link(n)).unwrap();
+        }
+
+        assert!(is_other_builtin_hook_path(
+            &link(0),
+            "example",
+            home,
+            &[],
+            &Default::default()
+        ));
+    }
 }

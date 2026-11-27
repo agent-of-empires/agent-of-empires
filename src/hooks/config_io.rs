@@ -90,7 +90,7 @@ pub(super) fn write_json(path: &Path, value: &Value) -> Result<()> {
 /// a file not created yet is seen before the installer creates it.
 pub(super) fn resolved(path: &Path) -> PathBuf {
     let mut current = path.to_path_buf();
-    for _ in 0..16 {
+    for _ in 0..crate::session::MAX_SYMLINK_HOPS {
         let is_link = std::fs::symlink_metadata(&current)
             .is_ok_and(|metadata| metadata.file_type().is_symlink());
         let Some(link) = is_link.then(|| std::fs::read_link(&current).ok()).flatten() else {
