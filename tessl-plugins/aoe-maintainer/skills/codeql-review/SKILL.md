@@ -6,8 +6,10 @@ description: "Triage the open CodeQL code scanning alerts of agent-of-empires as
 # CodeQL review
 
 Judge each open code scanning alert of `agent-of-empires/agent-of-empires` and
-record a Tessl finding for each true positive. This runs unattended with a
-read-only GitHub token. Do not dismiss alerts, comment, or push.
+record a Tessl finding for each true positive. This runs unattended with the
+`aoe-issues` token, which can also write issues, pull requests and Actions.
+Never use it to write: do not dismiss alerts, comment, label, open issues,
+rerun jobs, or push.
 
 ```sh
 REPO=agent-of-empires/agent-of-empires
@@ -29,8 +31,8 @@ gh api --paginate "repos/$REPO/code-scanning/alerts?state=open&per_page=100" \
 If the call fails with 403 or 404, or says the resource is not accessible,
 record one finding titled "codeql-review: token cannot read code scanning
 alerts", tagged `codeql-review` and `access`, with the error text as evidence
-and a recommendation to grant the Tessl App read access to code scanning
-alerts for the `aoe-readonly` environment. Then stop.
+and a recommendation to add "Code scanning alerts: Read" to the token in
+the `aoe-issues` environment. Then stop.
 
 ## 2. Skip alerts already judged
 

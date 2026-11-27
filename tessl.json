@@ -260,7 +260,7 @@
     },
     "codeql-review": {
       "skill": "file:./tessl-plugins/aoe-maintainer#codeql-review",
-      "environment": "aoe-readonly",
+      "environment": "aoe-issues",
       "agent": "claude",
       "model": "claude-opus-5-5",
       "effort": "high",
