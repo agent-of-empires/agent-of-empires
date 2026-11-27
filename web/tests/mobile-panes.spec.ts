@@ -83,6 +83,8 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await expect(page.getByRole("menuitemradio", { name: "Agent" })).toBeVisible();
     await expect(picker(page)).toBeHidden();
     await expect(drawer).toBeHidden();
+    // The backdrop takes the closing tap, so it never lands on the Session beneath.
+    expect((await page.getByTestId("overflow-menu-backdrop").boundingBox())?.height).toBe(viewport.height);
     await page.mouse.click(24, viewport.height - 120);
     await expect(page.getByRole("menuitemradio", { name: "Agent" })).toBeHidden();
     await swipe(page, viewport.width / 2 - 80, viewport.width / 2 + 80, y);

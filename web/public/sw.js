@@ -28,11 +28,11 @@ self.addEventListener("activate", (e) => {
 
 const OFFLINE_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#18181b"><title>Agent of Empires: offline</title>
-<style>html,body{height:100%;margin:0;background:#18181b;color:#e4e4e7;font:16px/1.5 system-ui,-apple-system,sans-serif}
+<meta name="theme-color" content="#1f1f1f"><title>Agent of Empires: offline</title>
+<style>html,body{height:100%;margin:0;background:#1f1f1f;color:#e5e5e5;font:16px/1.5 system-ui,-apple-system,sans-serif}
 main{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:24px;text-align:center}
-h1{font-size:20px;margin:0}p{margin:0;color:#a1a1aa;max-width:22rem}
-button{margin-top:8px;height:44px;padding:0 24px;border:0;border-radius:10px;background:#f59e0b;color:#18181b;font:600 15px system-ui,sans-serif}</style>
+h1{font-size:20px;margin:0}p{margin:0;color:#a3a3a3;max-width:22rem}
+button{margin-top:8px;height:44px;padding:0 24px;border:0;border-radius:10px;background:#f59e0b;color:#1f1f1f;font:600 15px system-ui,sans-serif}</style>
 </head><body><main><h1>Can't reach Agent of Empires</h1>
 <p>This device is offline or the Daemon is not answering. Your sessions keep running.</p>
 <button onclick="location.reload()">Try again</button></main>
@@ -81,7 +81,8 @@ self.addEventListener("fetch", (e) => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
   if (request.mode === "navigate") {
-    e.respondWith(navigate(request));
+    // Only the app's own pages are its shell: a plugin page or other HTML under /api/ is not.
+    if (request.destination === "document" && !url.pathname.startsWith("/api/")) e.respondWith(navigate(request));
   } else if (url.pathname.startsWith("/assets/")) {
     e.respondWith(asset(request));
   }

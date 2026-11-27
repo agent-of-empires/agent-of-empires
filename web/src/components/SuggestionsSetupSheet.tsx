@@ -12,6 +12,7 @@ import { PluginInstallConsentModal } from "./settings/PluginInstallConsentModal"
 import { PluginJobProgressModal } from "./settings/PluginJobProgressModal";
 import { sourceFromCommand, usePluginMarketplace, type PluginJobRef } from "./settings/pluginFlows";
 import { BUTTON_INLINE } from "../lib/surfaces";
+import { CloseButton } from "./Dialog";
 
 interface Props {
   /** Featured providers that declare `[suggestions]` and are not installed yet. */
@@ -103,19 +104,7 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
       <div className="max-h-[90vh] w-full max-w-[560px] overflow-auto rounded-lg border border-surface-700 bg-surface-900">
         <div className="flex items-center justify-between border-b border-surface-700/40 px-4 py-3">
           <h2 className="text-[15px] font-semibold text-text-bright">{title}</h2>
-          {step !== "done" && (
-            <button
-              type="button"
-              title="Close"
-              aria-label="Close"
-              disabled={installing}
-              onClick={close}
-              className="size-8 rounded-md text-text-dim hover:bg-surface-800 disabled:opacity-50"
-              data-testid="suggestions-setup-close"
-            >
-              ✕
-            </button>
-          )}
+          {step !== "done" && <CloseButton onClick={close} disabled={installing} testId="suggestions-setup-close" />}
         </div>
         {step === "pick" && (
           <PickStep

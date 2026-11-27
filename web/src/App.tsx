@@ -3376,8 +3376,9 @@ function AppContent({
                 }`}
               >
                 {phoneDrawer && (
-                  // Floats over the Session, which scrolls beneath it; only its controls take taps.
-                  <div className="md:hidden absolute inset-x-0 top-0 z-30 translate-y-[var(--vv-offset-top,0px)] pointer-events-none [&_button]:pointer-events-auto [&_[role=menu]]:pointer-events-auto [&_[data-testid=session-title-pill]]:pointer-events-auto">
+                  // Floats over the Session, which scrolls beneath it; only its controls take taps. Placed by `top`, not a
+                  // transform, which would bound the ⋯ backdrop's `fixed` box to this strip.
+                  <div className="md:hidden absolute inset-x-0 top-[var(--vv-offset-top,0px)] z-30 pointer-events-none [&_button]:pointer-events-auto [&_[role=menu]]:pointer-events-auto [&_[data-testid=session-title-pill]]:pointer-events-auto">
                     {topBar}
                   </div>
                 )}

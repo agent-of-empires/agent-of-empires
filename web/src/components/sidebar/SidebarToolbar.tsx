@@ -60,7 +60,7 @@ export function SidebarToolbar({
   const axisHeading = AXIS_HEADING[axis];
   return (
     <div
-      className={`${compact ? "px-1" : "pl-4 pr-2"} pt-4 pb-1 max-md:pt-3 max-md:pb-2 max-md:pr-3 max-md:sticky max-md:top-0 max-md:z-10 max-md:bg-surface-950 flex items-center`}
+      className={`${compact ? "px-1" : "pl-4 pr-2"} pt-2.5 pb-1.5 max-md:pt-3 max-md:pb-2 max-md:pr-3 max-md:sticky max-md:top-0 max-md:z-10 max-md:bg-surface-950 flex items-center`}
     >
       {compact ? (
         <span className="flex-1" />

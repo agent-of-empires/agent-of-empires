@@ -106,18 +106,18 @@
   --color-accent-700: #0f766e;
 
   /* Surfaces, derived from zinc.background and border */
-  --color-surface-500: #65656b;
-  --color-surface-600: #525258;
-  --color-surface-700: #3f3f46;
-  --color-surface-800: #2e2e31;
-  --color-surface-850: #27272a;
-  --color-surface-900: #1c1c1f;
-  --color-surface-950: #0f0f11;
+  --color-surface-500: #666666;
+  --color-surface-600: #535353;
+  --color-surface-700: #404040;
+  --color-surface-800: #313131;
+  --color-surface-850: #2a2a2a;
+  --color-surface-900: #1f1f1f;
+  --color-surface-950: #111111;
 
   /* Semantic Text */
-  --color-text-primary: #e4e4e7;
-  --color-text-secondary: #a1a1aa;
-  --color-text-muted: #71717a;
+  --color-text-primary: #e5e5e5;
+  --color-text-secondary: #a3a3a3;
+  --color-text-muted: #737373;
   --color-text-dim: #97979f;
   --color-text-subtle: #97979f;
   --color-text-bright: #fafafa;
@@ -134,7 +134,7 @@
      so the breathe rattle's pulse stays visually consistent. One rung
      dimmer than waiting so the hierarchy reads bright > amber > slate. */
   --color-status-fresh-idle: #f59e0b;
-  --color-status-idle: #71717a;
+  --color-status-idle: #737373;
   /* Unread accent: a finished turn the user hasn't viewed, or a manual flag.
      Sits between waiting and idle on the attention scale. Theme-projected
      from `theme.unread` (see resolved.rs); this default matches `zinc`. */
@@ -146,7 +146,7 @@
      4.5:1 on surface-900, -850 and the error banner's tint (see resolved.rs). This default is zinc's. */
   --color-status-error-text: #f26969;
   --color-status-starting: #f59e0b;
-  --color-status-stopped: #52525b;
+  --color-status-stopped: #525252;
   /* Dormant: a structured-view worker auto-stopped for inactivity
      (resumable), distinct from a deliberate Stop. A dim amber, brighter
      than the slate Stopped grey but muted well below the fresh-idle
@@ -159,8 +159,8 @@
      projection (see src/tui/styles/resolved.rs). These build-time
      defaults match the `zinc` builtin theme so cold-load paint
      matches the post-fetch paint when no localStorage cache exists. */
-  --color-selection: #3f3f46;
-  --color-session-selection: #52525b;
+  --color-selection: #404040;
+  --color-session-selection: #525252;
   /* Edge marking a collapsed sidebar group that holds the open session. Projected as the theme
      accent lifted until it clears 3:1 against every surface it can sit on
      (see resolved.rs); zinc's accent already does, so this matches
@@ -177,19 +177,19 @@
 
   /* Terminal cold-load defaults, the `zinc` builtin's projection in
      src/tui/styles/resolved.rs; the resolved theme overrides them. */
-  --term-bg: #1c1c1f;
-  --term-fg: #e4e4e7;
+  --term-bg: #1f1f1f;
+  --term-fg: #e5e5e5;
   --term-cursor: #f59e0b;
   --term-selection-bg: rgba(161, 161, 170, 0.35);
-  --term-color-0: #1c1c1f;
+  --term-color-0: #1f1f1f;
   --term-color-1: #ef4444;
   --term-color-2: #22c55e;
   --term-color-3: #fbbf24;
   --term-color-4: #0d9488;
   --term-color-5: #f59e0b;
   --term-color-6: #0d9488;
-  --term-color-7: #e4e4e7;
-  --term-color-8: #8b8b94;
+  --term-color-7: #e5e5e5;
+  --term-color-8: #8f8f8f;
   --term-color-9: #f26969;
   --term-color-10: #4ed17e;
   --term-color-11: #fccc50;
@@ -615,7 +615,7 @@ html[data-ios-standalone]:not([data-editing]) {
   0%,
   50% {
     background-color: var(--term-cursor, #f59e0b);
-    color: var(--term-bg, #1c1c1f);
+    color: var(--term-bg, #1f1f1f);
   }
   50.001%,
   100% {
@@ -816,6 +816,16 @@ select:focus-visible,
 }
 @utility drawer-card-shadow {
   box-shadow: var(--drawer-card-shadow);
+}
+
+/* An overlay's close button: a small raised disc on the overlay's surface, not a bare glyph. */
+@utility close-bubble {
+  border-radius: 9999px;
+  background-color: var(--color-surface-800);
+  border: 1px solid color-mix(in srgb, var(--color-text-primary) 9%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 8%, transparent),
+    0 1px 3px rgb(0 0 0 / 0.35);
 }
 
 @utility float-control {

@@ -18,7 +18,7 @@ Suggestions stay off until you set them up. A **New: suggested sessions** tip sh
 
 ### Homepage and `/suggestions`
 
-The homepage shows up to 3 suggestions under "Suggested sessions", with **View all (N)** linking to `/suggestions`. On a phone, whose home is the session list, the list opens with up to 2 above the sessions. Turn the section off in Settings › Suggestions.
+The homepage shows up to 3 suggestions (2 on a narrow screen) under "Suggested sessions", with **View all (N)** linking to `/suggestions`. Turn the section off in Settings › Suggestions.
 
 The full view lists every suggestion, one line per row, grouped by repo:
 

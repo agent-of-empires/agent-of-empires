@@ -353,157 +353,161 @@ export function WorkspaceSidebar(props: Props) {
           open ? "" : "md:hidden"
         }`}
       >
-        <SidebarNav compact={compact} offline={offline} onNew={() => props.onNew()} onSearch={props.onOpenPalette} />
-        <SidebarToolbar
-          compact={compact}
-          axis={axis}
-          onAxisChange={props.onAxisChange}
-          sortMode={props.sortMode}
-          onSortModeChange={props.onSortModeChange}
-          pluginSorts={pluginSorts}
-          pluginSortRef={props.pluginSortRef}
-          onPluginSortChange={props.onPluginSortChange}
-          hasFacets={facets.facetSpecs.length > 0}
-          facetsActive={facets.activeFacets.length > 0}
-          facetOpen={facetOpen}
-          onToggleFacets={() => setFacetOpen((o) => !o)}
-          filterOpen={filterOpen}
-          onToggleFilter={toggleFilter}
-          headingAnchored={!!props.drawer}
-          onHome={props.onHome}
-          phoneMenu={
-            props.menuItems && (
-              <OverflowMenu items={props.menuItems} phoneFloating triggerDataTour={TOUR_ANCHORS.topbarMore} />
-            )
-          }
-        />
-
-        {filterOpen && !compact && (
-          <div className="px-3 pb-2">
-            <input
-              ref={filterRef}
-              type="text"
-              value={filterQuery}
-              onChange={(e) => setFilterQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") toggleFilter();
-              }}
-              placeholder="Filter by name, branch, agent..."
-              data-testid="sidebar-filter-input"
-              className="w-full bg-surface-800 border border-surface-700 rounded-md px-2.5 py-1.5 text-[13px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+        {/* New session and Search scroll away with the list, as Claude's do; the list's title row, with its view options
+            and filters, stays at the top. */}
+        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+          <SidebarNav compact={compact} offline={offline} onNew={() => props.onNew()} onSearch={props.onOpenPalette} />
+          {/* The canvas gradient, fixed to the viewport, so the pinned row matches what it scrolls over. */}
+          <div className="sticky top-0 z-10 md:chrome-canvas md:bg-fixed md:border-b md:border-surface-700/40">
+            <SidebarToolbar
+              compact={compact}
+              axis={axis}
+              onAxisChange={props.onAxisChange}
+              sortMode={props.sortMode}
+              onSortModeChange={props.onSortModeChange}
+              pluginSorts={pluginSorts}
+              pluginSortRef={props.pluginSortRef}
+              onPluginSortChange={props.onPluginSortChange}
+              hasFacets={facets.facetSpecs.length > 0}
+              facetsActive={facets.activeFacets.length > 0}
+              facetOpen={facetOpen}
+              onToggleFacets={() => setFacetOpen((o) => !o)}
+              filterOpen={filterOpen}
+              onToggleFilter={toggleFilter}
+              headingAnchored={!!props.drawer}
+              onHome={props.onHome}
+              phoneMenu={
+                props.menuItems && (
+                  <OverflowMenu items={props.menuItems} phoneFloating triggerDataTour={TOUR_ANCHORS.topbarMore} />
+                )
+              }
             />
-          </div>
-        )}
 
-        {facetOpen && !compact && facets.facetSpecs.length > 0 && (
-          <FacetPanel
-            facetSpecs={facets.facetSpecs}
-            selectedValues={facets.selectedValues}
-            onToggle={facets.toggleValue}
-          />
-        )}
-
-        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/40 px-2 pt-1">
-          {isNested ? (
-            <NestedGroupList
-              ctx={ctx}
-              groups={filteredNested}
-              fullGroups={nestedGroups}
-              onToggleGroup={props.onToggleGroup}
-              onToggleSubgroup={props.onToggleSubgroup}
-            />
-          ) : isOrgAxis ? (
-            <OrgGroupList
-              ctx={ctx}
-              groups={filteredOrgGroups}
-              fullGroups={orgGroups}
-              onToggleOrg={props.onToggleOrg}
-              onToggleOrgRepo={props.onToggleOrgRepo}
-            />
-          ) : (
-            <FlatGroupList
-              ctx={ctx}
-              groups={filteredGroups}
-              fullGroups={groups}
-              reorderDisabled={reorderDisabled}
-              groupDragDisabled={reorderDisabled || q.length > 0}
-              onToggleGroup={props.onToggleGroup}
-              onReorderGroups={props.onReorderGroups}
-              onReorderWorkspaces={props.onReorderWorkspaces}
-              dragClickGuard={dragClickGuard}
-            />
-          )}
-
-          {sunk.length > 0 && (
-            <div data-testid="sidebar-sunk-section">
-              <button
-                onClick={toggleSunkExpanded}
-                onKeyDown={onSidebarArrowKey}
-                data-testid="sidebar-sunk-toggle"
-                aria-expanded={sunkExpanded}
-                // A header for the arrow keys like a Group's, so Left on one of its rows comes back here.
-                aria-controls={SUNK_ROWS}
-                {...{ [NAV_ITEM]: "" }}
-                className={`w-full flex items-center gap-2 py-1.5 rounded-md text-[12px] font-medium text-text-dim hover:text-text-secondary hover:bg-surface-800/60 cursor-pointer transition-colors border-t border-surface-800/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 max-md:mt-4 max-md:border-t-0 max-md:text-[12px] max-md:uppercase max-md:tracking-[0.06em] max-md:font-semibold ${
-                  compact ? "px-2" : "px-3 md:tracking-widest"
-                }`}
-              >
-                <FoldChevron
-                  className={`shrink-0 transition-transform duration-75 ${sunkExpanded ? "" : "-rotate-90"}`}
+            {filterOpen && !compact && (
+              <div className="px-3 pb-2">
+                <input
+                  ref={filterRef}
+                  type="text"
+                  value={filterQuery}
+                  onChange={(e) => setFilterQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") toggleFilter();
+                  }}
+                  placeholder="Filter by name, branch, agent..."
+                  data-testid="sidebar-filter-input"
+                  className="w-full bg-surface-800 border border-surface-700 rounded-md px-2.5 py-1.5 text-[13px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
                 />
-                {/* The count and wide tracking do not fit the compact rail. */}
-                <span className="truncate">Snoozed &amp; archived{compact ? "" : ` (${sunk.length})`}</span>
-              </button>
-              <div id={SUNK_ROWS} {...{ [ROWS]: "" }}>
-                {sunkExpanded && sunk.map((v) => <SessionRow key={v.key} {...ctx.rowProps(v)} indented />)}
               </div>
-            </div>
-          )}
+            )}
 
-          {(props.canManageProjects ?? true) && (
-            <ProjectsSection
-              projects={props.savedProjects}
-              drawsRepoHeaders={axisDrawsRepoHeaders(axis)}
-              query={q}
-              readOnly={readOnly}
-              offline={offline}
-              onCreateSession={props.onCreateSession}
-              onAddProject={props.onAddProject}
-              onEditProject={props.onEditProject}
-              onRemoveProject={props.onRemoveProject}
-            />
-          )}
+            {facetOpen && !compact && facets.facetSpecs.length > 0 && (
+              <FacetPanel
+                facetSpecs={facets.facetSpecs}
+                selectedValues={facets.selectedValues}
+                onToggle={facets.toggleValue}
+              />
+            )}
+          </div>
+          <div className="px-2 pt-1">
+            {isNested ? (
+              <NestedGroupList
+                ctx={ctx}
+                groups={filteredNested}
+                fullGroups={nestedGroups}
+                onToggleGroup={props.onToggleGroup}
+                onToggleSubgroup={props.onToggleSubgroup}
+              />
+            ) : isOrgAxis ? (
+              <OrgGroupList
+                ctx={ctx}
+                groups={filteredOrgGroups}
+                fullGroups={orgGroups}
+                onToggleOrg={props.onToggleOrg}
+                onToggleOrgRepo={props.onToggleOrgRepo}
+              />
+            ) : (
+              <FlatGroupList
+                ctx={ctx}
+                groups={filteredGroups}
+                fullGroups={groups}
+                reorderDisabled={reorderDisabled}
+                groupDragDisabled={reorderDisabled || q.length > 0}
+                onToggleGroup={props.onToggleGroup}
+                onReorderGroups={props.onReorderGroups}
+                onReorderWorkspaces={props.onReorderWorkspaces}
+                dragClickGuard={dragClickGuard}
+              />
+            )}
 
-          {!hasResults && hasFilter && (
-            <div className="px-4 py-8 text-center">
-              <p className="text-sm text-text-muted">No matches for &ldquo;{activeFilterQuery}&rdquo;</p>
-            </div>
-          )}
+            {sunk.length > 0 && (
+              <div data-testid="sidebar-sunk-section">
+                <button
+                  onClick={toggleSunkExpanded}
+                  onKeyDown={onSidebarArrowKey}
+                  data-testid="sidebar-sunk-toggle"
+                  aria-expanded={sunkExpanded}
+                  // A header for the arrow keys like a Group's, so Left on one of its rows comes back here.
+                  aria-controls={SUNK_ROWS}
+                  {...{ [NAV_ITEM]: "" }}
+                  className={`w-full flex items-center gap-2 py-1.5 rounded-md text-[12px] font-medium text-text-dim hover:text-text-secondary hover:bg-surface-800/60 cursor-pointer transition-colors border-t border-surface-800/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 max-md:mt-4 max-md:border-t-0 max-md:text-[12px] max-md:uppercase max-md:tracking-[0.06em] max-md:font-semibold ${
+                    compact ? "px-2" : "px-3 md:tracking-widest"
+                  }`}
+                >
+                  <FoldChevron
+                    className={`shrink-0 transition-transform duration-75 ${sunkExpanded ? "" : "-rotate-90"}`}
+                  />
+                  {/* The count and wide tracking do not fit the compact rail. */}
+                  <span className="truncate">Snoozed &amp; archived{compact ? "" : ` (${sunk.length})`}</span>
+                </button>
+                <div id={SUNK_ROWS} {...{ [ROWS]: "" }}>
+                  {sunkExpanded && sunk.map((v) => <SessionRow key={v.key} {...ctx.rowProps(v)} indented />)}
+                </div>
+              </div>
+            )}
 
-          {/* Unreachable, the list is unknown rather than empty; the banner above says why. */}
-          {!hasResults && !hasFilter && !offline && (
-            <div className="px-4 py-10 text-center" data-testid="sidebar-empty-state">
-              <p className="text-sm font-medium text-text-secondary">No sessions yet</p>
-              <p className="mt-1 text-[13px] text-text-muted">Create a session to start working in a repo.</p>
-              <button
-                onClick={() => props.onNew()}
-                disabled={offline}
-                className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-600"
-              >
-                <PlusIcon size={14} />
-                New session
-              </button>
-            </div>
-          )}
+            {(props.canManageProjects ?? true) && (
+              <ProjectsSection
+                projects={props.savedProjects}
+                drawsRepoHeaders={axisDrawsRepoHeaders(axis)}
+                query={q}
+                readOnly={readOnly}
+                offline={offline}
+                onCreateSession={props.onCreateSession}
+                onAddProject={props.onAddProject}
+                onEditProject={props.onEditProject}
+                onRemoveProject={props.onRemoveProject}
+              />
+            )}
 
-          {props.suggestions && <SidebarSuggestions readOnly={readOnly} {...props.suggestions} />}
+            {!hasResults && hasFilter && (
+              <div className="px-4 py-8 text-center">
+                <p className="text-sm text-text-muted">No matches for &ldquo;{activeFilterQuery}&rdquo;</p>
+              </div>
+            )}
+
+            {/* Unreachable, the list is unknown rather than empty; the banner above says why. */}
+            {!hasResults && !hasFilter && !offline && (
+              <div className="px-4 py-10 text-center" data-testid="sidebar-empty-state">
+                <p className="text-sm font-medium text-text-secondary">No sessions yet</p>
+                <p className="mt-1 text-[13px] text-text-muted">Create a session to start working in a repo.</p>
+                <button
+                  onClick={() => props.onNew()}
+                  disabled={offline}
+                  className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-600"
+                >
+                  <PlusIcon size={14} />
+                  New session
+                </button>
+              </div>
+            )}
+
+            {props.suggestions && <SidebarSuggestions readOnly={readOnly} {...props.suggestions} />}
+          </div>
         </div>
-
-        <SidebarSystemHealth />
 
         {/* The rail is a fixed 88px, so its controls stack to fit a scaled root font. */}
         <div
-          className={`p-2 max-md:px-4 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] max-md:sticky max-md:bottom-0 max-md:bg-surface-950 max-md:gap-2 flex items-center ${
+          className={`relative p-2 max-md:px-4 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] max-md:sticky max-md:bottom-0 max-md:bg-surface-950 max-md:gap-2 max-md:flex-wrap flex items-center ${
             compact ? "flex-col gap-2" : "gap-1"
           }`}
         >
@@ -526,7 +530,7 @@ export function WorkspaceSidebar(props: Props) {
             onClick={props.onSettings}
             {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
             // A phone's row reads as Muse's: settings, search, then a new session.
-            className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors max-md:order-first max-md:w-11 max-md:h-11 max-md:rounded-full max-md:float-control"
+            className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors max-md:-order-1 max-md:w-11 max-md:h-11 max-md:rounded-full max-md:float-control"
             title="Settings"
             aria-label="Settings"
           >
@@ -535,7 +539,11 @@ export function WorkspaceSidebar(props: Props) {
               <circle cx="12" cy="12" r="3" />
             </StrokeIcon>
           </button>
-          {/* Wide screens keep Search and New session in the nav rows above the list. */}
+          {/* Beside Settings on a wide screen; a phone gives it a line of its own above its controls. */}
+          <div className="contents max-md:flex max-md:order-first max-md:basis-full">
+            <SidebarSystemHealth />
+          </div>
+          {/* Wide screens keep Search and New session in the row above the list. */}
           {!compact && props.onOpenPalette && (
             // iOS raises the keyboard only for a focus inside the tap, and the palette's input mounts after it: this
             // takes the focus first, and the palette's input then takes it over with the keyboard already up.

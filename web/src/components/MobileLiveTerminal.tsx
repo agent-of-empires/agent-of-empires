@@ -768,8 +768,8 @@ export function MobileLiveTerminal({
             lineHeight: `${lineH}px`,
             // A variable, so a re-measure restyles mounted rows without re-rendering them.
             "--term-cell": `${charW}px`,
-            background: "var(--term-bg, #1c1c1f)",
-            color: "var(--term-fg, #e4e4e7)",
+            background: "var(--term-bg, #1f1f1f)",
+            color: "var(--term-fg, #e5e5e5)",
             // A fixed grid: ligatures would merge cells.
             fontVariantLigatures: "none",
             fontFeatureSettings: '"liga" 0, "calt" 0',

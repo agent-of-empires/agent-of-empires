@@ -125,9 +125,9 @@ export function CloseButton({
       disabled={disabled}
       data-testid={testId}
       aria-label={label}
-      className="-mr-2 shrink-0 inline-flex items-center justify-center h-8 w-8 max-md:h-11 max-md:w-11 rounded-lg text-text-dim hover:text-text-primary hover:bg-surface-700/50 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+      className="close-bubble shrink-0 inline-flex items-center justify-center h-8 w-8 max-md:h-10 max-md:w-10 text-text-secondary hover:text-text-primary hover:bg-surface-700 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
     >
-      <X className="h-4 w-4" aria-hidden="true" />
+      <X className="h-4 w-4" strokeWidth={2} aria-hidden="true" />
     </button>
   );
 }

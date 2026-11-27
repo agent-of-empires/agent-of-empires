@@ -1,7 +1,7 @@
 // A backgrounded shell command's row, and its command and output.
 
 import { useEffect, useRef, useState } from "react";
-import { Maximize2, Terminal, X } from "lucide-react";
+import { Maximize2, Terminal } from "lucide-react";
 
 import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { fetchTaskOutput, type TaskOutput } from "../../lib/api";
@@ -9,6 +9,7 @@ import type { BackgroundShell } from "../../lib/acpTypes";
 import { BACKDROP, DIALOG } from "../../lib/surfaces";
 import { BUTTON_GHOST_SM, CAPTION_INLINE, CODE_BLOCK } from "../../lib/surfaces";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
+import { CloseButton } from "../Dialog";
 
 const OUTPUT_POLL_MS = 2000;
 // Failed reads retried after the shell ended, before the modal gives up.
@@ -108,14 +109,7 @@ export function ShellDetailModal({
           <Terminal className="h-4 w-4 shrink-0 text-text-dim" />
           <span className="min-w-0 flex-1 truncate text-sm font-semibold text-text-bright">Background shell</span>
           <span className="shrink-0 text-[11px] text-text-dim">{shell.finished ? "done" : "running"}</span>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="flex h-7 w-7 max-md:h-11 max-md:w-11 cursor-pointer items-center justify-center rounded-md text-text-muted transition-colors hover:bg-surface-700/50 hover:text-text-secondary"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <CloseButton onClick={onClose} />
         </div>
         <div className="flex min-h-0 flex-col gap-3 overflow-y-auto px-4 py-3 text-[12px]">
           <div className="flex flex-col gap-0.5">

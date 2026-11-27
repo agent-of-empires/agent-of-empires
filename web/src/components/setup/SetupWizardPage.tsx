@@ -1,4 +1,4 @@
-import { ArrowRight, ChevronUp, X } from "lucide-react";
+import { ArrowRight, ChevronUp } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useInlineMachineSave } from "../../hooks/useInlineMachineSave";
@@ -25,6 +25,7 @@ import { SandboxStep } from "./steps/SandboxStep";
 import { ThemeTelemetryStep, type TelemetryLoad } from "./steps/ThemeTelemetryStep";
 import { WorktreesStep } from "./steps/WorktreesStep";
 import { BUTTON_INLINE } from "../../lib/surfaces";
+import { CloseButton } from "../Dialog";
 
 interface Props {
   status: SetupStatus;
@@ -437,14 +438,7 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
               <span className="ml-auto mr-3 text-xs text-text-secondary">
                 {done} of {steps.length} done
               </span>
-              <button
-                type="button"
-                aria-label="Close"
-                onClick={() => setSheetOpen(false)}
-                className="h-11 w-11 flex items-center justify-center cursor-pointer"
-              >
-                <X size={16} />
-              </button>
+              <CloseButton onClick={() => setSheetOpen(false)} />
             </div>
             {rail}
             <p className="text-sm text-text-secondary">{LEAVE_NOTE}</p>

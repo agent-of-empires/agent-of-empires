@@ -11,7 +11,8 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
-import { Check, X } from "lucide-react";
+import { Check } from "lucide-react";
+import { CloseButton } from "./Dialog";
 import { createPortal } from "react-dom";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import {
@@ -132,15 +133,9 @@ export function ContextMenu({
                 {typeof heading === "string" ? <span className={MENU_HEADING_TEXT}>{heading}</span> : heading}
               </div>
               {sheetOnMobile && onClose && (
-                <button
-                  type="button"
-                  onClick={onClose}
-                  data-testid={`${testId}-close`}
-                  aria-label="Close"
-                  className="md:hidden shrink-0 -mr-1.5 flex h-10 w-10 items-center justify-center rounded-md text-text-muted hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
-                >
-                  <X className="h-5 w-5" />
-                </button>
+                <span className="md:hidden flex">
+                  <CloseButton onClick={onClose} testId={`${testId}-close`} />
+                </span>
               )}
             </div>
           </div>

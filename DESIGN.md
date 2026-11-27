@@ -102,8 +102,8 @@ content. It is denser and quieter than the marketing site.
   status, severity, syntax, user content, third-party visualizations, and the
   brand mark.
 - Mobile prioritizes monitoring and conversation controls, after Muse and
-  Claude's iOS app: the session list is home, and with a Session open it is a
-  darker drawer under the Session, which slides aside as one rounded, dimmed
+  Claude's iOS app: the landing page is home, and the session list is a darker
+  drawer under the page, which slides aside as one rounded, dimmed
   card, header and all, following the finger. Controls float
   (`float-control`: a solid surface, hairline edge and soft shadow) over the
   Session, which scrolls beneath them; menus are frosted (`glass-menu`); a Session's views switch from

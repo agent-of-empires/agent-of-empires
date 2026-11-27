@@ -177,7 +177,7 @@
         "web/src/lib/paneLayout.ts",
         "web/src/lib/panes.ts"
       ],
-      "notes": "A terminal tab opens in the bottom dock unless a terminal is already open elsewhere, and a saved right-dock terminal stays on the right. A terminal tab is bound to one Session's shell (terminal:<sessionId>:<n>) and stays, still showing that shell, when the sidebar selects another Session; every Session shows the shared terminal tabs while its other panels stay per Session. v3 layouts bind their terminal tabs to the Session they belonged to. The dock switcher and Cmd/Ctrl+Shift+` list every live paired shell from the Daemon's auxiliary observations, the selected Session first; picking one focuses its tab or opens one. The phone picker lists the same shells and shows the pick in the paired view, with Host/Container in its header for sandboxed Sessions."
+      "notes": "A terminal tab opens in the right dock, stacked below the review panes, or in whichever dock already holds a terminal. A terminal tab is bound to one Session's shell (terminal:<sessionId>:<n>) and stays, still showing that shell, when the sidebar selects another Session; every Session shows the shared terminal tabs while its other panels stay per Session. v3 layouts bind their terminal tabs to the Session they belonged to. The dock switcher and Cmd/Ctrl+Shift+` list every live paired shell from the Daemon's auxiliary observations, the selected Session first; picking one focuses its tab or opens one. The phone picker lists the same shells and shows the pick in the paired view, with Host/Container in its header for sandboxed Sessions."
     },
     {
       "id": "app-shell.docks",
@@ -3731,6 +3731,14 @@
       "risk": "medium",
       "specs": ["tests/live/session-lifecycle.spec.ts"],
       "components": ["web/src/components/DisconnectBanner.tsx"]
+    },
+    {
+      "id": "connectivity.offline-shell",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/__tests__/sw.test.ts"],
+      "components": ["web/public/sw.js"],
+      "notes": "The service worker keeps the last app page a document navigation fetched and serves it, or a page with Try again, when the network fails; hashed /assets/ files are served from Cache Storage once fetched, and a Cache Storage failure never fails a fetched asset. Plugin page frames, /api/ navigations, non-GET and cross-origin requests go to the network."
     },
     {
       "id": "connectivity.lifecycle-fetch-toasts",

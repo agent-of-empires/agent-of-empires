@@ -281,7 +281,7 @@ mod tests {
     const BUILTIN_COLOR_ANCHORS: &[(&str, Color, Color)] = &[
         (
             "zinc",
-            Color::Rgb(0x1c, 0x1c, 0x1f),
+            Color::Rgb(0x1f, 0x1f, 0x1f),
             Color::Rgb(0xfb, 0xbf, 0x24),
         ),
         (
