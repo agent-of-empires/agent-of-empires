@@ -73,5 +73,5 @@ The Unix Mio consumer retains fetched control events across early returns and
 refreshes TTY readiness before polling again instead of reading a saved hint.
 The upstream parser and other backends are unchanged.
 
-Fork provenance, update ownership, supported distribution, and required release
-checks are documented in [Vendored dependencies](docs/development/releases.md#vendored-dependencies).
+See [Experimental vendored dependencies](docs/development/releases.md#experimental-vendored-dependencies)
+for provenance and release conditions.
