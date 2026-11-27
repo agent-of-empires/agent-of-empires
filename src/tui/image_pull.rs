@@ -247,8 +247,8 @@ pub(crate) struct Flight {
 pub(crate) enum Applied {
     Unchanged,
     Changed,
-    /// The pull finished, and this is it: the update it installed is now local.
-    Updated(Flight),
+    /// The pull finished, with the digest the Daemon says it installed, if it said.
+    Updated(Option<String>),
     /// The request got no answer; the text says what didn't happen.
     Unanswered(&'static str),
     /// The Start got no answer, but the Daemon may have registered it: poll now.
@@ -346,10 +346,9 @@ impl PullWatch {
                 self.end(None);
                 return Applied::Unanswered(START_UNANSWERED);
             }
-            PullReport::State(PullState::Done { .. }) => {
-                let flight = std::mem::take(&mut self.shown);
+            PullReport::State(PullState::Done { digest }) => {
                 self.end(Some(PullLine::Done));
-                applied = Applied::Updated(flight);
+                applied = Applied::Updated(digest);
             }
             PullReport::State(PullState::Cancelled) => self.end(Some(PullLine::Cancelled)),
             PullReport::State(PullState::Failed { reason, .. }) => {
@@ -532,9 +531,10 @@ impl PullWatch {
             PullReport::State(PullState::Running(snapshot)) => {
                 self.behind = Some(PullLine::Running(*snapshot));
             }
-            PullReport::State(PullState::Done { .. }) if self.behind_running() => {
+            PullReport::State(PullState::Done { digest }) if self.behind_running() => {
                 self.behind = Some(PullLine::Done);
-                return Some(Applied::Updated(std::mem::take(&mut self.behind_flight)));
+                self.behind_flight = Flight::default();
+                return Some(Applied::Updated(digest.clone()));
             }
             PullReport::State(state) if self.behind.is_some() => {
                 // An ended or vanished pull's update goes with it.
@@ -595,14 +595,6 @@ mod tests {
 
     const IMAGE: &str = "aoe-test/tui-pull-source:latest";
 
-    /// The record of a pull this TUI started with nothing on offer.
-    fn ours() -> Flight {
-        Flight {
-            started_here: true,
-            ..Flight::default()
-        }
-    }
-
     fn running(done: u32) -> PullReport {
         PullReport::State(PullState::Running(ProgressSnapshot {
             layers_done: Some(done),
@@ -624,7 +616,11 @@ mod tests {
     #[test]
     fn a_pull_shows_its_outcome_only_once_watched() {
         use PullRequest::{Cancel, Poll, Start};
-        let done = || PullReport::State(PullState::Done { digest: None });
+        let done = || {
+            PullReport::State(PullState::Done {
+                digest: Some("sha256:d".into()),
+            })
+        };
         let cancelled = || PullReport::State(PullState::Cancelled);
         let idle = || PullReport::State(PullState::Idle);
         let gated = || PullReport::Gated {
@@ -659,14 +655,14 @@ mod tests {
                 false,
                 vec![(Poll, running(3)), (Poll, done())],
                 shown(PullLine::Done),
-                Applied::Updated(Flight::default()),
+                Applied::Updated(Some("sha256:d".into())),
             ),
             (
                 "started, then done",
                 true,
                 vec![(Poll, done())],
                 shown(PullLine::Done),
-                Applied::Updated(ours()),
+                Applied::Updated(Some("sha256:d".into())),
             ),
             (
                 "started, then failed",
@@ -736,7 +732,7 @@ mod tests {
                     (Poll, done()),
                 ],
                 shown(PullLine::Done),
-                Applied::Updated(ours()),
+                Applied::Updated(Some("sha256:d".into())),
             ),
             (
                 "no answer to a start, and no pull",
@@ -833,7 +829,12 @@ mod tests {
             (
                 "a failure, then another pull that finishes",
                 failed(),
-                vec![running(1), PullReport::State(PullState::Done { digest: None })],
+                vec![
+                    running(1),
+                    PullReport::State(PullState::Done {
+                        digest: Some("sha256:d".into()),
+                    }),
+                ],
                 failure.clone(),
                 Some(PullLine::Done),
             ),
@@ -857,11 +858,14 @@ mod tests {
             watch.start(None);
             watch.apply(PullRequest::Poll, outcome);
             for report in after {
-                let finished = report == PullReport::State(PullState::Done { digest: None });
+                let finished = report
+                    == PullReport::State(PullState::Done {
+                        digest: Some("sha256:d".into()),
+                    });
                 assert_eq!(
                     watch.apply(PullRequest::Poll, report),
                     if finished {
-                        Applied::Updated(Flight::default())
+                        Applied::Updated(Some("sha256:d".into()))
                     } else {
                         Applied::Unchanged
                     },
