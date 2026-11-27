@@ -4,6 +4,7 @@ import { isImagePath } from "../../lib/imagePath";
 import { openInNewTab } from "../../lib/openInNewTab";
 import { useArtifactObjectUrl } from "../../hooks/useArtifactObjectUrl";
 import { Centered } from "./viewerChrome";
+import { BUTTON_SECONDARY_SM } from "../../lib/surfaces";
 
 function basename(filePath: string): string {
   return filePath.slice(filePath.lastIndexOf("/") + 1);
@@ -44,15 +45,11 @@ function DownloadView({ sessionId, filePath }: { sessionId: string; filePath: st
   return (
     <Centered>
       <div className="flex flex-col items-center gap-2">
-        <span className="text-sm">Binary file</span>
-        <button
-          type="button"
-          onClick={() => void download()}
-          className="px-3 py-1 text-[12px] rounded border border-surface-700/40 text-text-secondary hover:text-text-primary cursor-pointer transition-colors"
-        >
+        <span>Binary file</span>
+        <button type="button" onClick={() => void download()} className={BUTTON_SECONDARY_SM}>
           Download
         </button>
-        {failed && <span className="text-xs text-status-error">Download failed</span>}
+        {failed && <span className="text-[12px] text-status-error-text">Download failed</span>}
       </div>
     </Centered>
   );

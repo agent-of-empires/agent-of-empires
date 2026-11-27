@@ -2,7 +2,7 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { ACTIONS, Joyride, EVENTS, STATUS, type EventData, type Step } from "react-joyride";
 import { installHint } from "../../lib/platform";
-import { INSTALL_STEPS, type TourShortcutHint, type TourStep, tourSelector } from "../../lib/tourSteps";
+import { INSTALL_STEPS, type TourShortcutHint, type TourStep, findTourAnchor } from "../../lib/tourSteps";
 import { SHORTCUTS_BY_ID, formatTourShortcut } from "../../lib/shortcuts";
 import { TOUR_RUNNER_OPTIONS, TOUR_RUNNER_STYLES } from "./tourRunnerStyles";
 
@@ -44,7 +44,7 @@ function StepBody({
 function toJoyrideStep(step: TourStep, installLine: string | undefined): Step {
   return {
     id: step.id,
-    target: tourSelector(step.anchor),
+    target: () => findTourAnchor(step.anchor),
     title: step.title,
     content: (
       <StepBody
@@ -54,6 +54,7 @@ function toJoyrideStep(step: TourStep, installLine: string | undefined): Step {
       />
     ),
     placement: "auto",
+    skipScroll: step.skipScroll,
   };
 }
 

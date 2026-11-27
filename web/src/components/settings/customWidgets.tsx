@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
-import { fetchAgents, fetchThemes } from "../../lib/api";
+import { fetchAgents, fetchThemes, type ThemeChoice } from "../../lib/api";
 import { dispatchThemePickerChanged } from "../../hooks/useResolvedTheme";
 import type { AgentInfo, SettingsFieldDescriptor } from "../../lib/types";
+import { CAPTION_INLINE } from "../../lib/surfaces";
+import { PanelMessage } from "../panelParts";
 import { SelectField, SliderField, TextField } from "./FormFields";
 import type { RowLabel } from "./rowLabel";
 
@@ -34,7 +36,7 @@ function useOneshotAgents(): AgentInfo[] {
 
 /** Theme picker; repaints only after the save succeeds. */
 export function ThemeNameWidget({ descriptor, value, save, row }: CustomWidgetProps) {
-  const [themes, setThemes] = useState<string[]>([]);
+  const [themes, setThemes] = useState<ThemeChoice[]>([]);
   useEffect(() => {
     fetchThemes()
       .then(setThemes)
@@ -50,7 +52,7 @@ export function ThemeNameWidget({ descriptor, value, save, row }: CustomWidgetPr
           dispatchThemePickerChanged(v || undefined);
         }
       }}
-      options={themes.map((t) => ({ value: t, label: t }))}
+      options={themes.map((t) => ({ value: t.name, label: t.label }))}
     />
   );
 }
@@ -208,7 +210,7 @@ export function LoggingTargetsWidget({ value, save, row }: CustomWidgetProps) {
     <div role="group" aria-labelledby={row.labelId} className="space-y-4">
       {Object.entries(grouped).map(([group, items]) => (
         <div key={group} className="space-y-2">
-          <h5 className="text-xs font-mono uppercase tracking-widest text-text-primary">{group}</h5>
+          <h5 className={CAPTION_INLINE}>{group}</h5>
           <div className="grid gap-3 sm:grid-cols-2">
             {items.map((t) => (
               <SelectField
@@ -243,7 +245,7 @@ export function SmartRenameModelWidget({ value, save, row }: CustomWidgetProps) 
   return (
     <div role="group" aria-labelledby={row.labelId} className="space-y-4">
       {tunable.length === 0 ? (
-        <p className="text-xs text-text-dim">No one-shot-capable agents installed.</p>
+        <PanelMessage>No one-shot-capable agents installed.</PanelMessage>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2">
           {tunable.map((a) => (

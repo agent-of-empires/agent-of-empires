@@ -186,8 +186,15 @@ test.describe("short phone", () => {
     await openStructuredSession(page, mock);
     await page.getByRole("button", { name: "View plan" }).click();
     const dialog = page.getByRole("dialog", { name: "Plan" });
-    const panel = (await dialog.locator("> div").boundingBox())!;
-    expect(panel.y + panel.height).toBeLessThanOrEqual(560);
+    // The sheet slides up as it opens; measure it at rest.
+    const panelBox = async () => (await dialog.locator("> div").boundingBox())!;
+    await expect
+      .poll(async () => {
+        const box = await panelBox();
+        return box.y + box.height;
+      })
+      .toBeLessThanOrEqual(560);
+    const panel = await panelBox();
     for (const name of ["Close", ...answers, "Dismiss"]) {
       const box = (await dialog.getByRole("button", { name, exact: true }).boundingBox())!;
       expect(box.x, name).toBeGreaterThanOrEqual(panel.x);

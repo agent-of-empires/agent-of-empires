@@ -2,6 +2,7 @@
 // The code lives only in component state, is cleared on submit and close, and never reaches a URL, storage or log.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { BUTTON_INLINE, BUTTON_PRIMARY } from "../lib/surfaces";
 import { createPortal } from "react-dom";
 
 import {
@@ -15,7 +16,7 @@ import {
   type SandboxLoginState,
 } from "../lib/api";
 import { writeClipboard } from "../lib/clipboard";
-import { BRAND_BUTTON, CancelButton, Dialog, Spinner } from "./Dialog";
+import { CancelButton, Dialog, Spinner } from "./Dialog";
 
 type Phase =
   | { kind: "starting" }
@@ -283,12 +284,7 @@ export function SandboxLoginDialog({
         </p>
         <div className="mt-3 flex items-center gap-2">
           {isHttps(phase.url) && (
-            <a
-              href={phase.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-sm text-brand-500 underline hover:text-brand-400"
-            >
+            <a href={phase.url} target="_blank" rel="noopener noreferrer" className={BUTTON_INLINE}>
               Open the page to sign in
             </a>
           )}
@@ -333,7 +329,7 @@ export function SandboxLoginDialog({
           type="button"
           onClick={() => void submit()}
           disabled={phase.submitting || !code.trim()}
-          className={`px-3 py-1.5 text-sm font-medium rounded-md cursor-pointer disabled:opacity-50 ${BRAND_BUTTON}`}
+          className={BUTTON_PRIMARY}
         >
           {phase.submitting ? "Submitting..." : "Submit"}
         </button>
@@ -382,11 +378,7 @@ export function SandboxLoginDialog({
 
 function ActionButton({ label, onClick }: { label: string; onClick: () => void }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`px-3 py-1.5 text-sm font-medium rounded-md cursor-pointer ${BRAND_BUTTON}`}
-    >
+    <button type="button" onClick={onClick} className={BUTTON_PRIMARY}>
       {label}
     </button>
   );

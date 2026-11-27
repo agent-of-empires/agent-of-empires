@@ -365,11 +365,11 @@ fn right_click_session_menu_hides_fork_for_unforkable_agent() {
     );
 }
 
-/// The Snooze row mirrors the `'h'` keybinding, which fires only in Attention sort, so the
-/// menu omits it in every other sort. For a forkable agent the Fork row is sort-independent.
+/// The Snooze row mirrors the `'h'` keybinding, which acts on a session row in every
+/// sort. For a forkable agent the Fork row is sort-independent.
 #[test]
 #[serial]
-fn right_click_session_menu_gates_snooze_to_attention_sort() {
+fn right_click_session_menu_offers_snooze_in_every_sort() {
     let mut env = create_test_env_empty();
     env.view.add_instance(observed_fork_parent("claude"));
     env.view.add_instance(observed_fork_parent("claude"));
@@ -385,14 +385,14 @@ fn right_click_session_menu_gates_snooze_to_attention_sort() {
             .collect()
     };
 
-    // Newest sort (the default): no Snooze row.
+    // Newest sort (the default): the Snooze row is present.
     env.view.sort_order = SortOrder::Newest;
     env.view.flat_items = env.view.build_flat_items();
     setup_inner(&mut env);
     assert!(env.view.handle_right_click(5, 1));
     assert!(
-        !menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
-        "Snooze must be hidden outside Attention sort"
+        menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
+        "Snooze must appear in every sort"
     );
     assert!(menu_actions(&env).contains(&ContextMenuAction::Fork));
     env.view.context_menu = None;

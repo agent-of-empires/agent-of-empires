@@ -5,6 +5,8 @@ import { useEffect, useRef, useState } from "react";
 
 import { elevateLogin } from "../lib/api";
 import { ELEVATION_REQUIRED_EVENT } from "../lib/fetchInterceptor";
+import { INPUT } from "../lib/surfaces";
+import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
 
 export function ElevationPrompt() {
   const [open, setOpen] = useState(false);
@@ -45,25 +47,28 @@ export function ElevationPrompt() {
   if (!open) return null;
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 safe-area-inset"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) close();
-      }}
+    <Dialog
+      id="elevation-prompt"
+      // Over the sandbox Log in dialog, which can ask for it.
+      layer="z-[70]"
+      title="Confirm passphrase"
+      panelClassName="md:w-[384px]"
+      describedBy="elevation-prompt-note"
+      onDismiss={close}
+      footer={
+        <>
+          <CancelButton onClick={close} disabled={loading} />
+          <ConfirmButton type="submit" form="elevation-prompt-form" disabled={loading || !passphrase.trim()}>
+            {loading ? "Confirming..." : "Confirm"}
+          </ConfirmButton>
+        </>
+      }
     >
-      <form
-        onSubmit={handleSubmit}
-        className="w-full max-w-sm rounded-xl border border-surface-700/40 bg-surface-800 p-6 shadow-xl"
-      >
-        <div className="mb-3">
-          <div className="text-sm font-medium text-text-primary">Confirm passphrase</div>
-          <div className="mt-1 text-xs text-text-muted">
-            This action requires re-entering your passphrase. The confirmation stays valid for 15 minutes; you will not
-            be prompted again during that window.
-          </div>
-        </div>
+      <form id="elevation-prompt-form" onSubmit={handleSubmit}>
+        <p id="elevation-prompt-note" className="mb-3 text-[13px] md:text-xs text-text-muted">
+          This action requires re-entering your passphrase. The confirmation stays valid for 15 minutes; you will not be
+          prompted again during that window.
+        </p>
         <input
           ref={inputRef}
           autoFocus
@@ -73,27 +78,11 @@ export function ElevationPrompt() {
           onChange={(e) => setPassphrase(e.target.value)}
           disabled={loading}
           placeholder="Enter passphrase"
-          className="w-full rounded-lg border border-surface-700/60 bg-surface-900 px-3 py-2.5 text-sm text-text-primary placeholder:text-text-dim focus:outline-none focus:ring-2 focus:ring-brand-600 disabled:opacity-50"
+          aria-label="Passphrase"
+          className={INPUT}
         />
-        {error && <p className="mt-3 text-xs text-status-error">{error}</p>}
-        <div className="mt-4 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={close}
-            disabled={loading}
-            className="rounded-lg border border-surface-700/60 bg-transparent px-3 py-1.5 text-xs text-text-secondary hover:bg-surface-700/40 disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={loading || !passphrase.trim()}
-            className="rounded-lg bg-brand-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-brand-700 disabled:opacity-50"
-          >
-            {loading ? "Confirming..." : "Confirm"}
-          </button>
-        </div>
+        {error && <p className="mt-3 text-[13px] md:text-xs text-status-error">{error}</p>}
       </form>
-    </div>
+    </Dialog>
   );
 }

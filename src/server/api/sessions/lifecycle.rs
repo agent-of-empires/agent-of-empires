@@ -2784,7 +2784,6 @@ struct StructuredRestartLaunch {
     /// The restart changed only the account, so the conversation continues where it stopped.
     account_swap: bool,
     carry: Option<crate::session::conversation_carry::ConversationCarry>,
-    wake: Option<String>,
     reason: &'static str,
     /// A limit rejecting this launch is the target account's: it comes back on the error and
     /// parks nothing.
@@ -2805,33 +2804,15 @@ pub(super) fn terminal_resume_refusal(
     })
 }
 
-/// An explicit wake outranks a continuation an earlier failed resume left pending. Runs under the
-/// submission authority, before the replacement worker exists to drain it.
-pub(super) async fn discard_stale_continuation(
-    state: &Arc<AppState>,
-    id: &str,
-    resumes_rate_limit: bool,
-    explicit_wake: bool,
-) {
-    if resumes_rate_limit && explicit_wake {
-        state.session_service.clear_pending_initial_turn(id).await;
-    }
-}
-
-/// After an account swap out of a rate-limit park: same sequence as `/acp/spawn`, with the
-/// submission authority covering the checks and the install. Returns whether the interrupted
-/// prompt (or a queued one) is now the next turn, so the default wake message can give way.
-///
-/// A restart that was superseded meanwhile (a stop or a newer launch) installs nothing. An explicit
-/// wake message takes precedence over the interrupted prompt, but the manual breadcrumb still
-/// disarms the auto-resume budget exactly once.
+/// After an account swap out of a rate-limit park, continue the interrupted prompt: same sequence
+/// as `/acp/spawn`, with the submission authority covering the checks and the install. A restart
+/// that was superseded meanwhile (a stop or a newer launch) installs nothing.
 pub(super) async fn continue_interrupted_prompt(
     state: &Arc<AppState>,
     id: &str,
     generation: u64,
     resets_at: crate::time::Timestamp,
-    explicit_wake: bool,
-) -> bool {
+) {
     let submission = state.session_service.prompt_submission(id).await;
     let current = state.instances.read().await.iter().any(|row| {
         row.id == id
@@ -2840,34 +2821,16 @@ pub(super) async fn continue_interrupted_prompt(
             && row.ensure_startable().is_ok()
     });
     if !current {
-        return false;
+        return;
     }
     // Published while this task still owns the submission authority, so a newer limit and its
     // automatic resume cannot slip in between and be disarmed by an older breadcrumb.
     state
         .acp_supervisor
         .publish_rate_limit_auto_resumed(id, resets_at, true);
-    if explicit_wake {
-        // The stale-continuation clear belongs before the spawn (`discard_stale_continuation`); by
-        // now newer work may have been installed, and it must survive.
-        drop(submission);
-        return false;
-    }
-    // A continuation already pending is work too, even when the interrupted prompt is gone.
-    let pending_before = state
-        .instances
-        .read()
-        .await
-        .iter()
-        .any(|row| row.id == id && row.pending_initial_turn.is_some());
-    use crate::server::acp_reconciler::ContinuationOutcome;
-    let outcome =
+    // The manual breadcrumb above already covers every outcome.
+    let _ =
         crate::server::acp_reconciler::install_rate_limit_continuation(state, id, submission).await;
-    pending_before
-        || matches!(
-            outcome,
-            ContinuationOutcome::Installed | ContinuationOutcome::SupersededByQueue
-        )
 }
 
 async fn finish_structured_restart(
@@ -2890,7 +2853,6 @@ async fn finish_structured_restart(
             hooks,
             account_swap,
             carry,
-            wake,
             reason: _,
             defers_rate_limit,
         } = launch;
@@ -2900,8 +2862,7 @@ async fn finish_structured_restart(
         } else {
             None
         };
-        let wake_requested = wake.is_some();
-        let (started, native, wake, reservation) = tokio::task::spawn_blocking(move || {
+        let (started, native, reservation) = tokio::task::spawn_blocking(move || {
             let sandbox_info = started.sandbox_info.take();
             let ownership =
                 match started.reacquire_launch_locks_after_hooks(&native, generation, hooks) {
@@ -2930,15 +2891,6 @@ async fn finish_structured_restart(
                 if let Some(carry) = carry {
                     carry.run_for(&mut started)?;
                 }
-                let wake = match wake {
-                    Some(wake) => wake,
-                    None => {
-                        native
-                            .configuration(Some(&started.source_profile))?
-                            .session
-                            .restart_wake_message
-                    }
-                };
                 (&native as &dyn SessionStore).update(|rows, _| {
                     let row = rows
                         .iter_mut()
@@ -2959,10 +2911,10 @@ async fn finish_structured_restart(
                     );
                     Ok(())
                 })?;
-                Ok::<_, anyhow::Error>((reservation, wake))
+                Ok::<_, anyhow::Error>(reservation)
             })();
 
-            let (reservation, wake) = match prepared {
+            let reservation = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     drop(ownership);
@@ -2975,12 +2927,9 @@ async fn finish_structured_restart(
             started.status = Status::Starting;
             started.lifecycle_reservation = None;
             native.adopt_runtime_fields(&started)?;
-            Ok::<_, anyhow::Error>((started, Arc::new(native), wake, reservation))
+            Ok::<_, anyhow::Error>((started, Arc::new(native), reservation))
         })
         .await??;
-        // Past the pre-launch hooks and the reservation, so a refused launch keeps the turn; still
-        // under the submission authority, so the new worker cannot drain it before the wake.
-        discard_stale_continuation(state, id, resumes_rate_limit.is_some(), wake_requested).await;
         let agent = state
             .acp_supervisor
             .pick_agent_for_tool(
@@ -3016,63 +2965,8 @@ async fn finish_structured_restart(
             state, native, id, generation, spawned,
         )
         .await?;
-        let continued = match resumes_rate_limit {
-            Some(resets_at) => {
-                continue_interrupted_prompt(state, id, generation, resets_at, wake_requested).await
-            }
-            None => false,
-        };
-        let wake = if continued { String::new() } else { wake };
-        if !wake.is_empty() {
-            let state = state.clone();
-            let id = id.to_owned();
-            let profile = profile.clone();
-            state
-                .session_service
-                .work
-                .clone()
-                .spawn("acp.restart_wake", async move {
-                    let _submission = state.session_service.prompt_submission(&id).await;
-                    let matches = state.instances.read().await.iter().any(|row| {
-                        row.id == id
-                            && row.lifecycle_generation == generation
-                            && row.source_profile == profile
-                            && row.launch_is_finalized()
-                            && row.ensure_startable().is_ok()
-                    });
-                    let dispatch = state
-                        .session_service
-                        .prompt_dispatch_under_submission(&id, &wake, false, true)
-                        .await;
-                    if matches
-                        && !matches!(
-                            dispatch,
-                            crate::acp::dispatch::PromptDispatch::Queued { .. }
-                        )
-                    {
-                        let result = state
-                            .session_service
-                            .send_turn(
-                                &crate::server::session_service::SessionCaller::User,
-                                &id,
-                                crate::server::session_service::SendTurnRequest {
-                                    resume_authority:
-                                        crate::process::worker_registry::ResumeAuthority::Automatic,
-                                    text: &wake,
-                                    attachments: &[],
-                                    woke_idle_dormant: false,
-                                    prompt_ids: Vec::new(),
-                                    synthesized: true,
-                                    origin: crate::daemon::PromptOrigin::Aoe,
-                                    no_revive: true,
-                                },
-                            )
-                            .await;
-                        if let Err(error) = result {
-                            tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart wake failed");
-                        }
-                    }
-                });
+        if let Some(resets_at) = resumes_rate_limit {
+            continue_interrupted_prompt(state, id, generation, resets_at).await;
         }
         Ok::<_, anyhow::Error>((generation, profile))
     }
@@ -3161,23 +3055,6 @@ fn restart_reason(
         (_, Some(body)) if body.discard_sandbox_container => "recreate_container",
         _ => "user",
     }
-}
-
-fn select_restart_wake_message(
-    origin: RestartOrigin,
-    requested: Option<String>,
-    profile: &str,
-) -> String {
-    requested.unwrap_or_else(|| {
-        let session = crate::session::resolve_config(profile)
-            .map(|config| config.session)
-            .unwrap_or_default();
-        if matches!(origin, RestartOrigin::StartupRecovery) && !session.startup_recovery_wake {
-            String::new()
-        } else {
-            session.restart_wake_message
-        }
-    })
 }
 
 pub(super) async fn prepare_agent_session(
@@ -3939,7 +3816,6 @@ async fn prepare_agent_session_inner(
     #[cfg(test)]
     launch_hook_gate::pause(&id, launch_hook_gate::Stage::BeforeHooks).await;
     let reason = restart_reason(restart_origin, restart.as_deref());
-    let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
         Ok(Ok(Some((generation, mut started, native, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || {
@@ -3980,7 +3856,6 @@ async fn prepare_agent_session_inner(
                     hooks,
                     account_swap: carry.0,
                     carry: carry.1,
-                    wake: requested_wake_message,
                     reason,
                     defers_rate_limit: matches!(restart_origin, RestartOrigin::Failover { .. }),
                 },
@@ -4196,34 +4071,7 @@ async fn prepare_agent_session_inner(
                 profile: profile.clone(),
             })
         };
-        let mut wake = None;
-        if matches!(
-            outcome,
-            Some(
-                crate::session::StartOutcome::Fresh
-                    | crate::session::StartOutcome::Resumed
-                    | crate::session::StartOutcome::FreshAfterFailedResume { .. }
-            )
-        ) {
-            let wake_message =
-                select_restart_wake_message(restart_origin, requested_wake_message, &profile);
-            if !wake_message.is_empty() {
-                wake = Some((wake_message, row.clone()));
-            }
-        }
         drop(rows);
-        if let Some((wake_message, wake_row)) = wake {
-            // The pace reads configuration, so it resolves outside the guard.
-            let delay = wake_row.send_keys_enter_delay();
-            crate::session::restart::spawn_wake_worker(
-                id.clone(),
-                wake_row.title.clone(),
-                wake_row.tool.clone(),
-                wake_message,
-                Some((profile.clone(), generation)),
-                delay,
-            );
-        }
         tracing::info!(target: "session.restart", session = %id, view = "terminal", reason, "session restarted");
         return crate::server::runtime::session_mutation_response(
             &state,
@@ -4800,7 +4648,6 @@ mod durable_stop_tests {
                 Path(row.id.clone()),
                 Ok(Some(Json(crate::daemon::RestartSessionBody {
                     skip_on_launch: true,
-                    wake_message: Some(String::new()),
                     ..Default::default()
                 }))),
             )
@@ -4952,7 +4799,6 @@ mod durable_stop_tests {
             Path(row.id.clone()),
             Ok(Some(Json(crate::daemon::RestartSessionBody {
                 skip_on_launch: true,
-                wake_message: Some(String::new()),
                 ..Default::default()
             }))),
         )
@@ -5443,72 +5289,4 @@ pub async fn update_session_unread(
     drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
-}
-
-#[cfg(test)]
-mod restart_wake_tests {
-    use super::{select_restart_wake_message, RestartOrigin};
-
-    #[test]
-    #[serial_test::serial]
-    fn restart_wake_selection_respects_origin_and_profile_policy() -> anyhow::Result<()> {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let config_path = crate::session::get_app_dir()?.join("config.toml");
-        let profile = "wake-policy";
-        let default_message = "wake up: pick up what you were doing";
-        for (global, overrides, recovered, explicit) in [
-            ("", "", "", default_message),
-            (
-                "startup_recovery_wake = false\nrestart_wake_message = '  custom text  '",
-                "",
-                "",
-                "  custom text  ",
-            ),
-            (
-                "startup_recovery_wake = true",
-                "",
-                default_message,
-                default_message,
-            ),
-            (
-                "startup_recovery_wake = true\nrestart_wake_message = '  custom text  '",
-                "",
-                "  custom text  ",
-                "  custom text  ",
-            ),
-            (
-                "startup_recovery_wake = true\nrestart_wake_message = ''",
-                "",
-                "",
-                "",
-            ),
-            (
-                "startup_recovery_wake = false",
-                "startup_recovery_wake = true\nrestart_wake_message = 'profile text'",
-                "profile text",
-                "profile text",
-            ),
-            (
-                "startup_recovery_wake = true",
-                "startup_recovery_wake = false",
-                "",
-                default_message,
-            ),
-        ] {
-            std::fs::write(&config_path, format!("[session]\n{global}\n"))?;
-            let profile_config = toml::from_str(&format!("[session]\n{overrides}\n"))?;
-            crate::session::config::profile_config::save_profile_config(profile, &profile_config)?;
-            for (origin, expected) in [
-                (RestartOrigin::StartupRecovery, recovered),
-                (RestartOrigin::Explicit, explicit),
-            ] {
-                assert_eq!(
-                    select_restart_wake_message(origin, None, profile),
-                    expected,
-                    "global={global:?}, profile={overrides:?}"
-                );
-            }
-        }
-        Ok(())
-    }
 }

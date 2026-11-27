@@ -1,5 +1,5 @@
 import { useRef } from "react";
-import { BRAND_BUTTON, CancelButton, ConfirmButton, Dialog } from "./Dialog";
+import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
 import { useBusyAction, useConfirmKeys, useDialogFocus } from "./dialogHooks";
 
 interface Props {
@@ -22,7 +22,7 @@ export function StopSessionDialog({ sessionTitle, onConfirm, onCancel }: Props) 
       footer={
         <>
           <CancelButton onClick={onCancel} disabled={stopping} />
-          <ConfirmButton buttonRef={confirmButtonRef} onClick={handleConfirm} busy={stopping} className={BRAND_BUTTON}>
+          <ConfirmButton buttonRef={confirmButtonRef} onClick={handleConfirm} busy={stopping}>
             {stopping ? "Stopping..." : "Stop"}
           </ConfirmButton>
         </>

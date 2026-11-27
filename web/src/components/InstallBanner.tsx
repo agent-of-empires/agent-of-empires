@@ -6,6 +6,7 @@ import { onDaemonChanged } from "../lib/connectionState";
 import { installHint } from "../lib/platform";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { INSTALL_STEPS } from "../lib/tourSteps";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 export const INSTALL_BANNER_DISMISSED_KEY = "aoe-install-banner-dismissed";
 export const INSTALL_BANNER_HIDE_LABEL = "Hide notification steps";
@@ -61,7 +62,7 @@ export function InstallBanner({ hidden = false }: { hidden?: boolean }) {
         {hint === "push" ? (
           <span className="text-text-subtle">
             Turn them on in{" "}
-            <Link to="/settings/notifications" className="text-text-primary underline underline-offset-2">
+            <Link to="/settings/notifications" className={BUTTON_INLINE}>
               Settings › Notifications
             </Link>
             .

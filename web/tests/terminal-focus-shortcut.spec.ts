@@ -1,11 +1,13 @@
 import { makePatch } from "./helpers/patch";
 import { test, expect, observeFor } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
-import { clickSidebarSession } from "./helpers/sidebar";
+import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 import { openPanelsByDefault } from "./helpers/apiMocks";
 
 async function openSession(page: Page) {
+  // A phone keeps the list in the drawer ☰ opens.
+  if ((page.viewportSize()?.width ?? 1280) < 768) await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await expect(page.locator('[data-term="agent"]')).toHaveCount(1);
   await expect(
@@ -86,6 +88,8 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await page.goto("/");
     await openSession(page);
 
+    // The terminal opens in the right dock, so collapsing that dock hides it.
+    await page.getByTestId("pane-tab-terminal:pinch-test:0").click();
     await page.keyboard.press("ControlOrMeta+Alt+b");
     await expect(page.locator('[data-term="paired"]')).toHaveCount(0);
 
@@ -206,7 +210,6 @@ test.describe("Cmd/Ctrl+` mobile", () => {
     await mockTerminalApis(page);
     await openPanelsByDefault(page);
     await page.goto("/");
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await openSession(page);
 
     // #1452: one full-viewport pane; the chord promotes a single paired instance.
@@ -224,7 +227,6 @@ test.describe("Cmd/Ctrl+` mobile", () => {
     const terminal = await mockTerminalApis(page);
     await openPanelsByDefault(page);
     await page.goto("/");
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await openSession(page);
     await terminal.waitForLiveReady();
 

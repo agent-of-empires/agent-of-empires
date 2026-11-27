@@ -6,6 +6,12 @@ Each item has a title, a reason, the plugin that proposed it, and a draft prompt
 
 Suggestions show up in the web dashboard (homepage section, `/suggestions`, and optionally the sidebar) and in the TUI. They are stored per [profile](configuration.md#profiles).
 
+## Without a plugin
+
+Any session can suggest work. Tell an agent, for example: "Look at this project and suggest up to three sessions worth starting next." It calls the `suggest_session` tool of AoE's MCP server, or you run `aoe suggest "<title>" --prompt "<prompt>" --reason "<why>"` (`--project` names a registered Project; `--id` makes a repeat replace the earlier suggestion). The suggestion appears under the **Agent** provider, which is on from the start, and stays across reloads and daemon restarts until you start or dismiss it. There is nothing to refresh: **Refresh** asks plugins only. The homepage section and the TUI's list (`S`) show a prompt to paste into a session until something is suggested.
+
+Plugins add to this list; they do not replace it.
+
 ## Setting up
 
 With no provider installed, the web homepage and the empty `/suggestions` view offer **Set up suggestions** when a featured plugin exists. The sheet installs the sources you tick, runs each plugin's setup checks (✓, `!`, ✕, with the plugin's fix text and **Check again**), and ends with "Suggestions are on". **Finish later** closes it; the plugin stays installed. **More sources in the Marketplace ›** opens Settings › Plugins › Marketplace filtered to plugins that work with suggestions. With no provider, the TUI's list (`S`) says to run `aoe plugin install gh:agent-of-empires/plugin-github` and turn the provider on in the dashboard, and names **Set up suggestions** when the dashboard offers it. With every provider off, it says to turn one on in Settings › Suggestions.
@@ -36,10 +42,26 @@ If the repo defines [hooks](repo-config.md) you have not approved, Start pauses 
 
 **▾** next to Start shows what Start will use for this suggestion (Project, agent, view, worktree) and offers:
 
-- **Start with changes**: opens the New session dialog prefilled from the preset, for this one only. A strip above the form names the source and says "issue text not included"; the source's own text is never added to the prompt for you. The dialog also shows "From the <kind> preset" with an **Edit preset** link.
+- **Start with changes**: opens the New session dialog prefilled from the preset, for this one only. A strip above the form names the source and says "issue text not included": AoE does not add the item's preview to the prompt. The prompt itself is the preset's or the provider's draft, which the provider writes and can quote the source, so read it before you launch. The dialog also shows "From the <kind> preset" with an **Edit preset** link.
 - **Copy prompt**, **Open in <provider> ↗**, and **Edit the <kind> preset** (Settings › Suggestions).
 
 If the repo has no Project yet, **Start in… ▾** replaces Start. Picking a Project links the repo to it, then starts, so later suggestions from that repo start in one click. It is off on read-only dashboards and in CityHall mode, which cannot save the link.
+
+### Start several at once
+
+Tick the checkbox on each row (or **Select all shown**), then **Start N** in the bar that appears. Items start one after another with their own presets. A failure stays on its row and the rest continue; a toast counts what started, what waits for a hooks review and what failed. Review dialogs open one at a time as usual.
+
+### Auto start
+
+Off by default. In **Settings › Suggestions**, a plugin kind's preset has an **Auto start** switch (the Agent kind has none: sessions can push more suggestions, so no cap would hold). Turning it on asks first: auto start launches an agent on text written by others (issue and PR content) with no human check, and says so again when the preset has Yolo on, since such a kind is never auto started. Pick a per-refresh cap from 1 to 10 (default 3).
+
+After each provider publish, AoE starts up to the cap of that kind's items that:
+
+- are not stale or dismissed and have no Session linked yet,
+- have exactly one linked Project, need no hooks or MCP review, and use a preset with Yolo off,
+- were never auto started before (each item is tried once, even if the start fails).
+
+Nothing runs when you turn the switch on, only after the next publish, and only for a provider that is switched on, and only when the daemon accepts changes (not on a read-only dashboard or in CityHall mode). Items left alone show a "Not auto started: <reason>" note while the switch is on. A failed start keeps "Auto start failed: <reason>. Start it by hand." on the row and is not retried.
 
 ### After starting
 
@@ -108,7 +130,9 @@ Strict mode moves the letters by Home's rule: a bare letter takes Shift, and a S
 | `j` / `k` | `j` / `k` | Select |
 | Enter | Enter | Start with the preset. On a started item it opens the session |
 | `e` | `E` | Start with changes: opens the New session dialog prefilled from the kind's preset and the final prompt |
-| `N` | `Ctrl+N` | A new session for the item that does not take its link, so a started item can have another |
+| `N` | `Ctrl+N` | Another session for the item that does not take its link, so a started item can have more than one |
+| Space | Space | Mark or unmark the item. Enter then starts every marked item one after another; a failure does not stop the rest, and one needing a hooks review stays on its row |
+| `a` | `A` | Turn auto start on or off for the item's kind. Turning it on asks first |
 | `z` | `Z` | Dismiss or restore |
 | `d` | `D` | Show or hide dismissed items |
 | `t` | `T` | Turn on pre-trust, on a Session blocked on folder trust |
@@ -123,11 +147,11 @@ If the repo has hooks nobody has approved, Enter shows them, with a one-line sum
 
 **New-session dialog.** The dialog has no Prompt row. For a suggestion, the first turn is one line above the footer: "Prompt from GitHub, not checked by AoE", or "Prompt: none" once you erase it. A blank session shows no prompt line until you add one. `Ctrl+O` opens it in a small editor, which also shows the item's source text; `Esc` closes it and keeps your edits. `Ctrl+P` still opens the focused row's picker. The prompt is sent once the agent is ready (typed into a terminal session, or sent as the first turn of a [structured-view](../structured-view.md) one).
 
-From the command line, `aoe add --prompt <text>` or `--prompt-file <path>` sets the same first turn. It is rejected for terminal sessions.
+From the command line, `aoe add --prompt <text>` (or `--prompt-file <path>`) sets the same first turn. A terminal session (the default) keeps it until its agent starts, with `--launch` or later from the dashboard or TUI. It is typed only into an agent whose ready marker AoE can see, so `aoe add` refuses the prompt for a shell, a `--cmd-override` command and an agent without one, and creates nothing; pass `--structured-view` or `--agent` to send it as a structured session's first turn instead.
 
 ## Read-only dashboards and CityHall
 
-A read-only dashboard lists suggestions but cannot change anything: "This dashboard is read-only. Start, Dismiss and Refresh are off." The TUI says "Read-only daemon: you can browse, not start or dismiss." at the top of the pane and when a key there is refused, and `r` only reloads. Offline, suggestions stay visible from the last fetch ("Disconnected. Suggestions show from the last fetch; reconnect to start one.").
+A read-only dashboard lists suggestions but cannot change anything: "Read-only: suggestions can't be started or changed." The TUI says "Read-only daemon: you can browse, not start or dismiss." at the top of the pane and when a key there is refused, and `r` only reloads. Offline, suggestions stay visible from the last fetch ("Disconnected. Suggestions show from the last fetch; reconnect to start one.").
 
 In [CityHall mode](web-dashboard.md#cityhall-client-mode) the suggestion routes that change anything (start, refresh, dismiss, source and preference changes, preset and mapping edits) are refused server-side, and plugin lifecycle is hidden, so setup and the Marketplace are unavailable. Reading suggestions stays allowed. The [API reference](../plugin-api.md#suggestions-api) lists the exact routes.
 

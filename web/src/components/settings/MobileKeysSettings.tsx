@@ -8,6 +8,7 @@ import {
   toolbarKeySpec,
   type ToolbarKeyId,
 } from "../../lib/terminalToolbarKeys";
+import { BUTTON_GHOST_SM, BUTTON_SECONDARY_SM, FIELD_DESCRIPTION, FIELD_LABEL, INSET, ROWS } from "../../lib/surfaces";
 
 function RowButton({
   label,
@@ -26,7 +27,7 @@ function RowButton({
       aria-label={label}
       disabled={disabled}
       onClick={onClick}
-      className="w-8 h-8 shrink-0 rounded-md font-mono text-sm text-text-secondary hover:bg-surface-700 cursor-pointer disabled:opacity-40 disabled:cursor-default transition-colors"
+      className="w-8 h-8 max-md:w-11 max-md:h-11 shrink-0 rounded-md font-mono text-sm text-text-secondary hover:bg-surface-700/60 hover:text-text-primary cursor-pointer disabled:opacity-40 disabled:cursor-default transition-colors"
     >
       {children}
     </button>
@@ -50,23 +51,22 @@ export function MobileKeysSettings() {
   return (
     <div className="space-y-3">
       <div>
-        <div className="flex items-center justify-between gap-3 mb-2">
-          <div className="text-[13px] text-text-secondary">Mobile key row</div>
-          <button
-            type="button"
-            onClick={() => setKeys([...DEFAULT_TOOLBAR_KEYS])}
-            className="text-[12px] text-brand-500 hover:text-brand-400 cursor-pointer"
-          >
+        <div className="flex items-center justify-between gap-3">
+          <div className={FIELD_LABEL}>Mobile key row</div>
+          <button type="button" onClick={() => setKeys([...DEFAULT_TOOLBAR_KEYS])} className={BUTTON_GHOST_SM}>
             Reset to default
           </button>
         </div>
-        <ol aria-label="Keys in the row" className="space-y-1">
+        <p className={FIELD_DESCRIPTION}>
+          Keys above the soft keyboard in the live terminal, left to right. Up to {MAX_TOOLBAR_KEYS} fit on one row.
+        </p>
+        <ol aria-label="Keys in the row" className={`${INSET} ${ROWS}`}>
           {keys.map((id, i) => {
             const spec = toolbarKeySpec(id);
             return (
-              <li key={id} className="flex items-center gap-2 pl-2 rounded-md bg-surface-800 border border-surface-700">
+              <li key={id} className="flex items-center gap-2 pl-3">
                 <span className="w-14 shrink-0 font-mono text-sm text-text-primary">{spec.label}</span>
-                <span className="flex-1 min-w-0 truncate text-[12px] text-text-muted">{spec.name}</span>
+                <span className="flex-1 min-w-0 truncate text-[13px] text-text-secondary">{spec.name}</span>
                 <RowButton label={`Move ${spec.name} up`} disabled={i === 0} onClick={() => move(i, i - 1)}>
                   {"↑"}
                 </RowButton>
@@ -93,22 +93,19 @@ export function MobileKeysSettings() {
                 aria-label={`Add ${spec.name}`}
                 disabled={full}
                 onClick={() => setKeys([...keys, spec.id])}
-                className="h-8 px-2 rounded-md border border-surface-700 font-mono text-[12px] text-text-secondary hover:bg-surface-800 cursor-pointer disabled:opacity-40 disabled:cursor-default transition-colors"
+                className={`${BUTTON_SECONDARY_SM} font-mono`}
               >
                 + {spec.label}
               </button>
             ))}
           </div>
         )}
-        <p className="text-[11px] text-text-muted mt-1">
-          Keys above the soft keyboard in the live terminal, left to right. Up to {MAX_TOOLBAR_KEYS} fit on one row.
-        </p>
       </div>
 
       <label className="flex items-center justify-between gap-3 cursor-pointer">
         <div>
-          <div className="text-[13px] text-text-secondary">Arrow joystick on mobile</div>
-          <p className="text-[11px] text-text-muted mt-1">
+          <div className="text-[15px] md:text-sm text-text-primary">Arrow joystick on mobile</div>
+          <p className="text-[13px] leading-normal text-text-secondary mt-0.5">
             Drag the pad above the keyboard button to send arrow keys; drag further to repeat faster.
           </p>
         </div>
