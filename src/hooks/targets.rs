@@ -730,5 +730,20 @@ mod tests {
             &[],
             &Default::default()
         ));
+        // A `..` in the missing part cancels it, as `create_dir_all` would.
+        assert!(is_other_builtin_hook_path(
+            &home.join("alias/nonexistent/../.claude/settings.json"),
+            "example",
+            home,
+            &[],
+            &Default::default()
+        ));
+        assert!(!is_other_builtin_hook_path(
+            &home.join("alias/.claude/../.example/settings.json"),
+            "example",
+            home,
+            &[],
+            &Default::default()
+        ));
     }
 }

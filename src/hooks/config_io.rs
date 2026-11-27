@@ -98,20 +98,34 @@ pub(super) fn resolved(path: &Path) -> PathBuf {
         };
         current = current.parent().map_or(link.clone(), |dir| dir.join(&link));
     }
-    // The nearest existing ancestor is resolved, and the components that do not exist
-    // yet are appended, so an alias above a missing directory is still seen.
-    let mut missing = Vec::new();
-    let mut base = current.as_path();
-    while std::fs::symlink_metadata(base).is_err() {
-        let (Some(name), Some(parent)) = (base.file_name(), base.parent()) else {
-            return current;
-        };
-        missing.push(name);
-        base = parent;
+    // Existing components are resolved one by one; the ones that do not exist yet are
+    // kept aside, and a `..` cancels the last of them, as `create_dir_all` would create
+    // it and step back. A `..` with none left steps out of the resolved ancestor.
+    let mut existing = PathBuf::new();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    for component in current.components() {
+        match component {
+            std::path::Component::Normal(name) if missing.is_empty() => {
+                let next = existing.join(name);
+                existing = if std::fs::symlink_metadata(&next).is_err() {
+                    missing.push(name.to_owned());
+                    existing
+                } else {
+                    std::fs::canonicalize(&next).unwrap_or(next)
+                };
+            }
+            std::path::Component::Normal(name) => missing.push(name.to_owned()),
+            std::path::Component::ParentDir => {
+                if missing.pop().is_none() {
+                    existing.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            root => existing.push(root),
+        }
     }
-    let mut resolved = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
-    resolved.extend(missing.iter().rev());
-    resolved
+    existing.extend(missing);
+    existing
 }
 
 /// Parses a JSON config, treating malformed content as empty so a torn file
