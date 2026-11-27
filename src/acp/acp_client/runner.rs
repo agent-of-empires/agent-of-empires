@@ -352,11 +352,15 @@ pub(super) async fn spawn_runner_detached(
             (None, None) => (config.spec.command.clone(), Vec::new()),
         };
 
-    let launch_config = config
-        .proxy
-        .as_ref()
-        .map(|_| write_proxy_launch_config(config, &session_id))
-        .transpose()?;
+    let launch_config = if config.proxy.is_some() {
+        Some(write_proxy_launch_config(config, &session_id)?)
+    } else {
+        // A fallback to the raw adapter must not leave the failed proxy runner's config behind.
+        if let Err(e) = crate::process::worker_registry::remove_proxy_launch_configs(&session_id) {
+            tracing::warn!(session_id, "stale proxy launch config not removed: {e:#}");
+        }
+        None
+    };
 
     let prefix = {
         let id = session_id.clone();
