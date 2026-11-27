@@ -47,6 +47,8 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
     let mut runs: HashSet<(&'static str, String)> = HashSet::new();
     let mut order: ArrivalOrder<Seen> = ArrivalOrder::default();
     let mut session: Option<String> = None;
+    // Session carried by updates before the first result.
+    let mut early_session: Option<String> = None;
 
     for (index, line) in reader.lines().enumerate() {
         let n = index + 1;
@@ -69,7 +71,8 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
         // A session/new result with a new id starts a fresh key space and
         // drops open leases and runs, as the runtime's reset commit does.
         if let Some(id) = frame.pointer("/result/sessionId").and_then(|v| v.as_str()) {
-            if session.as_deref().is_some_and(|current| current != id) {
+            let previous = session.as_deref().or(early_session.as_deref());
+            if previous.is_some_and(|current| current != id) {
                 keys.clear();
                 leases.clear();
                 runs.clear();
@@ -104,6 +107,12 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
 
         if frame.get("method").and_then(|m| m.as_str()) != Some("session/update") {
             continue;
+        }
+        if session.is_none() && early_session.is_none() {
+            early_session = frame
+                .pointer("/params/sessionId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
         }
         let update = frame
             .pointer("/params/update")
@@ -612,6 +621,26 @@ mod tests {
                     in_session("s1", update(r#"{"v":2,"key":"a","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
                     in_session("s1", update(r#"{"v":2,"key":"b","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
                     in_session("s1", update(r#"{"v":2,"key":"c","workflow_run":{"id":"w","state":"ended"}}"#)),
+                ],
+                false,
+                vec![],
+            ),
+            (
+                "first result names a different session than the earlier updates",
+                vec![
+                    in_session("s1", update(r#"{"v":2,"key":"a","background_task":{"id":"x","state":"started","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session("s2", update(r#"{"v":2,"key":"b","background_task":{"id":"x","state":"ended"}}"#)),
+                ],
+                false,
+                vec!["lifecycle_unknown"],
+            ),
+            (
+                "first result matches the earlier updates",
+                vec![
+                    in_session("s1", update(r#"{"v":2,"key":"a","background_task":{"id":"x","state":"started","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"b","background_task":{"id":"x","state":"ended"}}"#)),
                 ],
                 false,
                 vec![],
