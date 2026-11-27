@@ -251,7 +251,7 @@ pub(crate) fn host_hook_disclosure(
     let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
     let session_config = &config.session;
 
-    if let Some(trust) = agent.trust {
+    if let Some(trust) = crate::agents::declared_trust(agent) {
         disclosure.trust_paths.push(
             crate::hooks::declared_trust_path(
                 trust,
@@ -853,17 +853,22 @@ impl Instance {
             .unwrap_or_else(|_| self.project_path.clone());
         let environment = self.resolved_host_environment();
         let config_dir = config.session.agent_config_dir_for(&self.tool, &home);
-        if let Err(e) = crate::hooks::trust_host_project(
-            agent.name,
-            &home,
-            &environment,
-            config_dir.as_deref(),
-            &project_path,
-        ) {
-            tracing::warn!(target: "session.store",
-                "Failed to pre-trust {} in the host {} config: {}", project_path, agent.name, e);
-        }
-        if let Some(trust) = agent.trust {
+        // One writer per origin: native agents write by name, a declaration through
+        // its own trust table. The bundled Claude fallback carries a table too, but
+        // is native, and a declaration reusing its tool name must not inherit the
+        // name-based write.
+        if crate::agents::is_native(agent) {
+            if let Err(e) = crate::hooks::trust_host_project(
+                agent.name,
+                &home,
+                &environment,
+                config_dir.as_deref(),
+                &project_path,
+            ) {
+                tracing::warn!(target: "session.store",
+                    "Failed to pre-trust {} in the host {} config: {}", project_path, agent.name, e);
+            }
+        } else if let Some(trust) = agent.trust {
             let path = crate::hooks::declared_trust_path(
                 trust,
                 &home,
@@ -2215,6 +2220,106 @@ mod tests {
                 "profile={profile}: host trust record presence"
             );
         }
+    }
+
+    // Exactly one writer per origin: the bundled Claude fallback writes the
+    // record by name, byte for byte what the built-in entry wrote, while a
+    // declaration taking over `claude` writes only its own table, or nothing.
+    #[test]
+    #[serial_test::serial]
+    fn claude_host_trust_has_one_writer_per_origin() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        crate::session::config::update_config(|config| {
+            config.session.pre_trust_agent_folders = true;
+        })
+        .unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let project_path = std::fs::canonicalize(&project).unwrap();
+        let project_path = project_path.to_str().unwrap();
+        let record = tmp.path().join(".claude.json");
+        let trust = || {
+            let mut inst = tool_instance("claude", project_path);
+            inst.with_hook_agent(|this, agent| {
+                let agent = agent.expect("claude resolves");
+                this.ensure_host_folder_trust(Some(agent));
+                (
+                    crate::agents::is_native(agent),
+                    crate::agents::declared_trust(agent).is_some(),
+                )
+            })
+        };
+
+        let expected = tmp.path().join("expected.json");
+        crate::hooks::trust_claude_project(
+            &expected,
+            project_path,
+            crate::hooks::SymlinkPolicy::Follow,
+        )
+        .unwrap();
+        assert_eq!(trust(), (true, false));
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            std::fs::read(&expected).unwrap()
+        );
+        std::fs::remove_file(&record).unwrap();
+
+        // A custom agent named `claude` resolves to the same native identity.
+        crate::session::config::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("claude".into(), "my-claude".into());
+        })
+        .unwrap();
+        assert_eq!(trust(), (true, false));
+        assert_eq!(
+            std::fs::read(&record).unwrap(),
+            std::fs::read(&expected).unwrap()
+        );
+        std::fs::remove_file(&record).unwrap();
+        crate::session::config::update_config(|config| {
+            config.session.custom_agents.remove("claude");
+        })
+        .unwrap();
+
+        let manifest = |trust: &str| {
+            format!(
+                "id = \"acme.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+                 api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
+                 command = \"claude-next\"\n[agent_integrations.launch]\n\
+                 oneshot_flag = \"-p\"\n{trust}"
+            )
+        };
+        crate::session::test_support::install_agent_plugin("acme.claude", &manifest(""));
+        assert_eq!(trust(), (false, false));
+        assert!(
+            !record.exists(),
+            "a takeover without a table writes nothing"
+        );
+
+        crate::session::test_support::install_agent_plugin(
+            "acme.claude",
+            &manifest(
+                "[agent_integrations.trust]\nfile = \".claude-next.json\"\n\
+                 location = \"config_dir_or_home\"\npointer = \"/projects/{path}/trusted\"\n\
+                 value = true\nsandbox = \"always\"\n",
+            ),
+        );
+        assert_eq!(trust(), (false, true));
+        assert!(
+            !record.exists(),
+            "a declared table replaces the native record"
+        );
+        let declared: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".claude-next.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(declared["projects"][project_path]["trusted"], true);
     }
 
     #[test]

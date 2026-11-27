@@ -420,7 +420,8 @@ pub struct AgentDef<'a> {
     pub detect_status: fn(&str) -> Status,
     pub container_env: &'a [(&'a str, &'a str)],
     pub hook_config: Option<AgentHookConfig<'a>>,
-    /// Plugin-declared folder trust; built-in agents write theirs through `trust_host_project`.
+    /// Declared folder trust, written for plugin declarations only; native agents, the
+    /// bundled Claude fallback included, write theirs through `trust_host_project`.
     pub trust: Option<&'a aoe_plugin_api::agent_integration::AgentTrustDeclaration>,
     pub sidecar_hooks: Option<SidecarHooks>,
     pub session_support: Option<SessionSupport<'a>>,
@@ -1498,6 +1499,19 @@ const HELP_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(
 pub(crate) fn native_agents() -> impl Iterator<Item = &'static AgentDef<'static>> {
     let mut bundled = crate::plugin::bundled_agents::definitions();
     bundled.next().into_iter().chain(AGENTS).chain(bundled)
+}
+
+/// Whether `agent` is a native definition, not one built from a plugin declaration.
+pub(crate) fn is_native(agent: &AgentDef<'_>) -> bool {
+    native_agents().any(|native| std::ptr::eq(native, agent))
+}
+
+/// The trust table a plugin declaration writes. Native agents, the bundled Claude
+/// fallback included, write theirs by name through `trust_host_project`.
+pub(crate) fn declared_trust<'a>(
+    agent: &AgentDef<'a>,
+) -> Option<&'a aoe_plugin_api::agent_integration::AgentTrustDeclaration> {
+    agent.trust.filter(|_| !is_native(agent))
 }
 
 /// `native_agents` minus the bundled fallbacks an active plugin has taken over.
