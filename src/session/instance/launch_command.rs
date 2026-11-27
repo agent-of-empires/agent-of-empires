@@ -3683,7 +3683,10 @@ sandbox = "unsupported"
                 "/workspace/project",
             ))
             .join(format!("{sid}.jsonl"));
-        for (written, want) in [(false, "--session-id"), (true, "--resume")] {
+        for (written, want, other) in [
+            (false, "--session-id", "--resume"),
+            (true, "--resume", "--session-id"),
+        ] {
             if written {
                 std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
                 std::fs::write(&transcript, "").unwrap();
@@ -3702,6 +3705,10 @@ sandbox = "unsupported"
             assert!(
                 command.contains(&format!("{want} {sid}")),
                 "{written}: {command}"
+            );
+            assert!(
+                !command.contains(&format!("{other} {sid}")),
+                "{written}: only {want}: {command}"
             );
             assert_eq!(inst.agent_session_id.as_deref(), Some(sid), "{written}");
         }
