@@ -809,13 +809,19 @@ pub async fn update_workspace_ordering(
         return refused;
     }
     // A request dropped while it waits for the guards leaves nothing behind; once it holds
-    // them, the spawned commit owns them through reconciliation.
+    // them, the spawned commit owns them through reconciliation. One conditioned on the sort
+    // holds the sort's lane, taken before publication as a sort write takes it.
     let namespace = state.profile_namespace.clone().read_owned().await;
+    let lane = match body.base_sort {
+        Some(_) => Some(state.sidebar_view_lane.clone().lock_owned().await),
+        None => None,
+    };
     let publication = state.publication.clone().write_owned().await;
     match tokio::spawn(commit_workspace_ordering(
         state,
         body,
         namespace,
+        lane,
         publication,
     ))
     .await
@@ -831,6 +837,7 @@ async fn commit_workspace_ordering(
     state: Arc<AppState>,
     body: crate::daemon::WorkspaceOrderingPatch,
     namespace: tokio::sync::OwnedRwLockReadGuard<()>,
+    lane: Option<tokio::sync::OwnedMutexGuard<()>>,
     publication: tokio::sync::OwnedRwLockWriteGuard<()>,
 ) -> axum::response::Response {
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
@@ -903,6 +910,7 @@ async fn commit_workspace_ordering(
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.runtime.request_publish();
     drop(publication);
+    drop(lane);
     drop(namespace);
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
@@ -1141,6 +1149,55 @@ mod sidebar_view_tests {
                 "{name}"
             );
         }
+    }
+
+    /// An ordering write conditioned on the sort waits for a sort write in flight, so it
+    /// checks the sort that write leaves.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_ordering_write_on_the_sort_waits_for_a_sort_write() {
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            crate::session::update_app_state(|_| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let patch = SidebarViewPatch {
+            sort: Some(SortOrder::Name),
+            ..Default::default()
+        };
+        let sort = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while state.sidebar_view_lane.try_lock().is_ok() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sort write never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let ordering = tokio::spawn(update_workspace_ordering(
+            State(state.clone()),
+            Ok(Json(crate::daemon::WorkspaceOrderingPatch {
+                order: Some(Vec::new()),
+                base_sort: Some(SortOrder::Custom),
+                ..Default::default()
+            })),
+        ));
+        tokio::task::yield_now().await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(sort.await.unwrap().into_response().status(), StatusCode::OK);
+        assert_eq!(
+            ordering.await.unwrap().into_response().status(),
+            StatusCode::CONFLICT
+        );
     }
 
     /// A stalled write holds no publication guard, and once admitted it finishes after its
