@@ -2296,8 +2296,12 @@ impl SuggestionsFeed {
         self.snapshot.as_ref()?.pre_trust
     }
 
-    /// Whether auto start is on for a kind; `None` when the daemon names no such kind.
+    /// Whether auto start is on for a kind; `None` when the daemon names no such kind
+    /// or the kind cannot auto start.
     pub(super) fn auto_start_on(&self, provider_id: &str, criterion: &str) -> Option<bool> {
+        if provider_id == crate::plugin::suggestions::AGENT_PROVIDER_ID {
+            return None;
+        }
         let provider = self
             .snapshot
             .as_ref()?

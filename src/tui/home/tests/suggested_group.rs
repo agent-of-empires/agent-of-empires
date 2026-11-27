@@ -1747,6 +1747,21 @@ fn auto_start_asks_first_says_who_wrote_the_text_and_mentions_yolo() {
 
 #[test]
 #[serial]
+fn the_agent_kind_has_no_auto_start_key() {
+    let (mut env, requests) = expanded_env(1);
+    let mut snap = auto_start_snapshot(serde_json::Value::Null);
+    snap["providers"][0]["id"] = crate::plugin::suggestions::AGENT_PROVIDER_ID.into();
+    snap["items"][0]["provider_id"] = crate::plugin::suggestions::AGENT_PROVIDER_ID.into();
+    env.view.suggestions_feed.set_snapshot_for_test(snap);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('a')), None);
+    });
+    assert!(env.view.confirm_dialog.is_none());
+    assert!(requests.try_iter().next().is_none());
+}
+
+#[test]
+#[serial]
 fn auto_start_turns_off_without_asking() {
     let (mut env, requests) = expanded_env(1);
     env.view

@@ -529,6 +529,13 @@ pub async fn put_suggestion_auto_start(
     }
     // A kind a plugin no longer declares stays switchable off.
     if body.enabled {
+        if body.provider_id == suggestions::AGENT_PROVIDER_ID {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                "Auto start is not available for agent suggestions",
+            );
+        }
         if let Err(response) = check_declared(find_provider(&body.provider_id), &body.criterion) {
             return response;
         }

@@ -122,10 +122,23 @@ function Harness({
 }
 
 function open(
-  props: { readOnly?: boolean; presetFocus?: PresetFocus; presets?: typeof PRESETS; mappings?: unknown[] } = {},
+  props: {
+    readOnly?: boolean;
+    presetFocus?: PresetFocus;
+    presets?: typeof PRESETS;
+    mappings?: unknown[];
+    asAgentProvider?: boolean;
+  } = {},
 ) {
-  api.fetchSuggestions.mockResolvedValue(snapshot());
-  api.fetchSuggestionPresets.mockResolvedValue(props.presets ?? PRESETS);
+  const snap = snapshot();
+  let presets = props.presets ?? PRESETS;
+  if (props.asAgentProvider) {
+    snap.providers[0]!.id = "builtin.agent";
+    snap.items.forEach((item) => (item.provider_id = "builtin.agent"));
+    presets = presets.map((p) => ({ ...p, provider_id: "builtin.agent" }));
+  }
+  api.fetchSuggestions.mockResolvedValue(snap);
+  api.fetchSuggestionPresets.mockResolvedValue(presets);
   api.fetchAgents.mockResolvedValue([
     { name: "claude", display_name: "Claude Code", kind: "builtin", installed: true },
     { name: "codex", display_name: "Codex", kind: "builtin", installed: true },
@@ -295,6 +308,13 @@ describe("SuggestionsSettings", () => {
       fireEvent.click(within(dialog).getByRole("button", { name: "Turn on auto start" }));
       await waitFor(() => expect(api.putSuggestionAutoStart).toHaveBeenCalledWith("gh", "review-requested", true, 5));
     }
+  });
+
+  it("the Agent kind has no auto start switch", async () => {
+    open({ asAgentProvider: true });
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    await screen.findByRole("switch", { name: "Yolo mode" });
+    expect(screen.queryByRole("switch", { name: "Auto start" })).toBeNull();
   });
 
   it("a kind with auto start on shows its limit and turns off at once", async () => {

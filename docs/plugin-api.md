@@ -632,7 +632,7 @@ Suggestions are stored per profile. The routes below list and act on them; only 
 | `GET /api/suggestions/presets` | none | `{ presets: [{ provider_id, criterion, customized, preset, defaults }] }`, one per declared source |
 | `PUT /api/suggestions/presets` | `{ provider_id, criterion, preset }` | `{ provider_id, criterion, customized: true, preset, defaults }` |
 | `DELETE /api/suggestions/presets?provider_id=&criterion=` | none | 204 |
-| `PUT /api/suggestions/auto-start` | `{ provider_id, criterion, enabled, cap? }` | `{ provider_id, criterion, auto_start: { cap } \| null }`; `cap` is 1 to 10, default 3 |
+| `PUT /api/suggestions/auto-start` | `{ provider_id, criterion, enabled, cap? }` | `{ provider_id, criterion, auto_start: { cap } \| null }`; `cap` is 1 to 10, default 3; `builtin.agent` is refused with 400 |
 | `POST /api/suggestions/start` | `{ provider_id, id, project?: { path }, approve_hooks?, review_fingerprint? }` | 201 `{ session_id, title }` |
 | `POST /api/suggestions/fix` | `{ provider_id }` | `{ ok, notified }` |
 | `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, customized, source_ref, project, extra_projects, tool, view, yolo, sandbox, worktree }`; `view` is `structured` or `terminal` |

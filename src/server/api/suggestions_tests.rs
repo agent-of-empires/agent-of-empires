@@ -1353,6 +1353,41 @@ async fn auto_start_is_validated_and_leaves_what_needs_the_user_with_a_note() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn auto_start_is_refused_for_the_agent_provider() {
+    let f = fixture();
+    let agent = crate::plugin::suggestions::AGENT_PROVIDER_ID;
+    let (status, code, _) = f
+        .call(
+            Method::PUT,
+            "/api/suggestions/auto-start",
+            json!({ "provider_id": agent, "criterion": "agent", "enabled": true }),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::BAD_REQUEST, "validation_failed")
+    );
+    // A stored switch is ignored by the sweep: the item gets no note at all.
+    f.host.with_suggestions_db(|conn, profile| {
+        crate::plugin::suggestions::set_auto_start(conn, profile, agent, "agent", Some(3)).unwrap();
+    });
+    let (status, _, _) = f
+        .call(
+            Method::POST,
+            "/api/suggestions/push",
+            json!({ "title": "Look", "prompt": "do it" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    super::suggestions::sweep_auto_start(&f.state).await;
+    let (_, _, snapshot) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    let items = snapshot["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].get("auto_note").is_none(), "{items:?}");
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn auto_start_never_starts_a_yolo_preset() {
     let f = fixture();
     f.seed_item("a", Some("acme/web"), "42");

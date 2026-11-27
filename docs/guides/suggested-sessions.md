@@ -53,7 +53,7 @@ Tick the checkbox on each row (or **Select all shown**), then **Start N** in the
 
 ### Auto start
 
-Off by default. In **Settings › Suggestions**, a kind's preset has an **Auto start** switch. Turning it on asks first: auto start launches an agent on text written by others (issue and PR content) with no human check, and says so again when the preset has Yolo on, since such a kind is never auto started. Pick a per-refresh cap from 1 to 10 (default 3).
+Off by default. In **Settings › Suggestions**, a plugin kind's preset has an **Auto start** switch (the Agent kind has none: sessions can push more suggestions, so no cap would hold). Turning it on asks first: auto start launches an agent on text written by others (issue and PR content) with no human check, and says so again when the preset has Yolo on, since such a kind is never auto started. Pick a per-refresh cap from 1 to 10 (default 3).
 
 After each provider publish, AoE starts up to the cap of that kind's items that:
 

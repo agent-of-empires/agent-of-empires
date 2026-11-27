@@ -115,6 +115,10 @@ pub(crate) async fn sweep(state: &Arc<AppState>) {
         return;
     };
     for provider in suggestions::providers() {
+        // Every push wakes a sweep and a started session can push again, so no cap would bind.
+        if provider.id == suggestions::AGENT_PROVIDER_ID {
+            continue;
+        }
         let mut criteria: Vec<(String, u32)> = enabled
             .iter()
             .filter(|((provider_id, _), _)| *provider_id == provider.id)

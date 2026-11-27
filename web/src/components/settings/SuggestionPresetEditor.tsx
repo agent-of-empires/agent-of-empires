@@ -9,6 +9,7 @@ import type {
   SuggestionSource,
 } from "../../lib/types";
 import { shortRef } from "../../lib/suggestionPlan";
+import { AGENT_PROVIDER_ID } from "../../lib/suggestionProviders";
 import { expandTemplate } from "../../lib/suggestionTemplate";
 import { TemplateEditor } from "./TemplateEditor";
 import { SuggestionSwitch } from "./suggestionsShared";
@@ -224,13 +225,15 @@ export function SuggestionPresetEditor({ provider, source, entry, item, disabled
           {preview}
         </p>
       </div>
-      <SuggestionAutoStart
-        provider={provider}
-        source={source}
-        yolo={stored?.yolo ?? draft.yolo}
-        disabled={disabled}
-        onChanged={onSaved}
-      />
+      {provider.id !== AGENT_PROVIDER_ID && (
+        <SuggestionAutoStart
+          provider={provider}
+          source={source}
+          yolo={stored?.yolo ?? draft.yolo}
+          disabled={disabled}
+          onChanged={onSaved}
+        />
+      )}
       <div className="flex items-center gap-2">
         <button type="button" className={GHOST} disabled={off || !entry?.customized} onClick={() => void reset()}>
           Reset to {provider.name}&apos;s settings
