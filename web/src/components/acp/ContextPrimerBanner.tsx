@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchContextPrimer } from "../../lib/api";
+import { BUTTON_WARNING_SM } from "../../lib/surfaces";
+import { WarningStrip } from "../panelParts";
 
 /** After a failed `session/load`, offers to prefill a recap of recent turns.
  *  Dismissal lives in the reducer so it survives session switches. */
@@ -58,38 +60,25 @@ export function ContextPrimerBanner({ sessionId, available, onInsertPrimer, onDi
   };
 
   return (
-    <div
+    <WarningStrip
       role="status"
-      className="bg-amber-900/30 border-y border-amber-700/40 px-4 py-2 flex items-center gap-3 text-xs font-mono text-amber-200"
+      title="Agent lost its prior model context."
+      onDismiss={onDismiss}
+      dismissLabel="Dismiss context-reset banner"
+      actions={
+        <>
+          {error && (
+            <span className="text-status-error-text text-[12px] shrink-0" role="alert">
+              {error}
+            </span>
+          )}
+          <button type="button" onClick={handleClick} disabled={loading} className={`${BUTTON_WARNING_SM} shrink-0`}>
+            {loading ? "Loading..." : "Resume with prior context"}
+          </button>
+        </>
+      }
     >
-      <span className="shrink-0 text-amber-400" aria-hidden="true">
-        ⚠
-      </span>
-      <span className="flex-1 leading-snug">
-        Agent lost its prior model context.{" "}
-        <span className="text-amber-100/70">You can pre-fill the composer with a recap of the recent turns.</span>
-      </span>
-      {error && (
-        <span className="text-status-error text-[11px] shrink-0" role="alert">
-          {error}
-        </span>
-      )}
-      <button
-        type="button"
-        onClick={handleClick}
-        disabled={loading}
-        className="shrink-0 px-2 py-1 rounded bg-amber-800/40 hover:bg-amber-700/50 border border-amber-700/60 text-amber-100 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-colors"
-      >
-        {loading ? "Loading..." : "Resume with prior context"}
-      </button>
-      <button
-        type="button"
-        onClick={onDismiss}
-        aria-label="Dismiss context-reset banner"
-        className="shrink-0 px-1 text-amber-300/70 hover:text-amber-100 cursor-pointer"
-      >
-        &times;
-      </button>
-    </div>
+      You can pre-fill the composer with a recap of the recent turns.
+    </WarningStrip>
   );
 }

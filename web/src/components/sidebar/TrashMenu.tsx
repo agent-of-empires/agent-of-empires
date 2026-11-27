@@ -7,6 +7,7 @@ import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { workspaceTrashedAtMs } from "../../lib/sidebarSort";
 import { hasPendingTrash, trashRecoveryTarget } from "../../lib/trashActions";
 import type { TrashRecoveryTarget } from "../../lib/trashActions";
+import { MENU } from "../../lib/surfaces";
 import { ContextMenu, MenuItem } from "../ContextMenu";
 import { EmptyTrashConfirm } from "../EmptyTrashConfirm";
 import { useContextMenu } from "../useContextMenu";
@@ -148,7 +149,7 @@ export function TrashMenu({
             role="region"
             aria-label="Trash"
             data-testid="sidebar-trash-menu"
-            className="fixed z-40 flex max-h-[min(520px,calc(100dvh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
+            className={`fixed z-40 flex max-h-[min(520px,calc(100dvh-5rem))] flex-col overflow-hidden ${MENU} animate-fade-in`}
             style={panelPosition}
           >
             <div className="flex items-start justify-between gap-3 border-b border-surface-700/60 px-4 py-3">
@@ -217,7 +218,7 @@ export function TrashMenu({
               openWorkspace(menu.ws);
             }}
             testId="sidebar-trash-context-menu-open"
-            icon={<ArrowUpRight className="h-3.5 w-3.5 shrink-0" />}
+            icon={<ArrowUpRight />}
           >
             Open
           </MenuItem>
@@ -233,14 +234,14 @@ export function TrashMenu({
                       }}
                       detail={target.title}
                       testId="sidebar-trash-context-menu-retry"
-                      icon={<RotateCcw className="h-3.5 w-3.5 shrink-0" />}
+                      icon={<RotateCcw />}
                     >
                       Retry Trash
                     </MenuItem>
                   </Fragment>
                 ))}
                 {menuTargets.length === 0 && (
-                  <p className="px-3 py-2 text-xs text-text-secondary">Recovery needs a current session identity.</p>
+                  <p className="px-3 py-2 text-[12px] text-text-dim">Recovery needs a current session identity.</p>
                 )}
               </>
             ) : (
@@ -251,7 +252,7 @@ export function TrashMenu({
                     restoreWorkspace(menu.ws);
                   }}
                   testId="sidebar-trash-context-menu-restore"
-                  icon={<RotateCcw className="h-3.5 w-3.5 shrink-0" />}
+                  icon={<RotateCcw />}
                 >
                   Restore
                 </MenuItem>
@@ -261,8 +262,8 @@ export function TrashMenu({
                     deleteWorkspace(menu.ws);
                   }}
                   testId="sidebar-trash-context-menu-delete"
-                  icon={<X className="h-3.5 w-3.5 shrink-0" />}
-                  className="text-status-error hover:bg-status-error/10"
+                  icon={<X />}
+                  danger
                 >
                   Delete permanently
                 </MenuItem>

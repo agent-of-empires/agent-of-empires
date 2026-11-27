@@ -567,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn cityhall_denies_native_input_and_sandbox_login_mutations_before_body() {
+    async fn cityhall_denies_input_recency_sandbox_login_and_suggestions_before_body() {
         use axum::http::{Method, Request, StatusCode};
         use tower::ServiceExt;
 
@@ -586,6 +586,9 @@ mod tests {
             (Method::DELETE, "/api/sandbox/login"),
             (Method::DELETE, "/api/sandbox/login/missing"),
             (Method::POST, "/api/sandbox/login/missing/code"),
+            (Method::POST, "/api/suggestions/push"),
+            (Method::PUT, "/api/suggestions/auto-start"),
+            (Method::POST, "/api/suggestions/start-batch"),
         ] {
             let mut request = Request::builder()
                 .method(method.clone())

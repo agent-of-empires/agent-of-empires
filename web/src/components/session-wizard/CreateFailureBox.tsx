@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { writeClipboard } from "../../lib/clipboard";
 import type { CreateFailure } from "../../lib/types";
+import { BUTTON_INLINE, BUTTON_PRIMARY, BUTTON_SECONDARY } from "../../lib/surfaces";
 import { FAILURE_ACTION_LABEL, type FailureAction, type FailureView } from "./createFailureView";
 
 const OUTPUT_LINES = 8;
@@ -37,11 +38,7 @@ export function CreateFailureBox({
       disabled={busy || !!blocked?.(action)}
       onClick={() => onAction(action)}
       data-testid={`create-failure-${action}`}
-      className={`min-h-8 rounded-md px-3 py-1.5 text-xs font-medium cursor-pointer disabled:cursor-not-allowed disabled:opacity-60 ${
-        primary
-          ? "bg-brand-600 text-surface-900 hover:bg-brand-700"
-          : "border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700"
-      }`}
+      className={primary ? BUTTON_PRIMARY : BUTTON_SECONDARY}
     >
       {FAILURE_ACTION_LABEL[action]}
     </button>
@@ -53,7 +50,7 @@ export function CreateFailureBox({
       role="alert"
       tabIndex={-1}
       data-testid="create-failure"
-      className="mb-4 rounded-lg border border-status-error/40 bg-status-error/10 p-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-status-error/60"
+      className="mb-3 rounded-xl border border-status-error/40 bg-status-error/10 p-3 text-[15px] md:text-sm outline-none focus-visible:ring-2 focus-visible:ring-status-error/60"
     >
       <p className="font-semibold text-status-error">{view.title}</p>
       {view.step && <p className="mt-1 text-text-secondary">{view.step}</p>}
@@ -78,7 +75,7 @@ export function CreateFailureBox({
           <button
             type="button"
             onClick={() => void writeClipboard(failure.reference!).then(setCopied)}
-            className="font-medium text-brand-400 hover:underline cursor-pointer"
+            className={BUTTON_INLINE}
           >
             {copied ? "Copied" : "Copy"}
           </button>

@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { useClampedMenuPosition } from "../../lib/menuPosition";
 import { writeClipboard } from "../../lib/clipboard";
 import { openInNewTab } from "../../lib/openInNewTab";
 import { toastBus } from "../../lib/toastBus";
+import { ContextMenu, MenuItem } from "../ContextMenu";
 
 export interface PathMenuState {
   x: number;
@@ -17,9 +17,6 @@ interface Props {
   menu: PathMenuState | null;
   onClose: () => void;
 }
-
-const ITEM =
-  "w-full px-3 py-1.5 text-left text-[13px] text-text-secondary hover:bg-surface-800 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent";
 
 function openFailureMessage(path: string, status?: number): string {
   if (status === 404) return `${path} is not in the worktree`;
@@ -81,29 +78,16 @@ export function FileContextMenu({ menu, onClose }: Props) {
     onClose();
   };
 
-  return createPortal(
-    <div
-      ref={menuRef}
-      role="menu"
-      className="fixed z-50 min-w-[160px] rounded-md border border-surface-700 bg-surface-850 py-1 shadow-lg"
-      style={{ left: pos.x, top: pos.y }}
-      onContextMenu={(e) => e.preventDefault()}
-    >
+  return (
+    <ContextMenu menu={pos} menuRef={menuRef} role="menu" minWidth="min-w-[180px]">
       {open && (
-        <button
-          type="button"
-          role="menuitem"
-          disabled={open.disabled}
-          onClick={() => openFile(open.url)}
-          className={ITEM}
-        >
+        <MenuItem role="menuitem" disabled={open.disabled} onClick={() => openFile(open.url)}>
           Open file
-        </button>
+        </MenuItem>
       )}
-      <button type="button" role="menuitem" onClick={copy} className={ITEM}>
+      <MenuItem role="menuitem" onClick={copy}>
         Copy relative path
-      </button>
-    </div>,
-    document.body,
+      </MenuItem>
+    </ContextMenu>
   );
 }

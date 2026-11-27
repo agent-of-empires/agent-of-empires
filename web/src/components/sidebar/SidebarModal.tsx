@@ -1,4 +1,5 @@
 import { useLayoutEffect, type ReactNode } from "react";
+import { ModalFrame } from "../Dialog";
 
 /** Portal-free modal shell for the sidebar row pickers. Escape and backdrop clicks cancel unless `locked`. */
 export function SidebarModal({
@@ -31,29 +32,21 @@ export function SidebarModal({
   }, [onCancel, locked]);
 
   return (
-    <div
-      data-testid={`${testId}-backdrop`}
-      onClick={(e) => {
-        if (e.target === e.currentTarget && !locked) onCancel();
-      }}
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 px-4 py-8 overflow-y-auto"
-      role="dialog"
-      aria-modal="true"
-      aria-label={label}
+    <ModalFrame
+      layer="z-[60]"
+      rootProps={{ "data-testid": `${testId}-backdrop`, role: "dialog", "aria-modal": true, "aria-label": label }}
+      panelProps={{ "data-testid": testId }}
+      panelClassName="md:max-w-sm md:max-h-[90vh]"
+      onBackdrop={locked ? undefined : onCancel}
     >
-      <div
-        data-testid={testId}
-        className="w-full max-w-sm rounded-lg border border-surface-700 bg-surface-800 shadow-xl"
-      >
-        <div className="px-4 py-3 border-b border-surface-700/40">
-          <div className="text-sm font-mono text-text-primary truncate" title={title}>
-            {heading}
-            <span className="text-text-muted"> · {title}</span>
-          </div>
-          {subtitle}
+      <div className="px-4 pt-3 pb-2 max-md:pt-1">
+        <div className="text-[15px] md:text-sm font-mono text-text-primary truncate" title={title}>
+          {heading}
+          <span className="text-text-muted"> · {title}</span>
         </div>
-        {children}
+        {subtitle}
       </div>
-    </div>
+      <div className="min-h-0 flex-1 overflow-y-auto">{children}</div>
+    </ModalFrame>
   );
 }

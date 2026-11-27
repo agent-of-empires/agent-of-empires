@@ -1,8 +1,8 @@
 import type { CSSProperties } from "react";
 import type { AnsiStyle } from "../../lib/ansi";
 
-const TERM_FG = "var(--term-fg, #e4e4e7)";
-const TERM_BG = "var(--term-bg, #1c1c1f)";
+const TERM_FG = "var(--term-fg, #e5e5e5)";
+const TERM_BG = "var(--term-bg, #1f1f1f)";
 
 export function segStyle(style: AnsiStyle): CSSProperties | undefined {
   const css: CSSProperties = {};

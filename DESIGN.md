@@ -83,9 +83,12 @@ content. It is denser and quieter than the marketing site.
 
 - Use self-hosted Geist Sans for headings and body copy, and Geist Mono for
   session names, paths, status glyphs, shortcuts, and data.
-- Rows are 28 to 32px; buttons are 32 to 40px.
-- Use 6px radii for controls and 8px for panels and dialogs. Do not add larger
-  radii.
+- Rows are 28 to 32px and buttons 32 to 40px on desktop; on a phone, tap
+  targets are at least 44px and inputs use 16px text.
+- Draw surfaces from `web/src/lib/surfaces.ts` (cards, captions, inputs,
+  menus, sheets, dialogs, buttons) rather than restyling them per component.
+  Radii follow it: 8px controls, 12px cards and menus, 16px dialogs and a
+  phone's cards, 28px a phone's sheets.
 - Use semantic theme tokens such as `bg-surface-900`,
   `text-status-running`, and `border-surface-700`.
 - All body text must meet WCAG AA contrast against its surface.
@@ -98,8 +101,37 @@ content. It is denser and quieter than the marketing site.
 - Fixed palette colors are allowed only when hue carries meaning, such as
   status, severity, syntax, user content, third-party visualizations, and the
   brand mark.
-- Mobile prioritizes monitoring and conversation controls; overlays replace
-  persistent side panels.
+- Mobile prioritizes monitoring and conversation controls, after Muse and
+  Claude's iOS app: the landing page is home, and the session list is a darker
+  drawer under the page, which slides aside as one rounded, dimmed
+  card, header and all, following the finger. Controls float
+  (`float-control`: a solid surface, hairline edge and soft shadow) over the
+  Session, which scrolls beneath them; menus are frosted (`glass-menu`); a Session's views switch from
+  the header's ⋯ so the agent keeps the screen; sheets replace persistent side
+  panels. Bars at the top and bottom edges are fixed or sticky and opaque (over
+  a Session, a strip exactly under the clock), so iOS 26 tints its bars from
+  them instead of blurring. Elevation comes from the theme's `shadow-*` tokens:
+  layered shadows with a hairline edge, on cards, menus and dialogs alike.
+- Sessions stay on the left. The right dock is the Session's review panel
+  (Diff, Files, Background, plugins), with the terminal tabs stacked below
+  them in the same dock, as in Conductor.
+  Below 1100px the right dock overlays the main area as a sheet rather than
+  squeezing a third column.
+- On desktop the app is a near-black canvas (`surface-950`) holding cards: the
+  agent pane and each dock group are `surface-900` cards with a 12px radius, a
+  faint border and 8px gaps, as in Claude Code desktop. The header and sidebar
+  sit on the canvas without borders. Tabs are plain text, the active one
+  brighter; a count follows its label (`Diff 3`).
+- The sidebar reads like Claude Code desktop's: **New session** and **Search**
+  rows first, one View options menu by the Sessions label, quiet sentence-case
+  section labels, inset rounded rows, and the open session as a soft filled
+  pill with brighter text. The header names the open session as
+  `project / title`.
+- Follow the conventions of Claude Code desktop, VS Code and Conductor rather
+  than inventing controls. The header toggles regions, not individual panes:
+  a terminal icon, then the review panel's split button (panel icon toggles it,
+  chevron opens a menu of its panes). An open toggle is tinted with the brand
+  accent, not filled; tooltips name the action and its shortcut.
 
 If a visual change requires an exception, update this document with the new
 rule as part of the change.

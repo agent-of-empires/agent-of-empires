@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 
 import { restartSession } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
-import { RecoveryActionRow, SECONDARY_BUTTON, type RecoveryAction } from "./acp/RecoveryActionRow";
+import { BUTTON_SECONDARY } from "../lib/surfaces";
+import { RecoveryActionRow, RecoveryScreen, type RecoveryAction } from "./acp/RecoveryActionRow";
 import { useCopy } from "./acp/useCopy";
 
 interface Props {
@@ -48,6 +49,7 @@ export function SessionErrorPanel({ session, readOnly }: Props) {
     onClick: () => void onRestart(),
     testId: "session-error-restart",
     disabled: restart.state === "restarting",
+    busy: restart.state === "restarting",
   };
   const copyAction: RecoveryAction = {
     label: copied ? "Copied" : "Copy error",
@@ -56,58 +58,52 @@ export function SessionErrorPanel({ session, readOnly }: Props) {
   };
 
   return (
-    <div
-      data-testid="session-error-panel"
-      data-recorded={lastError ? "true" : "false"}
-      className="flex h-full flex-1 items-center justify-center bg-surface-900 px-4 py-12"
-    >
-      <div className="w-full max-w-xl rounded-lg border border-status-error/60 bg-surface-850 p-4 text-text-primary shadow-lg sm:p-6">
-        <h2 className="text-lg font-semibold text-text-primary">
-          <span className="font-mono">{name}</span> reported an error
-        </h2>
-        <p className="mt-1 text-sm text-text-subtle">
-          {deleting
-            ? "This Session is being deleted."
-            : lastError
-              ? "This is the most recent error AoE recorded for this Session."
-              : canRestart
-                ? "No details were recorded. Restart to try again."
-                : "No details were recorded."}
+    <RecoveryScreen data-testid="session-error-panel" data-recorded={lastError ? "true" : "false"}>
+      <h2 className="text-lg font-semibold text-text-primary">
+        <span className="font-mono">{name}</span> reported an error
+      </h2>
+      <p className="mt-1 text-sm text-text-subtle">
+        {deleting
+          ? "This Session is being deleted."
+          : lastError
+            ? "This is the most recent error AoE recorded for this Session."
+            : canRestart
+              ? "No details were recorded. Restart to try again."
+              : "No details were recorded."}
+      </p>
+      {lastError && (
+        <pre
+          data-testid="session-error-text"
+          className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-xs text-text-primary"
+        >
+          {lastError}
+        </pre>
+      )}
+      {canRestart ? (
+        <RecoveryActionRow
+          primary={restartAction}
+          secondary={lastError ? [copyAction] : []}
+          install={{ error: null, output: null }}
+        />
+      ) : (
+        lastError && (
+          <div className="mt-3">
+            <button
+              type="button"
+              data-testid={copyAction.testId}
+              onClick={copyAction.onClick}
+              className={BUTTON_SECONDARY}
+            >
+              {copyAction.label}
+            </button>
+          </div>
+        )
+      )}
+      {restart.state === "failed" && (
+        <p data-testid="session-error-restart-failed" className="mt-2 text-xs text-status-error-text">
+          Restart failed: {restart.message}
         </p>
-        {lastError && (
-          <pre
-            data-testid="session-error-text"
-            className="mt-3 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-md border border-surface-700 bg-surface-950 p-2 font-mono text-xs text-text-primary"
-          >
-            {lastError}
-          </pre>
-        )}
-        {canRestart ? (
-          <RecoveryActionRow
-            primary={restartAction}
-            secondary={lastError ? [copyAction] : []}
-            install={{ error: null, output: null }}
-          />
-        ) : (
-          lastError && (
-            <div className="mt-3">
-              <button
-                type="button"
-                data-testid={copyAction.testId}
-                onClick={copyAction.onClick}
-                className={SECONDARY_BUTTON}
-              >
-                {copyAction.label}
-              </button>
-            </div>
-          )
-        )}
-        {restart.state === "failed" && (
-          <p data-testid="session-error-restart-failed" className="mt-2 text-xs text-status-error-text">
-            Restart failed: {restart.message}
-          </p>
-        )}
-      </div>
-    </div>
+      )}
+    </RecoveryScreen>
   );
 }

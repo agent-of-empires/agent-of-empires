@@ -7,6 +7,7 @@ import type { ConfigOptionChoice, ConfigOptionDescriptor, AcpState } from "../..
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { loadSessionModelDefault, saveAgentModelDefault, type AgentModelDefault } from "../../lib/agentModelDefault";
 import { isImeComposing } from "../../lib/ime";
+import { INPUT, MENU, MENU_HEADING, MENU_ITEM, MENU_OPTION_ROW } from "../../lib/surfaces";
 import { REJECTED_ERROR, UNCERTAIN_ERROR } from "../../lib/settingsStore";
 import { toastBus } from "../../lib/toastBus";
 
@@ -49,6 +50,10 @@ const MENU_MAX_HEIGHT_FLOOR = 120;
 const MENU_VIEWPORT_MARGIN = 8;
 const EFFORT_SEGMENTED_MAX_COUNT = 5;
 const EFFORT_SEGMENTED_MAX_TOTAL_LABEL_LEN = 40;
+/** A menu row with a second line of description, so its trailing state sits by the first line. */
+const OPTION_ROW_CURRENT = `${MENU_OPTION_ROW.replace("text-text-secondary", "text-text-primary")} bg-surface-700/40`;
+/** The model default row, pinned under the list as it scrolls. */
+const FOOTER_ROW = "sticky bottom-0 border-t border-surface-700/50 bg-surface-800";
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
@@ -317,16 +322,14 @@ function ModelDropdown({ option, pending, onSelect, lockedReason, modelDefault }
           id={menuId}
           onKeyDown={onMenuKeyDown}
           className={[
-            "absolute left-0 z-30 flex w-64 flex-col overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl",
+            `absolute left-0 z-30 flex w-72 flex-col overflow-hidden ${MENU}`,
             menuLayout.direction === "up" ? "bottom-full mb-1" : "top-full mt-1",
           ].join(" ")}
           style={{ maxHeight: menuLayout.maxHeight }}
         >
-          <div className="shrink-0 border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
-            {option.name}
-          </div>
+          <div className={`shrink-0 ${MENU_HEADING}`}>{option.name}</div>
           {searchable && (
-            <div className="shrink-0 border-b border-surface-800 p-2">
+            <div className="shrink-0 border-b border-surface-700/50 px-2 pb-2">
               <input
                 type="text"
                 autoFocus
@@ -335,13 +338,13 @@ function ModelDropdown({ option, pending, onSelect, lockedReason, modelDefault }
                 onChange={(e) => setQuery(e.target.value)}
                 aria-label="Search models"
                 placeholder="Search models..."
-                className="w-full rounded border border-surface-700 bg-surface-900 px-2 py-1.5 text-xs text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+                className={INPUT}
               />
             </div>
           )}
           <div ref={menuRef} role="menu" aria-label={option.name} className="min-h-0 overflow-y-auto">
             {searchable && filteredOptions.length === 0 && (
-              <div role="status" className="px-3 py-2 text-xs text-text-dim">
+              <div role="status" className="px-3 py-2 text-[13px] text-text-dim">
                 {query.trim() ? "No models match your search." : "No models available."}
               </div>
             )}
@@ -367,20 +370,14 @@ function ModelDropdown({ option, pending, onSelect, lockedReason, modelDefault }
                     void onSelect(opt.value);
                   }}
                   data-testid={`config-option-${option.id}-value-${opt.value}`}
-                  className={[
-                    "flex w-full items-start gap-2 px-3 py-1.5 text-left text-[12px]",
-                    isCurrent
-                      ? "bg-surface-800 text-text-primary"
-                      : "text-text-secondary hover:bg-surface-800 hover:text-text-primary",
-                    isPending ? "cursor-not-allowed opacity-50" : "",
-                  ].join(" ")}
+                  className={isCurrent ? OPTION_ROW_CURRENT : MENU_OPTION_ROW}
                 >
-                  <span className="flex-1">
+                  <span className="min-w-0 flex-1">
                     <span className="block font-medium">{opt.name}</span>
-                    {opt.description && <span className="block text-[11px] text-text-dim">{opt.description}</span>}
+                    {opt.description && <span className="block text-[12px] text-text-dim">{opt.description}</span>}
                   </span>
-                  {isCurrent && !isPending && <span className="text-[10px] uppercase text-brand-500">Active</span>}
-                  {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
+                  {isCurrent && !isPending && <span className="shrink-0 text-[11px] text-brand-500">Active</span>}
+                  {isPending && <span className="shrink-0 text-[11px] text-text-dim">…</span>}
                 </button>
               );
             })}
@@ -432,8 +429,6 @@ function ModelDefaultItem({
   const agentLabel = agentName(state.status === "ready" ? state.value.agent_key : agent);
 
   if (state.status === "failed") return null;
-  const itemClass =
-    "sticky bottom-0 flex w-full items-center gap-2 border-t border-surface-800 bg-surface-850 px-3 py-2 text-left text-[12px]";
 
   if (state.status === "ready" && state.value.pinned) {
     return (
@@ -445,7 +440,7 @@ function ModelDefaultItem({
           onDone(e.detail === 0);
           open();
         }}
-        className={`${itemClass} text-text-secondary hover:bg-surface-800 hover:text-text-primary`}
+        className={`${MENU_ITEM} ${FOOTER_ROW}`}
       >
         Pinned in Agent defaults ›
       </button>
@@ -488,7 +483,7 @@ function ModelDefaultItem({
         onDone(e.detail === 0);
         void save();
       }}
-      className={`${itemClass} ${inert ? "cursor-default text-text-dim" : "text-text-secondary hover:bg-surface-800 hover:text-text-primary"}`}
+      className={`${inert ? MENU_ITEM.replace("text-text-secondary", "text-text-dim").replace("cursor-pointer", "cursor-default") : MENU_ITEM} ${FOOTER_ROW}`}
     >
       <span
         aria-hidden
