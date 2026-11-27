@@ -873,17 +873,21 @@ mod tests {
                                 native.send(json!({"jsonrpc":"2.0","id":constructor_id,
                                     "result":{"sessionId":sid}})).await;
                                 client.ready().await;
-                                phase.set("awaiting creation finalization");
-                                let storage = crate::session::Storage::open_unwatched("test").unwrap();
-                                loop {
-                                    let row = storage.load_instances_complete().unwrap().into_iter()
-                                        .find(|row| row.id == client.id).unwrap();
-                                    if row.status == crate::session::Status::Idle {
-                                        drop(state.session_service.prompt_submission(&client.id).await);
-                                        break;
-                                    }
-                                    tokio::task::yield_now().await;
+                            }
+                            // Installing the SDK lets creation finalize before Native readiness.
+                            // Wait in both cases so that finalizer cannot overwrite the discard fault.
+                            phase.set("awaiting creation finalization");
+                            let storage = crate::session::Storage::open_unwatched("test").unwrap();
+                            loop {
+                                let row = storage.load_instances_complete().unwrap().into_iter()
+                                    .find(|row| row.id == client.id).unwrap();
+                                if row.status == crate::session::Status::Idle {
+                                    drop(state.session_service.prompt_submission(&client.id).await);
+                                    break;
                                 }
+                                tokio::task::yield_now().await;
+                            }
+                            if !original {
                                 client.send_prompt("one explicit prompt", &[]).await.unwrap();
                                 prompt_id = Some(prompt_rx.await.unwrap());
                             }
@@ -919,7 +923,6 @@ mod tests {
                             assert_eq!(publication.is_original(), original);
                             assert!(!publication.published_at(u64::MAX));
                             assert_unresolvable(&client, &nonce, question).await;
-                            let storage = crate::session::Storage::open_unwatched("test").unwrap();
                             let status = storage.load_instances_complete().unwrap().into_iter()
                                 .find(|row| row.id == client.id).unwrap().status;
                             let mut fault = PublicationFault {

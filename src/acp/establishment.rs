@@ -1682,8 +1682,8 @@ impl NativeResourceAuthority {
     fn original_guard(
         &self,
     ) -> anyhow::Result<(
-        crate::session::StorageFlock,
         crate::process::worker_registry::RegistryGuard<'_>,
+        crate::session::StorageFlock,
     )> {
         let witness = self
             .witness
@@ -1730,7 +1730,9 @@ impl NativeResourceAuthority {
                     == owner.birth_fingerprint,
             EstablishmentRefusal::Superseded
         );
-        Ok((native, registry))
+        // Tuple fields drop in order. Keep lifecycle locked until the
+        // registry is free so a waiting reader cannot spuriously see it busy.
+        Ok((registry, native))
     }
 
     /// Guard actual tracking-state insertion too, without pretending IO began.
@@ -1743,7 +1745,8 @@ impl NativeResourceAuthority {
             NativeResourceSource::Current(start)
                 if !self.started.load(std::sync::atomic::Ordering::Acquire) =>
             {
-                start.context.try_effect_guard()?
+                let (native, registry) = start.context.try_effect_guard()?;
+                (registry, native)
             }
             _ => self.original_guard()?,
         };
@@ -1766,7 +1769,7 @@ impl NativeResourceAuthority {
             match &self.source {
                 NativeResourceSource::Original(_) => self.original_guard()?,
                 NativeResourceSource::Current(start) => match start.context.effect_guard() {
-                    Ok(guard) => guard,
+                    Ok((native, registry)) => (registry, native),
                     Err(_) if self.started.load(std::sync::atomic::Ordering::Acquire) => {
                         self.original_guard()?
                     }
