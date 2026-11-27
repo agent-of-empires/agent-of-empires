@@ -9,6 +9,7 @@ import {
   type ComponentProps,
   type ReactNode,
 } from "react";
+import { flushSync } from "react-dom";
 import {
   AlarmClock,
   AlarmClockOff,
@@ -2206,16 +2207,12 @@ function AppContent({
   }, [attentionJump, activeSessionId, handleSelectSession]);
 
   const handleFocusSidebar = useCallback(() => {
-    setSidebarOpen(true);
-    // Two frames: a phone's drawer is hidden, and so unfocusable, until the opening render commits.
-    requestAnimationFrame(() =>
-      requestAnimationFrame(() => {
-        const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
-        const activeRow = sidebar?.querySelector<HTMLElement>("[data-active-session-row]");
-        const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
-        target?.focus();
-      }),
-    );
+    // Commit the open drawer before focusing it. A hidden sidebar cannot receive focus.
+    flushSync(() => setSidebarOpen(true));
+    const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
+    const activeRow = sidebar?.querySelector<HTMLElement>("[data-active-session-row]");
+    const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
+    target?.focus();
   }, []);
 
   useKeyboardShortcuts(
