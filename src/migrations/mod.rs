@@ -71,6 +71,11 @@ mod v059_owner_only_event_logs;
 mod v060_terminal_handoff_outcome;
 mod v061_unpin_default_sandbox_image;
 mod v062_plugin_staging_evidence;
+mod v063_retire_color_labels;
+mod v064_builtin_sounds;
+mod v065_account_limit_estimate_rows;
+mod v066_retire_agent_update_fields;
+mod v067_retire_restart_wake;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -111,7 +116,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 62;
+const CURRENT_VERSION: u32 = 67;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -328,6 +333,19 @@ const MIGRATIONS: &[Migration] = &[
         "plugin_staging_evidence",
         v062_plugin_staging_evidence::run,
     ),
+    (63, "retire_color_labels", v063_retire_color_labels::run),
+    (64, "builtin_sounds", v064_builtin_sounds::run),
+    (
+        65,
+        "account_limit_estimate_rows",
+        v065_account_limit_estimate_rows::run,
+    ),
+    (
+        66,
+        "retire_agent_update_fields",
+        v066_retire_agent_update_fields::run,
+    ),
+    (67, "retire_restart_wake", v067_retire_restart_wake::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

@@ -279,6 +279,43 @@ including updates whose recorded source is local. Other principals receive
 Preview and apply retain read-only and CityHall restrictions; apply also requires
 elevation. See [plugin consent and job recovery](plugins.md#installing-external-plugins).
 
+## Sandbox login
+
+With `sandbox.shared_credential = "separate_login"`, these endpoints run the same login as [`aoe sandbox login`](cli/reference.md#aoe-sandbox-login) for the daemon's profile, or for the `profile` a request names. One login runs at a time. The sign-in link and the code never appear in logs or error text.
+
+The login belongs to one shared credential file per profile and agent tool. `tool` names the agent whose file to read or log in (default: the profile's default tool when it has a sandbox login, else the only agent that has one): a wrapper agent with its own `session.agent_config_dir` entry has a file of its own, and a session of it waits on that file. The file follows the command the tool launches (`agent_command_override`, else `custom_agents`, else the built-in agent), as the launch gate reads it. `command` is the command a session's launch runs for `tool` when it has its own, the same value `aoe sandbox login --command` takes and the `command` of a `sandbox_login_required` error; it needs `tool` (without it the request answers `400` `sandbox_login_command_needs_tool`), and an empty one counts as none. Send what the error named: a session with its own command waits on that command's file, which the profile's command for the tool does not reach. `profile` is the profile of the session, the same value `aoe -p` takes and the `profile` of a `sandbox_login_required` error: the file, the default tool, the status and the login are those of that profile. Absent or empty is the daemon's profile. A name that is not an existing profile answers `400` `sandbox_login_unknown_profile`. Unlike `command`, `profile` does not need `tool`: without it the tool is that profile's default, as `aoe -p <profile> sandbox login` resolves it. Status, `running` and `held_sessions` describe that file only. A start while a login for another tool's file runs answers `409` `sandbox_login_busy`, and a tool with no sandbox login (or none named or implied) answers `400` `sandbox_login_tool_unsupported`.
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /api/sandbox/login?tool=&command=&profile=` | `{"status": {"state": "needed" \| "ok" \| "not_applicable"}, "running": {"login_id"} \| null, "held_sessions"}` for the file of `tool` and `command` under `profile`. On Apple Container a login that is needed reads `not_applicable` with `"reason"` carrying the refusal message; a usable credential still reads `ok`. Needs no elevation and never returns the link. |
+| `POST /api/sandbox/login` | Optional body `{"force": false, "tool": "<tool>", "command": "<command>", "profile": "<profile>"}` (at most 4 KiB). Starts a login for the file of `tool` and `command` under `profile`, or returns the running one: `{"login_id", "url", "lease"}`. `force` logs in again although the credential is usable. An optional `"lease"` (1 to 64 letters, digits, `-` or `_`) is the dialog's own lease: a start repeated with it returns the same lease, so a dialog that lost the answer can still leave. |
+| `DELETE /api/sandbox/login?lease=` | A dialog that never got the answer to its start leaves by the lease it chose, without the login id. Ends the login only with its last lease; a lease nobody holds changes nothing. `204`, or `400 invalid_lease` when `lease` is missing or not an id. |
+| `POST /api/sandbox/login/{login_id}/code` | Body `{"code"}` (at most 4 KiB). Hands the code to the login client: `{"ok": true}`. |
+| `GET /api/sandbox/login/{login_id}` | `{"outcome": "succeeded" \| "failed" \| "pending" \| "unknown"}`: what the code exchange of that login came to, for a client that lost the answer to its code. An exchange in progress is waited for (up to 5 s); `pending` while the login still waits for its code or the exchange runs longer; `unknown` for an id that never exchanged a code or is no longer remembered. Needs no elevation. |
+| `DELETE /api/sandbox/login/{login_id}?lease=` | A dialog leaves the login. Dialogs for one credential share a login and each start returns its own `lease`; the login ends with the last lease, or at once without `lease`. `204`, also when it already ended. A code exchange in progress is left to settle. |
+
+The mutating endpoints need a read-write server and an elevated session when login is enabled, and are unavailable in CityHall mode. Errors are `{"error", "message"}`:
+
+| Status | `error` | When |
+| --- | --- | --- |
+| `400` / `415` / `422` | none | The JSON body is malformed, has the wrong content type or the wrong field types. An unelevated caller gets the `403` first |
+| `400` | `invalid_code` | The code is malformed. Nothing reached the login client and the same `login_id` accepts a corrected code |
+| `400` | `sandbox_login_command_needs_tool` | A `command` came without the `tool` it is for (the status read answers it too) |
+| `400` | `sandbox_login_unknown_profile` | A `profile` that is not an existing profile (the status read answers it too) |
+| `404` | `login_not_found` | Unknown `login_id`, or that login already ended |
+| `409` | `sandbox_login_not_separate_login` | The setting is `host_seed` |
+| `409` | `sandbox_login_already_ok` | The credential is usable; send `force` to log in again |
+| `409` | `sandbox_login_cancelled` | The login was cancelled while the request waited, or the daemon is shutting down |
+| `409` | `sandbox_login_busy` | Another process runs a login for the same credential file, or this daemon runs one for another tool's file |
+| `409` | `sandbox_login_unsupported` | The container runtime is Apple Container, which cannot run the login helper, and a login is wanted (the credential is unusable, or `force` was sent); `message` says to use `host_seed` or Docker/Podman. A usable credential answers `sandbox_login_already_ok` instead |
+| `413` | none | The request body is over 4 KiB |
+| `500` | `internal` | An unexpected helper failure; the detail is in the daemon log only |
+| `422` | `sandbox_login_no_url` | The login client printed no sign-in link; `message` holds its redacted output |
+| `422` | `login_failed` | The login client rejected the code or the login failed. The login has ended: start a new one for a new link |
+| `504` | `sandbox_login_timeout` | No link or no answer in time |
+
+After a successful code, the sessions that waited for the login resume within one reconciler tick. The startup error that keeps a session waiting is an `AgentStartupError` event whose `cause` is `{"kind": "sandbox_login_required"}`, which the dashboard keys its Log in button on, with the `profile` and, when the recovery needs it, the `command` of the `409` above inside `cause`. The dashboard shows the message as the server wrote it and starts the login with that `command` and `profile`, so the login lands in the file the session waits on, as the `-p <profile>` in the message says.
+
 ## Runtime CLI reads
 
 The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws`, over the Daemon's local Unix socket by default and over HTTP when `--daemon-url` or `AOE_DAEMON_URL` selects an endpoint. `/api/runtime/ws` remains the separate TUI stream.
@@ -410,7 +447,7 @@ read `sessions`; the array is never returned unwrapped.
 `aoe-runtime-epoch` and `aoe-runtime-revision` identify the exact returned
 snapshot. Revisions are decimal unsigned 64-bit integers; clients must preserve
 their precision. A stale list must not replace newer canonical rows or ordering.
-Color and notification mutation receipts identify one session: another session
+Notification mutation receipts identify one session: another session
 at a higher revision cannot satisfy that receipt.
 
 **Query parameters**
@@ -945,7 +982,7 @@ Before delivery, the HTTP endpoint removes bracketed-paste delimiters and remain
 | `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited during the probe. The ID and failure marker are preserved in this call; the next default revival can start fresh. |
 | `409` | `{"error": "session_transient", "status": "..."}` | Session is mid-lifecycle and cannot accept input yet |
 | `409` | `{"error": "session_archived" \| "session_trashed", "message": "..."}` | Session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, `/container-terminal` and structured-view prompts refuse the same way. |
-| `409` | `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?}` | Reviving a sandbox needs the sandbox login of its agent (`sandbox.shared_credential = "separate_login"`); `tool` is the one to log in. `profile` is present only when the session runs under a profile other than the default one (pass it as `-p <profile>`); `command` only when the session runs its own command for the tool and `aoe sandbox login --tool <tool>` alone would log in another file than the launch waits for (pass it as `--command <command>`). Terminal sessions have no queue, so the message is not kept; send it again after `aoe sandbox login --tool <tool>` |
+| `409` | `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?}` | Reviving a sandbox needs the sandbox login of its agent (`sandbox.shared_credential = "separate_login"`); `tool` is the one to log in. `profile` is the profile the session runs under (pass it as `-p <profile>`, or in the login request's `profile`); `command` only when the session runs its own command for the tool and `aoe sandbox login --tool <tool>` alone would log in another file than the launch waits for (pass it as `--command <command>`). Terminal sessions have no queue, so the message is not kept; send it again after `aoe sandbox login --tool <tool>` |
 | `500` | `{"error": "tmux_error"}` or `{"error": "internal"}` | Unexpected failure (logged server-side) |
 
 After a prior failed resume probe, a default restart or send-driven revival can start a new conversation and deliver input there. The old native transcript is not deleted, but its AoE association is abandoned. `/ensure` reports this as `resume_outcome: "fresh_after_failed_resume"` with `prior_session_id` and a message, rather than claiming a successful resume. See [session recovery policy](guides/session-resume.md#pinning-or-resetting-a-conversation) for explicit retry and direct CLI start behavior.
@@ -954,7 +991,7 @@ A structured-view prompt (`POST /api/sessions/{id}/acp/prompt`) that would reviv
 
 If the session's `host_hooks.before_start` hook fails while that launch is admitted, the prompt is kept the same way and the answer is `502` with `{"error": "before_start_hook_failed", "message", "queued_id"}`. Nothing is held: the next launch that works delivers the queue. `message` is fixed text and never carries the hook's command or output.
 
-`/start`, `/ensure`, `/restart`, `/recreate-container` and `/acp/spawn` refuse a launch that needs the login the same way (`409` `sandbox_login_required`, or `502` `before_start_hook_failed`), without `queued_id`. A restart or recreate is refused before the running agent is stopped or its container is discarded. With Apple Container, which cannot run the login helper, they answer `409` `{"error": "sandbox_login_unsupported", "message"}` instead, and nothing is held.
+`/start`, `/ensure`, `/restart`, `/recreate-container` and `/acp/spawn` refuse a launch that needs the login the same way (`409` `sandbox_login_required`, or `502` `before_start_hook_failed`), without `queued_id`. A restart or recreate is refused before the running agent is stopped or its container is discarded. With Apple Container, which cannot run the login helper, they answer `409` `{"error": "sandbox_login_unsupported", "message"}` instead, and nothing is held. Any other launch (a prompt that revives the session, the reconciler, a terminal send) reports the same message as a launch error, such as the session's startup error, whose `cause` is `{"kind": "sandbox_login_unsupported"}`.
 
 Concurrent POSTs to the same `id` are serialized server-side, so two
 orchestrators racing on the same session won't interleave keystrokes

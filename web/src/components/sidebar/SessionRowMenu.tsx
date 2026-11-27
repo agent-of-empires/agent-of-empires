@@ -18,7 +18,6 @@ import {
   Pin,
   Play,
   Plus,
-  RefreshCw,
   ScrollText,
   SquareTerminal,
   Sparkles,
@@ -28,9 +27,9 @@ import {
 import type { SessionResponse } from "../../lib/types";
 import { triageMenuShape, triageStateOf } from "../../lib/sidebarSort";
 import type { BulkTriageBuckets } from "../../lib/sidebarBulk";
-import { MenuChoiceRow, MenuHeading, MenuItem, MenuSeparator, MenuSwatches } from "../ContextMenu";
+import { MenuChoiceRow, MenuHeading, MenuItem, MenuSeparator } from "../ContextMenu";
 import { SNOOZE_PRESETS } from "./format";
-import { SESSION_COLOR_OPTIONS, type NotifyPreset, type RowModel } from "./rowModel";
+import type { NotifyPreset, RowModel } from "./rowModel";
 import type { SessionAction } from "./sessionActionTargets";
 import type { RowBulkApi } from "./types";
 
@@ -106,10 +105,8 @@ export interface SingleRowActions {
   openOwnWindow?: (sessionId: string) => void;
   stop: (sessionId: string) => void;
   start: (sessionId: string) => void;
-  restartUpdate: (sessionId: string) => void;
   recreateContainer: (sessionId: string) => void;
   notify: (preset: NotifyPreset) => void;
-  color: (color: string | null) => void;
   pin: () => void;
   archive: () => void;
   openSnooze: () => void;
@@ -179,14 +176,12 @@ function Tiers({ tiers }: { tiers: React.ReactNode[][] }) {
 export function SingleRowMenuItems({
   model,
   readOnly,
-  colorsEnabled,
   unreadEnabled,
   actions: a,
   extraItems,
 }: {
   model: RowModel;
   readOnly?: boolean;
-  colorsEnabled: boolean;
   unreadEnabled: boolean;
   actions: SingleRowActions;
   /** Plugin-contributed items, placed above Move to Trash…. */
@@ -339,12 +334,6 @@ export function SingleRowMenuItems({
           ),
         ],
         [
-          item("restartUpdate", {
-            label: "Restart to update",
-            detail: "Keeps the conversation",
-            testId: "sidebar-context-menu-restart-update",
-            glyph: icon(RefreshCw, "text-brand-400"),
-          }),
           item("stop", { label: "Stop", testId: "sidebar-context-menu-stop", glyph: icon(CircleStop) }),
           item("start", { label: "Start", testId: "sidebar-context-menu-start", glyph: icon(Play) }),
           item("switchView", {
@@ -411,16 +400,6 @@ export function SingleRowMenuItems({
               ))}
             </div>
           </MenuChoiceRow>,
-          write && colorsEnabled && (
-            <MenuChoiceRow key="color" label="Color">
-              <MenuSwatches
-                options={SESSION_COLOR_OPTIONS.map((o) => ({ key: o.key, label: o.label, className: o.dotClass }))}
-                value={model.sessionColor}
-                onPick={a.color}
-                testIdPrefix="sidebar-context-menu-color"
-              />
-            </MenuChoiceRow>
-          ),
         ],
         [extraItems && <Fragment key="plugin">{extraItems}</Fragment>],
         [

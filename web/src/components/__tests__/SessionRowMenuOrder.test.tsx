@@ -23,7 +23,7 @@ function order() {
     if (id === undefined) out.push("|");
     else if (id.endsWith("-target") || id === "summary" || id === "close") continue;
     else {
-      const token = id.startsWith("notify-") ? "notify" : id.startsWith("color-") ? "color" : id;
+      const token = id.startsWith("notify-") ? "notify" : id;
       if (out.at(-1) !== token) out.push(token);
     }
   }
@@ -42,7 +42,7 @@ const open = (sessions: Partial<SessionResponse>[], options: object = {}) =>
 describe("Session menu tiers", () => {
   it("orders items by tier, with separators only between tiers that show something", () => {
     const quick = "pin archive snooze unread";
-    const tail = "notify color | delete";
+    const tail = "notify | delete";
     // More opens on the window entries, their own tier.
     const more = "more show-only own-window |";
     // (state, sessions, options, header line, order with More open)
@@ -60,14 +60,6 @@ describe("Session menu tiers", () => {
         {},
         "Stopped · Terminal view",
         `${quick} | rename | start | ${more} edit-group add-project | ${tail}`,
-      ],
-      // Restart to update leads the Run tier.
-      [
-        "update waiting",
-        [{ status: "Idle", update_restart: true }],
-        {},
-        "Idle · Terminal view",
-        `${quick} | rename | restart-update stop | ${more} edit-group add-project | ${tail}`,
       ],
       // Recreate container sits last in More, after its own separator.
       [
@@ -126,13 +118,8 @@ describe("Session menu tiers", () => {
     // (Session, [name, description] it offers)
     const cases: [Partial<SessionResponse>, [string, string?][]][] = [
       [
-        { status: "Running", update_restart: true, is_sandboxed: true },
-        [
-          ["Restart to update", "Keeps the conversation"],
-          ["Recreate container", "Resets anything installed inside it"],
-          ["Move to another group"],
-          ["Move to Trash…"],
-        ],
+        { status: "Running", is_sandboxed: true },
+        [["Recreate container", "Resets anything installed inside it"], ["Move to another group"], ["Move to Trash…"]],
       ],
       [{ status: "Stopped", has_managed_worktree: true }, [["Rename workdir"]]],
     ];
@@ -141,7 +128,7 @@ describe("Session menu tiers", () => {
       for (const [name, description] of items) {
         expect(screen.getByRole("button", { name, ...(description ? { description } : {}) }), name).toBeTruthy();
       }
-      for (const old of ["Restart to apply update (keeps conversation)", "Edit group", "Edit workdir name", "Delete"]) {
+      for (const old of ["Edit group", "Edit workdir name", "Delete"]) {
         expect(screen.queryByRole("button", { name: old }), old).toBeNull();
       }
       cleanup();

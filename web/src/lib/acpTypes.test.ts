@@ -216,7 +216,63 @@ describe("applyEvent control state", () => {
     [
       "AgentStartupError closes the turn",
       [prompt(), { AgentStartupError: { message: "boom" } }],
-      { turnActive: false, startupError: "boom" },
+      { turnActive: false, startupError: "boom", startupCause: null },
+    ],
+    [
+      "AgentStartupError keeps its machine-readable cause",
+      [{ AgentStartupError: { message: "login", cause: { kind: "sandbox_login_required" } } }],
+      { startupError: "login", startupCause: { kind: "sandbox_login_required" } },
+    ],
+    [
+      "an unsupported sandbox login cause is kept as it came",
+      [{ AgentStartupError: { message: "no", cause: { kind: "sandbox_login_unsupported" } } }],
+      { startupError: "no", startupCause: { kind: "sandbox_login_unsupported" } },
+    ],
+    [
+      "a container_missing cause is kept as it came",
+      [{ AgentStartupError: { message: "gone", cause: { kind: "container_missing" } } }],
+      { startupError: "gone", startupCause: { kind: "container_missing" } },
+    ],
+    [
+      "AgentStartupError keeps the command and profile its recovery needs",
+      [
+        {
+          AgentStartupError: {
+            message: "login",
+            cause: { kind: "sandbox_login_required", command: "claude", profile: "work" },
+          },
+        },
+      ],
+      {
+        startupError: "login",
+        startupCause: { kind: "sandbox_login_required", command: "claude", profile: "work" },
+      },
+    ],
+    [
+      "an AgentStartupError without a cause drops the previous one",
+      [
+        {
+          AgentStartupError: {
+            message: "login",
+            cause: { kind: "sandbox_login_required", command: "claude", profile: "work" },
+          },
+        },
+        { AgentStartupError: { message: "boom" } },
+      ],
+      { startupError: "boom", startupCause: null },
+    ],
+    [
+      "a new prompt clears the startup cause",
+      [
+        {
+          AgentStartupError: {
+            message: "login",
+            cause: { kind: "sandbox_login_required", command: "claude", profile: "work" },
+          },
+        },
+        prompt(),
+      ],
+      { startupError: null, startupCause: null },
     ],
     [
       "IntegrationLost closes the turn and surfaces the reason",
@@ -446,9 +502,9 @@ describe("applyEvent control state", () => {
         SubagentUpdated: { subagent: stopped, at: "2026-01-01T00:00:00Z" },
       },
     });
-    expect(replayed.subagents).toEqual([stopped]);
+    expect(replayed.subagents).toEqual([{ ...stopped, idle_since: "2026-01-01T00:00:00Z", runs: 1 }]);
     // A snapshot older than the replayed frame must not roll the record back.
-    expect(applyReducedState(replayed, base, [], 8).subagents).toEqual([stopped]);
+    expect(applyReducedState(replayed, base, [], 8).subagents).toEqual(replayed.subagents);
   });
 
   it("refreshes a stale held subagent from a snapshot at or past lastSeq, keeping local-only children", () => {
@@ -495,6 +551,19 @@ describe("applyEvent control state", () => {
       record("local", "running", true),
       record("b", "running", true),
     ]);
+
+    // The idle stamp survives a snapshot that agrees on the state; runs never drop below the held count.
+    const stamps = { idle_since: "t2", runs: 2 };
+    const stamped = { ...held, lastSeq: 7, subagents: [{ ...record("a", "running", true), ...stamps }] };
+    expect(applyReducedState(stamped, snapshot([record("a", "running", true)]), [], 7).subagents[0]).toMatchObject(
+      stamps,
+    );
+    expect(applyReducedState(stamped, snapshot([record("a", "idle", true)]), [], 7).subagents[0]).toEqual({
+      ...record("a", "idle", true),
+      runs: 2,
+    });
+    const higher = { ...record("a", "idle", true), runs: 3 };
+    expect(applyReducedState(stamped, snapshot([higher]), [], 7).subagents[0]!.runs).toBe(3);
   });
 
   it("codex /new drops usage to the post-reset baseline (#2979)", () => {
@@ -1045,5 +1114,35 @@ describe("auth status", () => {
     });
     // A daemon that omits the field has nothing to report, so neither do we.
     expect(applyReducedState(base, reduced(undefined)).authStatus).toBeNull();
+  });
+});
+
+describe("a refused launch answered after a recovery event", () => {
+  const sent = (state: AcpState) => acpHookReducer(state, { kind: "user_prompt", id: "p-1", text: "hi" });
+  const refused = (state: AcpState) =>
+    acpHookReducer(state, {
+      kind: "blocked_launch",
+      message: "sandbox login required",
+      cause: { kind: "sandbox_login_required" },
+      promptId: "p-1",
+    });
+  const apply = (state: AcpState, event: AcpEvent) => applyEvent(state, { session_id: "s", seq: 1, event });
+
+  it("sets the login cause when nothing recovered meanwhile", () => {
+    expect(refused(sent(emptyAcpState())).startupCause).toEqual({ kind: "sandbox_login_required" });
+  });
+
+  it.each<[string, AcpEvent]>([
+    ["AcpSessionAssigned", assigned],
+    ["UserPromptSent", { UserPromptSent: { text: "hi" } } as AcpEvent],
+  ])("ignores the cause when %s landed while the response was in flight", (_name, event) => {
+    const state = refused(apply(sent(emptyAcpState()), event));
+    expect(state.startupCause).toBeNull();
+    expect(state.startupError).toBeNull();
+  });
+
+  it("keeps the guidance for a prompt sent after the recovery", () => {
+    const recovered = apply(emptyAcpState(), assigned);
+    expect(refused(sent(recovered)).startupCause).toEqual({ kind: "sandbox_login_required" });
   });
 });

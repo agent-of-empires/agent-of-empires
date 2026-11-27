@@ -20,7 +20,7 @@ Every plugin declares identity, what it contributes, and, with a worker, how to 
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 25
+api_version = 27
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 
@@ -43,6 +43,8 @@ id = "my_plugin_pane"
 
 Pick an `id` outside the reserved `aoe.*` and `agent-of-empires.*` namespaces, set `api_version` to the schema version you target, and set `aoe_version` to the host range you have tested.
 
+A command is a flat top-level `aoe` verb unless it names a `group`. Declare a `[[command_groups]]` verb, set `group` on the commands it carries, and the CLI nests them as `aoe <group> <command>`; core and earlier plugins keep their claim on a name. See [Command groups](../plugin-api.md#command-groups-api_version--27).
+
 A worker requests only the grants it uses. `runtime.worker` is required to run any code at all; add `net`, `session.read`, `notifications`, and so on as needed. Static contributions (commands, keybinds, themes, ui, status) need no capability. The user grants the exact declared set at install, pinned to the manifest hash, so an update that widens capabilities must be re-approved. Keep the list honest and minimal.
 
 Agent integrations are optional contributions, not worker RPCs. They require `api_version >= 19`; launch, detection, and reply-fallback extensions require API 21 and a host that implements them. Provider-native status and replies also require `session.integration`. When declared, `session.integration` requires valid, nonempty `provider_versions` on every integration entry. See [Agent integrations](../plugin-api.md#agent-integrations) for the launch grammar, supported capture declarations, and communication contract.
@@ -62,6 +64,8 @@ The host spawns the worker, sends one JSON-RPC request per line on stdin, and re
 The host delivers a command that has no client [`action`](../plugin-api.md#commands) as a `plugin.command.invoke` notification with params `{ "command": "plugin.<id>.<command-id>", "session_id": "..." }`. It has no `id`, so never reply; act on the commands you know and ignore the rest.
 
 The host also pushes notifications that carry no `id`, such as `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) for plugins that hold `session.read`. Ignore methods you do not handle and never reply. See [Session status events](../plugin-api.md#session-driving-rpcs) in the Plugin API reference.
+
+Host-initiated requests such as `mcp.rewrite` and the `mcp.serve` methods (`mcp.session.servers`, `mcp.tools.list`, `mcp.tools.call`) arrive with string ids like `h-1`; answer with the same id. The `mcp.cancel` notification has no id (the call to stop is in `params.request_id`); do not reply to it. A plugin that wants to offer MCP tools to agents holds `mcp.serve`; see [Serving MCP servers](../plugin-api.md#serving-mcp-servers-api_version--26).
 
 ## Build and launch
 

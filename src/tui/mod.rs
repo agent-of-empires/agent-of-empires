@@ -20,10 +20,12 @@ pub(crate) mod plugin_ui_poller;
 
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
+mod sandbox_login_poller;
 mod session_feed;
 pub mod settings;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
+mod suggestions;
 mod telemetry;
 mod worker;
 

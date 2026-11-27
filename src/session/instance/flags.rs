@@ -1,19 +1,7 @@
 //! User-facing triage state: archive, trash, favorite, pin, snooze, unread,
-//! color, and the idle bookkeeping they read.
+//! and the idle bookkeeping they read.
 
 use super::*;
-
-/// The MVP palette for the per-session color label (#2383). Kept deliberately
-/// small and status-oriented: red = needs attention / blocked, amber =
-/// working / in progress, green = done / ready. `None`/absent clears the dot.
-/// Both the CLI (`aoe session color`) and the web PATCH endpoint validate
-/// against this list via [`is_valid_session_color`].
-pub const SESSION_COLORS: &[&str] = &["red", "amber", "green"];
-
-/// True when `color` is a member of the [`SESSION_COLORS`] palette.
-pub fn is_valid_session_color(color: &str) -> bool {
-    SESSION_COLORS.contains(&color)
-}
 
 /// Mutually-exclusive lifecycle bucket a session belongs to, computed by
 /// `Instance::effective_bucket()`. Precedence is `Trashed > Archived >
@@ -59,11 +47,12 @@ impl StartBlocked {
 
 /// A sandbox launch refused in `separate_login` mode while the shared credential its agent
 /// needs holds none. `tool` is the session's tool, which `aoe sandbox login --tool` takes;
-/// `credential` is the shared file the launch waits for. `profile` is the session's profile
-/// and `command` its own command for the tool: each is set only when the recovery needs it,
-/// `profile` when it is not the default one (the CLI runs under the default profile unless
-/// `-p` says otherwise) and `command` when `--tool` alone would log in another file than the
-/// one the launch waits for and `--command` with it reaches that file.
+/// `credential` is the shared file the launch waits for. `profile` is the session's profile,
+/// always named so a daemon serving another one logs in the right file; the CLI line leaves
+/// it out when it is the default one, which the CLI runs under unless `-p` says otherwise.
+/// `command` is the session's own command for the tool, set only when `--tool` alone would
+/// log in another file than the one the launch waits for and `--command` with it reaches
+/// that file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxLoginRequired {
     pub tool: String,
@@ -91,7 +80,11 @@ impl SandboxLoginRequired {
             }
         }
         let mut line = String::from("aoe sandbox login");
-        if let Some(profile) = &self.profile {
+        if let Some(profile) = self
+            .profile
+            .as_ref()
+            .filter(|profile| **profile != crate::session::config::effective_profile(""))
+        {
             flag(&mut line, Some("-p"), "--profile", profile);
         }
         flag(&mut line, None, "--tool", &self.tool);
@@ -99,6 +92,16 @@ impl SandboxLoginRequired {
             flag(&mut line, None, "--command", command);
         }
         line
+    }
+}
+
+impl SandboxLoginRequired {
+    /// The cause a launch error carries to clients that act on it.
+    pub fn startup_cause(&self) -> crate::acp::state::StartupCause {
+        crate::acp::state::StartupCause::SandboxLoginRequired {
+            command: self.command.clone(),
+            profile: self.profile.clone(),
+        }
     }
 }
 
@@ -127,6 +130,14 @@ pub struct SandboxLoginUnsupported;
 impl SandboxLoginUnsupported {
     /// Stable machine-readable code for API error bodies.
     pub const CODE: &'static str = "sandbox_login_unsupported";
+
+    /// The cause a launch error carries to clients that act on it: this one's when `error`
+    /// is the refusal.
+    pub fn cause_of(error: &anyhow::Error) -> Option<crate::acp::state::StartupCause> {
+        error
+            .downcast_ref::<Self>()
+            .map(|_| crate::acp::state::StartupCause::SandboxLoginUnsupported)
+    }
 }
 
 impl Instance {
@@ -354,27 +365,6 @@ impl Instance {
 
     pub fn is_favorited(&self) -> bool {
         self.favorited_at.is_some()
-    }
-
-    /// Set (or clear, with `None`) the per-session color label. Only a value
-    /// in the [`SESSION_COLORS`] palette is accepted; anything else is
-    /// rejected so the sidebar never has to render an unknown swatch. See
-    /// #2383.
-    pub fn set_color(&mut self, color: Option<String>) -> Result<(), String> {
-        match color {
-            None => self.color = None,
-            Some(c) => {
-                if !is_valid_session_color(&c) {
-                    return Err(format!(
-                        "invalid color {:?}; expected one of: {}, or none",
-                        c,
-                        SESSION_COLORS.join(", ")
-                    ));
-                }
-                self.color = Some(c);
-            }
-        }
-        Ok(())
     }
 
     /// Read the agent-raised urgent flag from `attention.json`. Sourced
@@ -613,46 +603,6 @@ mod tests {
 
         i.trashed_at = Some(Timestamp::now());
         assert!(!i.counts_toward_plugin_session_cap());
-    }
-
-    #[test]
-    fn set_color_accepts_palette_and_clears_with_none() {
-        let mut inst = Instance::new("color-test", "/tmp");
-        assert_eq!(inst.color, None);
-
-        for c in SESSION_COLORS {
-            inst.set_color(Some((*c).to_string())).unwrap();
-            assert_eq!(inst.color.as_deref(), Some(*c));
-        }
-
-        inst.set_color(None).unwrap();
-        assert_eq!(inst.color, None);
-    }
-
-    #[test]
-    fn set_color_rejects_unknown_color_and_leaves_prior_value() {
-        let mut inst = Instance::new("color-test", "/tmp");
-        inst.set_color(Some("green".to_string())).unwrap();
-
-        let err = inst
-            .set_color(Some("chartreuse".to_string()))
-            .expect_err("unknown color must be rejected");
-        assert!(
-            err.contains("chartreuse"),
-            "error should name the value: {err}"
-        );
-        // A rejected write must not clobber the previously stored color.
-        assert_eq!(inst.color.as_deref(), Some("green"));
-    }
-
-    #[test]
-    fn is_valid_session_color_matches_palette() {
-        assert!(is_valid_session_color("red"));
-        assert!(is_valid_session_color("amber"));
-        assert!(is_valid_session_color("green"));
-        assert!(!is_valid_session_color("blue"));
-        assert!(!is_valid_session_color(""));
-        assert!(!is_valid_session_color("Red"));
     }
 
     /// `touch_last_accessed` is what `aoe send` and the TUI dispatch path

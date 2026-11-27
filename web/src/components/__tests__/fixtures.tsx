@@ -7,7 +7,6 @@ import type { RuntimeCursor, SessionMutation } from "../../lib/api";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { sessionWorkspaces } from "../../lib/sessionWorkspace";
 import { SidebarCompactContext } from "../../lib/sidebarCompact";
-import { SessionColorsContext } from "../../lib/sessionColors";
 import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { SessionRow } from "../sidebar/SessionRow";
@@ -97,11 +96,9 @@ interface RowOptions {
   onCreateSession?: (repoPath: string) => void;
   compact?: boolean;
   rowTagMode?: SessionRowTagMode;
-  colorsEnabled?: boolean;
   unread?: boolean;
   onStop?: (sessionId: string) => void;
   onStart?: (sessionId: string) => void;
-  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onActivate?: RowActivate;
   activeSessionId?: string | null;
@@ -116,7 +113,6 @@ function Row({
   onCreateSession,
   onStop,
   onStart,
-  onRestartForUpdate,
   onSwitchView,
   onActivate = () => {},
   activeSessionId = null,
@@ -160,7 +156,6 @@ function Row({
         onCreateSession={onCreateSession}
         onStop={onStop}
         onStart={onStart}
-        onRestartForUpdate={onRestartForUpdate}
         onSwitchView={onSwitchView}
         readOnly={readOnly}
         optimistic={triage.optimisticFor(ws)}
@@ -176,18 +171,10 @@ function Row({
   );
 }
 
-function Providers({
-  children,
-  rowTagMode = "branch",
-  colorsEnabled = true,
-  compact = false,
-  unread,
-}: RowOptions & { children: ReactNode }) {
+function Providers({ children, rowTagMode = "branch", compact = false, unread }: RowOptions & { children: ReactNode }) {
   const inner = (
     <SidebarCompactContext.Provider value={compact}>
-      <SessionRowTagContext.Provider value={rowTagMode}>
-        <SessionColorsContext.Provider value={colorsEnabled}>{children}</SessionColorsContext.Provider>
-      </SessionRowTagContext.Provider>
+      <SessionRowTagContext.Provider value={rowTagMode}>{children}</SessionRowTagContext.Provider>
     </SidebarCompactContext.Provider>
   );
   return unread === undefined ? (

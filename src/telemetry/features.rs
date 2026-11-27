@@ -18,7 +18,6 @@ pub fn active_features(config: &Config) -> BTreeMap<String, bool> {
         ),
         ("sounds", config.sound.enabled),
         ("favorites_first", s.favorites_first),
-        ("session_colors", s.show_session_colors),
         ("unread_indicator", s.unread_indicator),
         ("diagnostics_pane", s.show_diagnostics_pane),
         ("tips", s.show_tips),

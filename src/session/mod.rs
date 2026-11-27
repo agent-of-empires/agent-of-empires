@@ -47,7 +47,6 @@ pub(crate) mod sync;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod trash;
-pub mod update_restart;
 pub mod worktree_edit;
 pub mod worktree_reconcile;
 
@@ -79,6 +78,7 @@ pub use groups::{
 };
 #[cfg(test)]
 pub(crate) use instance::before_start_slot_waiters;
+pub(crate) use instance::generate_id;
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
 pub(crate) use instance::resume_profile_config;
@@ -99,18 +99,18 @@ pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
     host_hook_post_install_notes,
 };
+pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND_STORE_HINT};
 pub use instance::{
-    is_valid_session_color, AuxiliaryObservation, AuxiliaryTarget, ConversationBinding,
-    ConversationProvenance, DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding,
-    ExecutionLocation, Instance, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity,
-    LegacyToolObservation, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
-    ManagedResumeCause, PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency,
-    PollerStart, SandboxInfo, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
-    SessionGone, StartBlocked, StartOutcome, Status, TerminalInfo, TmuxServerIdentity, View,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES, SESSION_COLORS,
+    AuxiliaryObservation, AuxiliaryTarget, ConversationBinding, ConversationProvenance,
+    DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation,
+    Instance, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity, LegacyToolObservation,
+    LifecycleOperation, LifecycleReservation, LifecycleReservationError, ManagedResumeCause,
+    PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency, PollerStart,
+    SandboxInfo, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket, SessionGone,
+    StartBlocked, StartOutcome, Status, SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View,
+    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES,
     TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
-pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND_STORE_HINT};
 pub(crate) use instance::{
     ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
     ResumeLaunchOptions, ResumeProfileConfig, TerminalContextResume,

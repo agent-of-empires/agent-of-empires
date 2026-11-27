@@ -196,6 +196,8 @@ impl CommandFailure {
                     && *status != reqwest::StatusCode::REQUEST_TIMEOUT
                     && *code != Some(crate::daemon::ApiErrorCode::CreateOutcomeUnknown)
             }
+            DaemonClientError::FavoriteSelection(_) => true,
+            DaemonClientError::RuntimeCursorUnsupported => !submitted,
             DaemonClientError::InvalidBaseUrl { .. }
             | DaemonClientError::InvalidPathSegment
             | DaemonClientError::InvalidBearerToken
@@ -412,6 +414,13 @@ fn status_allows_attachment(status: &str) -> bool {
         status,
         "Running" | "Waiting" | "Idle" | "Starting" | "Unknown"
     )
+}
+
+/// Why the daemon refuses mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MutationBlock {
+    ReadOnly,
+    Offline,
 }
 
 fn set_grant(grant: &AtomicU64, allowed: bool) {
@@ -979,6 +988,27 @@ impl SessionFeed {
             generation: self.native_grant.load(Ordering::SeqCst),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Why mutations are unavailable; `None` when they are available.
+    pub(crate) fn mutation_block(&self) -> Option<MutationBlock> {
+        if self.mutations_available() {
+            return None;
+        }
+        // The writer keeps its channel open after the read side drops, so the
+        // latest runtime result decides whether the daemon is still there.
+        let connected = matches!(
+            self.receiver.borrow().as_ref(),
+            Some(SessionFeedResult::Snapshot(_))
+        ) && self
+            .commands
+            .as_ref()
+            .is_some_and(|commands| !commands.is_closed());
+        Some(if connected {
+            MutationBlock::ReadOnly
+        } else {
+            MutationBlock::Offline
+        })
     }
 
     pub(crate) fn mutations_available(&self) -> bool {

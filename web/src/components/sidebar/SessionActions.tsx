@@ -11,7 +11,6 @@ import {
 } from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
 import { useUnreadIndicatorEnabled } from "../../lib/unreadIndicator";
-import { useSessionColorsEnabled } from "../../lib/sessionColors";
 import { enterFocusWindow, openFocusWindow, requestOpenSession } from "../../lib/sessionRoute";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { requestSwitchAccount } from "../../lib/switchAccountTrigger";
@@ -38,7 +37,6 @@ export interface SessionActionHandlers {
   onDelete?: (sessionIds: string[]) => void;
   onStop?: (sessionId: string) => void;
   onStart?: (sessionId: string) => void;
-  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   /** Opens the wizard prefilled from this row's project, like the group header's "+". */
   onCreateSession?: (repoPath: string) => void;
@@ -61,7 +59,6 @@ export function SessionActionsMenu({
   workspace,
   model,
   setNotify,
-  setColor,
   readOnly,
   handlers,
   onRename,
@@ -75,7 +72,6 @@ export function SessionActionsMenu({
   workspace: Workspace;
   model: RowModel;
   setNotify: SingleRowActions["notify"];
-  setColor: SingleRowActions["color"];
   readOnly?: boolean;
   handlers: SessionActionHandlers;
   onRename: () => void;
@@ -86,7 +82,6 @@ export function SessionActionsMenu({
   const [modal, setModal] = useState<Modal>(null);
   const [recreating, setRecreating] = useState<SessionResponse | null>(null);
   const owner = useSessionActions();
-  const colorsEnabled = useSessionColorsEnabled();
   const unreadEnabled = useUnreadIndicatorEnabled();
   // An installed dashboard on a phone cannot open a second window.
   const canOpenWindows = !useIsCoarsePointer();
@@ -99,7 +94,6 @@ export function SessionActionsMenu({
     openOwnWindow: canOpenWindows ? rowActions.openOwnWindow : undefined,
     rename: onRename,
     notify: setNotify,
-    color: setColor,
   };
 
   return (
@@ -125,9 +119,6 @@ export function SessionActionsMenu({
                     dormant={model.dormant}
                   />
                 </span>
-                {model.sessionColorDot && colorsEnabled && (
-                  <span className={`h-2 w-2 shrink-0 rounded-full ${model.sessionColorDot}`} aria-hidden="true" />
-                )}
                 <span className="min-w-0">
                   <span className="block truncate">{label}</span>
                   {model.sessionCount > 0 && (
@@ -153,7 +144,6 @@ export function SessionActionsMenu({
             <SingleRowMenuItems
               model={model}
               readOnly={readOnly}
-              colorsEnabled={colorsEnabled}
               unreadEnabled={unreadEnabled}
               actions={actions}
               extraItems={extraItems}
@@ -186,7 +176,7 @@ export function SessionActionsMenu({
 }
 
 /** Menu actions; each closes the menu first so its dismiss listener cannot race a modal mount.
- *  Pin, unread, notify and color are in-place toggles that keep it open; the row supplies the last two. */
+ *  Pin, unread and notify are in-place toggles that keep it open; the row supplies notify. */
 function buildRowActions(
   workspace: Workspace,
   props: SessionActionHandlers,
@@ -195,7 +185,7 @@ function buildRowActions(
   setModal: (m: Modal) => void,
   setRecreating: (session: SessionResponse) => void,
   openAttach: () => void,
-): Omit<SingleRowActions, "rename" | "notify" | "color"> {
+): Omit<SingleRowActions, "rename" | "notify"> {
   const after = (fn: () => unknown) => () => {
     closeMenu();
     void fn();
@@ -261,7 +251,6 @@ function buildRowActions(
     }),
     stop: afterTarget("stop", (s) => props.onStop?.(s.id)),
     start: afterTarget("start", (s) => props.onStart?.(s.id)),
-    restartUpdate: afterTarget("restartUpdate", (s) => props.onRestartForUpdate?.(s.id)),
     recreateContainer: afterTarget("recreateContainer", setRecreating),
     pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),

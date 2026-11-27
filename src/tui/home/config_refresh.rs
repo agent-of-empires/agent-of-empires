@@ -98,13 +98,15 @@ impl HomeView {
             DefaultTerminalMode::Host => TerminalMode::Host,
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
-        self.sound_config = config.sound.clone();
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.host_tab_title = config.session.host_tab_title;
         self.row_tag_mode = config.session.row_tag;
         self.show_activity_age = config.session.show_activity_age;
         self.show_structured_badge = config.session.show_structured_badge;
+        let hide_snoozed_changed =
+            self.hide_snoozed_with_stopped != config.session.hide_snoozed_with_stopped;
+        self.hide_snoozed_with_stopped = config.session.hide_snoozed_with_stopped;
         self.set_sidebar_position(config.session.sidebar_position);
         self.narrow_layout = config.session.narrow_layout;
         self.narrow_breakpoint = config.session.narrow_breakpoint;
@@ -126,23 +128,31 @@ impl HomeView {
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         crate::session::set_unread_enabled(config.session.unread_indicator);
         crate::session::set_favorites_first(config.session.favorites_first);
-        self.tips_unseen = tips_unseen_count(&config);
+        self.tips_unseen = self.tips_unseen_count(&config);
         self.queue_shortcut_bar_tip(&config);
+        let keybind_warnings = install_keybinds(&config);
+        self.live_send_chords = live_send::LiveSendChords::from_config(&config);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
-        let hotkey_warnings = input::validate_tool_hotkeys(&self.tool_configs);
-        if matches!(origin, ConfigRefreshOrigin::Interactive)
-            && !hotkey_warnings.is_empty()
-            && self.info_dialog.is_none()
-        {
-            self.info_dialog = Some(InfoDialog::new(
-                "Tool hotkey config errors",
-                &hotkey_warnings.join("\n"),
-            ));
+        if matches!(origin, ConfigRefreshOrigin::Interactive) {
+            self.show_key_config_errors(keybind_warnings);
         }
         // Interactive saves already dispatch `Action::SetTheme`; the theme is global-only.
         if matches!(origin, ConfigRefreshOrigin::Watcher) {
             self.pending_watcher_theme = Some(crate::session::config::resolve_theme_name());
+        }
+        if hide_snoozed_changed && self.hide_stopped_in_groups {
+            self.rebuild_flat_items_keeping_cursor();
+            self.update_selected();
+        }
+    }
+
+    /// Report tool hotkey and `[keybinds]` warnings unless another dialog is up.
+    pub(super) fn show_key_config_errors(&mut self, keybind_warnings: Vec<String>) {
+        let mut warnings = input::validate_tool_hotkeys(&self.tool_configs);
+        warnings.extend(keybind_warnings);
+        if !warnings.is_empty() && self.info_dialog.is_none() {
+            self.info_dialog = Some(InfoDialog::new("Key config errors", &warnings.join("\n")));
         }
     }
 
@@ -189,6 +199,23 @@ impl HomeView {
             );
         }
     }
+}
+
+/// Make the config's `[keybinds]` the active keymap, logging and returning its warnings.
+/// The only logging point: building the keymap is pure, since the settings page rebuilds
+/// it on every search keystroke.
+pub(super) fn install_keybinds(config: &crate::session::Config) -> Vec<String> {
+    let (keymap, warnings) = super::keybinds::from_config(config);
+    super::keybinds::install(keymap);
+    for w in &warnings {
+        tracing::warn!(
+            target: "tui.input",
+            action = %w.name,
+            reason = %w.reason,
+            "ignoring [keybinds] entry"
+        );
+    }
+    warnings.iter().map(ToString::to_string).collect()
 }
 
 #[cfg(test)]
@@ -246,5 +273,91 @@ mod tests {
         std::fs::write(crate::session::config::config_path().unwrap(), "[session\n").unwrap();
         assert!(view.try_refresh_from_config_watcher().is_err());
         assert_eq!(view.sidebar_position, SidebarPosition::Right);
+    }
+
+    /// Live mode reads the exit and leader applied with the keymap, so an external edit
+    /// reaches a later live-send entry or target switch only once a reload applies both.
+    #[test]
+    #[serial]
+    fn live_send_chords_change_only_with_the_applied_keymap() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let set_exit = |spec: &str| {
+            update_config(|config| config.session.live_send_exit_chord = spec.to_string()).unwrap()
+        };
+        set_exit("C-e");
+        save_profile_config("test", &Default::default()).unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let exit = |spec| live_send::parse_chord_list(spec);
+        assert_eq!(view.live_send_chords.exit, exit("C-e"));
+
+        set_exit("C-r");
+        assert_eq!(view.live_send_chords.exit, exit("C-e"), "not yet applied");
+        view.try_refresh_from_config_watcher().unwrap();
+        assert_eq!(view.live_send_chords.exit, exit("C-r"));
+    }
+
+    /// Building the keymap is silent, so the settings page can rebuild it per search
+    /// keystroke; applying config logs each problem once, under its TUI area target.
+    #[test]
+    fn keybind_and_live_send_problems_log_only_when_applied() {
+        let mut config = crate::session::Config {
+            keybinds: [("bogus".to_string(), vec!["F2".to_string()])].into(),
+            ..Default::default()
+        };
+        config.session.live_send_leader = "Ctrl+".to_string();
+        let logs = crate::session::test_support::LogCapture::start();
+        let (_, warnings) = super::super::keybinds::describe(&config);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(logs.contents(), "", "the settings path never logs");
+
+        install_keybinds(&config);
+        live_send::LiveSendChords::from_config(&config);
+        let out = logs.contents();
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(
+            out.contains("tui.input") && out.contains("action=bogus"),
+            "{out}"
+        );
+        assert!(
+            out.contains("tui.live_send") && out.contains("unparseable leader"),
+            "{out}"
+        );
+    }
+
+    /// A bad `[keybinds]` entry is reported at startup and on interactive reloads, not
+    /// from the watcher. Only an invalid entry is used, so the installed keymap stays empty.
+    #[test]
+    #[serial]
+    fn bad_keybind_entries_surface_in_the_key_config_dialog() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        update_config(|config| {
+            config
+                .keybinds
+                .insert("bogus".to_string(), vec!["F2".to_string()]);
+        })
+        .unwrap();
+        save_profile_config("test", &Default::default()).unwrap();
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let message = |view: &HomeView| view.info_dialog.as_ref().map(|d| d.message().to_string());
+        let want = "[keybinds] bogus: unknown action; keeping the default keys";
+        assert_eq!(message(&view).as_deref(), Some(want));
+
+        view.info_dialog = None;
+        view.try_refresh_from_config_watcher().unwrap();
+        assert_eq!(message(&view), None);
+        view.refresh_from_config(ConfigRefreshOrigin::Interactive);
+        assert_eq!(message(&view).as_deref(), Some(want));
     }
 }

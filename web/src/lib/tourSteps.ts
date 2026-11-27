@@ -10,6 +10,7 @@ export const TOUR_ANCHORS = {
   sidebar: "sidebar",
   sidebarSettings: "sidebar-settings",
   dashboardNewSession: "dashboard-new-session",
+  dashboardSuggestions: "dashboard-suggestions",
   diffToggle: "diff-toggle",
   composer: "acp-composer",
   modePicker: "acp-mode-picker",
@@ -117,6 +118,14 @@ export const TOUR_STEPS: readonly TourStep[] = [
       { id: "newScratch", verb: "starts a scratch session" },
     ],
     writableOnly: true,
+  },
+  {
+    // The Suggested section only: the Set up suggestions hint hides while the tour runs.
+    id: "suggestions",
+    anchor: TOUR_ANCHORS.dashboardSuggestions,
+    scopes: ["dashboard"],
+    title: "Suggested sessions",
+    body: "Plugins can propose sessions worth starting, like pull requests waiting for your review. Nothing runs until you press Start.",
   },
   {
     id: "settings",

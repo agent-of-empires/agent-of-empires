@@ -402,11 +402,11 @@ fn trash_system_health_releases_reader_keyboard() {
 }
 
 /// Footer discoverability hints track where each key actually does something.
-/// Archive/Snooze are Attention-only. Fav follows its keybind's own gate
-/// (`Context::FavoritesUsable`): usable in Attention, or in any sort order
-/// while `favorites_first` is on. The underlying keybinds are unchanged; only
-/// the footer adapts so it doesn't waste width on a shortcut that would not
-/// visibly do anything.
+/// Snooze works on a session row in every sort; Archive is Attention-only.
+/// Fav follows its keybind's own gate (`Context::FavoritesUsable`): usable in
+/// Attention, or in any sort order while `favorites_first` is on. The
+/// underlying keybinds are unchanged; only the footer adapts so it doesn't
+/// waste width on a shortcut that would not visibly do anything.
 #[test]
 #[serial]
 fn footer_hides_attention_workflow_hints_outside_attention_sort() {
@@ -444,7 +444,11 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
     crate::session::set_favorites_first(false);
     env.view.sort_order = SortOrder::Newest;
     let newest_off = render_footer(&mut env);
-    for hint in ["Snooze", "Fav", "Archive"] {
+    assert!(
+        newest_off.contains("Snooze"),
+        "Snooze hint should appear in Newest sort; its key works there.\n{newest_off}"
+    );
+    for hint in ["Fav", "Archive"] {
         assert!(
             !newest_off.contains(hint),
             "{hint} hint should be hidden in Newest sort with favorites-first off.\n{newest_off}"
@@ -452,19 +456,19 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
     }
 
     // Newest sort with favorites-first ON: Fav is advertised because `f` pins
-    // here, but Archive/Snooze stay Attention-only.
+    // here, but Archive stays Attention-only.
     crate::session::set_favorites_first(true);
     let newest_on = render_footer(&mut env);
-    assert!(
-        newest_on.contains("Fav"),
-        "Fav hint should appear in Newest sort with favorites-first on.\n{newest_on}"
-    );
-    for hint in ["Snooze", "Archive"] {
+    for hint in ["Snooze", "Fav"] {
         assert!(
-            !newest_on.contains(hint),
-            "{hint} hint should stay hidden outside Attention sort.\n{newest_on}"
+            newest_on.contains(hint),
+            "{hint} hint should appear in Newest sort with favorites-first on.\n{newest_on}"
         );
     }
+    assert!(
+        !newest_on.contains("Archive"),
+        "Archive hint should stay hidden outside Attention sort.\n{newest_on}"
+    );
 
     // Attention sort: footer advertises all three regardless of the flag.
     env.view.sort_order = SortOrder::Attention;

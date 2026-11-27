@@ -34,14 +34,11 @@ function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
     id: "g1",
     kind: "repo",
     displayName: "my-project",
-    defaultDisplayName: "my-project",
-    alias: null,
-    color: null,
     remoteOwnerKey: null,
     workspaces: views(workspace("w1", idle(3))),
     status: "idle",
     collapsed: false,
-    capabilities: { appearance: true, reorder: true, create: "repo" },
+    capabilities: { reorder: true, create: "repo" },
     repoPath: "/p",
     registeredProjects: [],
     pinned: false,
@@ -65,7 +62,6 @@ function renderHeader(props: Partial<Parameters<typeof SidebarGroupHeader>[0]> =
       hasActiveChild={false}
       onClick={onClick}
       onNewSession={onNewSession}
-      onUpdateAppearance={() => {}}
       offline={false}
       rowsId="sidebar-rows-test"
       {...p}
@@ -155,7 +151,6 @@ describe("SidebarGroupHeader", () => {
             hasActiveChild={false}
             onClick={() => {}}
             onNewSession={() => {}}
-            onUpdateAppearance={() => {}}
             offline={false}
             rowsId="sidebar-rows-test"
           />
@@ -191,7 +186,7 @@ describe("SidebarGroupHeader", () => {
   });
 
   it("is one disclosure button that controls its rows and names its menu shortcut", () => {
-    const { rerender } = renderHeader();
+    const { rerender } = renderHeader({ onPin: vi.fn() });
     const header = screen.getByTestId("sidebar-group-header");
     const button = header.querySelector("button[aria-expanded]")!;
     expect(header.hasAttribute("tabindex")).toBe(false);
@@ -199,17 +194,18 @@ describe("SidebarGroupHeader", () => {
     expect(button.getAttribute("aria-expanded")).toBe("true");
     expect(button.getAttribute("aria-controls")).toBe("sidebar-rows-test");
     expect(button.getAttribute("aria-keyshortcuts")).toBe("Shift+F10");
-    rerender({ group: group({ collapsed: true }) });
+    rerender({ onPin: vi.fn(), group: group({ collapsed: true }) });
     expect(button.getAttribute("aria-expanded")).toBe("false");
+    // With nothing to offer there is no menu to announce.
+    rerender({ group: group() });
+    expect(button.getAttribute("aria-keyshortcuts")).toBeNull();
   });
 
-  it("returns focus to the header after a menu action that keeps it, but not after Rename or settings", () => {
+  it("returns focus to the header after a menu action that keeps it, but not after settings", () => {
     // (menu item, props, focus back on the header button)
     const cases: [string, Partial<Parameters<typeof SidebarGroupHeader>[0]>, boolean][] = [
       ["sidebar-group-context-menu-pin", { onPin: vi.fn() }, true],
       ["sidebar-group-context-menu-archive-all", { onArchiveAll: vi.fn() }, true],
-      ["Clear alias", { group: group({ alias: "nick" }) }, true],
-      ["sidebar-group-context-menu-rename", {}, false],
       ["sidebar-group-context-menu-settings", { onEditProject: vi.fn(), group: group({ id: "__scratch__" }) }, false],
     ];
     for (const [item, props, toHeader] of cases) {
@@ -217,26 +213,11 @@ describe("SidebarGroupHeader", () => {
       const button = screen.getByTestId("sidebar-group-header").querySelector<HTMLElement>("button[aria-expanded]")!;
       button.focus();
       fireEvent.keyDown(button, { key: "F10", shiftKey: true });
-      const action = screen.queryByTestId(item) ?? screen.getByText(item);
+      const action = screen.getByTestId(item);
       // Keyboard activation of a menu button is a click on the focused item.
       action.focus();
       fireEvent.click(action);
       expect(document.activeElement === button, item).toBe(toHeader);
-      cleanup();
-    }
-  });
-
-  it("returns focus to the header when a rename ends with Enter or Escape", async () => {
-    for (const key of ["Enter", "Escape"]) {
-      renderHeader();
-      fireEvent.contextMenu(screen.getByTestId("sidebar-group-header"));
-      fireEvent.click(screen.getByTestId("sidebar-group-context-menu-rename"));
-      const input = screen.getByTestId("sidebar-group-rename-input");
-      input.focus();
-      fireEvent.keyDown(input, { key });
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-      const button = screen.getByTestId("sidebar-group-header").querySelector("button[aria-expanded]");
-      expect(document.activeElement, key).toBe(button);
       cleanup();
     }
   });
@@ -281,7 +262,7 @@ describe("SidebarGroupHeader", () => {
   it("offers 'Edit settings' for the synthetic Scratch group despite capabilities.create being 'generic'", () => {
     const onEditProjectSettings = vi.fn();
     renderHeader({
-      group: group({ id: "__scratch__", capabilities: { appearance: true, reorder: true, create: "generic" } }),
+      group: group({ id: "__scratch__", capabilities: { reorder: true, create: "generic" } }),
       onEditProject: onEditProjectSettings,
     });
 
@@ -292,7 +273,7 @@ describe("SidebarGroupHeader", () => {
 
   it("hides 'Edit settings' for an ordinary unregistered repo group ('generic' create, no repoPath match)", () => {
     renderHeader({
-      group: group({ id: "other", capabilities: { appearance: true, reorder: true, create: "generic" } }),
+      group: group({ id: "other", capabilities: { reorder: true, create: "generic" } }),
       onEditProject: vi.fn(),
     });
 

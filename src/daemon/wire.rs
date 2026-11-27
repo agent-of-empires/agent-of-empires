@@ -190,6 +190,9 @@ pub struct CreateSessionBody {
     /// Typed into the agent as its first turn, only once it is ready.
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    /// Suggestion this session starts from; omitted by "Start another".
+    #[serde(default)]
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
     pub profile: Option<String>,
     /// Structured view requires an ACP-capable agent.
     #[serde(default)]
@@ -480,10 +483,6 @@ pub struct RestartSessionBody {
     pub bound_hooks: bool,
     #[serde(default)]
     pub discard_sandbox_container: bool,
-    pub wake_message: Option<String>,
-    /// Refuse, under the lifecycle locks, a session that is no longer Idle.
-    #[serde(default)]
-    pub only_if_idle: bool,
     /// Refuse, before anything stops, unless `tool` is an account swap that keeps the conversation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub require_account_carry: bool,
@@ -774,16 +773,100 @@ pub struct UpdatePinBody {
     pub pinned: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct UpdateFavoriteBody {
-    pub favorited: bool,
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum UpdateFavoriteBody {
+    Scoped {
+        profile: String,
+        selector: String,
+        // A distinct value key makes older Daemons reject the scoped request.
+        select_favorited: bool,
+    },
+    Unscoped {
+        favorited: bool,
+    },
+}
+
+impl<'de> Deserialize<'de> for UpdateFavoriteBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Keep the scoped form map-only, but allow legacy clients' extra fields.
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Scoped {
+            Request {
+                profile: String,
+                selector: String,
+                select_favorited: bool,
+            },
+        }
+
+        #[derive(Deserialize)]
+        struct Legacy {
+            favorited: bool,
+            #[serde(
+                default,
+                rename = "profile",
+                deserialize_with = "reject_selector_field"
+            )]
+            _profile: (),
+            #[serde(
+                default,
+                rename = "selector",
+                deserialize_with = "reject_selector_field"
+            )]
+            _selector: (),
+            #[serde(
+                default,
+                rename = "select_favorited",
+                deserialize_with = "reject_selector_field"
+            )]
+            _select_favorited: (),
+        }
+
+        fn reject_selector_field<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+            Err(serde::de::Error::custom(
+                "selector field in legacy favorite request",
+            ))
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Request {
+            Scoped(Scoped),
+            Legacy(Legacy),
+        }
+
+        Ok(match Request::deserialize(deserializer)? {
+            Request::Scoped(Scoped::Request {
+                profile,
+                selector,
+                select_favorited,
+            }) => Self::Scoped {
+                profile,
+                selector,
+                select_favorited,
+            },
+            Request::Legacy(Legacy { favorited, .. }) => Self::Unscoped { favorited },
+        })
+    }
+}
+
+pub(crate) const FAVORITE_BY_SELECTOR: &str = "by-selector";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLookupError {
+    NotFound,
+    ProfileNotFound(String),
+    Ambiguous {
+        count: usize,
+        candidates: Vec<(String, String)>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct UpdateColorBody {
-    /// A palette color, or null to clear the label.
-    #[serde(default)]
-    pub color: Option<String>,
+pub(crate) struct FavoriteOutcome {
+    pub title: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1195,11 +1278,6 @@ pub struct SessionResponse {
     pub favorited: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub favorited_at: Option<String>,
-    /// Per-session color label (`red` / `amber` / `green`), or omitted when
-    /// unset. Rendered as a colored status dot in the web sidebar; set via the
-    /// sidebar context menu or `aoe session color`. See #2383.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
     /// True when the agent has flagged this session as urgent via the
     /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
@@ -1337,9 +1415,6 @@ pub struct SessionResponse {
     pub acp_worker_state: AcpWorkerState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_worker_start: Option<AcpWorkerStart>,
-    /// The agent binary was replaced after launch and a restart is safe to offer now.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub update_restart: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_approvals: Vec<PendingApproval>,
     /// The provider rate limit this session is parked on, read from the

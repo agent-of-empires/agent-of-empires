@@ -671,6 +671,7 @@ impl Instance {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn terminal_context_resume_cached(&self) -> TerminalContextResume {
         let mut resolved = None;
         self.terminal_context_resume_cached_with(|| {
@@ -678,8 +679,8 @@ impl Instance {
         })
     }
 
-    /// [`Self::terminal_context_resume_cached`] with the profile config resolved
-    /// by the caller, so a projection resolves once per profile.
+    /// The cached terminal resume answer, with the profile config resolved by the caller so a
+    /// projection resolves once per profile.
     pub(crate) fn terminal_context_resume_cached_with<'a>(
         &self,
         profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
@@ -916,6 +917,11 @@ impl Instance {
                 .fork_strategy
                 .resolve(generation)
                 .expect("the unknown generation bailed above");
+            anyhow::ensure!(
+                !(self.is_sandboxed() && agent.fork_host_only),
+                "{} forks only on the host, so a sandboxed session cannot fork it",
+                agent.name
+            );
             anyhow::ensure!(
                 agent.can_fork_in(self.is_sandboxed()),
                 "{} mints the forked conversation id, and AoE can capture that id only in a sandbox",

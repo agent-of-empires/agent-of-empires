@@ -4,45 +4,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, type RenderHookResult } from "@testing-library/react";
 import type { SessionResponse, SessionStatus } from "../lib/types";
 import { session } from "./__tests__/fixtures";
+import { fakeAudio, installFakeAudioContext, playedSounds, soundBytes } from "../lib/__tests__/fakeAudioContext";
 
 const fetchSettings = vi.fn();
-const fetchSounds = vi.fn();
-const fetchSoundBlob = vi.fn();
+const fetchSound = vi.fn();
 
 vi.mock("../lib/api", () => ({
   fetchSettings: (...args: unknown[]) => fetchSettings(...args),
-  fetchSounds: (...args: unknown[]) => fetchSounds(...args),
-  fetchSoundBlob: (...args: unknown[]) => fetchSoundBlob(...args),
+  fetchSound: (...args: unknown[]) => fetchSound(...args),
 }));
 
 import { useStatusSounds } from "./useStatusSounds";
 import { clearSoundCache, noteApprovalChime } from "../lib/soundPlayer";
 import { notifySettingsChanged } from "../lib/settingsEvents";
 
-const ENABLED = {
-  enabled: true,
-  browser_enabled: true,
-  browser_volume: 1,
-  on_idle: "done",
-  on_waiting: "ask",
-  on_error: "bad",
-};
+const ENABLED = { enabled: true, browser_enabled: true, browser_volume: 1 };
 
-let played: string[] = [];
 let view: RenderHookResult<ReturnType<typeof useStatusSounds>, { s: SessionResponse[] }>;
 let activeId: string | null = null;
-
-class FakeAudio {
-  volume = 1;
-  src: string;
-  constructor(src: string) {
-    this.src = src;
-  }
-  play() {
-    played.push(this.src);
-    return Promise.resolve();
-  }
-}
 
 const at = (id: string, status: SessionStatus, over: Partial<SessionResponse> = {}): SessionResponse =>
   session({ id, status, ...over });
@@ -62,34 +41,28 @@ async function step(sessions: SessionResponse[]) {
 }
 
 /**
- * Proves the sound pipeline had time to run: enables sounds with a distinct probe sound, walks a fresh session into
- * Idle and waits for the probe to load. Any sound the case under test wrongly played would have fetched its own file
- * first, so the fetched names must be exactly the probe.
+ * Proves the sound pipeline had time to run: enables sounds, walks a fresh session into Idle and waits for its sound.
+ * Any sound the case under test wrongly played started earlier and would have played first, so after `prior` the
+ * probe's must be the only one.
  */
-async function expectOnlyProbeSounds(base: SessionResponse[]) {
-  fetchSettings.mockResolvedValue({ sound: { ...ENABLED, on_idle: "probe" } });
+async function expectOnlyProbeSounds(base: SessionResponse[], prior: string[] = []) {
+  fetchSettings.mockResolvedValue({ sound: ENABLED });
   act(() => notifySettingsChanged());
   await step([...base, at("probe", "Running")]);
   await step([...base, at("probe", "Idle")]);
   await step([...base, at("probe", "Idle")]);
-  await vi.waitFor(() => expect(fetchSoundBlob).toHaveBeenCalledWith("probe"));
-  await vi.waitFor(() => expect(played).toHaveLength(1));
-  expect(fetchSoundBlob.mock.calls.map(([name]) => name)).toEqual(["probe"]);
+  await vi.waitFor(() => expect(playedSounds()).toHaveLength(prior.length + 1));
+  expect(playedSounds()).toEqual([...prior, "idle"]);
 }
 
 describe("useStatusSounds", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000_000);
-    played = [];
+    installFakeAudioContext();
     activeId = null;
     fetchSettings.mockReset().mockResolvedValue({ sound: ENABLED });
-    fetchSounds.mockReset().mockResolvedValue(["random"]);
-    fetchSoundBlob.mockReset().mockImplementation(async (name: string) => new Blob([name]));
-    vi.stubGlobal("Audio", FakeAudio);
-    let n = 0;
-    vi.spyOn(URL, "createObjectURL").mockImplementation(() => `blob:${n++}`);
-    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    fetchSound.mockReset().mockImplementation(async (event: string) => soundBytes(event));
     clearSoundCache();
   });
 
@@ -103,11 +76,10 @@ describe("useStatusSounds", () => {
     mount([at("a", "Running")]);
     await step([at("a", "Waiting")]);
     act(() => view.result.current.onSoundDue("a", "waiting"));
-    await vi.waitFor(() => expect(played).toEqual(["blob:0"]));
+    await vi.waitFor(() => expect(playedSounds()).toEqual(["waiting"]));
     await step([at("a", "Waiting")]);
     await step([at("a", "Waiting")]);
-    await vi.waitFor(() => expect(fetchSoundBlob).toHaveBeenCalledTimes(1));
-    expect(played).toHaveLength(1);
+    await expectOnlyProbeSounds([at("a", "Waiting")], ["waiting"]);
   });
 
   it("replays a cue that arrived before the refreshed list, without waiting for another poll", async () => {
@@ -115,11 +87,10 @@ describe("useStatusSounds", () => {
     // The reconnect snapshot is still in flight, so the list still shows the stale status.
     act(() => view.result.current.onSoundDue("a", "idle"));
     await step([at("a", "Idle")]);
-    await vi.waitFor(() => expect(played).toHaveLength(1));
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(1));
     await step([at("a", "Idle")]);
     await step([at("a", "Idle")]);
-    expect(fetchSoundBlob).toHaveBeenCalledTimes(1);
-    expect(played).toHaveLength(1);
+    await expectOnlyProbeSounds([at("a", "Idle")], ["idle"]);
   });
 
   it("keeps a cue across a stale snapshot, and drops it once the session moves to another status", async () => {
@@ -130,11 +101,11 @@ describe("useStatusSounds", () => {
     });
     await step([at("a", "Running"), at("b", "Running")]);
     await step([at("a", "Idle"), at("b", "Error")]);
-    await vi.waitFor(() => expect(played).toHaveLength(1));
-    expect(fetchSoundBlob.mock.calls.map(([name]) => name)).toEqual(["done"]);
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(1));
+    expect(playedSounds()).toEqual(["idle"]);
     // b's cue is gone: going Idle later waits for its own dwell instead of sounding at once.
     await step([at("a", "Idle"), at("b", "Idle")]);
-    expect(played).toHaveLength(1);
+    expect(playedSounds()).toHaveLength(1);
   });
 
   it("drops a held cue when a status push starts a new interval", async () => {
@@ -160,12 +131,12 @@ describe("useStatusSounds", () => {
       view.result.current.onSoundDue("a", "idle");
       view.result.current.onSoundDue("b", "idle");
     });
-    await vi.waitFor(() => expect(played).toHaveLength(1));
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(1));
     await act(async () => {
       vi.advanceTimersByTime(1000);
     });
     act(() => view.result.current.onSoundDue("c", "idle"));
-    await vi.waitFor(() => expect(played).toHaveLength(2));
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(2));
   });
 
   it("cues a reconnect mid-dwell once, and stays silent for a status that was there at load", async () => {
@@ -177,17 +148,17 @@ describe("useStatusSounds", () => {
       view.result.current.onSoundDue("old", "waiting");
       view.result.current.onSoundDue("a", "waiting");
     });
-    await vi.waitFor(() => expect(played).toHaveLength(1));
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(1));
     await step([at("old", "Waiting"), at("a", "Waiting")]);
-    expect(played).toHaveLength(1);
+    expect(playedSounds()).toHaveLength(1);
   });
 
   it("plays the idle sound once a session settles into Idle", async () => {
     mount([at("a", "Running")]);
     await step([at("a", "Idle")]);
     await step([at("a", "Idle")]);
-    await vi.waitFor(() => expect(played).toHaveLength(1));
-    expect(fetchSoundBlob).toHaveBeenCalledWith("done");
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(1));
+    expect(playedSounds()).toEqual(["idle"]);
   });
 
   it("plays the waiting sound after its longer dwell", async () => {
@@ -195,8 +166,8 @@ describe("useStatusSounds", () => {
     await step([at("a", "Waiting")]);
     await step([at("a", "Waiting")]);
     await step([at("a", "Waiting")]);
-    await vi.waitFor(() => expect(played).toHaveLength(1));
-    expect(fetchSoundBlob).toHaveBeenCalledWith("ask");
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(1));
+    expect(playedSounds()).toEqual(["waiting"]);
   });
 
   it("is silent for sessions already present on load", async () => {
@@ -211,8 +182,8 @@ describe("useStatusSounds", () => {
     mount([at("a", "Running"), at("b", "Running"), at("c", "Running")]);
     await step(changed);
     await step(changed);
-    await vi.waitFor(() => expect(played).toHaveLength(2));
-    expect(fetchSoundBlob.mock.calls.map(([name]) => name).sort()).toEqual(["bad", "done"]);
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(2));
+    expect(playedSounds().sort()).toEqual(["error", "idle"]);
   });
 
   it("skips a waiting sound right after the approval chime for that session", async () => {
@@ -229,7 +200,7 @@ describe("useStatusSounds", () => {
     ["the master switch is off", { enabled: false, browser_enabled: true }],
     ["browser sounds are off", { enabled: true, browser_enabled: false }],
   ])("is silent when %s", async (_label, sound) => {
-    fetchSettings.mockResolvedValue({ sound: { ...sound, on_idle: "done" } });
+    fetchSettings.mockResolvedValue({ sound });
     const idle = [at("a", "Idle")];
     mount([at("a", "Running")]);
     await step(idle);
@@ -244,8 +215,8 @@ describe("useStatusSounds", () => {
     mount(changed.map((s) => at(s.id, "Running")));
     await step(changed);
     await step(changed);
-    await vi.waitFor(() => expect(played).toHaveLength(2));
-    expect(fetchSoundBlob.mock.calls.map(([name]) => name).sort()).toEqual(["bad", "done"]);
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(2));
+    expect(playedSounds().sort()).toEqual(["error", "idle"]);
   });
 
   it("stays silent under other_sessions when the only change is the open session", async () => {
@@ -259,44 +230,44 @@ describe("useStatusSounds", () => {
 
   it("stays silent under other_sessions when the session is opened while its sound loads", async () => {
     fetchSettings.mockResolvedValue({ sound: { ...ENABLED, browser_scope: "other_sessions" } });
-    let resolveBlob!: (blob: Blob) => void;
-    fetchSoundBlob.mockReturnValueOnce(new Promise<Blob>((r) => (resolveBlob = r)));
+    let resolveBytes!: (bytes: ArrayBuffer) => void;
+    fetchSound.mockReturnValueOnce(new Promise<ArrayBuffer>((r) => (resolveBytes = r)));
     activeId = "a";
     mount([at("a", "Running"), at("b", "Running")]);
     const changed = [at("a", "Running"), at("b", "Idle")];
     await step(changed);
     await step(changed);
-    await vi.waitFor(() => expect(fetchSoundBlob).toHaveBeenCalledWith("done"));
+    await vi.waitFor(() => expect(fetchSound).toHaveBeenCalledWith("idle"));
 
     activeId = "b";
     view.rerender({ s: [...changed] });
     await act(async () => {
-      resolveBlob(new Blob(["done"]));
+      resolveBytes(soundBytes("idle"));
     });
-    await vi.waitFor(() => expect(URL.createObjectURL).toHaveBeenCalled());
+    await vi.waitFor(() => expect(fakeAudio.decoded).toBe(1));
     await act(async () => {
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
-    expect(played).toHaveLength(0);
+    expect(playedSounds()).toHaveLength(0);
   });
 
   it("still plays when the first of several due sessions is opened while the sound loads", async () => {
     fetchSettings.mockResolvedValue({ sound: { ...ENABLED, browser_scope: "other_sessions" } });
-    let resolveBlob!: (blob: Blob) => void;
-    fetchSoundBlob.mockReturnValueOnce(new Promise<Blob>((r) => (resolveBlob = r)));
+    let resolveBytes!: (bytes: ArrayBuffer) => void;
+    fetchSound.mockReturnValueOnce(new Promise<ArrayBuffer>((r) => (resolveBytes = r)));
     activeId = "a";
     mount([at("a", "Running"), at("b", "Running"), at("c", "Running")]);
     const changed = [at("a", "Running"), at("b", "Idle"), at("c", "Idle")];
     await step(changed);
     await step(changed);
-    await vi.waitFor(() => expect(fetchSoundBlob).toHaveBeenCalledWith("done"));
+    await vi.waitFor(() => expect(fetchSound).toHaveBeenCalledWith("idle"));
 
     activeId = "b";
     view.rerender({ s: [...changed] });
     await act(async () => {
-      resolveBlob(new Blob(["done"]));
+      resolveBytes(soundBytes("idle"));
     });
-    await vi.waitFor(() => expect(played).toHaveLength(1));
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(1));
   });
 
   it("lets a cue sound right after a scope-dropped one for the same event", async () => {
@@ -308,9 +279,9 @@ describe("useStatusSounds", () => {
     await act(async () => {
       for (let i = 0; i < 8; i++) await Promise.resolve();
     });
-    expect(played).toHaveLength(0);
+    expect(playedSounds()).toHaveLength(0);
     act(() => view.result.current.onSoundDue("b", "idle"));
-    await vi.waitFor(() => expect(played).toHaveLength(1));
+    await vi.waitFor(() => expect(playedSounds()).toHaveLength(1));
   });
 
   it("is silent for a session muted for this event", async () => {
@@ -319,25 +290,5 @@ describe("useStatusSounds", () => {
     await step([at("a", "Idle", muted)]);
     await step([at("a", "Idle", muted)]);
     await expectOnlyProbeSounds([at("a", "Idle", muted)]);
-  });
-
-  it("loads a shared sound file once when several events use it", async () => {
-    fetchSettings.mockResolvedValue({ sound: { ...ENABLED, on_idle: "same", on_error: "same" } });
-    const changed = [at("a", "Idle"), at("b", "Error")];
-    mount([at("a", "Running"), at("b", "Running")]);
-    await step(changed);
-    await step(changed);
-    await vi.waitFor(() => expect(played).toHaveLength(2));
-    expect(fetchSoundBlob).toHaveBeenCalledTimes(1);
-    expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
-  });
-
-  it("picks a random sound when none is chosen for the event", async () => {
-    fetchSettings.mockResolvedValue({ sound: { enabled: true, browser_enabled: true } });
-    mount([at("a", "Running")]);
-    await step([at("a", "Idle")]);
-    await step([at("a", "Idle")]);
-    await vi.waitFor(() => expect(played).toHaveLength(1));
-    expect(fetchSoundBlob).toHaveBeenCalledWith("random");
   });
 });

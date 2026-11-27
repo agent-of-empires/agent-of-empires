@@ -8,7 +8,7 @@ import {
   type ComponentProps,
   type ReactNode,
 } from "react";
-import { Puzzle } from "lucide-react";
+import { Puzzle, Sparkles } from "lucide-react";
 import {
   confirmFileEditNavigation,
   confirmFileEditPanes,
@@ -25,6 +25,7 @@ import { CloseOnEscape } from "./components/diff/comments/CloseOnEscape";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
+import { onSoundBlocked } from "./lib/soundPlayer";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { useWizardReopen } from "./hooks/app/useWizardReopen";
@@ -78,6 +79,7 @@ import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed, renderedG
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
+import { SuggestionsView } from "./components/SuggestionsView";
 import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
 import {
   deleteWorkspaceSessions,
@@ -128,16 +130,20 @@ import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
-import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
 import { PanelDefaultsContext, parsePanelDefaults, usePanelDefaults, type PanelDefaults } from "./lib/panelDefaults";
 import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
-import { restartForUpdate } from "./lib/restartForUpdate";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
-import { NAVIGATE_EVENT, OPEN_SESSION_EVENT, openFocusWindow, replaceDocument } from "./lib/sessionRoute";
+import {
+  NAVIGATE_EVENT,
+  OPEN_SESSION_EVENT,
+  openFocusWindow,
+  replaceDocument,
+  requestNavigate,
+} from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
   bindHiddenInput,
@@ -225,6 +231,7 @@ import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./
 import { AboutModal } from "./components/AboutModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
+import type { CommandAction } from "./components/command-palette/types";
 import { useConversationSearch } from "./hooks/useConversationSearch";
 import { BannerStack } from "./components/BannerStack";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -247,7 +254,6 @@ export default function App() {
   const [idleDecayWindowMs, setIdleDecayWindowMs] = useState(IDLE_DECAY_WINDOW_MS);
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabled] = useState(true);
   const [sessionRowTagMode, setSessionRowTagMode] = useState<SessionRowTagMode>("branch");
-  const [sessionColorsEnabled, setSessionColorsEnabled] = useState(true);
   const [systemHealthEnabled, setSystemHealthEnabled] = useState(false);
   const [panelDefaults, setPanelDefaults] = useState<PanelDefaults>(() => parsePanelDefaults(null));
 
@@ -255,7 +261,6 @@ export default function App() {
     setIdleDecayWindowMs(parseIdleDecayWindowMs(settings));
     setUnreadIndicatorEnabled(parseUnreadIndicatorEnabled(settings));
     setSessionRowTagMode(parseSessionRowTagMode(settings));
-    setSessionColorsEnabled(parseSessionColorsEnabled(settings));
     setSystemHealthEnabled(parseSystemHealthEnabled(settings));
     setPanelDefaults(parsePanelDefaults(settings));
   }, []);
@@ -348,19 +353,17 @@ export default function App() {
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
         <SessionRowTagContext.Provider value={sessionRowTagMode}>
-          <SessionColorsContext.Provider value={sessionColorsEnabled}>
-            <SystemHealthEnabledContext.Provider value={systemHealthEnabled}>
-              <PanelDefaultsContext.Provider value={panelDefaults}>
-                {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+          <SystemHealthEnabledContext.Provider value={systemHealthEnabled}>
+            <PanelDefaultsContext.Provider value={panelDefaults}>
+              {/* PluginUiProvider must sit above AppContent: AppContent itself reads
                   the plugin UI snapshot (usePluginPanes), so the provider can't live
                   inside its own return. */}
-                <PluginUiProvider>
-                  <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
-                </PluginUiProvider>
-                <ElevationPrompt />
-              </PanelDefaultsContext.Provider>
-            </SystemHealthEnabledContext.Provider>
-          </SessionColorsContext.Provider>
+              <PluginUiProvider>
+                <AppContent loginRequired={loginRequired} onLogout={handleLogout} resolvedTheme={resolvedTheme} />
+              </PluginUiProvider>
+              <ElevationPrompt />
+            </PanelDefaultsContext.Provider>
+          </SystemHealthEnabledContext.Provider>
         </SessionRowTagContext.Provider>
       </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>
@@ -439,6 +442,7 @@ function AppContent({
   const { focusSessionId, enterFocusMode, exitFocusMode } = useFocusMode(sessionMatch?.params.sessionId ?? null);
   const focusMode = focusSessionId !== null;
   useDashboardPresence(focusSessionId);
+  const suggestionsMatch = useMatch("/suggestions");
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
   const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
   const selectPluginPageSession = useCallback(
@@ -466,7 +470,7 @@ function AppContent({
   }, [focusMode, onPluginPage, selectPluginPageSession, navigate]);
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   // Settings and plugin pages take the full width, sidebar and session panels hidden.
-  const fullPageView = showSettings || pluginPageMatch !== null;
+  const fullPageView = showSettings || pluginPageMatch !== null || suggestionsMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -544,6 +548,8 @@ function AppContent({
     [cancelCue, applyPushedStatus],
   );
   useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
+  // Shown in focus mode too: the focused session's sounds are blocked like any other.
+  useEffect(() => onSoundBlocked(() => toastBus.handler?.info("Click anywhere on this page to turn on sounds.")), []);
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103). A focus window is not the main window.
@@ -570,6 +576,17 @@ function AppContent({
   const pluginUiEntries = usePluginUiEntries();
   const pluginPages = usePluginPages();
   const pluginPageActions = useMemo(() => buildPluginPageActions(pluginPages ?? []), [pluginPages]);
+  const suggestionsAction = useMemo<CommandAction>(
+    () => ({
+      id: "page:suggestions",
+      title: "Suggested sessions",
+      group: "Pages",
+      keywords: ["page", "suggestions", "suggested", "start"],
+      icon: <Sparkles className="h-4 w-4" />,
+      perform: () => requestNavigate("/suggestions"),
+    }),
+    [],
+  );
   const pluginAttention = usePluginAttention();
   const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
   const activePluginSort = useMemo(() => {
@@ -612,7 +629,6 @@ function AppContent({
     groups: repoGroups,
     savedProjects,
     toggleRepoCollapsed,
-    updateRepoAppearance,
     reorderRepoGroups,
   } = useRepoGroups(
     workspaces,
@@ -638,7 +654,7 @@ function AppContent({
     pluginAttention,
   );
   // The nested `repo+group` axis reuses the already-built repo groups for
-  // its top level (so repo collapse, appearance, and ordering are shared
+  // its top level (so repo collapse and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
   // See #1720.
   const { groups: nestedGroups, toggleSubgroupCollapsed } = useNestedSidebarGroups(
@@ -1594,10 +1610,10 @@ function AppContent({
     (session: SessionResponse): NewSessionLike | undefined => {
       if (caps.readOnly) return undefined;
       const repoPath = session.main_repo_path || session.project_path;
-      // Named as its sidebar header is: the alias, else the folder name.
+      // Named as its sidebar header is: the folder name.
       const groupId = (session.main_repo_path ?? session.project_path).replace(/\/+$/, "");
       return {
-        project: repoGroups.find((group) => group.id === groupId)?.displayName ?? (groupId.split("/").pop() || groupId),
+        project: groupId.split("/").pop() || groupId,
         open: () => {
           const profile = session.profile || requireProjectProfile();
           if (!profile) return;
@@ -1615,7 +1631,7 @@ function AppContent({
         },
       };
     },
-    [caps.readOnly, projects, repoGroups, requireProjectProfile],
+    [caps.readOnly, projects, requireProjectProfile],
   );
 
   const handlePinProject = useCallback(
@@ -2386,13 +2402,44 @@ function AppContent({
                 onDelete: handleDeleteSession,
                 onStop: handleStopSession,
                 onStart: handleStartSession,
-                onRestartForUpdate: restartForUpdate,
                 onSwitchView: handleSwitchView,
                 onCreateSession: handleCreateSession,
               }}
             />
           )}
         />
+      );
+    }
+    if (suggestionsMatch) {
+      return (
+        <div className="flex-1 min-h-0 flex flex-col">
+          <div className="px-4 pt-3 md:px-8">
+            <button onClick={handleClosePluginPage} className="text-brand-500 cursor-pointer text-sm">
+              &larr; Back
+            </button>
+          </div>
+          <SuggestionsView
+            readOnly={caps.readOnly || !caps.canManageSuggestions}
+            cityhall={caps.cityhall}
+            onOpenMarketplace={
+              caps.canManageProjects ? () => requestNavigate("/settings/plugins?marketplace=suggestions") : undefined
+            }
+            initialDismissed={searchParams.get("dismissed") === "1"}
+            onPrepare={(prefill) => {
+              setWizardPrefill(prefill);
+              setShowSessionWizard(true);
+            }}
+            onOpenSession={(id) => requestNavigate(`/session/${encodeURIComponent(id)}`)}
+            onOpenSettings={caps.canManageSuggestions ? () => requestNavigate("/settings/suggestions") : undefined}
+            sessions={sessions}
+            canLink={!caps.nameOnlyWizard}
+            onEditPreset={(providerId, criterion) =>
+              requestNavigate(
+                `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
+              )
+            }
+          />
+        </div>
       );
     }
     if (showSettings) {
@@ -2420,6 +2467,16 @@ function AppContent({
             await refreshProjects();
           }}
           profile={searchParams.get("profile")}
+          onOpenSuggestions={(dismissed) => navigate(dismissed ? "/suggestions?dismissed=1" : "/suggestions")}
+          presetFocus={
+            searchParams.get("preset_provider") && searchParams.get("preset_criterion")
+              ? {
+                  providerId: searchParams.get("preset_provider")!,
+                  criterion: searchParams.get("preset_criterion")!,
+                  returnToSuggestions: searchParams.get("from") === "suggestions",
+                }
+              : undefined
+          }
           field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
@@ -2478,6 +2535,23 @@ function AppContent({
               />
             )
           }
+          canLinkSuggestions={!caps.nameOnlyWizard}
+          canManageSuggestions={caps.canManageSuggestions}
+          onEditSuggestionPreset={
+            caps.canManageSuggestions
+              ? (providerId, criterion) =>
+                  requestNavigate(
+                    `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
+                  )
+              : undefined
+          }
+          onPrepareSuggestion={(prefill) => {
+            setWizardPrefill(prefill);
+            setShowSessionWizard(true);
+          }}
+          onViewAllSuggestions={() => requestNavigate("/suggestions")}
+          onOpenSuggestionsMarketplace={() => requestNavigate("/settings/plugins?marketplace=suggestions")}
+          tourActive={tour.isTourActive}
         />
       );
     }
@@ -2835,7 +2909,6 @@ function AppContent({
                 onOpenChange={setSidebarOpen}
                 onSelect={handleSelectWorkspace}
                 onToggleGroup={toggleSidebarGroup}
-                onUpdateRepoAppearance={updateRepoAppearance}
                 onNew={(prefill) => {
                   setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
                   setShowSessionWizard(true);
@@ -2855,7 +2928,6 @@ function AppContent({
                 onRetryTrash={handleRetryTrash}
                 onStopSession={handleStopSession}
                 onStartSession={handleStartSession}
-                onRestartForUpdate={restartForUpdate}
                 onSwitchView={handleSwitchView}
                 readOnly={caps.readOnly}
                 canManageProjects={caps.canManageProjects}
@@ -2865,6 +2937,22 @@ function AppContent({
                 onPluginSortChange={selectPluginSort}
                 axis={sidebarAxis}
                 onAxisChange={setSidebarAxis}
+                suggestions={{
+                  readOnly: caps.readOnly || !caps.canManageSuggestions,
+                  cityhall: caps.cityhall,
+                  onEditPreset: caps.canManageSuggestions
+                    ? (providerId, criterion) =>
+                        requestNavigate(
+                          `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion })}`,
+                        )
+                    : undefined,
+                  onPrepare: (prefill) => {
+                    setWizardPrefill(prefill);
+                    setShowSessionWizard(true);
+                  },
+                  onOpenSession: (id) => requestNavigate(`/session/${encodeURIComponent(id)}`),
+                  onViewAll: () => requestNavigate("/suggestions"),
+                }}
               />
             )}
 
@@ -2900,6 +2988,20 @@ function AppContent({
               }}
               prefill={wizardPrefill}
               nameOnly={caps.nameOnlyWizard}
+              onEditPreset={
+                caps.canManageSuggestions
+                  ? ({ providerId, criterion }) => {
+                      setShowSessionWizard(false);
+                      setWizardPrefill(undefined);
+                      const q = new URLSearchParams({
+                        preset_provider: providerId,
+                        preset_criterion: criterion,
+                        from: "suggestions",
+                      });
+                      navigate(`/settings/suggestions?${q}`);
+                    }
+                  : undefined
+              }
             />
           )}
 
@@ -2982,6 +3084,7 @@ function AppContent({
               ...commandActions,
               ...conversationActions,
               ...pluginPageActions,
+              suggestionsAction,
               ...settingsCommands,
               ...pluginCommandActions,
             ]}

@@ -58,7 +58,7 @@ pub struct Cli {
     #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 
-    /// Select a daemon endpoint for read-only CLI commands or the TUI.
+    /// Select a Daemon endpoint for commands that use the Daemon API, or for the TUI.
     ///
     /// Explicit endpoints and `AOE_DAEMON_URL` never fall back to local storage
     /// or start a local daemon. Authenticate with `AOE_DAEMON_TOKEN` or
@@ -194,7 +194,7 @@ pub enum Commands {
         command: TmuxCommands,
     },
 
-    /// Manage sound effects for agent state transitions
+    /// Test the built-in sound effects
     Sounds {
         #[command(subcommand)]
         command: SoundsCommands,

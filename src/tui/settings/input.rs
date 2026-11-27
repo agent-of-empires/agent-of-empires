@@ -297,6 +297,7 @@ impl SettingsView {
                         FieldValue::List(_) => {
                             self.list_edit_state = Some(ListEditState::default());
                         }
+                        FieldValue::ReadOnly(_) => {}
                         FieldValue::SectionHeader => {
                             // Navigation never lands here; arm is for exhaustiveness.
                         }

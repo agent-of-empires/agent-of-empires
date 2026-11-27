@@ -91,13 +91,6 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
-    /// Set (or clear) a per-session color label, rendered as a colored dot in
-    /// the web sidebar for at-a-glance status signaling. Intended for a
-    /// running agent to flag its own state, e.g.
-    /// `aoe session color $(aoe session current -q) red`. Colors: `red`
-    /// (needs attention), `amber` (working), `green` (done); `none` clears it.
-    Color(SetColorArgs),
-
     /// Archive a session: sink it in the Attention sort and tear down its
     /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
     /// skips tmux teardown. See #1868.
@@ -396,15 +389,6 @@ pub struct SetBaseArgs {
     pub repo: Option<String>,
 }
 
-#[derive(Args)]
-pub struct SetColorArgs {
-    /// Session ID or title
-    pub identifier: String,
-    /// Color label: `red` (needs attention), `amber` (working), `green`
-    /// (done), or `none`/`clear` to remove the label.
-    pub color: String,
-}
-
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     match command {
@@ -424,13 +408,8 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
-        SessionCommands::Favorite(args) => {
-            mark_session(profile, args, "Favorited", Instance::favorite).await
-        }
-        SessionCommands::Unfavorite(args) => {
-            mark_session(profile, args, "Unfavorited", Instance::unfavorite).await
-        }
-        SessionCommands::Color(args) => set_color_session(profile, args).await,
+        SessionCommands::Favorite(args) => set_favorite(profile, args, true).await,
+        SessionCommands::Unfavorite(args) => set_favorite(profile, args, false).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => {
             mark_session(profile, args, "Unarchived", Instance::unarchive).await
@@ -442,6 +421,78 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         }
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
+}
+
+async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Result<()> {
+    use crate::acp::client::{
+        daemon_manager::require_local_read_daemon, discovery::discover_env, HttpClient,
+    };
+    use crate::daemon::{
+        DaemonClientError, RuntimeHealth, UpdateFavoriteBody, RUNTIME_PROTOCOL_VERSION,
+    };
+
+    anyhow::ensure!(
+        !matches!(
+            std::env::var("AOE_DAEMON_URL"),
+            Err(std::env::VarError::NotUnicode(_))
+        ),
+        "AOE_DAEMON_URL must be valid UTF-8"
+    );
+    let endpoint = match discover_env() {
+        Some(endpoint) => endpoint,
+        None => require_local_read_daemon().await?,
+    };
+    let (client, info, baseline) = HttpClient::new(endpoint)?
+        .runtime_mutation_client()
+        .await
+        .map_err(|error| anyhow::anyhow!("{}", super::terminal_text(&error.to_string())))?;
+    anyhow::ensure!(
+        info.protocol_version == RUNTIME_PROTOCOL_VERSION && info.health == RuntimeHealth::Healthy,
+        "Daemon runtime is not ready"
+    );
+    let selector = args.identifier;
+    let body = UpdateFavoriteBody::Scoped {
+        profile: profile.into(),
+        selector,
+        select_favorited: favorited,
+    };
+    let result = client.set_favorite_by_selector(&body, &baseline).await;
+    let outcome = match (result, body) {
+        (Ok(outcome), _) => outcome,
+        (
+            Err(DaemonClientError::FavoriteSelection(error)),
+            UpdateFavoriteBody::Scoped { selector, .. },
+        ) => {
+            return Err(error.for_cli(&selector));
+        }
+        (
+            Err(
+                error @ (DaemonClientError::Transport
+                | DaemonClientError::Timeout
+                | DaemonClientError::UnixTransport
+                | DaemonClientError::InvalidMutationReceipt
+                | DaemonClientError::AuthenticatedDecode
+                | DaemonClientError::Status {
+                    status: reqwest::StatusCode::GATEWAY_TIMEOUT,
+                    ..
+                }
+                | DaemonClientError::ResponseTooLarge { .. }),
+            ),
+            _,
+        ) => {
+            return Err(anyhow::Error::new(error).context(
+                "Favorite outcome may be unknown; check the session before running the command again",
+            ));
+        }
+        (Err(error), _) => bail!("{}", super::terminal_text(&error.to_string())),
+    };
+    let verb = if favorited {
+        "Favorited"
+    } else {
+        "Unfavorited"
+    };
+    println!("{verb}: {}", super::terminal_text(&outcome.title));
+    Ok(())
 }
 
 /// Flips one boolean marker on a session and reports it with `verb`.
@@ -459,29 +510,6 @@ async fn mark_session(
         })
     })?;
     println!("{verb}: {title}");
-    Ok(())
-}
-
-async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
-    let normalized = args.color.trim().to_lowercase();
-    let new_color = match normalized.as_str() {
-        "none" | "clear" | "" => None,
-        other => Some(other.to_string()),
-    };
-
-    let storage = Storage::open_unwatched(profile)?;
-    let (title, color) = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
-            inst.set_color(new_color.clone())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            Ok((inst.title.clone(), inst.color.clone()))
-        })
-    })?;
-
-    match color {
-        Some(c) => println!("✓ Set color for '{}': {}", title, c),
-        None => println!("✓ Cleared color for '{}'", title),
-    }
     Ok(())
 }
 
@@ -1391,22 +1419,6 @@ fn pick_targets_for_restart_all(
         .collect()
 }
 
-/// Type the restart wake message under the input lock, so an archive or trash that landed after
-/// the relaunch wins and nothing is typed into the shelved pane.
-fn send_restart_wake(
-    working: &Instance,
-    tmux_session: &crate::tmux::Session,
-    wake_msg: &str,
-) -> Result<bool> {
-    if !tmux_session.exists() {
-        return Ok(false);
-    }
-    let _input_lock = working.lock_for_input()?;
-    let delay = working.send_keys_enter_delay();
-    tmux_session.send_keys_with_delay(wake_msg, delay)?;
-    Ok(true)
-}
-
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
@@ -1423,25 +1435,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     )?;
     let title = working.title.clone();
     let session_id = working.id.clone();
-    let tool = working.tool.clone();
-
-    let wake_msg = crate::session::resolve_config(profile)
-        .map(|c| c.session.restart_wake_message.clone())
-        .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
-
-    let mut wake_succeeded = false;
-    if !wake_msg.is_empty() && !matches!(outcome, StartOutcome::ResumeFailed { .. }) {
-        let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
-        tmux_session.wait_until_ready(
-            std::time::Duration::from_secs(5),
-            crate::agents::ready_markers(&tool),
-        );
-
-        match send_restart_wake(&working, &tmux_session, &wake_msg) {
-            Ok(sent) => wake_succeeded = sent,
-            Err(e) => eprintln!("Warning: failed to send wake-up message: {}", e),
-        }
-    }
 
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
@@ -1457,9 +1450,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
             stored.merge_post_restart(&working);
-            if wake_succeeded {
-                stored.touch_after_input();
-            }
             Ok(true)
         } else {
             tracing::warn!(
@@ -3309,62 +3299,9 @@ mod target_filter_tests {
 /// #4116: CLI start and restart refuse an archived or trashed session.
 #[cfg(test)]
 mod start_blocked_tests {
-    use super::{
-        archive_session, restart_session, send_restart_wake, start_session, ArchiveArgs,
-        SessionIdArgs,
-    };
+    use super::{archive_session, restart_session, start_session, ArchiveArgs, SessionIdArgs};
     use crate::session::{Instance, Storage};
     use serial_test::serial;
-
-    /// The restart wake runs after the relaunch released its locks; a peer archive that landed
-    /// since wins, so nothing is typed into the pane and the row stays archived.
-    #[test]
-    #[serial]
-    fn restart_wake_is_not_typed_into_a_row_archived_since_the_relaunch() {
-        if crate::tmux::tmux_command().arg("-V").output().is_err() {
-            eprintln!("tmux not available; skipping");
-            return;
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let profile = "restart-wake-archived";
-        let mut working = Instance::new("restart-wake", "/tmp/x");
-        working.source_profile = profile.to_string();
-        let mut peer = working.clone();
-        peer.archive();
-        Storage::new_unwatched(profile)
-            .unwrap()
-            .update(|rows, _| {
-                *rows = vec![peer];
-                Ok(())
-            })
-            .unwrap();
-        let pane = crate::tmux::Session::generate_name(&working.id, &working.title);
-        let created = crate::tmux::tmux_command()
-            .args(["new-session", "-d", "-s", &pane, "cat"])
-            .status();
-        if !created.map(|s| s.success()).unwrap_or(false) {
-            eprintln!("tmux new-session failed; skipping");
-            return;
-        }
-        crate::tmux::refresh_session_cache();
-
-        let session = crate::tmux::Session::new(&working.id, &working.title).unwrap();
-        let result = send_restart_wake(&working, &session, "wake-4116");
-        let captured = crate::tmux::tmux_command()
-            .args(["capture-pane", "-p", "-t", &pane])
-            .output()
-            .unwrap();
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &pane])
-            .output();
-
-        let err = result.expect_err("an archived row takes no wake message");
-        assert_eq!(err.to_string(), "session is archived; unarchive it first");
-        assert!(!String::from_utf8_lossy(&captured.stdout).contains("wake-4116"));
-        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert!(stored[0].is_archived());
-    }
 
     #[tokio::test]
     #[serial]
@@ -3450,7 +3387,7 @@ mod start_blocked_tests {
 
 #[cfg(test)]
 mod session_mutation_tests {
-    use super::{set_color_session, set_session_id, SetColorArgs, SetSessionIdArgs};
+    use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, ResumeIntent, Storage};
     use serial_test::serial;
     use tempfile::tempdir;
@@ -3633,64 +3570,6 @@ mod session_mutation_tests {
         assert_eq!(
             row.agent_session_id, None,
             "rejected call must not mutate sid"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_normalizes_clears_and_rejects_unknown_values() {
-        let temp = tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-
-        let (storage, id) = seed("set-color", Instance::new("color_session", "/tmp/x"));
-        let set = |color: &str| {
-            set_color_session(
-                "set-color",
-                SetColorArgs {
-                    identifier: id.clone(),
-                    color: color.to_string(),
-                },
-            )
-        };
-
-        set("Red")
-            .await
-            .expect("palette names are case-insensitive");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("chartreuse")
-            .await
-            .expect_err("unknown color must error");
-        assert_eq!(stored(&storage, &id).color.as_deref(), Some("red"));
-
-        set("none").await.unwrap();
-        assert_eq!(stored(&storage, &id).color, None);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn set_color_refuses_unknown_profile_without_vivifying_it() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let profiles = crate::session::get_app_dir().unwrap().join("profiles");
-        std::fs::create_dir_all(profiles.join("real")).unwrap();
-
-        let msg = set_color_session(
-            "ghost-profile",
-            SetColorArgs {
-                identifier: "whatever".to_string(),
-                color: "red".to_string(),
-            },
-        )
-        .await
-        .expect_err("unknown profile must error")
-        .to_string();
-        assert!(
-            msg.contains("does not exist"),
-            "expected the unknown-profile error, got: {msg}"
-        );
-        assert!(
-            !profiles.join("ghost-profile").exists(),
-            "set-color must not mint profiles/ghost-profile"
         );
     }
 }

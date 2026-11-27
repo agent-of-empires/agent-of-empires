@@ -20,6 +20,8 @@ pub enum ApiErrorCode {
     LifecycleLocked,
     TrashIncomplete,
     LifecycleSuperseded,
+    /// The caller selected its target under a profile the Daemon does not serve.
+    ProfileMismatch,
     PendingTargetGone,
     TlsRequired,
     RuntimeEpochMismatch,
@@ -35,6 +37,9 @@ pub enum ApiErrorCode {
     CreationNotPending,
     CreateHookFailed,
     CreateOutcomeUnknown,
+    FavoriteSelectionRefused,
+    FavoriteNamespaceBusy,
+    OutcomeUnconfirmed,
     /// The project path is not a directory on the Daemon host.
     WorkingDirMissing,
     /// A worktree checkout named a branch that exists neither locally nor on a remote.
@@ -71,6 +76,7 @@ impl ApiErrorCode {
             Self::LifecycleLocked => "lifecycle_locked",
             Self::TrashIncomplete => "trash_incomplete",
             Self::LifecycleSuperseded => "lifecycle_superseded",
+            Self::ProfileMismatch => "profile_mismatch",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
             Self::SandboxMigrationDeferred => "sandbox_migration_deferred",
@@ -86,6 +92,9 @@ impl ApiErrorCode {
             Self::CreationNotPending => "creation_not_pending",
             Self::CreateHookFailed => "create_hook_failed",
             Self::CreateOutcomeUnknown => "create_outcome_unknown",
+            Self::FavoriteSelectionRefused => "favorite_selection_refused",
+            Self::FavoriteNamespaceBusy => "favorite_namespace_busy",
+            Self::OutcomeUnconfirmed => "outcome_unconfirmed",
             Self::WorkingDirMissing => "working_dir_missing",
             Self::BranchNotFound => "branch_not_found",
             Self::UnknownImage => "unknown_image",
@@ -115,7 +124,9 @@ impl ApiErrorCode {
             Self::LifecycleLocked
             | Self::TrashIncomplete
             | Self::LifecycleSuperseded
+            | Self::ProfileMismatch
             | Self::RuntimeEpochMismatch
+            | Self::FavoriteNamespaceBusy
             | Self::ResumeFailed
             | Self::ManagedResumeRefused(_)
             | Self::SandboxMigrationDeferred
@@ -146,6 +157,8 @@ impl ApiErrorCode {
             Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::StartFailed | Self::SandboxMigrationFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::FavoriteSelectionRefused => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::OutcomeUnconfirmed => StatusCode::SERVICE_UNAVAILABLE,
             Self::TerminalSwitchRefused(
                 TerminalSwitchReason::HandoffPending | TerminalSwitchReason::ContextUnconfirmed,
             ) => StatusCode::SERVICE_UNAVAILABLE,
@@ -192,10 +205,14 @@ impl ApiErrorCode {
             b"lifecycle_locked" => Self::LifecycleLocked,
             b"trash_incomplete" => Self::TrashIncomplete,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
+            b"profile_mismatch" => Self::ProfileMismatch,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
             b"create_outcome_unknown" => Self::CreateOutcomeUnknown,
+            b"favorite_selection_refused" => Self::FavoriteSelectionRefused,
+            b"favorite_namespace_busy" => Self::FavoriteNamespaceBusy,
+            b"outcome_unconfirmed" => Self::OutcomeUnconfirmed,
             b"agent_hooks_not_approved" => Self::AgentHooksNotApproved,
             b"resume_failed" => Self::ResumeFailed,
             b"managed_resume_refused" => Self::ManagedResumeRefused(managed_resume_cause(headers)),
@@ -303,6 +320,12 @@ mod tests {
                 Some(ApiErrorCode::NoRevive),
             ),
             (StatusCode::FORBIDDEN, "no_revive", false, None),
+            (
+                StatusCode::CONFLICT,
+                "profile_mismatch",
+                false,
+                Some(ApiErrorCode::ProfileMismatch),
+            ),
             (
                 StatusCode::CONFLICT,
                 "lifecycle_superseded",
