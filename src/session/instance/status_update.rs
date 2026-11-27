@@ -732,8 +732,11 @@ impl Instance {
         reuse: Option<(&str, usize)>,
         pane: Option<&str>,
     ) -> Option<(Option<Status>, &'static str)> {
-        if let Some((status, reported)) =
-            crate::plugin::agent_integration::owned_status(self, session.is_pane_dead())
+        let dead = match pane {
+            Some(pane) => tmux::utils::is_pane_dead_at(pane),
+            None => session.is_pane_dead(),
+        };
+        if let Some((status, reported)) = crate::plugin::agent_integration::owned_status(self, dead)
         {
             let rule = if reported {
                 crate::plugin::agent_integration::OWNED_RULE
@@ -768,8 +771,7 @@ impl Instance {
             None => tmux::utils::pane_title(session.name()),
         }
         .unwrap_or_default();
-        let owned = !policy.observe_ownership
-            || self.live_pane_owned(session, None, pane, session.is_pane_dead());
+        let owned = !policy.observe_ownership || self.live_pane_owned(session, None, pane, dead);
         let observation = tmux::Observation::new(&title, hook, owned);
         let clean = tmux::utils::strip_ansi(content);
         let detection = plan.detect(&clean, &observation);
@@ -1479,8 +1481,9 @@ mod tests {
         false
     }
 
-    /// A read of a given pane takes that pane's title, not the first pane's: a working title
-    /// on another pane of the session doesn't make an idle prompt read as running.
+    /// A read of a given pane takes that pane's title and death, not the first pane's: a working
+    /// title on another pane doesn't make an idle prompt read as running, and a dead first pane
+    /// doesn't make a live pinned one read as not the agent's.
     #[test]
     #[serial_test::serial]
     fn a_pane_read_takes_that_panes_title() {
@@ -1489,32 +1492,78 @@ mod tests {
             eprintln!("skipping: tmux not available");
             return;
         }
-        let mut inst = Instance::new("aoe_test_pane_title", "/tmp");
-        inst.tool = "claude".into();
-        inst.view = crate::session::View::Terminal;
-        let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
-        let _guard = spawn_pane(&session_name, "exec cat");
-        let titled = crate::tmux::tmux_command()
-            .args(["select-pane", "-t", &format!("={session_name}:^"), "-T"])
-            .arg("\u{2810} Working")
-            .status()
-            .unwrap();
-        assert!(titled.success());
-        let pinned = crate::tmux::test_helpers::split_pane(
-            &session_name,
-            crate::tmux::test_helpers::INPUT_BOX_SCRIPT,
-        );
-        assert!(
-            wait_for_pane(&pinned, "for shortcuts"),
-            "the box never painted"
-        );
-        crate::tmux::refresh_session_cache();
-        let session = tmux::Session::from_name(&session_name);
+        // (case, tool, first pane's title, whether the first pane is dead, pinned pane's script
+        // and title, want)
+        let cases = [
+            (
+                "claude-first-pane-titled",
+                "claude",
+                Some("\u{2810} Working"),
+                false,
+                crate::tmux::test_helpers::INPUT_BOX_SCRIPT,
+                None,
+                Status::Idle,
+            ),
+            (
+                "omp-dead-first-pane",
+                "omp",
+                None,
+                true,
+                "exec cat",
+                Some("π \u{280b} Working"),
+                Status::Running,
+            ),
+        ];
+        for (case, tool, first_title, first_dead, script, pinned_title, want) in cases {
+            let mut inst = Instance::new(&format!("aoe_test_pane_read_{tool}"), "/tmp");
+            inst.tool = tool.into();
+            inst.view = crate::session::View::Terminal;
+            let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _guard = spawn_pane(&session_name, "exec cat");
+            let first = format!("={session_name}:^");
+            if let Some(title) = first_title {
+                let titled = crate::tmux::tmux_command()
+                    .args(["select-pane", "-t", &first, "-T", title])
+                    .status()
+                    .unwrap();
+                assert!(titled.success(), "{case}");
+            }
+            let pinned = crate::tmux::test_helpers::split_pane(&session_name, script);
+            if let Some(title) = pinned_title {
+                let titled = crate::tmux::tmux_command()
+                    .args(["select-pane", "-t", &pinned, "-T", title])
+                    .status()
+                    .unwrap();
+                assert!(titled.success(), "{case}");
+            }
+            if first_dead {
+                let first_id = tmux::utils::first_pane_id(&session_name).expect("first pane");
+                for args in [
+                    vec!["set-option", "-p", "-t", &first_id, "remain-on-exit", "on"],
+                    vec!["send-keys", "-t", &first_id, "C-d"],
+                ] {
+                    let ran = crate::tmux::tmux_command().args(&args).status().unwrap();
+                    assert!(ran.success(), "{case}: {args:?}");
+                }
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !tmux::utils::is_pane_dead_at(&first_id) {
+                    assert!(Instant::now() < deadline, "{case}: the first pane dies");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            } else {
+                assert!(
+                    wait_for_pane(&pinned, "for shortcuts"),
+                    "{case}: the box never painted"
+                );
+            }
+            crate::tmux::refresh_session_cache();
+            let session = tmux::Session::from_name(&session_name);
 
-        let (status, rule) = inst
-            .detect_pane_now(&inst.source_profile, &session, None, Some(&pinned))
-            .expect("claude has a manifest");
-        assert_eq!(status, Some(Status::Idle), "{rule}");
+            let (status, rule) = inst
+                .detect_pane_now(&inst.source_profile, &session, None, Some(&pinned))
+                .expect("the agent has a manifest");
+            assert_eq!(status, Some(want), "{case}: {rule}");
+        }
     }
 
     /// End-to-end regression for #1913 through the real status pipeline.

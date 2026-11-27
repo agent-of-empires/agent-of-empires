@@ -267,11 +267,16 @@ pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
     let Some(first) = first.into_iter().next() else {
         return PaneProbe::Missing;
     };
+    probe_pane_at(&first)
+}
+
+/// [`probe_pane`] of the pane `target` names.
+fn probe_pane_at(target: &str) -> PaneProbe {
     // `tmux_query_command`, not `tmux_command`: `classify_pane_probe` matches
     // the ENOENT marker in tmux's `error connecting to <socket> (<strerror>)`,
     // and glibc localizes `strerror` by `LC_MESSAGES`.
     let Some(output) = crate::tmux::tmux_query_command()
-        .args(["display-message", "-t", &first, "-p", "#{pane_dead}"])
+        .args(["display-message", "-t", target, "-p", "#{pane_dead}"])
         .output()
         .ok()
     else {
@@ -279,6 +284,11 @@ pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     classify_pane_probe(output.status.success(), stdout.trim(), &output.stderr)
+}
+
+/// [`is_pane_dead`] of the pane `target` names.
+pub(crate) fn is_pane_dead_at(target: &str) -> bool {
+    probe_pane_at(target) == PaneProbe::Dead
 }
 
 pub fn first_pane_id(session_name: &str) -> Option<String> {
