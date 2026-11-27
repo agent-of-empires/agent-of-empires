@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// More simultaneous leases than any real agent holds; a larger table is a
-/// contract violation. Explicit and derived leases share it.
+/// contract violation. Explicit and derived leases share it, and so do the
+/// derived leases that lapsed and are not yet reported.
 pub const MAX_LEASES: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -48,7 +49,7 @@ pub fn derived_op(id: &str, state: RunState, ttl_ms: Option<u64>) -> LeaseOp {
 
 impl LeaseTable {
     /// Applies the ops of one frame together: all, or none when the new keys do
-    /// not fit. Returns per op whether its id was already open: held, or
+    /// not fit beside the held leases and the unreported lapses. Returns per op whether its id was already open: held, or
     /// lapsed and not yet reported. A renew of an unknown or expired id
     /// re-acquires it: the renew can race the expiry.
     pub fn apply_all(
@@ -64,16 +65,18 @@ impl LeaseTable {
         for (ns, op) in ops {
             let key = (*ns, op.id.clone());
             match op.op {
-                LeaseVerb::Release if held.contains_key(&key) => {
+                LeaseVerb::Release if held.contains_key(&key) || lapsed.contains(&key) => {
                     freed.insert(key);
                 }
-                LeaseVerb::Acquire | LeaseVerb::Renew if !held.contains_key(&key) => {
+                LeaseVerb::Acquire | LeaseVerb::Renew
+                    if !held.contains_key(&key) && !lapsed.contains(&key) =>
+                {
                     added.insert(key);
                 }
                 _ => {}
             }
         }
-        if held.len() + added.len() - freed.len() > MAX_LEASES {
+        if held.len() + lapsed.len() + added.len() - freed.len() > MAX_LEASES {
             return Err(LeaseTableFull);
         }
         let mut open = Vec::with_capacity(ops.len());
@@ -325,11 +328,11 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_acquire_keeps_the_pending_lapse() {
+    fn a_refused_acquire_keeps_the_pending_lapse() {
         let t = LeaseTable::default();
         let ns = LeaseNamespace::BackgroundTask;
         apply_derived(&t, ns, "d", RunState::Started, Some(10), 0).unwrap();
-        for i in 0..MAX_LEASES - 1 {
+        for i in 0..MAX_LEASES - 2 {
             let hold = op(
                 &i.to_string(),
                 LeaseKind::Busy,
@@ -341,9 +344,25 @@ mod tests {
         // This apply expires "d" into the pending lapses and fills the table.
         let last = op("last", LeaseKind::Busy, LeaseVerb::Acquire, Some(1000));
         apply(&t, &last, 10).unwrap();
-        let restart = apply_derived(&t, ns, "d", RunState::Started, Some(10), 11);
-        assert!(restart.is_err(), "the table is full");
+        let other = apply_derived(&t, ns, "other", RunState::Started, Some(10), 11);
+        assert!(other.is_err(), "the table is full");
         assert_eq!(t.drain_expired(11), vec![(ns, "d".to_string())]);
+    }
+
+    #[test]
+    fn unreported_lapses_count_against_the_bound() {
+        let t = LeaseTable::default();
+        let ns = LeaseNamespace::WorkflowRun;
+        let admitted = (0..MAX_LEASES + 44)
+            .filter(|i| {
+                let id = i.to_string();
+                apply_derived(&t, ns, &id, RunState::Started, Some(1), *i as i64).is_ok()
+            })
+            .count();
+        assert_eq!(admitted, MAX_LEASES);
+        assert!(t.lapsed.lock().unwrap().len() <= MAX_LEASES);
+        assert_eq!(t.drain_expired(10_000).len(), MAX_LEASES);
+        apply_derived(&t, ns, "next", RunState::Started, Some(1), 10_000).unwrap();
     }
 
     #[test]
