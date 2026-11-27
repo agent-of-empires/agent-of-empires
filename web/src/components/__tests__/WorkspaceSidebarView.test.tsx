@@ -95,7 +95,7 @@ describe("the sidebar view button", () => {
     const menu = openMenu();
     expect(menu.getAttribute("aria-describedby")).toBe(within(menu).getByText(reason).id);
     const radios = within(menu).getAllByRole("menuitemradio");
-    for (const item of radios) expect((item as HTMLButtonElement).disabled).toBe(true);
+    for (const item of radios) expect(item.getAttribute("aria-disabled")).toBe("true");
     expect(radios.find((r) => r.getAttribute("aria-checked") === "true")?.textContent).toBe("Repository");
     fireEvent.click(within(menu).getByText("Groups"));
     expect(onGroupByChange).not.toHaveBeenCalled();

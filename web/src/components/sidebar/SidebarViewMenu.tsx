@@ -26,7 +26,7 @@ function Option({
   testId,
   label,
   hint,
-  disabled,
+  disabledBy,
   onSelect,
 }: {
   role: "menuitemradio" | "menuitemcheckbox";
@@ -34,7 +34,7 @@ function Option({
   testId: string;
   label: string;
   hint?: string;
-  disabled?: boolean;
+  disabledBy?: string;
   /** `keyboard` when Enter or Space picked it, not a pointer. */
   onSelect: (keyboard: boolean) => void;
 }) {
@@ -42,7 +42,7 @@ function Option({
     <MenuItem
       role={role}
       checked={checked}
-      disabled={disabled}
+      disabledBy={disabledBy}
       tabIndex={-1}
       testId={testId}
       // A keyboard click carries no pointer detail.
@@ -98,7 +98,6 @@ export function SidebarViewMenu({
   onToggleFacets: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const locked = lockReason !== null;
   const reasonId = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -181,7 +180,7 @@ export function SidebarViewMenu({
                 checked={value === groupBy}
                 testId={`sidebar-view-group-${value}`}
                 label={GROUP_BY_LABEL[value]}
-                disabled={locked}
+                disabledBy={lockReason ? reasonId : undefined}
                 onSelect={(k) => choose(k, () => value !== groupBy && onGroupByChange(value))}
               />
             ))}
@@ -212,7 +211,7 @@ export function SidebarViewMenu({
                 label={SORT_LABEL[value]}
                 hint={value === "custom" ? "drag to reorder" : undefined}
                 // Picking the shared sort back only drops this browser's plugin sort, which writes nothing.
-                disabled={locked && !(activePlugin && value === sort)}
+                disabledBy={lockReason && !(activePlugin && value === sort) ? reasonId : undefined}
                 onSelect={(k) => choose(k, () => (activePlugin || value !== sort) && onSortChange(value))}
               />
             ))}

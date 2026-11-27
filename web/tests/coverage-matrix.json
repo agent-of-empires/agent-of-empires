@@ -2857,14 +2857,19 @@
       "id": "sidebar.view-menu-ui",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/sidebar-view.spec.ts", "src/components/__tests__/WorkspaceSidebarView.test.tsx"],
+      "specs": [
+        "tests/sidebar-view.spec.ts",
+        "src/components/__tests__/WorkspaceSidebarView.test.tsx",
+        "src/components/__tests__/SidebarViewMenu.test.tsx"
+      ],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SidebarViewMenu.tsx",
+        "web/src/components/ContextMenu.tsx",
         "web/src/components/Tooltip.tsx",
         "web/src/components/sidebar/SidebarToolbar.tsx"
       ],
-      "notes": "The View options menu holds the shared Group by (Repository, Groups) ending in + New group…, Sort by (Custom, Newest first, Name), this browser's plugin sorts, Filter sessions with its Needs you toggle, and Plugin facets; the trigger marks the grouping and sort and shows a dot off the default (#5896). On a read-only Daemon or under CityHall the menu shows the current choice with the options disabled and says why; CityHall still drags Group headers and creates Groups."
+      "notes": "The View options menu holds the shared Group by (Repository, Groups) ending in + New group…, Sort by (Custom, Newest first, Name), this browser's plugin sorts, Filter sessions with its Needs you toggle, and Plugin facets; the trigger marks the grouping and sort and shows a dot off the default (#5896). On a read-only Daemon or under CityHall the menu opens on the current choice and says why; the Group by and Sort by options stay focusable and announced as aria-disabled, described by that reason, and picking one does nothing, except that re-picking the shared sort still drops this browser's plugin sort; CityHall still drags Group headers and creates Groups."
     },
     {
       "id": "sidebar.new-group",

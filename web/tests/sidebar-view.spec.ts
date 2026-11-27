@@ -111,15 +111,28 @@ test.describe("shared sidebar view (#5896)", () => {
     ["read-only", { readOnly: true }, "This Daemon is read-only.", false],
     ["CityHall", { cityhall: true }, "Managed by CityHall.", true],
   ] as const) {
-    test(`a ${name} viewer sees the current choice, disabled, and why`, async ({ page }) => {
+    test(`a ${name} viewer lands on the current choice, hears why it is locked, and cannot pick`, async ({ page }) => {
       const handle = await open(page, opts);
-      await page.locator(TOGGLE).click();
+      const toggle = page.locator(TOGGLE);
+      await toggle.focus();
+      await page.keyboard.press("Enter");
       const menu = page.getByRole("menu", { name: "View options" });
       await expect(menu).toHaveAccessibleDescription(reason);
-      for (const item of await menu.getByRole("menuitemradio").all()) await expect(item).toBeDisabled();
-      await expect(menu.getByRole("menuitemradio", { name: "Repository" })).toBeChecked();
-      await menu.getByRole("menuitemradio", { name: "Groups" }).click({ force: true });
+      const current = menu.getByRole("menuitemradio", { name: "Repository" });
+      await expect(current).toBeFocused();
+      await expect(current).toBeChecked();
+      for (const item of await menu.getByRole("menuitemradio").all()) {
+        await expect(item).toBeDisabled();
+        await expect(item).toHaveAccessibleDescription(reason);
+      }
+      // The arrow keys walk the locked choices rather than skipping them.
+      await page.keyboard.press("ArrowDown");
+      const groups = menu.getByRole("menuitemradio", { name: "Groups" });
+      await expect(groups).toBeFocused();
+      await page.keyboard.press("Enter");
+      await groups.click({ force: true });
       await expect(menu).toBeVisible();
+      await expect(current).toBeChecked();
       const newGroup = menu.getByRole("menuitem", { name: "+ New group…" });
       if (canCreate) await expect(newGroup).toBeEnabled();
       else await expect(newGroup).toBeDisabled();
