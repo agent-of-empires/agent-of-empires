@@ -366,7 +366,7 @@ impl SessionIngress {
                 discarded += 1;
             }
         }
-        state.discarded_adapter_frames += discarded;
+        state.discarded_adapter_frames = state.discarded_adapter_frames.saturating_add(discarded);
         state.current = id;
         state.children = children;
         drop(state);
@@ -431,7 +431,7 @@ impl SessionIngress {
             && !state.children.contains_key(&notification.session_id)
         {
             if is_adapter_frame(&notification) {
-                state.discarded_adapter_frames += 1;
+                state.discarded_adapter_frames = state.discarded_adapter_frames.saturating_add(1);
             }
             return Ok(None);
         }
