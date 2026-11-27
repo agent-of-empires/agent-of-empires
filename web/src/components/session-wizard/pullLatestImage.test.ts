@@ -31,7 +31,7 @@ describe("pullLatestOffer", () => {
       ON,
       { checkedByDefault: true, command: "docker pull sb:1", running: null },
     ],
-    // A running download is offered whatever the image's state, even after a dismiss, so Launch can wait.
+    // A running download is offered over any local image, even after a dismiss, so Launch can wait.
     [
       "a download over the latest image",
       status({
@@ -47,6 +47,12 @@ describe("pullLatestOffer", () => {
       status({ state: "check_failed", error: "timeout", pull: { state: "running" } }),
       ON,
       { checkedByDefault: true, command: null, running: { phase: "downloading" } },
+    ],
+    [
+      "a first pull's download, with no current image to start on",
+      status({ state: "unknown", reason: "not_pulled", pull: { state: "running", phase: "downloading" } }),
+      ON,
+      null,
     ],
     [
       "a gated download",

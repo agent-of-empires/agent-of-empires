@@ -1100,6 +1100,20 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     await act(async () => refuse({ ok: false, message: "cancels are off here" }));
     expect(banner()?.textContent, "a Cancel retired by a create's pull still answered").toBe(DOWNLOADING);
     expect(cancelButton().disabled).toBe(false);
+
+    // The wizard names its image. A pull this page only polled has no Update now, and its Cancel is still retired.
+    cleanup();
+    let named!: (r: { ok: boolean; message?: string }) => void;
+    cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (named = r)));
+    await mount(running());
+    fireEvent.click(cancelButton());
+    fetchSandboxImageStatus.mockImplementation(() => new Promise(() => {}));
+    act(() => notifySandboxImagePulled("ghcr.io/example/other:1"));
+    expect(cancelButton().disabled, "a create's pull of another image retired this Cancel").toBe(true);
+    act(() => notifySandboxImagePulled(IMAGE));
+    await act(async () => named({ ok: false, message: "cancels are off here" }));
+    expect(banner()?.textContent, "a named create's pull left a polled pull's Cancel out").toBe(DOWNLOADING);
+    expect(cancelButton().disabled).toBe(false);
   });
 
   it("ignores a Cancel reply that arrives after a newer update started", async () => {
@@ -1218,6 +1232,26 @@ describe("SandboxImageBanner progress, cancel and hide (#5751)", () => {
     fetchSandboxImageStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } }));
     await pollAfter(2000);
     expect(banner()?.textContent).toBe(UPDATED);
+  });
+
+  it("answers a Cancel sent before × once its reply lands, so showing the pull has Cancel back and the refusal", async () => {
+    let refuse!: (r: { ok: boolean; message?: string }) => void;
+    cancelSandboxImagePull.mockReturnValueOnce(new Promise((r) => (refuse = r)));
+    await mount(running());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Hide sandbox image notice" }));
+    expect(bar()).toBeNull();
+    // Hold the poll the reply triggers, so only the reply decides; then a poll still shows the pull running.
+    fetchSandboxImageStatus.mockReturnValueOnce(new Promise(() => {}));
+    await act(async () => refuse({ ok: false, message: "cancels are off here" }));
+    fetchSandboxImageStatus.mockResolvedValue(running());
+    await pollAfter(2000);
+    fireEvent.click(screen.getByRole("button", { name: "Show pull" }));
+    const cancelButton = screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement;
+    expect(cancelButton.disabled, "a hide stranded the Cancel's reply").toBe(false);
+    expect(banner()?.textContent, "the refusal after a hide never showed").toBe(`${DOWNLOADING} Couldn't cancel.`);
+    fireEvent.click(screen.getByRole("button", { name: "Details" }));
+    expect(screen.getByText("cancels are off here").closest("[hidden]")).toBeNull();
   });
 
   it.each([

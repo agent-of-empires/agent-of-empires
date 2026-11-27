@@ -24,6 +24,8 @@ export function pullLatestOffer(
   const command = reply.pull_blocked ? reply.pull_command : null;
   // Gated, the dashboard can't join a pull either, so it keeps the gated checkbox.
   const running = reply.pull.state === "running" && !command ? pullProgress(reply.pull) : null;
+  // A first pull leaves no current image to start on, and the create joins that download anyway.
+  if (running && reply.state === "unknown" && reply.reason === "not_pulled") return null;
   if (!running && reply.state !== "available") return null;
   // Waiting is the default, as pulling first is: the create gets the image the download brings.
   return { checkedByDefault: running ? true : !reply.dismissed, command, running };

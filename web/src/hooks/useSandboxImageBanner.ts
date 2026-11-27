@@ -101,8 +101,9 @@ export interface Attempt {
   refusal: string | null;
 }
 
-/** The last Cancel. A reply applies only while this object is still the current one. */
+/** The last Cancel. A reply applies only while this record's `id` is still the current one. */
 export interface CancelSent {
+  id: number;
   image: string;
   pending: boolean;
   /** Why the Daemon refused it; the pull keeps running. Kept until a click or the pull's end, not the next poll,
@@ -258,6 +259,7 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   const attemptIds = useRef(0);
   const [cancelSent, setCancelSent] = useState<CancelSent | null>(null);
   const cancelRef = useRef<CancelSent | null>(null);
+  const cancelIds = useRef(0);
   const writeAttempt = useCallback((next: (a: Attempt | null) => Attempt | null) => {
     attemptRef.current = next(attemptRef.current);
     setAttempt(attemptRef.current);
@@ -363,14 +365,14 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
     const offServerDown = onServerDownChange((down) => {
       if (!down) pollNow.current();
     });
-    // The create's pull supersedes an "Update now" of its image, refused or still awaiting its reply, and a Cancel
-    // still out; one whose image the dialog didn't know may be any.
+    // The create's pull supersedes an "Update now" of its image, refused or still awaiting its reply, and any Cancel of
+    // that image still out; one whose image the dialog didn't know may be any.
     const offPulled = onSandboxImagePulled((image) => {
       createPullSince.current = null;
       if (image === undefined || image === attemptRef.current?.image) {
         writeAttempt((a) => a && { ...a, id: ++attemptIds.current, replyOut: false, refusal: null });
-        writeCancel(() => null);
       }
+      writeCancel((c) => (c && (image === undefined || c.image === image) ? null : c));
       pollNow.current();
     });
     const offStarted = onSandboxImagePullStarted(() => {
@@ -453,16 +455,19 @@ export function useSandboxImageBanner(): SandboxImageBannerState {
   // `image` is the one on the banner, so a default changed since can't cancel a different pull.
   const cancel = useCallback(
     (image: string) => {
-      const mine: CancelSent = { image, pending: true, refused: null };
-      writeCancel(() => mine);
+      const id = ++cancelIds.current;
+      writeCancel(() => ({ id, image, pending: true, refused: null }));
       void cancelSandboxImagePull(image).then((reply) => {
         // A click, a create's pull, or a status for another image or the pull's end retired this Cancel.
-        if (cancelRef.current !== mine) return;
-        writeCancel(() => ({
-          ...mine,
-          pending: false,
-          refused: reply.ok ? null : (reply.message ?? "Couldn't reach the Daemon."),
-        }));
+        if (cancelRef.current?.id !== id) return;
+        writeCancel(
+          (c) =>
+            c && {
+              ...c,
+              pending: false,
+              refused: reply.ok ? null : (reply.message ?? "Couldn't reach the Daemon."),
+            },
+        );
         if (reply.pull) {
           const pull = reply.pull;
           if (pull.state !== "running") {
