@@ -65,8 +65,11 @@ pub(crate) fn push(conn: &Connection, profile: &str, input: Push) -> Result<Valu
     let tx = conn.unchecked_transaction().map_err(db_error)?;
     let (count, known): (i64, bool) = tx
         .query_row(
-            "SELECT COUNT(*), COALESCE(MAX(item_id = ?3), 0) FROM suggestion_items
-             WHERE profile = ?1 AND provider_id = ?2",
+            "SELECT COUNT(*) FILTER (WHERE item_id NOT IN (
+                        SELECT item_id FROM suggestion_dismissals
+                        WHERE profile = ?1 AND provider_id = ?2)),
+                    COALESCE(MAX(item_id = ?3), 0)
+             FROM suggestion_items WHERE profile = ?1 AND provider_id = ?2",
             params![profile, PROVIDER_ID, id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -141,6 +144,21 @@ mod tests {
             "newest first, same id replaced"
         );
         assert_eq!(snap["items"][0]["source_ref"], "Session A");
+    }
+
+    #[test]
+    fn dismissed_items_do_not_count_toward_the_cap() {
+        let conn = conn();
+        for n in 0..MAX_ITEMS {
+            push_one(&conn, Some(&format!("k{n}")), "T").unwrap();
+        }
+        assert!(push_one(&conn, Some("extra"), "T").is_err());
+        conn.execute(
+            "INSERT INTO suggestion_dismissals (profile, provider_id, item_id) VALUES ('p', ?1, 'k0')",
+            [PROVIDER_ID],
+        )
+        .unwrap();
+        push_one(&conn, Some("extra"), "T").unwrap();
     }
 
     #[test]
