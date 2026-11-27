@@ -131,6 +131,7 @@ impl<'a> DefinitionData<'a> {
             sidecar_hooks: None,
             session_support: support,
             fork_strategy: ForkStrategy::Unsupported,
+            fork_host_only: false,
             host_only: launch.host_only,
             send_keys_enter_delay_ms: launch.send_keys_enter_delay_ms.unwrap_or(0),
             ready_markers: &[],

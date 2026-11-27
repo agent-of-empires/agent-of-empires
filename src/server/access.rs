@@ -567,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn cityhall_denies_sandbox_login_mutations_before_json() {
+    async fn cityhall_denies_native_input_and_sandbox_login_mutations_before_body() {
         use axum::http::{Method, Request, StatusCode};
         use tower::ServiceExt;
 
@@ -581,6 +581,7 @@ mod tests {
         );
         let app = test_support::build_router_for_test(state);
         for (method, path) in [
+            (Method::PATCH, "/api/sessions/missing/input-recency"),
             (Method::POST, "/api/sandbox/login"),
             (Method::DELETE, "/api/sandbox/login"),
             (Method::DELETE, "/api/sandbox/login/missing"),

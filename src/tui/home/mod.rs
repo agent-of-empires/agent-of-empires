@@ -9,6 +9,7 @@ mod file_watch_tests;
 pub(crate) use icons::get_indent;
 mod icons;
 mod input;
+pub(crate) mod keybinds;
 mod last_prompt;
 mod layout;
 mod lifecycle;
@@ -150,6 +151,15 @@ pub(super) struct PendingArchiveCursor {
     pub(super) archived: bool,
     /// Where the cursor lands when the row sinks (non-Attention sorts).
     pub(super) successor: Option<String>,
+}
+
+/// Status flash owed to the snapshot that reflects a snooze toggle: the view
+/// submits the change, and the message waits for the canonical stamp so it
+/// never announces a change the daemon has not applied.
+pub(super) struct PendingSnoozeFlash {
+    pub(super) id: String,
+    pub(super) snoozed: bool,
+    pub(super) message: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -529,6 +539,9 @@ pub struct HomeView {
     /// Cursor placement owed to the applied snapshot after an archive toggle.
     pub(super) pending_archive_cursor: Option<PendingArchiveCursor>,
 
+    /// Status flash owed to the applied snapshot after a snooze toggle.
+    pub(super) pending_snooze_flash: Option<PendingSnoozeFlash>,
+
     pub(super) preview_cache: PreviewCache,
     pub(super) terminal_preview_cache: PreviewCache,
     pub(super) container_terminal_preview_cache: PreviewCache,
@@ -650,6 +663,8 @@ pub struct HomeView {
     pub(super) restart_cooldown_at: std::collections::HashMap<String, std::time::Instant>,
 
     pub(super) tool_configs: HashMap<String, crate::session::config::ToolSessionConfig>,
+    /// Live mode's exit and leader, applied alongside the keymap.
+    live_send_chords: live_send::LiveSendChords,
     pub(super) tool_hotkey_cache: Vec<(
         String,
         crossterm::event::KeyCode,

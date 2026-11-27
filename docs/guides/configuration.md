@@ -102,8 +102,6 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 |--------|---------|-------------|
 | `default_tool` | (auto-detect) | Default agent for new sessions. Falls back to the first available tool if unset or unavailable. Can be set to a custom agent name. |
 | `auto_stop_idle_secs` | `0` | Seconds a plain tmux session may stay `Idle` before its tmux session and sandbox container are stopped, leaving a restartable `Stopped` row. `0` disables it. Idle age starts at the later of the last `Idle` transition and last interaction; an attached tmux client spares the session. The Daemon checks about once a minute. Structured workers use `acp.auto_stop_idle_secs`. |
-| `startup_recovery_wake` | `false` | Send `restart_wake_message` after automatic recovery of a missing terminal agent pane at Daemon startup, including after a reboot. Off still restores the pane, honoring native resume settings, without sending a new prompt. Explicit CLI, TUI, and API restarts keep their existing behavior. Global and profile settings only; repository overrides cannot enable it. |
-| `restart_wake_message` | `"wake up: pick up what you were doing"` | Wake text for explicit restarts and opted-in startup recovery. An empty string disables the message even when `startup_recovery_wake` is on, without disabling recovery or native resume. Custom text is sent unchanged. |
 | `prevent_sleep_when_active` | `false` | Have the Daemon inhibit user-idle system sleep while sessions are active; the display can sleep. Global only. Uses `caffeinate -i` or `systemd-inhibit --what=idle:sleep`; missing tools or logind warn once and skip inhibition. |
 | `prevent_sleep_idle_grace_minutes` | `15` | Minutes a session must stay idle before the sleep-inhibit assertion may be released. Only consulted when `prevent_sleep_when_active` is on. Range `0` to `240`; `0` releases as soon as every session leaves an active status. The grace period only begins once a session goes `Idle`, so a session that never reaches `Idle` keeps holding the assertion: `Waiting` on an unanswered prompt, or `Creating` on a container, worktree, or submodule setup that never returns, can hold sleep indefinitely. A `Starting` session is bounded by a short (~3s) launch guard and then re-resolves. |
 | `session_id_poller_max_threads` | `50` | Ceiling on concurrent native-session-ID pollers per process. Overflow IDs stop refreshing until a poller is available, with a 5 s to 60 s retry backoff. `0` keeps the default. Global only; applied when the Daemon starts. |
@@ -579,6 +577,22 @@ hotkey = "Alt+g"
 ```
 
 See [Tool Sessions](tool-sessions.md) for the full reference.
+
+## Keybinds
+
+`[keybinds]` changes the TUI's home-view and live-mode shortcuts. Each key is an action name and each value a list of keys in the `live_send_leader` grammar (`C-n`, `M-Up`, `S-PageUp`, `F7`, `x`); a bare letter is lowercase, so write `S-d` for `D`. The list replaces the action's keys in both hotkey modes, and `[]` unbinds it.
+
+```toml
+[keybinds]
+previous-finished = ["M-k"]
+next-finished = ["M-j"]
+move-row-up = []
+activate = ["C-Enter"]
+```
+
+`activate` (Enter) opens the selected session the way `default_attach_mode` says, and `activate-alt` (Tab) does the other of live mode and tmux attach. Ctrl+Enter reaches AoE only in terminals with the kitty keyboard protocol enabled; elsewhere it arrives as Enter.
+
+**Settings > Global > Keybinds** lists every action name with its current keys, read-only, checked against the hotkey mode, leader and exit chord the TUI uses for the current profile. An entry is ignored, with a warning on that page and when the TUI loads config, if it names an unknown action, has a key that does not parse, or adds a key already in use: another action's key in the current hotkey mode, a tool hotkey, `Ctrl+C`, `Ctrl+L`, or the navigation keys (arrows, `j` `k` `h` `l`, `G`, `{` `}`, `<` `>`, Home, End, Page Up/Down, Esc). Keeping one of the action's own default keys is always allowed. `quit` takes its key under every modifier, so no other action or tool hotkey can use that key with Ctrl or Alt, and `quit` itself cannot use Ctrl or Alt, or Shift on a key other than a letter, such as `S-F10` or `S-Space`. The actions live mode keeps from the Agent (`previous-finished`, `next-finished`, `preview-scroll-up`, `preview-scroll-down`) also cannot use the live-send leader or exit chord, or a character key, Enter, Tab, Backspace, Delete or Shift+Tab without Ctrl or Alt. An ignored entry leaves its action on the default keys. Dialog keys are not configurable. Global only: a `[keybinds]` table in a profile's `config.toml` is ignored.
 
 ## Profiles
 

@@ -2028,11 +2028,10 @@ async fn test_strict_mode_h_collapses_group() {
 
 #[tokio::test]
 #[serial]
-async fn test_non_strict_h_snoozes_only_in_attention_sort() {
-    // Snooze is Attention-only: there `h` toggles snooze on the cursor's session and the
-    // group below stays expanded, while every other sort falls through to the unconditional
-    // `Left | Char('h')` collapse. Before the gate, snooze caught first in non-strict mode
-    // regardless of sort and silently mutated persisted state.
+async fn test_non_strict_h_snoozes_on_a_session_row_in_any_sort() {
+    // `h` snoozes the cursor's session in every sort; on a group header there is no
+    // session to snooze, so it falls through to the unconditional `Left | Char('h')`
+    // collapse.
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_groups();
@@ -2063,9 +2062,26 @@ async fn test_non_strict_h_snoozes_only_in_attention_sort() {
     env.view.snooze_duration_dialog = None;
     env.view.pending_snooze_session = None;
 
-    // Now flip back to a non-Attention sort and confirm `h` falls
-    // through to the collapse handler instead of snoozing.
+    // Newest sort: a session row is still snoozable, so the dialog opens there too.
     env.view.sort_order = SortOrder::Newest;
+    env.view.flat_items = env.view.build_flat_items();
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { .. }))
+        .expect("setup should produce a session in Newest sort");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+    env.view.handle_key(key(KeyCode::Char('h')), None);
+    assert!(
+        env.view.snooze_duration_dialog.is_some(),
+        "`h` on a session row must open the snooze dialog in every sort"
+    );
+    env.view.snooze_duration_dialog = None;
+    env.view.pending_snooze_session = None;
+
+    // On a group header `h` still collapses instead of snoozing.
     env.view.flat_items = env.view.build_flat_items();
     let group_idx = env
         .view
@@ -2096,7 +2112,7 @@ async fn test_non_strict_h_snoozes_only_in_attention_sort() {
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(
             *collapsed,
-            "non-strict 'h' outside Attention sort must collapse the group, not snooze"
+            "non-strict 'h' on a group header must collapse the group, not snooze"
         );
     }
 }
