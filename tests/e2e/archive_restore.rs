@@ -686,11 +686,13 @@ fn trash_retained_transcript_is_read_only() {
     h.append_config("[session]\nlive_send_on_view_switch = true\nshow_diagnostics_pane = true");
     let project = h.project_path();
     let mut retained = Instance::new("TrashRetained", project.to_str().unwrap());
+    retained.tool = "fake-agent".to_string();
     retained.trashed_at = Some(agent_of_empires::time::Timestamp::now());
     retained.status = Status::Stopped;
     retained.mark_unread();
     let id = retained.id.clone();
     let mut empty = Instance::new("TrashEmpty", project.to_str().unwrap());
+    empty.tool = "fake-agent".to_string();
     empty.trashed_at = Some(agent_of_empires::time::Timestamp::now());
     empty.archived_at = empty.trashed_at;
     empty.status = Status::Stopped;
