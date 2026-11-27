@@ -39,7 +39,6 @@ export interface LiveTerminalState {
   connected: boolean;
   reconnecting: boolean;
   retryCount: number;
-  retryCountdown: number;
   frame: LiveFrame | null;
   reading: boolean;
   isOwner: boolean;
@@ -58,7 +57,6 @@ const INITIAL_STATE: LiveTerminalState = {
   connected: false,
   reconnecting: false,
   retryCount: 0,
-  retryCountdown: 0,
   frame: null,
   reading: false,
   isOwner: false,
@@ -90,7 +88,6 @@ export function useLiveTerminal(
   const handleGridTransport = useEffectEvent(() => onGridTransport?.());
   const wsRef = useRef<WebSocket | null>(null);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const retryCountRef = useRef(0);
   // The live socket a user redial closed; its onclose reconnects instead of backing off.
   const redialRef = useRef<WebSocket | null>(null);
@@ -172,7 +169,6 @@ export function useLiveTerminal(
     pendingInputRef.current = null;
     ownerKnownRef.current = false;
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-    if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
     redialRef.current = null;
     setState(() => INITIAL_STATE);
@@ -340,7 +336,6 @@ export function useLiveTerminal(
         setState((prev) => ({
           ...prev,
           retryCount: retryCountRef.current,
-          retryCountdown: 0,
           frame: incoming,
           stats: { ...stats },
         }));
@@ -391,30 +386,13 @@ export function useLiveTerminal(
         if (retryCountRef.current < MAX_RETRIES) {
           retryCountRef.current += 1;
           const count = retryCountRef.current;
-          const delayMs = retryDelayMs(count);
-          let countdown = Math.ceil(delayMs / 1000);
-          setState((prev) => ({
-            ...prev,
-            reconnecting: true,
-            retryCount: count,
-            retryCountdown: countdown,
-          }));
-          countdownRef.current = setInterval(() => {
-            countdown -= 1;
-            if (countdown > 0) {
-              setState((prev) => ({ ...prev, retryCountdown: countdown }));
-            }
-          }, 1000);
-          retryTimerRef.current = setTimeout(() => {
-            if (countdownRef.current) clearInterval(countdownRef.current);
-            connect();
-          }, delayMs);
+          setState((prev) => ({ ...prev, reconnecting: true, retryCount: count }));
+          retryTimerRef.current = setTimeout(connect, retryDelayMs(count));
         } else {
           setState((prev) => ({
             ...prev,
             reconnecting: false,
             retryCount: retryCountRef.current,
-            retryCountdown: 0,
           }));
         }
       };
@@ -428,7 +406,6 @@ export function useLiveTerminal(
       const readyState = wsRef.current?.readyState;
       if (readyState === WebSocket.OPEN || readyState === WebSocket.CONNECTING) return;
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-      if (countdownRef.current) clearInterval(countdownRef.current);
       retryCountRef.current = 0;
       connect();
     };
@@ -446,7 +423,6 @@ export function useLiveTerminal(
       stopVisibility();
       stopNetwork();
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-      if (countdownRef.current) clearInterval(countdownRef.current);
       const ws = wsRef.current;
       if (ws) {
         ws.onopen = null;
@@ -574,12 +550,11 @@ export function useLiveTerminal(
     const ws = wsRef.current;
     if (ws && redialRef.current === ws) return;
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-    if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
     // Wait for onclose so the server releases this socket's size claim before the redial asks for it.
     if (ws?.readyState === WebSocket.OPEN) {
       redialRef.current = ws;
-      setState((prev) => ({ ...prev, retryCount: 0, retryCountdown: 0 }));
+      setState((prev) => ({ ...prev, retryCount: 0 }));
       retryTimerRef.current = setTimeout(() => {
         if (redialRef.current !== ws) return;
         redialRef.current = null;
@@ -596,7 +571,6 @@ export function useLiveTerminal(
       ownerKnown: false,
       reconnecting: true,
       retryCount: 0,
-      retryCountdown: 0,
     }));
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       connectRef.current?.();

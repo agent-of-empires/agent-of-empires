@@ -178,7 +178,11 @@ const requestCases: RequestCase[] = [
     () => api.getProfileSettings("my work"),
     { respond: json({ description: "x" }), result: { description: "x" } },
   ],
-  ["GET /api/themes", () => api.fetchThemes(), { respond: json(["empire"]), result: ["empire"] }],
+  [
+    "GET /api/themes",
+    () => api.fetchThemes(),
+    { respond: json([{ name: "empire", label: "empire" }]), result: [{ name: "empire", label: "empire" }] },
+  ],
   ["GET /api/themes/My%20Theme", () => api.fetchResolvedTheme("My Theme")],
   ["GET /api/theme/current", () => api.fetchCurrentTheme()],
   [
@@ -1412,6 +1416,42 @@ describe("createSession errors", () => {
     expect(url).toBe("/api/suggestions/presets?provider_id=acme.sugg&criterion=assigned");
     expect(init?.method).toBe("DELETE");
     expect(init?.body).toBeUndefined();
+  });
+
+  describe("startSuggestions", () => {
+    const items = [
+      { provider_id: "acme.sugg", id: "i1" },
+      { provider_id: "acme.sugg", id: "i2" },
+    ];
+
+    it("posts once and reads each item's status and body like a single start", async () => {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            results: [
+              { ...items[0], status: 201, body: { session_id: "s1", title: "Fix it" } },
+              { ...items[1], status: 400, body: { error: "no_project" } },
+            ],
+          }),
+          { status: 200 },
+        ),
+      );
+      expect(await api.startSuggestions(items)).toEqual([
+        { kind: "started", sessionId: "s1", title: "Fix it" },
+        { kind: "no_project" },
+      ]);
+      const [url, init] = fetchSpy.mock.calls.at(-1)!;
+      expect(url).toBe("/api/suggestions/start-batch");
+      expect(JSON.parse(init?.body as string)).toEqual({ items });
+    });
+
+    it("answers every item with the error when the request itself fails", async () => {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "read_only", message: "Read-only mode" }), { status: 403 }),
+      );
+      const results = await api.startSuggestions(items);
+      expect(results.map((r) => r.kind)).toEqual(["error", "error"]);
+    });
   });
 
   describe("startSuggestion", () => {

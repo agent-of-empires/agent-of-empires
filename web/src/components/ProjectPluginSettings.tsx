@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchMachineSettings, getSettingsSchema } from "../lib/api";
 import type { SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 const PLUGIN_PREFIX = "plugin:";
 
@@ -106,7 +107,7 @@ export function ProjectPluginSettings({ stored, draft, onChange }: Props) {
                         <button
                           type="button"
                           onClick={() => setKey(id, d.field, savedValue !== undefined ? null : undefined)}
-                          className="underline cursor-pointer hover:text-text-secondary"
+                          className={BUTTON_INLINE}
                         >
                           Use global
                         </button>

@@ -11,6 +11,7 @@ import type { ActivityFilter } from "./activityFold";
 import { PreviewMarkdown, SteppedMarkdown } from "./LongMarkdown";
 import type { SubagentRecord, SubagentStatus } from "./model";
 import { StopSession, StopSubagent } from "./StopSession";
+import { BUTTON_INLINE } from "../../../lib/surfaces";
 
 const STATUS: Record<SubagentStatus, { glyph: string; word: string; dot: string; tone: string }> = {
   running: { glyph: "●", word: "running", dot: "bg-status-waiting animate-pulse", tone: "text-text-dim" },
@@ -226,13 +227,13 @@ function ActivitySection({
             type="button"
             aria-pressed={following}
             onClick={() => setFollowing((v) => !v)}
-            className="normal-case text-accent-600 hover:underline"
+            className={`${BUTTON_INLINE} normal-case tracking-normal`}
           >
             {following ? "Following" : "Follow"}
           </button>
         )}
         {record.status === "failed" && errors > 0 && (
-          <button type="button" onClick={jump} className="normal-case text-status-error hover:underline">
+          <button type="button" onClick={jump} className={`${BUTTON_INLINE} normal-case tracking-normal`}>
             Jump to failure
           </button>
         )}

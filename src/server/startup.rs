@@ -1407,6 +1407,7 @@ pub(crate) async fn start_server(
         // forwarder to carry it.
         plugin_status::spawn_forwarder(state.clone(), host.clone());
         host.start(&crate::plugin::registry()).await;
+        api::spawn_auto_start(&state);
     }
 
     // Opt-in clean-only plugin auto-update sweep (off by default).

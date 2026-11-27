@@ -32,6 +32,16 @@ import type { Approval, ApprovalDecision, ApprovalOptionKind } from "../../lib/a
 import { useServerDown, OFFLINE_TITLE } from "../../lib/connectionState";
 import { hasArgsBody, humanizePermissionTitle, parseJsonObject, previewFromArgs } from "../../lib/acpArgs";
 import { PlanModal } from "./PlanModal";
+import {
+  PROMPT_CARD,
+  PROMPT_CARD_HEADER,
+  PROMPT_ERROR,
+  PROMPT_KIND,
+  PROMPT_KIND_DESTRUCTIVE,
+  PROMPT_PRIMARY,
+  PROMPT_REFUSE,
+  PROMPT_SECONDARY,
+} from "./promptCard";
 
 interface Props {
   approval: Approval;
@@ -201,8 +211,8 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
   return (
     <div
       className={[
-        "my-2 overflow-hidden rounded-md border bg-surface-800/50 text-sm",
-        approval.destructive ? "border-rose-900/60 bg-rose-950/20" : "border-brand-700/40 bg-brand-700/5",
+        PROMPT_CARD,
+        approval.destructive ? "border-status-error/40 bg-status-error/5" : "border-brand-700/40 bg-surface-850",
       ].join(" ")}
       role="alertdialog"
       aria-label={`${isChoice && !approval.destructive ? "Question" : "Approval needed"}: ${humanizePermissionTitle(
@@ -213,24 +223,16 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
         type={canExpand ? "button" : undefined}
         onClick={canExpand ? () => setExpanded((v) => !v) : undefined}
         aria-expanded={canExpand ? expanded : undefined}
-        className={[
-          "flex w-full items-center gap-2 px-3 py-2 text-left border-b border-surface-800/60",
-          canExpand ? "cursor-pointer hover:bg-surface-800/40" : "",
-        ].join(" ")}
+        className={[PROMPT_CARD_HEADER, canExpand ? "cursor-pointer hover:bg-surface-700/30" : ""].join(" ")}
       >
         {approval.destructive ? (
-          <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-status-error-text" />
         ) : isChoice ? (
           <MessageCircleQuestion className="h-3.5 w-3.5 shrink-0 text-brand-500" />
         ) : (
           <Shield className="h-3.5 w-3.5 shrink-0 text-brand-500" />
         )}
-        <span
-          className={[
-            "shrink-0 text-[11px] uppercase tracking-wider",
-            approval.destructive ? "text-rose-400" : "text-brand-500",
-          ].join(" ")}
-        >
+        <span className={approval.destructive ? PROMPT_KIND_DESTRUCTIVE : PROMPT_KIND}>
           {approval.destructive ? "Destructive action" : isChoice ? "Question" : "Approval needed"}
         </span>
         <span className="shrink-0 font-mono text-xs text-text-secondary">
@@ -249,16 +251,12 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
 
       {(expanded || showEmptyArgsState) && <ArgsView raw={raw} />}
 
-      {phase === "rolled-back" && <p className="px-3 pt-2 text-rose-400 text-xs">Could not submit. Try again.</p>}
-      {offline && <p className="px-3 pt-2 text-status-error text-xs">{OFFLINE_TITLE}</p>}
+      {phase === "rolled-back" && <p className={`${PROMPT_ERROR} pt-2`}>Could not submit. Try again.</p>}
+      {offline && <p className={`${PROMPT_ERROR} pt-2`}>{OFFLINE_TITLE}</p>}
 
       {approval.plan && (
         <div className="px-2 pt-2">
-          <button
-            type="button"
-            className="w-full rounded-md border border-surface-700 bg-surface-800 px-3 py-1.5 text-xs font-medium text-text-secondary hover:bg-surface-700"
-            onClick={() => setPlanOpen(true)}
-          >
+          <button type="button" className={`${PROMPT_SECONDARY} w-full`} onClick={() => setPlanOpen(true)}>
             View plan
           </button>
         </div>
@@ -277,7 +275,9 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
 
       {isChoice && (
         <div className="flex flex-col gap-1.5 p-2">
-          {approval.destructive && <p className="px-1 pb-0.5 text-[11px] text-rose-400">Hold an answer to confirm.</p>}
+          {approval.destructive && (
+            <p className="px-1 pb-0.5 text-[12px] text-status-error-text">Hold an answer to confirm.</p>
+          )}
           {options.map((option) => {
             const needsHold = optionNeedsHold(option.kind);
             const pick = () => void submit("Allow", option.option_id);
@@ -286,11 +286,11 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
                 key={option.option_id}
                 type="button"
                 className={[
-                  "relative w-full overflow-hidden rounded-md border",
-                  "px-3 py-2 text-left text-xs font-medium text-text-primary break-words",
+                  "relative w-full overflow-hidden rounded-lg border cursor-pointer transition-colors",
+                  "px-3 py-2 max-md:py-3 text-left text-[13px] max-md:text-[15px] font-medium text-text-primary break-words",
                   needsHold
-                    ? "border-rose-900/60 bg-rose-950/30 enabled:hover:border-rose-700"
-                    : "border-surface-700 bg-surface-800 enabled:hover:border-brand-600/60 enabled:hover:bg-brand-700/10",
+                    ? "border-status-error/40 bg-status-error/10 enabled:hover:border-status-error/70"
+                    : "border-surface-600/70 bg-surface-800 enabled:hover:border-brand-600/60 enabled:hover:bg-brand-700/10",
                   blockedClass,
                 ].join(" ")}
                 disabled={blocked}
@@ -353,11 +353,7 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
           <>
             <button
               type="button"
-              className={[
-                "flex flex-1 items-center justify-center gap-1.5",
-                "rounded-md bg-brand-600 text-white text-xs font-medium py-2 px-3 enabled:hover:bg-brand-500",
-                blockedClass,
-              ].join(" ")}
+              className={`${PROMPT_PRIMARY} flex-1 ${blockedClass}`}
               disabled={blocked}
               onClick={() => void submit("Allow")}
             >
@@ -366,13 +362,7 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
             </button>
             <button
               type="button"
-              className={[
-                "flex items-center justify-center gap-1.5",
-                "rounded-md border border-surface-700 bg-surface-800",
-                "text-xs font-medium text-text-secondary py-2 px-3",
-                "enabled:hover:bg-surface-700",
-                blockedClass,
-              ].join(" ")}
+              className={`${PROMPT_SECONDARY} ${blockedClass}`}
               disabled={blocked}
               onClick={() => void submit("AllowAlways")}
               title={offline ? OFFLINE_TITLE : "Allow this tool for the whole session"}
@@ -384,13 +374,7 @@ export function ApprovalCard({ approval, canDecide, onResolve }: Props) {
 
         <button
           type="button"
-          className={[
-            "flex items-center justify-center gap-1.5",
-            "rounded-md border border-surface-700 bg-surface-800",
-            "text-xs font-medium text-text-secondary py-2 px-3",
-            "enabled:hover:border-rose-700/60 enabled:hover:bg-rose-950/30 enabled:hover:text-rose-300",
-            blockedClass,
-          ].join(" ")}
+          className={`${PROMPT_REFUSE} ${blockedClass}`}
           disabled={blocked}
           // Dismiss answers nothing, so it cancels rather than denying:
           // a Deny would be mapped onto the first reject-kind option and
@@ -438,7 +422,7 @@ function ArgsView({ raw }: { raw: string }) {
     <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 border-b border-surface-800/60 bg-surface-950 px-3 py-2.5 max-h-48 overflow-y-auto text-xs">
       {entries.map(([k, v]) => (
         <Fragment key={k}>
-          <dt className="font-mono text-[10px] uppercase tracking-wider text-text-dim self-start pt-0.5">{k}</dt>
+          <dt className="font-mono text-[11px] text-text-dim self-start pt-0.5">{k}</dt>
           <dd className="font-mono text-text-secondary break-all whitespace-pre-wrap min-w-0">
             <ArgValue value={v} />
           </dd>

@@ -75,6 +75,19 @@
    matches the resolved palette for zinc. Keep these values in
    sync with that TOML file. */
 @theme {
+  /* Elevation: layered shadows with a hairline edge and a faint top highlight, so cards, menus and dialogs sit
+     above the canvas the way a native app's do. Every shadow-* utility in the app reads these. */
+  --shadow-md: 0 0 0 1px rgb(255 255 255 / 0.03), 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 28px -14px rgb(0 0 0 / 0.55);
+  --shadow-lg:
+    inset 0 1px 0 rgb(255 255 255 / 0.05), 0 0 0 1px rgb(0 0 0 / 0.25), 0 2px 4px -1px rgb(0 0 0 / 0.35),
+    0 10px 22px -6px rgb(0 0 0 / 0.5);
+  --shadow-xl:
+    inset 0 1px 0 rgb(255 255 255 / 0.05), 0 0 0 1px rgb(0 0 0 / 0.3), 0 4px 8px -2px rgb(0 0 0 / 0.4),
+    0 18px 36px -10px rgb(0 0 0 / 0.6);
+  --shadow-2xl:
+    inset 0 1px 0 rgb(255 255 255 / 0.05), 0 0 0 1px rgb(0 0 0 / 0.3), 0 8px 16px -4px rgb(0 0 0 / 0.45),
+    0 32px 64px -16px rgb(0 0 0 / 0.7);
+
   /* Brand, derived from zinc.accent */
   --color-brand-100: #fdecce;
   --color-brand-200: #fcddaa;
@@ -93,20 +106,20 @@
   --color-accent-700: #0f766e;
 
   /* Surfaces, derived from zinc.background and border */
-  --color-surface-500: #65656b;
-  --color-surface-600: #525258;
-  --color-surface-700: #3f3f46;
-  --color-surface-800: #2e2e31;
-  --color-surface-850: #27272a;
-  --color-surface-900: #1c1c1f;
-  --color-surface-950: #0f0f11;
+  --color-surface-500: #666666;
+  --color-surface-600: #535353;
+  --color-surface-700: #404040;
+  --color-surface-800: #313131;
+  --color-surface-850: #2a2a2a;
+  --color-surface-900: #1f1f1f;
+  --color-surface-950: #111111;
 
   /* Semantic Text */
-  --color-text-primary: #e4e4e7;
-  --color-text-secondary: #a1a1aa;
-  --color-text-muted: #71717a;
-  --color-text-dim: #97979f;
-  --color-text-subtle: #97979f;
+  --color-text-primary: #e5e5e5;
+  --color-text-secondary: #a3a3a3;
+  --color-text-muted: #737373;
+  --color-text-dim: #9a9a9a;
+  --color-text-subtle: #9a9a9a;
   --color-text-bright: #fafafa;
 
   /* Semantic Status */
@@ -121,7 +134,7 @@
      so the breathe rattle's pulse stays visually consistent. One rung
      dimmer than waiting so the hierarchy reads bright > amber > slate. */
   --color-status-fresh-idle: #f59e0b;
-  --color-status-idle: #71717a;
+  --color-status-idle: #737373;
   /* Unread accent: a finished turn the user hasn't viewed, or a manual flag.
      Sits between waiting and idle on the attention scale. Theme-projected
      from `theme.unread` (see resolved.rs); this default matches `zinc`. */
@@ -133,7 +146,7 @@
      4.5:1 on surface-900, -850 and the error banner's tint (see resolved.rs). This default is zinc's. */
   --color-status-error-text: #f26969;
   --color-status-starting: #f59e0b;
-  --color-status-stopped: #52525b;
+  --color-status-stopped: #525252;
   /* Dormant: a structured-view worker auto-stopped for inactivity
      (resumable), distinct from a deliberate Stop. A dim amber, brighter
      than the slate Stopped grey but muted well below the fresh-idle
@@ -146,9 +159,9 @@
      projection (see src/tui/styles/resolved.rs). These build-time
      defaults match the `zinc` builtin theme so cold-load paint
      matches the post-fetch paint when no localStorage cache exists. */
-  --color-selection: #3f3f46;
-  --color-session-selection: #52525b;
-  /* Frame around the open session's sidebar row. Projected as the theme
+  --color-selection: #404040;
+  --color-session-selection: #525252;
+  /* Edge marking a collapsed sidebar group that holds the open session. Projected as the theme
      accent lifted until it clears 3:1 against every surface it can sit on
      (see resolved.rs); zinc's accent already does, so this matches
      --color-brand-500. */
@@ -162,25 +175,21 @@
   --color-diff-modified: #fbbf24;
   --color-diff-header: #0d9488;
 
-  /* Embedded terminal cold-load defaults. useResolvedTheme refetches
-     and overrides these once the resolved palette lands; the terminal
-     hook reads them on construction and on `aoe:theme-changed` to
-     build xterm.js's ITheme. These match the `zinc` builtin
-     projected by src/tui/styles/resolved.rs::terminal_projection so
-     the pre-fetch paint matches the post-fetch paint for the zinc theme. */
-  --term-bg: #1c1c1f;
-  --term-fg: #e4e4e7;
+  /* Terminal cold-load defaults, the `zinc` builtin's projection in
+     src/tui/styles/resolved.rs; the resolved theme overrides them. */
+  --term-bg: #1f1f1f;
+  --term-fg: #e5e5e5;
   --term-cursor: #f59e0b;
-  --term-selection-bg: rgba(161, 161, 170, 0.35);
-  --term-color-0: #1c1c1f;
+  --term-selection-bg: rgba(163, 163, 163, 0.35);
+  --term-color-0: #1f1f1f;
   --term-color-1: #ef4444;
   --term-color-2: #22c55e;
   --term-color-3: #fbbf24;
   --term-color-4: #0d9488;
   --term-color-5: #f59e0b;
   --term-color-6: #0d9488;
-  --term-color-7: #e4e4e7;
-  --term-color-8: #8b8b94;
+  --term-color-7: #e5e5e5;
+  --term-color-8: #8f8f8f;
   --term-color-9: #f26969;
   --term-color-10: #4ed17e;
   --term-color-11: #fccc50;
@@ -229,6 +238,8 @@ html {
   /* Live right-panel width, published by ContentSplit for the symmetric
      treatment on the right. Default mirrors ContentSplit's DEFAULT_DIFF_WIDTH. */
   --aoe-right-panel-width: 380px;
+  /* The phone session drawer's width; the Session it pushes aside moves by as much. */
+  --aoe-drawer-w: min(85vw, 400px);
 }
 
 body {
@@ -260,6 +271,8 @@ html[data-ios-standalone]:not([data-editing]) {
   --app-height: 100lvh;
 }
 
+/* iOS 26 blurs an installed app's top and bottom edges unless a fixed or sticky box there paints one solid colour,
+   which it then extends under the status bar and home indicator. The fixed root is that box wherever no edge bar is. */
 @media (pointer: coarse) {
   #root {
     position: fixed;
@@ -267,6 +280,7 @@ html[data-ios-standalone]:not([data-editing]) {
     height: var(--app-height);
     width: 100%;
     overflow: hidden;
+    background-color: var(--color-surface-900);
   }
 }
 
@@ -601,7 +615,7 @@ html[data-ios-standalone]:not([data-editing]) {
   0%,
   50% {
     background-color: var(--term-cursor, #f59e0b);
-    color: var(--term-bg, #1c1c1f);
+    color: var(--term-bg, #1f1f1f);
   }
   50.001%,
   100% {
@@ -773,4 +787,74 @@ select:focus-visible,
   mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 3v5h8M9 5l3 3-3 3' fill='none' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E")
     0 0 / 2ch 1lh repeat-y;
   pointer-events: none;
+}
+
+/* Barely-there washes for the chrome around the cards, mixed from theme surfaces so every theme gets them:
+   lighter at the top, where the header sits, settling into the canvas. */
+@utility chrome-canvas {
+  background-image: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--color-surface-900) 55%, var(--color-surface-950)) 0%,
+    var(--color-surface-950) 55%
+  );
+}
+@utility chrome-drawer {
+  background-image: linear-gradient(
+    to bottom,
+    var(--color-surface-800),
+    color-mix(in srgb, var(--color-surface-800) 55%, var(--color-surface-850))
+  );
+}
+
+/* Floating controls on phones, after Claude's iOS app: a raised surface with a hairline edge, a faint top
+   highlight and a soft two-layer shadow, so they read as sitting above the content. */
+/* The Session card a phone's drawer pushes aside: a shadow cast left onto the drawer, as Muse's page casts it,
+   and a hairline so its edge reads against a near-black drawer. Shared with the finger-tracked drag. */
+:root {
+  --drawer-card-shadow:
+    -16px 0 40px -8px rgb(0 0 0 / 0.8), -2px 0 6px rgb(0 0 0 / 0.45), 0 0 0 1px rgb(255 255 255 / 0.07);
+  /* Raised controls: an edge lit from above, then a shadow that reads on a dark page. */
+  --float-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.1), inset 0 -1px 0 rgb(0 0 0 / 0.25), 0 2px 4px rgb(0 0 0 / 0.3),
+    0 10px 24px -6px rgb(0 0 0 / 0.55);
+  --bubble-shadow: inset 0 1px 0 rgb(255 255 255 / 0.08), 0 1px 3px rgb(0 0 0 / 0.35);
+  --sheet-shadow: 0 -12px 40px -12px rgb(0 0 0 / 0.6);
+  --pill-shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 10px 24px -8px rgb(0 0 0 / 0.7);
+}
+/* A light page needs far less: dark layers stacked under a control read as a second control beneath it. */
+:root[data-theme-appearance="light"] {
+  --drawer-card-shadow: -12px 0 32px -12px rgb(0 0 0 / 0.18), 0 0 0 1px rgb(0 0 0 / 0.06);
+  --float-shadow: inset 0 1px 0 rgb(255 255 255 / 0.8), 0 1px 2px rgb(0 0 0 / 0.06), 0 4px 12px -6px rgb(0 0 0 / 0.12);
+  --bubble-shadow: 0 1px 2px rgb(0 0 0 / 0.08);
+  --sheet-shadow: 0 -8px 28px -12px rgb(0 0 0 / 0.16);
+  --pill-shadow: 0 1px 2px rgb(0 0 0 / 0.1), 0 6px 16px -8px rgb(0 0 0 / 0.2);
+}
+@utility drawer-card-shadow {
+  box-shadow: var(--drawer-card-shadow);
+}
+
+/* An overlay's close button: a small raised disc on the overlay's surface, not a bare glyph. */
+@utility close-bubble {
+  border-radius: 9999px;
+  background-color: var(--color-surface-800);
+  border: 1px solid color-mix(in srgb, var(--color-text-primary) 9%, transparent);
+  box-shadow: var(--bubble-shadow);
+}
+
+@utility float-control {
+  /* A solid surface with its own edge and shadow, so it reads over whatever scrolls beneath it. */
+  background-color: var(--color-surface-800);
+  border: 1px solid color-mix(in srgb, var(--color-text-primary) 9%, transparent);
+  box-shadow: var(--float-shadow);
+}
+/* A frosted popover for menus: translucent surface, blur behind, a deep soft shadow. */
+@utility glass-menu {
+  background-color: color-mix(in srgb, var(--color-surface-800) 82%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  backdrop-filter: blur(24px) saturate(1.4);
+  border: 1px solid color-mix(in srgb, var(--color-surface-600) 30%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--color-text-primary) 6%, transparent),
+    0 24px 48px -12px rgb(0 0 0 / 0.6),
+    0 8px 16px -8px rgb(0 0 0 / 0.45);
 }

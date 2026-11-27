@@ -2,6 +2,7 @@
 // `/` command trigger popovers, attachments, queue recall, and draft persistence.
 
 import { ComposerPrimitive } from "@assistant-ui/react";
+import { MENU } from "../../lib/surfaces";
 import { unstable_defaultDirectiveFormatter as defaultDirectiveFormatter } from "@assistant-ui/core";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { AtSign, Paperclip, Pencil, Slash } from "lucide-react";
@@ -123,8 +124,7 @@ interface Props {
   editQueuedPrompt: (id: string, text: string) => void;
 }
 
-const POPOVER_CLASS =
-  "absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl";
+const POPOVER_CLASS = `absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden ${MENU} !py-0`;
 
 export function Composer(props: Props) {
   const { sessionId, turnActive, connected, canSubmit, promptCapabilities, queuedPrompts, compositionControlRef } =

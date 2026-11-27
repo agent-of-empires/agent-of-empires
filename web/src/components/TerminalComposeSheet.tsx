@@ -1,6 +1,7 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import { BACKDROP, BUTTON_GHOST, BUTTON_PRIMARY, BUTTON_SECONDARY, INPUT, SHEET, SHEET_HANDLE } from "../lib/surfaces";
 
 // Per terminal, in memory: closing keeps the draft and a delivered send clears it.
 const drafts = new Map<string, string>();
@@ -109,22 +110,21 @@ export function TerminalComposeSheet({
     }
   };
 
-  const action = "h-10 px-3 rounded-md text-sm transition-colors disabled:opacity-40";
-
   return (
     <div
       className="absolute inset-x-0 top-0 z-30 flex flex-col justify-end"
       style={{ bottom: `calc(${bottomInset}px + env(safe-area-inset-bottom))` }}
     >
-      <div className="absolute inset-0 bg-black/40" onClick={() => onClose(false)} data-compose-backdrop />
+      <div className={`absolute inset-0 ${BACKDROP}`} onClick={() => onClose(false)} data-compose-backdrop />
       <div
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Compose"
         onKeyDown={onKeyDown}
-        className="relative flex flex-col gap-2 p-2 bg-surface-900 border-t border-surface-700/40 rounded-t-lg"
+        className={`relative flex flex-col gap-2 px-3 pb-3 ${SHEET}`}
       >
+        <div className={SHEET_HANDLE} aria-hidden />
         <textarea
           ref={textRef}
           aria-label="Message"
@@ -140,7 +140,7 @@ export function TerminalComposeSheet({
           }}
           // 16px stops iOS from zooming the page on focus.
           style={{ fontSize: "16px" }}
-          className="w-full max-h-[40vh] resize-none overflow-y-auto bg-surface-950 border border-surface-700 rounded-md px-2 py-1.5 text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+          className={`${INPUT} max-h-[40vh] resize-none overflow-y-auto`}
         />
         {error && (
           <div role="alert" className="text-status-error">
@@ -149,7 +149,7 @@ export function TerminalComposeSheet({
         )}
         {/* preventDefault keeps the keyboard up until the terminal input takes focus. */}
         <div className="flex items-center gap-2" onMouseDown={(e) => e.preventDefault()}>
-          <button type="button" className={`${action} text-text-secondary`} onClick={() => onClose(false)}>
+          <button type="button" className={BUTTON_GHOST} onClick={() => onClose(false)}>
             Close
           </button>
           <span className="flex-1" />
@@ -157,7 +157,7 @@ export function TerminalComposeSheet({
             <button
               type="button"
               disabled={readOnly || empty || pending}
-              className={`${action} border border-surface-700 text-text-primary active:bg-surface-800`}
+              className={BUTTON_SECONDARY}
               onClick={() => deliver(false)}
             >
               Insert
@@ -166,7 +166,7 @@ export function TerminalComposeSheet({
           <button
             type="button"
             disabled={readOnly || empty || pending}
-            className={`${action} px-4 font-semibold bg-brand-600 text-white active:bg-brand-700`}
+            className={BUTTON_PRIMARY}
             onClick={() => deliver(true)}
           >
             Send

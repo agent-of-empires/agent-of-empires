@@ -111,9 +111,8 @@ describe("read-only live consumers with the real socket and terminal", () => {
     async (surface) => {
       const session = makeSession({ id: `observer-${surface}`, is_sandboxed: true });
       if (surface === "agent") render(<TerminalView session={session} readOnly />);
-      else render(<PairedShellPane session={session} sessionId={session.id} readOnly />);
-      if (surface === "container") fireEvent.click(screen.getByRole("button", { name: "Container" }));
-      await waitFor(() => expect(FakeWS.sockets.length).toBe(surface === "container" ? 2 : 1));
+      else render(<PairedShellPane session={session} mode={surface} readOnly />);
+      await waitFor(() => expect(FakeWS.sockets.length).toBe(1));
       const socket = FakeWS.sockets.at(-1)!;
       expect(socket.url).toContain(
         surface === "agent"

@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { pickPhoneView } from "./helpers/phoneViews";
 import { devices, type Page } from "@playwright/test";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
@@ -218,12 +219,11 @@ test.describe("Live terminal IME syllable rewrite", () => {
     });
     await openSession(page, handle);
     await softKey(page, "insertText", "ㅎ", PROXY);
-    await page.getByRole("button", { name: "Toggle panels", exact: true }).click();
-    await page.getByTestId("mobile-right-panel-pick-paired").click();
+    await pickPhoneView(page, "Terminal");
     await expect(page.locator('[data-term="paired"]')).toBeVisible();
     expect(await valueOf(page, PROXY)).toBe(S);
     await softKey(page, "insertText", "ㅏ", PROXY);
-    await page.getByTestId("mobile-back-to-agent").click();
+    await pickPhoneView(page, "Agent");
     expect(await valueOf(page, PROXY)).toBe(S);
     await softKey(page, "insertText", "ㄴ", PROXY);
     await page.locator(PROXY).dispatchEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
@@ -247,8 +247,7 @@ test.describe("Live terminal IME syllable rewrite", () => {
       },
     });
     await openSession(page, handle);
-    await page.getByRole("button", { name: "Toggle panels", exact: true }).click();
-    await page.getByTestId("mobile-right-panel-pick-paired").click();
+    await pickPhoneView(page, "Terminal");
     await expect(page.locator('[data-term="paired"]')).toBeVisible();
     const pairedInput = `[data-term="paired"] ${INPUT}`;
     await page.locator(pairedInput).evaluate((element) => {
@@ -257,7 +256,7 @@ test.describe("Live terminal IME syllable rewrite", () => {
       element.dispatchEvent(new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }));
     });
     await softKey(page, "insertText", "ㄱ", pairedInput);
-    await page.getByTestId("mobile-back-to-agent").click();
+    await pickPhoneView(page, "Agent");
     await softKey(page, "insertText", "ㅎ", PROXY);
     await page.evaluate(() => (window as unknown as { releasePasteImage: () => void }).releasePasteImage());
     await expect

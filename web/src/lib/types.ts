@@ -2,6 +2,12 @@ import type { OperationErrorEvidence, RateLimitInfo, SessionRecovery } from "./a
 import type { AgentLifecycleInfo } from "./agentProfiles";
 import type { SchemaSettings } from "./generated/settingsKeys";
 
+export interface AuxiliaryObservation {
+  target: { kind: "host"; index: number } | { kind: "container"; index: number } | { kind: "tool"; tool_name: string };
+  state: "absent" | "alive" | "dead" | "unknown";
+  tmux_session?: string | null;
+}
+
 export interface SessionResponse {
   id: string;
   idempotency_key?: string | null;
@@ -71,6 +77,8 @@ export interface SessionResponse {
   /** Renaming also moves the worktree directory. */
   tie_workdir_to_name?: boolean;
   has_terminal: boolean;
+  /** The Daemon's latest look at the Session's paired shells and tool panes. */
+  auxiliary?: AuxiliaryObservation[];
   profile: string;
   cleanup_defaults: CleanupDefaults;
   remote_owner: string | null;
@@ -617,6 +625,8 @@ export interface SuggestionSource {
   enabled: boolean;
   /** Placeholder names every item of this criterion carries. */
   variables: string[];
+  /** Set when open items of this kind start on their own, at most `cap` per refresh. */
+  auto_start?: { cap: number } | null;
 }
 
 /** How a kind starts a Session. `prompt` is a template with `{variables}` filled from each item; null uses the plugin's own prompt. */
@@ -732,6 +742,8 @@ export interface SuggestionItem {
   stale?: boolean;
   /** The registered Project the item resolves to; the provider's `project` is only a hint. */
   resolved_project?: { name: string; path: string } | null;
+  /** Why auto start left this item alone, or that its start failed. */
+  auto_note?: string;
 }
 
 export interface SuggestionsSnapshot {

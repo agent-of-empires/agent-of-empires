@@ -135,6 +135,27 @@ pub(super) struct SendToParentParams {
     message: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct SuggestSessionParams {
+    /// Short title of the suggested session.
+    title: String,
+    /// The first prompt the suggested session starts with.
+    prompt: String,
+    /// Why this is worth doing now.
+    #[serde(default)]
+    reason: String,
+    /// Registered Project name or path the session belongs in.
+    project: Option<String>,
+    /// A stable key; suggesting the same one again replaces that suggestion.
+    id: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct SuggestOutcome {
+    /// The suggestion's id.
+    id: String,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum Disposition {
@@ -360,6 +381,46 @@ impl McpServer {
             .await
             .map(Json)
             .map_err(|e| *e)
+    }
+
+    #[rmcp::tool(
+        description = "Suggest a session for the user to start: it appears under Suggested \
+            sessions in the dashboard and the TUI until they start or dismiss it. Give a \
+            title, the prompt the session starts with, and why. Suggesting the same `id` again \
+            replaces it."
+    )]
+    async fn suggest_session(
+        &self,
+        Parameters(params): Parameters<SuggestSessionParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<SuggestOutcome>, CallToolResult> {
+        if let Some(refusal) = read_only_refusal(&self.state) {
+            return Err(refusal);
+        }
+        let pushed_by = match caller_session_id(&context) {
+            Some(id) => self
+                .state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|inst| inst.id == id)
+                .map(|inst| inst.title.clone()),
+            None => None,
+        }
+        .unwrap_or_else(|| "Agent".to_string());
+        let input = crate::plugin::suggestions::AgentPush {
+            id: params.id,
+            title: params.title,
+            reason: params.reason,
+            prompt: params.prompt,
+            project: params.project,
+            pushed_by,
+        };
+        crate::server::api::push_agent_suggestion(&self.state, input)
+            .await
+            .map(|id| Json(SuggestOutcome { id }))
+            .map_err(|(_, code, message)| tool_error(code, message))
     }
 
     #[rmcp::tool(

@@ -1943,6 +1943,8 @@ impl SessionService {
                 i.id == id
                     && !i.is_structured()
                     && i.launch_is_finalized()
+                    // Not launched yet (`aoe add` without `--launch`): the turn waits for the agent.
+                    && i.status != crate::session::Status::Stopped
                     && i.terminal_handoff.is_none()
                     && !i.is_archived()
                     && !i.is_snoozed()
@@ -1985,6 +1987,11 @@ impl SessionService {
         let code = error
             .downcast_ref::<TerminalPromptBlocker>()
             .map(|blocker| blocker.code());
+        if code == Some("agent_folder_not_trusted") && waited.suggestion.is_some() {
+            crate::telemetry::feature_use::record(
+                crate::telemetry::feature_use::FeatureUse::SuggestFailTrust,
+            );
+        }
         self.fail_pending_initial_turn(waited, text, error.to_string(), code)
             .await;
     }
@@ -6554,6 +6561,76 @@ mod tests {
                 "synthesized={synthesized}"
             );
         }
+    }
+
+    /// A row nobody has launched (`aoe add` without `--launch`) keeps its first
+    /// turn until the agent starts, instead of spending the wait budget.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_drain_leaves_a_stopped_rows_turn_pending() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        for (status, taken) in [
+            (crate::session::Status::Stopped, false),
+            (crate::session::Status::Starting, true),
+            (crate::session::Status::Idle, true),
+        ] {
+            let mut inst = terminal_turn_instance("sess-stopped", "term-stopped", "first");
+            inst.status = status;
+            let service = crate::server::test_support::build_test_app_state(vec![inst])
+                .session_service
+                .clone();
+            assert_eq!(
+                service
+                    .undelivered_terminal_turn("sess-stopped")
+                    .await
+                    .is_some(),
+                taken,
+                "{status:?}"
+            );
+            if status == crate::session::Status::Stopped {
+                service
+                    .drain_terminal_initial_turn_within(
+                        "sess-stopped",
+                        std::time::Duration::from_millis(300),
+                    )
+                    .await;
+                let turn = pending_turn(&service, "sess-stopped").await;
+                assert!(
+                    turn.is_some_and(|turn| turn.error.is_none()),
+                    "a drain spent the turn of a row nobody launched"
+                );
+            }
+        }
+    }
+
+    /// A turn a stopped row keeps is spent once that row is launched, without
+    /// another create: the row's status, not the prompt, gates the drain.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stopped_rows_turn_is_taken_once_the_row_is_launched() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-launched", "term-launched", "first");
+        inst.status = crate::session::Status::Stopped;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+        assert!(
+            service
+                .undelivered_terminal_turn("sess-launched")
+                .await
+                .is_none(),
+            "a row nobody launched spent its turn"
+        );
+
+        service.instances.write().await[0].status = crate::session::Status::Starting;
+
+        assert!(
+            service
+                .undelivered_terminal_turn("sess-launched")
+                .await
+                .is_some(),
+            "a launched row kept its turn instead of spending it"
+        );
     }
 
     /// A Claude session is typed into once its input box shows the mode line,

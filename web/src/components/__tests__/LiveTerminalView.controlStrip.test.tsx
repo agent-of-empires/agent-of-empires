@@ -11,7 +11,6 @@ const live = vi.hoisted(() => ({
     connected: true,
     reconnecting: false,
     retryCount: 0,
-    retryCountdown: 0,
     frame: null,
     reading: false,
     isOwner: false,
