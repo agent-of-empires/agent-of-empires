@@ -601,10 +601,16 @@ provider_versions = ["^18"]
             .unwrap();
             crate::plugin::reload_registry();
             // The fallback is back, so the override is no longer plugin-owned; the
-            // host may still lack the binary.
+            // host either has the binary or refuses for its absence.
             assert!(crate::agents::get_agent(tool).is_some());
-            if let Err(error) = resolve("false") {
-                assert!(!error.to_string().contains("--cmd-override cannot be used"));
+            match resolve("false") {
+                Ok((body, _)) => assert_eq!(body.tool, tool),
+                Err(error) => assert!(
+                    error
+                        .to_string()
+                        .contains("is not installed on the Daemon host"),
+                    "{error}"
+                ),
             }
         }
     }
