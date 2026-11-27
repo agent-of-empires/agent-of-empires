@@ -237,8 +237,21 @@ impl HomeView {
         let Some(row) = self.instances.get(id) else {
             return self.refresh_after_stale_move();
         };
-        let profile = row.source_profile.clone();
-        let source_group = row.group_path.clone();
+        let (profile, source_group) = (row.source_profile.clone(), row.group_path.clone());
+        self.freeze_through(id, profile, source_group, order, repositories, delta)
+    }
+
+    /// `freeze_in_place` through session `id` of `profile` in `source_group`, which the
+    /// move names but leaves where it is.
+    fn freeze_through(
+        &mut self,
+        id: &str,
+        profile: String,
+        source_group: String,
+        order: Vec<String>,
+        repositories: Option<Vec<String>>,
+        delta: isize,
+    ) -> anyhow::Result<()> {
         let headers = if self.group_by == GroupByMode::Group {
             self.displayed_headers(&profile)
         } else {
@@ -264,6 +277,30 @@ impl HomeView {
                 switch: Some(switch),
             },
         )
+    }
+
+    /// The profiles whose Groups the Repository headers show nested, by name.
+    fn nested_header_profiles(&self) -> Vec<String> {
+        let mut profiles: Vec<String> = self
+            .group_trees
+            .iter()
+            .filter(|(profile, _)| {
+                self.active_profile
+                    .as_deref()
+                    .is_none_or(|active| active == profile.as_str())
+            })
+            .filter(|(_, tree)| {
+                self.flat_items.iter().any(|item| {
+                    matches!(item, Item::Group { path, .. }
+                        if super::rows::split_project_view_path(path)
+                            .1
+                            .is_some_and(|path| tree.group_exists(path)))
+                })
+            })
+            .map(|(profile, _)| profile.clone())
+            .collect();
+        profiles.sort();
+        profiles
     }
 
     /// `profile`'s Groups nested under Repository headers, in the order the list shows them,
@@ -822,6 +859,31 @@ impl HomeView {
         if !order.contains(&repo) || !order.contains(&other) {
             self.flash_status("This repository's path is too long for the Custom order");
             return Ok(());
+        }
+        // From Name or Newest first the nested Groups freeze with the rows, as a row move's do.
+        if let Some(rows) = rows {
+            match self.nested_header_profiles().as_slice() {
+                [] => {}
+                [profile] => {
+                    let Some((id, source_group)) = self.group_order_anchor(profile) else {
+                        return self.refresh_after_stale_move();
+                    };
+                    let profile = profile.clone();
+                    return self.freeze_through(
+                        &id,
+                        profile,
+                        source_group,
+                        rows,
+                        Some(order),
+                        delta,
+                    );
+                }
+                _ => {
+                    self.flash_status("Pick Custom first: the Groups can't keep this order");
+                    return Ok(());
+                }
+            }
+            return self.submit_custom_order(Some(rows), Some(order));
         }
         self.submit_custom_order(rows, Some(order))
     }
@@ -2014,15 +2076,91 @@ mod tests {
             })
             .collect();
         assert_eq!(nested, ["x/alpha", "x/beta", "y/beta", "y/alpha"]);
-        view.select_session_by_id(&rows[0].id);
+        let mut capture = view.session_feed.namespace_capture_for_test();
+        // A row move and a Repository header move alike.
+        for header in [None, Some("x")] {
+            match header {
+                None => view.select_session_by_id(&rows[0].id),
+                Some(label) => {
+                    view.cursor = view
+                        .flat_items
+                        .iter()
+                        .position(|item| matches!(item, Item::Group { path, depth: 0, .. } if path == label))
+                        .unwrap();
+                    view.update_selected();
+                }
+            }
+            view.status_flash = None;
+            view.move_row_at_cursor(1).unwrap();
+            assert!(capture().is_none(), "{header:?}");
+            assert_eq!(
+                view.status_flash.as_ref().map(|f| f.text.as_str()),
+                Some("Pick Custom first: the Groups can't keep this order"),
+                "{header:?}"
+            );
+            assert_eq!(view.sort_order, SortOrder::Newest);
+        }
+    }
+
+    /// From Name a Repository header move freezes the nested Group order with the rows and
+    /// the header order, in one move.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_repository_header_move_under_name_freezes_its_groups() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let rows: Vec<Instance> = [("x1", "/tmp/x"), ("y1", "/tmp/y")]
+            .into_iter()
+            .map(|(title, repo)| {
+                let mut row = Instance::new(title, repo);
+                row.group_path = "alpha".into();
+                row
+            })
+            .collect();
+        storage
+            .update(|stored, groups| {
+                *stored = rows.clone();
+                *groups = vec![crate::session::Group::new("alpha", "alpha")];
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["reorder"]).await;
+        let mut view = HomeView::new_for_test(
+            Some("reorder".into()),
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        apply_published(&mut view, &state).await;
+        view.sort_order = SortOrder::Name;
+        view.group_by = GroupByMode::Project;
+        view.flat_items = view.build_flat_items();
+        view.cursor = view
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Group { path, depth: 0, .. } if path == "x"))
+            .unwrap();
+        view.update_selected();
         let mut capture = view.session_feed.namespace_capture_for_test();
         view.move_row_at_cursor(1).unwrap();
-        assert!(capture().is_none());
-        assert_eq!(
-            view.status_flash.as_ref().map(|f| f.text.as_str()),
-            Some("Pick Custom first: the Groups can't keep this order")
-        );
-        assert_eq!(view.sort_order, SortOrder::Newest);
+        match capture().map(|(sent, _)| sent) {
+            Some(crate::daemon::NamespaceMutation::Reorder(
+                crate::daemon::ReorderBody::Session {
+                    destination: None,
+                    headers: Some(headers),
+                    freeze: Some(freeze),
+                    ..
+                },
+            )) => {
+                assert_eq!(headers, ["alpha"]);
+                assert_eq!(
+                    freeze.repositories,
+                    Some(vec!["/tmp/y".to_string(), "/tmp/x".to_string()])
+                );
+                assert_eq!(freeze.order.len(), 2);
+            }
+            _ => panic!("expected a frozen move"),
+        }
     }
 
     /// A move under Custom places only its header's rows, so other rows stay newest first.
