@@ -37,10 +37,20 @@ interface Options {
   workspaceOrdering: string[];
   repositoryOrder: string[];
   groupOrder: GroupOrder;
-  moveGroup: (profile: string, path: string, move: GroupMove, after?: Promise<WriteResult>) => Promise<WriteResult>;
+  moveGroup: (
+    profile: string,
+    path: string,
+    move: GroupMove,
+    after?: Promise<WriteResult>,
+    base?: string[],
+  ) => Promise<WriteResult>;
   changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<WriteResult>;
   orderingSaving: () => boolean;
-  changeSidebarView: (patch: Partial<SidebarView>, after?: Promise<WriteResult>) => Promise<WriteResult>;
+  changeSidebarView: (
+    patch: Partial<SidebarView>,
+    after?: Promise<WriteResult>,
+    baseSort?: SidebarSort,
+  ) => Promise<WriteResult>;
   onSharedRead: (listener: (read: SharedRead) => void) => () => void;
   /** Reads the Daemon now. */
   refresh: () => void;
@@ -229,19 +239,31 @@ export function useSidebarModel({
 
   /**
    * Writes back what `change` replaced, with the Groups now `groups`. The orders go first, carrying the stored orders
-   * the change left, so the Daemon refuses them once another Client changed them and nothing else is sent.
+   * the change left, so the Daemon refuses them once another Client changed them and nothing else is sent. An Undo,
+   * which restores the sort, also has every write carry the sort and Group order it replaces.
    */
   const putBack = useCallback(
     (change: Undoable, groups: GroupOrder) => {
       const { groups: previousGroups, sort: previousSort, ...lists } = change.previous;
-      const ordered = changeOrdering({ ...lists, base: change.base });
-      const moves = Object.entries(previousGroups ?? {}).flatMap(([profile, paths]) =>
-        restoreGroups(groups[profile] ?? [], paths, change.groups[profile] ?? []).map(({ path, move }) =>
-          moveGroup(profile, path, move, ordered),
-        ),
-      );
+      const owned = previousSort !== undefined;
+      const profiles = Object.keys(previousGroups ?? {});
+      const ordered = changeOrdering({
+        ...lists,
+        base: change.base,
+        ...(owned && { base_sort: "custom" }),
+        ...(owned &&
+          profiles.length > 0 && { base_groups: Object.fromEntries(profiles.map((p) => [p, groups[p] ?? []])) }),
+      });
+      const moves = Object.entries(previousGroups ?? {}).flatMap(([profile, paths]) => {
+        let base = groups[profile] ?? [];
+        return restoreGroups(base, paths, change.groups[profile] ?? []).map(({ path, move }) => {
+          const write = moveGroup(profile, path, move, ordered, owned ? base : undefined);
+          base = move.order;
+          return write;
+        });
+      });
       const undone = settleAll([ordered, ...moves]);
-      return previousSort ? settleAll([undone, changeSidebarView({ sort: previousSort }, undone)]) : undone;
+      return previousSort ? settleAll([undone, changeSidebarView({ sort: previousSort }, undone, "custom")]) : undone;
     },
     [changeOrdering, moveGroup, changeSidebarView],
   );

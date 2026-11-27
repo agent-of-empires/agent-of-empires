@@ -28,6 +28,14 @@ const row = (id: string, repo: string, title: string, created_at = "2025-01-01T0
   session({ id, title, project_path: repo, branch: id, group_path: "", created_at });
 const wsId = (s: SessionResponse) => `${s.project_path}::${s.branch}`;
 const same = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+const parentOf = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
+/** Whether the paths `stored` and `base` both name stand among their siblings in the same order, as the Daemon checks. */
+const sameSiblings = (stored: string[], base: string[]) => {
+  const kept = stored.filter((p) => base.includes(p));
+  const expected = base.filter((p) => kept.includes(p));
+  const under = (list: string[], parent: string) => list.filter((p) => parentOf(p) === parent);
+  return expected.every((p) => same(under(kept, parentOf(p)), under(expected, parentOf(p))));
+};
 
 let daemon: Daemon;
 const writes: { method: string; body: unknown }[] = [];
@@ -46,8 +54,9 @@ const server = setupServer(
     ),
   ),
   http.patch("*/api/sidebar-view", async ({ request }) => {
-    const body = (await request.json()) as Partial<SidebarView>;
-    writes.push({ method: "PATCH", body });
+    const { base_sort, ...body } = (await request.json()) as Partial<SidebarView> & { base_sort?: string };
+    writes.push({ method: "PATCH", body: base_sort ? { ...body, base_sort } : body });
+    if (base_sort && base_sort !== daemon.sidebar_view.sort) return HttpResponse.json({}, { status: 409 });
     daemon.sidebar_view = { ...daemon.sidebar_view, ...body };
     daemon.revision += 1;
     return HttpResponse.json(daemon.sidebar_view, { headers: runtime(daemon.revision) });
@@ -55,8 +64,12 @@ const server = setupServer(
   http.put("*/api/workspace-ordering", async ({ request }) => {
     const body = (await request.json()) as WorkspaceOrderingPatch;
     writes.push({ method: "PUT", body });
-    const { base } = body;
-    if (base && !(same(base.order, daemon.workspace_ordering) && same(base.repositories, daemon.repository_order))) {
+    const { base, base_sort, base_groups } = body;
+    if (
+      (base && !(same(base.order, daemon.workspace_ordering) && same(base.repositories, daemon.repository_order))) ||
+      (base_sort && base_sort !== daemon.sidebar_view.sort) ||
+      Object.entries(base_groups ?? {}).some(([p, paths]) => !sameSiblings(daemon.group_order[p] ?? [], paths))
+    ) {
       return HttpResponse.json({ message: "stale" }, { status: 409 });
     }
     if (body.order) daemon.workspace_ordering = body.order;
@@ -67,6 +80,9 @@ const server = setupServer(
   http.post("*/api/reorder", async ({ request }) => {
     const body = (await request.json()) as ReorderBody;
     writes.push({ method: "POST", body });
+    if (body.base && !sameSiblings(daemon.group_order[body.group.profile] ?? [], body.base)) {
+      return HttpResponse.json({ status: "stale" });
+    }
     if (!reorder(body)) return HttpResponse.json({ status: "at_edge" });
     daemon.revision += 1;
     return HttpResponse.json({ status: "moved", destination: null }, { headers: runtime(daemon.revision) });
@@ -77,6 +93,7 @@ interface ReorderBody {
   group: { profile: string; path: string };
   direction: "up" | "down";
   siblings?: string[];
+  base?: string[];
 }
 
 /** Arranges the listed siblings slot for slot, then swaps the Group with its neighbour, as the Daemon does. */
@@ -84,8 +101,7 @@ function reorder(body: ReorderBody): boolean {
   const order = (daemon.group_order[body.group.profile] ??= []);
   // A Group that only sessions name joins the tree at the end.
   order.push(...(body.siblings ?? []).filter((p) => !order.includes(p)));
-  const parent = (p: string) => p.slice(0, Math.max(0, p.lastIndexOf("/")));
-  const siblings = order.flatMap((p, i) => (parent(p) === parent(body.group.path) ? [i] : []));
+  const siblings = order.flatMap((p, i) => (parentOf(p) === parentOf(body.group.path) ? [i] : []));
   const wanted = (body.siblings ?? []).filter((p) => siblings.some((i) => order[i] === p));
   const slots = siblings.filter((i) => wanted.includes(order[i]!));
   slots.forEach((slot, n) => (order[slot] = wanted[n]!));
@@ -551,8 +567,8 @@ describe("Undo", () => {
       await act(async () => void toasts.undo[0]!.run());
       await waitFor(() => expect(writes).toHaveLength(4));
       expect(writes.slice(2)).toEqual([
-        { method: "PUT", body: { ...before, base: left } },
-        { method: "PATCH", body: { sort } },
+        { method: "PUT", body: { ...before, base: left, base_sort: "custom" } },
+        { method: "PATCH", body: { sort, base_sort: "custom" } },
       ]);
       expect(result.current.model.sort).toBe(sort);
       // Single level: the Undo offers nothing further.
@@ -626,7 +642,7 @@ describe("Undo after another Client", () => {
     await waitFor(() => expect(writes).toHaveLength(4));
     expect(writes[2]).toEqual({
       method: "PUT",
-      body: { order: before, base: { order, repositories: daemon.repository_order } },
+      body: { order: before, base: { order, repositories: daemon.repository_order }, base_sort: "custom" },
     });
   });
 
@@ -644,6 +660,39 @@ describe("Undo after another Client", () => {
     expect(writes.map((w) => w.method)).toEqual(["PUT", "PATCH", "PUT"]);
     expect(daemon.workspace_ordering).toEqual(theirs);
     expect(daemon.sidebar_view.sort).toBe("custom");
+  });
+
+  it("is refused, keeping the newer choice, when another Client picked a sort before this one read it", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    const order = [...daemon.workspace_ordering];
+    daemon.sidebar_view = { group_by: "project", sort: "newest" };
+    await act(async () => void toasts.undo[0]!.run());
+    await waitFor(() => expect(toasts.info).toHaveBeenCalledWith("Another Client changed the order, so Undo kept it"));
+    expect(writes.map((w) => w.method)).toEqual(["PUT", "PATCH", "PUT"]);
+    expect(daemon.workspace_ordering).toEqual(order);
+    expect(daemon.sidebar_view.sort).toBe("newest");
+  });
+
+  it("leaves a sort another Client picked while its orders were saving", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "name" };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await act(async () => result.current.model.moveWorkspace("/r/beta::b2", "/r/beta::b1", false));
+    await waitFor(() => expect(toasts.undo).toHaveLength(1));
+    await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+    const releases = heldWrites("put", "*/api/workspace-ordering");
+    act(() => void toasts.undo[0]!.run());
+    await waitFor(() => expect(writes).toHaveLength(3));
+    daemon.sidebar_view = { group_by: "project", sort: "newest" };
+    await act(async () => releases[0]!());
+    await waitFor(() => expect(toasts.info).toHaveBeenCalledWith("Another Client changed the order, so Undo kept it"));
+    expect(writes[3]).toEqual({ method: "PATCH", body: { sort: "name", base_sort: "custom" } });
+    expect(daemon.sidebar_view.sort).toBe("newest");
   });
 
   it("says so when its restore fails", async () => {
@@ -746,7 +795,7 @@ describe("Group headers", () => {
     await waitFor(() => expect(writes).toHaveLength(6));
     expect(writes[4]).toMatchObject({ method: "POST", body: { group: { path: "zeta" } } });
     expect(daemon.group_order.default).toEqual(["zeta", "alpha", "alpha/inner", "mid", "loose"]);
-    expect(writes[5]).toEqual({ method: "PATCH", body: { sort: "name" } });
+    expect(writes[5]).toEqual({ method: "PATCH", body: { sort: "name", base_sort: "custom" } });
   });
 
   it("drop the Undo when the first read shows another Client rearranged them", async () => {
@@ -758,6 +807,34 @@ describe("Group headers", () => {
     daemon.group_order.default = ["zeta", "mid", "alpha", "alpha/inner", "loose"];
     await pollAt(result, daemon.revision + 1);
     await waitFor(() => expect(toasts.undo[0]!.dismissed).toBe(true));
+  });
+
+  it("are left to another Client that rearranged them before Undo read it, or while it saves", async () => {
+    for (const late of [false, true]) {
+      daemon.group_order = { default: ["zeta", "alpha", "alpha/inner", "mid"] };
+      daemon.sidebar_view = { group_by: "group", sort: "name" };
+      writes.length = 0;
+      toasts.undo.length = 0;
+      const { result, unmount } = mount();
+      await waitFor(() => expect(groupHeaders(result)).toHaveLength(5));
+      await act(async () => result.current.model.moveWorkspace("/r/one::zeta", "/r/one::mid", false));
+      await waitFor(() => expect(toasts.undo).toHaveLength(1));
+      await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+      const theirs = ["mid", "zeta", "alpha", "alpha/inner", "loose"];
+      const releases = late ? heldWrites("put", "*/api/workspace-ordering") : [];
+      if (!late) daemon.group_order.default = [...theirs];
+      act(() => void toasts.undo[0]!.run());
+      if (late) {
+        await waitFor(() => expect(writes).toHaveLength(4));
+        daemon.group_order.default = [...theirs];
+        await act(async () => releases[0]!());
+      }
+      await waitFor(() => expect(result.current.sessions.orderingSaving()).toBe(false));
+      expect(daemon.group_order.default, `late ${late}`).toEqual(theirs);
+      expect(daemon.sidebar_view.sort, `late ${late}`).toBe("custom");
+      server.resetHandlers();
+      unmount();
+    }
   });
 
   it("keep a Group another Client placed when Undo puts their order back", async () => {

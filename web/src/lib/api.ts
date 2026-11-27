@@ -314,6 +314,9 @@ export interface WorkspaceOrderingPatch {
   repositories?: string[];
   /** The stored orders this write replaces; the Daemon refuses it with 409 once either changed. */
   base?: { order: string[]; repositories: string[] };
+  /** With `base`, the sort and each named profile's Group order the write assumes; refused alike once changed. */
+  base_sort?: SidebarView["sort"];
+  base_groups?: Record<string, string[]>;
 }
 
 /** How a shared write ended: its receipt once committed, else `conflict` (refused for a stale `base`), `rejected`
@@ -348,16 +351,17 @@ export function updateWorkspaceOrdering(patch: WorkspaceOrderingPatch): Promise<
   return writeReceipt("/api/workspace-ordering", jsonInit("PUT", patch));
 }
 
-/** Arranges a Group's siblings as `siblings` lists them, then moves it one slot; a Group that did not move is
- *  `rejected`. */
+/** Arranges a Group's siblings as `siblings` lists them, then moves it one slot; a Group that did not move, or whose
+ *  profile's Group order no longer has `base`'s sibling order, is `rejected`. */
 export async function reorderGroup(
   group: { profile: string; path: string },
   direction: "up" | "down",
   siblings: string[],
+  base?: string[],
 ): Promise<WriteResult> {
   try {
     const res = await fetch("/api/reorder", {
-      ...jsonInit("POST", { target: "group", group, direction, siblings }),
+      ...jsonInit("POST", { target: "group", group, direction, siblings, base }),
       signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS),
     });
     const result = writeResult(res);
@@ -370,7 +374,10 @@ export async function reorderGroup(
   }
 }
 
-export function updateSidebarView(patch: Partial<SidebarView>): Promise<WriteResult> {
+/** `base_sort` is the sort the write replaces; it is refused with `conflict` once that changed. */
+export function updateSidebarView(
+  patch: Partial<SidebarView> & { base_sort?: SidebarView["sort"] },
+): Promise<WriteResult> {
   return writeReceipt("/api/sidebar-view", jsonInit("PATCH", patch));
 }
 

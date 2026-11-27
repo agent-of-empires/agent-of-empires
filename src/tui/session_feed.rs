@@ -1285,6 +1285,7 @@ impl SessionFeed {
             patch: crate::daemon::SidebarViewPatch {
                 group_by: patch.group_by.or(queued.group_by),
                 sort: patch.sort.or(queued.sort),
+                ..Default::default()
             },
             grant: self.grant.clone(),
             lease,

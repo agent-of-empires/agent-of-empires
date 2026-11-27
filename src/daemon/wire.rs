@@ -331,6 +331,14 @@ pub struct WorkspaceOrderingPatch {
     /// stored one, the write is refused with 409 so it cannot undo a peer's change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<WorkspaceOrderingBase>,
+    /// The sort this write was built under, refused with 409 like `base` once it changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sort: Option<crate::session::config::SortOrder>,
+    /// Group paths per profile in the order this write was built under, refused with 409
+    /// once the paths both it and the stored order name stand among their siblings in
+    /// another order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_groups: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 /// The row order a move under Name or Newest first shows, which it commits as the shared
@@ -365,6 +373,9 @@ pub struct SidebarViewPatch {
     pub group_by: Option<crate::session::config::GroupByMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<crate::session::config::SortOrder>,
+    /// The sort this write replaces, refused with 409 once it changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sort: Option<crate::session::config::SortOrder>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -470,6 +481,11 @@ pub enum ReorderBody {
         siblings: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         freeze: Option<FrozenOrder>,
+        /// The profile's Group paths in the order the move was built under; the move is
+        /// refused as stale once the paths both this and the stored order name stand among
+        /// their siblings in another order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<Vec<String>>,
     },
 }
 

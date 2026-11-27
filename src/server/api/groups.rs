@@ -850,6 +850,10 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                 }) {
                     return Ok(());
                 }
+                if matches!(&body, ReorderBody::Group { base: Some(base), .. } if !same_sibling_order(groups, base))
+                {
+                    return Ok(());
+                }
                 outcome = apply_canonical_reorder(rows, groups, &body, worker_state.cityhall_mode)?;
                 // CityHall may regroup a row but not rewrite the shared order, which it
                 // denies through `PUT /api/workspace-ordering`.
@@ -914,6 +918,29 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
         }
         Err(error) => failure(&state, error).await,
     }
+}
+
+/// Whether the paths `stored` and `base` both name stand among their siblings in the same
+/// order in each.
+pub(crate) fn same_sibling_order(stored: &[crate::session::Group], base: &[String]) -> bool {
+    fn parent(path: &str) -> &str {
+        path.rsplit_once('/').map_or("", |(parent, _)| parent)
+    }
+    fn under<'a>(list: &[&'a String], dir: &str) -> Vec<&'a String> {
+        list.iter()
+            .filter(|path| parent(path) == dir)
+            .copied()
+            .collect()
+    }
+    let kept: Vec<&String> = stored
+        .iter()
+        .map(|group| &group.path)
+        .filter(|path| base.contains(path))
+        .collect();
+    let expected: Vec<&String> = base.iter().filter(|path| kept.contains(path)).collect();
+    expected
+        .iter()
+        .all(|path| under(&kept, parent(path)) == under(&expected, parent(path)))
 }
 
 /// The shared order write a moved reorder makes once its membership commits.

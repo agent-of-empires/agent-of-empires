@@ -73,15 +73,20 @@ export function useSuppressClickAfterDrag(ref: MutableRefObject<DragClickGuard>)
 }
 
 /** Headers and rows share one DndContext, so only droppables of the dragged item's type and sortable list may
- *  collide; any other drop is refused. */
+ *  collide. When another list holds that type, a pointer past the first or last droppable of its own list finds
+ *  none, so a drop on another list is refused rather than taken as a move within its own. */
 export const typedClosestCenter: CollisionDetection = (args) => {
   const active = args.active.data.current;
-  return closestCenter({
-    ...args,
-    droppableContainers: args.droppableContainers.filter(
-      (container) =>
-        container.data.current?.type === active?.type &&
-        container.data.current?.sortable?.containerId === active?.sortable?.containerId,
-    ),
-  });
+  const typed = args.droppableContainers.filter((container) => container.data.current?.type === active?.type);
+  const droppableContainers = typed.filter(
+    (container) => container.data.current?.sortable?.containerId === active?.sortable?.containerId,
+  );
+  const pointer = args.pointerCoordinates;
+  const rects = droppableContainers.flatMap((c) => args.droppableRects.get(c.id) ?? []);
+  if (pointer && rects.length > 0 && typed.length > droppableContainers.length) {
+    const top = Math.min(...rects.map((r) => r.top));
+    const bottom = Math.max(...rects.map((r) => r.bottom));
+    if (pointer.y < top || pointer.y > bottom) return [];
+  }
+  return closestCenter({ ...args, droppableContainers });
 };

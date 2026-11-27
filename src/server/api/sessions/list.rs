@@ -836,11 +836,24 @@ async fn commit_workspace_ordering(
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    if let Some(base) = &body.base {
+    {
         let metadata = state.canonical_metadata.read().await;
-        if base.order != metadata.workspace_ordering
-            || base.repositories != metadata.repository_order
-        {
+        let stale_orders = body.base.as_ref().is_some_and(|base| {
+            base.order != metadata.workspace_ordering
+                || base.repositories != metadata.repository_order
+        });
+        let stale_sort = body
+            .base_sort
+            .is_some_and(|sort| sort != metadata.sidebar_view.sort);
+        let stale_groups = body.base_groups.iter().flatten().any(|(name, paths)| {
+            let stored = metadata
+                .profiles
+                .iter()
+                .find(|profile| &profile.name == name)
+                .map_or(&[][..], |profile| &profile.groups[..]);
+            !crate::server::api::groups::same_sibling_order(stored, paths)
+        });
+        if stale_orders || stale_sort || stale_groups {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -936,6 +949,17 @@ async fn commit_sidebar_view(
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    // Sort writes hold the lane, so the stored sort cannot change before this one commits.
+    let stored_sort = state.canonical_metadata.read().await.sidebar_view.sort;
+    if patch.base_sort.is_some_and(|sort| sort != stored_sort) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "message": "The sort changed elsewhere; try again on the refreshed list"
+            })),
+        )
+            .into_response();
+    }
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_app_state(|app| {
             if let Some(group_by) = patch.group_by {
@@ -1005,8 +1029,9 @@ mod sidebar_view_tests {
             (
                 SidebarViewPatch {
                     group_by: Some(GroupByMode::Group),
-                    sort: None,
+                    ..Default::default()
                 },
+                StatusCode::OK,
                 SidebarView {
                     group_by: GroupByMode::Group,
                     sort: SortOrder::Custom,
@@ -1014,20 +1039,35 @@ mod sidebar_view_tests {
             ),
             (
                 SidebarViewPatch {
-                    group_by: None,
                     sort: Some(SortOrder::Newest),
+                    base_sort: Some(SortOrder::Custom),
+                    ..Default::default()
                 },
+                StatusCode::OK,
+                SidebarView {
+                    group_by: GroupByMode::Group,
+                    sort: SortOrder::Newest,
+                },
+            ),
+            // A write built on a sort since replaced is refused.
+            (
+                SidebarViewPatch {
+                    sort: Some(SortOrder::Name),
+                    base_sort: Some(SortOrder::Custom),
+                    ..Default::default()
+                },
+                StatusCode::CONFLICT,
                 SidebarView {
                     group_by: GroupByMode::Group,
                     sort: SortOrder::Newest,
                 },
             ),
         ];
-        for (patch, expected) in steps {
+        for (patch, status, expected) in steps {
             let response = update_sidebar_view(State(state.clone()), Ok(Json(patch)))
                 .await
                 .into_response();
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), status);
             let snapshot = state.runtime.publish(&state).await.unwrap();
             assert_eq!(snapshot.value.contents.sidebar_view, expected);
             assert_eq!(
@@ -1125,8 +1165,8 @@ mod sidebar_view_tests {
             held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
             let patch = SidebarViewPatch {
-                group_by: None,
                 sort: Some(SortOrder::Name),
+                ..Default::default()
             };
             let write = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1185,8 +1225,8 @@ mod sidebar_view_tests {
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         let exclusive = state.profile_namespace.write().await;
         let patch = SidebarViewPatch {
-            group_by: None,
             sort: Some(SortOrder::Name),
+            ..Default::default()
         };
         let write = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
         let ordering = tokio::spawn(update_workspace_ordering(
@@ -1633,10 +1673,45 @@ mod workspace_ordering_tests {
         }
         assert_eq!(snapshot.contents.placed_workspaces, placed);
 
-        // A write built on an order since replaced is refused; one on the stored order lands.
-        for (base, expected) in [
-            (Vec::new(), StatusCode::CONFLICT),
-            (placed.clone(), StatusCode::OK),
+        state.canonical_metadata.write().await.profiles = vec![crate::daemon::ProfileSnapshot {
+            name: "work".into(),
+            description: None,
+            groups: ["x", "y"]
+                .into_iter()
+                .map(|path| crate::session::Group::new(path, path))
+                .collect(),
+            projects: Vec::new(),
+        }];
+        let groups = |paths: &[&str]| {
+            Some(std::collections::BTreeMap::from([(
+                "work".to_string(),
+                paths.iter().map(|p| p.to_string()).collect(),
+            )]))
+        };
+        // A write built on an order, sort or Group order since replaced is refused; one on
+        // the stored values lands, whatever Groups only one side names.
+        use crate::session::config::SortOrder;
+        let stored_sort = state.canonical_metadata.read().await.sidebar_view.sort;
+        let other_sort = if stored_sort == SortOrder::Name {
+            SortOrder::Newest
+        } else {
+            SortOrder::Name
+        };
+        for (base, base_sort, base_groups, expected) in [
+            (Vec::new(), None, None, StatusCode::CONFLICT),
+            (placed.clone(), Some(other_sort), None, StatusCode::CONFLICT),
+            (
+                placed.clone(),
+                None,
+                groups(&["y", "x"]),
+                StatusCode::CONFLICT,
+            ),
+            (
+                placed.clone(),
+                Some(stored_sort),
+                groups(&["x", "new", "y"]),
+                StatusCode::OK,
+            ),
         ] {
             let patch = crate::daemon::WorkspaceOrderingPatch {
                 order: Some(Vec::new()),
@@ -1645,6 +1720,8 @@ mod workspace_ordering_tests {
                     order: base,
                     repositories: vec!["/repo/b".into(), "/repo/a".into()],
                 }),
+                base_sort,
+                base_groups,
             };
             let response = update_workspace_ordering(State(state.clone()), Ok(Json(patch)))
                 .await

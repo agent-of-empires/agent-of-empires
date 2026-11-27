@@ -164,13 +164,15 @@ export function useSessions() {
   );
 
   /** Applies a Group move at once and sends it after `after`, dropping it when that fails; the next poll then
-   *  restores what the Daemon holds. */
+   *  restores what the Daemon holds. The Daemon refuses it once the profile's Group order left `base`. */
   const moveGroup = useCallback(
-    async (profile: string, path: string, move: GroupMove, after?: Promise<WriteResult>) => {
+    async (profile: string, path: string, move: GroupMove, after?: Promise<WriteResult>, base?: string[]) => {
       setGroupOrder((prev) => ({ ...prev, [profile]: move.order }));
       holdStarted(groupHold.current);
       const result = await groupWrites.current(async () =>
-        !after || (await after).receipt ? reorderGroup({ profile, path }, move.direction, move.siblings) : NOT_SENT,
+        !after || (await after).receipt
+          ? reorderGroup({ profile, path }, move.direction, move.siblings, base)
+          : NOT_SENT,
       );
       noteWriteEpoch(result.receipt);
       holdSettled(groupHold.current, result.receipt);
@@ -188,10 +190,11 @@ export function useSessions() {
   /**
    * Applies a grouping or sort pick at once. The write is sent after the earlier picks' writes, waits for `after`,
    * and is dropped when that fails; a field picked again meanwhile is left to the newer pick. Either way the next
-   * poll restores what the Daemon holds. Resolves with how the write ended.
+   * poll restores what the Daemon holds. The Daemon refuses a sort write once the sort left `baseSort`. Resolves
+   * with how the write ended.
    */
   const changeSidebarView = useCallback(
-    async (patch: Partial<SidebarView>, after?: Promise<WriteResult>) => {
+    async (patch: Partial<SidebarView>, after?: Promise<WriteResult>, baseSort?: SidebarView["sort"]) => {
       setSidebarView((prev) => ({ ...prev, ...patch }));
       const picks = viewPicks.current;
       const pick = ++picks.seq;
@@ -201,7 +204,10 @@ export function useSessions() {
       const result = await viewWrites.current(async () => {
         const ready = !after || (await after).receipt !== null;
         const current = fields.filter((field) => picks.latest[field] === pick);
-        const send = Object.fromEntries(current.map((field) => [field, patch[field]]));
+        const send = {
+          ...Object.fromEntries(current.map((field) => [field, patch[field]])),
+          ...(baseSort && current.includes("sort") && { base_sort: baseSort }),
+        };
         return ready && current.length > 0 ? updateSidebarView(send) : NOT_SENT;
       });
       noteWriteEpoch(result.receipt);

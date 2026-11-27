@@ -193,7 +193,7 @@ test.describe("desktop rows", () => {
   });
 
   test("dragging a row onto a different repo group is a no-op", async ({ page }) => {
-    // Each repo has its own SortableContext, so a cross-group drop never reaches the reorder handler.
+    // A drop past the repo's own rows targets none of them, so it is not a move to the nearest.
     const sessions: MockSessionInput[] = [
       { id: "a1", title: "alpha-a", project_path: "/tmp/repo-a", branch: "feat/1" },
       { id: "a2", title: "beta-a", project_path: "/tmp/repo-a", branch: "feat/2" },
@@ -203,7 +203,7 @@ test.describe("desktop rows", () => {
     const handle = await openDesktop(page, sessions, { ordering: sessions.map(workspaceId) });
     const wrappers = page.locator(WRAPPERS);
     await expect(wrappers).toHaveCount(4);
-    await dragRow(page, wrappers.nth(1), wrappers.nth(2));
+    await dragRow(page, wrappers.nth(0), wrappers.nth(2));
     await expectNoOrderingPut(page, handle, 300);
     expect(await readVisibleSessionTitles(page)).toEqual(["alpha-a", "beta-a", "alpha-b", "beta-b"]);
   });

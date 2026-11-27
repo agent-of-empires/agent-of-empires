@@ -532,6 +532,7 @@ impl HomeView {
                 order,
                 repositories,
                 base: Some(base),
+                ..Default::default()
             })?;
         if !matches!(change, Some(OrderChange::Undo(_))) {
             self.order_undo = None;
@@ -979,6 +980,7 @@ impl HomeView {
                 direction: move_direction(delta),
                 siblings,
                 freeze,
+                base: None,
             }),
             NamespaceIntent::ReorderGroup { switch },
         )

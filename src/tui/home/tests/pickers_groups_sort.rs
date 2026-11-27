@@ -444,6 +444,7 @@ pub(in crate::tui::home) async fn settle_reorder(
             direction,
             siblings,
             freeze: None,
+            base: None,
         }
     } else {
         let id = view.selected_session.clone().expect("selected session");
@@ -2645,6 +2646,8 @@ async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
         serde_json::to_value(crate::daemon::SidebarViewPatch {
             group_by: Some(crate::session::config::GroupByMode::Group),
             sort: Some(SortOrder::Custom),
+
+            ..Default::default()
         })
         .unwrap(),
     )
@@ -2752,6 +2755,8 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
         serde_json::to_value(crate::daemon::SidebarViewPatch {
             group_by: Some(crate::session::config::GroupByMode::Group),
             sort: Some(SortOrder::Name),
+
+            ..Default::default()
         })
         .unwrap(),
     )
@@ -3466,7 +3471,7 @@ fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
     assert!(
         matches!(
             respond(Err("refused".into())),
-            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: Some(siblings), freeze: None }))
+            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: Some(siblings), freeze: None, base: None }))
                 if group.profile == "test" && group.path == "beta" && siblings == ["zeta", "beta", "mid"]
         ),
         "a nested header moves its profile's Group among the shown siblings"
