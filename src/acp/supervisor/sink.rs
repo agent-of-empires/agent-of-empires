@@ -69,6 +69,11 @@ pub trait BroadcastSink: Send + Sync + 'static {
     fn unresolved_background_task_ids(&self, _session_id: &str) -> Vec<String> {
         Vec::new()
     }
+    /// Run ids of `WorkflowRunStarted` events on disk with no matching
+    /// `WorkflowRunFinished`.
+    fn unresolved_workflow_run_ids(&self, _session_id: &str) -> Vec<String> {
+        Vec::new()
+    }
     fn unresolved_background_task_launches(&self, _session_id: &str) -> Vec<BackgroundTaskLaunch> {
         Vec::new()
     }
@@ -332,6 +337,10 @@ impl BroadcastSink for ChannelSink {
     fn unresolved_background_task_ids(&self, session_id: &str) -> Vec<String> {
         self.flushed_store()
             .unresolved_background_task_ids(session_id)
+    }
+
+    fn unresolved_workflow_run_ids(&self, session_id: &str) -> Vec<String> {
+        self.flushed_store().unresolved_workflow_run_ids(session_id)
     }
 
     fn unresolved_background_task_launches(&self, session_id: &str) -> Vec<BackgroundTaskLaunch> {

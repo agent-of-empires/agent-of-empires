@@ -77,6 +77,23 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
        )
      ORDER BY started.seq ASC";
 
+const UNRESOLVED_WORKFLOW_RUNS_SQL: &str =
+    "SELECT json_extract(started.event_json, '$.WorkflowRunStarted.run_id')
+     FROM acp_events AS started
+     WHERE started.session_id = ?1
+       AND started.discriminant = 'WorkflowRunStarted'
+       AND json_extract(started.event_json, '$.WorkflowRunStarted.run_id') IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM acp_events AS later
+           WHERE later.session_id = ?1
+             AND later.discriminant IN ('WorkflowRunStarted', 'WorkflowRunFinished')
+             AND later.seq > started.seq
+             AND COALESCE(json_extract(later.event_json, '$.WorkflowRunStarted.run_id'),
+                          json_extract(later.event_json, '$.WorkflowRunFinished.run_id')) =
+                 json_extract(started.event_json, '$.WorkflowRunStarted.run_id')
+       )
+     ORDER BY started.seq ASC";
+
 const LATER_PLAN_DROP_SQL: &str = "SELECT EXISTS(
      SELECT 1 FROM acp_events
      WHERE session_id = ?1
@@ -312,6 +329,17 @@ impl EventStore {
             &self.conn(),
             UNRESOLVED_BACKGROUND_TASKS_SQL,
             "unresolved_background_task_ids",
+            session_id,
+        )
+    }
+
+    /// Run ids of `WorkflowRunStarted` events with no later
+    /// `WorkflowRunFinished`; a repeated start is a lease renewal, not a run.
+    pub fn unresolved_workflow_run_ids(&self, session_id: &str) -> Vec<String> {
+        query_strings(
+            &self.conn(),
+            UNRESOLVED_WORKFLOW_RUNS_SQL,
+            "unresolved_workflow_run_ids",
             session_id,
         )
     }
@@ -1633,6 +1661,23 @@ mod tests {
             ["t-2".to_string()]
         );
         assert!(store.unresolved_background_task_ids("s-2").is_empty());
+    }
+
+    #[test]
+    fn unresolved_workflow_run_ids_skip_finished_runs_and_renewals() {
+        let (_tmp, store) = open_store(1000);
+        let started = |id: &str| Event::WorkflowRunStarted {
+            run_id: id.into(),
+            started_at: None,
+        };
+        store.record("s-1", 1, &started("a")).unwrap();
+        store.record("s-1", 2, &started("b")).unwrap();
+        store.record("s-1", 3, &started("a")).unwrap();
+        store
+            .record("s-1", 4, &Event::WorkflowRunFinished { run_id: "b".into() })
+            .unwrap();
+        assert_eq!(store.unresolved_workflow_run_ids("s-1"), ["a".to_string()]);
+        assert!(store.unresolved_workflow_run_ids("s-2").is_empty());
     }
 
     /// A workflow run's resume carries its launch and what the log recorded

@@ -435,6 +435,14 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
             },
         );
     }
+    for run_id in sink.unresolved_workflow_run_ids(session_id) {
+        publish_next_persisted(
+            sink,
+            next_seqs,
+            session_id,
+            &Event::WorkflowRunFinished { run_id },
+        );
+    }
     for event in cancelled_open_subagents(sink, session_id) {
         publish_next_persisted(sink, next_seqs, session_id, &event);
     }
