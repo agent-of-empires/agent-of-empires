@@ -429,6 +429,7 @@ mod tests {
                 &["C-x"],
                 "Ctrl+X is bound to dismiss-update-banner",
             ),
+            ("delete", &["C-e"], "Ctrl+E is bound to cancel-image-pull"),
             (
                 "delete",
                 &["C-l"],
@@ -517,7 +518,7 @@ mod tests {
         use crossterm::event::{KeyEvent, KeyModifiers};
         let (km, warnings) = build(
             &entries(&[
-                ("delete", &["C-e"]),
+                ("delete", &["C-f"]),
                 ("restart", &[]),
                 ("activate", &["C-Enter"]),
             ]),
@@ -535,7 +536,7 @@ mod tests {
         };
         for (key, want) in [
             (
-                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
                 Some(ActionId::Delete),
             ),
             (KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), None),
@@ -548,7 +549,7 @@ mod tests {
         ] {
             assert_eq!(resolve_in(&km, &key, false, &ctx), want, "{key:?}");
         }
-        assert_eq!(label_in(&km, ActionId::Delete, true), "Ctrl+E");
+        assert_eq!(label_in(&km, ActionId::Delete, true), "Ctrl+F");
         assert_eq!(label_in(&km, ActionId::Restart, false), "");
     }
 }
