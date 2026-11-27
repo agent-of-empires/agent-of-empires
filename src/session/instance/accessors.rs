@@ -1498,7 +1498,8 @@ replies = true
         // An adapter not known to load Claude session ids starts fresh.
         for (cmd, expected) in [
             ("my-adapter --stdio", false),
-            ("npx -y claude-code-acp", true),
+            ("npx -y claude-code-acp@latest", true),
+            ("npx -y claude-code-acp", false),
         ] {
             write_config(true, cmd);
             assert_eq!(

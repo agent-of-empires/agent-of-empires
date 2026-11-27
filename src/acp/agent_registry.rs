@@ -47,7 +47,7 @@ fn is_registry_selector(selector: &str) -> bool {
     let is_tag = !matches!(selector, "" | "." | "..")
         && selector
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+            .all(|c| c.is_ascii_alphanumeric() || "._-~".contains(c));
     let is_comparator = |token: &str| {
         let core = token.trim_start_matches(['^', '~', '<', '>', '=']);
         let core = core.strip_prefix(['v', 'V']).unwrap_or(core);
@@ -79,7 +79,8 @@ fn is_registry_selector(selector: &str) -> bool {
 
 /// Whether a custom `agent_acp_cmd` runs the Claude ACP adapter, the only adapter known to
 /// load Claude session ids. Matches the adapter binary, or an `npx`/`bunx` launch that
-/// passes only `-y`/`--yes` before one of the adapter's known packages.
+/// passes only `-y`/`--yes` before one of the adapter's known packages with an explicit
+/// registry selector (an unversioned name can resolve a local binary first).
 pub fn runs_claude_adapter(cmd: &str) -> bool {
     const BINARIES: [&str; 2] = ["claude-agent-acp", "claude-code-acp"];
     const PACKAGES: [&str; 4] = [
@@ -114,7 +115,10 @@ pub fn runs_claude_adapter(cmd: &str) -> bool {
             .and_then(|rest| rest.find('@'))
             .map_or(package.len(), |at| at + 1);
         let (name, version) = package.split_at(name_end);
-        PACKAGES.contains(&name) && (version.is_empty() || is_registry_selector(&version[1..]))
+        // A bare `pkg@` is npm's `*`.
+        PACKAGES.contains(&name)
+            && !version.is_empty()
+            && (version == "@" || is_registry_selector(&version[1..]))
     })
 }
 
@@ -486,7 +490,7 @@ mod tests {
             ("claude-agent-acp", true),
             ("/opt/bin/claude-code-acp --flag", true),
             ("npx -y @agentclientprotocol/claude-agent-acp@latest", true),
-            ("bunx @zed-industries/claude-code-acp", true),
+            ("bunx @zed-industries/claude-code-acp@latest", true),
             ("npx claude-agent-acp@1.2.3", true),
             ("my-adapter --stdio", false),
             ("launcher claude-work", false),
@@ -499,9 +503,14 @@ mod tests {
             ("npx --package=other claude-agent-acp", false),
             ("npx @evil/claude-agent-acp", false),
             ("npx -y @agentclientprotocol/claude-agent-acp@1.2.3", true),
-            ("npx claude-agent-acp", true),
-            ("bunx -y claude-code-acp --foo", true),
-            ("/path/to/npx --yes claude-agent-acp", true),
+            ("npx claude-agent-acp", false),
+            ("npx -y @agentclientprotocol/claude-agent-acp", false),
+            ("bunx @zed-industries/claude-code-acp", false),
+            ("bunx -y claude-code-acp --foo", false),
+            ("bunx -y claude-code-acp@latest --foo", true),
+            ("/path/to/npx --yes claude-agent-acp@1", true),
+            ("/path/to/npx --yes claude-agent-acp", false),
+            ("npx @agentclientprotocol/claude-agent-acp@rc~1", true),
             ("npx @agentclientprotocol/claude-agent-acp@^1.2", true),
             ("npx \"@agentclientprotocol/claude-agent-acp@>=1 <2\"", true),
             ("npx @agentclientprotocol/claude-agent-acp@npm:other", false),
@@ -567,7 +576,8 @@ mod tests {
                 false,
             ),
             ("npx claude-agent-acp@npm:other", false),
-            ("npx claude-agent-acp@", false),
+            ("npx claude-agent-acp@", true),
+            ("npx @agentclientprotocol/claude-agent-acp@", true),
         ] {
             assert_eq!(runs_claude_adapter(cmd), expected, "{cmd:?}");
         }
