@@ -366,7 +366,20 @@ mod tests {
                 })
                 .await
                 .expect("the original Native receives the selector before replacement");
-                let delayed_cleanup = state.acp_supervisor.capture_retirement(&id).unwrap();
+                let delayed_cleanup =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        loop {
+                            match state.acp_supervisor.capture_retirement(&id) {
+                                Err(crate::acp::supervisor::SupervisorError::RegistryBusy) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                }
+                                result => break result,
+                            }
+                        }
+                    })
+                    .await
+                    .expect("original worker registry becomes available")
+                    .unwrap();
                 let sid = session.sid.clone();
                 let expected_sid = sid.clone();
                 let row = find_instance(&state, &id).await.unwrap();
