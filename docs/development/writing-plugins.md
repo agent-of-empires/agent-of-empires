@@ -20,7 +20,7 @@ Every plugin declares identity, what it contributes, and, with a worker, how to 
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 25
+api_version = 26
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 
@@ -62,6 +62,8 @@ The host spawns the worker, sends one JSON-RPC request per line on stdin, and re
 The host delivers a command that has no client [`action`](../plugin-api.md#commands) as a `plugin.command.invoke` notification with params `{ "command": "plugin.<id>.<command-id>", "session_id": "..." }`. It has no `id`, so never reply; act on the commands you know and ignore the rest.
 
 The host also pushes notifications that carry no `id`, such as `session.status.changed` (`api_version >= 14`) and `session.lifecycle.changed` (`api_version >= 19`) for plugins that hold `session.read`. Ignore methods you do not handle and never reply. See [Session status events](../plugin-api.md#session-driving-rpcs) in the Plugin API reference.
+
+Host-initiated requests such as `mcp.rewrite` and the `mcp.serve` methods (`mcp.session.servers`, `mcp.tools.list`, `mcp.tools.call`) arrive with string ids like `h-1`; answer with the same id. The `mcp.cancel` notification has no id (the call to stop is in `params.request_id`); do not reply to it. A plugin that wants to offer MCP tools to agents holds `mcp.serve`; see [Serving MCP servers](../plugin-api.md#serving-mcp-servers-api_version--26).
 
 ## Build and launch
 

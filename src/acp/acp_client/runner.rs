@@ -9,6 +9,8 @@ use super::spawn::{
     apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
     SpawnConfig,
 };
+#[cfg(test)]
+use crate::process::runner::test_support::managed_runner::ManagedRunnerCommand;
 
 /// Deadline for the runner socket to appear. 10s suffices in production, but
 /// a debug-build cold start under CI load blows past it deterministically, so
@@ -121,6 +123,35 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
     }
 }
 
+/// What the runner hands the adapter as `ACP_AGENT_ENV`. The minted MCP credentials ride
+/// it last; a sandbox forwards them through `docker exec -e` instead, so the carrier never
+/// holds them there.
+fn carrier_environment(config: &SpawnConfig, sandboxed: bool) -> Vec<(String, String)> {
+    let credentials = (!sandboxed)
+        .then_some(&config.mcp_credentials)
+        .into_iter()
+        .flatten();
+    config
+        .host_environment
+        .iter()
+        .chain(&config.provider_routing)
+        .chain(credentials)
+        .filter(|(key, _)| match host_environment_denyreason(key) {
+            Some(reason) => {
+                warn!(
+                    target: "acp",
+                    key = %key,
+                    reason,
+                    "rejecting configured host environment key",
+                );
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// A Worker started for a bare adapter name that resolved nowhere can only exit
 /// before its Hello, which loses the cause (#4576). `unresolved` is `None` when
 /// the name resolved or a sandbox resolves it inside its container; paths and
@@ -191,8 +222,39 @@ fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) enum TestRunner {
+    Executable(std::path::PathBuf),
+    Managed(ManagedRunnerCommand),
+}
+
+#[cfg(test)]
+impl TestRunner {
+    fn executable(&self) -> &std::path::Path {
+        match self {
+            Self::Executable(path) => path,
+            Self::Managed(command) => command.executable(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<std::path::PathBuf> for TestRunner {
+    fn from(path: std::path::PathBuf) -> Self {
+        Self::Executable(path)
+    }
+}
+
+#[cfg(test)]
+impl From<ManagedRunnerCommand> for TestRunner {
+    fn from(command: ManagedRunnerCommand) -> Self {
+        Self::Managed(command)
+    }
+}
+
+#[cfg(test)]
 tokio::task_local! {
-    pub(super) static TEST_RUNNER_EXECUTABLE: std::path::PathBuf;
+    pub(super) static TEST_RUNNER: TestRunner;
 }
 
 /// The runner owns the agent subprocess and outlives the daemon; its Child is
@@ -212,8 +274,11 @@ pub(super) async fn spawn_runner_detached(
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
     #[cfg(test)]
-    let current_exe = TEST_RUNNER_EXECUTABLE
-        .try_with(Clone::clone)
+    let test_runner = TEST_RUNNER.try_with(Clone::clone).ok();
+    #[cfg(test)]
+    let current_exe = test_runner
+        .as_ref()
+        .map(|runner| runner.executable().to_owned())
         .unwrap_or(current_exe);
     ensure_runner_exe(&current_exe)?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
@@ -277,24 +342,7 @@ pub(super) async fn spawn_runner_detached(
     // the adapter only: they ride a carrier key the runner strips and applies to
     // its child, because HOME, PATH or XDG_CONFIG_HOME set on the runner itself
     // would move its worker registry (#1383) or change which binary it loads.
-    let host_environment: Vec<(String, String)> = config
-        .host_environment
-        .iter()
-        .chain(&config.provider_routing)
-        .filter(|(key, _)| match host_environment_denyreason(key) {
-            Some(reason) => {
-                warn!(
-                    target: "acp",
-                    key = %key,
-                    reason,
-                    "rejecting configured host environment key",
-                );
-                false
-            }
-            None => true,
-        })
-        .cloned()
-        .collect();
+    let host_environment = carrier_environment(config, sandbox_argv.is_some());
     refuse_unresolved_adapter(
         config,
         resolution.as_ref().and_then(|r| r.as_ref().err()),
@@ -486,6 +534,28 @@ pub(super) async fn spawn_runner_detached(
 
     // Reads the runner env, so it runs before the scope wrapper adds its own.
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
+    // Darwin audit tokens identify an execution, not an exec-stable birth.
+    // Start the real libtest runner directly so the lease cannot attest a
+    // shell trampoline instead of the executable that registers the worker.
+    #[cfg(test)]
+    if let Some(TestRunner::Managed(test_runner)) = test_runner {
+        let mut direct = test_runner
+            .command(cmd.as_std().get_args())
+            .map_err(|error| AcpError::Spawn(format!("prepare managed runner: {error}")))?;
+        let fixture_environment: Vec<_> = direct
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_owned(), value?.to_owned())))
+            .collect();
+        direct
+            .env_clear()
+            .envs(
+                cmd.as_std()
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .envs(fixture_environment);
+        cmd = direct.into();
+    }
     let mut cmd = match &prefix {
         Some(prefix) => wrap_in_scope(cmd, prefix),
         None => cmd,
@@ -585,6 +655,36 @@ pub(super) async fn spawn_runner_detached(
 mod tests {
     use super::*;
     use crate::process::systemd::ScopePrefix;
+
+    /// Minted MCP credentials reach a host agent through the owner-only carrier, after the
+    /// configured environment, and never through the carrier of a sandboxed one.
+    #[test]
+    fn carrier_holds_mcp_credentials_for_host_agents_only() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config =
+            super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
+        config.host_environment = vec![("HOOK_VALUE".into(), "kept".into())];
+        config.mcp_credentials = vec![(
+            "AOE_PLUGIN_MCP_CRED_01".to_string(),
+            "fake-credential".to_string(),
+        )]
+        .into();
+        assert_eq!(
+            carrier_environment(&config, false),
+            [
+                ("HOOK_VALUE".to_string(), "kept".to_string()),
+                (
+                    "AOE_PLUGIN_MCP_CRED_01".to_string(),
+                    "fake-credential".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            carrier_environment(&config, true),
+            [("HOOK_VALUE".to_string(), "kept".to_string())]
+        );
+    }
+
     use crate::session::test_support::EnvGuard;
     use std::ffi::{OsStr, OsString};
 

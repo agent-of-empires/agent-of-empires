@@ -1,7 +1,11 @@
 //! Private libtest child hosting the unchanged production runner and its real native child.
 
 use super::{control_protocol, ControlBody, DeliveryScope, QueuedKind, RunnerShared};
+use std::ffi::OsStr;
+use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -74,7 +78,6 @@ pub(crate) fn observe_native_spawn(
 ) -> anyhow::Result<()> {
     NATIVE_BIRTH_FILE
         .try_with(|path| -> anyhow::Result<()> {
-            use std::io::Write;
             let pid = child
                 .id()
                 .ok_or_else(|| anyhow::anyhow!("native Child has no original PID"))?;
@@ -101,6 +104,39 @@ pub(crate) fn observe_native_spawn(
         .unwrap_or(Ok(()))
 }
 
+/// Launch the selected libtest directly so it owns the spawned PID from exec.
+#[derive(Clone)]
+pub(crate) struct ManagedRunnerCommand {
+    executable: PathBuf,
+    test_name: String,
+    argv: PathBuf,
+    manifest: PathBuf,
+}
+
+impl ManagedRunnerCommand {
+    pub(crate) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub(crate) fn command<'a>(
+        &self,
+        args: impl IntoIterator<Item = &'a OsStr>,
+    ) -> io::Result<Command> {
+        let mut argv = BufWriter::new(std::fs::File::create(&self.argv)?);
+        for arg in args {
+            argv.write_all(arg.as_bytes())?;
+            argv.write_all(b"\0")?;
+        }
+        argv.flush()?;
+        let mut cmd = Command::new(self.executable());
+        cmd.arg("--exact")
+            .arg(&self.test_name)
+            .arg("--nocapture")
+            .env(CHILD_ROLE, &self.manifest);
+        Ok(cmd)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RunnerInspection {
     socket: PathBuf,
@@ -108,8 +144,7 @@ pub(crate) struct RunnerInspection {
 }
 
 impl RunnerInspection {
-    pub(crate) fn prepare(directory: &Path, test_name: &str) -> (PathBuf, Self) {
-        use std::os::unix::fs::PermissionsExt;
+    pub(crate) fn prepare(directory: &Path, test_name: &str) -> (ManagedRunnerCommand, Self) {
         let role = ChildRole {
             test_name: test_name.into(),
             argv: directory.join("runner-argv"),
@@ -118,16 +153,14 @@ impl RunnerInspection {
         };
         let manifest = directory.join("runner-role.json");
         std::fs::write(&manifest, serde_json::to_vec(&role).unwrap()).unwrap();
-        let executable = directory.join("runner-libtest");
-        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
-        std::fs::write(&executable, format!(
-            "#!/bin/sh\nprintf '%s\\0' \"$@\" > {}\nexport {CHILD_ROLE}={}\nexec {} --exact {} --nocapture\n",
-            quote(role.argv.to_str().unwrap()), quote(manifest.to_str().unwrap()),
-            quote(std::env::current_exe().unwrap().to_str().unwrap()), quote(test_name),
-        )).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let command = ManagedRunnerCommand {
+            executable: std::env::current_exe().expect("managed libtest executable"),
+            test_name: role.test_name,
+            argv: role.argv,
+            manifest,
+        };
         (
-            executable,
+            command,
             Self {
                 socket: role.socket,
                 native_birth: role.native_birth,
@@ -322,7 +355,6 @@ async fn outbound_observation(shared: &RunnerShared) -> serde_json::Value {
 /// The production detached-spawn path owns/reaps this child through its real lease.
 pub(crate) async fn child_if_requested(test_name: &str) -> bool {
     use clap::Parser;
-    use std::os::unix::ffi::OsStringExt;
     let Some(manifest) = std::env::var_os(CHILD_ROLE) else {
         return false;
     };
@@ -338,9 +370,10 @@ pub(crate) async fn child_if_requested(test_name: &str) -> bool {
     }
     let argv = std::fs::read(&role.argv).unwrap();
     let argv = argv
+        .strip_suffix(b"\0")
+        .expect("managed runner argv has a final separator")
         .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(|arg| std::ffi::OsString::from_vec(arg.to_vec()));
+        .map(OsStr::from_bytes);
     let args = RunnerCli::parse_from(argv).args;
     let listener = tokio::net::UnixListener::bind(&role.socket).unwrap();
     let (observer, mut observed) = tokio::sync::mpsc::unbounded_channel::<(
