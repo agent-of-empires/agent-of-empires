@@ -1904,12 +1904,6 @@ fn render_status(
             Style::default().fg(theme.running),
         ));
     }
-    for badge in lifecycle_badges(&state.transcript, crate::time::Timestamp::now()) {
-        spans.push(Span::styled(
-            format!("· {badge} "),
-            Style::default().fg(theme.hint),
-        ));
-    }
     if state.transcript.context_primer_pending() {
         spans.push(Span::styled(
             " context lost; include needed context ",
@@ -1931,6 +1925,12 @@ fn render_status(
     if state.scroll_offset.get() != u16::MAX {
         spans.push(Span::styled(
             " · G latest ",
+            Style::default().fg(theme.hint),
+        ));
+    }
+    for badge in lifecycle_badges(&state.transcript, crate::time::Timestamp::now()) {
+        spans.push(Span::styled(
+            format!("· {badge} "),
             Style::default().fg(theme.hint),
         ));
     }
