@@ -124,8 +124,9 @@ For each PR with `mergeable` `CONFLICTING` whose author is not a bot
    ```
 
 2. Do not comment if one of them contains
-   `<!-- pr-steward:rebase <headRefOid> -->` for the current head, or was
-   created after the `committedDate` of the last entry in `commits`. Record
+   `<!-- pr-steward:rebase <headRefOid> -->` for the current head, or is a
+   rebase request (contains `<!-- pr-steward:rebase`) created after the
+   `committedDate` of the last entry in `commits`. Record
    the PR as nudged `no (already asked)`.
 3. Otherwise post this text word for word, with the author's validated
    login and the PR's `headRefOid`:
