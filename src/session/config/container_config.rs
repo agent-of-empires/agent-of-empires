@@ -2364,6 +2364,16 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
         .and_then(|declared| declared.contribution().trust.clone())
     {
         let applies = crate::hooks::declared_trust_applies_in_sandbox(&trust, is_yolo_mode);
+        // A file name declared by an earlier launch stays staged, and a running
+        // container may still mount it.
+        if let Ok(stage) = crate::hooks::declared_sandbox_dir(instance_id) {
+            let home = stage.join("home");
+            blank_staged_tree(&home, Some(&home.join(&trust.file))).map_err(|e| {
+                e.context(format!(
+                    "cannot revoke the staged sandbox trust left under a previous file name for {tool}; refusing to reuse the container; make the files writable or remove the session's container and relaunch"
+                ))
+            })?;
+        }
         let result = crate::hooks::declared_sandbox_dir(instance_id).and_then(|stage| {
             let file = stage.join("home").join(&trust.file);
             if !applies {
@@ -2395,7 +2405,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
     // A declaration dropped since an earlier launch leaves its record staged, and a
     // running container may still mount it.
     if let Ok(stage) = crate::hooks::declared_sandbox_dir(instance_id) {
-        blank_staged_tree(&stage.join("home")).map_err(|e| {
+        blank_staged_tree(&stage.join("home"), None).map_err(|e| {
             e.context(format!(
                 "cannot revoke the staged sandbox trust left by a removed declaration for {tool}; refusing to reuse the container; make the files writable or remove the session's container and relaunch"
             ))
@@ -3150,8 +3160,8 @@ fn blank_staged_file(file: &Path) -> Result<()> {
     }
 }
 
-/// Blanks every file under `dir`, never following a symlink.
-fn blank_staged_tree(dir: &Path) -> Result<()> {
+/// Blanks every file under `dir` except `keep`, never following a symlink.
+fn blank_staged_tree(dir: &Path, keep: Option<&Path>) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         entries => entries.with_context(|| format!("reading {}", dir.display()))?,
@@ -3160,8 +3170,8 @@ fn blank_staged_tree(dir: &Path) -> Result<()> {
         let path = entry?.path();
         let kind = std::fs::symlink_metadata(&path)?.file_type();
         if kind.is_dir() {
-            blank_staged_tree(&path)?;
-        } else if !kind.is_symlink() {
+            blank_staged_tree(&path, keep)?;
+        } else if !kind.is_symlink() && keep != Some(path.as_path()) {
             blank_staged_file(&path)?;
         }
     }
@@ -8127,6 +8137,56 @@ sandbox = "SANDBOX"
 
         assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
         assert_eq!(fs::metadata(&file).unwrap().ino(), mounted);
+    }
+
+    // Renaming the declared trust file must blank the record staged under the old name,
+    // in place, since an earlier container may still mount it.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_renamed_trust_file_revokes_the_previous_record() {
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let launch = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-renamed",
+                "/workspace/project",
+                false,
+            )
+            .unwrap()
+        };
+        let home = crate::hooks::declared_sandbox_dir("declared-renamed")
+            .unwrap()
+            .join("home");
+        let install = |name: &str| {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN
+                    .replace("SANDBOX", "always")
+                    .replace(".example.json", name),
+            )
+        };
+
+        install(".a.json");
+        launch();
+        let old = home.join(".a.json");
+        let mounted = fs::metadata(&old).unwrap().ino();
+        assert!(fs::read_to_string(&old).unwrap().contains("trusted"));
+
+        install(".b.json");
+        launch();
+
+        assert_eq!(fs::read_to_string(&old).unwrap(), "{}");
+        assert_eq!(fs::metadata(&old).unwrap().ino(), mounted);
+        assert!(fs::read_to_string(home.join(".b.json"))
+            .unwrap()
+            .contains("trusted"));
     }
 
     #[test]
