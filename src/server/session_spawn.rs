@@ -72,6 +72,8 @@ pub(crate) struct StructuredSessionSpec {
     /// Plugin create-idempotency record to persist with the instance,
     /// stamped alongside `created_by_plugin`.
     pub plugin_create_idempotency: Option<crate::session::PluginCreateIdempotency>,
+    /// Suggestion the session was started from, persisted onto the instance.
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
     /// Initial prompt and its origin, persisted with the instance and delivered once
     /// the ACP worker is live. Stamped by `SessionService::create_structured_session`.
     pub pending_initial_turn: Option<(String, crate::daemon::PromptOrigin)>,
@@ -88,6 +90,8 @@ pub(crate) struct StructuredSessionSpec {
     pub import_acp_session_id: Option<String>,
     pub import_binding: Option<crate::session::ConversationBinding>,
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// Id the new Session takes, when the caller named it before creating.
+    pub session_id: Option<String>,
     /// Where the web wizard polls this create's stage and hook output.
     pub progress: Option<Arc<crate::server::create_progress::CreateProgress>>,
     pub cli: Option<crate::daemon::CliCreationOptions>,
@@ -256,6 +260,7 @@ pub(crate) async fn spawn_structured_session(
             profile,
             created_by_plugin,
             plugin_create_idempotency,
+            suggestion,
             pending_initial_turn,
             parent_session_id,
             acp_mode_id,
@@ -266,6 +271,7 @@ pub(crate) async fn spawn_structured_session(
             import_acp_session_id,
             import_binding,
             fork_seed,
+            session_id,
             progress,
             cli,
         } = spec;
@@ -348,6 +354,7 @@ pub(crate) async fn spawn_structured_session(
             no_submodules: cli.as_ref().is_some_and(|options| options.no_submodules),
             tie_workdir_to_name: cli.is_some(),
             worktree_path_id: cli.as_ref().and_then(|options| options.worktree_path_id.clone()),
+            session_id,
         };
 
         let namespace = runtime.block_on(worker_state.profile_namespace.read());
@@ -389,6 +396,7 @@ pub(crate) async fn spawn_structured_session(
         native.set_status_id(instance.id.clone());
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
+        instance.suggestion = suggestion;
         instance.pending_initial_turn =
             pending_initial_turn.map(|(text, origin)| crate::session::PendingInitialTurn {
                 text,
@@ -1144,13 +1152,16 @@ fn report_failed_auto_spawn(
         tracing::warn!(target: "acp.supervisor", session = %id,
             "auto-spawn after create held: {blocked}");
         service.sandbox_login.hold(id, origin, blocked);
-    } else {
-        tracing::warn!(target: "acp.supervisor", session = %id,
-            "auto-spawn after create failed: {error}");
+        service.acp_supervisor.publish_login_required(id, blocked);
+        return;
     }
-    service
-        .acp_supervisor
-        .publish_startup_error(id, error.to_string());
+    tracing::warn!(target: "acp.supervisor", session = %id,
+        "auto-spawn after create failed: {error}");
+    service.acp_supervisor.publish_startup_error_with_cause(
+        id,
+        error.to_string(),
+        crate::session::SandboxLoginUnsupported::cause_of(error),
+    );
 }
 
 /// The sandbox login admission of the auto-spawn after a create, on the row the create
@@ -1375,6 +1386,7 @@ mod tests {
             profile: profile.into(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            suggestion: None,
             pending_initial_turn: None,
             parent_session_id: None,
             acp_mode_id: None,
@@ -1385,6 +1397,7 @@ mod tests {
             import_acp_session_id: None,
             import_binding: None,
             fork_seed: None,
+            session_id: None,
             progress: None,
             cli: None,
         };
@@ -1527,6 +1540,8 @@ mod tests {
                 profile: profile.into(),
                 created_by_plugin: None,
                 plugin_create_idempotency: None,
+                suggestion: None,
+                session_id: None,
                 pending_initial_turn: None,
                 parent_session_id: None,
                 acp_mode_id: None,
@@ -1763,6 +1778,7 @@ mod tests {
             let state = crate::server::test_support::build_test_app_state(peers.clone());
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let spec = StructuredSessionSpec {
+                suggestion: None,
                 title: Some("hooked".into()),
                 title_typed: true,
                 size: None,
@@ -1804,6 +1820,7 @@ mod tests {
                 import_acp_session_id: None,
                 import_binding: None,
                 fork_seed: None,
+                session_id: None,
                 progress: Some(Arc::clone(&progress)),
                 cli: Some(crate::daemon::CliCreationOptions {
                     parent: None,

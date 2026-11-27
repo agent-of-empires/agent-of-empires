@@ -3,7 +3,7 @@
 use crate::session::{Instance, Item, LifecycleOperation, StartBlocked, Status};
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteAction, GroupDeleteOptions, InfoDialog};
 
-use super::{HomeView, PendingArchiveCursor};
+use super::{HomeView, PendingArchiveCursor, PendingSnoozeFlash};
 
 /// Membership predicate for a manual group: matches instances whose
 /// `group_path` equals `group_path` or nests beneath it, optionally scoped to
@@ -266,67 +266,6 @@ impl HomeView {
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.restart_selected_session_with_wake(
-            new_profile,
-            new_tool,
-            new_extra_args,
-            new_command_override,
-            false,
-        )
-    }
-
-    /// Whether the session runs an agent binary replaced since launch and may be restarted for
-    /// it now. Structured rows are left to the web dashboard: this restart path cannot respawn a
-    /// structured worker.
-    pub(super) fn update_restart_offered(&self, id: &str) -> bool {
-        self.get_instance(id).is_some_and(|inst| {
-            crate::session::update_restart::offer_pending(
-                inst,
-                match inst.terminal_context_resume_cached() {
-                    crate::session::TerminalContextResume::Available => true,
-                    crate::session::TerminalContextResume::RuntimeCheckRequired => {
-                        inst.agent_session_id.is_some()
-                    }
-                    _ => false,
-                },
-                false,
-            )
-        })
-    }
-
-    /// Restart the selected session onto the updated agent, with no wake-up message. The restart
-    /// resumes through `auto_resume_on_restart`, so the offer's "conversation kept" promise only
-    /// holds while that is on.
-    pub(super) fn restart_selected_for_update(&mut self) -> anyhow::Result<()> {
-        let Some(id) = self.selected_session.clone() else {
-            return Ok(());
-        };
-        let Some(profile) = self
-            .get_instance(&id)
-            .filter(|_| self.update_restart_offered(&id))
-            .map(|inst| inst.effective_profile())
-        else {
-            return Ok(());
-        };
-        let auto_resume = crate::session::resolve_config(&profile)
-            .map(|c| c.session.auto_resume_on_restart)
-            .unwrap_or(true);
-        if !auto_resume {
-            anyhow::bail!("auto_resume_on_restart is off, so a restart would start a new conversation. Restart with 'e' if that is intended");
-        }
-        self.restart_selected_session_with_wake(None, None, None, None, true)
-    }
-
-    /// `for_update` sends no wake-up message and has the daemon refuse a session that is no longer
-    /// idle.
-    fn restart_selected_session_with_wake(
-        &mut self,
-        new_profile: Option<&str>,
-        new_tool: Option<&str>,
-        new_extra_args: Option<&str>,
-        new_command_override: Option<&str>,
-        for_update: bool,
-    ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
             None => return Ok(()),
@@ -382,8 +321,6 @@ impl HomeView {
             extra_args: new_extra_args.map(str::to_owned),
             command_override: new_command_override.map(str::to_owned),
             unsnooze: wake_snooze,
-            wake_message: for_update.then(String::new),
-            only_if_idle: for_update,
             ..Default::default()
         };
         if let Err(error) = self
@@ -670,12 +607,17 @@ impl HomeView {
             return Ok(());
         };
         if instance.is_snoozed() {
-            return self.session_feed.submit(
-                id,
+            self.session_feed.submit(
+                id.clone(),
                 crate::daemon::SessionMutation::Snooze(crate::daemon::UpdateSnoozeBody {
                     minutes: None,
                 }),
-            );
+            )?;
+            // No snooze marker shows outside the Attention sort, so confirm the wake.
+            if self.sort_order != crate::session::config::SortOrder::Attention {
+                self.queue_snooze_flash(id, false, "Unsnoozed");
+            }
+            return Ok(());
         }
         self.snooze_duration_dialog = Some(crate::tui::dialogs::SnoozeDurationDialog::new(
             &instance.title,
@@ -693,8 +635,47 @@ impl HomeView {
         )?;
         if self.sort_order == crate::session::config::SortOrder::Attention {
             self.select_top_attention(Some(id));
+        } else {
+            // No snooze marker shows outside the Attention sort, so confirm the park.
+            let message = format!(
+                "Snoozed for {}",
+                super::render::format_snooze_remaining(crate::time::Duration::minutes(i64::from(
+                    minutes
+                )))
+            );
+            self.queue_snooze_flash(id.to_owned(), true, message);
         }
         Ok(())
+    }
+
+    /// Hold the confirmation until the applied snapshot carries the snooze
+    /// change, since the flash would otherwise claim what the daemon has not
+    /// confirmed yet.
+    fn queue_snooze_flash(&mut self, id: String, snoozed: bool, message: impl Into<String>) {
+        self.pending_snooze_flash = Some(PendingSnoozeFlash {
+            id,
+            snoozed,
+            message: message.into(),
+        });
+    }
+
+    /// Flash a queued snooze confirmation once the row shows the new state.
+    /// Returns whether the message was shown.
+    pub(super) fn apply_pending_snooze_flash(&mut self) -> bool {
+        let Some(pending) = self.pending_snooze_flash.take() else {
+            return false;
+        };
+        let settled = self
+            .instances
+            .get(&pending.id)
+            .is_some_and(|inst| inst.is_snoozed() == pending.snoozed);
+        if !settled {
+            // The snapshot predates the change; the next one carries it.
+            self.pending_snooze_flash = Some(pending);
+            return false;
+        }
+        self.flash_status(pending.message);
+        true
     }
 
     /// Queue a favorite change; only canonical snapshots update the row.
@@ -708,7 +689,7 @@ impl HomeView {
         };
         self.session_feed.submit(
             id,
-            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody {
+            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody::Unscoped {
                 favorited: !is_fav,
             }),
         )?;
@@ -834,20 +815,26 @@ impl HomeView {
         Ok(())
     }
     /// Preserve the shelf's collapsed state; teardown and relocation remain daemon-owned.
-    pub(super) fn trash_session_by_id(&mut self, id: &str) {
+    /// True when the runtime queued the Trash request.
+    pub(super) fn trash_session_by_id(&mut self, id: &str) -> bool {
         let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
             self.flash_status("Runtime unavailable; reopen Trash controls");
-            return;
+            return false;
         };
-        self.trash_session_by_id_at_epoch(id, epoch);
+        self.trash_session_by_id_at_epoch(id, epoch)
     }
 
-    pub(super) fn trash_session_by_id_at_epoch(&mut self, id: &str, expected_epoch: String) {
+    /// True when the runtime queued the Trash request.
+    pub(super) fn trash_session_by_id_at_epoch(
+        &mut self,
+        id: &str,
+        expected_epoch: String,
+    ) -> bool {
         let Some(instance) = self
             .get_instance(id)
             .filter(|instance| !instance.is_trashed())
         else {
-            return;
+            return false;
         };
         let generation = instance.lifecycle_generation;
         let profile = instance.source_profile.clone();
@@ -866,7 +853,9 @@ impl HomeView {
                 "Could Not Trash Session",
                 &error.to_string(),
             ));
+            return false;
         }
+        true
     }
 
     pub(super) fn retry_selected_trash(&mut self) {

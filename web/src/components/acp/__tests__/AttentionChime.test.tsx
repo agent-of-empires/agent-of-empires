@@ -13,41 +13,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 
 vi.mock("../../../lib/api", () => ({
-  fetchSettings: vi.fn(async () => ({
-    sound: { enabled: true, volume: 1, on_approval: "approval" },
-  })),
-  fetchSounds: vi.fn(async () => ["approval"]),
-  fetchSoundBlob: vi.fn(async () => new Blob(["x"])),
+  fetchSettings: vi.fn(async () => ({ sound: { enabled: true } })),
+  fetchSound: vi.fn(async (event: string) => soundBytes(event)),
 }));
 
 import { AttentionChime } from "../AttentionChime";
 import { clearSoundCache } from "../../../lib/soundPlayer";
-
-let audioCount = 0;
+import { installFakeAudioContext, playedSounds, soundBytes } from "../../../lib/__tests__/fakeAudioContext";
 
 beforeEach(() => {
-  audioCount = 0;
+  installFakeAudioContext();
   clearSoundCache();
   vi.useFakeTimers();
-  // jsdom has no Audio / object-URL plumbing; stub the minimum the hook
-  // touches so a successful play() path is observable by counting builds.
-  vi.stubGlobal(
-    "Audio",
-    class {
-      volume = 1;
-      constructor(_src: string) {
-        audioCount++;
-      }
-      play() {
-        return Promise.resolve();
-      }
-    },
-  );
-  vi.stubGlobal("URL", {
-    ...URL,
-    createObjectURL: vi.fn(() => "blob:stub"),
-    revokeObjectURL: vi.fn(),
-  });
 });
 
 afterEach(() => {
@@ -62,7 +39,7 @@ describe("AttentionChime", () => {
     await vi.advanceTimersByTimeAsync(1500);
     rerender(<AttentionChime sessionId="s1" approvals={0} elicitations={1} />);
     await vi.runAllTimersAsync();
-    expect(audioCount).toBe(1);
+    expect(playedSounds()).toEqual(["approval"]);
   });
 
   it("does not re-chime when a second item arrives (>=1 -> >=2)", async () => {
@@ -70,6 +47,6 @@ describe("AttentionChime", () => {
     await vi.advanceTimersByTimeAsync(1500);
     rerender(<AttentionChime sessionId="s1" approvals={1} elicitations={1} />);
     await vi.runAllTimersAsync();
-    expect(audioCount).toBe(0);
+    expect(playedSounds()).toEqual([]);
   });
 });

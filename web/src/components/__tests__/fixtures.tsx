@@ -99,7 +99,6 @@ interface RowOptions {
   unread?: boolean;
   onStop?: (sessionId: string) => void;
   onStart?: (sessionId: string) => void;
-  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onActivate?: RowActivate;
   activeSessionId?: string | null;
@@ -114,7 +113,6 @@ function Row({
   onCreateSession,
   onStop,
   onStart,
-  onRestartForUpdate,
   onSwitchView,
   onActivate = () => {},
   activeSessionId = null,
@@ -158,7 +156,6 @@ function Row({
         onCreateSession={onCreateSession}
         onStop={onStop}
         onStart={onStart}
-        onRestartForUpdate={onRestartForUpdate}
         onSwitchView={onSwitchView}
         readOnly={readOnly}
         optimistic={triage.optimisticFor(ws)}

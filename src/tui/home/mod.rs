@@ -25,10 +25,12 @@ mod projects;
 pub(crate) mod render;
 mod reorder;
 mod rows;
+mod sandbox_login;
 mod selection;
 mod send;
 mod status;
 mod store_move;
+mod suggested;
 #[cfg(test)]
 mod tests;
 pub(crate) mod update_bar;
@@ -62,14 +64,14 @@ use super::settings::SettingsView;
 
 use self::icons::{
     ICON_ARCHIVED_SECTION, ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED,
-    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_TERMINAL, ICON_TRASH_SECTION,
-    ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
+    ICON_FAVORITE, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_SUGGESTED, ICON_TERMINAL,
+    ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
 use self::rows::project_group_key;
 pub(super) use self::watchers::{
-    log_legacy_duplicates_once, tips_unseen_count, ConfigRefreshOrigin, ConfigWatchState,
-    DiskWatchState, ReloadFailureState,
+    log_legacy_duplicates_once, ConfigRefreshOrigin, ConfigWatchState, DiskWatchState,
+    ReloadFailureState,
 };
 use self::watchers::{RELOAD_FAILED_TITLE, WATCHER_WARNING_TITLE};
 
@@ -148,6 +150,15 @@ pub(super) struct PendingArchiveCursor {
     pub(super) archived: bool,
     /// Where the cursor lands when the row sinks (non-Attention sorts).
     pub(super) successor: Option<String>,
+}
+
+/// Status flash owed to the snapshot that reflects a snooze toggle: the view
+/// submits the change, and the message waits for the canonical stamp so it
+/// never announces a change the daemon has not applied.
+pub(super) struct PendingSnoozeFlash {
+    pub(super) id: String,
+    pub(super) snoozed: bool,
+    pub(super) message: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -389,6 +400,15 @@ pub struct HomeView {
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
+    pub(super) sandbox_login_dialog: Option<super::dialogs::SandboxLoginDialog>,
+    /// The login the dialog shows; dropped (and so cancelled) with it.
+    pub(super) sandbox_login_poller: Option<super::sandbox_login_poller::SandboxLoginPoller>,
+    /// Cancelled logins whose helpers are still being cleaned up: quitting waits for them,
+    /// within one deadline shared with the live login.
+    pub(super) sandbox_login_retiring: Vec<super::sandbox_login_poller::Retiring>,
+    pub(super) sandbox_login_clock: super::sandbox_login_poller::QuitClock,
+    /// What the open dialog logs in, resolved once when it opened.
+    pub(super) sandbox_login_selection: Option<sandbox_login::LoginSelection>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     pub(super) serve_view: Option<ServeView>,
     pub(super) serve_jobs: super::dialogs::ServeJobs,
@@ -518,6 +538,9 @@ pub struct HomeView {
     /// Cursor placement owed to the applied snapshot after an archive toggle.
     pub(super) pending_archive_cursor: Option<PendingArchiveCursor>,
 
+    /// Status flash owed to the applied snapshot after a snooze toggle.
+    pub(super) pending_snooze_flash: Option<PendingSnoozeFlash>,
+
     pub(super) preview_cache: PreviewCache,
     pub(super) terminal_preview_cache: PreviewCache,
     pub(super) container_terminal_preview_cache: PreviewCache,
@@ -552,8 +575,6 @@ pub struct HomeView {
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
     pub(super) default_terminal_mode: TerminalMode,
 
-    pub(super) sound_config: crate::sound::SoundConfig,
-
     pub(super) idle_decay_window: std::time::Duration,
 
     pub(super) strict_hotkeys: bool,
@@ -571,6 +592,7 @@ pub struct HomeView {
     pub(super) settings_close_confirm: bool,
 
     pub(super) diff_view: Option<DiffView>,
+    pub(super) suggestions_view: Option<super::suggestions::SuggestionsView>,
 
     pub(super) list_width: u16,
     pub(super) list_height: Option<u16>,
@@ -612,11 +634,28 @@ pub struct HomeView {
 
     /// Stopped sessions inside groups are left out of the sidebar, for this run only.
     pub(super) hide_stopped_in_groups: bool,
+    /// `session.hide_snoozed_with_stopped`: count snoozed Sessions as hidden too.
+    pub(super) hide_snoozed_with_stopped: bool,
     /// While stopped sessions are hidden, each group header's full count, keyed by path and
     /// profile, so the header can show `visible/total`.
     pub(super) group_totals: HashMap<(String, Option<String>), usize>,
 
     pub(super) trashed_section_collapsed: bool,
+    /// The keys go to the suggestions list in the preview pane.
+    pub(super) suggestions_focused: bool,
+    /// Sessions whose undelivered first prompt was already announced.
+    pub(super) prompt_failures_announced: std::collections::HashSet<String>,
+    /// False until the first snapshot: failures it already carries are not announced.
+    pub(super) prompt_failures_seeded: bool,
+    /// Announced failures waiting for the tick path: session id and message.
+    pub(super) prompt_failure_queue: Vec<(String, String)>,
+    /// The suggested-sessions tip queues once the first suggestions snapshot loads.
+    pub(super) suggested_sessions_tip_armed: bool,
+    /// The prompt the "Prompt not delivered" dialog's Copy button puts on the clipboard.
+    pub(super) undelivered_prompt: Option<String>,
+    /// A suggestion to start again once its blocked Session, by id, is in Trash.
+    pub(super) start_after_trash: Option<RetryAfterTrash>,
+    pub(super) suggestions_feed: super::suggestions::SuggestionsFeed,
 
     /// Non-web links handed to the system opener until their exit status arrives.
     pub(super) opener_exits: Vec<(String, std::sync::mpsc::Receiver<std::process::ExitStatus>)>,
@@ -636,4 +675,14 @@ pub struct HomeView {
     pub(super) watcher_config_refresh_count: std::sync::atomic::AtomicU64,
     pub(super) reload_failure_state: ReloadFailureState,
     pub(super) pending_watcher_theme: Option<String>,
+}
+
+/// A one-click start to repeat once the runtime accepts its blocked Session's Trash.
+pub(super) struct RetryAfterTrash {
+    pub(super) session_id: String,
+    pub(super) key: (String, String),
+    /// The runtime the Trash request went to.
+    pub(super) epoch: String,
+    /// The suggestions daemon and profile the retry was asked from.
+    pub(super) origin: Option<crate::tui::suggestions::Origin>,
 }

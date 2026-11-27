@@ -30,7 +30,7 @@ const CAP_COMPOSER_READ: &str = "composer.read";
 const CAP_SESSION_READ: &str = "session.read";
 
 /// Apply mutation restrictions before resolving the authenticated principal.
-async fn mutation_gate(
+pub(super) async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedBrowserSession>,
     local: Option<&Principal>,
@@ -144,9 +144,8 @@ fn content_type_for_icon(path: &std::path::Path) -> Option<&'static str> {
 }
 
 /// `GET /plugin-icons/{id}`: stream an installed plugin's `icon_asset`
-/// from its install directory. Mirrors `serve_sound_file`'s allowlist-then-read
-/// shape: the manifest path is re-validated and re-joined against the
-/// plugin's own directory rather than trusted from a cached URL. A builtin
+/// from its install directory. The manifest path is re-validated and
+/// re-joined against the plugin's own directory rather than trusted from a cached URL. A builtin
 /// (no install directory) or a plugin with no `icon_asset` 404s.
 pub async fn serve_plugin_icon(
     State(state): State<std::sync::Arc<AppState>>,

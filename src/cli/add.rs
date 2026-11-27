@@ -60,7 +60,7 @@ pub struct AddArgs {
     /// Fork an existing session: resume its conversation context in a new,
     /// independent session that then diverges. Give the source session's id or
     /// title. Terminal fork; available for agents that support forking
-    /// (claude, codex, opencode, pi).
+    /// (claude, codex, opencode, pi, prime-agent, omp).
     #[arg(long = "fork-from")]
     fork_from: Option<String>,
 
@@ -437,6 +437,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             .collect::<Result<_>>()?,
         command_override: args.cmd_override.unwrap_or_default(),
         custom_instruction: None,
+        suggestion: None,
         profile: Some(profile.clone()),
         view: if args.structured_view || args.agent.is_some() {
             crate::session::View::Structured

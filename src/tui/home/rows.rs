@@ -4,20 +4,10 @@
 use super::*;
 use std::collections::HashSet;
 
-/// `pool` without the stopped sessions that sit in a group, when `hide_stopped` is on. Archived
-/// and trashed sessions keep their own sections.
-fn shown_in_groups(pool: Vec<Instance>, hide_stopped: bool) -> Vec<Instance> {
-    if !hide_stopped {
-        return pool;
-    }
-    pool.into_iter()
-        .filter(|i| {
-            i.status != crate::session::Status::Stopped
-                || i.group_path.is_empty()
-                || i.is_archived()
-                || i.is_trashed()
-        })
-        .collect()
+/// Whether the `y` filter counts `inst` among the stopped rows to hide. Snoozed Sessions join
+/// them when `hide_snoozed` is on; archived and trashed rows keep their own sections.
+fn stopped_row_hidden_in_groups(inst: &Instance, hide_snoozed: bool) -> bool {
+    inst.status == crate::session::Status::Stopped || (hide_snoozed && inst.is_snoozed())
 }
 
 /// Project-mode group key, including the distinct scratch sentinel.
@@ -144,19 +134,18 @@ impl HomeView {
     }
 
     /// Index of the first `flat_items` row that belongs to the pinned bottom
-    /// shelf (the synthetic Archived / Trash sections), or `None` when neither
-    /// section is present. The shelf is always a contiguous suffix: both
-    /// sections are appended last (Archived then Trash) by `build_flat_items`,
-    /// and nothing non-shelf follows them, so the first row whose path sits
-    /// within either section marks where the workspace list ends and the shelf
-    /// begins. The renderer splits the sidebar here and hit-testing maps clicks
-    /// in the shelf region back to this suffix.
+    /// shelf (the Suggested row and the synthetic Archived / Trash sections), or
+    /// `None` when none is present. The shelf is always a contiguous suffix:
+    /// `build_flat_items` appends them last, in that order, so the first such row
+    /// marks where the workspace list ends. The renderer splits the sidebar here
+    /// and hit-testing maps clicks in the shelf region back to this suffix.
     pub(in crate::tui) fn shelf_start(&self) -> Option<usize> {
         self.flat_items.iter().position(|it| match it {
             Item::Group { path, .. } => {
                 crate::session::is_within_archived_section(path)
                     || crate::session::is_within_trash_section(path)
             }
+            Item::Suggested { .. } => true,
             Item::Session { .. } => false,
         })
     }
@@ -178,7 +167,7 @@ impl HomeView {
                         session_count,
                         ..
                     } => Some(((path, profile), session_count)),
-                    Item::Session { .. } => None,
+                    Item::Session { .. } | Item::Suggested { .. } => None,
                 })
                 .collect()
         } else {
@@ -191,17 +180,20 @@ impl HomeView {
         self.hide_stopped_in_groups = !self.hide_stopped_in_groups;
         self.rebuild_flat_items_keeping_cursor();
         self.update_selected();
-        self.flash_status(if self.hide_stopped_in_groups {
-            "Stopped sessions in groups hidden (y to show)"
-        } else {
+        self.flash_status(if !self.hide_stopped_in_groups {
             "Showing stopped sessions"
+        } else if self.hide_snoozed_with_stopped {
+            // Keep the recovery key on screen at the supported 48-column minimum.
+            "Stopped and snoozed hidden (y to show)"
+        } else {
+            "Stopped sessions in groups hidden (y to show)"
         });
     }
 
     /// Whether the `y` filter is keeping `inst` out of the list.
     pub(super) fn hidden_by_filter(&self, inst: &Instance) -> bool {
         self.hide_stopped_in_groups
-            && inst.status == crate::session::Status::Stopped
+            && stopped_row_hidden_in_groups(inst, self.hide_snoozed_with_stopped)
             && self.could_hide(inst)
     }
 
@@ -233,11 +225,29 @@ impl HomeView {
             .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))?;
         let (path, profile) = unfiltered[..at].iter().rev().find_map(|item| match item {
             Item::Group { path, profile, .. } => Some((path, profile)),
-            Item::Session { .. } => None,
+            Item::Session { .. } | Item::Suggested { .. } => None,
         })?;
         self.flat_items.iter().position(|item| {
             matches!(item, Item::Group { path: p, profile: pr, .. } if p == path && pr == profile)
         })
+    }
+
+    /// `pool` without the sessions the `y` filter hides, when `hide_stopped` is on: stopped rows
+    /// in a group, plus snoozed ones under `session.hide_snoozed_with_stopped`. Archived and
+    /// trashed sessions keep their own sections, and a session in no manual group stays visible.
+    fn shown_in_groups(&self, pool: Vec<Instance>, hide_stopped: bool) -> Vec<Instance> {
+        if !hide_stopped {
+            return pool;
+        }
+        let hide_snoozed = self.hide_snoozed_with_stopped;
+        pool.into_iter()
+            .filter(|i| {
+                !stopped_row_hidden_in_groups(i, hide_snoozed)
+                    || i.group_path.is_empty()
+                    || i.is_archived()
+                    || i.is_trashed()
+            })
+            .collect()
     }
 
     fn build_flat_items_hiding(&self, hide_stopped: bool) -> Vec<Item> {
@@ -254,7 +264,7 @@ impl HomeView {
         let pool = if self.sort_order == SortOrder::Attention {
             pool
         } else {
-            shown_in_groups(pool, hide_stopped)
+            self.shown_in_groups(pool, hide_stopped)
         };
         // Manual grouping + Attention sort is a flat priority view so tiers
         // interleave across groups.
@@ -272,6 +282,7 @@ impl HomeView {
         } else {
             flatten_tree_all_profiles(&pool, &self.group_trees, self.sort_order)
         };
+        self.append_suggested(&mut items);
         append_archived_section(&mut items, &pool, self.archived_section_collapsed);
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
         items
@@ -299,7 +310,7 @@ impl HomeView {
             .cloned()
             .collect();
         // Seeded before hiding, so a group whose sessions are all hidden keeps its header.
-        (shown_in_groups(grouped, hide_stopped), tree_seed)
+        (self.shown_in_groups(grouped, hide_stopped), tree_seed)
     }
 
     /// Flatten a derived (project or org) grouping with its collapse state,
@@ -316,6 +327,7 @@ impl HomeView {
             tree.set_collapsed(path, true);
         }
         let mut items = flatten_tree(&tree, grouped, self.sort_order);
+        self.append_suggested(&mut items);
         append_archived_section_by_project(
             &mut items,
             grouped,
@@ -423,8 +435,9 @@ impl HomeView {
             // Seed from the unfiltered members, so a status whose sessions are all hidden
             // keeps its header like the other derived groupings.
             let present = !members.is_empty();
-            if hide_stopped && status == crate::session::Status::Stopped {
-                members.clear();
+            if hide_stopped {
+                members
+                    .retain(|i| !stopped_row_hidden_in_groups(i, self.hide_snoozed_with_stopped));
             }
             if !present {
                 continue;
@@ -441,6 +454,7 @@ impl HomeView {
             items.extend(flatten_tree(&tree, &members, self.sort_order));
         }
 
+        self.append_suggested(&mut items);
         append_archived_section(&mut items, &archived, self.archived_section_collapsed);
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
         items

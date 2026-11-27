@@ -2427,6 +2427,7 @@ mod tests {
                         cancel_capable: true,
                         model: None,
                         background: true,
+                        runs: 0,
                     },
                     at: crate::time::Timestamp::now(),
                 },

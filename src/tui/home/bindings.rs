@@ -51,6 +51,8 @@ pub enum ActionId {
     Diff,
     Serve,
     Settings,
+    /// Select the Suggested row and focus its pane. `S` is provisional pending #4597.
+    Suggestions,
     Profiles,
     Projects,
     Restart,
@@ -110,6 +112,9 @@ pub enum ActionId {
     /// Scroll the preview back or forward a page.
     PreviewScrollUp,
     PreviewScrollDown,
+    /// Log the sandboxes in (palette only; no chord). Listed only while
+    /// `sandbox.shared_credential = "separate_login"`.
+    SandboxLogin,
 }
 
 impl ActionId {
@@ -251,7 +256,10 @@ const fn shift_code(code: KeyCode) -> Chord {
 pub enum Context {
     Always,
     TerminalView,
-    AttentionSort,
+    /// A session row sits under the cursor, whatever the sort order. Snooze acts on
+    /// that session, and must not claim the chord on a group header, where `h` still
+    /// collapses the group.
+    SessionSelected,
     /// Favorites are actionable: either the Attention sort is active, where
     /// favorite is a within-tier tiebreak, or `session.favorites_first` is on,
     /// where it pins in every sort order. With neither, toggling a favorite
@@ -308,6 +316,8 @@ pub struct Ctx {
     pub view_mode: ViewMode,
     pub sort_order: SortOrder,
     pub has_search: bool,
+    /// True when the cursor sits on a session row rather than a group or suggestion header.
+    pub session_selected: bool,
     /// True when the cursor sits on a real project header in project view, so
     /// the pin toggle can claim its chord ahead of the projects-dialog binding.
     pub project_group_selected: bool,
@@ -331,7 +341,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
     match context {
         Context::Always => true,
         Context::TerminalView => ctx.view_mode == ViewMode::Terminal,
-        Context::AttentionSort => ctx.sort_order == SortOrder::Attention,
+        Context::SessionSelected => ctx.session_selected,
         Context::FavoritesUsable => {
             ctx.sort_order == SortOrder::Attention || crate::session::favorites_first()
         }
@@ -651,10 +661,10 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::ToggleSnooze,
         non_strict: &[k('h')],
         strict: &[k('H')],
-        context: Context::AttentionSort,
+        context: Context::SessionSelected,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Snooze (toggle, Attention sort)",
+            desc: "Snooze (toggle)",
         }),
         palette: Some(PaletteMeta {
             title: "Toggle snooze",
@@ -792,7 +802,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "New from selection",
+            desc: "New from selection (new session from a suggestion)",
         }),
         palette: Some(PaletteMeta {
             title: "New session from selection",
@@ -1020,6 +1030,21 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Settings,
         }),
     },
+    Binding {
+        id: ActionId::Suggestions,
+        non_strict: &[k('S')],
+        strict: &[ctrl('s')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Other,
+            desc: "Suggested sessions",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Suggested sessions",
+            keywords: &["suggestions", "suggest", "issues", "review"],
+            group: PaletteGroup::Actions,
+        }),
+    },
     // Pin toggle shares `p` (Shift+P in strict) with Projects but fires only on a project
     // header, so it must precede the Projects binding. The `?` overlay lists both rows
     // unconditionally, so each desc names its context (#3133).
@@ -1117,7 +1142,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Archive (toggle, any sort)",
+            desc: "Archive (toggle) or dismiss suggestion",
         }),
         palette: Some(PaletteMeta {
             title: "Toggle archive",
@@ -1310,6 +1335,25 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
+    Binding {
+        id: ActionId::SandboxLogin,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Log the sandboxes in",
+            keywords: &[
+                "claude",
+                "sandbox",
+                "login",
+                "log in",
+                "credential",
+                "sign in",
+            ],
+            group: PaletteGroup::Actions,
+        }),
+    },
     // The mnemonic keys (a/A, n/N, r/R, t/T) are taken and the home keyspace is saturated
     // (see Fork), so "Auto-name now" lands on the free v/V pair. Gated to a
     // still-default-named session by the daemon handler.
@@ -1361,6 +1405,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Diff => "diff",
         ActionId::Serve => "serve",
         ActionId::Settings => "settings",
+        ActionId::Suggestions => "suggestions",
         ActionId::Profiles => "profiles",
         ActionId::Projects => "projects",
         ActionId::Restart => "restart",
@@ -1401,6 +1446,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::DismissUpdateBanner => "dismiss-update-banner",
         ActionId::PreviewScrollUp => "preview-scroll-up",
         ActionId::PreviewScrollDown => "preview-scroll-down",
+        ActionId::SandboxLogin => "sandbox-login",
     }
 }
 
@@ -1413,6 +1459,7 @@ mod tests {
             view_mode: ViewMode::Structured,
             sort_order: SortOrder::Newest,
             has_search: false,
+            session_selected: true,
             project_group_selected: false,
             preview_scroll: false,
         }
@@ -1551,6 +1598,7 @@ mod tests {
             (key('u'), ActionId::Update),
             (key('U'), ActionId::ToggleUnread),
             (key('y'), ActionId::ToggleHideStopped),
+            (key('S'), ActionId::Suggestions),
             (ctrl_key('o'), ActionId::SortPicker),
         ];
         let strict = [
@@ -1569,6 +1617,7 @@ mod tests {
             (ctrl_key('p'), ActionId::Profiles),
             (ctrl_key('g'), ActionId::GroupBy),
             (ctrl_key('u'), ActionId::Update),
+            (ctrl_key('s'), ActionId::Suggestions),
             (ctrl_key('o'), ActionId::SortPicker),
         ];
         for (strict_mode, cases) in [(false, &non_strict[..]), (true, &strict[..])] {
@@ -1628,14 +1677,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn context_guards_gate_attention_and_terminal_actions() {
-        // Snooze resolves only in the Attention sort. Favorite resolves there regardless
+        // Snooze resolves on a session row in any sort. Favorite resolves there regardless
         // of `session.favorites_first`, which only opens it outside Attention.
         let original = crate::session::favorites_first();
         crate::session::set_favorites_first(false);
 
         let mut c = ctx();
         assert_eq!(resolve(&key('f'), false, &c), None);
+        assert_eq!(resolve(&key('h'), false, &c), Some(ActionId::ToggleSnooze));
+        // Without a session under the cursor `h` is a group collapse, not a snooze.
+        c.session_selected = false;
         assert_eq!(resolve(&key('h'), false, &c), None);
+        c.session_selected = true;
         crate::session::set_favorites_first(true);
         assert_eq!(
             resolve(&key('f'), false, &c),
@@ -1678,6 +1731,21 @@ mod tests {
             assert!(binding.help.is_none());
             assert!(binding.palette.is_some());
         }
+    }
+
+    #[test]
+    fn sandbox_login_is_palette_only() {
+        let binding = BINDINGS
+            .iter()
+            .find(|b| b.id == ActionId::SandboxLogin)
+            .unwrap();
+        assert!(binding.non_strict.is_empty() && binding.strict.is_empty());
+        assert!(binding.help.is_none());
+        assert_eq!(
+            binding.palette.as_ref().map(|p| p.title),
+            Some("Log the sandboxes in")
+        );
+        assert_eq!(palette_id(ActionId::SandboxLogin), "sandbox-login");
     }
 
     #[test]

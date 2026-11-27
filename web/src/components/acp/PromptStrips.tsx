@@ -7,6 +7,7 @@ import { useAcpPrefs } from "../../lib/acpPrefs";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import type { QueuedAction, QueuedReason } from "./queuedReason";
+import { TRANSCRIPT_COLUMN } from "./transcriptColumn";
 import { Tooltip } from "../Tooltip";
 import { isImeComposing } from "../../lib/ime";
 
@@ -19,7 +20,7 @@ const AMBER_DISMISS =
 function Strip({ tone, testId, children }: { tone: string; testId?: string; children: React.ReactNode }) {
   return (
     <div data-testid={testId} className={`border-t ${tone} px-4 py-2`}>
-      <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">{children}</div>
+      <div className={TRANSCRIPT_COLUMN}>{children}</div>
     </div>
   );
 }

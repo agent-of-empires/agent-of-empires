@@ -768,18 +768,12 @@
       "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
-      "id": "settings.startup-recovery-wake",
+      "id": "sessions.startup-recovery",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/settings-persistence.spec.ts", "tests/live/startup-recovery.spec.ts"],
-      "components": [
-        "web/src/components/SettingsView.tsx",
-        "web/src/components/settings/SchemaSection.tsx",
-        "src/session/config/mod.rs",
-        "src/server/api/sessions/lifecycle.rs",
-        "src/server/startup_recovery.rs"
-      ],
-      "notes": "The real schema switch defaults off, validates boolean PATCH values, persists per profile, and resets to machine inheritance. Missing Idle/Waiting/Running panes still resume; opted-in default/custom text, empty opt-out, profile precedence, failed resume, and unchanged explicit API/CLI restart wake behavior use private fake agents."
+      "specs": ["tests/live/startup-recovery.spec.ts"],
+      "components": ["src/server/api/sessions/lifecycle.rs", "src/server/startup_recovery.rs"],
+      "notes": "Missing Idle/Waiting/Running panes resume at Daemon startup, in any profile, and a failed resume leaves no pane. For terminal sessions, neither recovery nor an API or CLI restart types anything into the agent; Structured restarts are not covered here. Uses private fake agents."
     },
     {
       "id": "settings.list-field",
@@ -1068,6 +1062,90 @@
       ]
     },
     {
+      "id": "suggestions.review-and-start",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/suggestions-review.spec.ts",
+        "tests/dashboard-suggestions.spec.ts",
+        "tests/suggestions-filter-mapping.spec.ts",
+        "src/components/__tests__/SuggestionsView.test.tsx",
+        "src/components/__tests__/DashboardSuggestions.test.tsx",
+        "src/components/__tests__/SuggestionMappingWizard.test.tsx"
+      ],
+      "components": [
+        "web/src/components/SuggestionsView.tsx",
+        "web/src/components/SuggestionRow.tsx",
+        "web/src/components/SuggestionHooksReview.tsx",
+        "web/src/components/PromptBlockedNote.tsx",
+        "web/src/components/SuggestionItemActions.tsx",
+        "web/src/components/SuggestionStartMenu.tsx",
+        "web/src/components/SuggestionFilterMenu.tsx",
+        "web/src/components/DashboardSuggestions.tsx",
+        "web/src/hooks/useSuggestions.ts",
+        "web/src/components/session-wizard/HooksTrustDialog.tsx",
+        "web/src/components/SuggestionMappingWizard.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.suggested",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SidebarSuggestions.test.tsx"],
+      "components": ["web/src/components/sidebar/SidebarSuggestions.tsx", "web/src/components/WorkspaceSidebar.tsx"],
+      "notes": "The Suggested Group shows only while prefs.sidebar is on, and appears without a remount when the pref changes in Settings."
+    },
+    {
+      "id": "suggestions.cityhall-read-only",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/DashboardSetupHint.test.tsx",
+        "src/components/__tests__/SuggestionsView.test.tsx"
+      ],
+      "components": ["web/src/lib/clientCapabilities.ts", "web/src/components/Dashboard.tsx", "web/src/App.tsx"],
+      "notes": "CityHall refuses suggestion mutations, so canManageSuggestions renders the Suggestions page, Home section and sidebar Group read-only."
+    },
+    {
+      "id": "suggestions.first-run-setup",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/suggestions-first-run.spec.ts",
+        "src/components/__tests__/SuggestionsSetup.test.tsx",
+        "src/components/__tests__/DashboardSetupHint.test.tsx"
+      ],
+      "components": ["web/src/components/SuggestionsSetupHint.tsx", "web/src/components/SuggestionsSetupSheet.tsx"]
+    },
+    {
+      "id": "suggestions.live-persistence",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/suggestions.spec.ts"],
+      "components": [
+        "web/src/components/settings/SuggestionsSettings.tsx",
+        "web/src/components/settings/SuggestionPresetEditor.tsx",
+        "web/src/components/SuggestionsView.tsx"
+      ],
+      "notes": "A real worker publishes; preferences, presets, mappings and dismissals round-trip through the server, and read-only refuses every write."
+    },
+    {
+      "id": "settings.suggestions",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/settings-suggestions.spec.ts", "src/components/settings/__tests__/SuggestionsSettings.test.tsx"],
+      "components": [
+        "web/src/components/settings/SuggestionsSettings.tsx",
+        "web/src/components/settings/PluginSettingsSections.tsx",
+        "web/src/components/settings/SuggestionPresetEditor.tsx",
+        "web/src/components/settings/SuggestionLinkedRepos.tsx",
+        "web/src/components/settings/TemplateEditor.tsx",
+        "web/src/components/settings/suggestionsShared.tsx",
+        "web/src/components/settings/useSuggestionsSnapshot.ts",
+        "web/src/lib/suggestionTemplate.ts"
+      ]
+    },
+    {
       "id": "settings.advanced-fold",
       "kind": "vitest",
       "risk": "medium",
@@ -1239,9 +1317,16 @@
         "src/lib/statusSounds.test.ts",
         "src/hooks/useStatusSounds.test.ts",
         "src/hooks/useSessionStatusStream.test.ts",
-        "src/hooks/useSessions.test.ts"
+        "src/hooks/useSessions.test.ts",
+        "src/lib/soundPlayer.test.ts"
       ],
-      "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
+      "components": [
+        "web/src/lib/statusSounds.ts",
+        "web/src/hooks/useStatusSounds.ts",
+        "web/src/lib/soundPlayer.ts",
+        "web/src/App.tsx"
+      ],
+      "notes": "Sounds are built in and fetched per event from `/api/sounds/{event}`. They play through one Web Audio context that each click or key press resumes; a sound that comes while it is suspended stays silent and fires `onSoundBlocked` once. The tests fake the context, so they cover this logic, not a real browser's autoplay policy or App's toast. The Daemon plays the host sounds itself (`server::sound_cues`)."
     },
     {
       "id": "notifications.linked-toasts",
@@ -2316,18 +2401,6 @@
       ]
     },
     {
-      "id": "sidebar.restart-for-update",
-      "kind": "vitest",
-      "risk": "medium",
-      "specs": ["src/components/__tests__/SessionRowSiblingTargets.test.tsx", "src/lib/restartForUpdate.test.ts"],
-      "components": [
-        "web/src/components/sidebar/sessionActionTargets.ts",
-        "web/src/components/sidebar/SessionRowMenu.tsx",
-        "web/src/components/sidebar/SessionActions.tsx",
-        "web/src/lib/restartForUpdate.ts"
-      ]
-    },
-    {
       "id": "sidebar.recreate-container",
       "kind": "vitest",
       "risk": "high",
@@ -3107,6 +3180,22 @@
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx"
       ],
       "notes": "Tool input and output, tool errors, edit diffs, todo lists, the plan, answers, review prompts, sub-agent prompt and result, and install commands each copy their own content. Prompt, diff and error copies are pinned in a mocked browser; the rest are unit tests."
+    },
+    {
+      "id": "acp.resumed-subagent-status",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/subagents/model.test.ts",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/subagents/model.ts",
+        "web/src/lib/acpTypes.ts",
+        "web/src/components/acp/subagents/SubagentDetail.tsx"
+      ],
+      "notes": "A resumed background sub-agent shows running or waiting with Stop, and a second finish shows its stop reason with the first report under earlier output. Foreground and never-resumed cards are unchanged."
     },
     {
       "id": "acp.tool-group-chunking",
@@ -4702,6 +4791,33 @@
       "notes": "An empty transcript under a startup error says <Agent> isn't running. and, during a Retry, <Agent> isn't running yet., with no starter prompts either way; the hint and starter prompts come back once the Agent starts. Archived and trashed Sessions show neither."
     },
     {
+      "id": "settings.sandbox-login",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SandboxLoginDialog.test.tsx",
+        "src/components/__tests__/SettingsView.sandboxLogin.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/acpTypes.test.ts"
+      ],
+      "components": [
+        "web/src/components/SandboxLoginDialog.tsx",
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/SettingsView.tsx"
+      ],
+      "notes": "Dialog request payloads and error codes run against MSW handlers shaped like the server contract in docs/api.md; the banner shows Log in only for the login-required startup code, and a prompt kept for the login (409 with queued_id) raises that banner. The `command` and `profile` a login-required startup event or 409 names reach the login the banner starts in its start request, so a session of another profile logs in that profile's file. Dialogs for one credential share a login: each leaves it with its own lease, and a lost answer to a code is settled by the outcome the server holds for that login id. The Settings row hides the button on a read-only server, drops another profile's status while the new one loads, and re-reads after an uncertain credential save is confirmed; the dialog yields Tab and Escape to the passphrase prompt and keeps the login after a too-large code."
+    },
+    {
+      "id": "settings.sandbox-login.browser",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sandbox-login-dialog.spec.ts"],
+      "components": ["web/src/components/SandboxLoginDialog.tsx", "web/src/components/ElevationPrompt.tsx"],
+      "notes": "Initial focus, Tab order, focus and the typed value after a rejected code, Escape cancelling the login, and the real passphrase prompt a code raises sitting above the dialog and taking pointer clicks."
+    },
+    {
       "id": "acp.startup-error-banner-live",
       "kind": "live-playwright",
       "risk": "high",
@@ -5516,6 +5632,19 @@
       "components": ["web/src/components/acp/Composer.tsx", "web/src/hooks/useAcpSession.ts"]
     },
     {
+      "id": "acp.wide-screen-column",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/acp-wide-screen-column.spec.ts"],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/PromptStrips.tsx",
+        "web/src/components/acp/transcriptColumn.ts"
+      ],
+      "notes": "The transcript column widens to 72rem at 120rem viewports and 80rem at 150rem, and the composer keeps its left edge and width. #6019."
+    },
+    {
       "id": "acp.mid-turn-steering",
       "kind": "live-playwright",
       "risk": "high",
@@ -5862,7 +5991,7 @@
         "web/src/components/ContextMenu.tsx",
         "web/src/components/plugin/PluginSessionMenu.tsx"
       ],
-      "notes": "The Session menu groups its items into tiers (quick row, Rename, Run, Start another, More, Settings, plugin items, Move to Trash…) with a separator only between tiers that show something, in the popover and the mobile sheet. Restart to update and Recreate container carry a second line as their description. The Notify hint shows only for Off and All. The heading adds the Session's status and view, or a count for a row with several. Read-only leaves only Notify."
+      "notes": "The Session menu groups its items into tiers (quick row, Rename, Run, Start another, More, Settings, plugin items, Move to Trash…) with a separator only between tiers that show something, in the popover and the mobile sheet. Recreate container carries a second line as its description. The Notify hint shows only for Off and All. The heading adds the Session's status and view, or a count for a row with several. Read-only leaves only Notify."
     },
     {
       "id": "sidebar.context-menu-clamp",
@@ -6036,6 +6165,7 @@
       ],
       "components": [
         "web/src/components/Dashboard.tsx",
+        "web/src/components/DashboardSuggestions.tsx",
         "web/src/components/tour/TourRunner.tsx",
         "web/src/components/tour/tourRunnerStyles.ts",
         "web/src/lib/brandMark.ts",
@@ -6177,6 +6307,7 @@
         "web/src/components/settings/PluginIdentityIcon.tsx",
         "web/src/components/settings/PluginCard.tsx",
         "web/src/components/settings/PluginMarketplace.tsx",
+        "web/src/components/settings/pluginFlows.ts",
         "web/src/components/settings/PluginModal.tsx"
       ]
     },
