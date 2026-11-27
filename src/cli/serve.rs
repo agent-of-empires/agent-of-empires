@@ -1274,19 +1274,32 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
             DaemonProcessIdentity::Indeterminate
         }
         Ok(Some(out)) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
-        Ok(Some(out)) => {
-            // `ps` flattens argv; macOS has the structured argv for the renamed check.
-            let argv = crate::process::process_argv(pid as u32);
-            let args: Vec<&[u8]> = argv.iter().flatten().map(Vec::as_slice).collect();
-            classify_renamed_daemon(pid as u32, &args)
-                .or_else(|| {
-                    command_mentions_aoe_executable(&out.stdout)
-                        .then_some(DaemonProcessIdentity::Indeterminate)
-                })
-                .unwrap_or(DaemonProcessIdentity::Foreign)
-        }
+        // `ps` flattens argv; macOS has the structured argv for the renamed check.
+        Ok(Some(out)) => match crate::process::process_argv(pid as u32) {
+            Some(argv) => {
+                let args: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+                classify_renamed_daemon(pid as u32, &args)
+                    .or_else(|| {
+                        command_mentions_aoe_executable(&out.stdout)
+                            .then_some(DaemonProcessIdentity::Indeterminate)
+                    })
+                    .unwrap_or(DaemonProcessIdentity::Foreign)
+            }
+            None if ps_line_may_be_aoe(&out.stdout) => DaemonProcessIdentity::Indeterminate,
+            None => DaemonProcessIdentity::Foreign,
+        },
         Ok(None) | Err(_) => DaemonProcessIdentity::Indeterminate,
     }
+}
+
+/// With no structured argv to check, a `ps` line that carries the daemon-child
+/// tail or names an aoe executable is unverifiable, not foreign: `Foreign`
+/// would clear the launch state of a daemon that is still running.
+fn ps_line_may_be_aoe(command: &[u8]) -> bool {
+    command_mentions_aoe_executable(command)
+        || command
+            .windows(b" serve --daemon-child".len())
+            .any(|window| window == b" serve --daemon-child")
 }
 
 /// Loose companion to `command_is_aoe_serve`, for the `ps` path only. `ps`
@@ -4273,6 +4286,27 @@ mod tests {
             assert_eq!(
                 command_mentions_aoe_executable(command),
                 expected,
+                "{}",
+                String::from_utf8_lossy(command)
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_argv_is_unverifiable_only_for_aoe_like_ps_lines() {
+        let cases: &[(&[u8], bool)] = &[
+            (
+                b"/Users/me/My Apps/aoe-darwin-arm64 serve --daemon-child --port 1",
+                true,
+            ),
+            (b"/usr/local/bin/aoe serve --daemon-child", true),
+            (b"/usr/bin/vim src/aoe.rs", false),
+            (b"/usr/bin/python3 manage.py runserver", false),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                ps_line_may_be_aoe(command),
+                *expected,
                 "{}",
                 String::from_utf8_lossy(command)
             );
