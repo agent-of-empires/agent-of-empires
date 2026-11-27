@@ -13,6 +13,19 @@ import type {
 } from "../../lib/acpTypes";
 import { OFFLINE_TITLE, useServerDown } from "../../lib/connectionState";
 import { isImeComposing } from "../../lib/ime";
+import { INPUT } from "../../lib/surfaces";
+import {
+  PROMPT_CARD,
+  PROMPT_CARD_HEADER,
+  PROMPT_CHOICE,
+  PROMPT_CHOICE_OFF,
+  PROMPT_CHOICE_ON,
+  PROMPT_ERROR,
+  PROMPT_KIND,
+  PROMPT_PRIMARY,
+  PROMPT_REFUSE,
+  PROMPT_SECONDARY,
+} from "./promptCard";
 
 interface Props {
   elicitation: Elicitation;
@@ -198,7 +211,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
 
   return (
     <form
-      className="my-2 overflow-hidden rounded-md border border-surface-800/60 bg-surface-800/50 text-sm"
+      className={`${PROMPT_CARD} border-surface-700/50 bg-surface-850`}
       role="alertdialog"
       aria-label="Question from the agent"
       noValidate
@@ -207,18 +220,18 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
         submit();
       }}
     >
-      <div className="flex w-full items-center gap-2 border-b border-surface-800/60 px-3 py-2">
+      <div className={PROMPT_CARD_HEADER}>
         <HelpCircle className="h-3.5 w-3.5 shrink-0 text-brand-500" />
-        <span className="shrink-0 text-[11px] uppercase tracking-wider text-brand-500">Question</span>
+        <span className={PROMPT_KIND}>Question</span>
         {elicitation.title && (
           <span className="min-w-0 flex-1 truncate text-xs text-text-secondary">{elicitation.title}</span>
         )}
       </div>
 
       <div className="flex flex-col gap-4 px-3 py-3">
-        <p className="whitespace-pre-wrap break-words text-xs text-text-secondary">{elicitation.message}</p>
+        <p className="whitespace-pre-wrap break-words text-[13px] text-text-primary">{elicitation.message}</p>
         {elicitation.description && (
-          <p className="whitespace-pre-wrap break-words text-[11px] text-text-dim">{elicitation.description}</p>
+          <p className="whitespace-pre-wrap break-words text-[12px] text-text-dim">{elicitation.description}</p>
         )}
         {elicitation.questions.map((q) => (
           <QuestionField
@@ -233,26 +246,21 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
         ))}
       </div>
 
-      {error && <p className="px-3 pb-1 text-xs text-rose-400">{error}</p>}
-      {phase === "rolled-back" && (
-        <p className="px-3 pb-1 text-xs text-rose-400">Could not reach the server. Try again.</p>
-      )}
-      {offline && <p className="px-3 pb-1 text-xs text-status-error">{OFFLINE_TITLE}</p>}
+      {error && <p className={`${PROMPT_ERROR} pb-1`}>{error}</p>}
+      {phase === "rolled-back" && <p className={`${PROMPT_ERROR} pb-1`}>Could not reach the server. Try again.</p>}
+      {offline && <p className={`${PROMPT_ERROR} pb-1`}>{OFFLINE_TITLE}</p>}
 
-      <div className="flex items-stretch gap-1.5 border-t border-surface-800/60 p-2">
+      <div className="flex items-stretch gap-1.5 border-t border-surface-700/40 p-2">
         <button
           type="submit"
-          className={[
-            "flex flex-1 items-center justify-center gap-1.5 rounded-md py-2 px-3 text-xs font-medium text-white",
-            phase === "submitting" ? "bg-brand-700 opacity-70 cursor-wait" : "bg-brand-600 hover:bg-brand-500",
-          ].join(" ")}
+          className={`${PROMPT_PRIMARY} flex-1 ${phase === "submitting" ? "opacity-70 cursor-wait" : disabled ? "opacity-60" : ""}`}
           disabled={disabled}
         >
           {phase === "submitting" ? "Submitting…" : "Submit"}
         </button>
         <button
           type="button"
-          className="flex items-center justify-center rounded-md border border-surface-700 bg-surface-800 py-2 px-3 text-xs font-medium text-text-secondary hover:bg-surface-700 disabled:opacity-60"
+          className={`${PROMPT_SECONDARY} disabled:opacity-60`}
           disabled={disabled}
           onClick={() => void run({ action: "decline" })}
           title="Skip this question; the agent continues without an answer"
@@ -261,7 +269,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
         </button>
         <button
           type="button"
-          className="flex items-center justify-center rounded-md border border-surface-700 bg-surface-800 py-2 px-3 text-xs font-medium text-text-secondary hover:border-rose-700/60 hover:bg-rose-950/30 hover:text-rose-300 disabled:opacity-60"
+          className={`${PROMPT_REFUSE} disabled:opacity-60`}
           disabled={disabled}
           onClick={() => void run({ action: "cancel" })}
           title="Cancel the agent's tool call"
@@ -289,28 +297,25 @@ function QuestionField({
   onToggleMulti: (value: string) => void;
 }) {
   const groupName = useMemo(() => `elicit-${question.field_key}`, [question.field_key]);
-  const inputClass =
-    "w-full rounded-md border border-surface-700 bg-surface-900 px-2 py-1.5 text-xs text-text-primary outline-none focus:border-brand-600 disabled:opacity-60";
+  const inputClass = INPUT;
 
   return (
     <fieldset className="min-w-0 border-0 p-0">
       {question.kind !== "boolean" && question.title && (
-        <legend className="mb-1 text-xs font-medium text-text-secondary">
+        <legend className="mb-1 text-[13px] font-medium text-text-primary">
           {question.title}
-          {question.required && <span className="ml-1 text-rose-400">*</span>}
+          {question.required && <span className="ml-1 text-status-error-text">*</span>}
         </legend>
       )}
       {question.kind !== "boolean" && question.description && (
-        <p className="mb-1.5 text-[11px] text-text-dim">{question.description}</p>
+        <p className="mb-1.5 text-[12px] text-text-dim">{question.description}</p>
       )}
 
       {question.kind === "boolean" ? (
         <label
           className={[
-            "flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
-            single === "true"
-              ? "border-brand-600 bg-brand-700/15 text-text-primary"
-              : "border-surface-700 bg-surface-900 text-text-secondary hover:bg-surface-800",
+            `flex items-center gap-2 px-2.5 py-1.5 text-[13px] ${PROMPT_CHOICE}`,
+            single === "true" ? PROMPT_CHOICE_ON : PROMPT_CHOICE_OFF,
             disabled ? "cursor-not-allowed opacity-60" : "",
           ].join(" ")}
         >
@@ -323,7 +328,7 @@ function QuestionField({
           />
           <span className="min-w-0 break-words">
             {question.title || "Yes"}
-            {question.required && <span className="ml-1 text-rose-400">*</span>}
+            {question.required && <span className="ml-1 text-status-error-text">*</span>}
           </span>
         </label>
       ) : isNumeric(question.kind) ? (
@@ -373,10 +378,8 @@ function QuestionField({
               <div key={opt.value}>
                 <label
                   className={[
-                    "flex cursor-pointer items-start gap-2 rounded-md border px-2 py-1.5 text-xs",
-                    checked
-                      ? "border-brand-600 bg-brand-700/15 text-text-primary"
-                      : "border-surface-700 bg-surface-900 text-text-secondary hover:bg-surface-800",
+                    `flex items-start gap-2 px-2.5 py-1.5 text-[13px] ${PROMPT_CHOICE}`,
+                    checked ? PROMPT_CHOICE_ON : PROMPT_CHOICE_OFF,
                     disabled ? "cursor-not-allowed opacity-60" : "",
                   ].join(" ")}
                 >
@@ -390,13 +393,13 @@ function QuestionField({
                   />
                   <span className="min-w-0 break-words">
                     <span className={description ? "font-medium" : undefined}>{label}</span>
-                    {description && <span className="block text-[11px] text-text-dim">{description}</span>}
+                    {description && <span className="block text-[12px] text-text-dim">{description}</span>}
                   </span>
                 </label>
                 {opt.preview && (
                   <details className="mt-1 ml-6 text-[11px] text-text-subtle">
                     <summary className="cursor-pointer">Preview</summary>
-                    <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-surface-700 bg-surface-900 p-2 font-mono">
+                    <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-surface-700/50 bg-surface-950 p-2 font-mono">
                       {opt.preview}
                     </pre>
                   </details>

@@ -1094,6 +1094,38 @@ pub(super) async fn settle_suggestion_link(
     }
 }
 
+/// Counts a Session started from a suggestion, by how it started and by the item's kind.
+async fn record_suggestion_start(
+    state: &Arc<AppState>,
+    origin: &crate::session::SuggestionOrigin,
+    wizard: bool,
+) {
+    use crate::telemetry::feature_use::{record, FeatureUse};
+    record(if wizard {
+        FeatureUse::SuggestStartChanges
+    } else {
+        FeatureUse::SuggestStart
+    });
+    let (Some(host), Some(provider)) = (
+        state.plugin_host.clone(),
+        crate::plugin::suggestions::providers()
+            .into_iter()
+            .find(|p| p.id == origin.provider_id),
+    ) else {
+        return;
+    };
+    let id = origin.id.clone();
+    let criterion = tokio::task::spawn_blocking(move || {
+        host.with_suggestions_db(|conn, profile| {
+            crate::plugin::suggestions::find_item_with_mapping(conn, profile, &provider, &id)
+        })
+    })
+    .await;
+    if let Ok(Ok(Some((item, _)))) = criterion {
+        crate::telemetry::suggestions::record_kind(&origin.provider_id, &item.criterion);
+    }
+}
+
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
@@ -1926,6 +1958,7 @@ pub(crate) async fn create_session_with(
     if spec.suggestion.is_some() {
         spec.session_id = Some(crate::session::generate_id());
     }
+    let wizard = matches!(via, crate::plugin::suggestions::StartedVia::Wizard);
     let link = match claim_suggestion_link(
         &state,
         spec.suggestion.as_ref(),
@@ -1975,6 +2008,9 @@ pub(crate) async fn create_session_with(
         // Settled here, not in the handler, so a client that dropped mid-create
         // cannot leave the claim pending.
         settle_suggestion_link(&task_state, link.as_ref(), result.is_ok()).await;
+        if let (true, Some((origin, _, _))) = (result.is_ok(), link.as_ref()) {
+            record_suggestion_start(&task_state, origin, wizard).await;
+        }
         result
     })
     .await

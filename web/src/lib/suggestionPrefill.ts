@@ -21,7 +21,7 @@ export function toWizardPrefill(
     useStructuredView: p.view ? p.view === "structured" : undefined,
     useWorktree: p.worktree,
     yoloMode: p.yolo,
-    sandboxEnabled: p.sandbox,
+    useSandbox: p.sandbox,
     // A blank initial_prompt is rejected by POST /api/sessions, so send none.
     initialPrompt: p.initial_prompt || undefined,
   };

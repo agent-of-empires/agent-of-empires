@@ -29,6 +29,7 @@ export function useTerminalInput({
   uploadPastedImage,
   captureWriteAdmission,
   onTabEscape,
+  onSubmit,
 }: {
   active: boolean;
   inputRef: RefObject<HTMLTextAreaElement | null>;
@@ -41,14 +42,18 @@ export function useTerminalInput({
   captureWriteAdmission: () => () => boolean;
   /** Takes a plain Tab instead of the pane when it returns true. */
   onTabEscape?: () => boolean;
+  /** Runs after a plain Enter reaches the pane; Shift+Enter and other chords are not submits. */
+  onSubmit?: () => void;
 }) {
   const composingRef = useRef(false);
   const activeRef = useRef(active);
   const onTabEscapeRef = useRef(onTabEscape);
+  const onSubmitRef = useRef(onSubmit);
   useLayoutEffect(() => {
     activeRef.current = active;
     onTabEscapeRef.current = onTabEscape;
-  }, [active, onTabEscape]);
+    onSubmitRef.current = onSubmit;
+  }, [active, onTabEscape, onSubmit]);
 
   const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
   useEffect(() => {
@@ -86,8 +91,11 @@ export function useTerminalInput({
         case "edit":
           return sendKeys("\x7f".repeat(input.deleted) + input.data);
         case "insertLineBreak":
-        case "insertParagraph":
-          return sendKeys("\r");
+        case "insertParagraph": {
+          const sent = sendKeys("\r");
+          if (sent) onSubmitRef.current?.();
+          return sent;
+        }
         case "insertFromPaste":
           // The paste bypasses the textarea, so the retained IME syllable no longer mirrors the line.
           invalidateRetainedImeContext(inputRef.current);
@@ -119,7 +127,7 @@ export function useTerminalInput({
         e.preventDefault();
         // Enter submits and other special keys rewrite the line, so the IME shadow is stale either way.
         invalidateRetainedImeContext(textareaOf(e));
-        sendData(seq);
+        if (sendData(seq) && e.key === "Enter" && plain) onSubmitRef.current?.();
         return;
       }
       // Ctrl+Shift+C copies the rendered selection; the focused textarea has nothing to copy.

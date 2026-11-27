@@ -3,6 +3,8 @@ import { createProfile, deleteProfile, fetchProfiles, renameProfile } from "../.
 import type { ProfileInfo } from "../../lib/types";
 import { validateProfileName } from "../profiles/profileName";
 import { isImeComposing } from "../../lib/ime";
+import { INPUT, MENU } from "../../lib/surfaces";
+import { BUTTON_DANGER_GHOST_SM, BUTTON_GHOST_SM, BUTTON_PRIMARY_SM } from "../../lib/surfaces";
 
 interface Props {
   selectedProfile: string;
@@ -77,14 +79,14 @@ export function ProfileSelector({ selectedProfile, onSelect, onRenamed }: Props)
   return (
     <div className="relative" ref={panelRef}>
       <div className="flex items-center gap-2 flex-nowrap">
-        <label htmlFor="settings-profile-select" className="text-sm font-medium text-text-secondary shrink-0">
+        <label htmlFor="settings-profile-select" className="text-[15px] md:text-sm text-text-primary shrink-0">
           Editing profile
         </label>
         <select
           id="settings-profile-select"
           value={selectedProfile}
           onChange={(e) => onSelect(e.target.value)}
-          className="bg-surface-900 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary focus:border-brand-600 focus:outline-none w-32 sm:w-40 shrink"
+          className={`${INPUT} !w-32 sm:!w-40 shrink`}
         >
           {profiles.map((p) => (
             <option key={p.name} value={p.name}>
@@ -94,7 +96,7 @@ export function ProfileSelector({ selectedProfile, onSelect, onRenamed }: Props)
         </select>
         <button
           onClick={() => openInput("create")}
-          className="text-sm text-brand-500 hover:text-brand-400 cursor-pointer shrink-0 font-medium px-1.5"
+          className={`${BUTTON_GHOST_SM} shrink-0`}
           title="Create new profile"
         >
           + New
@@ -103,7 +105,7 @@ export function ProfileSelector({ selectedProfile, onSelect, onRenamed }: Props)
           <>
             <button
               onClick={() => openInput("rename", selectedProfile)}
-              className="text-xs text-text-dim hover:text-text-primary cursor-pointer"
+              className={BUTTON_GHOST_SM}
               title="Rename profile"
             >
               Rename
@@ -111,7 +113,7 @@ export function ProfileSelector({ selectedProfile, onSelect, onRenamed }: Props)
             {(!activeProfile || activeProfile.name !== selectedProfile) && (
               <button
                 onClick={() => handleDelete(selectedProfile)}
-                className="text-xs text-text-dim hover:text-red-400 cursor-pointer"
+                className={BUTTON_DANGER_GHOST_SM}
                 title="Delete profile"
               >
                 Delete
@@ -122,7 +124,7 @@ export function ProfileSelector({ selectedProfile, onSelect, onRenamed }: Props)
       </div>
 
       {mode && (
-        <div className="absolute right-0 top-full mt-1 z-10 bg-surface-850 border border-surface-700 rounded-lg p-3 shadow-lg min-w-[280px]">
+        <div className={`absolute right-0 top-full mt-1 z-10 ${MENU.replace("py-1", "p-3")} min-w-[280px]`}>
           <div className="flex gap-2">
             <input
               type="text"
@@ -137,16 +139,13 @@ export function ProfileSelector({ selectedProfile, onSelect, onRenamed }: Props)
               }}
               placeholder={mode === "create" ? "Profile name" : "New name"}
               autoFocus
-              className={`flex-1 bg-surface-900 border rounded-md px-2 py-1.5 text-sm text-text-primary focus:outline-none ${error ? "border-red-500" : "border-surface-700 focus:border-brand-600"}`}
+              className={`${INPUT} !w-auto flex-1 ${error ? "!border-status-error" : ""}`}
             />
-            <button
-              onClick={submitInput}
-              className="px-3 py-1.5 rounded-md bg-brand-600 hover:bg-brand-500 text-xs font-medium text-surface-950 cursor-pointer"
-            >
+            <button onClick={submitInput} className={BUTTON_PRIMARY_SM}>
               {mode === "create" ? "Create" : "Rename"}
             </button>
           </div>
-          {error && <div className="text-xs text-red-400 mt-1">{error}</div>}
+          {error && <div className="text-[13px] text-status-error-text mt-1">{error}</div>}
         </div>
       )}
     </div>

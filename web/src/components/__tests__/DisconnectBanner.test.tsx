@@ -42,7 +42,7 @@ describe("DisconnectBanner", () => {
     const { container } = render(<Banner />);
     expect(container.firstChild).toBeNull();
     act(() => setServerDown(true));
-    expect(screen.getByRole("alert").textContent).toBe("Daemon unreachable. Reconnecting…");
+    expect(screen.getByText("Daemon unreachable. Reconnecting…")).toBeTruthy();
     act(() => setServerDown(false));
 
     const status = screen.getByRole("status");
@@ -74,6 +74,18 @@ describe("DisconnectBanner", () => {
     expect(screen.getByRole("status")).toBeTruthy();
     act(() => vi.advanceTimersByTime(1));
     expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("names a lost network and offers Try again, which reloads", () => {
+    const reload = vi.fn();
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    vi.spyOn(window, "location", "get").mockReturnValue({ ...window.location, reload });
+    render(<Banner />);
+    act(() => setServerDown(true));
+    expect(screen.getByText("Offline. Reconnecting…")).toBeTruthy();
+    act(() => screen.getByRole("button", { name: "Try again" }).click());
+    expect(reload).toHaveBeenCalledOnce();
+    vi.restoreAllMocks();
   });
 
   it("releases the flash timer and the subscription on unmount mid-flash", () => {

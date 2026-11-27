@@ -1,4 +1,5 @@
 /** "Dashboard updated, reload" banner. `version` is the Daemon's, which served the new bundle. */
+import { BUTTON_INLINE } from "../lib/surfaces";
 export function DashboardUpdateBanner({ version }: { version: string }) {
   return (
     <div
@@ -8,11 +9,7 @@ export function DashboardUpdateBanner({ version }: { version: string }) {
     >
       <span className="w-1.5 h-1.5 rounded-full bg-brand-400 shrink-0" />
       <span>Dashboard updated to v{version}.</span>
-      <button
-        type="button"
-        onClick={() => window.location.reload()}
-        className="underline hover:text-brand-200 cursor-pointer"
-      >
+      <button type="button" onClick={() => window.location.reload()} className={BUTTON_INLINE}>
         Reload now
       </button>
     </div>

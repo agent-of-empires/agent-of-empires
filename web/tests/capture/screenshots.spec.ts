@@ -132,7 +132,7 @@ base("sidebar grouped by session status", async ({ page }, testInfo) => {
     await page.getByRole("link").filter({ hasText: "api-server" }).first().waitFor({ timeout: 15_000 });
 
     // Status grouping renders one bucket per execution status, each holding its own session.
-    await page.getByTestId("sidebar-axis-toggle").click();
+    await page.getByTestId("sidebar-view-toggle").click();
     await page.getByTestId("sidebar-axis-option-status").click();
     await page.getByTestId("sidebar-group-header").first().waitFor({ timeout: 10_000 });
     await shot(page, "web/sidebar-grouping.png");

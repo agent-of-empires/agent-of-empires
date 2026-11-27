@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { FROM_OTHER_PEOPLE_NOTE, fromOtherPeople } from "../../lib/suggestionKinds";
 import { DndContext, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
 import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
@@ -159,6 +159,15 @@ export function SuggestionsSettings({
   const [linkedCount, setLinkedCount] = useState<number | null>(null);
   // Re-read on returning from Linked repos, where links change.
   const onList = view === null;
+  // The control that opened a sub-view gets focus back when the list returns.
+  const openedFrom = useRef<string | null>(null);
+  // A new list element mounts each time the list returns, so this runs once per return.
+  const listRef = useCallback((el: HTMLDivElement | null) => {
+    if (!el || !openedFrom.current) return;
+    el.querySelector<HTMLElement>(`[data-focus-key="${openedFrom.current}"]`)?.focus();
+    openedFrom.current = null;
+  }, []);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   useEffect(() => {
     if (!onList) return;
     let live = true;
@@ -222,6 +231,8 @@ export function SuggestionsSettings({
     if (provider && source) {
       return (
         <SuggestionPresetEditor
+          // The draft belongs to one kind; another focus gets a fresh editor.
+          key={`${provider.id}/${source.criterion}`}
           provider={provider}
           source={source}
           entry={presetOf(provider.id, source.criterion)}
@@ -252,7 +263,7 @@ export function SuggestionsSettings({
     : [...REFRESH_OPTIONS, prefs.refresh_minutes].sort((a, b) => a - b);
 
   return (
-    <div className="space-y-6" title={offline ? OFFLINE_TITLE : undefined}>
+    <div ref={listRef} className="space-y-6" title={offline ? OFFLINE_TITLE : undefined}>
       {failed && (
         <div
           role="alert"
@@ -355,8 +366,12 @@ export function SuggestionsSettings({
                   <button
                     type="button"
                     aria-label={`Edit ${source.label}`}
+                    data-focus-key={`kind:${provider.id}/${source.criterion}`}
                     className={BUTTON}
-                    onClick={() => setView({ providerId: provider.id, criterion: source.criterion })}
+                    onClick={() => {
+                      openedFrom.current = `kind:${provider.id}/${source.criterion}`;
+                      setView({ providerId: provider.id, criterion: source.criterion });
+                    }}
                   >
                     Edit
                   </button>
@@ -391,7 +406,7 @@ export function SuggestionsSettings({
           </fieldset>
         ))}
 
-      <details className="group">
+      <details className="group" open={advancedOpen} onToggle={(e) => setAdvancedOpen(e.currentTarget.open)}>
         <summary className="cursor-pointer font-mono text-[11px] uppercase tracking-[0.14em] text-text-muted">
           Advanced
         </summary>
@@ -419,7 +434,15 @@ export function SuggestionsSettings({
                 : `${linkedCount} ${linkedCount === 1 ? "repo" : "repos"} linked to Projects.`
             }
           >
-            <button type="button" className={BUTTON} onClick={() => setView("linked")}>
+            <button
+              type="button"
+              data-focus-key="linked"
+              className={BUTTON}
+              onClick={() => {
+                openedFrom.current = "linked";
+                setView("linked");
+              }}
+            >
               Edit
             </button>
           </Row>

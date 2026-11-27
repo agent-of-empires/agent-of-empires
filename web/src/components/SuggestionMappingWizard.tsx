@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { BUTTON_PRIMARY } from "../lib/surfaces";
 import { fetchSuggestionMappings, fetchSuggestionProjects, putSuggestionMapping } from "../lib/api";
 import { proposeMappings, type MappingProposal } from "../lib/mappingProposals";
 import { notifySuggestionsChanged } from "../lib/suggestionEvents";
 import type { SuggestionItem, SuggestionProject, SuggestionProvider } from "../lib/types";
-import { BRAND_BUTTON, CancelButton, Dialog } from "./Dialog";
+import { CancelButton, Dialog } from "./Dialog";
 import { useConfirmKeys, useDialogFocus } from "./dialogHooks";
 
 interface Props {
@@ -145,7 +146,7 @@ export function SuggestionMappingWizard({ items, providers, disabled = false, on
             type="button"
             onClick={() => void save()}
             disabled={busy || disabled || chosen.length === 0}
-            className={`rounded-md px-3 py-1.5 text-sm font-medium disabled:opacity-50 ${BRAND_BUTTON}`}
+            className={BUTTON_PRIMARY}
           >
             {busy ? "Saving…" : `Link ${chosen.length} ${chosen.length === 1 ? "repo" : "repos"}`}
           </button>

@@ -18,6 +18,7 @@ export interface ShortcutActions {
   onToggleSidebar: () => void;
   onToggleRightPanel: () => void;
   onToggleTerminalFocus: () => void;
+  onSwitchTerminal: () => void;
 }
 
 export type ShortcutId =
@@ -26,6 +27,7 @@ export type ShortcutId =
   | "sidebarFocus"
   | "rightPanel"
   | "terminalFocus"
+  | "terminalSwitcher"
   | "new"
   | "newScratch"
   | "jumpAttention"
@@ -152,6 +154,21 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
       code: "Backquote",
       preventDefault: true,
       stopPropagation: false,
+    },
+  },
+  {
+    id: "terminalSwitcher",
+    action: "onSwitchTerminal",
+    description: "Switch paired terminal",
+    chord: { mod: true, shift: true, base: "`" },
+    trigger: {
+      scope: "global",
+      mod: true,
+      shift: true,
+      alt: false,
+      code: "Backquote",
+      preventDefault: true,
+      stopPropagation: true,
     },
   },
   {

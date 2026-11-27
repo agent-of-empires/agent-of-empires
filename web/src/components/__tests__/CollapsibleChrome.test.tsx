@@ -10,7 +10,6 @@ describe("collapsible chrome", () => {
     const tree = (collapsed: boolean) => (
       <>
         <ChromeCollapseHandle
-          edge="bottom"
           collapsed={collapsed}
           onToggle={() => {}}
           collapseLabel="Collapse message composer"
@@ -36,23 +35,20 @@ describe("collapsible chrome", () => {
   });
 
   it("labels the handle for the action it performs and points the triangle at it", () => {
-    // (edge, collapsed) -> (accessible label, triangle points up)
+    // collapsed -> (accessible label, triangle points up)
     const cases = [
-      ["top" as const, false, "Collapse conversation header", true],
-      ["top" as const, true, "Expand conversation header", false],
-      ["bottom" as const, false, "Collapse message composer", false],
-      ["bottom" as const, true, "Expand message composer", true],
-    ];
-    for (const [edge, collapsed, label, pointsUp] of cases) {
+      [false, "Collapse message composer", false],
+      [true, "Expand message composer", true],
+    ] as const;
+    for (const [collapsed, label, pointsUp] of cases) {
       const onToggle = vi.fn();
       const { unmount } = render(
         <ChromeCollapseHandle
-          edge={edge}
-          collapsed={collapsed as boolean}
+          collapsed={collapsed}
           onToggle={onToggle}
-          collapseLabel={edge === "top" ? "Collapse conversation header" : "Collapse message composer"}
-          expandLabel={edge === "top" ? "Expand conversation header" : "Expand message composer"}
-          controlsId={edge === "top" ? "conversation-header" : "conversation-composer"}
+          collapseLabel="Collapse message composer"
+          expandLabel="Expand message composer"
+          controlsId="conversation-composer"
           testId="handle"
         />,
       );

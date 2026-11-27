@@ -46,9 +46,9 @@ describe("expanding a shared-worktree row into its sessions", () => {
     expect(rows()[1]!.textContent).toContain("first");
     expect(rows()[2]!.textContent).toContain("second");
     // The group header keeps its own padding; its children get the indented row's.
-    expect(rows()[0]!.className).not.toContain("pl-6");
-    expect(rows()[1]!.className).toContain("pl-6");
-    expect(rows()[2]!.className).toContain("pl-6");
+    expect(rows()[0]!.className).not.toContain("pl-5");
+    expect(rows()[1]!.className).toContain("pl-5");
+    expect(rows()[2]!.className).toContain("pl-5");
 
     expand();
     expect(rows()).toHaveLength(1);

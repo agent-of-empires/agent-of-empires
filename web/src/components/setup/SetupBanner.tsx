@@ -2,6 +2,7 @@ import { ArrowRight, X } from "lucide-react";
 import { Link } from "react-router-dom";
 import type { SetupStep } from "../../lib/api";
 import { SETUP_STEP_INFO } from "../../lib/setup";
+import { BUTTON_INLINE } from "../../lib/surfaces";
 
 interface Props {
   /** Every step, for the count. */
@@ -24,7 +25,7 @@ export function SetupBanner({ steps, open, onDismiss }: Props) {
         <span className="text-sm text-text-secondary">
           {done} of {steps.length} done. Nothing here blocks you.
         </span>
-        <Link to="/setup" className="ml-auto inline-flex items-center gap-1 text-sm text-brand-500 hover:underline">
+        <Link to="/setup" className={`${BUTTON_INLINE} ml-auto`}>
           Resume setup <ArrowRight size={12} />
         </Link>
         <button

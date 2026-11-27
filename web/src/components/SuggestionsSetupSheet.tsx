@@ -7,10 +7,15 @@ import {
   type PluginDiscoveryResult,
 } from "../lib/api";
 import { sourceLabel } from "../lib/featuredSuggestionSources";
+import { reportFeatureUse } from "../lib/featureUse";
+import { useReportFeatureOnce } from "../hooks/useReportFeatureOnce";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 import type { SuggestionSetupCheck, SuggestionsSnapshot } from "../lib/types";
 import { PluginInstallConsentModal } from "./settings/PluginInstallConsentModal";
 import { PluginJobProgressModal } from "./settings/PluginJobProgressModal";
 import { sourceFromCommand, usePluginMarketplace, type PluginJobRef } from "./settings/pluginFlows";
+import { BUTTON_INLINE } from "../lib/surfaces";
+import { CloseButton } from "./Dialog";
 
 interface Props {
   /** Featured providers that declare `[suggestions]` and are not installed yet. */
@@ -24,7 +29,6 @@ interface Props {
 type Step = "pick" | "checks" | "done";
 
 const POLL_MS = 2000;
-const LINK = "cursor-pointer text-brand-500 hover:underline";
 const GHOST = "h-8 rounded-md px-3 text-xs text-text-secondary hover:bg-surface-800 disabled:opacity-50";
 const PRIMARY =
   "h-8 rounded-md bg-brand-500 px-3 text-xs font-medium text-black hover:bg-brand-400 disabled:opacity-50";
@@ -38,12 +42,25 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
   // Plugin ids this sheet installed; only these are turned on, not one another client installed meanwhile.
   const [installedIds, setInstalledIds] = useState<string[]>([]);
   const approvedId = useRef<string | null>(null);
+  // The install dialogs over the sheet are aria-modal too, so the trap leaves Tab to them.
+  const dialog = useRef<HTMLDivElement>(null);
+  useFocusTrap(() => dialog.current, { restoreFocus: true });
+  useEffect(() => dialog.current?.focus(), []);
   const market = usePluginMarketplace(setJob);
   const installing = queue.length > 0;
   const toDone = useCallback(() => setStep("done"), []);
 
+  useReportFeatureOnce("suggest_setup_opened", true);
+  const finished = useCallback(() => {
+    reportFeatureUse("suggest_setup_finished");
+    onFinished();
+  }, [onFinished]);
+  const finishLater = () => {
+    reportFeatureUse("suggest_setup_later");
+    onFinished();
+  };
   // Once a plugin is installed, closing finishes the sheet so the hint does not offer the same install again.
-  const close = step === "pick" ? onClose : onFinished;
+  const close = step === "pick" ? onClose : finished;
 
   useEffect(() => {
     if (step === "done") return;
@@ -94,7 +111,9 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-surface-950/80 p-4"
+      ref={dialog}
+      tabIndex={-1}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-surface-950/80 p-4 outline-none"
       role="dialog"
       aria-modal="true"
       aria-label={title}
@@ -103,19 +122,7 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
       <div className="max-h-[90vh] w-full max-w-[560px] overflow-auto rounded-lg border border-surface-700 bg-surface-900">
         <div className="flex items-center justify-between border-b border-surface-700/40 px-4 py-3">
           <h2 className="text-[15px] font-semibold text-text-bright">{title}</h2>
-          {step !== "done" && (
-            <button
-              type="button"
-              title="Close"
-              aria-label="Close"
-              disabled={installing}
-              onClick={close}
-              className="size-8 rounded-md text-text-dim hover:bg-surface-800 disabled:opacity-50"
-              data-testid="suggestions-setup-close"
-            >
-              ✕
-            </button>
-          )}
+          {step !== "done" && <CloseButton onClick={close} disabled={installing} testId="suggestions-setup-close" />}
         </div>
         {step === "pick" && (
           <PickStep
@@ -129,14 +136,14 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
             onOpenMarketplace={onOpenMarketplace}
           />
         )}
-        {step === "checks" && <ChecksStep ids={installedIds} onDone={toDone} onFinishLater={onFinished} />}
+        {step === "checks" && <ChecksStep ids={installedIds} onDone={toDone} onFinishLater={finishLater} />}
         {step === "done" && (
           <>
             <p className="px-4 py-4 text-sm text-text-secondary">
               You'll see up to 3 on your homepage. Choose a suggestion and start it to keep the work going.
             </p>
             <Footer note="Turn them off any time in Settings › Suggestions.">
-              <button type="button" className={PRIMARY} onClick={onFinished} data-testid="suggestions-setup-show">
+              <button type="button" className={PRIMARY} onClick={finished} data-testid="suggestions-setup-show">
                 Show suggestions
               </button>
             </Footer>
@@ -226,7 +233,7 @@ function PickStep(p: {
       <div className="border-t border-surface-700/40 px-4 py-3 text-xs">
         <button
           type="button"
-          className={LINK}
+          className={BUTTON_INLINE}
           title="Opens Settings › Plugins › Marketplace. Other sources there, like Linear, are unvetted"
           onClick={p.onOpenMarketplace}
           data-testid="suggestions-setup-marketplace"
