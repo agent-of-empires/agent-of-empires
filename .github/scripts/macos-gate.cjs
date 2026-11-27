@@ -24,6 +24,7 @@ const QUEUE_ONLY = ['Cargo.lock'];
 // pulls.listFiles stops listing here.
 const FILE_LIMIT = 3000;
 const CFG = /target_os\s*=\s*"macos"/;
+const MACOS_CHECK = 'Cargo Test (macos)';
 
 function sensitivePath(path, queue) {
   if (!path || LINUX_ONLY.includes(path)) return false;
@@ -41,18 +42,22 @@ function sensitiveFile(files, queue) {
       /^[+-](?![+-]{2} )/.test(line) && CFG.test(line)));
 }
 
-async function changedFiles(github, context, pr, queue) {
-  if (pr) {
-    return github.paginate(github.rest.pulls.listFiles, {
-      ...context.repo, pull_number: pr.number, per_page: 100,
-    });
-  }
-  // base_sha is the entry ahead of this one, so this lists only this PR.
+// Whether the entry sits directly on its target branch. Each entry's base_sha
+// is the entry ahead of it, so diff against the branch instead.
+async function aloneInQueue(github, context, queue) {
   const { data } = await github.rest.repos.compareCommitsWithBasehead({
-    ...context.repo, basehead: `${queue.base_sha}...${queue.head_sha}`,
+    ...context.repo, basehead: `${queue.base_ref}...${queue.head_sha}`,
   });
-  // The compare API lists at most 300 files.
-  return data.files.length >= 300 ? null : data.files;
+  return data.ahead_by === 1;
+}
+
+// Whether the PR's own run already passed macOS on this head.
+async function passedOnHead(github, context, sha) {
+  const { data } = await github.rest.checks.listForRef({
+    ...context.repo, ref: sha, check_name: MACOS_CHECK, filter: 'latest',
+  });
+  const runs = data.check_runs.filter(r => r.app?.slug === 'github-actions');
+  return runs.length > 0 && runs.every(r => r.conclusion === 'success');
 }
 
 module.exports = async function macosGate({ github, context, core, queueRef }) {
@@ -63,9 +68,29 @@ module.exports = async function macosGate({ github, context, core, queueRef }) {
   const number = pr?.number ?? Number(/\/pr-(\d+)-[0-9a-f]+$/.exec(queueRef)?.[1]);
   if (!number) return run(`no PR number in ${queueRef}`);
   const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
-  if (current.labels.some(l => l.name === 'ci-macos')) return run('ci-macos label');
 
-  const files = await changedFiles(github, context, pr, queue);
+  let files;
+  if (pr) {
+    if (current.labels.some(l => l.name === 'ci-macos')) return run('ci-macos label');
+    files = await github.paginate(github.rest.pulls.listFiles, {
+      ...context.repo, pull_number: number, per_page: 100,
+    });
+  } else {
+    // base_sha is the entry ahead of this one, so this lists only this PR.
+    const { data: diff } = await github.rest.repos.compareCommitsWithBasehead({
+      ...context.repo, basehead: `${queue.base_sha}...${queue.head_sha}`,
+    });
+    // An entry stacked behind others also holds their changes, so only the
+    // first skips. Main still runs macOS after the merge.
+    if (await aloneInQueue(github, context, queue) &&
+        await passedOnHead(github, context, current.head.sha)) {
+      core.notice(`macOS skipped: #${number} passed it on ${current.head.sha.slice(0, 7)}; runs post-merge on main.`);
+      return core.setOutput('run', 'false');
+    }
+    if (current.labels.some(l => l.name === 'ci-macos')) return run('ci-macos label');
+    // The compare API lists at most 300 files.
+    files = diff.files.length >= 300 ? null : diff.files;
+  }
   if (!files || files.length >= FILE_LIMIT) return run('diff too large to inspect');
   const hit = sensitiveFile(files, !pr);
   if (hit) return run(`${hit.filename} is macOS-sensitive`);
