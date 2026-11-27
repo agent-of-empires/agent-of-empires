@@ -527,10 +527,7 @@ mod attach {
 #[tokio::test]
 #[serial]
 async fn killing_the_proxy_mid_turn_loses_the_integration() {
-    use agent_of_empires::acp::acp_client::{
-        AcpClient, ProxyFailurePolicy, ProxySpec, SpawnConfig,
-    };
-    use agent_of_empires::acp::agent_compat::ProxyCompat;
+    use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
     use agent_of_empires::acp::agent_registry::AgentSpec;
     use agent_of_empires::acp::state::{AcpSessionId, Event, IntegrationLostReason};
 
@@ -588,14 +585,8 @@ async fn killing_the_proxy_mid_turn_loses_the_integration() {
         prior_conversation: false,
         generation: 0,
         artifact_dir: None,
-        proxy: Some(ProxySpec {
-            plugin_id: "fake-proxy".into(),
-            command: String::new(),
-            args: Vec::new(),
-            failure_policy: ProxyFailurePolicy::Refuse,
-            display_name: "Fake".into(),
-            compat: ProxyCompat::default(),
-        }),
+        // The fake proxy is the adapter command here; in-process spawns launch no proxy.
+        proxy: None,
         degraded: None,
         sandbox_info: None,
         workspace_info: None,
