@@ -379,10 +379,34 @@ async fn spawn_fake_connection_raw(
     proxy: Option<ProxySpec>,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> (Result<(), AcpError>, FakeConnection) {
+    spawn_fake_connection_inner(
+        session_id,
+        init_extra,
+        default_mode,
+        config_options,
+        proxy,
+        false,
+        on_prompt,
+    )
+    .await
+}
+
+/// With `close_after_init`, the one-slot event channel is full when the
+/// post-hello emit runs, so it blocks, and the agent closes its end right after
+/// the initialize reply: the transport closes before the connection is ready.
+async fn spawn_fake_connection_inner(
+    session_id: &'static str,
+    init_extra: &'static str,
+    default_mode: Option<&'static str>,
+    config_options: Option<&'static str>,
+    proxy: Option<ProxySpec>,
+    close_after_init: bool,
+    on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
+) -> (Result<(), AcpError>, FakeConnection) {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
     let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
     let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
-    let (event_tx, event_rx) = mpsc::channel(64);
+    let (event_tx, event_rx) = mpsc::channel(if close_after_init { 1 } else { 64 });
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
     let temp = tempfile::tempdir().unwrap();
@@ -429,6 +453,14 @@ async fn spawn_fake_connection_raw(
     let set_options = Arc::new(Mutex::new(Vec::new()));
     let recorded = set_options.clone();
     let options_json = config_options.unwrap_or("[]");
+    // (agent side, harness side) of the initialize-reply handshake.
+    let (mut close_gate, harness_gate) = if close_after_init {
+        let (replied_tx, replied_rx) = oneshot::channel();
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        (Some((replied_tx, go_rx)), Some((replied_rx, go_tx)))
+    } else {
+        (None, None)
+    };
     let agent = tokio::spawn(async move {
         let mut lines = BufReader::new(agent_read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -462,9 +494,38 @@ async fn spawn_fake_connection_raw(
             for reply in replies {
                 write_line(&reply_write, &reply).await;
             }
+            if let Some((replied, go)) = close_gate.take() {
+                let _ = replied.send(());
+                let _ = go.await;
+                let _ = reply_write.lock().await.shutdown().await;
+            }
         }
     });
-    let ready = ready_rx.await.expect("handshake completes");
+    let mut event_rx = event_rx;
+    let mut ready_rx = ready_rx;
+    let ready = if let Some((replied, go)) = harness_gate {
+        replied.await.expect("agent answers initialize");
+        // On the current-thread runtime these yields park the connection in
+        // its post-hello emit before the agent closes.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let _ = go.send(());
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        // Frees the blocked emits; the loss event is sent only after ready.
+        loop {
+            tokio::select! {
+                biased;
+                ready = &mut ready_rx => break ready,
+                _ = event_rx.recv() => {}
+            }
+        }
+    } else {
+        (&mut ready_rx).await
+    }
+    .expect("handshake completes");
     let fake = FakeConnection {
         event_rx,
         cmd_tx,
@@ -1401,6 +1462,39 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
     ));
     fake.agent.abort();
     fake.connection.abort();
+}
+
+/// A proxy that exits after a valid hello but before the connection is ready
+/// is a lost integration; reporting it as a spawn failure would make the
+/// supervisor relaunch the session without the proxy.
+#[tokio::test]
+async fn proxy_lost_between_hello_and_ready_is_integration_lost() {
+    let (ready, mut fake) =
+        spawn_fake_connection_inner("s-w", GOOD_HELLO, None, None, None, true, |_| vec![]).await;
+    ready.expect("a proxy that passed its hello is not a launch failure");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = fake.event_rx.recv().await {
+            events.push(event);
+        }
+    })
+    .await
+    .expect("connection ends once the agent closes");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::IntegrationLost {
+                reason: IntegrationLostReason::ProxyExited
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::AgentStartupError { .. })),
+        "{events:?}"
+    );
 }
 
 /// Closes the agent's end and returns every event the ended connection emitted.

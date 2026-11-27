@@ -504,7 +504,15 @@ async fn report_connection_error(
         Some(_) => classify_rate_limit_error(e, captured, now),
         None => classify_rate_limit_from_message(&message, captured, now),
     };
-    if let Some(tx) = ready_tx.lock().await.take() {
+    let mut pending_ready = ready_tx.lock().await.take();
+    // The hello already proved the proxy; losing it before ready is a lost
+    // integration, not a launch failure the supervisor would relaunch raw.
+    if shared.transport_closed.load(Ordering::Relaxed) && shared.aoe.is_proxied() {
+        if let Some(tx) = pending_ready.take() {
+            let _ = tx.send(Ok(()));
+        }
+    }
+    if let Some(tx) = pending_ready {
         // A handshake-time limit fails the spawn as rate-limited so the
         // supervisor parks instead of burning respawn budget (#3514).
         let err = match rate_limit {
