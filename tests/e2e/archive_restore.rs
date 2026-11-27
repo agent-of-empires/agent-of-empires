@@ -70,7 +70,7 @@ fn seed_group_sessions(h: &TuiTestHarness, project: &str, group: &str, sessions:
         .iter()
         .map(|(id, title)| {
             format!(
-                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"{group}","command":"","tool":"claude","yolo_mode":false,"status":"idle","terminal_scopes":[],"created_at":"2026-01-01T00:00:00Z"}}"#,
+                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"{group}","command":"","tool":"fake-agent","yolo_mode":false,"status":"idle","terminal_scopes":[],"created_at":"2026-01-01T00:00:00Z"}}"#,
             )
         })
         .collect();
@@ -91,7 +91,7 @@ fn seed_sessions(h: &TuiTestHarness, project: &str, titles: &[(&str, &str)]) {
         .iter()
         .map(|(id, title)| {
             format!(
-                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","terminal_scopes":[],"created_at":"2026-01-01T00:00:00Z"}}"#,
+                r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"","command":"","tool":"fake-agent","yolo_mode":false,"status":"idle","terminal_scopes":[],"created_at":"2026-01-01T00:00:00Z"}}"#,
             )
         })
         .collect();
@@ -102,17 +102,17 @@ fn seed_sessions(h: &TuiTestHarness, project: &str, titles: &[(&str, &str)]) {
     .expect("write sessions.json");
 }
 
-/// Install a persistent `claude` (shadows the exit-0 stub) so a revived session
+/// Install a persistent `fake-agent` (shadows the exit-0 stub) so a revived session
 /// stays Running instead of dying immediately.
-fn install_persistent_claude(h: &mut TuiTestHarness) {
-    let bin = h.install_path_command("claude");
-    let claude = bin.join("claude");
-    std::fs::write(&claude, "#!/bin/sh\nexec sleep 600\n").expect("write persistent claude");
+fn install_persistent_agent(h: &mut TuiTestHarness) {
+    let bin = h.install_path_command("fake-agent");
+    let agent = bin.join("fake-agent");
+    std::fs::write(&agent, "#!/bin/sh\nexec sleep 600\n").expect("write persistent agent");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod claude");
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod agent");
     }
 }
 
@@ -130,7 +130,7 @@ fn test_archive_then_unarchive_cycle() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("archive_restore");
-    install_persistent_claude(&mut h);
+    install_persistent_agent(&mut h);
 
     let project = h.project_path();
     // Two sessions so "cursor advances to the neighbour" is meaningful.
@@ -594,7 +594,7 @@ fn test_archived_waiting_row_reads_idle_and_migrates_once() {
     let project = project.to_str().unwrap();
     let row = |id: &str, title: &str, status: &str| {
         format!(
-            r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"{status}","archived_at":"2026-07-13T22:17:21Z","created_at":"2026-01-01T00:00:00Z"}}"#
+            r#"{{"id":"{id}","title":"{title}","project_path":"{project}","group_path":"","command":"","tool":"fake-agent","yolo_mode":false,"status":"{status}","archived_at":"2026-07-13T22:17:21Z","created_at":"2026-01-01T00:00:00Z"}}"#
         )
     };
     let frozen = format!(
@@ -844,9 +844,9 @@ fn trash_retained_transcript_is_read_only() {
     }
     drop(store);
     let launch_marker = h.home_path().join("agent-launched");
-    let bin = h.install_path_command("claude");
+    let bin = h.install_path_command("fake-agent");
     std::fs::write(
-        bin.join("claude"),
+        bin.join("fake-agent"),
         format!(
             "#!/bin/sh\nprintf started >> {}\n",
             shell_words::quote(launch_marker.to_str().unwrap())

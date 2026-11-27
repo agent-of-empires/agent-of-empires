@@ -371,7 +371,7 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
         "-t",
         "PR",
         "-c",
-        "claude",
+        "fake-agent",
         "--structured-view",
     ]);
     assert!(
