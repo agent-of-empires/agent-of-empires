@@ -554,7 +554,7 @@ impl App {
             self.home.acknowledge_confirmation(pending.confirmation);
             self.home.acknowledge_rows(pending.rows);
             if pending.rows.is_some() && !self.home.rows_presented() {
-                super::terminal_output::request_redraw();
+                super::terminal_output::request_frame();
                 self.needs_redraw = true;
             }
         } else {
@@ -563,7 +563,7 @@ impl App {
         }
         if !self.home.presentation_ready {
             self.home.invalidate_presentation();
-            super::terminal_output::request_redraw();
+            super::terminal_output::request_frame();
         }
         #[cfg(feature = "e2e-tests")]
         if self.home.presentation_ready
@@ -706,6 +706,7 @@ impl App {
         self.theme = crate::tui::styles::load_theme_with_mode(name, palette_mode);
         self.theme_name = name.to_string();
         self.theme_palette_mode = palette_mode;
+        super::terminal_output::request_redraw();
         self.needs_redraw = true;
     }
 
@@ -803,7 +804,6 @@ impl App {
             // Paint the redraw now: clearing alone leaves a blank screen until the
             // next event arrives, which never comes while the loop is parked.
             if self.needs_redraw {
-                super::terminal_output::request_redraw();
                 self.needs_redraw = false;
                 self.draw(terminal)?;
             }
