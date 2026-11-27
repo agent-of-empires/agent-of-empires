@@ -40,7 +40,7 @@ test('path and cfg rules', async () => {
     ['Linux-only process module', [{ filename: 'src/process/linux.rs', patch: '+x' }], 'false'],
     ['macOS process module', [{ filename: 'src/process/macos.rs', patch: '+x' }], 'true'],
     ['exact file', [{ filename: 'src/session/mod.rs', patch: '+x' }], 'true'],
-    ['rename out of a sensitive path', [{ filename: 'src/a.rs', previous_filename: 'src/git/a.rs', patch: '' }], 'true'],
+    ['rename out of a sensitive path', [{ filename: 'src/a.rs', previous_filename: 'src/git/a.rs', patch: '+x' }], 'true'],
     ['added macOS cfg', [{ filename: 'src/a.rs', patch: '@@\n+#[cfg(target_os = "macos")]' }], 'true'],
     ['cfg only in context', [{ filename: 'src/a.rs', patch: '@@\n #[cfg(target_os = "macos")]\n+x' }], 'false'],
     ['Rust file without a patch', [{ filename: 'src/big.rs' }], 'true'],

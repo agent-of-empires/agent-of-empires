@@ -65,30 +65,17 @@ pub(crate) fn mount_points() -> std::io::Result<std::collections::HashSet<std::p
     }
 }
 
-/// Standard system folders that live directly under $HOME. On macOS several
-/// of these (Downloads, Desktop, Pictures/Photos, Music) are TCC-protected:
-/// opening them triggers a permission prompt. None is ever a git repo, so the
-/// directory browser skips its `.git` probe for them and avoids the prompt.
-const HOME_SYSTEM_DIRS: &[&str] = &[
-    "Desktop",
-    "Documents",
-    "Downloads",
-    "Movies",
-    "Music",
-    "Pictures",
-    "Public",
-    "Library",
-];
-
 /// Whether `name` is a TCC-protected folder directly under `home`, so opening
 /// it would prompt. Always false off macOS, where no such prompt exists.
 pub(crate) fn is_tcc_protected_home_dir(parent: &Path, name: &str, home: Option<&Path>) -> bool {
-    if !cfg!(target_os = "macos") {
-        return false;
+    #[cfg(target_os = "macos")]
+    {
+        macos::is_tcc_protected_home_dir(parent, name, home)
     }
-    match home {
-        Some(home) => parent == home && HOME_SYSTEM_DIRS.contains(&name),
-        None => false,
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (parent, name, home);
+        false
     }
 }
 

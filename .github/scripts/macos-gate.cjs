@@ -21,7 +21,7 @@ const EXACT = [
 ];
 // A PR lockfile bump runs post-merge; the queue still checks it.
 const QUEUE_ONLY = ['Cargo.lock'];
-// The files endpoints stop listing here.
+// pulls.listFiles stops listing here.
 const FILE_LIMIT = 3000;
 const CFG = /target_os\s*=\s*"macos"/;
 
@@ -47,7 +47,7 @@ async function changedFiles(github, context, pr, queue) {
       ...context.repo, pull_number: pr.number, per_page: 100,
     });
   }
-  // A queue entry is diffed whole, so every PR in the group counts.
+  // base_sha is the entry ahead of this one, so this lists only this PR.
   const { data } = await github.rest.repos.compareCommitsWithBasehead({
     ...context.repo, basehead: `${queue.base_sha}...${queue.head_sha}`,
   });
