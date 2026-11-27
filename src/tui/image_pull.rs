@@ -167,12 +167,14 @@ async fn daemon(
         Err(error) if is_code(&error, crate::daemon::ApiErrorCode::PullReplaced) => {
             PullReport::Replaced.into()
         }
+        // A 403 is a pull refusal only when the Daemon's own status says it blocks pulls; one from
+        // anything else in the way reads as no answer.
         Err(error) if is_refusal(&error) => match client.sandbox_image_status(false, image).await {
-            Ok(status) => PullReport::Gated {
+            Ok(status) if status.pull_blocked.is_some() => PullReport::Gated {
                 command: status.pull_command,
             }
             .into(),
-            Err(_) => PullReport::Unavailable.into(),
+            _ => PullReport::Unavailable.into(),
         },
         Err(_) => PullReport::Unavailable.into(),
     }
@@ -1083,7 +1085,8 @@ mod tests {
         }
     }
 
-    /// A Daemon that won't pull reports the command to run instead.
+    /// A Daemon that won't pull reports the command to run instead. A 403 its status doesn't
+    /// explain, as from a proxy in front of it, is no answer rather than a refusal.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_refused_daemon_pull_is_gated_and_never_pulls_locally() {
@@ -1094,43 +1097,66 @@ mod tests {
             c.sandbox.default_image = Some(IMAGE.into());
         })
         .unwrap();
-        let state =
-            test_support::build_test_app_state_configured(Vec::new(), |s| s.read_only = true);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let app = test_support::build_router_for_test(state.clone());
-        let shutdown = state.shutdown.clone();
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(shutdown.cancelled_owned())
-            .await
-            .unwrap();
-        });
-        let endpoint = DaemonEndpoint::new(base, None, crate::daemon::Source::Env);
-        let source = PullSource::Daemon(HttpClient::new(endpoint).unwrap());
-
-        assert_eq!(
-            source.run(IMAGE, PullRequest::Poll, None).await,
-            PullAnswer {
-                report: PullReport::State(PullState::Idle),
-                offer: Some(ImageOffer::NoUpdate),
-                image: Some(IMAGE.into()),
-                flight: None,
-            },
-            "checks are off, so the Daemon offers nothing"
-        );
-        for request in [PullRequest::Start, PullRequest::Cancel] {
-            let PullReport::Gated { command } = source.run(IMAGE, request, None).await.report
-            else {
-                panic!("{request:?} should be gated");
+        for read_only in [true, false] {
+            let state = test_support::build_test_app_state_configured(Vec::new(), |s| {
+                s.read_only = read_only
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let daemon = test_support::build_router_for_test(state.clone());
+            let app = if read_only {
+                daemon
+            } else {
+                let forbidden = || async { axum::http::StatusCode::FORBIDDEN };
+                axum::Router::new()
+                    .route("/api/sandbox/image-pull", axum::routing::post(forbidden))
+                    .route(
+                        "/api/sandbox/image-pull/cancel",
+                        axum::routing::post(forbidden),
+                    )
+                    .fallback_service(daemon)
             };
-            assert!(command.contains(IMAGE), "{command}");
+            let shutdown = state.shutdown.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .unwrap();
+            });
+            let endpoint = DaemonEndpoint::new(base, None, crate::daemon::Source::Env);
+            let source = PullSource::Daemon(HttpClient::new(endpoint).unwrap());
+
+            assert_eq!(
+                source.run(IMAGE, PullRequest::Poll, None).await,
+                PullAnswer {
+                    report: PullReport::State(PullState::Idle),
+                    offer: Some(ImageOffer::NoUpdate),
+                    image: Some(IMAGE.into()),
+                    flight: None,
+                },
+                "checks are off, so the Daemon offers nothing"
+            );
+            for request in [PullRequest::Start, PullRequest::Cancel] {
+                let report = source.run(IMAGE, request, None).await.report;
+                if read_only {
+                    let PullReport::Gated { command } = report else {
+                        panic!("{request:?} should be gated");
+                    };
+                    assert!(command.contains(IMAGE), "{command}");
+                } else {
+                    assert_eq!(
+                        report,
+                        PullReport::Unavailable,
+                        "{request:?}: a 403 the Daemon's status doesn't explain was gated"
+                    );
+                }
+            }
+            state.shutdown.cancel();
+            server.await.unwrap();
         }
-        state.shutdown.cancel();
-        server.await.unwrap();
     }
 
     /// Ctrl+X's dismissal through the real router, kept by the Daemon whichever transport
