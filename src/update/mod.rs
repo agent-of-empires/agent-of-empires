@@ -274,7 +274,15 @@ pub async fn resolve_target(target: &Target) -> Result<String> {
                 .release_by_tag(GITHUB_OWNER, GITHUB_REPO, &release_tag_for(tag))
                 .await
                 .with_context(|| format!("no release found for {tag}"))?;
-            (!release.draft).then(|| release_info_from(release))
+            let info = (!release.draft).then(|| release_info_from(release));
+            // A nightly tag carries only its date, so a typed full version must match the release.
+            if let Some(info) = &info {
+                let typed = tag.trim_start_matches('v');
+                if typed.contains("-nightly.") && info.version != typed {
+                    anyhow::bail!("no release found for {tag}");
+                }
+            }
+            info
         }
     };
     release

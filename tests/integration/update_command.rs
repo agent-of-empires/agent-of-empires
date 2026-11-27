@@ -259,6 +259,21 @@ fn update_check_resolves_explicit_targets() {
     }
 }
 
+/// A full nightly version must match the release on its date, not just the date.
+#[test]
+#[serial_test::parallel]
+fn update_explicit_nightly_version_with_wrong_prefix_is_rejected() {
+    let fixture = stable_and_nightly_fixture();
+    let output = run_update(
+        &fixture,
+        &["--check", "--version", "1.99.9-nightly.29990101"],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("no release found"), "stderr was: {stderr}");
+}
+
 /// An explicit target on an install that is not an install-script tarball is refused before
 /// any release lookup, so the refusal holds offline.
 #[test]
