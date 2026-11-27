@@ -1296,10 +1296,12 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
 /// tail or names an aoe executable is unverifiable, not foreign: `Foreign`
 /// would clear the launch state of a daemon that is still running.
 fn ps_line_may_be_aoe(command: &[u8]) -> bool {
+    const TAIL: &[u8] = b" serve --daemon-child";
     command_mentions_aoe_executable(command)
         || command
-            .windows(b" serve --daemon-child".len())
-            .any(|window| window == b" serve --daemon-child")
+            .windows(TAIL.len() + 1)
+            .any(|window| window.starts_with(TAIL) && window[TAIL.len()].is_ascii_whitespace())
+        || command.ends_with(TAIL)
 }
 
 /// Loose companion to `command_is_aoe_serve`, for the `ps` path only. `ps`
@@ -4300,6 +4302,9 @@ mod tests {
                 true,
             ),
             (b"/usr/local/bin/aoe serve --daemon-child", true),
+            (b"/x/aoe-darwin-arm64 serve --daemon-child", true),
+            (b"/usr/bin/worker serve --daemon-children", false),
+            (b"/usr/bin/worker serve --daemon-child-x --port 1", false),
             (b"/usr/bin/vim src/aoe.rs", false),
             (b"/usr/bin/python3 manage.py runserver", false),
         ];
