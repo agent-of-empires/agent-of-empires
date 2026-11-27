@@ -1,0 +1,35 @@
+
+[97m●[39m ok
+
+[2m[37m✻[0m [2m[37mCrunched for 2s · done 10:49 AM[0m
+
+[37m[40m❯ [97mwrite a two-line note about what tmux is, then suggest what I might ask next[39m
+
+[97m[49m●[39m tmux is a terminal multiplexer: it runs several shell sessions, windows and split panes inside one terminal.
+  Sessions keep running on the server after you detach, so you can disconnect from SSH and reattach later with
+  everything still in place.
+
+  [1mYou might ask next:[0m
+  - What are the essential tmux keybindings (prefix key, splitting panes, switching windows)?
+  - How do I set up a [97m~/.tmux.conf[39m with sensible defaults like mouse support and a better prefix?
+  - How do tmux sessions, windows and panes differ, and how do I name and manage them?
+  - How does tmux compare to GNU Screen or Zellij?
+  - How can I script a tmux layout so a project's dev environment opens with one command?
+
+[2m[37m✻[0m [2m[37mCrunched for 9s · done 10:50 AM[0m
+
+[37m[40m❯ [97mwake up: pick up what you were doing[39m
+[2m[37m[49m  ⎿  [0;1m[37m3[0;2m[37m skills available[0m
+
+[97m●[39m There's nothing left to pick up. The last task was the two-line tmux note and the list of follow-up questions, and
+  that's finished.
+
+  If you want to go further with tmux, choose one of those questions, for example the essential keybindings or a starter
+  [97m~/.tmux.conf[39m, and I'll start there.
+
+[2m[37m✻[0m [2m[37mBaked for 2s · done 10:51 AM[0m
+
+[37m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [2mshow me the essential tmux keybindings[0m
+[37m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [95m⏵⏵ bypass permissions on[2m[37m (shift+tab to cycle)[0m

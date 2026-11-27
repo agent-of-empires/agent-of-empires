@@ -1239,7 +1239,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt_error: Option<String>,
     /// Machine-readable `initial_prompt_error` cause when one applies:
-    /// `agent_folder_not_trusted` or `agent_bypass_not_accepted`.
+    /// `agent_folder_not_trusted`, `agent_bypass_not_accepted` or `input_line_busy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt_error_code: Option<String>,
     pub branch: Option<String>,

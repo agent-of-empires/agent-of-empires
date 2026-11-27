@@ -1901,7 +1901,7 @@ impl HomeView {
         }
         if let Some(dialog) = &self.info_dialog {
             if let Some(DialogResult::Cancel) = dialog.handle_click(col, row) {
-                self.info_dialog = None;
+                self.dismiss_info_dialog();
             }
             return true;
         }
@@ -2604,7 +2604,7 @@ impl HomeView {
                 match dialog.handle_key(key) {
                     DialogResult::Continue => {}
                     DialogResult::Cancel | DialogResult::Submit(_) => {
-                        self.info_dialog = None;
+                        self.dismiss_info_dialog();
                         if let Some(session_id) = self.pending_attach_after_warning.take() {
                             return Some(Action::AttachSession(session_id));
                         }

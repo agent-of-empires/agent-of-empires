@@ -466,6 +466,9 @@ pub struct HomeView {
     /// Input for a row whose mount is still connecting, split at each Enter.
     pub(super) pending_paste_for_structured_view: HashMap<String, PendingStructuredInput>,
     pub(super) pending_attach_after_warning: Option<String>,
+    /// A send refused at delivery, reopened with its text once its refusal is dismissed:
+    /// the session, target, title and message.
+    pub(super) refused_send: Option<(String, live_send::LiveSendTarget, String, String)>,
     pub(super) pending_stop_session: Option<String>,
     /// Target captured when the auxiliary stop confirmation opens.
     pub(super) pending_stop_auxiliary: Option<(String, crate::daemon::StopAuxiliaryBody)>,

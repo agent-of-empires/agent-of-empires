@@ -1467,3 +1467,38 @@ fn tab_on_a_structured_row_dismisses_the_system_health_panel() {
         "the health takeover must not cover the composer the press focuses"
     );
 }
+
+/// A send refused at delivery, such as for a person's draft, keeps its text: once the refusal
+/// is dismissed, the send dialog reopens for the same session with that text.
+#[test]
+#[serial]
+fn a_refused_send_keeps_its_text() {
+    let mut env = create_test_env_empty();
+    let inst = Instance::new("session-one", "/tmp/test");
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.refuse_send(
+        &id,
+        crate::tui::home::live_send::LiveSendTarget::Agent,
+        "session-one",
+        "hello",
+        "The agent's input box holds text someone typed",
+    );
+    assert!(env.view.info_dialog.is_some(), "the refusal shows");
+    assert!(
+        env.view.send_message_dialog.is_none(),
+        "the send dialog waits under the refusal"
+    );
+
+    let _ = env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.info_dialog.is_none());
+    assert!(
+        env.view.send_message_dialog.is_some(),
+        "the send dialog reopens"
+    );
+    let resent = env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(
+        matches!(&resent, Some(Action::SendMessage(session, message)) if *session == id && message == "hello"),
+        "{resent:?}"
+    );
+}
