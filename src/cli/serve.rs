@@ -1159,29 +1159,24 @@ enum DaemonProcessIdentity {
     Indeterminate,
 }
 
-fn command_is_aoe_serve(command: &[u8]) -> bool {
-    let args: Vec<&[u8]> = if command.contains(&0) {
-        command
-            .split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty())
-            .collect()
-    } else {
-        command
-            .split(|byte| byte.is_ascii_whitespace())
-            .filter(|arg| !arg.is_empty())
-            .collect()
-    };
-    let Some(executable) = args.first() else {
-        return false;
-    };
-    let basename = executable
-        .rsplit(|byte| *byte == b'/')
-        .next()
-        .unwrap_or(executable);
-    if !matches!(basename, b"aoe" | b"agent-of-empires") {
-        return false;
-    }
+/// NUL-separated when the source is `/proc/<pid>/cmdline`, otherwise `ps` output,
+/// which joins argv with spaces.
+fn split_argv(command: &[u8]) -> Vec<&[u8]> {
+    let nul_delimited = command.contains(&0);
+    command
+        .split(|byte| {
+            if nul_delimited {
+                *byte == 0
+            } else {
+                byte.is_ascii_whitespace()
+            }
+        })
+        .filter(|arg| !arg.is_empty())
+        .collect()
+}
 
+/// Index of the `serve` subcommand once the top-level globals are skipped.
+fn serve_subcommand_index(args: &[&[u8]]) -> Option<usize> {
     // The top-level globals declared on `Cli` in `src/cli/definition.rs`, so a
     // value like `--profile work` is not mistaken for the subcommand.
     // `parser_knows_every_top_level_global` fails if that list changes.
@@ -1191,7 +1186,7 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
             b"-p" | b"--profile" | b"--daemon-url" => {
                 index += 2;
                 if index > args.len() {
-                    return false;
+                    return None;
                 }
             }
             b"--no-autostart" => index += 1,
@@ -1202,21 +1197,37 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
             {
                 index += 1;
             }
-            b"serve" => return true,
-            _ => return false,
+            b"serve" => return Some(index),
+            _ => return None,
         }
     }
-    false
+    None
 }
 
-/// `ps` flattens argv, so match the flattened `serve --daemon-child` tail that
-/// `daemon_child_args` always emits.
+fn command_is_aoe_serve(command: &[u8]) -> bool {
+    let args = split_argv(command);
+    let Some(executable) = args.first() else {
+        return false;
+    };
+    let basename = executable
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or(executable);
+    matches!(basename, b"aoe" | b"agent-of-empires") && serve_subcommand_index(&args).is_some()
+}
+
+/// Whether the command line is `<any executable> [globals] serve --daemon-child`,
+/// the argv `daemon_child_args` always emits. Exact for NUL-separated argv. `ps`
+/// flattens argv and cannot be split when the executable path contains spaces, so
+/// match its `serve --daemon-child` tail instead.
 fn renamed_daemon_child_argv(command: &[u8]) -> bool {
-    let flat: Vec<u8> = command
-        .iter()
-        .map(|byte| if *byte == 0 { b' ' } else { *byte })
-        .collect();
-    flat.windows(b" serve --daemon-child".len())
+    if command.contains(&0) {
+        let args = split_argv(command);
+        return serve_subcommand_index(&args)
+            .is_some_and(|index| args.get(index + 1) == Some(&&b"--daemon-child"[..]));
+    }
+    command
+        .windows(b" serve --daemon-child".len())
         .any(|window| window == b" serve --daemon-child")
 }
 
@@ -3248,6 +3259,8 @@ mod tests {
             (b"/x/aoe-darwin-arm64 serve --daemon", false),
             (b"/x/aoe-darwin-arm64 serve", false),
             (b"/x/aoe-darwin-arm64 serve --daemon --daemon-child", false),
+            (b"/usr/bin/worker\0--label\0serve --daemon-child\0", false),
+            (b"/My Apps/x\0-p\0work\0serve\0--daemon-child\0", true),
         ];
         for (command, expected) in argv {
             assert_eq!(renamed_daemon_child_argv(command), *expected, "{command:?}");
