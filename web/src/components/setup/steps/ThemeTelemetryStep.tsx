@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { fetchThemes } from "../../../lib/api";
+import { fetchThemes, type ThemeChoice } from "../../../lib/api";
 import { useThemeMutation } from "../../../hooks/useThemeMutation";
 import { GhostButton, PANEL, RadioRow, Section } from "../ui";
 
@@ -16,7 +16,7 @@ interface Props {
 
 /** Theme saves on pick; the telemetry choice saves when the wizard moves on. */
 export function ThemeTelemetryStep({ share, onShareChange, doNotTrack, telemetry, onRetryTelemetry }: Props) {
-  const [themes, setThemes] = useState<string[]>([]);
+  const [themes, setThemes] = useState<ThemeChoice[]>([]);
   const [selected, setSelected] = useState(() => document.documentElement.dataset.theme ?? "");
   const [error, setError] = useState<string | null>(null);
   const { select } = useThemeMutation();
@@ -43,9 +43,9 @@ export function ThemeTelemetryStep({ share, onShareChange, doNotTrack, telemetry
     <>
       <Section title="Theme" hint="Applies here and in the TUI. Picking one repaints this page.">
         <div className={`${PANEL} max-h-80 overflow-y-auto`}>
-          {themes.map((name) => (
+          {themes.map(({ name, label }) => (
             <RadioRow key={name} name="theme" checked={selected === name} onSelect={() => void pick(name)}>
-              <span className="font-mono text-sm text-text-primary">{name}</span>
+              <span className="font-mono text-sm text-text-primary">{label}</span>
             </RadioRow>
           ))}
         </div>

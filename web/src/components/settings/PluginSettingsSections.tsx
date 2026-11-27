@@ -1,4 +1,6 @@
 import { useMemo } from "react";
+import { CAPTION } from "../../lib/surfaces";
+
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import { SchemaSection } from "./SchemaSection";
 import { SectionHeader } from "./suggestionsShared";
@@ -47,7 +49,7 @@ export function PluginSettingsSections({ schema, settings, onSaveField }: Props)
 
   return (
     <div className="space-y-6">
-      <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">Plugin Settings</h4>
+      <h4 className={CAPTION}>Plugin settings</h4>
       {sections.map((section) => {
         const id = section.slice(PLUGIN_PREFIX.length);
         const values = pluginValues(schema, settings, id);

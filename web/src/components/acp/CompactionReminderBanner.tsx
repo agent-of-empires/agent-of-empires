@@ -1,5 +1,7 @@
 import { isCompactionReminderDue, type AcpState } from "../../lib/acpTypes";
 import { useAcpPrefs } from "../../lib/acpPrefs";
+import { BUTTON_WARNING_SM } from "../../lib/surfaces";
+import { WarningStrip } from "../panelParts";
 
 /** Opt-in `/compact` reminder past the configured context usage. Shown at every width
  *  because mobile hides the usage chip. It sends the command rather than prefilling,
@@ -18,35 +20,19 @@ export function CompactionReminderBanner({ state, onCompact, onDismiss }: Props)
   const pct = Math.round((usage.used / usage.size) * 100);
 
   return (
-    <div
+    <WarningStrip
       role="status"
-      data-testid="compaction-reminder"
-      className="bg-amber-900/30 border-y border-amber-700/40 px-4 py-2 flex items-center gap-3 text-xs font-mono text-amber-200"
+      testId="compaction-reminder"
+      title={`Context window ${pct}% full.`}
+      onDismiss={onDismiss}
+      dismissLabel="Dismiss compaction reminder"
+      actions={
+        <button type="button" onClick={onCompact} className={`${BUTTON_WARNING_SM} shrink-0`}>
+          Compact now
+        </button>
+      }
     >
-      <span className="shrink-0 text-amber-400" aria-hidden="true">
-        ⚠
-      </span>
-      <span className="flex-1 leading-snug">
-        Context window {pct}% full.{" "}
-        <span className="text-amber-100/70">
-          Compacting replaces the earlier turns in the model&apos;s context with a summary.
-        </span>
-      </span>
-      <button
-        type="button"
-        onClick={onCompact}
-        className="shrink-0 px-2 py-1 rounded bg-amber-800/40 hover:bg-amber-700/50 border border-amber-700/60 text-amber-100 cursor-pointer transition-colors"
-      >
-        Compact now
-      </button>
-      <button
-        type="button"
-        onClick={onDismiss}
-        aria-label="Dismiss compaction reminder"
-        className="shrink-0 px-1 text-amber-300/70 hover:text-amber-100 cursor-pointer"
-      >
-        &times;
-      </button>
-    </div>
+      Compacting replaces the earlier turns in the model&apos;s context with a summary.
+    </WarningStrip>
   );
 }

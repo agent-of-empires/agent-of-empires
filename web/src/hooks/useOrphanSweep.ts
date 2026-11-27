@@ -3,6 +3,7 @@ import { fetchAllSessions } from "../lib/api";
 import { sweepOrphanDrafts } from "../lib/acpDrafts";
 import { sweepOrphanComments } from "../components/diff/comments/storage";
 import { sweepOrphanPaneLayouts } from "../lib/paneLayout";
+import { sweepOrphanDiffScopes } from "../lib/diffScope";
 import type { SessionResponse } from "../lib/types";
 
 /**
@@ -36,6 +37,7 @@ export function useOrphanSweep(sessions: SessionResponse[], sessionsLoaded: bool
       sweepOrphanDrafts(ids);
       sweepOrphanComments(ids);
       sweepOrphanPaneLayouts(ids);
+      sweepOrphanDiffScopes(ids);
     })();
     /* eslint-enable react-you-might-not-need-an-effect/no-event-handler */
   }, [sessionsLoaded, sessions, trashedCount]);
