@@ -93,7 +93,7 @@ export function OverflowMenu({ items, triggerDataTour, phoneFloating = false, op
           phoneGlass={phoneFloating}
           className={`absolute right-0 top-full mt-1 min-w-[180px] z-50 ${
             phoneFloating
-              ? "max-md:mt-2 max-md:min-w-[240px] max-md:max-w-[calc(100vw-1.5rem)] max-md:max-h-[calc(100dvh-7rem)]"
+              ? "max-md:mt-2 max-md:min-w-[min(240px,calc(100vw-1.5rem))] max-md:max-w-[calc(100vw-1.5rem)] max-md:max-h-[calc(100dvh-7rem)]"
               : ""
           }`}
         >
