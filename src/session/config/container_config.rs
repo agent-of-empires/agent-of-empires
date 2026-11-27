@@ -2355,9 +2355,9 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
     instance_id: &str,
     container_workspace_path: &str,
     is_yolo_mode: bool,
-) {
+) -> Result<()> {
     let Some(home) = dirs::home_dir() else {
-        return;
+        return Ok(());
     };
 
     if let Some(trust) = declared_sandbox_agent(tool, command, session_config)
@@ -2381,11 +2381,19 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
                 crate::hooks::SymlinkPolicy::Never,
             )
         });
-        if let Err(e) = result {
-            tracing::warn!(target: "session.profile",
-                "Failed to apply sandbox folder trust for {tool}: {e:#}");
+        match result {
+            // A running container may still mount the old record, so a launch that
+            // could not blank it must not go on to reuse that container.
+            Err(e) if !applies => {
+                return Err(e.context(format!(
+                    "cannot revoke the staged sandbox trust file for {tool}; refusing to reuse the container"
+                )))
+            }
+            Err(e) => tracing::warn!(target: "session.profile",
+                "Failed to apply sandbox folder trust for {tool}: {e:#}"),
+            Ok(()) => {}
         }
-        return;
+        return Ok(());
     }
 
     let active_agent = resolve_active_agent(tool, command, session_config);
@@ -2432,6 +2440,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
             );
         }
     }
+    Ok(())
 }
 
 pub(crate) fn resolve_active_agent(
@@ -3631,14 +3640,17 @@ pub(crate) fn build_container_config(
     }
 
     // The agent registry distinguishes approval gates from startup-only trust prompts.
-    ensure_folder_trust_config_for_active_agent(
+    // A new container mounts only what applies, so a failed revocation is not fatal here.
+    if let Err(e) = ensure_folder_trust_config_for_active_agent(
         agent_selection.tool,
         agent_selection.command,
         profile_session_config,
         instance_id,
         &workspace_path,
         yolo.enabled,
-    );
+    ) {
+        tracing::warn!(target: "session.profile", "{e:#}");
+    }
     if let Some(declared) = &plugin_agent {
         match stage_declared_sandbox(
             declared,
@@ -7787,6 +7799,57 @@ sandbox = "SANDBOX"
         assert!(mount_of(&config, "/root/.example.json").is_some());
     }
 
+    // A reused container may still mount the old trust file, so a launch that
+    // cannot blank a revoked record refuses instead of carrying on.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn an_unrevocable_declared_trust_file_refuses_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        let stage = crate::hooks::declared_sandbox_dir("declared-revoke").unwrap();
+        let file = stage.join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, r#"{"projects":{}}"#).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        let revoke = |yolo: bool| {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-revoke",
+                "/workspace/project",
+                yolo,
+            )
+        };
+
+        // A privileged process can write a read-only file, so nothing is proven there.
+        if fs::OpenOptions::new().write(true).open(&file).is_ok() {
+            eprintln!("the file is writable (privileged); revocation failure not exercised");
+            return;
+        }
+        let error = revoke(false).expect_err("a revocation that failed is an error");
+        assert!(
+            format!("{error:#}").contains("refusing to reuse the container"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            r#"{"projects":{}}"#,
+            "the record is untouched"
+        );
+        // Trust that still applies is not a revocation, so nothing is refused.
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        revoke(true).unwrap();
+    }
+
     #[test]
     fn declared_container_dirs_are_checked_again_at_use() {
         let mut entry = aoe_plugin_api::agent_integration::AgentIntegrationContribution::default();
@@ -7944,7 +8007,8 @@ sandbox = "SANDBOX"
                 &instance_id,
                 "/workspace/project",
                 true,
-            );
+            )
+            .unwrap();
             let restored = read();
             assert_eq!(
                 restored.pointer(host_key),

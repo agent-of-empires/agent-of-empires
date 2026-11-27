@@ -442,8 +442,7 @@ impl Instance {
             &self.id,
             &self.container_workdir(),
             self.is_yolo_mode(),
-        );
-        Ok(())
+        )
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
