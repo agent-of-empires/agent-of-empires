@@ -37,6 +37,7 @@ import { Navigate, useLocation, useMatch, useNavigate, useSearchParams } from "r
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { lazyView } from "./lib/lazyView";
+import { focusSessionSidebar } from "./lib/focusSessionSidebar";
 import { CloseOnEscape } from "./components/diff/comments/CloseOnEscape";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
@@ -2208,15 +2209,7 @@ function AppContent({
 
   const handleFocusSidebar = useCallback(() => {
     setSidebarOpen(true);
-    // Two frames: a phone's drawer is hidden, and so unfocusable, until the opening render commits.
-    requestAnimationFrame(() =>
-      requestAnimationFrame(() => {
-        const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
-        const activeRow = sidebar?.querySelector<HTMLElement>("[data-active-session-row]");
-        const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
-        target?.focus();
-      }),
-    );
+    focusSessionSidebar();
   }, []);
 
   useKeyboardShortcuts(

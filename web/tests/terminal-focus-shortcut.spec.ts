@@ -244,4 +244,34 @@ test.describe("Cmd/Ctrl+` mobile", () => {
       expect(terminal.liveInput.some((input) => input.includes(0x11))).toBe(false);
     });
   });
+  test("Ctrl+Q still reaches the active row when the drawer is slow to open", async ({ page }) => {
+    const terminal = await mockTerminalApis(page);
+    await openPanelsByDefault(page);
+    await page.goto("/");
+    await openSession(page);
+    await terminal.waitForLiveReady();
+
+    const proxy = page.locator("[data-keyboard-proxy]");
+    await proxy.focus();
+    await expect(proxy).toBeFocused();
+    // The sidebar cannot take focus for the first frames after the chord, as a phone's drawer before it has rendered.
+    await page.evaluate(() => {
+      const style = document.createElement("style");
+      style.textContent = '[role="navigation"][aria-label="Sessions sidebar"] { display: none !important; }';
+      document.head.append(style);
+      addEventListener(
+        "keydown",
+        (event) => {
+          if (!event.ctrlKey || event.key !== "q") return;
+          let frames = 0;
+          const tick = () => (++frames < 5 ? requestAnimationFrame(tick) : style.remove());
+          requestAnimationFrame(tick);
+        },
+        true,
+      );
+    });
+    await page.keyboard.press("Control+q");
+    const sidebar = page.getByRole("navigation", { name: "Sessions sidebar" });
+    await expect(sidebar.locator("[data-active-session-row]")).toBeFocused();
+  });
 });

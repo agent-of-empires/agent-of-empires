@@ -1503,13 +1503,15 @@
       "specs": [
         "tests/terminal-focus-shortcut.spec.ts",
         "tests/acp-retained-focus-sidebar-nav.spec.ts",
-        "src/hooks/useKeyboardShortcuts.test.ts"
+        "src/hooks/useKeyboardShortcuts.test.ts",
+        "src/lib/__tests__/focusSessionSidebar.test.ts"
       ],
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SessionRow.tsx",
         "web/src/hooks/useKeyboardShortcuts.ts",
+        "web/src/lib/focusSessionSidebar.ts",
         "web/src/lib/shortcuts.ts"
       ]
     },
