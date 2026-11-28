@@ -46,6 +46,15 @@ pub fn render(
     // Keep the previous window start so hover cannot scroll rows away.
     let prev_picker = state.mouse_targets.take().picker;
 
+    if let Some(recovery) = state.transcript.recovery.as_ref() {
+        crate::tui::components::preview::render_session_recovery(
+            frame,
+            layout.recovery,
+            recovery,
+            state.transcript.recovery_current && state.ws.is_some(),
+            theme,
+        );
+    }
     let geometry = render_transcript(frame, layout.transcript, theme, state, active);
     render_status(frame, layout.status, theme, state, active);
     if layout.approval.height > 0 {
@@ -154,8 +163,16 @@ fn render_choice_picker(
     // Padded to the reserved height so the option rows keep their position.
     detail.resize(detail_rows, Line::default());
     lines.extend(detail);
-    let drawn = render_popup_above(frame, composer_area, theme, picker.title.clone(), lines);
-    record_picker(state, PickerKind::Choice, drawn, first, rows, context_rows);
+    let accepts_choice = state.can_accept_choice();
+    let title = if accepts_choice {
+        picker.title.clone()
+    } else {
+        " Native input not ready · Esc dismiss ".into()
+    };
+    let drawn = render_popup_above(frame, composer_area, theme, title, lines);
+    if accepts_choice {
+        record_picker(state, PickerKind::Choice, drawn, first, rows, context_rows);
+    }
 }
 
 /// Rows `detail` takes at `width`, counted the way it is painted.
@@ -314,24 +331,35 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
     let queue_height = queued_strip_height(state);
     // A tall shelf on a short terminal would crowd out the transcript behind it.
     let approval_height = approval_shelf_height(state, area.width).min(area.height / 2);
+    let notices_height = notices_strip_height(state, area.width);
+    let composer_height = composer_height(state);
+    let recovery_height = if state.transcript.recovery.is_some() {
+        area.height
+            .saturating_sub(approval_height + notices_height + queue_height + composer_height + 6)
+            .min(crate::tui::components::preview::RECOVERY_BANNER_ROWS)
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(recovery_height),
             Constraint::Min(5), // transcript
             Constraint::Length(approval_height),
-            Constraint::Length(notices_strip_height(state, area.width)), // 0 when none
-            Constraint::Length(queue_height), // queued prompts strip (0 when empty)
-            Constraint::Length(composer_height(state)),
+            Constraint::Length(notices_height),
+            Constraint::Length(queue_height),
+            Constraint::Length(composer_height),
             Constraint::Length(1), // status line
         ])
         .split(area);
     ViewLayout {
-        transcript: chunks[0],
-        approval: chunks[1],
-        notices: chunks[2],
-        queue: chunks[3],
-        composer: chunks[4],
-        status: chunks[5],
+        recovery: chunks[0],
+        transcript: chunks[1],
+        approval: chunks[2],
+        notices: chunks[3],
+        queue: chunks[4],
+        composer: chunks[5],
+        status: chunks[6],
     }
 }
 
@@ -659,8 +687,12 @@ fn render_approval_shelf(
         height: 1.min(inner.height),
         ..inner
     };
-    let (actions, spans) =
-        approval_actions_line(theme, active, row.choice && !row.options.is_empty());
+    let (actions, spans) = approval_actions_line(
+        theme,
+        active,
+        row.choice && !row.options.is_empty(),
+        state.can_decide(&row.nonce),
+    );
     frame.render_widget(Paragraph::new(actions), actions_area);
     // An open choice picker owns the keyboard, so the decision buttons go
     // inert with their keys.
@@ -863,9 +895,19 @@ fn approval_actions_line(
     theme: &Theme,
     active: bool,
     choice: bool,
+    native_available: bool,
 ) -> (Line<'static>, Vec<(u16, u16, Intent)>) {
     use crate::acp::protocol::ApprovalDecisionWire as Decision;
 
+    if !native_available {
+        return (
+            Line::from(Span::styled(
+                "Native input unavailable",
+                Style::default().fg(theme.hint),
+            )),
+            Vec::new(),
+        );
+    }
     if !active {
         let hint = Span::styled("Enter to respond", Style::default().fg(theme.hint));
         return (Line::from(hint), Vec::new());
@@ -1836,20 +1878,38 @@ fn render_status(
             Style::default().fg(color),
         ));
     }
-    if state.transcript.turn_active || state.transcript.background_agent_active {
-        let banner = state.transcript.status_text.as_deref().unwrap_or("working");
-        spans.push(Span::styled(
-            format!("· ● {banner} "),
-            Style::default().fg(theme.running),
-        ));
-    } else if state.ws.is_none() {
+    if state.ws.is_none() {
         spans.push(Span::styled(
             "· ○ Disconnected ",
             Style::default().fg(theme.error),
         ));
-    } else {
+    } else if state.transcript.connection_unavailable.is_some() {
+        spans.push(Span::styled(
+            "· ○ Native input unavailable ",
+            Style::default().fg(theme.error),
+        ));
+    } else if state.host_prompt_intent().is_some() && !state.transcript.turn_active {
+        spans.push(Span::styled(
+            "· ○ Host message pending ",
+            Style::default().fg(theme.hint),
+        ));
+    } else if !state.native_input_available() {
+        let label = if state.can_submit_prompt_intent() {
+            "· ○ Wake eligible "
+        } else {
+            "· ○ Native input unconfirmed "
+        };
+        spans.push(Span::styled(label, Style::default().fg(theme.hint)));
+    } else if !state.transcript.turn_active && !state.transcript.background_agent_active {
         spans.push(Span::styled(
             "· ● Ready ",
+            Style::default().fg(theme.running),
+        ));
+    }
+    if state.transcript.turn_active || state.transcript.background_agent_active {
+        let banner = state.transcript.status_text.as_deref().unwrap_or("working");
+        spans.push(Span::styled(
+            format!("· ● {banner} "),
             Style::default().fg(theme.running),
         ));
     }
@@ -1922,14 +1982,32 @@ fn render_status(
             );
         }
     }
-    let hint = if active {
+    let hint = if state.choice.is_some() && !state.can_accept_choice() {
+        " Native input not ready · Esc dismiss · Ctrl+Q exit "
+    } else if active
+        && state.host_prompt_intent().is_some()
+        && matches!(state.focus, Focus::Composer | Focus::Transcript)
+    {
+        " Ctrl+C stops pending message · Ctrl+Q exit "
+    } else if active {
         help_hint(
             state.focus,
             selected_approval_is_choice(state),
             state.visible_notices().next().is_some(),
+            if state.focus == Focus::Approval {
+                state
+                    .selected_approval
+                    .as_deref()
+                    .is_some_and(|nonce| state.can_decide(nonce))
+            } else {
+                state.native_input_available()
+            },
+            state.can_submit_prompt_intent(),
         )
-    } else {
+    } else if state.can_submit_prompt_intent() {
         " Enter reply · wheel history "
+    } else {
+        " Enter view · wheel history "
     };
     let hint_width = hint.chars().count() as u16;
     if left_area.width > hint_width.saturating_add(24) {
@@ -2273,8 +2351,7 @@ fn transcript_lines(
                     out.push(Line::default());
                 }
             }
-            TranscriptRowKind::EmptyOutput
-            | TranscriptRowKind::ContextReset
+            TranscriptRowKind::ContextReset
             | TranscriptRowKind::SessionCleared
             | TranscriptRowKind::Compacted
             | TranscriptRowKind::Summary
@@ -2950,13 +3027,22 @@ fn selected_approval_is_choice(state: &StructuredViewState) -> bool {
         .any(|pending| pending.nonce == selected && pending.choice && !pending.options.is_empty())
 }
 
-fn help_hint(focus: Focus, approval_is_choice: bool, has_notices: bool) -> &'static str {
+fn help_hint(
+    focus: Focus,
+    approval_is_choice: bool,
+    has_notices: bool,
+    native_available: bool,
+    prompt_eligible: bool,
+) -> &'static str {
     match focus {
+        Focus::Composer if !prompt_eligible => " Input retained · Ctrl+Q to exit ",
+        Focus::Composer if !native_available => " Enter to queue wake intent · Ctrl+Q to exit ",
         Focus::Composer => " Enter to send · Ctrl+Q to exit ",
         // `render_status` drops the hint unless it has `len + 24` spare columns,
         // so keep these short.
         Focus::Transcript if has_notices => " x dismiss · scroll · p pane · Ctrl+Q exit ",
         Focus::Transcript => " scroll · p pane · Ctrl+Q exit ",
+        Focus::Approval if !native_available => " Native input unavailable · Ctrl+Q exit ",
         Focus::Approval if approval_is_choice => " a answer · d deny · Esc stop ",
         Focus::Approval => " a allow · A always · d deny · Esc stop ",
         Focus::Pane => " scroll to read · Esc to close ",
@@ -3018,10 +3104,6 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].contains("Model fallback"), "{rows:?}");
         assert!(rows[1].contains("Fast mode turned off"), "{rows:?}");
-        assert!(
-            help_hint(Focus::Transcript, false, true).contains("x dismiss"),
-            "the key is advertised while a notice is up"
-        );
 
         state.dismissed_notices.insert("notice-1".into());
         let rows = strip_rows(&state);
@@ -3217,13 +3299,13 @@ mod tests {
         geometry.expect("geometry")
     }
 
-    /// Server transcript rows folded from events, as the daemon ships them.
     fn server_rows(events: &[Event]) -> Vec<TranscriptRow> {
-        let mut m = crate::acp::transcript::TranscriptModel::new();
-        for (i, e) in events.iter().enumerate() {
-            m.apply_event(i as u64 + 1, e);
+        let mut model = crate::acp::transcript::TranscriptModel::new();
+        let metadata = crate::acp::event_sender::EventMetadata::history();
+        for (index, event) in events.iter().enumerate() {
+            model.apply_scoped_event(index as u64 + 1, event, &metadata);
         }
-        m.rows().to_vec()
+        model.rows().to_vec()
     }
 
     fn cmd(name: &str, desc: &str) -> AvailableCommand {
@@ -3291,7 +3373,7 @@ mod tests {
                 ],
             ),
         ] {
-            let (line, buttons) = approval_actions_line(&Theme::default(), true, choice);
+            let (line, buttons) = approval_actions_line(&Theme::default(), true, choice, true);
             let text = line_text(&line);
             assert!(
                 !text.contains('[') && !text.contains(']'),
@@ -3313,12 +3395,12 @@ mod tests {
             assert_eq!(got, want, "choice={choice}");
         }
         // The preview shelf has no keyboard, so nothing is clickable.
-        assert!(approval_actions_line(&Theme::default(), false, false)
+        assert!(approval_actions_line(&Theme::default(), false, false, true)
             .1
             .is_empty());
-        assert!(help_hint(Focus::Approval, true, false).contains("a answer"));
-        assert!(!help_hint(Focus::Approval, true, false).contains("always"));
-        assert!(help_hint(Focus::Approval, false, false).contains("A always"));
+        assert!(approval_actions_line(&Theme::default(), true, false, false)
+            .1
+            .is_empty());
     }
 
     #[test]
@@ -3530,6 +3612,7 @@ mod tests {
             cancel_capable: true,
             model: None,
             background: false,
+            provenance: None,
             runs: 0,
         };
         let mut state = test_state();
@@ -3768,11 +3851,12 @@ mod tests {
 
     /// A pending question has to say what it is asking: the option labels alone
     /// leave the lead-in and the chosen answer's detail unsaid.
-    #[test]
-    fn question_picker_shows_the_question_context_and_highlighted_detail() {
+    #[tokio::test]
+    async fn question_picker_shows_the_question_context_and_highlighted_detail() {
         use super::super::state::{ChoicePicker, ChoicePurpose};
 
         let mut state = test_state();
+        state.mark_native_ready_for_test();
         state.choice = Some(ChoicePicker {
             title: " Which store? (Enter=pick · Esc=dismiss) ".into(),
             context: Some(
@@ -3814,9 +3898,10 @@ mod tests {
 
     /// The approval shelf has to show the request itself: the tool name and an
     /// elided target in the title are not enough to decide on a command.
-    #[test]
-    fn approval_shelf_shows_the_request_payload() {
+    #[tokio::test]
+    async fn approval_shelf_shows_the_request_payload() {
         let mut state = test_state();
+        state.mark_native_ready_for_test();
         state.transcript.pending_approvals = vec![PendingApproval {
             nonce: "n-1".into(),
             title: "Bash".into(),
@@ -3986,10 +4071,11 @@ mod tests {
 
     /// Moving between options must not resize the popup: it is bottom-anchored,
     /// so a shorter detail would slide the options out from under the pointer.
-    #[test]
-    fn question_picker_option_rows_hold_still_while_the_detail_changes() {
+    #[tokio::test]
+    async fn question_picker_option_rows_hold_still_while_the_detail_changes() {
         use super::super::state::{ChoicePicker, ChoicePurpose};
         let mut state = test_state();
+        state.mark_native_ready_for_test();
         state.choice = Some(ChoicePicker {
             title: " Which store? ".into(),
             context: None,
@@ -4458,6 +4544,63 @@ mod tests {
             "the collapsed preview stays visible: {rows:?}"
         );
     }
+    #[test]
+    fn certified_clear_keeps_new_prefix_after_marker_without_hiding_history() {
+        let message = |text: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: Some(text.into()),
+        };
+        let mut rows = server_rows(&[
+            message("old history"),
+            message("new handshake prefix"),
+            Event::SessionCleared,
+            message("new followup"),
+        ]);
+        rows[2].clear_after_seq = Some(1);
+        let prefix_id = rows[1].id.clone();
+        let mut transcript = AcpTranscript::new("s-1");
+        transcript.merge_server_rows(rows.clone());
+        // An overlapping snapshot must neither duplicate nor move the prefix back.
+        transcript.merge_server_rows(rows);
+        let out = joined(
+            &transcript_lines(
+                &transcript,
+                &Theme::default(),
+                None,
+                false,
+                ToolOutputMode::Compact,
+            )
+            .lines,
+        );
+        let clear = out.find("Conversation cleared").unwrap();
+        assert!(out.find("old history").unwrap() < clear, "{out}");
+        assert!(clear < out.find("new handshake prefix").unwrap(), "{out}");
+        assert!(out.find("new handshake prefix").unwrap() < out.find("new followup").unwrap());
+        assert_eq!(out.matches("new handshake prefix").count(), 1);
+        assert_eq!(transcript.rows()[2].id, prefix_id);
+
+        // Legacy clears have no certified cut and keep physical history order.
+        let mut legacy = AcpTranscript::new("s-1");
+        let mut rows = server_rows(&[
+            message("legacy prefix"),
+            Event::SessionCleared,
+            message("legacy followup"),
+        ]);
+        rows[0].seq = 0;
+        legacy.merge_server_rows(rows);
+        let out = joined(
+            &transcript_lines(
+                &legacy,
+                &Theme::default(),
+                None,
+                false,
+                ToolOutputMode::Compact,
+            )
+            .lines,
+        );
+        assert!(out.find("legacy prefix").unwrap() < out.find("Conversation cleared").unwrap());
+        assert!(out.find("Conversation cleared").unwrap() < out.find("legacy followup").unwrap());
+    }
 
     #[test]
     fn transcript_projection() {
@@ -4628,6 +4771,7 @@ mod tests {
             t.set_subagents(vec![SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
+                provenance: None,
                 parent_tool_call_id: Some("msg-1".into()),
                 title: Some("Explore repo".into()),
                 description: None,
@@ -4669,6 +4813,7 @@ mod tests {
             t.set_subagents(vec![SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
+                provenance: None,
                 parent_tool_call_id: Some("msg-1".into()),
                 title: Some("Explore repo".into()),
                 description: None,

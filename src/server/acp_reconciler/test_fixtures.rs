@@ -34,12 +34,10 @@ pub(super) fn test_state(id: &str) -> (AppDirGuard, Arc<AppState>, tempfile::Tem
 }
 
 pub(super) fn enable_auto_resume(enabled: bool) {
-    let app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    std::fs::write(
-        app_dir.join("config.toml"),
-        format!("[acp]\nrate_limit_auto_resume = {enabled}\n"),
-    )
-    .expect("write config");
+    crate::session::config::update_config(|config| {
+        config.acp.rate_limit_auto_resume = enabled;
+    })
+    .expect("write isolated config");
 }
 
 pub(super) fn queued_prompt() -> crate::daemon::QueuedPromptEntry {
@@ -61,7 +59,7 @@ pub(super) struct Tick {
     pub(super) attempted: HashSet<String>,
     pub(super) respawn_history: HashMap<String, Vec<Instant>>,
     pub(super) parked: HashSet<String>,
-    pub(super) capacity_deferred: HashSet<String>,
+    pub(super) resume_deferred: HashMap<String, super::ResumeDeferral>,
     pub(super) stop_notified: HashSet<String>,
 }
 
@@ -80,7 +78,7 @@ impl Tick {
             &mut cadence,
             &mut self.respawn_history,
             &mut self.parked,
-            &mut self.capacity_deferred,
+            &mut self.resume_deferred,
             &mut self.stop_notified,
         )
         .await;
@@ -90,9 +88,9 @@ impl Tick {
 fn count_startup_errors(state: &AppState, id: &str, filter: impl Fn(&str) -> bool) -> usize {
     state
         .acp_event_store
-        .replay_from(id, 0)
+        .replay_from(id, 0).expect("read retained events")
         .into_iter()
-        .filter(|(_, e)| matches!(e, Event::AgentStartupError { message, .. } if filter(message)))
+        .filter(|stored| matches!(stored.event.as_ref(), Event::AgentStartupError { message, .. } if filter(message)))
         .count()
 }
 

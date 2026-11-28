@@ -86,7 +86,7 @@ Approvals expire after `approval_timeout_secs` (default 300). The agent receives
 
 ## Rate limits and agent hand-off
 
-When the active backend hits an account-level limit (rate, usage, five-hour, weekly, or billing), aoe parks the session rather than respawning into the same limit. A banner above the composer shows the reset time, or the agent's own wording when it reported no clock, and whether auto-resume is on. **Try again** respawns the same agent now, for when you've added usage; once the reset has passed with auto-resume off, it reads **Resume now**. **Switch Agent** appears when another installed agent is allowed to take over. It opens a picker over those agents only, switches on confirm, and pre-fills the composer with a recap of the prior conversation (including the prompt that triggered the limit). Review and send it yourself; nothing is auto-sent.
+When the active backend hits an account-level limit (rate, usage, five-hour, weekly, or billing), aoe parks the session rather than respawning into the same limit. A banner above the composer shows the reset time, or the agent's own wording when no reset is available, and whether auto-resume is on. **Try again** retries on the same agent now, for when you've added usage; once the reset has passed with auto-resume off, it reads **Resume now**. **Switch Agent** appears when another installed agent is allowed to take over. It opens a picker over those agents only, switches on confirm, and pre-fills the composer with a recap of the prior conversation (including the prompt that triggered the limit). Review and send it yourself; nothing is auto-sent.
 
 ### Auto-resume after reset
 

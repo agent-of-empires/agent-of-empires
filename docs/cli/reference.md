@@ -525,6 +525,8 @@ Restart session (or all sessions with `--all`)
   Default value: `3`
 * `--tool <TOOL>` — Restart as this tool, through the Daemon. Swapping between tools that run the same agent under different `[session.agent_config_dir]` accounts keeps the conversation (Claude). Any other swap starts a fresh conversation. Use `aoe acp switch-account` to refuse instead
 * `--to-profile <TO_PROFILE>` — Move the session to this existing profile while restarting, through the Daemon
+* `--same` — Explicitly reassert and restart the same qualified conversation
+* `--fresh` — Explicitly abandon AoE restore intent without replaying prior input
 
 
 

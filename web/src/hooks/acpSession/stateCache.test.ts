@@ -6,10 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyEvent,
   emptyAcpState,
+  nativeInputAvailable,
+  canSubmitPromptIntent,
   type AcpEvent,
   type AcpState,
   type ActivityRow,
   type BackgroundAgent,
+  type SessionRecovery,
   type BackgroundShell,
 } from "../../lib/acpTypes";
 import { PENDING_DONE_KEY_PREFIX, PENDING_KEY_PREFIX, STORAGE_KEY_PREFIX } from "../../lib/acpStateStorage";
@@ -39,7 +42,19 @@ beforeEach(() => localStorage.clear());
 afterEach(() => vi.restoreAllMocks());
 
 describe("loadPersistedState", () => {
-  it.each(["pendingElicitations", "oldestSeq", "startupCause"])("backfills %s missing from an older entry", (field) => {
+  it.each([
+    "pendingElicitations",
+    "oldestSeq",
+    "interactionError",
+    "startupCause",
+    "connectionReady",
+    "nativeSnapshotSeq",
+    "promptWakeEligible",
+    "connectionUnavailableNotice",
+    "recovery",
+    "recoveryNotice",
+    "recoverySnapshotSeq",
+  ])("backfills %s missing from an older entry", (field) => {
     const legacy: Record<string, unknown> = { ...emptyAcpState() };
     delete legacy[field];
     writeEntry("legacy", legacy);
@@ -55,6 +70,69 @@ describe("loadPersistedState", () => {
     const loaded = loadPersistedState("seq");
     expect(loaded?.oldestSeq).toBe(42);
     expect(loaded?.pendingElicitations.map((e) => e.nonce)).toEqual(["e-1"]);
+  });
+
+  it("persists canonical failures without persisting transient interaction errors", () => {
+    const state = applyEvent(emptyAcpState(), {
+      session_id: "s",
+      seq: 1,
+      event: { PromptRuntimeError: { message: "canonical failure" } },
+    });
+    persistState("failed", {
+      ...state,
+      interactionError: { message: "temporary request failure", target: { kind: "elicitation", nonce: "e-1" } },
+    });
+    const loaded = loadPersistedState("failed");
+    expect(loaded?.lastError).toBe("canonical failure");
+    expect(loaded?.lastErrorEvidence).toBeNull();
+    expect(loaded?.interactionError).toBeNull();
+  });
+
+  it("never restores native or governed-wake authority from disk or a retained in-memory view", () => {
+    const live = {
+      ...emptyAcpState(),
+      connectionReady: true,
+      nativeSnapshotSeq: 9,
+      promptWakeEligible: true,
+      lastError: "retained diagnostic",
+    };
+    writeEntry("poisoned-authority", live);
+    const disk = loadPersistedState("poisoned-authority")!;
+    expect(nativeInputAvailable(disk)).toBe(false);
+    expect(canSubmitPromptIntent(disk)).toBe(false);
+    expect(disk.lastError).toBe("retained diagnostic");
+    cacheSet("retained-authority", live);
+    const retained = cacheGet("retained-authority")!;
+    expect(nativeInputAvailable(retained)).toBe(false);
+    expect(canSubmitPromptIntent(retained)).toBe(false);
+    expect(retained.lastError).toBe("retained diagnostic");
+    expect(nativeInputAvailable(live)).toBe(true);
+    clearAcpCache("retained-authority");
+  });
+
+  it("reopens shared recovery diagnostics without restoring any current recovery permissions", () => {
+    const recovery: SessionRecovery = {
+      reason: "operation_failed",
+      diagnostic: "Original safe diagnostic",
+      evidence: null,
+      runtime: "acp_transport_ready",
+      work_in_progress: false,
+      uncertainty: "Delivery is uncertain.",
+      guidance: "Inspect the retained conversation.",
+      actions: { attach: true, retry_operation: true, restart_same: true, stop: true, fresh: true },
+      expected: "ephemeral-selection",
+    };
+    const live = { ...emptyAcpState(), recovery, recoveryNotice: recovery, recoverySnapshotSeq: 4 };
+    persistState("recovery", live);
+    const disk = loadPersistedState("recovery")!;
+    cacheSet("recovery-memory", live);
+    const memory = cacheGet("recovery-memory")!;
+    for (const state of [disk, memory]) {
+      expect(state.recovery).toBeNull();
+      expect(state.recoverySnapshotSeq).toBeNull();
+      expect(state.recoveryNotice?.diagnostic).toBe(recovery.diagnostic);
+    }
+    clearAcpCache("recovery-memory");
   });
 });
 

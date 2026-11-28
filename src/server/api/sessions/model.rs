@@ -87,6 +87,8 @@ pub(super) fn session_response_from_instance_with_plan(
         last_accessed_at: timestamp(row.last_accessed_at),
         idle_entered_at: timestamp(row.idle_entered_at),
         last_error: row.last_error.map(str::to_string),
+        last_error_evidence: row.last_error_evidence,
+        recovery: row.recovery.clone(),
         initial_prompt_error: inst
             .pending_initial_turn
             .as_ref()
@@ -152,6 +154,7 @@ pub(super) fn session_response_from_instance_with_plan(
         acp_worker_start: None,
         pending_approvals: Vec::new(),
         rate_limit: None,
+        rate_limit_known: None,
         rate_limit_auto_resume: None,
         rate_limit_failover_to: None,
         queued_count: inst.queued_prompts.len(),
@@ -316,7 +319,9 @@ pub(super) fn context_resume_with<'a>(
             }
         } else {
             match inst.acp_load_session_capable {
-                Some(true) => ContextResumeAvailability::Available,
+                Some(true) => ContextResumeAvailability::Indeterminate {
+                    reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+                },
                 Some(false) => ContextResumeAvailability::Unavailable {
                     reason: ContextResumeUnavailableReason::AgentUnsupported,
                 },
@@ -328,7 +333,17 @@ pub(super) fn context_resume_with<'a>(
     }
 
     match inst.terminal_context_resume_cached_with(profile_config) {
-        TerminalContextResume::Available => ContextResumeAvailability::Available,
+        TerminalContextResume::Available if inst.clone().qualify_recovery_same().is_ok() => {
+            ContextResumeAvailability::Available
+        }
+        TerminalContextResume::Available => ContextResumeAvailability::Indeterminate {
+            reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+        },
+        TerminalContextResume::RuntimeCheckRequired
+            if inst.clone().qualify_recovery_same().is_ok() =>
+        {
+            ContextResumeAvailability::Available
+        }
         TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
             reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
         },

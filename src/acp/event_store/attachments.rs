@@ -151,7 +151,14 @@ mod tests {
             origin_plugin: None,
             origin: crate::daemon::PromptOrigin::Unknown,
         };
-        store.record(session_id, 1, &prompt).unwrap();
+        store
+            .record(
+                session_id,
+                1,
+                &prompt,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         assert!(store.record_attachment(session_id, 1, &img_blob(id)));
     }
 

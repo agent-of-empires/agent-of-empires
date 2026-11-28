@@ -1,13 +1,15 @@
 //! Supervisor-authored events, each allocated the session's next seq.
 
+use std::sync::Arc;
 use tracing::info;
 
 use super::{
-    publish_next_persisted, publish_with_next_seq, BroadcastSink, PromptDisposition,
+    publish_next_persisted, with_publication_seq, BroadcastSink, PromptDisposition,
     PublishedPrompt, SeqMap, Supervisor, WorkerKind,
 };
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
+use crate::acp::event_sender::{AcpEventData, EventScope};
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
 use crate::acp::state::{BackgroundAgentStatus, Event, StartupCause, SubagentState};
 
@@ -28,13 +30,222 @@ pub struct UserPrompt<'a> {
 }
 
 impl<S: BroadcastSink> Supervisor<S> {
-    pub(super) fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
-        publish_next_persisted(self.sink.as_ref(), &self.next_seqs, session_id, event).0
+    pub(super) fn publish_next(&self, session_id: &str, event: Event) -> u64 {
+        publish_next_persisted(
+            self.sink.as_ref(),
+            &self.next_seqs,
+            session_id,
+            AcpEventData::from_host(event),
+        )
+        .0
     }
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
     pub fn publish_startup_error(&self, session_id: &str, message: String) {
         self.publish_startup_error_with_cause(session_id, message, None);
+    }
+
+    /// A retained runtime refused admission; this is not a native I/O/death
+    /// observation. Keep both native and worker exclusions through publication.
+    pub(crate) async fn publish_control_refusal(
+        &self,
+        session_id: &str,
+        scope: &crate::acp::state::NativeObservationScope,
+        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+        originating_epoch: Option<u64>,
+    ) -> bool {
+        let workers = Arc::clone(&self.workers);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let next_seqs = Arc::clone(&self.next_seqs);
+        let sink = Arc::clone(&self.sink);
+        let session_id = session_id.to_owned();
+        let scope = scope.clone();
+        let (done, published) = tokio::sync::oneshot::channel();
+        let publication = super::WorkerPublication::new(async move {
+            let result = loop {
+                let published = async {
+                    let workers = workers.lock().await;
+                    if workers.contains_key(&session_id) {
+                        return Some(false);
+                    }
+                    let lifecycle = super::lock_recover(&lifecycle);
+                    let current = lifecycle.current_lease(&session_id);
+                    let epoch = match lifecycle.phase(&session_id) {
+                        crate::acp::runner_lifecycle::WorkerPhase::Absent => None,
+                        crate::acp::runner_lifecycle::WorkerPhase::Resuming => {
+                            let Some(lease) = current.as_ref().filter(|lease| {
+                                originating_epoch == Some(lease.epoch())
+                                    && lease.spawned_runner() == refusal.owner
+                                    && lease
+                                        .native_scope()
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|native| native.context == scope.context)
+                            }) else {
+                                return Some(false);
+                            };
+                            Some(lease.epoch())
+                        }
+                        _ => return Some(false),
+                    };
+                    let _native = match scope.fence.try_lock_observation_matching(|_| true) {
+                        Ok(Some(guard)) => guard,
+                        Ok(None) => return None,
+                        Err(_) => return Some(false),
+                    };
+                    if !crate::process::worker_registry::refusal_still_applies(
+                        &session_id,
+                        &refusal,
+                    ) {
+                        return Some(false);
+                    }
+                    let observed = refusal.observation();
+                    let subject = crate::acp::state::NativeEventSubject {
+                        context: scope.context,
+                        owner: refusal.owner,
+                        kind: crate::acp::state::NativeSubjectEvent::AdmissionRefusal(refusal),
+                    };
+                    let event = Event::AcpConnectionUnavailable {
+                        source: observed.source,
+                        cause: observed.cause,
+                        phase: observed.phase,
+                        native_subject: Some(subject),
+                    };
+                    let mut data = AcpEventData::from_history(event);
+                    data.metadata.scope = EventScope::SessionCurrent;
+                    data.metadata.availability_denial = true;
+                    let seq = with_publication_seq(&next_seqs, &session_id, |seq| seq);
+                    drop(lifecycle);
+                    drop(workers);
+                    let persisted = match epoch {
+                        Some(epoch) => {
+                            sink.publish_replay_from_worker(
+                                &session_id,
+                                seq,
+                                &data,
+                                epoch,
+                                Some(subject),
+                                None,
+                            )
+                            .1
+                        }
+                        None => sink.publish_persisted(&session_id, seq, &data),
+                    };
+                    Some(persisted)
+                }
+                .await;
+                if let Some(published) = published {
+                    break published;
+                }
+                let fence = Arc::clone(&scope.fence);
+                if !matches!(
+                    tokio::task::spawn_blocking(move || fence.lock_observation().map(drop)).await,
+                    Ok(Ok(()))
+                ) {
+                    break false;
+                }
+            };
+            let _ = done.send(result);
+        });
+        if let Some(publication) = self.sink.publish_from_worker(publication) {
+            publication.complete().await;
+        }
+        published.await.unwrap_or(false)
+    }
+
+    pub(super) async fn publish_initial_stopped(
+        &self,
+        session_id: &str,
+        original: std::sync::Weak<crate::acp::acp_client::AcpClient>,
+        epoch: u64,
+        intent: uuid::Uuid,
+        prompt_seq: u64,
+    ) -> Result<(), super::SupervisorError> {
+        let workers = Arc::clone(&self.workers);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let next_seqs = Arc::clone(&self.next_seqs);
+        let sink = Arc::clone(&self.sink);
+        let session_id = session_id.to_owned();
+        let (done, completed) = tokio::sync::oneshot::channel();
+        let publication = super::WorkerPublication::new(async move {
+            let result = loop {
+                let mut wait = None;
+                let result = async {
+                    let workers = workers.lock().await;
+                    let Some(handle) = workers.get(&session_id) else {
+                        return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
+                    };
+                    let Some(client) = original
+                        .upgrade()
+                        .filter(|client| Arc::ptr_eq(client, &handle.client))
+                    else {
+                        return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
+                    };
+                    let lifecycle = super::lock_recover(&lifecycle);
+                    if lifecycle.phase(&session_id)
+                        != crate::acp::runner_lifecycle::WorkerPhase::Running
+                        || lifecycle.current_lease(&session_id).as_ref() != Some(&handle.lease)
+                        || handle.lease.epoch() != epoch
+                        || handle.lease.cancellation().is_cancelled()
+                    {
+                        return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
+                    }
+                    let scope = match handle.lease.native_scope() {
+                        Ok(Some(scope)) => scope,
+                        _ => return Some(Err(super::SupervisorError::NativeStoreUnavailable)),
+                    };
+                    let _native = match scope.fence.try_lock_observation_matching(|row| {
+                        row.status != crate::session::Status::Stopped
+                            && row.archived_at.is_none()
+                            && row.trashed_at.is_none()
+                            && row.terminal_handoff.is_none()
+                            && scope
+                                .choice
+                                .as_ref()
+                                .is_some_and(|choice| choice.matches(row))
+                    }) {
+                        Ok(Some(guard)) => guard,
+                        Ok(None) => {
+                            wait = Some(Arc::clone(&scope.fence));
+                            return None;
+                        }
+                        Err(_) => return Some(Err(super::SupervisorError::NativeStoreUnavailable)),
+                    };
+                    if !client.take_cancelled_initial_prompt(intent, prompt_seq) {
+                        return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
+                    }
+                    let data = AcpEventData::from_host(Event::Stopped {
+                        reason: "user_stopped".into(),
+                    });
+                    let seq = with_publication_seq(&next_seqs, &session_id, |seq| seq);
+                    drop(lifecycle);
+                    drop(workers);
+                    Some(if sink.publish_persisted(&session_id, seq, &data) {
+                        Ok(())
+                    } else {
+                        Err(super::SupervisorError::NativeStoreUnavailable)
+                    })
+                }
+                .await;
+                if let Some(result) = result {
+                    break result;
+                }
+                let fence = wait.expect("unavailable Native fence supplied a wait");
+                if !matches!(
+                    tokio::task::spawn_blocking(move || fence.lock_observation().map(drop)).await,
+                    Ok(Ok(()))
+                ) {
+                    break Err(super::SupervisorError::NativeStoreUnavailable);
+                }
+            };
+            let _ = done.send(result);
+        });
+        if let Some(publication) = self.sink.publish_from_worker(publication) {
+            publication.complete().await;
+        }
+        completed
+            .await
+            .unwrap_or(Err(super::SupervisorError::ControlStateUnavailable))
     }
 
     /// As [`Self::publish_startup_error`], naming the cause for clients that act on it.
@@ -44,7 +255,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         message: String,
         cause: Option<StartupCause>,
     ) {
-        self.publish_next(session_id, &Event::AgentStartupError { message, cause });
+        self.publish_next(
+            session_id,
+            Event::AgentStartupError {
+                message,
+                cause,
+                native_subject: None,
+            },
+        );
     }
 
     /// The startup error of a launch held for the sandbox login: the instruction, and the
@@ -79,23 +297,37 @@ impl<S: BroadcastSink> Supervisor<S> {
         )
     }
 
-    /// [`Self::publish_stopped_if_seq`] for any event. True only once the
-    /// event is stored.
+    /// Publish any event conditionally, reporting success only after it is stored.
     pub fn publish_if_seq(&self, session_id: &str, event: &Event, expected_seq: u64) -> bool {
-        let counter = super::session_seq(&self.next_seqs, session_id);
-        let persisted = super::sink::blocking_io(|| {
-            let mut last = super::lock_recover(&counter);
-            if *last != expected_seq {
-                return None;
-            }
-            *last = last.saturating_add(1);
-            Some(self.sink.queue_persisted(session_id, *last, event))
-        });
-        let Some(persisted) = persisted else {
-            return false;
-        };
-        // A failed save is already broadcast as an AgentStartupError.
-        persisted.wait()
+        self.sink
+            .queue_persisted(
+                session_id,
+                Arc::clone(&self.next_seqs),
+                AcpEventData::from_host(event.clone()),
+                Some(expected_seq),
+            )
+            .wait()
+            .is_some_and(|(_, stored)| stored)
+    }
+
+    pub(crate) fn publish_autonomous_rate_limit_if_seq(
+        &self,
+        session_id: &str,
+        info: crate::acp::state::RateLimitInfo,
+        identity: Arc<crate::acp::event_sender::NativeAutonomousIdentity>,
+        expected_seq: u64,
+    ) -> bool {
+        let mut data = AcpEventData::from_host(Event::RateLimit { info });
+        data.metadata.autonomous_rate_limit = Some(identity);
+        self.sink
+            .queue_persisted(
+                session_id,
+                Arc::clone(&self.next_seqs),
+                data,
+                Some(expected_seq),
+            )
+            .wait()
+            .is_some_and(|(_, stored)| stored)
     }
 
     pub fn publish_agent_switched(
@@ -105,7 +337,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         to: String,
         reason: String,
     ) -> u64 {
-        self.publish_next(session_id, &Event::AgentSwitched { from, to, reason })
+        self.publish_next(session_id, Event::AgentSwitched { from, to, reason })
     }
 
     pub fn publish_conversation_summary(
@@ -116,7 +348,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) {
         self.publish_next(
             session_id,
-            &Event::ConversationSummary {
+            Event::ConversationSummary {
                 text,
                 summarized_until_seq,
             },
@@ -129,18 +361,51 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         resets_at: crate::time::Timestamp,
         manual: bool,
-    ) -> u64 {
-        self.publish_next(
+    ) -> Result<u64, super::SupervisorError> {
+        let (seq, stored) = publish_next_persisted(
+            self.sink.as_ref(),
+            &self.next_seqs,
             session_id,
-            &Event::RateLimitAutoResumed { resets_at, manual },
-        )
+            AcpEventData::from_host(Event::RateLimitAutoResumed { resets_at, manual }),
+        );
+        stored
+            .then_some(seq)
+            .ok_or(super::SupervisorError::NativeStoreUnavailable)
+    }
+
+    /// Refuse a deferred release if its checked event frontier changed.
+    pub(crate) fn publish_rate_limit_auto_resumed_if_seq(
+        &self,
+        session_id: &str,
+        resets_at: crate::time::Timestamp,
+        expected_seq: u64,
+    ) -> Result<(), super::SupervisorError> {
+        match self
+            .sink
+            .queue_persisted(
+                session_id,
+                Arc::clone(&self.next_seqs),
+                AcpEventData::from_host(Event::RateLimitAutoResumed {
+                    resets_at,
+                    manual: true,
+                }),
+                Some(expected_seq),
+            )
+            .wait()
+        {
+            Some((_, true)) => Ok(()),
+            Some((_, false)) => Err(super::SupervisorError::NativeStoreUnavailable),
+            None => Err(super::SupervisorError::SpawnCancelled(
+                session_id.to_owned(),
+            )),
+        }
     }
 
     /// Close a turn that was in flight when the previous daemon died.
     pub fn synthesize_stopped_for_orphan(&self, session_id: &str, reason: &str) {
         let seq = self.publish_next(
             session_id,
-            &Event::Stopped {
+            Event::Stopped {
                 reason: reason.to_string(),
             },
         );
@@ -198,7 +463,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             seq: None,
             last_seq: None,
         };
-        // The first id names the transcript row; the rest were folded into it by a queue drain or send-now.
+        // The first id owns the row; queue drains preserve every folded submission id.
         let mut prompt_ids = prompt_ids.into_iter();
         let event = Event::UserPromptSent {
             text,
@@ -209,19 +474,24 @@ impl<S: BroadcastSink> Supervisor<S> {
             origin_plugin,
             origin,
         };
-        let (seq, persisted) = publish_with_next_seq(&self.next_seqs, session_id, |seq| {
-            (
-                seq,
-                self.sink.queue_prompt(session_id, seq, attachments, &event),
+        let Some((seq, persisted)) = self
+            .sink
+            .queue_prompt(
+                session_id,
+                Arc::clone(&self.next_seqs),
+                attachments,
+                AcpEventData::from_host(event),
             )
-        });
-        if !persisted.wait() {
-            // Roll back so refs never point at blobs that were not published.
+            .wait()
+        else {
+            return unrecorded;
+        };
+        if !persisted {
             self.sink.delete_attachments_for_seq(session_id, seq);
             return unrecorded;
         }
         let last_seq = if is_clear && disposition == PromptDisposition::Forward {
-            self.publish_next(session_id, &Event::SessionCleared)
+            self.publish_next(session_id, Event::SessionCleared)
         } else {
             seq
         };
@@ -252,7 +522,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let _admission = super::lock_recover(&self.lifecycle).note_admission(session_id);
         self.publish_next(
             session_id,
-            &Event::UserDiffCommentsPrompt {
+            Event::UserDiffCommentsPrompt {
                 intro,
                 outro,
                 is_multi_repo,
@@ -420,37 +690,78 @@ pub(super) const WORKER_REPLACED_DETACH_WARNING: &str =
 /// see [`collect_resumable_background_agent_launches`].
 pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
     warning: &str,
 ) {
-    for task_id in sink.unresolved_background_task_ids(session_id) {
-        publish_next_persisted(
+    complete_stopped_worker_work(sink, next_seqs, session_id, Some(warning));
+}
+
+/// End tracking with the original allocation, without claiming a Native outcome.
+pub(super) fn complete_stopped_worker_work<S: BroadcastSink>(
+    sink: &S,
+    next_seqs: &Arc<SeqMap>,
+    session_id: &str,
+    warning: Option<&str>,
+) -> bool {
+    let finish_task = |task_id, allocation| {
+        publish_tracking_end(
             sink,
             next_seqs,
             session_id,
-            &Event::BackgroundTaskFinished {
+            Event::BackgroundTaskFinished {
                 task_id,
                 ended_at: Some(crate::time::Timestamp::now()),
             },
-        );
+            allocation,
+        )
+    };
+    let finish_agent = |agent_id, allocation| {
+        publish_background_agent_detached(
+            sink, next_seqs, session_id, agent_id, warning, allocation,
+        )
+    };
+    if let Some(store) = sink.establishment_store() {
+        let (Ok(tasks), Ok(agents)) = (
+            store.unresolved_background_task_launches(session_id),
+            store.unresolved_background_agent_tracking_launches(session_id),
+        ) else {
+            return false;
+        };
+        for task in tasks {
+            if !finish_task(
+                task.task_id,
+                task.witness.as_ref().map(|witness| witness.allocation),
+            ) {
+                return false;
+            }
+        }
+        for agent in agents {
+            if !finish_agent(
+                agent.agent_id,
+                agent.witness.as_ref().map(|witness| witness.allocation),
+            ) {
+                return false;
+            }
+        }
+    } else {
+        for task_id in sink.unresolved_background_task_ids(session_id) {
+            if !finish_task(task_id, None) {
+                return false;
+            }
+        }
+        for agent_id in sink.unresolved_background_agent_ids(session_id) {
+            if !finish_agent(agent_id, None) {
+                return false;
+            }
+        }
     }
     for event in cancelled_open_subagents(sink, session_id) {
-        publish_next_persisted(sink, next_seqs, session_id, &event);
+        if !publish_next_persisted(sink, next_seqs, session_id, AcpEventData::from_host(event)).1 {
+            return false;
+        }
     }
-    let stale_ids = sink.unresolved_background_agent_ids(session_id);
-    if stale_ids.is_empty() {
-        return;
-    }
-    info!(
-        target: "acp.supervisor",
-        session = %session_id,
-        stale = stale_ids.len(),
-        "detaching background sub-agents orphaned by daemon restart"
-    );
-    for agent_id in stale_ids {
-        publish_background_agent_detached(sink, next_seqs, session_id, agent_id, warning);
-    }
+    true
 }
 
 /// A dead worker's working subagents will never report their idle, so each
@@ -471,62 +782,75 @@ pub(super) fn cancelled_open_subagents<S: BroadcastSink>(sink: &S, session_id: &
 
 fn publish_background_agent_detached<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
     agent_id: String,
-    warning: &str,
-) {
-    publish_next_persisted(
+    warning: Option<&str>,
+    allocation: Option<uuid::Uuid>,
+) -> bool {
+    publish_tracking_end(
         sink,
         next_seqs,
         session_id,
-        &Event::BackgroundAgentCompleted {
+        Event::BackgroundAgentCompleted {
             agent_id,
             status: BackgroundAgentStatus::Detached,
             tools: Vec::new(),
             result: None,
-            warning: Some(warning.to_string()),
+            warning: warning.map(str::to_owned),
             ended_at: crate::time::Timestamp::now(),
         },
-    );
+        allocation,
+    )
 }
 
-/// The attach-path counterpart of [`detach_orphaned_background_agents_on`]:
-/// the worker just attached is provably alive, so a sub-agent it launched may
-/// still be running. Detaches only the launches with no transcript path to
-/// resume from and returns the rest for `AcpClient::resume_background_tailing`.
-/// Sync so the query and those publishes can run before the drain starts,
-/// while the resume send stays an await outside the caller's lock.
+fn publish_tracking_end<S: BroadcastSink>(
+    sink: &S,
+    next_seqs: &Arc<SeqMap>,
+    session_id: &str,
+    event: Event,
+    allocation: Option<uuid::Uuid>,
+) -> bool {
+    let mut data = AcpEventData::from_host(event);
+    data.metadata.resource_ref = allocation;
+    publish_next_persisted(sink, next_seqs, session_id, data).1
+}
+
+/// Missing paths are untrackable; usable paths still require their real witness at adoption.
 pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
-) -> Vec<UnresolvedBackgroundAgentLaunch> {
+) -> anyhow::Result<Vec<UnresolvedBackgroundAgentLaunch>> {
     let (resumable, untrackable): (Vec<_>, Vec<_>) = sink
-        .unresolved_background_agent_launches(session_id)
+        .unresolved_background_agent_launches(session_id)?
         .into_iter()
         .partition(|l| !l.output_file.is_empty());
     for launch in untrackable {
-        publish_background_agent_detached(
-            sink,
-            next_seqs,
-            session_id,
-            launch.agent_id,
-            "session reattached before this sub-agent finished; tracking stopped",
+        anyhow::ensure!(
+            publish_background_agent_detached(
+                sink,
+                next_seqs,
+                session_id,
+                launch.agent_id,
+                Some("session reattached before this sub-agent finished; tracking stopped"),
+                launch.witness.as_ref().map(|witness| witness.allocation),
+            ),
+            "background agent detach was not persisted"
         );
     }
-    resumable
+    Ok(resumable)
 }
 
 /// Cancel approvals and elicitations a dead worker left unresolved in the log:
 /// their responders died with it, so the cards would fail on submit.
 pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
 ) {
     let publish = |event: Event| {
-        publish_next_persisted(sink, next_seqs, session_id, &event);
+        publish_next_persisted(sink, next_seqs, session_id, AcpEventData::from_host(event));
     };
     let approvals = sink.unresolved_approval_nonces(session_id);
     if !approvals.is_empty() {
@@ -608,7 +932,7 @@ mod tests {
 
         let frames = sink.frames.lock().unwrap().clone();
         assert_eq!(frames.len(), 2);
-        let Event::AgentStartupError { message, cause } = &frames[0].2 else {
+        let Event::AgentStartupError { message, cause, .. } = &frames[0].2 else {
             panic!("expected a startup error, got {:?}", frames[0].2);
         };
         assert_eq!(*message, blocked.to_string());
@@ -628,9 +952,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tracking_cleanup_refuses_unreadable_durable_allocations() {
+        let (sink, _store, _events, database) = channel_sink();
+        let supervisor = Supervisor::new(sink.clone());
+
+        let fault = rusqlite::Connection::open(database.path().join("acp.db")).unwrap();
+        fault.execute_batch("DROP TABLE acp_events").unwrap();
+        assert!(!complete_stopped_worker_work(
+            sink.as_ref(),
+            &supervisor.next_seqs,
+            "tracking",
+            None
+        ));
+    }
+
     #[tokio::test]
-    async fn seq_counters_are_per_session_hydratable_and_forgettable() {
-        let sink = VecSink::new();
+    async fn durable_forget_clears_history_and_budget_before_restarting_the_sequence() {
+        let (sink, store, mut published, _database) = channel_sink();
         let sup = Supervisor::new(sink.clone());
         sup.hydrate_seqs([("s-hydrated".to_string(), 42)]);
 
@@ -638,45 +977,66 @@ mod tests {
         sup.publish_user_prompt("s-1", "first prompt".into()).await;
         let resets_at = crate::time::Timestamp::now();
         assert_eq!(
-            sup.publish_rate_limit_auto_resumed("s-1", resets_at, false),
+            sup.publish_rate_limit_auto_resumed("s-1", resets_at, false)
+                .unwrap(),
             3
         );
         assert_eq!(
-            publish_with_next_seq(&sup.next_seqs, "s-2", |seq| seq),
+            sup.publish_next(
+                "s-2",
+                Event::Stopped {
+                    reason: "user_stopped".into()
+                }
+            ),
             1,
             "sessions count separately"
         );
         sup.publish_user_prompt("s-hydrated", "after restart".into())
             .await;
 
-        let frames = sink.frames.lock().unwrap().clone();
+        let frames: Vec<_> = (0..5).map(|_| published.try_recv().unwrap()).collect();
         let seqs: Vec<(&str, u64)> = frames
             .iter()
-            .map(|(id, seq, _)| (id.as_str(), *seq))
+            .map(|frame| (frame.session_id.as_str(), frame.seq))
             .collect();
         assert_eq!(
             seqs,
-            [("s-1", 1), ("s-1", 2), ("s-1", 3), ("s-hydrated", 43)]
+            [
+                ("s-1", 1),
+                ("s-1", 2),
+                ("s-1", 3),
+                ("s-2", 1),
+                ("s-hydrated", 43)
+            ]
         );
         assert!(matches!(
-            &frames[1].2,
+            frames[1].event.as_ref(),
             Event::UserPromptSent { text, .. } if text == "first prompt"
         ));
         assert!(matches!(
-            &frames[2].2,
+            frames[2].event.as_ref(),
             Event::RateLimitAutoResumed { resets_at: ts, .. } if *ts == resets_at
         ));
 
         sup.forget_session("s-1").unwrap();
-        assert_eq!(publish_with_next_seq(&sup.next_seqs, "s-1", |seq| seq), 1);
+        sup.publish_user_prompt("s-1", "new explicit input".into())
+            .await;
+        let replay = store.replay_from("s-1", 0).unwrap();
+        assert!(matches!(replay.as_slice(), [stored]
+            if stored.seq == 1 && matches!(stored.event.as_ref(),
+                Event::UserPromptSent { text, .. } if text == "new explicit input")));
+        assert_eq!(
+            store.rate_limit_redelivery_streak("s-1").unwrap(),
+            crate::acp::event_store::ControlKnowledge::Known(0)
+        );
     }
 
     #[tokio::test]
     async fn publish_if_seq_is_false_when_the_save_fails() {
         struct FailingSink;
         impl BroadcastSink for FailingSink {
-            fn publish(&self, _: &str, _: u64, _: &Event) {}
-            fn publish_persisted(&self, _: &str, _: u64, _: &Event) -> bool {
+            fn publish(&self, _: &str, _: u64, _: &AcpEventData) {}
+            fn publish_persisted(&self, _: &str, _: u64, _: &AcpEventData) -> bool {
                 false
             }
         }
@@ -1021,8 +1381,13 @@ inherits-claude = "claude"
     async fn publish_user_prompt_reports_the_seq_it_recorded() {
         struct RefusesToPersist;
         impl BroadcastSink for RefusesToPersist {
-            fn publish(&self, _: &str, _: u64, _: &Event) {}
-            fn publish_persisted(&self, _: &str, _: u64, _: &Event) -> bool {
+            fn publish(&self, _: &str, _: u64, _: &crate::acp::event_sender::AcpEventData) {}
+            fn publish_persisted(
+                &self,
+                _: &str,
+                _: u64,
+                _: &crate::acp::event_sender::AcpEventData,
+            ) -> bool {
                 false
             }
         }
@@ -1069,18 +1434,27 @@ inherits-claude = "claude"
         );
     }
 
-    /// Records, for each broadcast, whether its session's seq counter was held.
+    /// Observes the reserved ordinal after sequence exclusion has been released for persistence.
     #[derive(Default)]
     struct LockProbeSink {
         seqs: std::sync::OnceLock<std::sync::Arc<SeqMap>>,
-        held: std::sync::Mutex<Vec<(u64, bool)>>,
+        seen: std::sync::Mutex<Vec<(u64, bool)>>,
+        durable: Arc<VecSink>,
     }
 
     impl BroadcastSink for LockProbeSink {
-        fn publish(&self, session_id: &str, seq: u64, _event: &Event) {
-            let counter = super::super::session_seq(self.seqs.get().unwrap(), session_id);
-            let held = matches!(counter.try_lock(), Err(std::sync::TryLockError::WouldBlock));
-            self.held.lock().unwrap().push((seq, held));
+        fn publish(&self, session_id: &str, seq: u64, _event: &AcpEventData) {
+            let counter = super::super::sequence_slot(self.seqs.get().unwrap(), session_id);
+            let Ok(current) = counter.try_lock() else {
+                panic!("persistence must not retain sequence exclusion");
+            };
+            let allocated = current.seq == seq;
+            drop(current);
+            self.seen.lock().unwrap().push((seq, allocated));
+        }
+        fn publish_persisted(&self, session_id: &str, seq: u64, data: &AcpEventData) -> bool {
+            self.publish(session_id, seq, data);
+            self.durable.publish_persisted(session_id, seq, data)
         }
     }
 
@@ -1092,9 +1466,9 @@ inherits-claude = "claude"
     }
 
     impl BroadcastSink for AdmissionProbeSink {
-        fn publish(&self, _: &str, _: u64, event: &Event) {
+        fn publish(&self, _: &str, _: u64, data: &AcpEventData) {
             if matches!(
-                event,
+                data.event.as_ref(),
                 Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
             ) {
                 self.seen
@@ -1133,16 +1507,14 @@ inherits-claude = "claude"
     async fn each_publish_runs_under_its_sessions_seq_lock() {
         let sink = std::sync::Arc::new(LockProbeSink::default());
         let sup = Supervisor::new(std::sync::Arc::clone(&sink));
-        sink.seqs
-            .set(std::sync::Arc::clone(&sup.next_seqs))
-            .unwrap();
+        assert!(sink.seqs.set(std::sync::Arc::clone(&sup.next_seqs)).is_ok());
 
         sup.publish_startup_error("s-1", "boom".into());
         sup.publish_user_prompt("s-1", "prompt".into()).await;
         assert!(sup.publish_stopped_if_seq("s-1", "user_stopped", 2));
 
         assert_eq!(
-            *sink.held.lock().unwrap(),
+            *sink.seen.lock().unwrap(),
             [(1, true), (2, true), (3, true)]
         );
     }

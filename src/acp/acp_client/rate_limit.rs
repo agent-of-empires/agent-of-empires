@@ -48,29 +48,44 @@ fn flattened_error(message: &str) -> Option<(&str, String)> {
 /// the reset and window come from the status text (`refine_from_status`).
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
     now: crate::time::Timestamp,
 ) -> Option<RateLimitInfo> {
-    let kind = err.data.as_ref()?.get("errorKind")?.as_str()?;
+    // Present data is authoritative; only a flattened error may use the message.
+    let Some(data) = err.data.as_ref() else {
+        return classify_rate_limit_from_message(&err.message, captured, now);
+    };
+    let kind = data.get("errorKind")?.as_str()?;
     let kind = *ACCOUNT_LIMIT_KINDS.iter().find(|k| **k == kind)?;
-    Some(limit_info(err.message.clone(), kind, captured, now))
+    Some(limit_info(
+        super::errors::public_error_message(err),
+        kind,
+        captured,
+        now,
+    ))
 }
 
 /// Fallback for an outer error that kept only the serialized `errorKind`.
-pub(crate) fn classify_rate_limit_from_message(
+fn classify_rate_limit_from_message(
     message: &str,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
     now: crate::time::Timestamp,
 ) -> Option<RateLimitInfo> {
     let (prose, kind) = flattened_error(message)?;
     let kind = *ACCOUNT_LIMIT_KINDS.iter().find(|k| **k == kind)?;
-    Some(limit_info(prose.to_string(), kind, captured, now))
+    let status = super::spawn::scrub_stderr_secrets(prose);
+    let status = if status.len() > 2048 {
+        super::delete::truncate_for_log(&status, 2045)
+    } else {
+        status.into_owned()
+    };
+    Some(limit_info(status, kind, captured, now))
 }
 
 fn limit_info(
     status: String,
     kind: &str,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
     now: crate::time::Timestamp,
 ) -> RateLimitInfo {
     // A captured window is a quota window's: a billing error keeps its own kind and takes no reset.
@@ -78,10 +93,8 @@ fn limit_info(
     refine_from_status(
         RateLimitInfo {
             status,
-            resets_at: captured.as_ref().map(|c| c.resets_at),
-            kind: captured
-                .as_ref()
-                .map_or_else(|| kind.to_string(), |c| c.kind()),
+            resets_at: captured.map(|c| c.resets_at),
+            kind: captured.map_or_else(|| kind.to_string(), |c| c.kind()),
         },
         now,
         Observation::Live,
@@ -255,29 +268,6 @@ fn parse_month_day(date: &str) -> Option<(i8, i8)> {
     Some((month, day.trim().parse().ok()?))
 }
 
-/// A stored session ID the agent no longer knows, as opposed to an
-/// unsupported session feature.
-pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
-    const PHRASES: &[&str] = &[
-        "unsupported acp session",
-        "unknown session",
-        "session not found",
-        "no such session",
-        "session does not exist",
-    ];
-    // 0.99.0+ answers an unknown id with `-32002` and `data.sessionId`.
-    if err.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
-        && err
-            .data
-            .as_ref()
-            .is_some_and(|d| d.get("sessionId").is_some())
-    {
-        return true;
-    }
-    let msg = err.message.to_ascii_lowercase();
-    PHRASES.iter().any(|phrase| msg.contains(phrase))
-}
-
 /// A rejected window from a `usage_update`'s `_meta["_claude/rateLimit"]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RateLimitRejection {
@@ -325,34 +315,48 @@ pub(super) fn rate_limit_rejection_from_meta(
     })
 }
 
+pub(super) fn recovered_rate_limit_window(
+    meta: &Option<agent_client_protocol::v1::schema::Meta>,
+) -> Option<&str> {
+    let info = meta.as_ref()?.get("_claude/rateLimit")?;
+    (overage_covers(info)
+        || info
+            .get("status")
+            .and_then(|status| status.as_str())
+            .is_some_and(|status| status != "rejected"))
+    .then(|| {
+        info.get("rateLimitType")
+            .and_then(|window| window.as_str())
+            .unwrap_or_default()
+    })
+}
+
 /// Records a rejected window and drops one a later report shows has recovered,
 /// so a stale rejection cannot park a turn. Returns whether a rejection was kept.
 pub(super) fn record_rate_limit_report(
     captures: &std::sync::Mutex<HashMap<String, i64>>,
     meta: &Option<agent_client_protocol::v1::schema::Meta>,
 ) -> bool {
-    let Some(info) = meta.as_ref().and_then(|m| m.get("_claude/rateLimit")) else {
+    if meta
+        .as_ref()
+        .and_then(|meta| meta.get("_claude/rateLimit"))
+        .is_none()
+    {
         return false;
-    };
+    }
     let mut captures = captures.lock().expect("rate-limit capture mutex poisoned");
     if let Some(r) = rate_limit_rejection_from_meta(meta) {
         captures.insert(r.window, r.resets_at_secs);
         return true;
     }
-    if overage_covers(info)
-        || info
-            .get("status")
-            .and_then(|s| s.as_str())
-            .is_some_and(|s| s != "rejected")
-    {
-        let window = info.get("rateLimitType").and_then(|v| v.as_str());
-        captures.remove(window.unwrap_or_default());
+    if let Some(window) = recovered_rate_limit_window(meta) {
+        captures.remove(window);
     }
     false
 }
 
 /// The window with the latest future reset, since every rejected window must clear.
-fn latest_future_reset<'a>(
+pub(super) fn latest_future_reset<'a>(
     captures: impl Iterator<Item = (&'a String, &'a i64)>,
     now: crate::time::Timestamp,
 ) -> Option<CapturedReset> {
@@ -571,7 +575,7 @@ mod tests {
             resets_at: utc("2026-11-20T00:00:00Z").unwrap(),
         };
         let info =
-            classify_rate_limit_error(&err(weekly, Some(limit)), Some(captured), now()).unwrap();
+            classify_rate_limit_error(&err(weekly, Some(limit)), Some(&captured), now()).unwrap();
         assert_eq!(info.resets_at, utc("2026-11-20T00:00:00Z"));
         assert_eq!(info.kind, "seven_day_opus");
 
@@ -741,7 +745,7 @@ mod tests {
                 "You've hit your 5-hour limit · resets 6pm (UTC)",
                 Some(json!({ "errorKind": "rate_limit" })),
             ),
-            Some(far),
+            Some(&far),
             now(),
         )
         .unwrap();
@@ -755,6 +759,18 @@ mod tests {
             Some(json!({ "errorKind": "rate_limit" })),
         );
         assert!(classify_rate_limit_error(&structured, None, now()).is_some());
+        let misleading = err(
+            r#"limit: {"errorKind":"rate_limit"}"#,
+            Some(json!({ "errorKind": "overloaded" })),
+        );
+        assert!(classify_rate_limit_error(&misleading, None, now()).is_none());
+        let flattened = err(r#"limit: {"errorKind":"billing_error"}"#, None);
+        assert_eq!(
+            classify_rate_limit_error(&flattened, None, now())
+                .unwrap()
+                .kind,
+            "billing_error"
+        );
         // Data without its own errorKind ends the search; a nested one is never promoted.
         let cause_only =
             "ACP connection failed: low: {\"cause\":{\"errorKind\":\"billing_error\"}}";
@@ -766,7 +782,7 @@ mod tests {
         };
         let billing = classify_rate_limit_error(
             &err("low", Some(json!({ "errorKind": "billing_error" }))),
-            Some(quota),
+            Some(&quota),
             now(),
         )
         .unwrap();
@@ -916,7 +932,7 @@ mod tests {
         assert_eq!(info.resets_at, None);
 
         let info =
-            classify_rate_limit_error(&err("limit", Some(limit)), Some(captured), now()).unwrap();
+            classify_rate_limit_error(&err("limit", Some(limit)), Some(&captured), now()).unwrap();
         assert_eq!(info.resets_at, Some(resets_at));
         assert_eq!(info.kind, "seven_day", "the window names the limit");
 
@@ -940,7 +956,7 @@ mod tests {
                     window: window.into(),
                     resets_at,
                 };
-                let info = classify_rate_limit_from_message(msg, Some(captured), now()).unwrap();
+                let info = classify_rate_limit_from_message(msg, Some(&captured), now()).unwrap();
                 assert_eq!(info.kind, kind);
                 assert_eq!(info.resets_at, Some(resets_at));
             }
@@ -1108,45 +1124,5 @@ mod tests {
                 assert!(take_rate_limit_from_captured_rejection(&captures, now).is_none());
             }
         }
-    }
-
-    #[test]
-    fn is_unsupported_session_error_matches_only_stale_session_rejections() {
-        let cases = [
-            ("Unsupported ACP session", true),
-            ("Unknown session 01a040bb-...", true),
-            ("session not found", true),
-            ("no such session: abc", true),
-            ("Session does not exist", true),
-            ("You've hit your limit", false),
-            ("transport closed", false),
-            ("unsupported model", false),
-            ("unknown tool", false),
-            ("Unsupported content block in session/prompt", false),
-            ("Method not found: session/prompt", false),
-            ("Unsupported session mode", false),
-            ("Unsupported session capability: fork", false),
-        ];
-        for (msg, expected) in cases {
-            assert_eq!(
-                is_unsupported_session_error(&err(msg, None)),
-                expected,
-                "{msg:?}"
-            );
-        }
-
-        // 0.99.0+ rejects an unknown id with a bare `-32002` and no phrase.
-        let not_found = |data| {
-            let mut e = err("Resource not found", data);
-            e.code = agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND;
-            e
-        };
-        assert!(is_unsupported_session_error(&not_found(Some(
-            json!({ "sessionId": "abc" })
-        ))));
-        assert!(!is_unsupported_session_error(&not_found(None)));
-        assert!(!is_unsupported_session_error(&not_found(Some(
-            json!({ "uri": "file:///x" })
-        ))));
     }
 }

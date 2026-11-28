@@ -62,9 +62,13 @@ mod v050_sound_volume_split;
 mod v051_structured_view;
 mod v052_runtime_filter_acp_target;
 mod v053_runtime_filter_reset;
+mod v054_acp_establishment;
 mod v054_retained_history_identity;
+mod v055_acp_event_scope;
 mod v055_global_max_concurrent_workers;
 mod v056_launch_resolved_executable;
+mod v056_native_prompt_publication;
+mod v057_acp_budget_knowledge;
 mod v057_worker_launch_executable;
 mod v058_account_limits_window_shape;
 mod v059_owner_only_event_logs;
@@ -76,7 +80,9 @@ mod v064_builtin_sounds;
 mod v065_account_limit_estimate_rows;
 mod v066_retire_agent_update_fields;
 mod v067_retire_restart_wake;
+mod v068_reconcile_acp_lineages;
 mod v068_shared_sidebar_view;
+mod v069_reconcile_acp_and_sidebar;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -117,7 +123,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 68;
+const CURRENT_VERSION: u32 = 69;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -348,6 +354,11 @@ const MIGRATIONS: &[Migration] = &[
     ),
     (67, "retire_restart_wake", v067_retire_restart_wake::run),
     (68, "shared_sidebar_view", v068_shared_sidebar_view::run),
+    (
+        69,
+        "reconcile_acp_and_sidebar",
+        v069_reconcile_acp_and_sidebar::run,
+    ),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -360,7 +371,10 @@ pub fn current_schema_version() -> u32 {
 
 /// Check whether there are any pending migrations to run.
 pub fn has_pending_migrations() -> bool {
-    get_current_version() < CURRENT_VERSION
+    let current = get_current_version();
+    current < CURRENT_VERSION
+        || (current == CURRENT_VERSION
+            && v068_reconcile_acp_lineages::autonomous_pending().unwrap_or(true))
 }
 
 /// Check compatibility before changing or stopping a managed daemon.
@@ -378,7 +392,7 @@ pub(crate) fn ensure_schema_supported() -> Result<u32> {
 pub fn assert_schema_current() -> Result<()> {
     let current = ensure_schema_supported()?;
     anyhow::ensure!(
-        current == CURRENT_VERSION,
+        current == CURRENT_VERSION && !v068_reconcile_acp_lineages::autonomous_pending()?,
         "data schema version {current} is behind this build ({CURRENT_VERSION}); \
          the parent `aoe serve` must migrate before launching the daemon child"
     );
@@ -476,10 +490,16 @@ fn run_migrations_inner(
     let _installed = progress::install(reporter);
     let _announced = progress::install_announced(announce);
     let current = ensure_schema_supported()?;
+    let needs_exclusion = |current| -> Result<bool> {
+        Ok(announce
+            || current < CURRENT_VERSION
+            || v068_reconcile_acp_lineages::autonomous_pending()?)
+    };
+    let requires_exclusion = needs_exclusion(current)?;
     // Older daemons know serve.lock but not the lifecycle transaction. Hold
     // both before the first schema write; standalone callers include the TUI.
     let owned_transaction;
-    let transaction = if (current < CURRENT_VERSION || announce) && transaction.is_none() {
+    let transaction = if requires_exclusion && transaction.is_none() {
         // A concurrent migrator holds this through its migration and the daemon
         // start it hands off to; match the async acquire bound.
         owned_transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
@@ -491,8 +511,9 @@ fn run_migrations_inner(
     };
     // Another migrator may have completed while we acquired its transaction.
     let current = ensure_schema_supported()?;
+    let requires_exclusion = requires_exclusion && needs_exclusion(current)?;
     let owned_serve;
-    let serve = if (current < CURRENT_VERSION || announce) && serve.is_none() {
+    let serve = if requires_exclusion && serve.is_none() {
         owned_serve = crate::cli::serve::try_lock_serve()?.ok_or(DaemonBlocksMigration(
             "A daemon or migration is starting or running",
         ))?;
@@ -500,7 +521,7 @@ fn run_migrations_inner(
     } else {
         serve
     };
-    if current < CURRENT_VERSION || announce {
+    if requires_exclusion {
         let transaction = transaction.context("Missing migration lifecycle transaction")?;
         // Drop this probe before v044 and explicit recovery take nested lifetime
         // and state exclusions. The held transaction and serve lock exclude starts.
@@ -515,6 +536,7 @@ fn run_migrations_inner(
     }
     debug!("Current schema version: {}", current);
     if current == CURRENT_VERSION {
+        v068_reconcile_acp_lineages::reconcile_autonomous_metadata()?;
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
         v033_isolate_sandbox_content::reconcile_pending(announce)?;
     } else {
@@ -651,6 +673,7 @@ mod tests {
             assert!(*version > prev, "Migration {version} should be > {prev}");
             prev = *version;
         }
+        assert_eq!(prev, CURRENT_VERSION);
     }
 
     #[test]

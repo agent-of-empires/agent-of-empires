@@ -150,7 +150,7 @@ tempfile = "3.14"
 which = "8.0"
 
 # SQLite
-rusqlite = "0.41"
+rusqlite = { version = "0.41", features = ["backup"] }
 
 axum = { version = "0.8", features = ["ws"] }
 # hyper/TokioIo reuse the UID/PID-verified UnixStream, including builds without `web`.
@@ -249,8 +249,6 @@ typescript = ["dep:ts-rs"]
 [dev-dependencies]
 serial_test = "4.0"
 jsonschema = { version = "0.59.0", default-features = false }
-syn = { version = "3.0", features = ["full", "visit"] }
-proc-macro2 = { version = "1.0", features = ["span-locations"] }
 # Integration tests are separate crates and don't inherit the normal
 # `serde_json` dependency; the acp-runner orphan test parses a worker
 # registry record to mutate its pid structurally.

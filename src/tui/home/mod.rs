@@ -124,6 +124,16 @@ pub(super) enum PermissionResponseTarget {
     },
 }
 
+pub(super) enum MessageIntent {
+    Send(String),
+    RetryExisting { id: String, expected: String },
+}
+
+pub(super) enum StopIntent {
+    Ordinary(String),
+    Recovery { id: String, expected: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ViewMode {
     #[default]
@@ -284,7 +294,7 @@ impl PendingStructuredInput {
 
 pub(in crate::tui) struct ReadyNativeAttachment {
     pub id: String,
-    pub tmux_name: String,
+    pub terminal: std::sync::Arc<crate::daemon::TerminalTarget>,
     pub lease: crate::tui::session_feed::NativeLease,
     /// What the caller asked to do with this pane once it was ready.
     pub intent: crate::tui::home::panes::PaneIntent,
@@ -417,7 +427,7 @@ pub struct HomeView {
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
     pub(super) agent_question_dialog: Option<super::dialogs::AgentQuestionDialog>,
     pub(super) pending_permission_response: Option<PermissionResponseTarget>,
-    pub(super) pending_send_session: Option<String>,
+    pub(super) pending_message: Option<MessageIntent>,
     pub(super) pending_send_target: live_send::LiveSendTarget,
     pub(super) pending_live_send_target: live_send::LiveSendTarget,
     pending_native_attachment: Option<panes::PendingNativeAttachment>,
@@ -457,7 +467,7 @@ pub struct HomeView {
     /// A send refused at delivery, reopened with its text once its refusal is dismissed:
     /// the session, target, title and message.
     pub(super) refused_send: Option<(String, live_send::LiveSendTarget, String, String)>,
-    pub(super) pending_stop_session: Option<String>,
+    pub(super) pending_stop_session: Option<StopIntent>,
     /// Target captured when the auxiliary stop confirmation opens.
     pub(super) pending_stop_auxiliary: Option<(String, crate::daemon::StopAuxiliaryBody)>,
     pending_legacy_tool_preparation: Option<panes::PendingLegacyToolPreparation>,

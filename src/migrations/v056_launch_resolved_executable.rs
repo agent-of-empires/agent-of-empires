@@ -1,4 +1,4 @@
-//! Registered `Instance.launch_resolved_executable`, retired by v064.
+//! Registered `Instance.launch_resolved_executable`, retired by v066.
 
 use anyhow::Result;
 

@@ -13,17 +13,10 @@ use tracing::warn;
 use super::errors::AcpError;
 use crate::acp::agent_profiles::AgentProfile;
 
-/// A fork needs both a requested parent and the agent's fork capability. A
-/// requested fork the agent cannot run fails the spawn rather than starting an
-/// empty session the user would take for a fork.
-pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) -> bool {
-    fork_from.is_some_and(|s| !s.is_empty()) && agent_advertises_fork
-}
-
 /// `client_info` is mandatory: a strict backend rejects the empty strings that
 /// omitting it serializes to (#2767).
 pub(super) fn build_initialize_request(profile: &AgentProfile) -> InitializeRequest {
-    let capabilities = ClientCapabilities::new()
+    let mut capabilities = ClientCapabilities::new()
         .fs(FileSystemCapabilities::new()
             .read_text_file(true)
             .write_text_file(true))
@@ -47,6 +40,14 @@ pub(super) fn build_initialize_request(profile: &AgentProfile) -> InitializeRequ
         .plan(PlanCapabilities::new())
         // Each subagent then arrives as a child session on this connection.
         .subagents(profile.supports_subagents.then(SubagentCapabilities::new));
+    capabilities.meta = Some(
+        [(
+            "ompAutonomousTurns".to_owned(),
+            serde_json::json!({"version": 1}),
+        )]
+        .into_iter()
+        .collect(),
+    );
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(capabilities)
         .client_info(

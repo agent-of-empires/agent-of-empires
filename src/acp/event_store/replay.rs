@@ -1,42 +1,34 @@
-//! Reading the log back: full replays and cursor pages in either direction.
+//! Reading the scoped log back, with cursor progress across unknown payloads.
 
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use rusqlite::types::Type;
 use tracing::{trace, warn};
 
-use super::EventStore;
+use super::{EventStore, StoredEvent};
+use crate::acp::event_sender::EventMetadata;
 use crate::acp::state::Event;
 use crate::events::{self, Order, SeqBound};
 
-/// One page of replayed events plus the cursor metadata for the next page.
 pub struct ReplayPage {
-    /// Deserialised events for this page, oldest first.
-    pub events: Vec<(u64, Event)>,
-    /// Cursor for the next page: the last seq this page consumed, decodable or not.
+    pub events: Vec<StoredEvent>,
     pub last_scanned_seq: Option<u64>,
-    /// True when at least one row exists beyond this page's window.
     pub has_more: bool,
-    /// Highest seq stored for the session, or 0 if none.
     pub highest_seq: u64,
-    /// Lowest seq still stored, or `None` when empty.
     pub lowest_seq: Option<u64>,
+    pub(crate) autonomous: Option<super::establishment::AutonomousCommit>,
 }
 
 impl EventStore {
-    /// All events with `seq < before`, oldest first.
-    pub fn replay_before(&self, session_id: &str, before: u64) -> Vec<(u64, Event)> {
-        let rows = events::scan(
-            &self.reader(),
-            &self.schema,
-            session_id,
-            SeqBound::Before(before),
-            Order::Asc,
-            None,
-        );
-        decode_rows(session_id, rows, None).0
+    pub fn replay_before(&self, session_id: &str, before: u64) -> Result<Vec<StoredEvent>> {
+        Ok(self
+            .page(session_id, SeqBound::Before(before), Order::Asc, None)?
+            .events)
     }
 
-    /// All events with `seq > since`, oldest first.
-    pub fn replay_from(&self, session_id: &str, since: u64) -> Vec<(u64, Event)> {
-        self.replay_page(session_id, since, None).events
+    pub fn replay_from(&self, session_id: &str, since: u64) -> Result<Vec<StoredEvent>> {
+        Ok(self.replay_page(session_id, since, None)?.events)
     }
 
     /// Events with `since < seq <= through`, oldest first.
@@ -45,72 +37,53 @@ impl EventStore {
         session_id: &str,
         since: u64,
         through: u64,
-    ) -> Vec<(u64, Event)> {
-        let rows = events::scan(
-            &self.reader(),
-            &self.schema,
-            session_id,
-            SeqBound::AfterThrough(since, through),
-            Order::Asc,
-            None,
-        );
-        #[cfg(test)]
-        tests::BOUNDED_ROWS.with(|count| count.set(rows.len()));
-        decode_rows(session_id, rows, None).0
+    ) -> Result<Vec<StoredEvent>> {
+        Ok(self
+            .page(
+                session_id,
+                SeqBound::AfterThrough(since, through),
+                Order::Asc,
+                None,
+            )?
+            .events)
     }
 
-    /// Up to `limit` events with `seq > since`, oldest first.
-    pub fn replay_page(&self, session_id: &str, since: u64, limit: Option<usize>) -> ReplayPage {
-        let page = self.page(session_id, SeqBound::After(since), Order::Asc, limit);
-        trace!(
-            target: "acp.event_store",
-            session = %session_id,
-            since,
-            limit = ?limit,
-            returned = page.events.len(),
-            has_more = page.has_more,
-            "replayed events"
-        );
-        page
+    pub fn replay_page(
+        &self,
+        session_id: &str,
+        since: u64,
+        limit: Option<usize>,
+    ) -> Result<ReplayPage> {
+        let page = self.page(session_id, SeqBound::After(since), Order::Asc, limit)?;
+        trace!(target: "acp.event_store", session = %session_id, since, ?limit,
+            returned = page.events.len(), has_more = page.has_more, "replayed events");
+        Ok(page)
     }
 
-    /// Up to `limit` events closest below `before`, oldest first. When older
-    /// events remain, a leading partial turn is trimmed so pages start on a
-    /// user turn boundary.
     pub fn replay_page_before(
         &self,
         session_id: &str,
         before: u64,
         limit: Option<usize>,
-    ) -> ReplayPage {
-        let mut page = self.page(session_id, SeqBound::Before(before), Order::Desc, limit);
+    ) -> Result<ReplayPage> {
+        let mut page = self.page(session_id, SeqBound::Before(before), Order::Desc, limit)?;
         page.events.reverse();
         if page.has_more {
             if let Some(i) = page
                 .events
                 .iter()
-                .position(|(_, ev)| is_user_turn_boundary(ev))
+                .position(|stored| is_user_turn_boundary(&stored.event))
                 .filter(|&i| i > 0)
             {
                 page.events.drain(0..i);
             }
         }
-        // The next-older page starts below the lowest seq kept, so a trimmed turn reloads whole.
         page.last_scanned_seq = page
             .events
             .first()
-            .map(|(seq, _)| *seq)
+            .map(|stored| stored.seq)
             .or(page.last_scanned_seq);
-        trace!(
-            target: "acp.event_store",
-            session = %session_id,
-            before,
-            limit = ?limit,
-            returned = page.events.len(),
-            has_more = page.has_more,
-            "replayed events before cursor"
-        );
-        page
+        Ok(page)
     }
 
     /// Read one coherent retained page; `None` means the expected identity changed.
@@ -122,7 +95,7 @@ impl EventStore {
         limit: usize,
         expected_identity: Option<&str>,
     ) -> anyhow::Result<Option<(ReplayPage, String)>> {
-        let (rows, highest_seq, lowest_seq, identity) = {
+        let (rows, highest_seq, lowest_seq, identity, autonomous) = {
             let mut conn = self.read_conn();
             let tx = conn.transaction()?;
             let identity = super::identity::read(&tx, session_id)?;
@@ -150,7 +123,7 @@ impl EventStore {
             };
             let rows = {
                 let mut statement = tx.prepare(&format!(
-                    "SELECT seq, event_json FROM {table}
+                    "SELECT seq, event_json, scope, qualification_json FROM {table}
                  WHERE session_id = ?1 AND seq {comparison} ?2
                  ORDER BY seq {order} LIMIT ?3"
                 ))?;
@@ -160,19 +133,55 @@ impl EventStore {
                         i64::try_from(cursor).unwrap_or(i64::MAX),
                         i64::try_from(limit.saturating_add(1))?
                     ],
-                    |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
                 )?;
                 found.collect::<rusqlite::Result<Vec<_>>>()?
             };
+            let (retained_frontier, autonomous) =
+                Self::retained_publication_state(&tx, session_id)?;
+            let highest_seq = highest_seq.max(retained_frontier);
             tx.commit()?;
-            (rows, highest_seq, lowest_seq, identity)
+            (rows, highest_seq, lowest_seq, identity, autonomous)
         };
         #[cfg(test)]
         self.pause_retained_read(
             session_id,
             super::test_support::RetainedReadStage::BeforeDecode,
         );
-        let (mut events, last_scanned_seq, has_more) = decode_rows(session_id, rows, Some(limit));
+        let mut events = Vec::with_capacity(rows.len().min(limit));
+        let mut last_scanned_seq = None;
+        let mut has_more = false;
+        for (scanned, (seq, json, scope, qualification)) in rows.into_iter().enumerate() {
+            let seq = u64::try_from(seq).context("negative retained ACP sequence")?;
+            let metadata = EventMetadata::decode_private(scope, qualification.as_deref())?;
+            if scanned >= limit {
+                has_more = true;
+                break;
+            }
+            last_scanned_seq = Some(seq);
+            match serde_json::from_str::<Event>(&json) {
+                Ok(event) => {
+                    metadata.validate_for_event(&event)?;
+                    events.push(StoredEvent {
+                        seq,
+                        event: Arc::new(event),
+                        metadata,
+                    });
+                }
+                Err(error) if metadata.availability_denial => return Err(error.into()),
+                Err(error) => {
+                    warn!(target: "acp.event_store", session = %session_id, seq, %error,
+                        "unknown or malformed historical event");
+                }
+            }
+        }
         if before.is_some() {
             events.reverse();
         }
@@ -183,6 +192,7 @@ impl EventStore {
                 has_more,
                 highest_seq,
                 lowest_seq,
+                autonomous,
             },
             identity,
         )))
@@ -194,58 +204,101 @@ impl EventStore {
         bound: SeqBound,
         order: Order,
         limit: Option<usize>,
-    ) -> ReplayPage {
+    ) -> Result<ReplayPage> {
         let conn = self.reader();
-        // One snapshot, so the bounds agree with the rows while writes land.
-        let snapshot = conn
-            .unchecked_transaction()
-            .map_err(|e| warn!(target: "acp.event_store", "replay snapshot for {session_id}: {e}"))
-            .ok();
-        let highest_seq = events::highest_seq(&conn, &self.schema, session_id);
-        let lowest_seq = events::lowest_seq(&conn, &self.schema, session_id);
+        let tx = conn.unchecked_transaction()?;
+        let (lowest, highest): (Option<i64>, Option<i64>) = tx.query_row(
+            "SELECT MIN(seq),MAX(seq) FROM acp_events WHERE session_id=?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let highest_seq = highest
+            .map(u64::try_from)
+            .transpose()
+            .context("negative highest ACP sequence")?
+            .unwrap_or(0);
+        let lowest_seq = lowest
+            .map(u64::try_from)
+            .transpose()
+            .context("negative lowest ACP sequence")?;
         #[cfg(test)]
         tests::AFTER_BOUNDS.with(|hook| hook.take().map(|run| run()));
-        // One probe row past `limit` detects `has_more` without a second query.
-        let probe = limit.map(|n| n.saturating_add(1));
-        let rows = events::scan(&conn, &self.schema, session_id, bound, order, probe);
-        drop(snapshot);
-        let (events, last_scanned_seq, has_more) = decode_rows(session_id, rows, limit);
-        ReplayPage {
+        let mut scanned = 0usize;
+        let mut last_scanned_seq = None;
+        let mut has_more = false;
+        let events = events::scan_projected(
+            &tx,
+            &self.schema,
+            session_id,
+            events::ScanWindow {
+                bound,
+                order,
+                limit: limit.map(|n| n.saturating_add(1)),
+            },
+            "seq,event_json,scope,qualification_json",
+            |row| {
+                let seq = u64::try_from(row.get::<_, i64>(0)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(error))
+                })?;
+                let qualification = row.get_ref(3)?.as_str_or_null().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
+                })?;
+                let metadata =
+                    EventMetadata::decode_private(row.get(2)?, qualification).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, error.into())
+                    })?;
+                if limit.is_some_and(|limit| scanned >= limit) {
+                    has_more = true;
+                    return Ok(None);
+                }
+                scanned += 1;
+                last_scanned_seq = Some(seq);
+                let json = row.get_ref(1)?.as_str().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
+                })?;
+                match serde_json::from_str::<Event>(json) {
+                    Ok(event) => {
+                        metadata.validate_for_event(&event).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(3, Type::Text, error.into())
+                        })?;
+                        Ok(Some(StoredEvent {
+                            seq,
+                            event: Arc::new(event),
+                            metadata,
+                        }))
+                    }
+                    Err(error) if metadata.availability_denial => Err(
+                        rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error)),
+                    ),
+                    Err(error) => {
+                        warn!(target: "acp.event_store", session = %session_id, seq, %error,
+                            "unknown or malformed historical event");
+                        Ok(None)
+                    }
+                }
+            },
+        )?;
+        #[cfg(test)]
+        if matches!(bound, SeqBound::AfterThrough(..)) {
+            tests::BOUNDED_ROWS.with(|count| count.set(scanned));
+        }
+        let (retained_frontier, autonomous) = Self::retained_publication_state(&tx, session_id)?;
+        let highest_seq = highest_seq.max(retained_frontier);
+        tx.commit()?;
+        Ok(ReplayPage {
             events,
             last_scanned_seq,
             has_more,
             highest_seq,
             lowest_seq,
-        }
+            autonomous,
+        })
     }
 }
 
-/// Decode up to `limit` rows, logging corrupt ones; returns the events, the
-/// last seq consumed, and whether a probe row beyond `limit` was present.
-fn decode_rows(
-    session_id: &str,
-    rows: Vec<(u64, String)>,
-    limit: Option<usize>,
-) -> (Vec<(u64, Event)>, Option<u64>, bool) {
-    let has_more = limit.is_some_and(|n| rows.len() > n);
-    let mut out = Vec::new();
-    let mut last_scanned_seq = None;
-    for (seq, json) in rows.into_iter().take(limit.unwrap_or(usize::MAX)) {
-        last_scanned_seq = Some(seq);
-        match serde_json::from_str::<Event>(&json) {
-            Ok(event) => out.push((seq, event)),
-            Err(e) => warn!(
-                target: "acp.event_store",
-                "deserialise event {session_id}@{seq}: {e}"
-            ),
-        }
-    }
-    (out, last_scanned_seq, has_more)
-}
-
-fn is_user_turn_boundary(ev: &Event) -> bool {
+fn is_user_turn_boundary(event: &Event) -> bool {
     matches!(
-        ev,
+        event,
         Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
     )
 }
@@ -260,10 +313,22 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         let store = std::sync::Arc::clone(&state.acp_event_store);
         store
-            .record("retained", 1, &agent_chunk("retained needle"))
+            .record(
+                "retained",
+                1,
+                &agent_chunk("retained needle"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         drop(state);
-        store.record("retained", 2, &Event::ThinkingEnded).unwrap();
+        store
+            .record(
+                "retained",
+                2,
+                &Event::ThinkingEnded,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let (page, _) = store
             .retained_page("retained", 0, None, 8, None)
             .unwrap()
@@ -289,7 +354,12 @@ mod tests {
             let state = crate::server::test_support::build_test_app_state(vec![instance]);
             let store = Arc::clone(&state.acp_event_store);
             store
-                .record(&id, 1, &user_prompt("original snapshot"))
+                .record(
+                    &id,
+                    1,
+                    &user_prompt("original snapshot"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .unwrap();
             let (_, initial_identity) =
                 store.retained_page(&id, 0, None, 8, None).unwrap().unwrap();
@@ -305,16 +375,19 @@ mod tests {
                 .expect("retained reader must reach its gate");
 
             let (tx, mut broadcasts) = tokio::sync::broadcast::channel(4);
-            let sink = ChannelSink::new(
-                tx,
-                Arc::clone(&store),
-                Arc::new(crate::acp::control_cache::ControlStateCache::new()),
-            );
+            let sink = ChannelSink::new(tx, Arc::clone(&store));
             let (done, completed) = mpsc::channel();
             let writer_id = id.clone();
             let writer = std::thread::spawn(move || {
-                let persisted = sink.publish_persisted("unrelated", 1, &Event::ThinkingStarted)
-                    && sink.publish_persisted(&writer_id, 2, &Event::ThinkingEnded);
+                let persisted = sink.publish_persisted(
+                    "unrelated",
+                    1,
+                    &crate::acp::event_sender::AcpEventData::from_history(Event::ThinkingStarted),
+                ) && sink.publish_persisted(
+                    &writer_id,
+                    2,
+                    &crate::acp::event_sender::AcpEventData::from_history(Event::ThinkingEnded),
+                );
                 done.send(persisted).unwrap();
             });
             let publication = completed.recv_timeout(deadline);
@@ -341,9 +414,12 @@ mod tests {
                 (id.as_str(), 2)
             );
             assert!(matches!(published.event.as_ref(), Event::ThinkingEnded));
-            assert_eq!(seqs(&store.replay_from("unrelated", 0)), [1]);
+            assert_eq!(seqs(&store.replay_from("unrelated", 0).unwrap()), [1]);
             assert_eq!(seqs(&page.events), [1]);
-            assert!(matches!(&page.events[0].1, Event::UserPromptSent { .. }));
+            assert!(matches!(
+                page.events[0].event.as_ref(),
+                Event::UserPromptSent { .. }
+            ));
             assert_eq!(
                 (page.highest_seq, page.lowest_seq, page.last_scanned_seq),
                 (1, Some(1), Some(1))
@@ -371,9 +447,15 @@ mod tests {
     #[test]
     fn retained_and_search_reads_share_private_memory_and_temporary_databases() {
         for name in [":memory:", ""] {
-            let store = EventStore::open(std::path::Path::new(name), 0).unwrap();
+            let store =
+                EventStore::open(std::path::Path::new(name), 0, Default::default()).unwrap();
             store
-                .record("private", 1, &agent_chunk("private needle"))
+                .record(
+                    "private",
+                    1,
+                    &agent_chunk("private needle"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .unwrap();
             let (page, identity) = store
                 .retained_page("private", 0, None, 8, None)
@@ -384,7 +466,14 @@ mod tests {
             let hits = store.search_content("needle", 1);
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].session_id, "private");
-            store.record("private", 2, &Event::ThinkingEnded).unwrap();
+            store
+                .record(
+                    "private",
+                    2,
+                    &Event::ThinkingEnded,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
             assert!(store
                 .retained_page("private", 0, None, 8, Some(&identity))
                 .unwrap()
@@ -402,17 +491,30 @@ mod tests {
         let (_tmp, store) = open_store(0);
         let max = i64::MAX as u64;
         store
-            .record("boundary", max - 1, &Event::ThinkingStarted)
+            .record(
+                "boundary",
+                max - 1,
+                &Event::ThinkingStarted,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         store
-            .record("boundary", max, &Event::ThinkingEnded)
+            .record(
+                "boundary",
+                max,
+                &Event::ThinkingEnded,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         for (cursor, expected) in [
             (max, vec![max - 1]),
             (max + 1, vec![max - 1, max]),
             (u64::MAX, vec![max - 1, max]),
         ] {
-            assert_eq!(seqs(&store.replay_before("boundary", cursor)), expected);
+            assert_eq!(
+                seqs(&store.replay_before("boundary", cursor).unwrap()),
+                expected
+            );
             let (page, _) = store
                 .retained_page("boundary", 0, Some(cursor), 10, None)
                 .unwrap()
@@ -437,7 +539,9 @@ mod tests {
             1,
             (1..=1002).map(|_| Event::ThinkingStarted),
         );
-        store.record("other", 3, &Event::ThinkingEnded).unwrap();
+        store
+            .record("other", 3, &Event::ThinkingEnded, &EventMetadata::history())
+            .unwrap();
         for (since, through, expected) in [
             (2, 3, vec![3]),
             (2, 4, vec![3, 4]),
@@ -446,9 +550,104 @@ mod tests {
             (1000, u64::MAX, vec![1001, 1002]),
             (u64::MAX, u64::MAX, vec![]),
         ] {
-            let replay = store.replay_through("bounded", since, through);
+            let replay = store.replay_through("bounded", since, through).unwrap();
             assert_eq!(seqs(&replay), expected);
             BOUNDED_ROWS.with(|count| assert_eq!(count.get(), expected.len()));
+        }
+    }
+
+    #[test]
+    fn legacy_prompt_errors_replay_without_rewriting_or_inventing_evidence() {
+        use crate::acp::state::test_support::{chunk, prompt, stopped};
+        use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
+        let (_tmp, store) = open_store(1000);
+        for (id, json) in [
+            (
+                "missing",
+                r#"{"PromptRuntimeError":{"message":"request failed"}}"#,
+            ),
+            (
+                "null",
+                r#"{"PromptRuntimeError":{"message":"request failed","evidence":null}}"#,
+            ),
+        ] {
+            store
+                .record(
+                    id,
+                    1,
+                    &Event::AcpSessionAssigned {
+                        acp_session_id: "native-history".into(),
+                        connection_ready: false,
+                        native_subject: None,
+                    },
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
+            store
+                .record(
+                    id,
+                    2,
+                    &prompt("explicit request"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
+            store
+                .record(
+                    id,
+                    3,
+                    &chunk("partial output survives"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
+            store.conn().execute(
+                "INSERT INTO acp_events (session_id, seq, event_json, created_at) VALUES (?1, 4, ?2, 0)",
+                rusqlite::params![id, json],
+            ).unwrap();
+            store
+                .record(
+                    id,
+                    5,
+                    &stopped("prompt_failed"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
+            let replay = store.replay_page(id, 0, Some(10)).unwrap();
+            assert_eq!(replay.events.len(), 5);
+            assert!(matches!(
+                replay.events[3].event.as_ref(),
+                Event::PromptRuntimeError { evidence: None, .. }
+            ));
+            let mut transcript = TranscriptModel::new();
+            for stored in replay.events {
+                transcript.apply_scoped_event(stored.seq, stored.event.as_ref(), &stored.metadata);
+            }
+            assert!(transcript
+                .rows()
+                .iter()
+                .any(|row| row.text == "partial output survives"));
+            assert!(transcript
+                .rows()
+                .iter()
+                .any(|row| row.kind == TranscriptRowKind::Notice
+                    && row.text.contains("request failed")));
+            assert_eq!(
+                transcript
+                    .rows()
+                    .iter()
+                    .filter(|row| row.kind == TranscriptRowKind::Notice)
+                    .count(),
+                1,
+                "a historical failure must not invent an additional output diagnosis"
+            );
+            let retained: String = store
+                .conn()
+                .query_row(
+                    "SELECT event_json FROM acp_events WHERE session_id = ?1 AND seq = 4",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, json);
         }
     }
 
@@ -456,13 +655,13 @@ mod tests {
     fn forward_pages_reassemble_the_full_replay() {
         let (_tmp, store) = open_store(1000);
         record_from(&store, "s-1", 1, (1..=10).map(|_| Event::ThinkingStarted));
-        assert_eq!(seqs(&store.replay_from("s-1", 7)), [8, 9, 10]);
-        assert_eq!(seqs(&store.replay_before("s-1", 3)), [1, 2]);
+        assert_eq!(seqs(&store.replay_from("s-1", 7).unwrap()), [8, 9, 10]);
+        assert_eq!(seqs(&store.replay_before("s-1", 3).unwrap()), [1, 2]);
 
         let mut paged = Vec::new();
         let mut cursor = 0u64;
         loop {
-            let page = store.replay_page("s-1", cursor, Some(3));
+            let page = store.replay_page("s-1", cursor, Some(3)).unwrap();
             assert!(page.events.len() <= 3, "page exceeded limit");
             paged.extend(seqs(&page.events));
             match page.last_scanned_seq {
@@ -474,7 +673,7 @@ mod tests {
 
         // (limit, events, has_more, cursor) at and around the exact boundary.
         for (limit, len, has_more, cursor) in [(10, 10, false, 10), (9, 9, true, 9)] {
-            let page = store.replay_page("s-1", 0, Some(limit));
+            let page = store.replay_page("s-1", 0, Some(limit)).unwrap();
             assert_eq!(
                 (page.events.len(), page.has_more, page.last_scanned_seq),
                 (len, has_more, Some(cursor)),
@@ -482,12 +681,19 @@ mod tests {
             );
         }
 
-        let past_end = store.replay_page("s-1", u64::MAX, Some(1000));
+        let past_end = store.replay_page("s-1", u64::MAX, Some(1000)).unwrap();
         assert!(past_end.events.is_empty() && !past_end.has_more);
         assert_eq!((past_end.highest_seq, past_end.lowest_seq), (10, Some(1)));
 
         // The cursor advances past a corrupt row.
-        store.record("bad", 1, &Event::ThinkingStarted).unwrap();
+        store
+            .record(
+                "bad",
+                1,
+                &Event::ThinkingStarted,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         store
             .conn()
             .execute(
@@ -496,13 +702,20 @@ mod tests {
                 rusqlite::params!["bad", 2_i64, "{not valid event json", 0_i64],
             )
             .unwrap();
-        store.record("bad", 3, &Event::ThinkingEnded).unwrap();
+        store
+            .record(
+                "bad",
+                3,
+                &Event::ThinkingEnded,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
 
-        let page1 = store.replay_page("bad", 0, Some(2));
+        let page1 = store.replay_page("bad", 0, Some(2)).unwrap();
         assert_eq!(seqs(&page1.events), [1]);
         assert_eq!(page1.last_scanned_seq, Some(2));
         assert!(page1.has_more);
-        let page2 = store.replay_page("bad", 2, Some(2));
+        let page2 = store.replay_page("bad", 2, Some(2)).unwrap();
         assert_eq!(seqs(&page2.events), [3]);
         assert!(!page2.has_more);
     }
@@ -515,17 +728,28 @@ mod tests {
         AFTER_BOUNDS.with(|hook| {
             hook.set(Some(Box::new(move || {
                 // A separate connection, as the event writer's would be.
-                let other = EventStore::open(&db, 1000).unwrap();
-                other.record("s-1", 4, &Event::ThinkingEnded).unwrap();
+                let other = EventStore::open(&db, 1000, Default::default()).unwrap();
+                other
+                    .record(
+                        "s-1",
+                        4,
+                        &Event::ThinkingEnded,
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    )
+                    .unwrap();
             })))
         });
-        let page = store.replay_page("s-1", 0, None);
+        let page = store.replay_page("s-1", 0, None).unwrap();
         assert_eq!(
             (seqs(&page.events), page.highest_seq),
             (vec![1, 2, 3], 3),
             "a row committed after the bounds must stay out of this page"
         );
-        assert_eq!(store.highest_seq("s-1"), 4, "the concurrent commit landed");
+        assert_eq!(
+            store.highest_seq("s-1").unwrap(),
+            4,
+            "the concurrent commit landed"
+        );
     }
 
     #[test]
@@ -536,7 +760,7 @@ mod tests {
         let (done, replayed) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let page = store.replay_page("s-1", 0, Some(10));
+                let page = store.replay_page("s-1", 0, Some(10)).unwrap();
                 let _ = done.send((
                     seqs(&page.events),
                     page.highest_seq,
@@ -556,18 +780,19 @@ mod tests {
     fn backward_pages_return_the_closest_rows_and_trim_to_a_turn_boundary() {
         let (_tmp, store) = open_store(1000);
         record_from(&store, "s-1", 1, (1..=10).map(|_| Event::ThinkingStarted));
-        let tail = store.replay_page_before("s-1", u64::MAX, Some(3));
+        let tail = store.replay_page_before("s-1", u64::MAX, Some(3)).unwrap();
         assert_eq!(seqs(&tail.events), [8, 9, 10]);
         assert!(tail.has_more);
         assert_eq!((tail.last_scanned_seq, tail.highest_seq), (Some(8), 10));
-        let older = store.replay_page_before("s-1", 8, Some(3));
+        let older = store.replay_page_before("s-1", 8, Some(3)).unwrap();
         assert_eq!(seqs(&older.events), [5, 6, 7]);
         assert_eq!(older.last_scanned_seq, Some(5));
-        let start = store.replay_page_before("s-1", 3, Some(10));
+        let start = store.replay_page_before("s-1", 3, Some(10)).unwrap();
         assert_eq!(seqs(&start.events), [1, 2]);
         assert!(!start.has_more, "reached session start");
         assert!(store
             .replay_page_before("s-1", 1, Some(10))
+            .unwrap()
             .events
             .is_empty());
 
@@ -593,7 +818,7 @@ mod tests {
             ],
         );
         // A tail of 4 would start at seq 4, mid-turn A.
-        let tail = store.replay_page_before("s-2", u64::MAX, Some(4));
+        let tail = store.replay_page_before("s-2", u64::MAX, Some(4)).unwrap();
         assert_eq!(
             seqs(&tail.events),
             [5, 6, 7],
@@ -601,7 +826,7 @@ mod tests {
         );
         assert!(tail.has_more);
         assert_eq!(tail.last_scanned_seq, Some(5), "cursor is boundary B");
-        let older = store.replay_page_before("s-2", 5, Some(10));
+        let older = store.replay_page_before("s-2", 5, Some(10)).unwrap();
         assert_eq!(seqs(&older.events), [1, 2, 3, 4]);
         assert!(!older.has_more);
     }

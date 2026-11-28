@@ -69,11 +69,15 @@ impl EventStore {
         );
         let turn_ended = first_work_seq.and_then(|work_seq| {
             exists_after(
-                "SELECT 1 FROM acp_events
+                concat!(
+                    "SELECT 1 FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND discriminant = 'Stopped'
-                 LIMIT 1",
+                   AND (discriminant = 'Stopped' OR ",
+                    native_channel_loss_sql!("event_json"),
+                    ")
+                 LIMIT 1"
+                ),
                 work_seq,
             )
         });
@@ -219,7 +223,14 @@ mod tests {
         assert!((at - Timestamp::now()).whole_seconds() > 60);
         assert_eq!(reason.as_deref(), Some("rescheduled"));
 
-        store.record("s-2", 1, &wakeup(-30, None)).unwrap();
+        store
+            .record(
+                "s-2",
+                1,
+                &wakeup(-30, None),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         assert!(store.latest_pending_wakeup("s-2").is_none());
 
         // A fired wakeup is claimed once, by the first prompt past its time.
@@ -278,7 +289,14 @@ mod tests {
         ];
         for (i, (events, active)) in cases.into_iter().enumerate() {
             let id = format!("s-{i}");
-            store.record(&id, 1, &armed).unwrap();
+            store
+                .record(
+                    &id,
+                    1,
+                    &armed,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
             record_from(&store, &id, 2, events);
             let got = store.latest_active_monitor(&id);
             assert_eq!(got.is_some(), active, "case {i}");
@@ -286,7 +304,14 @@ mod tests {
                 assert_eq!(got.unwrap().as_deref(), Some("watch"));
             }
         }
-        store.record("none", 1, &user_prompt("hi")).unwrap();
+        store
+            .record(
+                "none",
+                1,
+                &user_prompt("hi"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         assert!(store.latest_active_monitor("none").is_none());
     }
 }

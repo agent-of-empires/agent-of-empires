@@ -154,6 +154,8 @@ pub struct StructuredViewState {
     /// held as a real `Sent` response would until the turn-start echo clears it.
     #[cfg(test)]
     pub accept_submits_for_test: usize,
+    #[cfg(test)]
+    pub prompt_intent_available_for_test: bool,
     /// Every prompt the composer submitted, in order. Test-only, so the paste
     /// handoff can assert what each Enter actually sent.
     #[cfg(test)]
@@ -287,6 +289,7 @@ impl ChoicePicker {
 /// The input layer maps mouse clicks to focus regions against it.
 #[derive(Debug, Clone, Copy)]
 pub struct ViewLayout {
+    pub recovery: Rect,
     pub transcript: Rect,
     pub status: Rect,
     pub approval: Rect,
@@ -465,6 +468,8 @@ impl StructuredViewState {
             #[cfg(test)]
             accept_submits_for_test: 0,
             #[cfg(test)]
+            prompt_intent_available_for_test: false,
+            #[cfg(test)]
             submitted_prompts: Vec::new(),
             show_full_thinking: false,
             transcript_cache: RefCell::new(None),
@@ -517,6 +522,86 @@ impl StructuredViewState {
     /// (#4001).
     pub fn is_busy(&self) -> bool {
         self.transcript.turn_active || self.in_flight || self.ws.is_none()
+    }
+
+    #[cfg(test)]
+    pub(super) fn mark_native_ready_for_test(&mut self) {
+        self.ws = Some(WsHandle::for_test());
+        self.transcript.native_snapshot_seq = Some(1);
+        self.transcript.connection_ready = true;
+    }
+
+    pub fn native_input_available(&self) -> bool {
+        self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && self.transcript.connection_ready
+            && self.transcript.connection_unavailable.is_none()
+    }
+
+    pub fn host_prompt_intent(&self) -> Option<uuid::Uuid> {
+        if self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && self.transcript.connection_unavailable.is_none()
+        {
+            self.transcript.host_prompt_intent
+        } else {
+            None
+        }
+    }
+
+    /// Reply authority is request-specific while Original establishment is pending.
+    /// Transport and a fresh canonical snapshot remain mandatory for both sources.
+    pub fn can_decide(&self, nonce: &str) -> bool {
+        self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && (self.native_input_available()
+                || self
+                    .transcript
+                    .original_decision_nonces
+                    .iter()
+                    .any(|original| original.0 == nonce))
+    }
+
+    pub fn can_submit_prompt_intent(&self) -> bool {
+        #[cfg(test)]
+        if self.prompt_intent_available_for_test {
+            return true;
+        }
+        self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && self.transcript.connection_unavailable.is_none()
+            && (self.transcript.connection_ready || self.transcript.prompt_wake_eligible)
+    }
+
+    pub fn can_accept_choice(&self) -> bool {
+        self.choice
+            .as_ref()
+            .is_none_or(|choice| match &choice.purpose {
+                ChoicePurpose::OpenLink => true,
+                ChoicePurpose::Mode | ChoicePurpose::Toggle => self.native_input_available(),
+                ChoicePurpose::Approval { nonce } => {
+                    self.can_decide(nonce)
+                        && self
+                            .transcript
+                            .pending_approvals
+                            .iter()
+                            .any(|pending| pending.nonce == *nonce)
+                }
+                ChoicePurpose::Elicitation { nonce, .. } => {
+                    self.can_decide(nonce)
+                        && self
+                            .transcript
+                            .pending_elicitations
+                            .iter()
+                            .any(|pending| pending.nonce == *nonce)
+                }
+            })
+    }
+
+    pub fn disconnect_management(&mut self) {
+        self.ws = None;
+        self.in_flight = false;
+        self.transcript.revoke_native_authority();
     }
 
     /// Drain the composer's current text and clear it so the user can

@@ -214,19 +214,48 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
     )
         -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
+    build_test_app_state_with_event_capacity(
+        prior,
+        allowed_hosts,
+        allowed_origins,
+        token,
+        (event_store, 8),
+        configure,
+        customize,
+    )
+}
+
+/// The managed SDK host observes complete bounded workloads without changing retention.
+pub(crate) fn build_test_app_state_with_event_capacity(
+    prior: Vec<Instance>,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    token: Option<String>,
+    events: (Option<Arc<crate::acp::event_store::EventStore>>, usize),
+    configure: impl FnOnce(&mut AppState),
+    customize: impl FnOnce(
+        crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+    )
+        -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+) -> Arc<AppState> {
+    let (event_store, event_capacity) = events;
     let event_store = event_store.unwrap_or_else(|| {
         Arc::new(crate::acp::event_store::EventStore::temporary_for_test(100).expect("event store"))
     });
-    let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(8).0;
-    let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
-    let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink::new(
+    let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(event_capacity).0;
+    let acp_control_cache = Arc::clone(event_store.control_cache());
+    let sink = Arc::new(crate::acp::supervisor::ChannelSink::new(
         acp_events_tx.clone(),
-        event_store.clone(),
-        acp_control_cache.clone(),
+        Arc::clone(&event_store),
     ));
     let supervisor = std::sync::Arc::new(
         customize(crate::acp::supervisor::Supervisor::with_capacity(sink, 1))
             .with_native_admission(),
+    );
+    supervisor.hydrate_seqs(
+        event_store
+            .all_session_seqs()
+            .expect("event publication frontiers"),
     );
     let instances = Arc::new(RwLock::new(prior));
     let instance_locks = Arc::new(RwLock::new(HashMap::new()));
@@ -361,6 +390,17 @@ pub async fn accept_runtime_read_cache_for_test(state: &Arc<AppState>) {
         Default::default(),
     )
     .await;
+}
+
+#[cfg(test)]
+pub(crate) fn select_retained_for_test(row: &mut Instance) {
+    assert!(row.acp_establishment.is_none());
+    assert!(row.fork_pending.is_none() && row.import_pending != Some(true));
+    let id = row
+        .acp_session_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    row.resume_intent = crate::session::ResumeIntent::Use(id);
 }
 
 pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {
@@ -590,23 +630,6 @@ pub(crate) fn counting_failing_launcher() -> (
     (launcher, launches)
 }
 
-/// A launcher that hands back a fake worker that accepts commands, keeping the
-/// event senders alive so the drains never see a close.
-#[cfg(test)]
-pub(crate) fn succeeding_launcher() -> crate::acp::supervisor::Launcher {
-    let senders: Arc<std::sync::Mutex<Vec<tokio::sync::mpsc::Sender<crate::acp::state::Event>>>> =
-        Default::default();
-    Arc::new(move |_config, id| {
-        let senders = Arc::clone(&senders);
-        Box::pin(async move {
-            let (client, tx, _cmds) =
-                crate::acp::acp_client::AcpClient::fake_for_test_cmd_recording(id);
-            senders.lock().unwrap().push(tx);
-            Ok(client)
-        })
-    })
-}
-
 /// Fail writes to this profile's sessions file while retaining readable rows.
 #[cfg(test)]
 pub(crate) fn fail_session_writes_for_test(profile: &str) -> impl Drop {
@@ -695,6 +718,487 @@ pub fn capture_log(f: impl FnOnce()) -> String {
     );
     let out = buf.lock().unwrap().clone();
     String::from_utf8(out).unwrap()
+}
+#[cfg(test)]
+pub(crate) struct ManagedControlSession {
+    pub(crate) client: crate::acp::supervisor::test_support::managed::ManagedClient,
+    pub(crate) native: crate::acp::supervisor::test_support::managed::NativePeer,
+    pub(crate) state: Arc<super::AppState>,
+    pub(crate) sid: String,
+    prompts: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+}
+
+#[cfg(test)]
+impl ManagedControlSession {
+    pub(crate) fn id(&self) -> &str {
+        &self.client.id
+    }
+
+    pub(crate) async fn next_prompt(&mut self) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(10), self.prompts.recv())
+            .await
+            .expect("actual native prompt arrives")
+            .expect("native request lane remains open")
+    }
+
+    pub(crate) async fn start_prompt(&mut self, text: &str) -> serde_json::Value {
+        use super::session_service::{SendTurnRequest, SessionCaller};
+        let id = self.client.id.clone();
+        let submission = self.state.session_service.prompt_submission(&id).await;
+        self.state
+            .session_service
+            .send_turn(
+                &SessionCaller::User,
+                &id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                    resume_reservation: None,
+                    text,
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_ids: Vec::new(),
+                    synthesized: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
+                    no_revive: false,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("explicit input rejected by real retained actor: {error}")
+            });
+        drop(submission);
+        let request = self.next_prompt().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if self
+                    .state
+                    .session_service
+                    .fold_control_state(&id)
+                    .await
+                    .unwrap()
+                    .turn_active
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the actual Native input establishes durable active state");
+        request
+    }
+
+    pub(crate) async fn finish_prompt(
+        &mut self,
+        request: &serde_json::Value,
+        error_kind: Option<&str>,
+    ) {
+        let response = match error_kind {
+            Some(kind) => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                "error":{"code":-32603,"message":"original request failed","data":{"errorKind":kind}}}),
+            None => {
+                serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{"stopReason":"end_turn"}})
+            }
+        };
+        self.native.send(response).await;
+        let reason = if error_kind == Some("rate_limit") {
+            "rate_limited"
+        } else if error_kind.is_some() {
+            "prompt_rejected"
+        } else {
+            "prompt_complete"
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = self
+                    .client
+                    .next_event()
+                    .await
+                    .expect("managed drain stays alive");
+                if matches!(&event, crate::acp::Event::Stopped { reason: got } if got == reason) {
+                    break;
+                }
+                assert!(!matches!(
+                    event,
+                    crate::acp::Event::AgentStartupError { .. }
+                        | crate::acp::Event::AcpConnectionUnavailable { .. }
+                ));
+            }
+        })
+        .await
+        .expect("the original result reaches its durable terminal");
+    }
+
+    pub(crate) async fn park(&mut self, text: &str) {
+        let request = self.start_prompt(text).await;
+        self.finish_prompt(&request, Some("rate_limit")).await;
+        assert!(matches!(
+            self.state
+                .acp_event_store
+                .rate_limit_park(self.id())
+                .unwrap(),
+            crate::acp::event_store::ControlKnowledge::Known(Some(_))
+        ));
+    }
+
+    /// Change clock data only, preserving actual Native provenance and durable budget.
+    pub(crate) fn make_quota_due(&self) {
+        self.state
+            .acp_event_store
+            .test_conn()
+            .execute(
+                "UPDATE acp_events SET created_at=?2 WHERE session_id=?1",
+                rusqlite::params![
+                    self.id(),
+                    (crate::time::Timestamp::now() - crate::time::Duration::days(3)).as_millis()
+                ],
+            )
+            .unwrap();
+        self.state.acp_event_store.control_cache().forget(self.id());
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn managed_control_session(
+    scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+    label: &str,
+    agent_key: &str,
+    options: Option<serde_json::Value>,
+) -> ManagedControlSession {
+    managed_control_session_as(scope, label, agent_key, agent_key, options, false, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn managed_control_session_as(
+    scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+    label: &str,
+    agent_key: &str,
+    tool: &str,
+    options: Option<serde_json::Value>,
+    steering: bool,
+    native_store: Option<std::path::PathBuf>,
+) -> ManagedControlSession {
+    let project = scope.tempdir();
+    let native_store = native_store.unwrap_or_else(|| {
+        crate::session::get_app_dir()
+            .unwrap()
+            .join("managed-control-native-store")
+    });
+    std::fs::create_dir_all(&native_store).unwrap();
+    scope.save_environment(&["CLAUDE_CONFIG_DIR"]);
+    std::env::set_var("CLAUDE_CONFIG_DIR", &native_store);
+    let sid = uuid::Uuid::new_v4().to_string();
+    let response_sid = sid.clone();
+    let (sent, prompts) = tokio::sync::mpsc::unbounded_channel();
+    let mut config_options = options.unwrap_or_else(|| {
+        serde_json::json!([{
+            "id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": "old-model", "options": [
+                {"value": "old-model", "name": "Old model"},
+                {"value": "new-model", "name": "New model"},
+                {"value": "plan", "name": "Plan"}
+            ]
+        }])
+    });
+    let mut modes = serde_json::json!({
+        "currentModeId": "old-mode", "availableModes": [
+            {"id": "old-mode", "name": "Old mode"},
+            {"id": "new-mode", "name": "New mode"},
+            {"id": "plan", "name": "Plan"}
+        ]
+    });
+    let (config, native) = scope.native_peer(
+        project.path().into(),
+        agent_key,
+        tool,
+        move |request| match request["method"].as_str().unwrap() {
+            "initialize" => Some(serde_json::json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "result":{
+                    "protocolVersion":1,
+                    "agentCapabilities":{"loadSession":true},
+                    "_meta":{
+                        "ompAutonomousTurns":{"version":1},
+                        "steering":{"supported":steering}
+                    }
+                }
+            })),
+            "session/new" | "session/load" => {
+                let sid = if request["method"] == "session/new" {
+                    serde_json::Value::String(response_sid.clone())
+                } else {
+                    request["params"]["sessionId"].clone()
+                };
+                Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                    "result":{"sessionId":sid,"configOptions":config_options,"modes":modes}}))
+            }
+            "session/set_mode" => {
+                modes["currentModeId"] = request["params"]["modeId"].clone();
+                Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{}}))
+            }
+            "session/set_config_option" => {
+                let selected = config_options
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|option| option["id"] == request["params"]["configId"])
+                    .expect("the actual Native peer accepts only its advertised options");
+                selected["currentValue"] = request["params"]["value"].clone();
+                Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                    "result":{"configOptions":config_options}}))
+            }
+            "session/prompt" => {
+                sent.send(request.clone()).unwrap();
+                None
+            }
+            "_session/steering" if steering => Some(serde_json::json!({
+                "jsonrpc":"2.0","id":request["id"],"result":{"outcome":"injected"}
+            })),
+            "session/cancel" => None,
+            other => panic!("unexpected Native method: {other}"),
+        },
+    );
+    let mut client = scope.spawn(config, label).await.unwrap();
+    client.ready().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut assigned = false;
+        let mut capabilities = false;
+        loop {
+            let event = client
+                .next_event()
+                .await
+                .expect("actual original assignment");
+            assigned |= matches!(&event, crate::acp::Event::AcpSessionAssigned {
+                acp_session_id, connection_ready: true, native_subject: Some(_),
+            } if acp_session_id == &sid);
+            capabilities |= matches!(&event, crate::acp::Event::PromptCapabilities { .. });
+            assert!(!matches!(
+                event,
+                crate::acp::Event::AgentStartupError { .. }
+            ));
+            if assigned && capabilities {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let state = scope.state.clone();
+    accept_runtime_read_cache_for_test(&state).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let finalized = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == client.id)
+                .is_some_and(|row| row.launch_is_finalized());
+            if finalized {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the actual creation finishes before control fixture use");
+    let creation = tokio::time::timeout(
+        Duration::from_secs(10),
+        state.session_service.prompt_submission(&client.id),
+    )
+    .await
+    .expect("the actual creation releases its submission custody");
+    drop(creation);
+    let owner = state
+        .acp_supervisor
+        .current_native_availability(&client.id)
+        .await
+        .unwrap()
+        .owner
+        .expect("actual runner birth");
+    assert_eq!(Some(owner), client.lease.spawned_runner());
+    assert_ne!(owner.pid, std::process::id());
+    // Query the proof already owned by the original launcher; do not replace any
+    // inspection or SDK probe that an existing caller armed before this helper.
+    let proof = scope.original_native_proof(&client.lease);
+    assert_eq!(proof.runner, owner);
+    assert_ne!(proof.pid, std::process::id());
+    assert_eq!(
+        crate::process::process_birth_identity(proof.pid)
+            .unwrap()
+            .as_ref(),
+        Some(&proof.birth),
+        "readiness belongs to this original Native incarnation",
+    );
+    ManagedControlSession {
+        client,
+        native,
+        state,
+        sid,
+        prompts,
+    }
+}
+
+#[cfg(test)]
+impl ManagedControlSession {
+    pub(crate) async fn wait_control(
+        &self,
+        predicate: impl Fn(&crate::acp::state::AcpState) -> bool,
+    ) -> crate::acp::state::AcpState {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let control = self
+                    .state
+                    .session_service
+                    .fold_control_state(self.id())
+                    .await
+                    .unwrap();
+                if predicate(&control) {
+                    return control;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual Native control reaches the asserted boundary")
+    }
+
+    pub(crate) async fn park_window(
+        &mut self,
+        text: &str,
+        kind: &str,
+        resets_at: crate::time::Timestamp,
+    ) {
+        let request = self.start_prompt(text).await;
+        self.native
+            .send(serde_json::json!({
+                "jsonrpc":"2.0", "method":"session/update", "params":{
+                    "sessionId":self.sid,
+                    "update":{
+                        "sessionUpdate":"usage_update", "used":10, "size":100,
+                        "cost":{"amount":0.1,"currency":"USD"},
+                        "_meta":{"_claude/rateLimit":{
+                            "status":"rejected", "rateLimitType":kind,
+                            "resetsAt":resets_at.as_unix_secs()
+                        }}
+                    }
+                }
+            }))
+            .await;
+        // The response and usage notification share the same original peer's ordered stream.
+        self.finish_prompt(&request, Some("rate_limit")).await;
+        let park = match self
+            .state
+            .acp_event_store
+            .rate_limit_park(self.id())
+            .unwrap()
+        {
+            crate::acp::event_store::ControlKnowledge::Known(Some(park)) => park,
+            other => panic!("the original result must establish its known park: {other:?}"),
+        };
+        let info = park
+            .info
+            .expect("the original rejected quota window is retained");
+        assert_eq!(info.kind, kind);
+        assert_eq!(
+            info.resets_at.unwrap().as_unix_secs(),
+            resets_at.as_unix_secs()
+        );
+    }
+
+    /// Reuse the first-I/O path from supervisor::launch's managed resource fixtures.
+    pub(crate) async fn start_background(
+        &mut self,
+        agent: bool,
+        output_file: &std::path::Path,
+    ) -> uuid::Uuid {
+        use crate::acp::Event;
+        let update = if agent {
+            serde_json::json!({
+                "sessionUpdate":"tool_call_update", "toolCallId":"tool-background",
+                "_meta":{"claudeCode":{"toolName":"Agent","toolResponse":{
+                    "agentId":"agent", "description":"research", "prompt":"research",
+                    "resolvedModel":"model", "outputFile":output_file,
+                    "status":"async_launched"
+                }}}
+            })
+        } else {
+            serde_json::json!({
+                "sessionUpdate":"tool_call_update", "toolCallId":"tool-background",
+                "_meta":{"claudeCode":{"toolName":"Bash","toolResponse":{
+                    "backgroundTaskId":"task"
+                }}}
+            })
+        };
+        let matching = |event: &Event| {
+            if agent {
+                matches!(event, Event::BackgroundAgentLaunched { agent_id, .. } if agent_id == "agent")
+            } else {
+                matches!(event, Event::BackgroundTaskStarted { task_id, .. } if task_id == "task")
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                self.native
+                    .send(serde_json::json!({
+                        "jsonrpc":"2.0", "method":"session/update",
+                        "params":{"sessionId":self.sid,"update":update}
+                    }))
+                    .await;
+                while !matching(
+                    &self
+                        .client
+                        .next_event()
+                        .await
+                        .expect("original resource observer"),
+                ) {}
+                if let Some(allocation) = self
+                    .state
+                    .acp_event_store
+                    .replay_from(self.id(), 0)
+                    .unwrap()
+                    .iter()
+                    .find_map(|stored| {
+                        matching(stored.event.as_ref())
+                            .then(|| {
+                                stored
+                                    .metadata
+                                    .resource_witness
+                                    .as_ref()
+                                    .map(|w| w.allocation)
+                            })
+                            .flatten()
+                    })
+                {
+                    return allocation;
+                }
+                // A genuinely new observation, never a promoted history row, retries first I/O.
+            }
+        })
+        .await
+        .expect("the original resource reaches first I/O and mints its witness")
+    }
+}
+
+/// DATA-only fixture. Never pass this metadata to a sink, Native gate, resource, or runtime admission.
+#[cfg(test)]
+pub(crate) fn sql_projection_metadata() -> crate::acp::event_sender::EventMetadata {
+    use crate::acp::event_sender::{EventMetadata, EventScope};
+    EventMetadata {
+        scope: EventScope::OperationCurrent,
+        native_origin: Some(crate::acp::state::NativeEventOrigin {
+            context: serde_json::from_value(serde_json::to_value([0_u8; 32]).unwrap()).unwrap(),
+            generation: 1,
+            attempt_id: serde_json::from_value(serde_json::json!(uuid::Uuid::new_v4())).unwrap(),
+            producer: uuid::Uuid::new_v4(),
+            owner: None,
+        }),
+        operation: Some(crate::acp::protocol::AcpOperationMetadata {
+            correlation: crate::acp::establishment::NativeOperationCorrelation::new(None),
+            outcome: None,
+        }),
+        ..EventMetadata::history()
+    }
 }
 
 /// Serve the production router through the kernel-verified owner Unix acceptor.

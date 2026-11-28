@@ -15,11 +15,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
-use agent_of_empires::acp::agent_registry::AgentSpec;
-use agent_of_empires::acp::state::{AcpSessionId, Event};
+use crate::acp::acp_client::SpawnConfig;
+use crate::acp::agent_registry::AgentSpec;
+use crate::acp::state::Event;
 
-use crate::common::{shim_path, shim_ready};
+use super::managed::{shim_path, shim_ready, ManagedClient, ManagedScope};
 
 fn spawn_config(
     shim: PathBuf,
@@ -36,7 +36,7 @@ fn spawn_config(
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: crate::common::shim_node()
+            command: super::managed::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
                 .into_owned(),
@@ -75,7 +75,8 @@ fn spawn_config(
 /// A prompt is only dispatched after the handshake completes, so a `Stopped`
 /// proves any post-handshake config-option work already ran. Returns the
 /// events seen before it.
-async fn drive_one_turn(client: &mut AcpClient) -> Vec<Event> {
+async fn drive_one_turn(client: &mut ManagedClient) -> Vec<Event> {
+    client.ready().await;
     client
         .send_prompt("hello", &[])
         .await
@@ -114,13 +115,37 @@ fn shim_env(
     env
 }
 
-async fn run(config: SpawnConfig, label: &str) -> Vec<Event> {
-    let mut client = AcpClient::spawn(config, AcpSessionId(label.into()))
-        .await
-        .expect("spawn shim");
+async fn run(scope: &mut ManagedScope, config: SpawnConfig, label: &str) -> Vec<Event> {
+    let mut client = scope.spawn(config, label).await.expect("spawn shim");
     let events = drive_one_turn(&mut client).await;
     let _ = client.shutdown().await;
     events
+}
+
+async fn await_config_option(client: &mut ManagedClient, id: &str, value: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match client
+                .next_event()
+                .await
+                .expect("actual live option response")
+            {
+                Event::ConfigOptionsUpdated { options }
+                    if options
+                        .iter()
+                        .any(|option| option.id == id && option.current_value == value) =>
+                {
+                    break
+                }
+                Event::ConfigOptionSwitchFailed { reason, .. } => {
+                    panic!("live option failed: {reason}")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("actual option publication precedes the new reset scope");
 }
 
 /// The persisted model and pinned effort are applied after every establish
@@ -129,351 +154,481 @@ async fn run(config: SpawnConfig, label: &str) -> Vec<Event> {
 /// and `session/new` applies each exactly once. An unpinned session sends no
 /// config-option RPC at all, so it keeps the agent's own defaults.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn pinned_model_and_effort_applied_on_load_and_new() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    // (label, resume via load, model, effort, expected record line, exact count)
-    let cases = [
-        (
-            "model-load",
-            true,
-            Some("opus"),
-            None,
-            Some("model=opus"),
-            None,
-        ),
-        (
-            "model-new",
-            false,
-            Some("sonnet"),
-            None,
-            Some("model=sonnet"),
-            Some(1),
-        ),
-        (
-            "effort-load",
-            true,
-            None,
-            Some("high"),
-            Some("thought_level=high"),
-            None,
-        ),
-        (
-            "effort-new",
-            false,
-            None,
-            Some("high"),
-            Some("thought_level=high"),
-            Some(1),
-        ),
-        ("unpinned", true, None, None, None, None),
-    ];
-    for (label, load, model, effort, line, exact) in cases {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let record_path = temp.path().join("config-option-calls.log");
-        let config = spawn_config(
-            shim_path(),
-            shim_env(&record_path, load, effort.is_some() || model.is_none()),
-            (load && (model.is_some() || effort.is_some())).then(|| format!("stored-{label}")),
-            model.map(Into::into),
-            effort.map(Into::into),
-        );
-        run(config, label).await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            // (label, resume via load, model, effort, expected record line, exact count)
+            let cases = [
+                (
+                    "model-load",
+                    true,
+                    Some("opus"),
+                    None,
+                    Some("model=opus"),
+                    None,
+                ),
+                (
+                    "model-new",
+                    false,
+                    Some("sonnet"),
+                    None,
+                    Some("model=sonnet"),
+                    Some(1),
+                ),
+                (
+                    "effort-load",
+                    true,
+                    None,
+                    Some("high"),
+                    Some("thought_level=high"),
+                    None,
+                ),
+                (
+                    "effort-new",
+                    false,
+                    None,
+                    Some("high"),
+                    Some("thought_level=high"),
+                    Some(1),
+                ),
+                ("unpinned", true, None, None, None, None),
+            ];
+            for (label, load, model, effort, line, exact) in cases {
+                let temp = scope.tempdir();
+                let record_path = temp.path().join("config-option-calls.log");
+                let config = spawn_config(
+                    shim_path(),
+                    shim_env(&record_path, load, effort.is_some() || model.is_none()),
+                    (load && (model.is_some() || effort.is_some()))
+                        .then(|| format!("stored-{label}")),
+                    model.map(Into::into),
+                    effort.map(Into::into),
+                );
+                run(scope, config, label).await;
 
-        let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-        let Some(line) = line else {
-            assert!(recorded.trim().is_empty(), "{label}: {recorded:?}");
-            continue;
-        };
-        let count = recorded.lines().filter(|l| *l == line).count();
-        match exact {
-            Some(exact) => assert_eq!(count, exact, "{label}: {recorded:?}"),
-            None => assert!(count > 0, "{label}: {recorded:?}"),
-        }
-    }
+                let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+                let Some(line) = line else {
+                    assert!(recorded.trim().is_empty(), "{label}: {recorded:?}");
+                    continue;
+                };
+                let count = recorded.lines().filter(|l| *l == line).count();
+                match exact {
+                    Some(exact) => assert_eq!(count, exact, "{label}: {recorded:?}"),
+                    None => assert!(count > 0, "{label}: {recorded:?}"),
+                }
+            }
+        })
+    })
+    .await;
 }
 
 /// When the handshake response already reports the persisted value, the
 /// round-trip is skipped, so a resume with a matching model costs nothing extra.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn pinned_model_skipped_when_already_current() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    // Both rows in one run: "no model= line" is equally true of a session that
-    // never reached the apply, or of the apply being gone, so the
-    // differing-value row is what gives the equal-value row meaning. The
-    // effort pin rides along as proof the post-handshake path ran at all.
-    for (pin, expect_sent) in [("opus", true), ("default", false)] {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let record_path = temp.path().join("config-option-calls.log");
-        // The shim's initial `currentValue` is "default".
-        let config = spawn_config(
-            shim_path(),
-            shim_env(&record_path, true, true),
-            Some("stored-model-session".into()),
-            Some(pin.into()),
-            Some("high".into()),
-        );
-        run(config, "model-current").await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            // Both rows in one run: "no model= line" is equally true of a session that
+            // never reached the apply, or of the apply being gone, so the
+            // differing-value row is what gives the equal-value row meaning. The
+            // effort pin rides along as proof the post-handshake path ran at all.
+            for (pin, expect_sent) in [("opus", true), ("default", false)] {
+                let temp = scope.tempdir();
+                let record_path = temp.path().join("config-option-calls.log");
+                // The shim's initial `currentValue` is "default".
+                let config = spawn_config(
+                    shim_path(),
+                    shim_env(&record_path, true, true),
+                    Some("stored-model-session".into()),
+                    Some(pin.into()),
+                    Some("high".into()),
+                );
+                run(scope, config, "model-current").await;
 
-        let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-        assert!(
-            recorded.lines().any(|line| line == "thought_level=high"),
-            "{pin}: the post-handshake apply path must have run (recorded: {recorded:?})"
-        );
-        assert_eq!(
-            recorded.lines().any(|line| line == format!("model={pin}")),
-            expect_sent,
-            "{pin}: a model the agent already reports must not be re-sent, and one \
-             it does not report must be (recorded: {recorded:?})"
-        );
-    }
+                let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+                assert!(
+                    recorded.lines().any(|line| line == "thought_level=high"),
+                    "{pin}: the post-handshake apply path must have run (recorded: {recorded:?})"
+                );
+                assert_eq!(
+                    recorded.lines().any(|line| line == format!("model={pin}")),
+                    expect_sent,
+                    "{pin}: a model the agent already reports must not be re-sent, and one \
+         it does not report must be (recorded: {recorded:?})"
+                );
+            }
+        })
+    })
+    .await;
 }
 
 /// A resumed session runs on its transcript's model, which after a provider
 /// switch may be one the new provider does not serve. Dropping the pin leaves
 /// it there; the `default` pin a switch writes moves it to the provider's own.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn default_pin_moves_a_resumed_session_off_its_transcript_model() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    for (pin, expect_reset) in [(Some("default"), true), (None, false)] {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let record_path = temp.path().join("config-option-calls.log");
-        let mut env = shim_env(&record_path, true, true);
-        env.push(("SHIM_RESUMED_MODEL".into(), "opus".into()));
-        let config = spawn_config(
-            shim_path(),
-            env,
-            Some("stored-transcript-session".into()),
-            pin.map(str::to_string),
-            Some("high".into()),
-        );
-        run(config, "resumed-model").await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            for (pin, expect_reset) in [(Some("default"), true), (None, false)] {
+                let temp = scope.tempdir();
+                let record_path = temp.path().join("config-option-calls.log");
+                let mut env = shim_env(&record_path, true, true);
+                env.push(("SHIM_RESUMED_MODEL".into(), "opus".into()));
+                let config = spawn_config(
+                    shim_path(),
+                    env,
+                    Some("stored-transcript-session".into()),
+                    pin.map(str::to_string),
+                    Some("high".into()),
+                );
+                run(scope, config, "resumed-model").await;
 
-        let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-        assert!(
-            recorded.lines().any(|line| line == "thought_level=high"),
-            "{pin:?}: the post-handshake apply path must have run (recorded: {recorded:?})"
-        );
-        assert_eq!(
-            recorded.lines().any(|line| line == "model=default"),
-            expect_reset,
-            "{pin:?}: recorded {recorded:?}"
-        );
-    }
+                let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+                assert!(
+                    recorded.lines().any(|line| line == "thought_level=high"),
+                    "{pin:?}: the post-handshake apply path must have run (recorded: {recorded:?})"
+                );
+                assert_eq!(
+                    recorded.lines().any(|line| line == "model=default"),
+                    expect_reset,
+                    "{pin:?}: recorded {recorded:?}"
+                );
+            }
+        })
+    })
+    .await;
 }
 
 /// A value the agent rejects (a stale alias after an upgrade, a pick persisted
 /// from another agent's namespace) warns and never fails the spawn: the session
 /// still comes up and answers, on the agent's own model, and the user is told.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn rejected_model_does_not_fail_the_spawn() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    let temp = tempfile::tempdir().expect("tempdir");
-    let record_path = temp.path().join("config-option-calls.log");
-    let config = spawn_config(
-        shim_path(),
-        shim_env(&record_path, true, false),
-        Some("stored-model-session".into()),
-        Some("no-such-model".into()),
-        None,
-    );
-    // `run` panics if the spawn errors or the prompt never completes.
-    let events = run(config, "model-rejected").await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            let temp = scope.tempdir();
+            let record_path = temp.path().join("config-option-calls.log");
+            let config = spawn_config(
+                shim_path(),
+                shim_env(&record_path, true, false),
+                Some("stored-model-session".into()),
+                Some("no-such-model".into()),
+                None,
+            );
+            // `run` panics if the spawn errors or the prompt never completes.
+            let events = run(scope, config, "model-rejected").await;
 
-    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-    assert!(
-        recorded.lines().any(|line| line == "model=no-such-model"),
-        "the re-assert must have been attempted (recorded: {recorded:?})"
-    );
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            Event::ConfigOptionSwitchFailed { config_id, value, .. }
-                if config_id == "model" && value == "no-such-model"
-        )),
-        "a rejected re-assert must surface as a switch failure"
-    );
+            let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+            assert!(
+                recorded.lines().any(|line| line == "model=no-such-model"),
+                "the re-assert must have been attempted (recorded: {recorded:?})"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::ConfigOptionSwitchFailed { config_id, value, .. }
+                        if config_id == "model" && value == "no-such-model"
+                )),
+                "a rejected re-assert must surface as a switch failure"
+            );
+        })
+    })
+    .await;
 }
 
 /// A conversation reset re-applies the model the user last picked, not the
 /// one the worker was spawned with.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn reset_reapplies_the_live_model_pick() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    let temp = tempfile::tempdir().expect("tempdir");
-    let record_path = temp.path().join("config-option-calls.log");
-    // The reset path re-reads the effort id from the model switch's response
-    // exactly as the handshake does, so it is driven with an effort pin and the
-    // renaming shim: the post-reset effort must land on the id that response
-    // advertised, not the one the pre-reset option list carried.
-    let mut env = shim_env(&record_path, false, true);
-    env.push(("SHIM_RENUMBER_ON_MODEL".into(), "1".into()));
-    let config = spawn_config(
-        shim_path(),
-        env,
-        None,
-        Some("sonnet".into()),
-        Some("high".into()),
-    );
-    let mut client = AcpClient::spawn(config, AcpSessionId("model-reset".into()))
-        .await
-        .expect("spawn shim");
-    drive_one_turn(&mut client).await;
-    client
-        .set_config_option("model", "opus", false)
-        .await
-        .unwrap();
-    client.reset_session("/clear").await.unwrap();
-    let _ = client.shutdown().await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            let temp = scope.tempdir();
+            let record_path = temp.path().join("config-option-calls.log");
+            // The reset path re-reads the effort id from the model switch's response
+            // exactly as the handshake does, so it is driven with an effort pin and the
+            // renaming shim: the post-reset effort must land on the id that response
+            // advertised, not the one the pre-reset option list carried.
+            let mut env = shim_env(&record_path, false, true);
+            env.push(("SHIM_RENUMBER_ON_MODEL".into(), "1".into()));
+            let config = spawn_config(
+                shim_path(),
+                env,
+                None,
+                Some("sonnet".into()),
+                Some("high".into()),
+            );
+            let mut client = scope
+                .spawn(config, "model-reset")
+                .await
+                .expect("spawn shim");
+            drive_one_turn(&mut client).await;
+            client
+                .set_config_option("model", "opus", false, None)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match client
+                        .next_event()
+                        .await
+                        .expect("live model switch publication")
+                    {
+                        Event::ConfigOptionsUpdated { options }
+                            if options.iter().any(|option| {
+                                option.id == "model" && option.current_value == "opus"
+                            }) =>
+                        {
+                            break
+                        }
+                        Event::ConfigOptionSwitchFailed { reason, .. } => {
+                            panic!("live model switch failed: {reason}")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("actual model switch settles before Fresh revokes its Current scope");
+            client.reset_session("/clear").await.unwrap();
+            let _ = client.shutdown().await;
 
-    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-    let models: Vec<&str> = recorded
-        .lines()
-        .filter(|line| line.starts_with("model="))
-        .collect();
-    assert_eq!(
-        models,
-        ["model=sonnet", "model=opus", "model=opus"],
-        "a reset must re-apply the live pick, not the spawn-time model (recorded: {recorded:?})"
-    );
-    // `session/new` restores the default id, so the pre-reset rename is undone
-    // and the reset's own switch renames it again: the last effort line is the
-    // one the reset applied.
-    assert_eq!(
-        recorded
-            .lines()
-            .rfind(|line| line.starts_with("thought_level")),
-        Some("thought_level_v2=high"),
-        "the reset must resolve the effort id from its own model switch \
-         (recorded: {recorded:?})"
-    );
+            let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+            let models: Vec<&str> = recorded
+                .lines()
+                .filter(|line| line.starts_with("model="))
+                .collect();
+            assert_eq!(
+    models,
+    ["model=sonnet", "model=opus", "model=opus"],
+    "a reset must re-apply the live pick, not the spawn-time model (recorded: {recorded:?})"
+);
+            // `session/new` restores the default id, so the pre-reset rename is undone
+            // and the reset's own switch renames it again: the last effort line is the
+            // one the reset applied.
+            assert_eq!(
+                recorded
+                    .lines()
+                    .rfind(|line| line.starts_with("thought_level")),
+                Some("thought_level_v2=high"),
+                "the reset must resolve the effort id from its own model switch \
+     (recorded: {recorded:?})"
+            );
+        })
+    })
+    .await;
 }
 
 /// A reset re-sends the model_config toggles at their live value, not the
 /// spawn-time one.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn reset_reapplies_the_live_model_config_pick() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    let temp = tempfile::tempdir().expect("tempdir");
-    let record_path = temp.path().join("config-option-calls.log");
-    let mut env = shim_env(&record_path, false, false);
-    env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
-    let mut config = spawn_config(shim_path(), env, None, Some("opus".into()), None);
-    config.default_model_config = [("fast".to_string(), "on".to_string())].into();
-    let mut client = AcpClient::spawn(config, AcpSessionId("model-config-reset".into()))
-        .await
-        .expect("spawn shim");
-    drive_one_turn(&mut client).await;
-    // The pick is dispatched in the background; the reset must not overtake it.
-    client.set_config_option("fast", "off", true).await.unwrap();
-    client
-        .set_config_option("ultracode", "on", true)
-        .await
-        .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::fs::read_to_string(&record_path).map_or(0, |r| r.lines().count()) < 4 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "live picks never recorded"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    client.reset_session("/clear").await.unwrap();
-    let _ = client.shutdown().await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            let temp = scope.tempdir();
+            let record_path = temp.path().join("config-option-calls.log");
+            let mut env = shim_env(&record_path, false, false);
+            env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
+            let mut config = spawn_config(shim_path(), env, None, Some("opus".into()), None);
+            config.default_model_config = [("fast".to_string(), "on".to_string())].into();
+            let mut client = scope
+                .spawn(config, "model-config-reset")
+                .await
+                .expect("spawn shim");
+            drive_one_turn(&mut client).await;
+            // The pick is dispatched in the background; the reset must not overtake it.
+            client
+                .set_config_option("fast", "off", true, None)
+                .await
+                .unwrap();
+            await_config_option(&mut client, "fast", "off").await;
+            client
+                .set_config_option("ultracode", "on", true, None)
+                .await
+                .unwrap();
+            await_config_option(&mut client, "ultracode", "on").await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::fs::read_to_string(&record_path).map_or(0, |r| r.lines().count()) < 4 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "live picks never recorded"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            client.reset_session("/clear").await.unwrap();
+            let _ = client.shutdown().await;
 
-    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-    assert_eq!(
-        recorded.lines().collect::<Vec<_>>(),
-        [
-            "model=opus",
-            "fast=on",
-            "fast=off",
-            "ultracode=on",
-            "model=opus",
-            "ultracode=on",
-        ],
-        "a reset must re-send the live toggle values (recorded: {recorded:?})"
-    );
+            let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+            assert_eq!(
+                recorded.lines().collect::<Vec<_>>(),
+                [
+                    "model=opus",
+                    "fast=on",
+                    "fast=off",
+                    "ultracode=on",
+                    "model=opus",
+                    "ultracode=on",
+                ],
+                "a reset must re-send the live toggle values (recorded: {recorded:?})"
+            );
+        })
+    })
+    .await;
 }
 
 /// A toggle turned off after one reset must stay off on the next one.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn second_reset_keeps_a_toggle_turned_off_after_the_first() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    let temp = tempfile::tempdir().expect("tempdir");
-    let record_path = temp.path().join("config-option-calls.log");
-    let mut env = shim_env(&record_path, false, false);
-    env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
-    let mut config = spawn_config(shim_path(), env, None, Some("opus".into()), None);
-    config.default_model_config = [
-        ("fast".to_string(), "on".to_string()),
-        ("ultracode".to_string(), "on".to_string()),
-    ]
-    .into();
-    let mut client = AcpClient::spawn(config, AcpSessionId("model-config-second-reset".into()))
-        .await
-        .expect("spawn shim");
-    drive_one_turn(&mut client).await;
-    let recorded_lines = || std::fs::read_to_string(&record_path).map_or(0, |r| r.lines().count());
-    let wait_for = |count: usize| async move {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while recorded_lines() < count {
-            assert!(std::time::Instant::now() < deadline, "calls never recorded");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    };
-    client.reset_session("/clear").await.unwrap();
-    client
-        .set_config_option("ultracode", "off", true)
-        .await
-        .unwrap();
-    wait_for(7).await;
-    client.reset_session("/clear").await.unwrap();
-    let _ = client.shutdown().await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            let temp = scope.tempdir();
+            let record_path = temp.path().join("config-option-calls.log");
+            let mut env = shim_env(&record_path, false, false);
+            env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
+            let mut config = spawn_config(shim_path(), env, None, Some("opus".into()), None);
+            config.default_model_config = [
+                ("fast".to_string(), "on".to_string()),
+                ("ultracode".to_string(), "on".to_string()),
+            ]
+            .into();
+            let mut client = scope
+                .spawn(config, "model-config-second-reset")
+                .await
+                .expect("spawn shim");
+            drive_one_turn(&mut client).await;
+            let recorded_lines =
+                || std::fs::read_to_string(&record_path).map_or(0, |r| r.lines().count());
+            let wait_for = |count: usize| async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while recorded_lines() < count {
+                    assert!(std::time::Instant::now() < deadline, "calls never recorded");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let first_reset = client.reset_session("/clear").await.unwrap();
+            assert!(matches!(
+                first_reset,
+                crate::acp::acp_client::ResetSessionOutcome::Reset { .. }
+            ));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match client
+                        .next_event()
+                        .await
+                        .expect("first reset remains observable")
+                    {
+                        Event::Stopped { reason } if reason == "session_reset" => break,
+                        Event::AgentStartupError { message, .. }
+                        | Event::PromptRuntimeError { message, .. } => {
+                            panic!("first reset failed: {message}");
+                        }
+                        Event::AcpConnectionUnavailable { .. } => {
+                            panic!("first reset lost its actual Native");
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("first reset's original terminal is durably published before the live pick");
 
-    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-    assert_eq!(
-        recorded.lines().collect::<Vec<_>>(),
-        [
-            "model=opus",
-            "fast=on",
-            "ultracode=on",
-            "model=opus",
-            "fast=on",
-            "ultracode=on",
-            "ultracode=off",
-            "model=opus",
-            "fast=on",
-        ],
-        "the second reset must not turn ultracode back on (recorded: {recorded:?})"
-    );
+            let mut acknowledgements = client.subscribe_publications();
+            let correlation = client
+                .set_config_option("ultracode", "off", true, None)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame = acknowledgements.recv().await.expect("live pick ACK stream");
+                    if frame.session_id != client.id
+                        || frame.operation.map(|operation| operation.correlation)
+                            != Some(correlation)
+                    {
+                        continue;
+                    }
+                    match frame.event.as_ref() {
+                        Event::ConfigOptionsUpdated { options }
+                            if options.iter().any(|option| {
+                                option.id == "ultracode" && option.current_value == "off"
+                            }) =>
+                        {
+                            assert_eq!(
+                                frame.operation.and_then(|operation| operation.outcome),
+                                Some(crate::acp::protocol::AcpOriginalRequestResult::Succeeded)
+                            );
+                            break;
+                        }
+                        Event::ConfigOptionSwitchFailed { reason, .. } => {
+                            panic!("the exact live pick failed: {reason}");
+                        }
+                        other => panic!("unexpected exact live pick outcome: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("the exact off pick settles before the second Fresh revokes its scope");
+            await_config_option(&mut client, "ultracode", "off").await;
+            wait_for(7).await;
+            let second_reset = client.reset_session("/clear").await.unwrap();
+            assert!(matches!(
+                second_reset,
+                crate::acp::acp_client::ResetSessionOutcome::Reset { .. }
+            ));
+            let _ = client.shutdown().await;
+
+            let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+            assert_eq!(
+                recorded.lines().collect::<Vec<_>>(),
+                [
+                    "model=opus",
+                    "fast=on",
+                    "ultracode=on",
+                    "model=opus",
+                    "fast=on",
+                    "ultracode=on",
+                    "ultracode=off",
+                    "model=opus",
+                    "fast=on",
+                ],
+                "the second reset must not turn ultracode back on (recorded: {recorded:?})"
+            );
+        })
+    })
+    .await;
 }
 
 /// The reason the model is applied first, and the reason its response is read
@@ -482,92 +637,89 @@ async fn second_reset_keeps_a_toggle_turned_off_after_the_first() {
 /// the effort pin is silently lost on every respawn. The shim's id is otherwise
 /// fixed, so nothing else here would notice.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn effort_id_is_re_read_from_the_model_switch_response() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    let temp = tempfile::tempdir().expect("tempdir");
-    let record_path = temp.path().join("config-option-calls.log");
-    let mut env = shim_env(&record_path, true, true);
-    env.push(("SHIM_RENUMBER_ON_MODEL".into(), "1".into()));
-    let config = spawn_config(
-        shim_path(),
-        env,
-        Some("stored-model-session".into()),
-        Some("opus".into()),
-        Some("high".into()),
-    );
-    run(config, "model-renumber").await;
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            let temp = scope.tempdir();
+            let record_path = temp.path().join("config-option-calls.log");
+            let mut env = shim_env(&record_path, true, true);
+            env.push(("SHIM_RENUMBER_ON_MODEL".into(), "1".into()));
+            let config = spawn_config(
+                shim_path(),
+                env,
+                Some("stored-model-session".into()),
+                Some("opus".into()),
+                Some("high".into()),
+            );
+            run(scope, config, "model-renumber").await;
 
-    let recorded = std::fs::read_to_string(&record_path).expect("record file");
-    assert!(
-        recorded.lines().any(|line| line == "thought_level_v2=high"),
-        "the effort must use the id the switch response advertised (recorded: {recorded:?})"
-    );
-    // The ordering this depends on, asserted here rather than in a second
-    // session: the effort can only carry the post-switch id if the model went
-    // first, so a reversal shows up as `thought_level=high` above.
-    let lines: Vec<&str> = recorded.lines().collect();
-    let model_at = lines.iter().position(|line| *line == "model=opus");
-    let effort_at = lines
-        .iter()
-        .position(|line| line.starts_with("thought_level"));
-    assert!(
-        matches!((model_at, effort_at), (Some(m), Some(e)) if m < e),
-        "model must be applied before the effort (recorded: {recorded:?})"
-    );
+            let recorded = std::fs::read_to_string(&record_path).expect("record file");
+            assert!(recorded.lines().any(|line| line == "thought_level_v2=high"),
+                "the effort must use the id the switch response advertised (recorded: {recorded:?})");
+            let lines: Vec<&str> = recorded.lines().collect();
+            let model_at = lines.iter().position(|line| *line == "model=opus");
+            let effort_at = lines.iter().position(|line| line.starts_with("thought_level"));
+            assert!(matches!((model_at, effort_at), (Some(model), Some(effort)) if model < effort),
+                "model must be applied before the effort (recorded: {recorded:?})");
+        })
+    }).await;
 }
 
-/// Fast mode and Ultracode picks are re-sent after the model and effort, and an
-/// option the model does not advertise (`ultracode` off `opus`) is skipped.
+/// Live model toggles follow the actual advertised model and effort options.
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn model_config_picks_reapplied_after_model_and_effort() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    // (model, expected record lines in order)
-    let cases = [
-        (
-            "opus",
-            vec![
-                "model=opus",
-                "thought_level=high",
-                "fast=on",
-                "ultracode=on",
-            ],
-        ),
-        (
-            "sonnet",
-            vec!["model=sonnet", "thought_level=high", "fast=on"],
-        ),
-    ];
-    for (model, expected) in cases {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let record_path = temp.path().join("config-option-calls.log");
-        let mut env = shim_env(&record_path, true, true);
-        env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
-        let mut config = spawn_config(
-            shim_path(),
-            env,
-            Some("stored-model-config-session".into()),
-            Some(model.into()),
-            Some("high".into()),
-        );
-        config.default_model_config = [("fast", "on"), ("ultracode", "on")]
-            .into_iter()
-            .map(|(id, value)| (id.to_string(), value.to_string()))
-            .collect();
-        run(config, "model-config").await;
-
-        let recorded = std::fs::read_to_string(&record_path).expect("record file");
-        assert_eq!(
-            recorded.lines().collect::<Vec<_>>(),
-            expected,
-            "{model}: recorded {recorded:?}"
-        );
-    }
+    super::managed::with_managed(|scope| {
+        Box::pin(async move {
+            if let Err(reason) = shim_ready() {
+                eprintln!("skipping: {reason}");
+                return;
+            }
+            let cases = [
+                (
+                    "opus",
+                    vec![
+                        "model=opus",
+                        "thought_level=high",
+                        "fast=on",
+                        "ultracode=on",
+                    ],
+                ),
+                (
+                    "sonnet",
+                    vec!["model=sonnet", "thought_level=high", "fast=on"],
+                ),
+            ];
+            for (model, expected) in cases {
+                let temp = scope.tempdir();
+                let record_path = temp.path().join("config-option-calls.log");
+                let mut env = shim_env(&record_path, true, true);
+                env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
+                let mut config = spawn_config(
+                    shim_path(),
+                    env,
+                    Some("stored-model-config-session".into()),
+                    Some(model.into()),
+                    Some("high".into()),
+                );
+                config.default_model_config = [("fast", "on"), ("ultracode", "on")]
+                    .into_iter()
+                    .map(|(id, value)| (id.to_string(), value.to_string()))
+                    .collect();
+                run(scope, config, "model-config").await;
+                let recorded = std::fs::read_to_string(&record_path).expect("record file");
+                assert_eq!(
+                    recorded.lines().collect::<Vec<_>>(),
+                    expected,
+                    "{model}: recorded {recorded:?}"
+                );
+            }
+        })
+    })
+    .await;
 }

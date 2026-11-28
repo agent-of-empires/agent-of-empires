@@ -7,7 +7,7 @@ import type { Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { commitAll, generateLargeFileContent, pngStubBytes, writeBinaryFile } from "../helpers/gitFixture";
-import { enableStructuredViewAndWait } from "../helpers/acp";
+import { spawnAcpAgentAndWait } from "../helpers/acp";
 import { openReviewPane } from "../helpers/panes";
 
 const decodablePng = Buffer.from(
@@ -275,18 +275,17 @@ test("right panel notifications: structured view comments banner appears on stag
   page,
   spawnServe,
 }) => {
-  const serve = await spawnServe({
-    acp: true,
-    seedFn: seedSessionViaAoeAdd({
-      title: "rp-notif",
-      // A modified hunk gives the comment gutter line numbers.
-      committed: { "notes.md": "line a\nline b\nline c\n" },
-      files: { "notes.md": "line A\nline B\nline C\n" },
-    }),
-  });
+  const serve = await spawnServe({ acp: true });
+  seedSessionViaAoeAdd({
+    title: "rp-notif",
+    structuredView: true,
+    // A modified hunk gives the comment gutter line numbers.
+    committed: { "notes.md": "line a\nline b\nline c\n" },
+    files: { "notes.md": "line A\nline B\nline C\n" },
+  })(serve);
   const sessionId = (await listSessions(serve.baseUrl)).find((s) => s.title === "rp-notif")?.id;
   if (!sessionId) throw new Error("seeded structured view session not visible in /api/sessions");
-  await enableStructuredViewAndWait(serve.baseUrl, sessionId, 30_000, serve.home);
+  await spawnAcpAgentAndWait(serve.baseUrl, sessionId, 30_000, serve.home);
   // Accept Discard-all's confirm.
   page.on("dialog", (dialog) => void dialog.accept());
 

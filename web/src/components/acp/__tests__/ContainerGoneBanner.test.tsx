@@ -54,7 +54,7 @@ function renderFailed(
         state={state}
         startingAgent={isNewSessionStarting(state, connection, "absent", true) ? "Claude" : null}
         canRestart={canRestart}
-        onRestarted={(epoch, stoppedSent, retriedError) =>
+        onStartupRestarted={(epoch, stoppedSent, retriedError) =>
           send({ kind: "restart_started", epoch, stoppedSent, retriedError })
         }
         acpWorkerState="absent"

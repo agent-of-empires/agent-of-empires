@@ -125,15 +125,9 @@ jobs:
             userns,
           }
           PROFILE
-      # tests/integration/acp_smoke.rs spawns the Node ACP shim under
-      # acp-worker/test-shim/. The shim depends on @agentclientprotocol/sdk,
-      # so its deps must be installed before the integration crate runs. Only
-      # the core-rest leg runs the integration binary; the web-e2e leg uses
-      # the fake ACP agent under web/tests/helpers/ instead, and bare-core does
-      # not exercise the shim. Node here is a test-runtime dependency, not a
-      # build one: core-rest's `cargo build` never invokes npm.
+      # Managed libtests and integration use the original SDK-backed Node shim.
       - name: Install ACP shim deps
-        if: matrix.leg == 'core-rest'
+        if: matrix.leg == 'core-rest' || matrix.leg == 'bare-core'
         working-directory: acp-worker/test-shim
         run: npm ci
       # web-e2e: just the e2e binary, and the only leg that builds the
@@ -202,6 +196,9 @@ jobs:
         # rather than passing as a green run with the guard gone.
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
+          cargo build --bin aoe
+          target_dir=$(cargo metadata --no-deps --format-version 1 | jq -er .target_directory)
+          export AOE_TEST_ACP_RUNNER_EXE="$target_dir/debug/aoe"
           cargo nextest run --no-fail-fast
       - name: Exercise bounded plugin staging
         if: matrix.leg == 'core-rest'
@@ -382,6 +379,9 @@ jobs:
           node-version: '22'
       # Two steps so the two crate compiles (lib, then lib tests) never run at
       # once: together they overflow the runner's 7 GB and swap.
+      - name: Install ACP shim deps
+        working-directory: acp-worker/test-shim
+        run: npm ci
       - name: Build lib and bins (macOS)
         run: cargo nextest run --features e2e-tests --bins --no-run
       - name: Build tests (macOS)
@@ -389,7 +389,12 @@ jobs:
           cargo nextest run --features e2e-tests --lib --bins --test integration --no-run
           cargo test --features e2e-tests --test e2e --no-run
       - name: Cargo test (macOS, lib + bins)
-        run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
+        run: |
+          # Owned-runner unit fixtures launch the matching normal binary, not a test harness.
+          cargo build --features e2e-tests --bin aoe
+          target_dir=$(cargo metadata --no-deps --format-version 1 | jq -er .target_directory)
+          export AOE_TEST_ACP_RUNNER_EXE="$target_dir/debug/aoe"
+          cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, daemon-only CLI reads)
         run: cargo nextest run --features e2e-tests --test integration -E 'test(cli_read_daemon::)' --no-fail-fast
       - name: Cargo test (macOS, acp live-daemon e2e)

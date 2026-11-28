@@ -22,6 +22,23 @@ fn group_membership<'a>(
     }
 }
 
+fn restart_request_with_terminal_size(
+    structured: bool,
+    mut body: crate::daemon::RestartSessionBody,
+    get_size: impl FnOnce() -> Option<(u16, u16)>,
+) -> crate::daemon::RestartSessionBody {
+    // Structured recovery rejects terminal geometry as a launch-setting override.
+    if !(structured && body.recovery.is_some()) {
+        body.size = get_size().and_then(|(cols, rows)| {
+            Some(crate::daemon::TerminalSize {
+                cols: std::num::NonZeroU16::new(cols)?,
+                rows: std::num::NonZeroU16::new(rows)?,
+            })
+        });
+    }
+    body
+}
+
 impl HomeView {
     /// Why this process may not write `projects.json`, or `None` when it may: only while a
     /// writable Daemon is attached, since it republishes the registry in every snapshot.
@@ -260,15 +277,59 @@ impl HomeView {
     ///   the field is updated before respawn so the new agent binary starts
     ///   on the next launch.
     ///
-    /// Launch edits travel with the restart command. Only the daemon may commit
-    /// them after lifecycle admission; a disconnected or refused request leaves
-    /// both this view and the stored session untouched.
+    /// The daemon admits launch edits before committing them to the stored session.
     pub(super) fn restart_selected_session(
         &mut self,
         new_profile: Option<&str>,
         new_tool: Option<&str>,
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.restart_selected_session_with_wake(
+            new_profile,
+            new_tool,
+            new_extra_args,
+            new_command_override,
+            None,
+        )
+    }
+
+    pub(super) fn restart_selected_recovery(
+        &mut self,
+        recovery: crate::session::SessionRecoveryRequest,
+    ) -> anyhow::Result<()> {
+        let Some(id) = self.selected_session.as_deref() else {
+            return Ok(());
+        };
+        let current = self
+            .session_feed
+            .applied_session(id)
+            .and_then(|row| row.recovery.as_ref())
+            .filter(|current| current.expected == recovery.expected)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Recovery selection changed; reopen its current diagnostic")
+            })?;
+        let allowed = match recovery.action {
+            crate::session::SessionRecoveryAction::Same => current.actions.restart_same,
+            crate::session::SessionRecoveryAction::Fresh => current.actions.fresh,
+        };
+        anyhow::ensure!(
+            self.session_feed.current_observation_applied()
+                && self.session_feed.can_submit(id)
+                && allowed,
+            "{}",
+            current.guidance
+        );
+        self.restart_selected_session_with_wake(None, None, None, None, Some(recovery))
+    }
+
+    fn restart_selected_session_with_wake(
+        &mut self,
+        new_profile: Option<&str>,
+        new_tool: Option<&str>,
+        new_extra_args: Option<&str>,
+        new_command_override: Option<&str>,
+        recovery: Option<crate::session::SessionRecoveryRequest>,
     ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
@@ -289,10 +350,11 @@ impl HomeView {
         }
 
         // Skip transient rows; starting a snoozed row wakes it.
-        let (skip, wake_snooze) = match self.get_instance(&id) {
+        let (skip, wake_snooze, structured) = match self.get_instance(&id) {
             Some(inst) => (
                 matches!(inst.status, Status::Creating | Status::Deleting),
                 inst.is_snoozed(),
+                inst.is_structured(),
             ),
             None => return Ok(()),
         };
@@ -308,20 +370,19 @@ impl HomeView {
                 return Ok(());
             }
         }
-        let body = crate::daemon::RestartSessionBody {
-            size: crate::terminal::get_size().and_then(|(cols, rows)| {
-                Some(crate::daemon::TerminalSize {
-                    cols: std::num::NonZeroU16::new(cols)?,
-                    rows: std::num::NonZeroU16::new(rows)?,
-                })
-            }),
-            profile: new_profile.map(str::to_owned),
-            tool: new_tool.map(str::to_owned),
-            extra_args: new_extra_args.map(str::to_owned),
-            command_override: new_command_override.map(str::to_owned),
-            unsnooze: wake_snooze,
-            ..Default::default()
-        };
+        let body = restart_request_with_terminal_size(
+            structured,
+            crate::daemon::RestartSessionBody {
+                profile: new_profile.map(str::to_owned),
+                tool: new_tool.map(str::to_owned),
+                extra_args: new_extra_args.map(str::to_owned),
+                command_override: new_command_override.map(str::to_owned),
+                unsnooze: wake_snooze,
+                recovery,
+                ..Default::default()
+            },
+            crate::terminal::get_size,
+        );
         if let Err(error) = self
             .session_feed
             .submit(id.clone(), crate::daemon::SessionMutation::Restart(body))
@@ -1050,6 +1111,74 @@ mod tests {
     use super::*;
     use crate::tui::home::tests::{native_state, payload_bytes, request_with_headers};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn recovery_request_omits_terminal_size_only_for_structured_sessions() {
+        use crate::session::{SessionRecoveryAction, SessionRecoveryRequest};
+
+        for structured in [false, true] {
+            for action in [SessionRecoveryAction::Same, SessionRecoveryAction::Fresh] {
+                let mut size_requested = false;
+                let body = restart_request_with_terminal_size(
+                    structured,
+                    crate::daemon::RestartSessionBody {
+                        recovery: Some(SessionRecoveryRequest {
+                            action,
+                            expected: "qualified-exact-selection".into(),
+                        }),
+                        ..Default::default()
+                    },
+                    || {
+                        size_requested = true;
+                        Some((132, 43))
+                    },
+                );
+                let request = serde_json::to_value(body).unwrap();
+                assert_eq!(size_requested, !structured);
+                assert_eq!(
+                    request["size"],
+                    if structured {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!({"cols": 132, "rows": 43})
+                    }
+                );
+                assert_eq!(
+                    request["recovery"],
+                    serde_json::json!({
+                        "action": action,
+                        "expected": "qualified-exact-selection",
+                    })
+                );
+                assert!(request.get("wake_message").is_none());
+                for field in ["profile", "tool", "extra_args", "command_override"] {
+                    assert!(
+                        request[field].is_null(),
+                        "{field} must not override recovery"
+                    );
+                }
+                for field in [
+                    "unsnooze",
+                    "skip_on_launch",
+                    "bound_hooks",
+                    "discard_sandbox_container",
+                ] {
+                    assert_eq!(request[field], false, "{field} must not override recovery");
+                }
+            }
+
+            let body = restart_request_with_terminal_size(
+                structured,
+                crate::daemon::RestartSessionBody::default(),
+                || Some((132, 43)),
+            );
+            assert_eq!(
+                serde_json::to_value(body).unwrap()["size"],
+                serde_json::json!({"cols": 132, "rows": 43}),
+                "ordinary restarts retain terminal size even for structured sessions"
+            );
+        }
+    }
 
     async fn check_worktree_edit(status: Status, sandboxed: bool, running: bool) {
         let home = crate::session::test_support::isolate_app_dir();

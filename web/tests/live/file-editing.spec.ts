@@ -3,7 +3,7 @@ import { pickPhoneView } from "../helpers/phoneViews";
 import { join } from "node:path";
 import type { Dialog, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
-import { enableStructuredViewAndWait, composer } from "../helpers/acp";
+import { composer, sessionIdByTitle, spawnAcpAgentAndWait } from "../helpers/acp";
 import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { openDeleteDialogFromRow } from "../helpers/trashMocks";
 import { openReviewPane } from "../helpers/panes";
@@ -329,19 +329,19 @@ test("a Structured view save offers a note that appends to the draft without sub
   spawnServe,
 }, testInfo) => {
   let target = "";
-  const serve = await spawnServe({
-    acp: true,
-    seedFn: seedSessionViaAoeAdd({
-      title: "file-structured",
-      git: false,
-      files: { "notes.txt": "original" },
-      prepare: (dir) => {
-        target = join(dir, "notes.txt");
-      },
-    }),
-  });
-  const [session] = await listSessions(serve.baseUrl);
-  await enableStructuredViewAndWait(serve.baseUrl, session!.id, 30_000, serve.home);
+  const title = "file-structured";
+  const serve = await spawnServe({ acp: true });
+  seedSessionViaAoeAdd({
+    title,
+    structuredView: true,
+    git: false,
+    files: { "notes.txt": "original" },
+    prepare: (dir) => {
+      target = join(dir, "notes.txt");
+    },
+  })(serve);
+  const sessionId = await sessionIdByTitle(serve.baseUrl, title);
+  await spawnAcpAgentAndWait(serve.baseUrl, sessionId, 30_000, serve.home);
   await enableEditing(page, serve);
   await openFile(page, serve);
   const draft = composer(page);
@@ -353,16 +353,13 @@ test("a Structured view save offers a note that appends to the draft without sub
   const notify = page.getByRole("button", { name: "Draft a note to the agent" });
   await expect(notify).toBeVisible();
   expect(readFileSync(target, "utf8")).toBe("changed in browser");
-  const before = await (
-    await page.request.get(`${serve.baseUrl}/api/sessions/${session!.id}/acp/replay?view=rows`)
-  ).json();
+  const replayUrl = `${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?view=rows`;
+  const before = await (await page.request.get(replayUrl)).json();
   await notify.click();
   await expect(draft).toHaveValue(
     "existing prompt draft\n\nI edited notes.txt in the file viewer. Please review the changes before continuing.",
   );
-  const after = await (
-    await page.request.get(`${serve.baseUrl}/api/sessions/${session!.id}/acp/replay?view=rows`)
-  ).json();
+  const after = await (await page.request.get(replayUrl)).json();
   expect(after.highest_seq).toBe(before.highest_seq);
   await page.screenshot({ path: testInfo.outputPath("structured-notice.png") });
 });

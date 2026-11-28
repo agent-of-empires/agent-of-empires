@@ -339,6 +339,7 @@ async fn edit_session(
         }
     };
     // Never call the supervisor while a storage/publication lock is held.
+    drop(lifecycle);
     if moves || after.source_profile != before.source_profile {
         quiesce_structured_worker(state, id, before.is_structured()).await?;
     }
@@ -352,7 +353,26 @@ async fn edit_session(
     let structured = before.is_structured();
     let profiles = vec![before.source_profile.clone(), after.source_profile.clone()];
     let committed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let changes = [(before, after)];
+        let lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&before.id)?;
+        let current = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == before.id)
+            .ok_or(crate::session::SessionGone)?;
+        anyhow::ensure!(
+            edit_identity_matches(&current, &before),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        let mut after = after;
+        after.acp_session_id = current.acp_session_id.clone();
+        after.agent_session_id = current.agent_session_id.clone();
+        after.agent_session_binding = current.agent_session_binding.clone();
+        after.resume_binding = current.resume_binding.clone();
+        after.fork_pending = current.fork_pending.clone();
+        after.import_pending = current.import_pending;
+        let changes = [(current, after)];
         let (before, after) = (&changes[0].0, &changes[0].1);
         let effect = |candidate: &Instance| -> anyhow::Result<()> {
             let Some(name) = name.as_deref() else {
@@ -562,18 +582,9 @@ fn session_edit_error(error: &anyhow::Error, partial: bool) -> axum::response::R
     )
 }
 
-/// Quiesce a structured-view worker before its worktree directory or profile
-/// moves. A live ACP worker is pinned to its launch cwd and profile: moving the
-/// directory crash-loops it at the stale cwd (#2260), and a profile move leaves
-/// it running under the old profile (#4919). `blocks_worktree_edit` misses both
-/// because a "stopped" structured session sits at Idle yet still owns a worker.
-///
-/// The stop is reversible: it keeps the transcript and `acp_session_id`, so the
-/// reconciler fresh-spawns under the new path and profile and resumes via
-/// session/load. Callers hold `instance_lock` across shutdown, move and persist.
-/// Waits for retirement to settle, since `shutdown` also succeeds for a worker
-/// that is already stopping. Refuses the move (409) if a live worker is not
-/// proven stopped within the deadline.
+/// Retire a structured worker before moving its cwd or profile, preserving its
+/// Native selection for Load. Callers hold instance exclusion through retirement,
+/// move and persistence; unproven retirement refuses the move.
 async fn quiesce_structured_worker(
     state: &Arc<AppState>,
     id: &str,
@@ -582,12 +593,19 @@ async fn quiesce_structured_worker(
     if !is_structured {
         return Ok(());
     }
-    match state
-        .acp_supervisor
-        .shutdown_and_wait(id, std::time::Duration::from_secs(5))
+    let retired = async {
+        let target = state.acp_supervisor.capture_retirement(id)?;
+        crate::server::acp_events::retire_native_worker(
+            state,
+            id,
+            target,
+            std::time::Duration::from_secs(5),
+        )
         .await
-    {
-        Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
+    }
+    .await;
+    match retired {
+        Ok(()) => Ok(()),
         Err(e) => {
             tracing::warn!(
                 target: "http.api.sessions",

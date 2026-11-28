@@ -19,9 +19,8 @@ use super::config_options::map_acp_config_option;
 use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
 use super::plan::{map_plan_status, plan_from_markdown, plan_status_to_str};
 use super::raw_input::{
-    background_agent_launched_from_value, background_command_launched_from_value,
-    background_task_started_from_value, background_task_stopped_from_value, monitor_event_from_raw,
-    wakeup_event_from_raw,
+    background_resource_from_parts, background_task_stopped_from_value, monitor_event_from_raw,
+    wakeup_event_from_raw, BackgroundResourceCue,
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
@@ -47,6 +46,27 @@ pub(super) fn is_compact_start(text: &str) -> bool {
 /// The adapter interpolates a reason after this prefix.
 pub(super) fn is_compact_failure(text: &str) -> bool {
     text.contains("Compacting failed")
+}
+
+/// Selects sparse compaction observations for the runner's existing capability checks.
+pub(crate) fn native_compaction_cue(update: &serde_json::Value) -> bool {
+    match update
+        .get("sessionUpdate")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("compaction_update") => true,
+        Some("agent_message_chunk") => update
+            .get("content")
+            .filter(|content| {
+                content.get("type").and_then(serde_json::Value::as_str) == Some("text")
+            })
+            .and_then(|content| content.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| {
+                is_compact_start(text) || is_compact_completion(text) || is_compact_failure(text)
+            }),
+        _ => false,
+    }
 }
 
 /// The model forgot its plan, so a finished compaction clears the plan strip.
@@ -120,22 +140,138 @@ pub(super) enum CompactionFold {
     Patch(Box<Event>),
 }
 
-/// Folds a compaction's update stream before anything classifies it. A
-/// summary streamed only as `compaction_summary_chunk`s is moved onto the
-/// completion that lacks one.
+enum ActiveCompaction {
+    Structured(CompactionId),
+    Text,
+}
+
+/// Folds typed and text compaction lifecycles before their consumers.
+/// Streamed summaries move onto completions that lack one.
 #[derive(Default)]
 pub(super) struct CompactionTracker {
-    active: Option<CompactionId>,
+    active: Option<ActiveCompaction>,
+    /// Keep the last stamp after settlement so delayed older cues cannot replace its fold.
+    current_scope: Option<std::sync::Arc<crate::acp::establishment::NativeRequestContext>>,
+    /// A contended cue is folded, but cannot grant current runtime authority.
+    current_pending: bool,
+    current_original: Option<(
+        crate::acp::runner_lifecycle::RunnerIdentity,
+        crate::acp::establishment::AttemptId,
+    )>,
     chunks: String,
     /// Finished ids, so a late patch for an earlier compaction is still a patch.
     terminal: std::collections::HashSet<CompactionId>,
 }
 
 impl CompactionTracker {
+    pub(super) fn begin_original(
+        &mut self,
+        owner: crate::acp::runner_lifecycle::RunnerIdentity,
+        attempt: crate::acp::establishment::AttemptId,
+    ) {
+        *self = Self::default();
+        self.current_original = Some((owner, attempt));
+    }
+
+    pub(super) fn is_active(&mut self) -> bool {
+        if self.active.is_none() && !self.current_pending {
+            return false;
+        }
+        let Some(scope) = self.current_scope.as_ref() else {
+            return self.active.is_some();
+        };
+        match scope.try_effect_guard() {
+            Ok(_guard) => {
+                self.current_pending = false;
+                self.active.is_some()
+            }
+            Err(error) if error.is::<crate::process::worker_registry::RegistryBusy>() => {
+                // A retained terminal is not permission to steer while qualification is unknown.
+                true
+            }
+            Err(_) => {
+                // Only this captured scope retires; it is never rebased onto a replacement.
+                self.active = None;
+                self.current_pending = false;
+                false
+            }
+        }
+    }
+
+    /// Retain a contended lifecycle fold, then requalify it at the runtime consumer.
+    /// The ingress reader never waits for the lifecycle or registry exclusion.
+    pub(super) fn observe_current(
+        &mut self,
+        update: &mut SessionUpdate,
+        scope: std::sync::Arc<crate::acp::establishment::NativeRequestContext>,
+    ) -> bool {
+        let crate::acp::establishment::NativeRequestScope::Session { permission } = &scope.scope
+        else {
+            return false;
+        };
+        let original = (permission.owner, permission.postimage.attempt_id);
+        if self
+            .current_original
+            .is_some_and(|expected| expected != original)
+        {
+            return false;
+        }
+        let qualification = scope.try_effect_guard();
+        let pending = match &qualification {
+            Ok(_) => false,
+            Err(error) if error.is::<crate::process::worker_registry::RegistryBusy>() => true,
+            Err(_) => return false,
+        };
+        if let Some(current) = &self.current_scope {
+            if current.scope != scope.scope {
+                if pending {
+                    let (
+                        crate::acp::establishment::NativeRequestScope::Session {
+                            permission: known,
+                        },
+                        crate::acp::establishment::NativeRequestScope::Session {
+                            permission: incoming,
+                        },
+                    ) = (&current.scope, &scope.scope)
+                    else {
+                        return false;
+                    };
+                    if known.owner != incoming.owner || known.generation >= incoming.generation {
+                        return false;
+                    }
+                }
+                *self = Self::default();
+            }
+        }
+        self.observe(update);
+        self.current_pending = pending;
+        self.current_original = Some(original);
+        drop(qualification);
+        self.current_scope = Some(scope);
+        pending
+    }
+
+    fn has_id(&self, id: &CompactionId) -> bool {
+        matches!(&self.active, Some(ActiveCompaction::Structured(active)) if active == id)
+    }
+
     pub(super) fn observe(&mut self, update: &mut SessionUpdate) -> CompactionFold {
         match update {
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                if let ContentBlock::Text(text) = &chunk.content {
+                    if is_compact_start(&text.text) {
+                        self.active.get_or_insert(ActiveCompaction::Text);
+                    }
+                    if (is_compact_completion(&text.text) || is_compact_failure(&text.text))
+                        && matches!(self.active, Some(ActiveCompaction::Text))
+                    {
+                        self.active = None;
+                    }
+                }
+                CompactionFold::Pass
+            }
             SessionUpdate::CompactionSummaryChunk(chunk) => {
-                if self.active.as_ref() != Some(&chunk.compaction_id) {
+                if !self.has_id(&chunk.compaction_id) {
                     return CompactionFold::Skip;
                 }
                 if let ContentBlock::Text(t) = &chunk.content {
@@ -144,8 +280,8 @@ impl CompactionTracker {
                 CompactionFold::Pass
             }
             SessionUpdate::CompactionUpdate(u) if u.status == CompactionStatus::InProgress => {
-                if self.active.as_ref() != Some(&u.compaction_id) {
-                    self.active = Some(u.compaction_id.clone());
+                if !self.has_id(&u.compaction_id) {
+                    self.active = Some(ActiveCompaction::Structured(u.compaction_id.clone()));
                     self.chunks.clear();
                 }
                 CompactionFold::Pass
@@ -171,7 +307,7 @@ impl CompactionTracker {
                     return patch
                         .map_or(CompactionFold::Skip, |e| CompactionFold::Patch(Box::new(e)));
                 }
-                let streamed = if self.active.as_ref() == Some(&u.compaction_id) {
+                let streamed = if self.has_id(&u.compaction_id) {
                     self.active = None;
                     std::mem::take(&mut self.chunks)
                 } else {
@@ -579,13 +715,22 @@ pub(super) fn map_update_to_events(
                 });
             } else if events.is_empty() {
                 // A metadata-only update may be an async sub-agent launch.
-                let payload = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
-                match background_agent_launched_from_value(&payload) {
-                    Some(event) => events.push(event),
-                    None => {
+                let cue = background_resource_from_parts(
+                    Some(id.as_str()),
+                    update.meta.as_ref().and_then(|meta| meta.get("claudeCode")),
+                );
+                match cue {
+                    Some(cue @ BackgroundResourceCue::Agent { .. }) => {
+                        events.extend(cue.into_agent_event());
+                    }
+                    other => {
+                        let payload =
+                            serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
                         if profile.supports_wakeup_tools {
-                            events.extend(background_command_launched_from_value(&payload));
-                            events.extend(background_task_started_from_value(&payload));
+                            if let Some(cue) = other {
+                                events.extend(cue.into_monitor_event());
+                                events.extend(cue.into_task_event());
+                            }
                             events.extend(background_task_stopped_from_value(&payload));
                         }
                         events.push(Event::RawAgentUpdate { payload });
@@ -977,12 +1122,18 @@ mod tests {
         )));
         let removed = |id| SessionUpdate::PlanRemoved(PlanRemoved::new(id));
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap();
+        let store = EventStore::open(&tmp.path().join("acp.db"), 1000, Default::default()).unwrap();
         let mut seq = 0;
         let mut record = |events: Vec<Event>| {
             for event in events {
                 seq += 1;
-                store.record("s", seq, &event).unwrap();
+                let metadata = match &event {
+                    Event::SessionCleared | Event::AgentSwitched { .. } => {
+                        crate::acp::event_sender::EventMetadata::host(&event)
+                    }
+                    _ => crate::acp::event_sender::EventMetadata::history(),
+                };
+                store.record("s", seq, &event, &metadata).unwrap();
             }
         };
         let mapped = |updates: Vec<SessionUpdate>| updates.into_iter().flat_map(claude).collect();
@@ -990,8 +1141,10 @@ mod tests {
         let shown = |store: &EventStore| {
             let mut state =
                 AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
-            for (seq, event) in store.replay_from("s", 0) {
-                state.apply_event(seq, event).unwrap();
+            for stored in store.replay_from("s", 0).unwrap() {
+                state
+                    .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                    .unwrap();
             }
             let steps = |plan: crate::acp::state::Plan| -> Vec<(String, String)> {
                 plan.steps
@@ -1334,7 +1487,11 @@ mod tests {
                     };
                     for event in events {
                         seq += 1;
-                        model.apply_event(seq, &event);
+                        model.apply_scoped_event(
+                            seq,
+                            &event,
+                            &crate::acp::event_sender::EventMetadata::history(),
+                        );
                     }
                 };
             let (mut one, mut two) = (CompactionTracker::default(), CompactionTracker::default());
@@ -1436,6 +1593,14 @@ mod tests {
             ("I am compacting the list", &[]),
         ];
         for (text, tail) in cases {
+            assert_eq!(
+                native_compaction_cue(&serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text },
+                })),
+                !tail.is_empty(),
+                "{text:?}",
+            );
             let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
             let mut want = vec!["agent_message_chunk"];
             want.extend_from_slice(tail);
@@ -1443,6 +1608,31 @@ mod tests {
                 kinds(&claude(SessionUpdate::AgentMessageChunk(chunk))),
                 want
             );
+        }
+        for status in ["in_progress", "completed", "failed", "cancelled"] {
+            assert!(native_compaction_cue(&serde_json::json!({
+                "sessionUpdate": "compaction_update",
+                "compactionId": "a",
+                "status": status,
+            })));
+        }
+        for update in [
+            serde_json::json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": "Compacting..." },
+            }),
+            serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "image", "text": "Compacting..." },
+            }),
+            serde_json::json!({
+                "sessionUpdate": "compaction_summary_chunk",
+                "compactionId": "a",
+                "content": { "type": "text", "text": "Compacting..." },
+            }),
+            serde_json::json!({ "sessionUpdate": "agent_message_chunk" }),
+        ] {
+            assert!(!native_compaction_cue(&update), "{update}");
         }
         // The web reducer matches this bare-string wire form.
         assert_eq!(

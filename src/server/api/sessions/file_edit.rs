@@ -71,7 +71,7 @@ fn version(bytes: &[u8], path: &FsPath, metadata: &cap_std::fs::Metadata) -> Str
 
 fn project_file(roots: &[PathBuf], path: &FsPath) -> Result<Confined, FileError> {
     let roots: Vec<_> = roots.iter().filter_map(|p| p.canonicalize().ok()).collect();
-    file_provenance::confine_path(&roots, Default::default, path)
+    file_provenance::confine_path(&roots, || Ok(Default::default()), path)
 }
 
 fn sandbox_reason(instance: &Instance, canonical: &FsPath) -> Option<&'static str> {
@@ -538,9 +538,12 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let path = outside.path().join("plan.md");
         fs::write(&path, "plan").unwrap();
-        let confined =
-            file_provenance::confine_path(&roots, || [path.clone()].into_iter().collect(), &path)
-                .unwrap();
+        let confined = file_provenance::confine_path(
+            &roots,
+            || Ok([path.clone()].into_iter().collect()),
+            &path,
+        )
+        .unwrap();
         let opened =
             read_file_snapshot(&roots, &confined, Some(&instance), false, true, false).unwrap();
         assert_eq!(

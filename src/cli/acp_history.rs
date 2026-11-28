@@ -248,7 +248,11 @@ mod tests {
     fn fold(events: &[Event]) -> Vec<Entry> {
         let mut model = TranscriptModel::new();
         for (i, event) in events.iter().enumerate() {
-            model.apply_event(i as u64 + 1, event);
+            model.apply_scoped_event(
+                i as u64 + 1,
+                event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            );
         }
         entries(&model.into_retained())
     }

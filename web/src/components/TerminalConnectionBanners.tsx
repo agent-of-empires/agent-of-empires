@@ -19,6 +19,8 @@ interface Props {
   paneDead?: boolean;
   /** Restart shows a spinner until the returned promise settles. */
   onRestart?: () => Promise<unknown> | void;
+  observeAllowed?: boolean;
+  paneDeadLabel?: string;
 }
 
 export function TerminalConnectionBanners({
@@ -29,6 +31,8 @@ export function TerminalConnectionBanners({
   onRetry,
   paneDead,
   onRestart,
+  observeAllowed = true,
+  paneDeadLabel = "Agent exited",
 }: Props) {
   const daemon = useConnectionBanner();
   const [slow, setSlow] = useState(false);
@@ -52,7 +56,7 @@ export function TerminalConnectionBanners({
   if (paneDead) {
     return (
       <div className="max-md:mt-[var(--phone-overlay-top,0px)] bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
-        <span className="text-xs text-status-error">Agent exited</span>
+        <span className="text-xs text-status-error">{paneDeadLabel}</span>
         {onRestart && (
           <button
             type="button"
@@ -81,7 +85,7 @@ export function TerminalConnectionBanners({
     return (
       <div className="max-md:mt-[var(--phone-overlay-top,0px)] bg-status-error/10 border-b border-status-error/30 px-4 py-1.5 flex items-center gap-2 shrink-0">
         <span className="text-xs text-status-error">Connection lost</span>
-        <button type="button" onClick={onRetry} className={BUTTON_INLINE}>
+        <button type="button" onClick={onRetry} disabled={!observeAllowed} className={BUTTON_INLINE}>
           Retry
         </button>
       </div>

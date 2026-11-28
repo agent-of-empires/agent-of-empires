@@ -1,6 +1,7 @@
 //! The ACP event listener: turning agent events into session status,
 //! unread marks, and stored session ids.
 
+use crate::acp::state::AcpSessionChange;
 use crate::server::push::{publish_status_change, StatusChange};
 use crate::session::Instance;
 use crate::session::Status;
@@ -10,6 +11,94 @@ use tokio::sync::{broadcast, RwLock};
 use super::state::{instance_lock_in, AppState};
 use crate::acp::state::Event;
 use crate::server::{acp_ws, api};
+
+#[cfg(test)]
+struct AssignmentPause {
+    session_id: String,
+    seq: Option<u64>,
+    arrived: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    applied: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+static ASSIGNMENT_PAUSE: std::sync::Mutex<Option<AssignmentPause>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct AssignmentListenerGate {
+    pub arrived: tokio::sync::oneshot::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
+    pub applied: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+pub(crate) fn pause_assignment_listener_for_test(
+    session_id: &str,
+    seq: u64,
+) -> AssignmentListenerGate {
+    assignment_listener_gate_for_test(session_id, Some(seq))
+}
+
+#[cfg(test)]
+fn assignment_listener_gate_for_test(session_id: &str, seq: Option<u64>) -> AssignmentListenerGate {
+    let (arrived, arrival) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (applied, application) = tokio::sync::oneshot::channel();
+    let mut pending = ASSIGNMENT_PAUSE.lock().unwrap();
+    assert!(pending.is_none(), "another assignment gate is installed");
+    *pending = Some(AssignmentPause {
+        session_id: session_id.to_owned(),
+        seq,
+        arrived,
+        release: released,
+        applied,
+    });
+    AssignmentListenerGate {
+        arrived: arrival,
+        release,
+        applied: application,
+    }
+}
+
+#[cfg(test)]
+struct AssignmentApplicationAck(Option<tokio::sync::oneshot::Sender<()>>);
+
+#[cfg(test)]
+impl Drop for AssignmentApplicationAck {
+    fn drop(&mut self) {
+        if let Some(applied) = self.0.take() {
+            let _ = applied.send(());
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_assignment_for_test(
+    frame: &crate::acp::protocol::AcpBroadcastFrame,
+) -> AssignmentApplicationAck {
+    let pause = {
+        let mut pending = ASSIGNMENT_PAUSE.lock().unwrap();
+        if pending.as_ref().is_some_and(|pause| {
+            pause.session_id == frame.session_id
+                && pause.seq.is_none_or(|seq| seq == frame.seq)
+                && matches!(
+                    frame.event.as_ref(),
+                    crate::acp::Event::AcpSessionAssigned { .. }
+                )
+        }) {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    let Some(pause) = pause else {
+        return AssignmentApplicationAck(None);
+    };
+    let ack = AssignmentApplicationAck(Some(pause.applied));
+    let _ = pause.arrived.send(());
+    let _ = pause.release.await;
+    ack
+}
 
 /// Applies live status, unread and session-id observations.
 /// One line per lifecycle frame. Approval lines carry the call id, never the
@@ -129,7 +218,7 @@ fn log_frame(frame: &crate::acp::protocol::AcpBroadcastFrame) {
 
 pub(super) async fn acp_event_listener(state: Arc<AppState>) {
     let mut rx = state.acp_events_tx.subscribe();
-    loop {
+    'frames: loop {
         let received = tokio::select! {
             biased;
             _ = state.shutdown.cancelled() => return,
@@ -170,8 +259,81 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 return;
             }
         };
-
         log_frame(&frame);
+        #[cfg(test)]
+        let _assignment_applied = pause_assignment_for_test(&frame).await;
+        let current = frame.scope != crate::acp::protocol::AcpEventScope::HistoryOnly;
+        let original_terminal = frame
+            .operation
+            .is_some_and(|operation| operation.outcome.is_some())
+            && matches!(
+                frame.event.as_ref(),
+                Event::Stopped { .. } | Event::PromptRuntimeError { .. }
+            );
+        // Resource custody has its own exact allocation identity. It may update
+        // background status without promoting its historical scope to Current.
+        let resource_effect = frame.resource_ref.is_some()
+            && (frame.native_origin.is_some() || frame.host_action)
+            && status_policy(frame.event.as_ref()) == Some(StatusPolicy::Background);
+        let resolved_callback = matches!(
+            frame.event.as_ref(),
+            Event::ApprovalResolved { .. } | Event::ElicitationResolved { .. }
+        );
+        let original_request = if !current
+            && matches!(
+                frame.event.as_ref(),
+                Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. }
+            ) {
+            match state
+                .session_service
+                .acp_control_cache
+                .is_live_original_request(&frame.session_id, frame.seq, &frame.event)
+                .await
+            {
+                Ok(live) => live,
+                Err(error) => {
+                    tracing::warn!(target: "acp.event_listener", %error, "read Original attention request");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if frame
+            .native_autonomous
+            .as_ref()
+            .is_some_and(|autonomous| autonomous.qualified)
+        {
+            let projected = match frame.sidebar_status {
+                Some(projected) => Some(projected),
+                None => {
+                    state
+                        .session_service
+                        .sidebar_status_at(&frame.session_id, frame.seq)
+                        .await
+                }
+            };
+            if let Some(projected) = projected {
+                persist_native_runtime_observation(
+                    &state,
+                    &frame,
+                    None,
+                    Some((StatusPolicy::Background, projected)),
+                    None,
+                )
+                .await;
+            }
+            continue;
+        }
+        if !current
+            && !frame.host_action
+            && !original_terminal
+            && !resolved_callback
+            && !original_request
+            && !resource_effect
+        {
+            continue;
+        }
 
         // Detect wake-fire.
         if matches!(
@@ -291,6 +453,9 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 .spawn("server.acp_event_effect", async move {
                     acp_ws::trigger_question_clear_push(&state_for_push, &session_id, seq).await;
                 });
+        }
+        if !current && !frame.host_action && !original_terminal && !resource_effect {
+            continue;
         }
 
         // Retain advertised options for settings without a live session.
@@ -435,11 +600,45 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         // The sink folds before broadcasting, so a frame published to a warm
         // cache carries its own status and no later reader depends on how far
         // the fold has run. A frame published cold (right after a restart with
-        // a reattached worker) carries none and is rebuilt from the log. A
-        // startup error whose write failed is substituted by the sink and
-        // never reaches the log, so the frame itself says Error.
-        let status_policy = status_policy(frame.event.as_ref());
+        // a reattached worker) carries none and is rebuilt from the log.
+        // Failed persistence is a history-only notice; qualified failed native
+        // observations remain private in the cache's failure lane.
+        let native_subject = frame
+            .native_subject
+            .or_else(|| frame.event.native_subject());
+        let status_policy = if !current && !original_terminal && !resource_effect {
+            None
+        } else {
+            match native_subject.map(|subject| subject.kind) {
+                Some(
+                    crate::acp::state::NativeSubjectEvent::ChannelUnavailable(_)
+                    | crate::acp::state::NativeSubjectEvent::AdmissionRefusal(_),
+                ) => Some(StatusPolicy::Authoritative),
+                Some(crate::acp::state::NativeSubjectEvent::ChannelReady) => {
+                    Some(StatusPolicy::Heal)
+                }
+                _ => status_policy(frame.event.as_ref()),
+            }
+        };
         let status_update = match (status_policy, frame.event.as_ref()) {
+            (Some(policy), _) if native_subject.is_some() => {
+                let Ok(mut fold) = state
+                    .session_service
+                    .fold_control_state(&frame.session_id)
+                    .await
+                else {
+                    continue;
+                };
+                if fold.last_seq < frame.seq {
+                    if let Err(error) =
+                        fold.apply_scoped_event(frame.seq, &frame.event, &frame.view_metadata())
+                    {
+                        tracing::warn!(target: "acp.event_listener", session = %frame.session_id, %error, "control fold failed");
+                        continue;
+                    }
+                }
+                Some((policy, fold.sidebar_status()))
+            }
             (Some(policy), crate::acp::state::Event::AgentStartupError { .. }) => {
                 Some((policy, Status::Error))
             }
@@ -453,7 +652,24 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             },
             (None, _) => None,
         };
-        let acp_change = derive_acp_session_change(frame.event.as_ref());
+        let change = current
+            .then(|| derive_acp_session_change(frame.event.as_ref()))
+            .flatten();
+        let acp_change = match change {
+            Some(change)
+                if native_subject.is_some() || matches!(&change, AcpSessionChange::Assigned(_)) =>
+            {
+                persist_identity_observation(
+                    &state,
+                    &frame,
+                    change,
+                    status_update.map(|(_, status)| status),
+                )
+                .await;
+                continue;
+            }
+            change => change,
+        };
         let load_session_capability = match (frame.event.as_ref(), frame.worker_generation) {
             (
                 crate::acp::state::Event::PromptCapabilities {
@@ -467,6 +683,17 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         if status_update.is_none() && acp_change.is_none() && load_session_capability.is_none() {
             continue;
         }
+        if native_subject.is_some() || (resource_effect && frame.native_origin.is_some()) {
+            persist_native_runtime_observation(
+                &state,
+                &frame,
+                native_subject,
+                status_update,
+                load_session_capability,
+            )
+            .await;
+            continue;
+        }
         // Identity and capability updates share lifecycle snapshot exclusion.
         let mutation_lock = if acp_change.is_some() || load_session_capability.is_some() {
             Some(state.instance_lock(&frame.session_id).await)
@@ -478,65 +705,47 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             None => None,
         };
         // A stop holds this lock while it removes the worker, so a retired
-        // worker's queued identity frame lands after the stop has committed. It
-        // keeps its id for a later resume but must not wake the stopped row.
+        // worker's queued identity frame lands after the stop has committed.
+        // Only its qualified retirement receipt can preserve an id for resume;
+        // the queued frame must not wake the stopped row.
         let live_worker = match (frame.worker_generation, &acp_change) {
-            (Some(generation), Some(_)) => {
-                state
-                    .acp_supervisor
-                    .is_current_worker_generation(&frame.session_id, generation)
-                    .await
-            }
+            (Some(generation), Some(_)) => state
+                .acp_supervisor
+                .current_lease(&frame.session_id)
+                .is_some_and(|lease| lease.epoch() == generation),
             _ => true,
         };
-
-        // #4127: the worker's own store is the only observation of the route
-        // this launch applied. Read it for the id the worker just assigned, and
-        // read it before the save so the durable row and the in-memory mirror
-        // attest the same thing. Awaited before `instances` is taken: the
-        // supervisor's worker map must never be reached under that lock.
-        // A reattach answers nothing, so such a session stays unattested until
-        // its next spawn.
-        let observed = match acp_change.as_ref() {
-            Some(AcpSessionChange::Assigned(new_id)) => {
-                state
-                    .acp_supervisor
-                    .native_handoff_store(&frame.session_id, new_id)
-                    .await
-            }
-            _ => None,
-        };
-        let observed_for_save = observed.clone();
-
-        let observed_mirror = observed.clone();
         let mut canonical_changed = false;
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
-        let (profile_to_save, unread_profile, attested_profile) = {
+        let (profile_to_save, unread_profile) = loop {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
-                continue;
+                continue 'frames;
             };
             if !inst.is_structured() {
-                continue;
+                continue 'frames;
             }
-            // Check while holding the instance lock: teardown removes the worker
-            // before clearing this field, so either this write happens first and
-            // is cleared, or the stale generation is rejected.
-            //
-            // This awaits the supervisor's `workers` mutex with the `instances`
-            // write lock held. That ordering is only safe while `Supervisor`
-            // never reaches for `instances`; give it a path that does and this
-            // becomes a lock cycle.
+            // Legacy unscoped capability observations still need the exact
+            // current lease at mutation. Never await `workers` under `instances`,
+            // or block on lifecycle while a native publisher owns its fence.
             if let Some((capable, generation)) = load_session_capability {
-                if state
-                    .acp_supervisor
-                    .is_current_worker_generation(&frame.session_id, generation)
-                    .await
-                    && inst.acp_load_session_capable != Some(capable)
-                {
-                    inst.acp_load_session_capable = Some(capable);
-                    canonical_changed = true;
+                match state.acp_supervisor.commit_native_observation(
+                    &frame.session_id,
+                    Some(generation),
+                    || {
+                        let changed = inst.acp_load_session_capable != Some(capable);
+                        inst.acp_load_session_capable = Some(capable);
+                        Ok(changed)
+                    },
+                ) {
+                    Ok(changed) => canonical_changed |= changed,
+                    Err(error) if error.is::<crate::acp::supervisor::NativeObservationBusy>() => {
+                        drop(instances);
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    Err(_) => continue 'frames,
                 }
             }
 
@@ -556,14 +765,15 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let unread_profile =
                 should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
                     .then(|| inst.source_profile.clone());
-            let profile_to_save =
-                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref(), live_worker);
+            let profile_to_save = apply_acp_session_change(
+                inst,
+                &frame.session_id,
+                acp_change.as_ref(),
+                false,
+                live_worker,
+            );
             canonical_changed |= profile_to_save.is_some();
-            // An attestation alone still has to reach the disk: the durable
-            // write below stamps it, and the mirror is only allowed to show it
-            // once that write has landed.
-            let attested_profile = observed.as_ref().map(|_| inst.source_profile.clone());
-            (profile_to_save, unread_profile, attested_profile)
+            break (profile_to_save, unread_profile);
         };
         if canonical_changed {
             state
@@ -612,51 +822,31 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         // Persist `acp_session_id` to disk if the field changed.
         // Sync FS (file copy + JSON write) goes through spawn_blocking
         // so the runtime stays responsive under large session lists.
-        if let Some(profile) = profile_to_save.or(attested_profile) {
+        if let Some(profile) = profile_to_save {
             let session_id_for_log = frame.session_id.clone();
             let session_id_for_save = frame.session_id.clone();
-            let profile_for_save = profile.clone();
-            let acp_change_for_save = acp_change.clone();
+            let profile_for_save = profile;
+            let acp_change_for_save = acp_change;
             let file_watch = state.file_watch.clone();
             let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
                 let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
                 storage.update(|all, _groups| {
                     let found = all.iter().any(|i| i.id == session_id_for_save);
                     if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
-                        inst.attest_launch_default_store(observed_for_save.as_ref());
                         apply_acp_session_change(
                             inst,
                             &session_id_for_save,
                             acp_change_for_save.as_ref(),
+                            false,
                             live_worker,
                         );
-                        if let Some(AcpSessionChange::Assigned(new_id)) =
-                            acp_change_for_save.as_ref()
-                        {
-                            inst.record_observed_acp_store(new_id, observed_for_save.as_ref());
-                        }
                     }
                     Ok(found)
                 })
             })
             .await;
             match save_result {
-                Ok(Ok(row_saved)) => {
-                    // The saved row is the durable one; the mirror may only
-                    // attest what has actually been written, never a marker the
-                    // next reload would drop.
-                    let mut instances = state.instances.write().await;
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) {
-                        inst.attest_launch_default_store(observed_mirror.as_ref());
-                        // A row that moved out of this profile was not written, and
-                        // the next reload would drop what the mirror recorded.
-                        if let (true, Some(AcpSessionChange::Assigned(new_id))) =
-                            (row_saved, acp_change.as_ref())
-                        {
-                            inst.record_observed_acp_store(new_id, observed_mirror.as_ref());
-                        }
-                    }
-                }
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
                     tracing::warn!(
                         target: "acp.event_listener",
@@ -676,6 +866,745 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         if canonical_changed {
             state.runtime.request_publish();
         }
+    }
+}
+
+async fn persist_native_runtime_observation(
+    state: &Arc<AppState>,
+    frame: &crate::acp::protocol::AcpBroadcastFrame,
+    subject: Option<crate::acp::state::NativeEventSubject>,
+    status_update: Option<(StatusPolicy, Status)>,
+    load_session_capability: Option<(bool, u64)>,
+) {
+    let _namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(&frame.session_id).await;
+    let _identity = lock.lock().await;
+    let identity = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == frame.session_id && row.is_structured())
+        .map(|row| {
+            (
+                row.source_profile.clone(),
+                row.created_at,
+                row.lifecycle_generation,
+            )
+        });
+    let Some((profile, created_at, generation)) = identity else {
+        return;
+    };
+    let owner = Arc::clone(state);
+    let id = frame.session_id.clone();
+    let epoch = frame.worker_generation;
+    let historical_origin = (frame.scope == crate::acp::protocol::AcpEventScope::HistoryOnly
+        && frame
+            .operation
+            .is_some_and(|operation| operation.outcome.is_some())
+        && matches!(
+            frame.event.as_ref(),
+            Event::Stopped { .. } | Event::PromptRuntimeError { .. }
+        ))
+    .then_some(frame.native_origin)
+    .flatten();
+    let resource_origin = (frame.resource_ref.is_some()
+        && status_policy(frame.event.as_ref()) == Some(StatusPolicy::Background))
+    .then_some(frame.native_origin)
+    .flatten();
+    let autonomous = frame
+        .native_autonomous
+        .as_ref()
+        .filter(|autonomous| autonomous.qualified);
+    let autonomous_origin = autonomous.map(|autonomous| autonomous.identity.origin);
+    let autonomous_root = autonomous.map(|autonomous| autonomous.identity.root_session_id.clone());
+    let scoped_origin = resource_origin.or(autonomous_origin);
+    let Some(context) = subject
+        .map(|subject| subject.context)
+        .or_else(|| scoped_origin.map(|origin| origin.context))
+    else {
+        return;
+    };
+    let denial = frame.availability_denial;
+    let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let storage = crate::session::Storage::open_reference(&profile)?;
+        anyhow::ensure!(
+            historical_origin.is_some()
+                || crate::acp::state::NativeEventContext::capture_identity(
+                    &id, created_at, generation, &storage,
+                )? == context,
+            crate::session::LifecycleReservationError::Superseded
+        );
+        let fence = crate::session::NativeInputFence::capture_route(
+            storage.profile(),
+            &id,
+            created_at,
+            generation,
+            false,
+            Some(storage.bound_profile_identity()?),
+        )?;
+        let applicable = |row: &Instance, resource_owner_guarded: bool| -> anyhow::Result<bool> {
+            let identity_matches = match historical_origin {
+                Some(origin) => origin.same_physical_row(row, &storage)?,
+                None => crate::acp::state::NativeEventContext::capture(row, &storage)? == context,
+            };
+            let owner_matches = if scoped_origin.is_some() {
+                resource_owner_guarded
+            } else if let Some(subject) = subject {
+                if denial {
+                    subject.unavailability_still_applies(&id)
+                } else if historical_origin.is_some() {
+                    subject.owner_not_replaced(&id)
+                } else {
+                    subject.owner_is_current(&id)
+                }
+            } else {
+                false
+            };
+            let attempt_matches = scoped_origin.is_none_or(|origin| {
+                origin.context == context
+                    && subject.is_none_or(|subject| origin.owner == subject.owner)
+                    && autonomous_root
+                        .as_ref()
+                        .is_none_or(|root| row.acp_session_id.as_deref() == Some(root.0.as_ref()))
+                    && row.acp_establishment
+                        == Some(crate::acp::establishment::AcpEstablishment::Applied {
+                            attempt_id: origin.attempt_id,
+                        })
+            });
+            Ok(identity_matches && owner_matches && attempt_matches)
+        };
+        loop {
+            let native_guard = if let Some(origin) = scoped_origin {
+                fence.lock_observation_matching(|row| {
+                    row.acp_establishment
+                        == Some(crate::acp::establishment::AcpEstablishment::Applied {
+                            attempt_id: origin.attempt_id,
+                        })
+                })?
+            } else {
+                fence.lock_observation()?
+            };
+            let resource_guard = if let Some(origin) = scoped_origin {
+                let Some(registry) = crate::process::worker_registry::try_registry_lock(&id)?
+                else {
+                    drop(native_guard);
+                    std::thread::yield_now();
+                    continue;
+                };
+                let record = registry.record()?.ok_or(crate::session::SessionGone)?;
+                let physical = origin
+                    .owner
+                    .filter(|physical| physical.birth_fingerprint.is_some())
+                    .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                anyhow::ensure!(
+                    registry.stop()?.is_none()
+                        && physical.owns_record(&record)
+                        && record.source_profile.as_deref() == Some(storage.profile())
+                        && crate::process::process_birth_identity(physical.pid)?.is_some_and(
+                            |birth| Some(birth.fingerprint()) == physical.birth_fingerprint
+                        ),
+                    crate::session::LifecycleReservationError::Superseded
+                );
+                Some(registry)
+            } else {
+                None
+            };
+            let publication = owner.publication.blocking_write();
+            let mut rows = owner.instances.blocking_write();
+            let applied = owner
+                .acp_supervisor
+                .commit_native_observation(&id, epoch, || {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .ok_or(crate::session::SessionGone)?;
+                    anyhow::ensure!(
+                        row.is_structured() && applicable(row, resource_guard.is_some())?,
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    let old = row.status;
+                    if let Some((policy, projected)) = status_update {
+                        apply_status_intent(row, policy, projected, &owner.status_tx);
+                    }
+                    let mut changed = row.status != old;
+                    if let Some((capable, issued)) = load_session_capability {
+                        if epoch == Some(issued) && row.acp_load_session_capable != Some(capable) {
+                            row.acp_load_session_capable = Some(capable);
+                            changed = true;
+                        }
+                    }
+                    Ok((
+                        changed,
+                        should_mark_acp_unread(row, old, crate::session::unread_enabled()),
+                    ))
+                });
+            drop(rows);
+            drop(publication);
+            let (changed, unread) = match applied {
+                Err(error) if error.is::<crate::acp::supervisor::NativeObservationBusy>() => {
+                    drop(resource_guard);
+                    drop(native_guard);
+                    std::thread::yield_now();
+                    continue;
+                }
+                result => result?,
+            };
+            if changed {
+                owner
+                    .mutation_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                owner.runtime.request_publish();
+            }
+            if unread {
+                storage.update(|rows, _| {
+                    owner
+                        .acp_supervisor
+                        .commit_native_observation(&id, epoch, || {
+                            let row = rows
+                                .iter_mut()
+                                .find(|row| row.id == id)
+                                .ok_or(crate::session::SessionGone)?;
+                            anyhow::ensure!(
+                                applicable(row, resource_guard.is_some())?,
+                                crate::session::LifecycleReservationError::Superseded
+                            );
+                            row.mark_unread();
+                            Ok(())
+                        })
+                })?;
+                let _publication = owner.publication.blocking_write();
+                let mut rows = owner.instances.blocking_write();
+                owner
+                    .acp_supervisor
+                    .commit_native_observation(&id, epoch, || {
+                        if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                            anyhow::ensure!(
+                                applicable(row, resource_guard.is_some())?,
+                                crate::session::LifecycleReservationError::Superseded
+                            );
+                            row.mark_unread();
+                        }
+                        Ok(())
+                    })?;
+                owner.runtime.request_publish();
+            }
+            return Ok(());
+        }
+    })
+    .await;
+    match saved {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if error.is::<crate::session::LifecycleReservationError>() => {}
+        Ok(Err(error)) => tracing::warn!(target: "acp.event_listener",
+            session = %frame.session_id, %error, "native observation was not applied"),
+        Err(error) => tracing::warn!(target: "acp.event_listener",
+            session = %frame.session_id, %error, "native observation task failed"),
+    }
+}
+
+/// Native controllers own this checkpoint; the actor supplies only its SDK receipt.
+pub(crate) struct BindingRetirement {
+    pub target: crate::acp::supervisor::RetirementTarget,
+    pub checkpoint: Option<crate::acp::supervisor::NativeBindingCheckpoint>,
+    supervisor:
+        std::sync::Weak<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+}
+
+impl BindingRetirement {
+    pub(crate) fn captured(
+        state: &AppState,
+        mut target: crate::acp::supervisor::RetirementTarget,
+        checkpoint: Option<crate::acp::supervisor::NativeBindingCheckpoint>,
+    ) -> Self {
+        target.journalled |= target.lease.is_some();
+        Self {
+            target,
+            checkpoint,
+            supervisor: Arc::downgrade(&state.acp_supervisor),
+        }
+    }
+
+    pub(crate) fn prepare(
+        state: &AppState,
+        row: &Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<Self> {
+        let target = state.acp_supervisor.capture_retirement(&row.id)?;
+        Self::prepare_captured(state, target, row, storage)
+    }
+
+    pub(crate) fn prepare_captured(
+        state: &AppState,
+        target: crate::acp::supervisor::RetirementTarget,
+        row: &Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<Self> {
+        let checkpoint = if let Some(saved) = target
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.retirement().binding_checkpoint())
+        {
+            (crate::acp::state::NativeEventContext::capture(row, storage)?
+                == saved.destination.context
+                && saved
+                    .destination
+                    .choice
+                    .as_ref()
+                    .is_some_and(|choice| choice.matches(row)))
+            .then_some(saved)
+        } else {
+            target.prepare_binding_checkpoint(row, storage)?
+        };
+        Ok(Self::captured(state, target, checkpoint))
+    }
+
+    pub(crate) fn promote(
+        &mut self,
+        row: &Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<()> {
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint.destination = checkpoint.destination.retarget(row, storage)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn activate(&self) {
+        if let Some(lease) = &self.target.lease {
+            lease.retirement().delegate_binding_checkpoint(true);
+        }
+        if let Some(checkpoint) = &self.checkpoint {
+            self.target.record_binding_checkpoint(checkpoint.clone());
+        }
+    }
+
+    /// Physical/current-producer completion, not proof that every SDK result
+    /// reached an installed worker's drain before its existing retirement abort.
+    fn ensure_settled(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.target.lease.is_none()
+                || self.supervisor.upgrade().is_some_and(|supervisor| {
+                    supervisor.binding_producer_is_current(&self.target)
+                }),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        Ok(())
+    }
+
+    fn has_captured_binding(&self) -> bool {
+        self.target
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.retirement().establishment_projection())
+            .is_some_and(|projection| {
+                projection.retirement_checkpoint_pending() || projection.has_unsettled_completion()
+            })
+    }
+
+    /// Caller holds native lifecycle exclusion after original retirement.
+    /// Preserve captured receipts and the deferred original-receiver drain;
+    /// lossless ingestion of installed SDK results is a separate requirement.
+    pub(crate) fn commit_under_native_lock(
+        &self,
+        native: &dyn crate::session::SessionStore,
+    ) -> anyhow::Result<()> {
+        self.ensure_settled()?;
+        if let Some(projection) = self
+            .target
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.retirement().establishment_projection())
+        {
+            if !projection.retirement_checkpoint_pending() {
+                return Ok(());
+            }
+            let checkpoint = self
+                .checkpoint
+                .as_ref()
+                .ok_or(crate::acp::establishment::EstablishmentRefusal::Unconfirmed)?;
+            let supervisor = self
+                .supervisor
+                .upgrade()
+                .ok_or(crate::acp::establishment::EstablishmentRefusal::Superseded)?;
+            if let Some(destination) =
+                supervisor.checkpoint_retired_establishment(native, &self.target, checkpoint)?
+            {
+                let mut saved = checkpoint.clone();
+                saved.destination = destination;
+                self.target.record_binding_checkpoint(saved);
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn commit_retired_binding(
+    native: &dyn crate::session::SessionStore,
+    id: &str,
+    retirement: &BindingRetirement,
+) -> anyhow::Result<()> {
+    let _lifecycle = native.storage().acquire_instance_lifecycle_lock(id)?;
+    retirement.commit_under_native_lock(native)
+}
+
+/// Caller retains the captured target, namespace and operation exclusion, never a native flock.
+pub(crate) async fn retire_native_worker(
+    state: &Arc<AppState>,
+    id: &str,
+    target: crate::acp::supervisor::RetirementTarget,
+    deadline: std::time::Duration,
+) -> anyhow::Result<()> {
+    use crate::session::SessionStore as _;
+    let retirement = BindingRetirement::captured(state, target, None);
+    retirement.activate();
+    let captured = state.clone();
+    let id_owned = id.to_owned();
+    let target = retirement.target.clone();
+    let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let profile = captured
+            .instances
+            .blocking_read()
+            .iter()
+            .find(|row| row.id == id_owned)
+            .map(|row| row.source_profile.clone())
+            .ok_or(crate::session::SessionGone)?;
+        let native = crate::server::session_store::NativeSessionStore::open(
+            captured.clone(),
+            &profile,
+            None,
+        )?;
+        let lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&id_owned)?;
+        let row = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == id_owned)
+            .ok_or(crate::session::SessionGone)?;
+        let binding =
+            BindingRetirement::prepare_captured(&captured, target, &row, native.storage())?;
+        binding.activate();
+        drop(lifecycle);
+        Ok((native, binding))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    // Failed checkpoints retain debt but cannot leave the captured actor running.
+    state
+        .acp_supervisor
+        .retire_captured_for_resume_and_wait(id, &retirement.target, deadline)
+        .await?;
+    retirement.ensure_settled()?;
+    if !retirement.has_captured_binding() {
+        // No captured binding obligation remains after owned retirement.
+        // This does not establish lossless ingestion of installed SDK results.
+        state
+            .acp_supervisor
+            .acknowledge_retirement(&retirement.target)?;
+        return Ok(());
+    }
+    let (native, binding) = prepared?;
+    let captured = state.clone();
+    let id_owned = id.to_owned();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let _lifecycle = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&id_owned)?;
+        binding.commit_under_native_lock(&native)?;
+        captured
+            .acp_supervisor
+            .acknowledge_retirement(&binding.target)?;
+        Ok(())
+    })
+    .await?
+}
+
+pub(crate) async fn commit_background_bindings(state: &Arc<AppState>) {
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return;
+    }
+    for (id, target) in state.acp_supervisor.retired_binding_targets() {
+        let _namespace = state.profile_namespace.read().await;
+        let instance = state.instance_lock(&id).await;
+        let _instance = instance.lock().await;
+        let owner = state.clone();
+        let captured = target.clone();
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            use crate::session::SessionStore as _;
+            let Some(row) = owner
+                .instances
+                .blocking_read()
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+            else {
+                // Only its explicit deletion journal may acknowledge an absent row.
+                return Ok(());
+            };
+            if row.terminal_handoff.is_some() {
+                return Ok(());
+            }
+            let native = crate::server::session_store::NativeSessionStore::open(
+                owner.clone(),
+                &row.source_profile,
+                None,
+            )?;
+            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
+            // An active restart owns this checkpoint until it releases its claim.
+            if owner.acp_supervisor.restart_request_is_active(&id) {
+                return Ok(());
+            }
+            if captured
+                .lease
+                .as_ref()
+                .is_none_or(|lease| !lease.retirement().binding_checkpoint_delegated())
+            {
+                return Ok(());
+            }
+            let Some(current) = native.load()?.into_iter().find(|row| row.id == id) else {
+                return Ok(());
+            };
+            if current.terminal_handoff.is_some() {
+                return Ok(());
+            }
+            let checkpoint = captured
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.retirement().binding_checkpoint());
+            let retirement = if let Some(checkpoint) = checkpoint {
+                BindingRetirement::captured(&owner, captured, Some(checkpoint))
+            } else {
+                BindingRetirement::prepare_captured(&owner, captured, &current, native.storage())?
+            };
+            let committed = retirement.commit_under_native_lock(&native);
+            if let Err(error) = committed {
+                if !matches!(
+                    error.downcast_ref::<crate::session::LifecycleReservationError>(),
+                    Some(crate::session::LifecycleReservationError::Superseded)
+                ) {
+                    return Err(error);
+                }
+            }
+            // The native exclusion serializes this ACK with a journal's claim.
+            if retirement
+                .target
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.retirement().binding_checkpoint_delegated())
+            {
+                owner
+                    .acp_supervisor
+                    .acknowledge_retirement(&retirement.target)?;
+            }
+            Ok(())
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::warn!(target: "acp.reconciler", ?result, "native binding checkpoint remains unconfirmed");
+        }
+    }
+}
+
+async fn persist_identity_observation(
+    state: &Arc<AppState>,
+    frame: &crate::acp::protocol::AcpBroadcastFrame,
+    change: AcpSessionChange,
+    projected_status: Option<Status>,
+) {
+    use crate::session::SessionStore;
+
+    let _namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(&frame.session_id).await;
+    let _identity = lock.lock().await;
+    let (profile, created_at, generation, conversation, previous_id, cached_status) = {
+        let rows = state.instances.read().await;
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.id == frame.session_id && row.is_structured())
+        else {
+            return;
+        };
+        (
+            row.source_profile.clone(),
+            row.created_at,
+            row.lifecycle_generation,
+            row.conversation_state(),
+            row.acp_session_id.clone(),
+            row.status,
+        )
+    };
+    // Capture before taking a native lock; producers acquire lifecycle first.
+    let admission = state
+        .acp_supervisor
+        .current_lease(&frame.session_id)
+        .filter(|lease| frame.worker_generation == Some(lease.epoch()))
+        .and_then(|lease| lease.admission())
+        .filter(|admission| {
+            admission.generation == generation && admission.store.storage().profile() == profile
+        });
+    let owner = Arc::clone(state);
+    let id = frame.session_id.clone();
+    let epoch = frame.worker_generation;
+    let subject = frame
+        .native_subject
+        .or_else(|| frame.event.native_subject());
+    let ready_subject = subject
+        .is_some_and(|subject| subject.kind == crate::acp::state::NativeSubjectEvent::ChannelReady);
+    let current_ready = if ready_subject {
+        state
+            .acp_supervisor
+            .current_native_availability(&id)
+            .await
+            .filter(|current| {
+                Some(current.lease.epoch()) == epoch
+                    && subject.is_some_and(|subject| {
+                        current.scope.context == subject.context && current.owner == subject.owner
+                    })
+            })
+    } else {
+        None
+    };
+    let Some(postimage) = current_ready
+        .as_ref()
+        .and_then(|current| current.client.establishment_projection())
+        .and_then(|projection| projection.applied())
+    else {
+        return;
+    };
+    let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let native = crate::server::session_store::NativeSessionStore::open(
+            Arc::clone(&owner), &profile, None,
+        )?;
+        let context = crate::acp::state::NativeEventContext::capture_identity(
+            &id, created_at, generation, native.storage(),
+        )?;
+        anyhow::ensure!(
+            subject.is_none_or(|subject| subject.context == context),
+            crate::session::LifecycleReservationError::Superseded
+        );
+        let admitted_scope = if let Some(admission) = admission {
+            let admitted = admission.store.storage();
+            admitted.verify_bound_profile()?;
+            anyhow::ensure!(
+                admitted.bound_profile_identity()? == native.storage().bound_profile_identity()?,
+                crate::session::LifecycleReservationError::Superseded
+            );
+            true
+        } else {
+            false
+        };
+        let repair_status = loop {
+            let guard = native.storage().acquire_instance_lifecycle_lock(&id)?;
+            let mut repair_status = None;
+            let result = native.commit(&mut |rows, _| {
+                owner.acp_supervisor.commit_native_observation(&id, epoch, || {
+                    let row = rows.iter_mut().find(|row| row.id == id)
+                        .ok_or(crate::session::SessionGone)?;
+                    anyhow::ensure!(
+                        row.created_at == created_at
+                            && row.lifecycle_generation == generation
+                            && conversation.matches(row)
+                            && postimage.matches(row, native.storage())?
+                            && row.acp_session_id == previous_id
+                            && row.is_structured()
+                            && row.terminal_handoff.as_ref().is_none_or(|intent| {
+                                intent.stage == crate::session::TerminalHandoffStage::RetirementPending
+                            })
+                            && crate::acp::state::NativeEventContext::capture(row, native.storage())?
+                                == context
+                            && subject.is_none_or(|subject| subject.owner_is_current(&id)),
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    let correlated = matches!(&change, AcpSessionChange::Assigned(_))
+                        && admitted_scope && row.ensure_startable().is_ok()
+                        && row.terminal_handoff.is_none() && row.launch_is_finalized();
+                    if correlated && !row.is_idle_dormant() {
+                        if ready_subject {
+                            if matches!(cached_status, Status::Error | Status::Stopped)
+                                && current_ready.as_ref().is_some_and(|current| {
+                                    current.scope.choice.as_ref().is_some_and(|choice| choice.matches(row))
+                                        && current.client.connection_ready()
+                                        && current.client.connection_unavailable().is_none()
+                                })
+                            {
+                                repair_status = projected_status;
+                            }
+                        } else if cached_status == Status::Stopped
+                            && matches!(row.status,
+                                Status::Starting | Status::Running | Status::Idle | Status::Waiting)
+                        {
+                            repair_status = Some(row.status);
+                        }
+                    }
+                    Ok(())
+                })
+            });
+            drop(guard);
+            match result {
+                Err(error) if error.is::<crate::acp::supervisor::NativeObservationBusy>() => {
+                    std::thread::yield_now();
+                }
+                result => { result?; break repair_status; }
+            }
+        };
+        if let Some(status) = repair_status {
+            let fence = crate::session::NativeInputFence::capture_route(
+                native.storage().profile(), &id, created_at, generation, false,
+                Some(native.storage().bound_profile_identity()?),
+            )?;
+            loop {
+                let guard = fence.lock_observation()?;
+                let publication = owner.publication.blocking_write();
+                let mut rows = owner.instances.blocking_write();
+                let applied = owner.acp_supervisor.commit_native_observation(&id, epoch, || {
+                    if let Some(row) = rows.iter_mut().find(|row| {
+                        row.id == id && !row.is_idle_dormant()
+                            && (row.status == Status::Stopped || (ready_subject && row.status == Status::Error))
+                    }) {
+                        anyhow::ensure!(
+                            crate::acp::state::NativeEventContext::capture(row, native.storage())?
+                                == context
+                                && subject.is_none_or(|subject| subject.owner_is_current(&id)),
+                            crate::session::LifecycleReservationError::Superseded
+                        );
+                        if ready_subject && !current_ready.as_ref().is_some_and(|current| {
+                            current.scope.choice.as_ref().is_some_and(|choice| choice.matches(row))
+                                && current.client.connection_ready()
+                                && current.client.connection_unavailable().is_none()
+                        }) {
+                            return Ok(());
+                        }
+                        let old = row.status;
+                        apply_status_intent(row, StatusPolicy::Heal, status, &owner.status_tx);
+                        if row.status != old {
+                            owner.mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            owner.runtime.request_publish();
+                        }
+                    }
+                    Ok(())
+                });
+                drop(rows);
+                drop(publication);
+                drop(guard);
+                match applied {
+                    Err(error) if error.is::<crate::acp::supervisor::NativeObservationBusy>() =>
+                        std::thread::yield_now(),
+                    result => { result?; break; }
+                }
+            }
+        }
+        Ok(())
+    }).await;
+    match saved {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if error.is::<crate::session::LifecycleReservationError>() => {}
+        Ok(Err(error)) => tracing::warn!(target: "acp.event_listener",
+            session = %frame.session_id, %error, "ACP identity observation was not applied"),
+        Err(error) => tracing::warn!(target: "acp.event_listener",
+            session = %frame.session_id, %error, "ACP identity observation task failed"),
     }
 }
 
@@ -719,23 +1648,170 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         .map(|i| i.id.clone())
         .collect();
     for id in acp_ids {
-        let Some(projected) = folded_sidebar_status(&state.session_service, &id).await else {
+        let Some(mut observation) = folded_sidebar_observation(&state.session_service, &id).await
+        else {
             continue;
         };
+        let namespace = Arc::clone(&state.profile_namespace);
+        let _namespace = namespace.read().await;
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            apply_status_seed(inst, projected, &state.status_tx);
+            observation.try_apply(&id, inst, |inst, _, observation| {
+                apply_status_seed(inst, observation.status, &state.status_tx);
+                Ok(())
+            });
         }
     }
 }
 
-/// The folded sidebar status, or `None` for a session with no events yet.
+/// A semantic sidebar observation, never the default Idle of a history-only fold.
 pub(crate) async fn folded_sidebar_status(
     service: &crate::server::session_service::SessionService,
     id: &str,
 ) -> Option<Status> {
-    let fold = service.fold_control_state(id).await;
-    (fold.last_seq > 0).then(|| fold.sidebar_status())
+    let mut observation = folded_sidebar_observation(service, id).await?;
+    let namespace = Arc::clone(&observation.owner.profile_namespace);
+    let _namespace = namespace.read().await;
+    let mut rows = service.instances.write().await;
+    let row = rows.iter_mut().find(|row| row.id == id)?;
+    observation.try_apply(id, row, |_, _, observation| Ok(observation.status))
+}
+
+struct SidebarObservation {
+    owner: Arc<AppState>,
+    origin: crate::acp::state::NativeEventOrigin,
+    current: crate::acp::state::CurrentNativeAvailability,
+    postimage: Arc<crate::acp::establishment::EstablishmentPostimage>,
+    frontier: u64,
+    status: Status,
+    ready: bool,
+    unavailable: Option<crate::acp::state::AcpConnectionUnavailability>,
+}
+
+impl SidebarObservation {
+    fn matches_row(
+        &self,
+        row: &Instance,
+        storage: &crate::session::Storage,
+    ) -> anyhow::Result<bool> {
+        Ok(row.is_structured()
+            && row.source_profile == storage.profile()
+            && row.terminal_handoff.is_none()
+            && self.origin.context == crate::acp::state::NativeEventContext::capture(row, storage)?
+            && self.postimage.matches(row, storage)?
+            && self
+                .current
+                .scope
+                .choice
+                .as_ref()
+                .is_some_and(|choice| choice.matches(row)))
+    }
+
+    /// Every guard lives only inside this synchronous mutation. Contention is unknown.
+    fn try_apply<T>(
+        &mut self,
+        id: &str,
+        row: &mut Instance,
+        apply: impl FnOnce(&mut Instance, &crate::session::Storage, &Self) -> anyhow::Result<T>,
+    ) -> Option<T> {
+        let fence = Arc::clone(&self.current.scope.fence);
+        let (_, result) = fence
+            .lock_observation_project(
+                |disk, storage| {
+                    if !self.matches_row(disk, storage)? || !self.matches_row(row, storage)? {
+                        return Ok(None);
+                    }
+                    let Some(registry) = crate::process::worker_registry::try_registry_lock(id)?
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(record) = registry.record()? else {
+                        return Ok(None);
+                    };
+                    let Some(owner) = self
+                        .origin
+                        .owner
+                        .filter(|owner| owner.birth_fingerprint.is_some())
+                    else {
+                        return Ok(None);
+                    };
+                    if registry.stop()?.is_some()
+                        || !owner.owns_record(&record)
+                        || record.source_profile.as_deref() != Some(storage.profile())
+                        || !crate::process::process_birth_identity(owner.pid)?.is_some_and(
+                            |birth| Some(birth.fingerprint()) == owner.birth_fingerprint,
+                        )
+                    {
+                        return Ok(None);
+                    }
+                    if !self.current.refresh(id, true).unwrap_or(false)
+                        || self.current.ready != self.ready
+                        || self.current.unavailable != self.unavailable
+                    {
+                        return Ok(None);
+                    }
+                    let Some(applied) =
+                        self.owner
+                            .acp_control_cache
+                            .with_frontier(id, self.frontier, || {
+                                self.owner.acp_supervisor.commit_native_observation(
+                                    id,
+                                    Some(self.current.lease.epoch()),
+                                    || apply(row, storage, self),
+                                )
+                            })
+                    else {
+                        return Ok(None);
+                    };
+                    match applied {
+                        Ok(value) => Ok(Some(value)),
+                        Err(error)
+                            if error.is::<crate::acp::supervisor::NativeObservationBusy>() =>
+                        {
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    }
+                },
+                true,
+            )
+            .ok()??;
+        result
+    }
+}
+
+async fn folded_sidebar_observation(
+    service: &crate::server::session_service::SessionService,
+    id: &str,
+) -> Option<SidebarObservation> {
+    let fold = service.fold_control_state(id).await.ok()?;
+    if fold.sidebar_observation_seq == 0 {
+        return None;
+    }
+    let origin = fold.sidebar_observation_origin?;
+    let owner = service.native_state().ok()?;
+    let current = service
+        .acp_supervisor
+        .current_native_availability(id)
+        .await?;
+    let postimage = current.client.establishment_projection()?.applied()?;
+    if origin.context != current.scope.context
+        || origin.owner != current.owner
+        || origin.attempt_id != postimage.attempt_id
+        || origin.context != postimage.context
+    {
+        return None;
+    }
+    Some(SidebarObservation {
+        owner,
+        origin,
+        current,
+        postimage,
+        frontier: fold.last_seq,
+        status: fold.sidebar_status(),
+        ready: fold.connection_ready,
+        unavailable: fold.connection_unavailable,
+    })
 }
 
 pub(crate) fn apply_status_seed(
@@ -786,12 +1862,8 @@ pub(crate) fn apply_status_intent(
         // A Stopped session must not be woken by a trailing worker event.
         StatusPolicy::Authoritative if inst.status == Status::Stopped => return,
         StatusPolicy::Authoritative => {}
-        // Background sub-agent events must not speak for the main turn: they
-        // preserve its Waiting (a pending approval/elicitation) and Error (a
-        // dead connection the supervisor is still respawning), and Stopped
-        // likewise stays until the main turn's own lifecycle moves it. The
-        // main turn's own events resolve Waiting and Error; Error also heals
-        // on a fresh worker attach.
+        // Background work cannot resolve main-turn Waiting, Error or Stopped.
+        // Error describes a failed operation or connection, not necessarily death.
         StatusPolicy::Background => {
             if matches!(
                 inst.status,
@@ -800,9 +1872,8 @@ pub(crate) fn apply_status_intent(
                 return;
             }
         }
-        // Only from AcpSessionAssigned / RateLimitAutoResumed, emitted when a
-        // fresh worker attaches. The listener drops a retired worker's identity
-        // frame before it gets here, since it can trail the stop.
+        // Lifecycle authority can repair a stale Error/Stopped projection.
+        // Retired identity frames cannot repair a stopped row.
         StatusPolicy::Heal => {
             if !matches!(inst.status, Status::Error | Status::Stopped) {
                 return;
@@ -846,9 +1917,8 @@ pub(crate) fn apply_status_intent(
 /// `ElicitationResolved`) before the turn's `Stopped`, so an answered-then-
 /// completed turn still ends on this edge and needs no case of its own. A
 /// direct `Waiting -> Idle` means the turn stopped while still blocked on the
-/// user, who is by construction present for it. Every `Stopped` reason maps to
-/// `Idle`, so a rate-limit park marks unread too; that is the same policy
-/// terminal sessions get, and a parked session does want attention.
+/// user, who is by construction present for it. Successful and parked stops
+/// project `Idle`; `prompt_failed` projects `Error`, not a successful unread edge.
 pub(super) fn should_mark_acp_unread(
     inst: &Instance,
     old_status: Status,
@@ -949,29 +2019,52 @@ pub(super) async fn recover_structured_unread_after_lag(
     let unread_enabled = crate::session::unread_enabled();
     let mut marked = 0usize;
     for id in ids {
-        let Some(projected) = folded_sidebar_status(service, &id).await else {
+        let Some(mut observation) = folded_sidebar_observation(service, &id).await else {
             continue;
         };
-        // Same snapshot-around-apply as the live path, so "the transition that
-        // was actually applied" means the same thing in both.
-        let unread_profile = {
-            let mut guard = instances.write().await;
-            let Some(inst) = guard.iter_mut().find(|i| i.id == id) else {
-                continue;
-            };
-            if !inst.is_structured() {
-                continue;
-            }
-            let old_status = inst.status;
-            apply_status_intent(inst, StatusPolicy::Authoritative, projected, status_tx);
-            should_mark_acp_unread(inst, old_status, unread_enabled)
-                .then(|| inst.source_profile.clone())
+        let namespace = Arc::clone(&observation.owner.profile_namespace);
+        let _namespace = namespace.read().await;
+        let lock = instance_lock_in(instance_locks, &id).await;
+        let _mutation = lock.lock().await;
+        let mut rows = instances.write().await;
+        let Some(inst) = rows.iter_mut().find(|row| row.id == id) else {
+            continue;
         };
-        if let Some(profile) = unread_profile {
-            let lock = instance_lock_in(instance_locks, &id).await;
-            if persist_and_mirror_unread(instances, &lock, file_watch.clone(), &id, profile).await {
-                marked += 1;
+        let applied = observation.try_apply(&id, inst, |inst, storage, observation| {
+            let old_status = inst.status;
+            apply_status_intent(
+                inst,
+                StatusPolicy::Authoritative,
+                observation.status,
+                status_tx,
+            );
+            let unread = should_mark_acp_unread(inst, old_status, unread_enabled);
+            if unread {
+                storage.update(|disk, _| {
+                    let row = disk
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .ok_or(crate::session::SessionGone)?;
+                    anyhow::ensure!(
+                        observation.matches_row(row, storage)?,
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    row.mark_unread();
+                    Ok(())
+                })?;
+                inst.mark_unread();
+                file_watch.notify_local_change(storage.sessions_path());
             }
+            if old_status != inst.status || unread {
+                service
+                    .mutation_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                observation.owner.runtime.request_publish();
+            }
+            Ok(unread)
+        });
+        if applied == Some(true) {
+            marked += 1;
         }
     }
     marked
@@ -981,12 +2074,17 @@ pub(super) async fn recover_structured_unread_after_lag(
 /// owning profile when sessions.json needs to be re-saved (so the new
 /// `acp_session_id` survives daemon restart), or `None` if the
 /// change was a no-op or no change was emitted.
+/// `assignment_scoped` requires native launch admission or the matching retained
+/// handoff. An identity observation alone cannot complete pending work or alter a pin.
+/// `live_worker` never grants assignment authority by itself. Dormancy belongs to typed launch commit.
 pub(super) fn apply_acp_session_change(
     inst: &mut Instance,
     session_id: &str,
     change: Option<&AcpSessionChange>,
+    assignment_scoped: bool,
     live_worker: bool,
 ) -> Option<String> {
+    let assignment_scoped = assignment_scoped && live_worker;
     if !inst.is_structured()
         || inst.terminal_handoff.as_ref().is_some_and(|intent| {
             intent.stage != crate::session::TerminalHandoffStage::RetirementPending
@@ -994,73 +2092,59 @@ pub(super) fn apply_acp_session_change(
     {
         return None;
     }
-    match change? {
-        AcpSessionChange::Assigned(new_id) => {
-            // A live worker just initialized (session/new or session/load), so the
-            // session is no longer idle-dormant; a retired worker's frame proves nothing.
-            let cleared_stale_dormant = live_worker && inst.idle_dormant_since.take().is_some();
-            let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
-            // #2276.
-            let cleared_import_pending = if same_acp_session {
-                inst.import_pending.take().unwrap_or(false)
-            } else {
-                false
-            };
-            if same_acp_session {
-                // Same id (a reattach / session/load reuses it).
-                if cleared_stale_dormant || cleared_import_pending {
-                    tracing::info!(
-                        target: "acp.event_listener",
-                        session = %session_id,
-                        cleared_import_pending,
-                        "cleared stale idle-dormant / import marker on worker (re)assign"
-                    );
-                    return Some(inst.source_profile.clone());
-                }
-                return None;
+    let AcpSessionChange::Assigned(new_id) = change?;
+    let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
+    if !assignment_scoped {
+        let pin_matches = matches!(&inst.resume_intent,
+                    crate::session::ResumeIntent::Use(target) if target == new_id);
+        let contradicts_choice = match &inst.resume_intent {
+            crate::session::ResumeIntent::Default => false,
+            crate::session::ResumeIntent::Use(target) => target != new_id,
+            crate::session::ResumeIntent::Cleared | crate::session::ResumeIntent::Fork { .. } => {
+                true
             }
+        };
+        let contradicts_binding = inst.resume_binding.as_ref().is_some_and(|binding| {
+            binding.provenance == crate::session::ConversationProvenance::Asserted
+                && binding.session_id != *new_id
+        });
+        let pending_flow = inst.fork_pending.is_some() || inst.import_pending == Some(true);
+        if contradicts_choice
+            || contradicts_binding
+            || (pending_flow && !same_acp_session && !pin_matches)
+        {
+            return None;
+        }
+    }
+    let cleared_import_pending = if assignment_scoped && same_acp_session {
+        inst.import_pending.take().unwrap_or(false)
+    } else {
+        false
+    };
+    if same_acp_session {
+        if cleared_import_pending {
             tracing::info!(
                 target: "acp.event_listener",
                 session = %session_id,
-                acp_session_id = %new_id,
-                "persisting agent-assigned ACP session id"
+                cleared_import_pending,
+                "cleared import marker on ACP reassignment"
             );
-            inst.acp_session_id = Some(new_id.clone());
-            // A structured fork sets fork_pending + import_pending together at creation and
-            // does not pre-pin acp_session_id, so the adapter's new forked id arrives on
-            // THIS different-id path.
-            if inst.fork_pending.take().is_some() {
-                inst.import_pending = None;
-            }
+            return Some(inst.source_profile.clone());
         }
-        AcpSessionChange::Reset(reason) => {
-            tracing::info!(
-                target: "acp.event_listener",
-                session = %session_id,
-                %reason,
-                "clearing stored ACP session id after a context reset (session/load or session/fork failure)"
-            );
-            inst.acp_session_id = None;
-            // A failed structured fork fails its spawn and keeps the marker; a reset
-            // that still finds one pending drops it with the conversation it seeded.
-            if inst.fork_pending.take().is_some() {
-                inst.import_pending = None;
-            }
-        }
-        AcpSessionChange::Cleared => {
-            tracing::info!(
-                target: "acp.event_listener",
-                session = %session_id,
-                "clearing stored ACP session id after a user /clear"
-            );
-            // For a profile that forwards its clear alias, AoE never learns the adapter's
-            // post-clear conversation id, so the only way to stop a restart from
-            // resurrecting the pre-clear conversation via session/load is to drop the
-            // stored id now and force a fresh session/new.
-            inst.acp_session_id = None;
-            inst.fork_pending = None;
-            inst.import_pending = None;
-        }
+        return None;
+    }
+    tracing::info!(
+        target: "acp.event_listener",
+        session = %session_id,
+        acp_session_id = %new_id,
+        "persisting agent-assigned ACP session id"
+    );
+    inst.acp_session_id = Some(new_id.clone());
+    if assignment_scoped && inst.fork_pending.take().is_some() {
+        inst.import_pending = None;
+    }
+    if !assignment_scoped || !matches!(inst.resume_intent, crate::session::ResumeIntent::Default) {
+        return Some(inst.source_profile.clone());
     }
     if let Some(stale) = inst.resume_binding.as_ref().filter(|binding| {
         binding.provenance == crate::session::ConversationProvenance::Asserted
@@ -1077,29 +2161,8 @@ pub(super) fn apply_acp_session_change(
     Some(inst.source_profile.clone())
 }
 
-/// What an event tells the ACP-session-id listener to do. `None` means
-/// the event is irrelevant. Extracted so the JSON-shape parsing has a
-/// pure-function test surface.
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub(super) enum AcpSessionChange {
-    Assigned(String),
-    Reset(String),
-    /// A user `/clear`: drop the stored resume id so the next worker
-    /// restart starts a fresh `session/new` instead of resurrecting the
-    /// pre-clear conversation via `session/load`. See #3080.
-    Cleared,
-}
-
 pub(super) fn derive_acp_session_change(event: &crate::acp::Event) -> Option<AcpSessionChange> {
-    use crate::acp::Event;
-    match event {
-        Event::AcpSessionAssigned { acp_session_id } => {
-            Some(AcpSessionChange::Assigned(acp_session_id.clone()))
-        }
-        Event::SessionContextReset { reason } => Some(AcpSessionChange::Reset(reason.clone())),
-        Event::SessionCleared => Some(AcpSessionChange::Cleared),
-        _ => None,
-    }
+    AcpSessionChange::from_event(event)
 }
 
 /// How an event's projected sidebar status may overwrite the row's current
@@ -1129,6 +2192,7 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
         | Event::AgentMessageChunk { .. }
         | Event::ToolCallStarted { .. }
         | Event::Stopped { .. }
+        | Event::PromptRuntimeError { .. }
         | Event::AgentStartupError { .. }
         | Event::IncompatibleAgent { .. }
         | Event::IntegrationLost { .. } => Some(StatusPolicy::Authoritative),
@@ -1141,9 +2205,7 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
         | Event::BackgroundAgentCompleted { .. }
         | Event::BackgroundTaskFinished { .. }
         | Event::SubagentUpdated { .. } => Some(StatusPolicy::Background),
-        Event::AcpSessionAssigned { .. } | Event::RateLimitAutoResumed { .. } => {
-            Some(StatusPolicy::Heal)
-        }
+        Event::RateLimitAutoResumed { .. } => Some(StatusPolicy::Heal),
         _ => None,
     }
 }
@@ -1416,626 +2478,750 @@ mod tests {
         );
     }
 
-    /// Lag replay, the other finding on #3530: the ACP broadcast tells a lagged
-    /// receiver only how many frames it missed, never which, so a dropped
-    /// `Stopped` would lose the turn-end mark permanently (unlike status, which
-    /// is level-triggered and re-derives from any later event). The events are
-    /// durable, so recovery reads the log.
-    ///
-    /// Three rows in one pass, all with a durable `Stopped` as their latest
-    /// lifecycle event, so the discriminator is the row rather than the event:
-    /// only the structured row still sitting at `Running` represents a turn that
-    /// ended unobserved.
+    /// Lag recovery marks a missed actual terminal, not an already observed turn or a terminal row.
     #[tokio::test]
     #[serial_test::serial]
     async fn recover_structured_unread_after_lag_marks_only_a_missed_turn_end() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                crate::session::set_unread_enabled(true);
+                let mut missed =
+                    test_support::managed_control_session(scope, "lag-missed", "claude", None)
+                        .await;
+                let missed_id = missed.id().to_owned();
+                let request = missed.start_prompt("actual missed terminal").await;
+                missed.finish_prompt(&request, None).await;
+                let mut already =
+                    test_support::managed_control_session(scope, "lag-observed", "claude", None)
+                        .await;
+                let already_id = already.id().to_owned();
+                let request = already.start_prompt("already observed terminal").await;
+                already.finish_prompt(&request, None).await;
+                let state = missed.state.clone();
+                let mut terminal = Instance::new("tmux-row", "/tmp/tmux");
+                terminal.source_profile = "test".into();
+                terminal.status = Status::Running;
+                let terminal_id = terminal.id.clone();
+                let persisted = terminal.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::session::Storage::open_reference("test")
+                        .unwrap()
+                        .update(|rows, _| {
+                            rows.push(persisted);
+                            Ok(())
+                        })
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                {
+                    let mut rows = state.instances.write().await;
+                    rows.iter_mut()
+                        .find(|row| row.id == missed_id)
+                        .unwrap()
+                        .status = Status::Running;
+                    rows.iter_mut()
+                        .find(|row| row.id == already_id)
+                        .unwrap()
+                        .status = Status::Idle;
+                    rows.push(terminal);
+                }
+                state.acp_control_cache.forget(&missed_id);
+                state.acp_control_cache.forget(&already_id);
+                let marked = recover_structured_unread_after_lag(
+                    &state.instances,
+                    &state.session_service,
+                    &state.instance_locks,
+                    state.file_watch.clone(),
+                    &state.status_tx,
+                )
+                .await;
+                assert_eq!(
+                    marked, 1,
+                    "only the actual missed terminal creates an unread edge"
+                );
+                let rows = state.instances.read().await;
+                let missed = rows.iter().find(|row| row.id == missed_id).unwrap();
+                assert_eq!(missed.status, Status::Idle);
+                assert!(missed.unread);
+                assert!(load_profile_row("test", &missed_id).unwrap().unread);
+                assert!(!rows.iter().find(|row| row.id == already_id).unwrap().unread);
+                let terminal = rows.iter().find(|row| row.id == terminal_id).unwrap();
+                assert_eq!(terminal.status, Status::Running);
+                assert!(!terminal.unread);
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn current_channel_ready_and_initialize_metadata_do_not_prove_a_finished_turn() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                crate::session::set_unread_enabled(true);
+                let live = test_support::managed_control_session(
+                    scope,
+                    "ready-is-not-terminal",
+                    "claude",
+                    None,
+                )
+                .await;
+                let state = live.state.clone();
+                let id = live.id().to_owned();
+                let fold = state.session_service.fold_control_state(&id).await.unwrap();
+                assert!(
+                    fold.connection_ready,
+                    "this is a genuinely qualified current Native source"
+                );
+                assert_eq!(
+                    fold.sidebar_observation_seq, 0,
+                    "initialize and readiness are not a turn outcome"
+                );
+                assert_eq!(
+                    folded_sidebar_status(&state.session_service, &id).await,
+                    None
+                );
+                state
+                    .instances
+                    .write()
+                    .await
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .status = Status::Running;
+                seed_acp_statuses(state.clone()).await;
+                let marked = recover_structured_unread_after_lag(
+                    &state.instances,
+                    &state.session_service,
+                    &state.instance_locks,
+                    state.file_watch.clone(),
+                    &state.status_tx,
+                )
+                .await;
+                assert_eq!(marked, 0);
+                let rows = state.instances.read().await;
+                let row = rows.iter().find(|row| row.id == id).unwrap();
+                assert_eq!(row.status, Status::Running);
+                assert!(!row.unread);
+                assert!(!load_profile_row("test", &id).unwrap().unread);
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn qualified_background_task_end_is_sidebar_evidence_without_a_main_turn() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                crate::session::set_unread_enabled(true);
+                let mut live = test_support::managed_control_session(
+                    scope,
+                    "background-only-status",
+                    "claude",
+                    None,
+                )
+                .await;
+                let state = live.state.clone();
+                let id = live.id().to_owned();
+                let path = start_projection_resource(&mut live, false).await;
+                let started = state.session_service.fold_control_state(&id).await.unwrap();
+                assert_eq!(started.native_control_seq, 0, "no main turn was admitted");
+                assert!(started.sidebar_observation_seq > 0);
+                assert_eq!(started.sidebar_status(), Status::Running);
+                let mut unmatched = started.clone();
+                unmatched
+                    .apply_scoped_event(
+                        started.last_seq + 1,
+                        &Event::BackgroundTaskFinished {
+                            task_id: "projection-task".into(),
+                            ended_at: None,
+                        },
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    unmatched.sidebar_observation_seq, started.sidebar_observation_seq,
+                    "an unqualified end cannot become evidence for the actual allocation"
+                );
+                assert_eq!(unmatched.sidebar_status(), Status::Running);
+                state
+                    .instances
+                    .write()
+                    .await
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .status = Status::Running;
+                finish_projection_resource(&mut live, &path, false).await;
+                let ended = state.session_service.fold_control_state(&id).await.unwrap();
+                assert_eq!(ended.native_control_seq, 0);
+                assert!(ended.sidebar_observation_seq > started.sidebar_observation_seq);
+                assert_eq!(ended.sidebar_status(), Status::Idle);
+                let marked = recover_structured_unread_after_lag(
+                    &state.instances,
+                    &state.session_service,
+                    &state.instance_locks,
+                    state.file_watch.clone(),
+                    &state.status_tx,
+                )
+                .await;
+                assert_eq!(marked, 1, "the exact allocated task really finished");
+                assert!(load_profile_row("test", &id).unwrap().unread);
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn historical_lifecycle_events_cannot_repaint_status_or_mark_a_turn_unread() {
+        let _home = crate::session::test_support::isolate_app_dir();
         crate::session::set_unread_enabled(true);
-
-        let profile = "acp-unread-lag-replay";
-
-        // The turn ended while the listener was lagged.
-        let mut missed = Instance::new("acp-missed", "/tmp/acp");
-        missed.view = crate::session::View::Structured;
-        missed.source_profile = profile.to_string();
-        missed.status = Status::Running;
-
-        // Already reconciled.
-        let mut already = Instance::new("acp-already-idle", "/tmp/acp");
-        already.view = crate::session::View::Structured;
-        already.source_profile = profile.to_string();
-        already.status = Status::Idle;
-
-        // A terminal row is not this producer's to touch at all.
-        let mut terminal = Instance::new("tmux-row", "/tmp/tmux");
-        terminal.source_profile = profile.to_string();
-        terminal.status = Status::Running;
-
-        let (missed_id, already_id, terminal_id) =
-            (missed.id.clone(), already.id.clone(), terminal.id.clone());
-        let rows = vec![missed.clone(), already.clone(), terminal.clone()];
-        seed_profile_store(profile, rows.clone());
-
-        let state = test_support::build_test_app_state(vec![]);
-        for id in [&missed_id, &already_id, &terminal_id] {
+        let mut row = Instance::new("history-only status", "/tmp/history-only");
+        row.view = crate::session::View::Structured;
+        row.source_profile = "history-only-status".into();
+        row.status = Status::Running;
+        let id = row.id.clone();
+        seed_profile_store(&row.source_profile, vec![row.clone()]);
+        let state = test_support::build_test_app_state(vec![row]);
+        for (index, event) in [
+            crate::acp::state::test_support::prompt("retained prompt"),
+            Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            Event::AgentStartupError {
+                message: "retained failure".into(),
+                native_subject: None,
+                cause: None,
+            },
+            Event::AcpSessionAssigned {
+                acp_session_id: "retained identity".into(),
+                connection_ready: true,
+                native_subject: None,
+            },
+            Event::BackgroundTaskStarted {
+                task_id: "historical-task".into(),
+                tool_call_id: None,
+                description: "retained task".into(),
+                workflow: None,
+                started_at: None,
+            },
+        ]
+        .iter()
+        .enumerate()
+        {
             state
                 .acp_event_store
                 .record(
-                    id,
-                    1,
-                    &crate::acp::Event::Stopped {
-                        reason: "prompt_complete".into(),
-                    },
+                    &id,
+                    index as u64 + 1,
+                    event,
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
-                .expect("record stopped");
+                .unwrap();
         }
-        let instances = RwLock::new(rows);
-        let locks = RwLock::new(std::collections::HashMap::new());
-        let (status_tx, _rx) = broadcast::channel(16);
-
+        assert_eq!(
+            folded_sidebar_status(&state.session_service, &id).await,
+            None
+        );
+        seed_acp_statuses(state.clone()).await;
         let marked = recover_structured_unread_after_lag(
-            &instances,
+            &state.instances,
             &state.session_service,
-            &locks,
-            crate::file_watch::FileWatchService::noop(),
-            &status_tx,
+            &state.instance_locks,
+            state.file_watch.clone(),
+            &state.status_tx,
         )
         .await;
-
-        assert_eq!(marked, 1, "only the missed turn-end is a fresh mark");
-
-        let guard = instances.read().await;
-        let row = |id: &str| guard.iter().find(|i| i.id == id).expect("row").clone();
-
-        let missed = row(&missed_id);
         assert_eq!(
-            missed.status,
-            Status::Idle,
-            "replay applies the missed Stopped"
+            marked, 0,
+            "history is not evidence that the current turn completed"
         );
-        assert!(missed.unread, "and marks the turn that ended unobserved");
-        assert!(
-            load_profile_row(profile, &missed_id).expect("row").unread,
-            "the replayed mark must be durable, not memory-only"
-        );
-
-        assert!(
-            !row(&already_id).unread,
-            "an already-reconciled row has no transition left, so no second mark"
-        );
-        assert_eq!(
-            row(&terminal_id).status,
-            Status::Running,
-            "a terminal row is left entirely to the tmux poller"
-        );
-        assert!(!row(&terminal_id).unread);
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.status, Status::Running);
+        assert!(!row.unread);
+        assert!(!load_profile_row("history-only-status", &id).unwrap().unread);
     }
 
-    /// #4001: lag recovery projects the whole fold, so a background sub-agent
-    /// still running or a newer turn already open keeps the row `Running` even
-    /// when the latest lifecycle event is a `Stopped`; resolving Idle there
-    /// would mark an unfinished turn unread.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn recover_structured_unread_after_lag_keeps_running_for_work_past_the_stopped() {
-        use crate::acp::Event;
-        let prompt = || Event::UserPromptSent {
-            merged_prompt_ids: Vec::new(),
-            text: "go".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-            synthesized: false,
-            origin_plugin: None,
-            origin: crate::daemon::PromptOrigin::Unknown,
-        };
-        let stopped = || Event::Stopped {
-            reason: "prompt_complete".into(),
-        };
-        let cases: [(&str, Vec<Event>); 2] = [
-            (
-                "live background agent",
-                vec![
-                    prompt(),
-                    Event::BackgroundAgentLaunched {
-                        agent_id: "bg-1".into(),
-                        tool_call_id: "tc-1".into(),
-                        description: "map backend".into(),
-                        prompt: "do it".into(),
-                        model: "claude-opus-4-8".into(),
-                        output_file: "/tmp/bg-1.output".into(),
-                        started_at: crate::time::Timestamp::now(),
-                        workflow: None,
-                    },
-                    stopped(),
-                ],
-            ),
-            (
-                "newer turn past the stopped",
-                vec![
-                    prompt(),
-                    stopped(),
-                    Event::UserDiffCommentsPrompt {
-                        intro: "intro".into(),
-                        outro: "outro".into(),
-                        is_multi_repo: false,
-                        comments: Vec::new(),
-                        assembled_markdown: "diff".into(),
-                    },
-                ],
-            ),
-        ];
-        for (name, log) in cases {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-            crate::session::set_unread_enabled(true);
-
-            let profile = "acp-unread-lag-live-work";
-            let mut live = Instance::new("acp-live", "/tmp/acp");
-            live.view = crate::session::View::Structured;
-            live.source_profile = profile.to_string();
-            live.status = Status::Running;
-            let live_id = live.id.clone();
-            let rows = vec![live];
-            seed_profile_store(profile, rows.clone());
-
-            let state = test_support::build_test_app_state(vec![]);
-            for (seq, event) in (1..).zip(&log) {
-                state
-                    .acp_event_store
-                    .record(&live_id, seq, event)
-                    .expect("record");
+    async fn observed_frame(
+        publications: &mut broadcast::Receiver<AcpBroadcastFrame>,
+        id: &str,
+        matches: impl Fn(&Event) -> bool,
+    ) -> AcpBroadcastFrame {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = publications.recv().await.unwrap();
+                if frame.session_id == id && matches(&frame.event) {
+                    return frame;
+                }
             }
-
-            let instances = RwLock::new(rows);
-            let locks = RwLock::new(std::collections::HashMap::new());
-            let (status_tx, _rx) = broadcast::channel(16);
-
-            let marked = recover_structured_unread_after_lag(
-                &instances,
-                &state.session_service,
-                &locks,
-                crate::file_watch::FileWatchService::noop(),
-                &status_tx,
-            )
-            .await;
-
-            assert_eq!(marked, 0, "{name}: live work is not a turn end");
-            let guard = instances.read().await;
-            let inst = &guard[0];
-            assert_eq!(
-                inst.status,
-                Status::Running,
-                "{name}: the Stopped must not resolve Idle under live work"
-            );
-            assert!(
-                !inst.unread,
-                "{name}: an unfinished turn must not be marked unread"
-            );
-        }
+        })
+        .await
+        .expect("actual source publication arrives")
     }
 
-    #[tokio::test]
-    async fn acp_event_listener_tracks_load_session_capability_updates() {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        let mut inst = Instance::new("acp-session", "/tmp/acp");
-        inst.source_profile = "listener-capability".into();
-        inst.view = crate::session::View::Structured;
-        inst.acp_session_id = Some("same-acp-id".to_string());
-        let id = inst.id.clone();
-        crate::session::Storage::new_unwatched(&inst.source_profile)
-            .unwrap()
-            .update(|rows, _| {
-                rows.push(inst.clone());
-                Ok(())
-            })
-            .unwrap();
-        let state = test_support::build_test_app_state(vec![inst]);
-        let first_generation = state.acp_supervisor.test_insert_worker(&id).await;
-        let listener = tokio::spawn(acp_event_listener(state.clone()));
-
-        for _ in 0..500 {
-            if state.acp_events_tx.receiver_count() > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        assert!(state.acp_events_tx.receiver_count() > 0);
-
-        let send_capability = |seq, capable, worker_generation| {
-            state
-                .acp_events_tx
-                .send(AcpBroadcastFrame {
-                    session_id: id.clone(),
-                    seq,
-                    event: Arc::new(crate::acp::Event::PromptCapabilities {
-                        image: false,
-                        audio: false,
-                        embedded_context: false,
-                        load_session: Some(capable),
-                        steering: false,
-                    }),
-                    worker_generation: Some(worker_generation),
-                    sidebar_status: None,
-                })
-                .expect("listener is subscribed");
-        };
-
-        send_capability(1, true, first_generation);
-        for _ in 0..500 {
-            if state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_load_session_capable == Some(true))
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        assert!(
-            state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_load_session_capable == Some(true)),
-            "the active worker capability was not applied"
-        );
-
-        state.acp_supervisor.test_remove_worker(&id).await;
-        state
-            .instances
-            .write()
-            .await
-            .iter_mut()
-            .find(|inst| inst.id == id)
-            .expect("instance")
-            .acp_load_session_capable = None;
-        let second_generation = state.acp_supervisor.test_insert_worker(&id).await;
-        assert_ne!(first_generation, second_generation);
-
-        send_capability(2, false, first_generation);
-        state
-            .acp_events_tx
-            .send(AcpBroadcastFrame {
-                session_id: id.clone(),
-                seq: 3,
-                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
-                    acp_session_id: "replacement-acp-id".to_string(),
-                }),
-                worker_generation: None,
-                sidebar_status: None,
-            })
-            .expect("listener is subscribed");
-        for _ in 0..500 {
-            if state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_session_id.as_deref() == Some("replacement-acp-id"))
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        let instance = state
+    async fn start_projection_resource(
+        live: &mut crate::server::test_support::ManagedControlSession,
+        agent: bool,
+    ) -> std::path::PathBuf {
+        let workdir = live
+            .state
             .instances
             .read()
             .await
             .iter()
-            .find(|inst| inst.id == id)
-            .cloned()
-            .expect("instance");
-        assert_eq!(
-            instance.acp_session_id.as_deref(),
-            Some("replacement-acp-id"),
-            "the sentinel event behind the stale frame was not applied"
-        );
-        assert_eq!(
-            instance.acp_load_session_capable, None,
-            "a queued event from the replaced worker must be ignored"
-        );
-
-        send_capability(4, false, second_generation);
-        for _ in 0..500 {
-            if state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_load_session_capable == Some(false))
-            {
-                break;
+            .find(|row| row.id == live.id())
+            .unwrap()
+            .project_path
+            .clone();
+        let project = if agent {
+            std::path::PathBuf::from(&workdir)
+        } else {
+            let actual = live.client.actual();
+            let home = actual
+                .native_store
+                .as_ref()
+                .filter(|store| store.agent == "claude" && store.filesystem == "host")
+                .and_then(|store| store.stores.first())
+                .expect("the actual Claude Bash original declares its native store");
+            home.join("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &workdir,
+                ))
+        };
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = if agent {
+            project.join("projection-agent.jsonl")
+        } else {
+            project.join(format!("{}.jsonl", live.sid))
+        };
+        std::fs::write(&transcript, "").unwrap();
+        let response = if agent {
+            serde_json::json!({"toolName":"Agent","toolResponse":{
+                "agentId":"projection-agent","description":"keep working",
+                "prompt":"continue","resolvedModel":"test-model",
+                "outputFile":transcript,"status":"async_launched"
+            }})
+        } else {
+            serde_json::json!({"toolName":"Bash","toolResponse":{"backgroundTaskId":"projection-task"}})
+        };
+        live.native
+            .send(serde_json::json!({
+                "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,
+                    "update":{"sessionUpdate":"tool_call_update","toolCallId":"projection-tool",
+                        "_meta":{"claudeCode":response}}}
+            }))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = live.client.next_event().await.unwrap();
+                if matches!(event, Event::BackgroundAgentLaunched { .. }) && agent
+                    || matches!(event, Event::BackgroundTaskStarted { .. }) && !agent
+                {
+                    break;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
+        })
+        .await
+        .expect("actual Native resource starts");
+        let history = live
+            .state
+            .acp_event_store
+            .replay_from(live.id(), 0)
+            .unwrap();
+        let launch = history
+            .iter()
+            .find(|stored| {
+                matches!(stored.event.as_ref(), Event::BackgroundAgentLaunched { .. }) && agent
+                    || matches!(stored.event.as_ref(), Event::BackgroundTaskStarted { .. })
+                        && !agent
+            })
+            .unwrap();
         assert!(
-            state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|inst| inst.id == id)
-                .is_some_and(|inst| inst.acp_load_session_capable == Some(false)),
-            "the replacement worker capability was not applied"
+            launch.metadata.resource_witness.is_some(),
+            "actual first-I/O resource custody"
         );
-
-        listener.abort();
-        let _ = listener.await;
+        transcript
     }
 
-    #[tokio::test]
-    async fn a_retired_workers_assigned_id_does_not_wake_a_committed_stop() {
-        for live in [false, true] {
-            let _app_dir = crate::session::test_support::isolate_app_dir();
-            let mut inst = Instance::new("acp-session", "/tmp/acp");
-            inst.source_profile = "listener-retired-identity".into();
-            inst.view = crate::session::View::Structured;
-            inst.status = Status::Stopped;
-            inst.idle_dormant_since = Some(crate::time::Timestamp::now());
-            let id = inst.id.clone();
-            let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
-            storage
-                .update(|rows, _| {
-                    rows.push(inst.clone());
-                    Ok(())
-                })
-                .unwrap();
-            let state = test_support::build_test_app_state(vec![inst]);
-            let generation = state.acp_supervisor.test_insert_worker(&id).await;
-            if !live {
-                state.acp_supervisor.test_remove_worker(&id).await;
-            }
-            let listener = tokio::spawn(acp_event_listener(state.clone()));
-            for _ in 0..500 {
-                if state.acp_events_tx.receiver_count() > 0 {
+    async fn finish_projection_resource(
+        live: &mut crate::server::test_support::ManagedControlSession,
+        path: &std::path::Path,
+        agent: bool,
+    ) {
+        let line = if agent {
+            serde_json::json!({"type":"assistant","message":{"stop_reason":"end_turn",
+                "content":[{"type":"text","text":"done"}]}})
+        } else {
+            serde_json::json!({"type":"user","message":{"content":
+                "<task-notification>\n<task-id>projection-task</task-id>\n<tool-use-id>projection-tool</tool-use-id>\n<status>completed</status>\n</task-notification>"}})
+        };
+        std::fs::write(path, format!("{line}\n")).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = live.client.next_event().await.unwrap();
+                if matches!(event, Event::BackgroundAgentCompleted { .. }) && agent
+                    || matches!(event, Event::BackgroundTaskFinished { .. }) && !agent
+                {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
-            state
-                .acp_events_tx
-                .send(AcpBroadcastFrame {
-                    session_id: id.clone(),
-                    seq: 1,
-                    event: Arc::new(crate::acp::Event::AcpSessionAssigned {
-                        acp_session_id: "assigned-acp-id".to_string(),
-                    }),
-                    worker_generation: Some(generation),
-                    sidebar_status: Some(Status::Idle),
-                })
-                .expect("listener is subscribed");
-            let on_disk = || {
-                storage
-                    .load()
-                    .unwrap()
-                    .into_iter()
-                    .find(|row| row.id == id)
-                    .expect("row")
-            };
-            for _ in 0..500 {
-                if on_disk().acp_session_id.as_deref() == Some("assigned-acp-id") {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-            let memory = state
-                .instances
-                .read()
-                .await
-                .iter()
-                .find(|row| row.id == id)
-                .cloned()
-                .expect("instance");
-            let disk = on_disk();
-            assert_eq!(
-                disk.acp_session_id.as_deref(),
-                Some("assigned-acp-id"),
-                "live={live}: the assigned id is kept for a later resume"
-            );
-            let expected = if live { Status::Idle } else { Status::Stopped };
-            assert_eq!(memory.status, expected, "live={live}");
-            assert_eq!(
-                memory.idle_dormant_since.is_some(),
-                !live,
-                "live={live}: only a live worker ends dormancy in memory"
-            );
-            assert_eq!(
-                disk.idle_dormant_since.is_some(),
-                !live,
-                "live={live}: only a live worker ends dormancy on disk"
-            );
-            listener.abort();
-            let _ = listener.await;
-        }
+        })
+        .await
+        .expect("actual resource transcript completes");
     }
-    /// End to end over `acp_event_listener` itself, the path that actually
-    /// closes #3181. The predicate table and the TUI ownership tests all pass
-    /// even if the snapshot is taken *after* `apply_status_intent`, the persist
-    /// is dropped, or the mirror is reordered, because none of them run the
-    /// listener. This one drives a real `Event::Stopped` frame through the
-    /// broadcast and asserts both halves of the write.
+
+    /// Lag recovery keeps genuinely owned background work and newer turns running.
     #[tokio::test]
     #[serial_test::serial]
-    async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-        crate::session::set_unread_enabled(true);
-
-        let profile = "acp-listener-turn-end";
-        let mut inst = Instance::new("acp-session", "/tmp/acp");
-        inst.view = crate::session::View::Structured;
-        inst.source_profile = profile.to_string();
-        // Mid-turn, so the incoming Stopped is a real Running -> Idle edge.
-        inst.status = Status::Running;
-        let id = inst.id.clone();
-        seed_profile_store(profile, vec![inst.clone()]);
-
-        let state = test_support::build_test_app_state(vec![inst]);
-        // Events are persisted before they are broadcast.
-        let stopped = crate::acp::Event::Stopped {
-            reason: "prompt_complete".into(),
-        };
-        state
-            .acp_event_store
-            .record(&id, 1, &stopped)
-            .expect("record");
-        let listener = tokio::spawn(acp_event_listener(state.clone()));
-
-        // A broadcast only reaches receivers that subscribed before the send,
-        // and the spawned listener subscribes as its first act. Wait for that
-        // rather than racing it; nothing else in this test subscribes, so the
-        // count reaching 1 is precisely "the listener is listening".
-        for _ in 0..500 {
-            if state.acp_events_tx.receiver_count() > 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        assert!(
-            state.acp_events_tx.receiver_count() > 0,
-            "listener never subscribed"
-        );
-
-        // The turn ends.
-        state
-            .acp_events_tx
-            .send(AcpBroadcastFrame {
-                session_id: id.clone(),
-                seq: 1,
-                event: Arc::new(stopped),
-                worker_generation: None,
-                sidebar_status: None,
+    async fn recover_structured_unread_after_lag_keeps_running_for_work_past_the_stopped() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        for background in [false, true] {
+            with_managed(|scope| {
+                Box::pin(async move {
+                    crate::session::set_unread_enabled(true);
+                    let mut live = test_support::managed_control_session(
+                        scope,
+                        "lag-live-work",
+                        if background { "gemini" } else { "claude" },
+                        None,
+                    )
+                    .await;
+                    let id = live.id().to_owned();
+                    let request = live.start_prompt("go").await;
+                    if background {
+                        start_projection_resource(&mut live, true).await;
+                    }
+                    live.finish_prompt(&request, None).await;
+                    if !background {
+                        live.start_prompt("newer turn").await;
+                    }
+                    live.state.acp_control_cache.forget(&id);
+                    live.state
+                        .instances
+                        .write()
+                        .await
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .status = Status::Running;
+                    let marked = recover_structured_unread_after_lag(
+                        &live.state.instances,
+                        &live.state.session_service,
+                        &live.state.instance_locks,
+                        live.state.file_watch.clone(),
+                        &live.state.status_tx,
+                    )
+                    .await;
+                    assert_eq!(marked, 0, "live work is not a turn end");
+                    let rows = live.state.instances.read().await;
+                    let row = rows.iter().find(|row| row.id == id).unwrap();
+                    assert_eq!(row.status, Status::Running);
+                    assert!(!row.unread, "unfinished work must not become unread");
+                })
             })
-            .expect("listener is subscribed");
-
-        // The listener owns the write, so poll rather than sleeping a fixed
-        // interval: the persist is a real flock'd file write. Wait on the
-        // *mirror*, which is the last step, so this cannot abort the listener
-        // in between the disk write and the mirror and then blame the mirror.
-        let mut mirrored = false;
-        for _ in 0..500 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if state
-                .instances
-                .read()
-                .await
-                .iter()
-                .any(|i| i.id == id && i.unread)
-            {
-                mirrored = true;
-                break;
-            }
+            .await;
         }
-        listener.abort();
-        let _ = listener.await;
-
-        assert!(
-            mirrored,
-            "daemon memory must mirror the mark, so /api/sessions reports it"
-        );
-        assert!(
-            load_profile_row(profile, &id).is_some_and(|i| i.unread),
-            "and the mark must be durable, which is the #3181 fix; a memory-only \
-             mark is dropped by the next reload"
-        );
-        let instances = state.instances.read().await;
-        let row = instances.iter().find(|i| i.id == id).expect("row present");
-        assert_eq!(row.status, Status::Idle, "the Stopped applied");
     }
 
-    /// The fold runs ahead of the listener, so a burst already folded to its
-    /// end must still replay each frame's own transition: Waiting -> Running on
-    /// the answer, then Running -> Idle on the stop, which is the edge the
-    /// unread mark needs.
+    #[tokio::test]
+    async fn acp_event_listener_tracks_only_actual_current_load_session_capability() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let state = scope.state.clone();
+                let listener = start_managed_listener(scope, &state).await;
+                let live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "listener-capability",
+                    "claude",
+                    None,
+                )
+                .await;
+                let id = live.id().to_owned();
+                let row = await_row(
+                    &state,
+                    &id,
+                    |row| row.acp_load_session_capable == Some(true),
+                    "actual initialize capability reaches the row",
+                )
+                .await;
+                assert_eq!(row.acp_load_session_capable, Some(true));
+                let before = state.acp_event_store.highest_seq(&id).unwrap();
+                let history = crate::acp::Event::PromptCapabilities {
+                    image: false,
+                    audio: false,
+                    embedded_context: false,
+                    load_session: Some(false),
+                    steering: false,
+                };
+                let metadata = crate::acp::event_sender::EventMetadata::history();
+                state
+                    .acp_event_store
+                    .record(&id, before + 1, &history, &metadata)
+                    .unwrap();
+                state
+                    .acp_events_tx
+                    .send(AcpBroadcastFrame::from_qualified(
+                        id.clone(),
+                        before + 1,
+                        Arc::new(history),
+                        &metadata,
+                        Some(live.client.lease.epoch()),
+                        None,
+                        None,
+                    ))
+                    .unwrap();
+                state
+                    .acp_supervisor
+                    .hydrate_seqs(state.acp_event_store.all_session_seqs().unwrap());
+                let request_count = live.native.requests().len();
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .acp_load_session_capable,
+                    Some(true)
+                );
+                assert_eq!(live.native.requests().len(), request_count);
+                listener.abort();
+                let _ = listener.await;
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retired_workers_assigned_id_does_not_wake_a_committed_stop() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut publications = scope.state.acp_events_tx.subscribe();
+                let live = test_support::managed_control_session(
+                    scope,
+                    "listener-retired-identity",
+                    "claude",
+                    None,
+                )
+                .await;
+                let state = live.state.clone();
+                let id = live.id().to_owned();
+                await_row(
+                    &state,
+                    &id,
+                    Instance::launch_is_finalized,
+                    "the actual original launch finalizes before Stop",
+                )
+                .await;
+                let frame = observed_frame(&mut publications, &id, |event| {
+                    matches!(
+                        event,
+                        Event::AcpSessionAssigned {
+                            connection_ready: true,
+                            ..
+                        }
+                    )
+                })
+                .await;
+                assert_ne!(
+                    frame.scope,
+                    crate::acp::protocol::AcpEventScope::HistoryOnly
+                );
+                assert_eq!(frame.worker_generation, Some(live.client.lease.epoch()));
+                let gate = pause_assignment_listener_for_test(&id, frame.seq);
+                let listener = start_managed_listener(scope, &state).await;
+                state.acp_events_tx.send(frame).unwrap();
+                let timeout = std::time::Duration::from_secs(5);
+                tokio::time::timeout(timeout, gate.arrived)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let namespace = state.profile_namespace.read().await;
+                let submission = state.session_service.prompt_submission(&id).await;
+                let instance = state.instance_lock(&id).await;
+                let mutation = instance.lock().await;
+                crate::server::api::sessions::stop_structured_with_commit(
+                    &state,
+                    "test".into(),
+                    &id,
+                )
+                .await
+                .unwrap_or_else(|response| panic!("Stop failed: {}", response.status()));
+                let stopped = load_profile_row("test", &id).unwrap();
+                assert_eq!(stopped.status, Status::Stopped);
+                assert!(state.acp_supervisor.current_lease(&id).is_none());
+                drop(mutation);
+                drop(submission);
+                drop(namespace);
+                gate.release.send(()).unwrap();
+                tokio::time::timeout(timeout, gate.applied)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                listener.abort();
+                let _ = listener.await;
+                let memory = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .clone();
+                let disk = load_profile_row("test", &id).unwrap();
+                for row in [&memory, &disk] {
+                    assert_eq!(row.status, Status::Stopped);
+                    assert_eq!(row.idle_dormant_since, stopped.idle_dormant_since);
+                    assert_eq!(row.acp_session_id, stopped.acp_session_id);
+                    assert_eq!(row.lifecycle_generation, stopped.lifecycle_generation);
+                    assert!(stopped.conversation_state().matches(row));
+                }
+            })
+        })
+        .await;
+    }
+    /// A genuine answer and terminal remain distinct when the listener trails the fold.
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_event_listener_keeps_the_running_to_idle_edge_across_a_folded_burst() {
-        use crate::acp::approvals::ApprovalDecision;
-        use crate::acp::permissions::build_approval;
-        use crate::acp::state::ToolCall;
-        use crate::acp::Event;
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-        crate::session::set_unread_enabled(true);
-
-        let profile = "acp-listener-burst";
-        let mut inst = Instance::new("acp-burst", "/tmp/acp");
-        inst.view = crate::session::View::Structured;
-        inst.source_profile = profile.to_string();
-        inst.status = Status::Waiting;
-        let id = inst.id.clone();
-        seed_profile_store(profile, vec![inst.clone()]);
-        let state = test_support::build_test_app_state(vec![inst]);
-
-        let approval = build_approval(
-            ToolCall {
-                prompt: None,
-                id: "t".into(),
-                name: "shell".into(),
-                kind: "execute".into(),
-                args_preview: "{}".into(),
-                started_at: crate::time::Timestamp::now(),
-                parent_tool_call_id: None,
-                memory_recall: None,
-                diffs: Vec::new(),
-            },
-            Vec::new(),
-        );
-        let answered = Event::ApprovalResolved {
-            nonce: approval.nonce.clone(),
-            decision: ApprovalDecision::Allow,
-        };
-        let stopped = Event::Stopped {
-            reason: "prompt_complete".into(),
-        };
-        let log = [
-            crate::acp::state::test_support::prompt("go"),
-            Event::ApprovalRequested { approval },
-            answered.clone(),
-            stopped.clone(),
-        ];
-        for (seq, event) in (1..).zip(&log) {
-            state
-                .acp_event_store
-                .record(&id, seq, event)
-                .expect("record");
-        }
-
-        let listener = tokio::spawn(acp_event_listener(state.clone()));
-        await_subscribed(&state).await;
-        // Both frames are queued behind a log that already holds the stop.
-        for (seq, event) in [(3, answered), (4, stopped)] {
-            state
-                .acp_events_tx
-                .send(AcpBroadcastFrame {
-                    session_id: id.clone(),
-                    seq,
-                    event: Arc::new(event),
-                    worker_generation: None,
-                    sidebar_status: None,
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use std::time::Duration;
+        with_managed(|scope| {
+            Box::pin(async move {
+                crate::session::set_unread_enabled(true);
+                let mut live = test_support::managed_control_session(
+                    scope,
+                    "listener-approved-burst",
+                    "claude",
+                    None,
+                )
+                .await;
+                let state = live.state.clone();
+                let id = live.id().to_owned();
+                let listener = start_managed_listener(scope, &state).await;
+                let request = live.start_prompt("go").await;
+                live.native
+                    .send(
+                        serde_json::json!({"jsonrpc":"2.0","id":"folded-burst-permission",
+                "method":"session/request_permission","params":{"sessionId":live.sid,
+                "toolCall":{"toolCallId":"burst-tool","title":"Wait for user"},
+                "options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}),
+                    )
+                    .await;
+                let nonce = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if let Some(Event::ApprovalRequested { approval }) =
+                            live.client.next_event().await
+                        {
+                            break approval.nonce;
+                        }
+                    }
                 })
-                .expect("listener is subscribed");
-        }
-
-        let row = await_row(
-            &state,
-            &id,
-            |i| i.unread,
-            "the burst's turn end must mark the row unread",
-        )
+                .await
+                .expect("the actual Original callback publishes its answerable nonce");
+                await_row(
+                    &state,
+                    &id,
+                    |row| row.status == Status::Waiting,
+                    "the original callback genuinely enters Waiting",
+                )
+                .await;
+                let locked = state.clone();
+                let mirror = locked.instances.write().await;
+                state
+                    .acp_supervisor
+                    .resolve_permission(
+                        &id,
+                        nonce,
+                        crate::acp::approvals::ApprovalDecision::Allow,
+                        Some("allow".into()),
+                    )
+                    .await
+                    .unwrap();
+                let reply = tokio::time::timeout(Duration::from_secs(10), live.native.reply())
+                    .await
+                    .unwrap();
+                assert_eq!(reply["id"], "folded-burst-permission");
+                assert_eq!(reply["result"]["outcome"]["optionId"], "allow");
+                live.finish_prompt(&request, None).await;
+                assert_eq!(
+                    state.acp_event_store.has_in_flight_main_turn(&id).unwrap(),
+                    crate::acp::event_store::ControlKnowledge::Known(false)
+                );
+                assert!(state
+                    .acp_event_store
+                    .unresolved_approval_nonces(&id)
+                    .is_empty());
+                drop(mirror);
+                let row = await_row(
+                    &state,
+                    &id,
+                    |row| row.unread,
+                    "the burst's genuine Waiting-to-Running-to-Idle edge marks unread",
+                )
+                .await;
+                assert_eq!(row.status, Status::Idle);
+                assert!(load_profile_row("test", &id).unwrap().unread);
+                listener.abort();
+                let _ = listener.await;
+            })
+        })
         .await;
-        listener.abort();
-        let _ = listener.await;
-        assert_eq!(row.status, Status::Idle);
-        assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
+    }
+
+    /// The real original terminal durably marks unread and mirrors it into daemon memory.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                crate::session::set_unread_enabled(true);
+                let mut live = test_support::managed_control_session(
+                    scope,
+                    "listener-turn-end",
+                    "claude",
+                    None,
+                )
+                .await;
+                let state = live.state.clone();
+                let id = live.id().to_owned();
+                let listener = start_managed_listener(scope, &state).await;
+                let request = live.start_prompt("finish this turn").await;
+                await_row(
+                    &state,
+                    &id,
+                    |row| row.status == Status::Running,
+                    "actual prompt opens the turn",
+                )
+                .await;
+                live.finish_prompt(&request, None).await;
+                let row = await_row(
+                    &state,
+                    &id,
+                    |row| row.unread,
+                    "durable unread mark reaches memory",
+                )
+                .await;
+                assert_eq!(row.status, Status::Idle);
+                assert!(load_profile_row("test", &id).unwrap().unread);
+                listener.abort();
+                let _ = listener.await;
+            })
+        })
+        .await;
     }
 
     /// A frame far behind the fold keeps its own transition: ApprovalResolved
@@ -2046,327 +3232,183 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_event_listener_keeps_the_edge_for_a_frame_far_behind_the_fold() {
-        use crate::acp::approvals::ApprovalDecision;
-        use crate::acp::permissions::build_approval;
-        use crate::acp::state::test_support::prompt;
-        use crate::acp::state::ToolCall;
-        use crate::acp::Event;
-        for (retained, content_frames) in [(2000usize, 255usize), (2000, 600), (42, 600)] {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-            crate::session::set_unread_enabled(true);
-
-            let profile = "acp-listener-window";
-            let mut inst = Instance::new("acp-window", "/tmp/acp");
-            inst.view = crate::session::View::Structured;
-            inst.source_profile = profile.to_string();
-            inst.status = Status::Waiting;
-            let id = inst.id.clone();
-            seed_profile_store(profile, vec![inst.clone()]);
-            let store = Arc::new(
-                crate::acp::event_store::EventStore::open(&temp.path().join("acp.db"), retained)
-                    .expect("event store"),
-            );
-            let state = test_support::build_test_app_state_impl_with_event_store(
-                vec![inst],
-                Vec::new(),
-                Vec::new(),
-                None,
-                Some(store),
-                |_| {},
-                std::convert::identity,
-            );
-
-            let tool_call = ToolCall {
-                prompt: None,
-                id: "t".into(),
-                name: "shell".into(),
-                kind: "execute".into(),
-                args_preview: "{}".into(),
-                started_at: crate::time::Timestamp::now(),
-                parent_tool_call_id: None,
-                memory_recall: None,
-                diffs: Vec::new(),
-            };
-            let approval = build_approval(tool_call, Vec::new());
-            let answered = Event::ApprovalResolved {
-                nonce: approval.nonce.clone(),
-                decision: ApprovalDecision::Allow,
-            };
-            let stopped = Event::Stopped {
-                reason: "prompt_complete".into(),
-            };
-            // Hydrate, then fold the whole window ahead of the listener: the answer
-            // at seq 3, `content_frames` content frames, then the stop.
-            let mut log = vec![prompt("go"), Event::ApprovalRequested { approval }];
-            log.push(answered.clone());
-            log.extend((0..content_frames).map(|i| Event::ToolCallContent {
-                tool_call_id: "t".into(),
-                content: format!("out {i}"),
-            }));
-            log.push(stopped.clone());
-            for (seq, event) in (1..).zip(&log[..2]) {
-                state
-                    .acp_event_store
-                    .record(&id, seq, event)
-                    .expect("record");
-            }
-            state.session_service.fold_control_state(&id).await;
-            // What the sink does: record, fold, and keep the status after each seq.
-            let mut folded = Vec::new();
-            for (seq, event) in (3..).zip(&log[2..]) {
-                state
-                    .acp_event_store
-                    .record(&id, seq, event)
-                    .expect("record");
-                folded.push(state.acp_control_cache.apply_if_cached(&id, seq, event));
-            }
-            let last = log.len() as u64;
-            let answered_status = folded[0];
-            let stopped_status = *folded.last().expect("folded");
-            assert_eq!(answered_status, Some(Status::Running));
-            assert_eq!(stopped_status, Some(Status::Idle));
-
-            let listener = tokio::spawn(acp_event_listener(state.clone()));
-            await_subscribed(&state).await;
-            for (seq, event, sidebar_status) in [
-                (3, answered, answered_status),
-                (last, stopped, stopped_status),
-            ] {
-                state
-                    .acp_events_tx
-                    .send(AcpBroadcastFrame {
-                        session_id: id.clone(),
-                        seq,
-                        event: Arc::new(event),
-                        worker_generation: None,
-                        sidebar_status,
-                    })
-                    .expect("listener is subscribed");
-            }
-
-            let row = await_row(
-                &state,
-                &id,
-                |i| i.unread,
-                "the stop behind the fold must mark the row unread",
-            )
-            .await;
-            listener.abort();
-            let _ = listener.await;
-            assert_eq!(
-                row.status,
-                Status::Idle,
-                "{content_frames} frames, retention {retained}"
-            );
-            assert!(load_profile_row(profile, &id).is_some_and(|i| i.unread));
+        use crate::acp::supervisor::test_support::managed::with_managed_retention;
+        for (retained, content_frames) in [(2000_usize, 8_usize), (2000, 24), (8, 24)] {
+            with_managed_retention(retained, |scope| Box::pin(async move {
+                    crate::session::set_unread_enabled(true);
+                    let mut live = crate::server::test_support::managed_control_session(scope, "listener-fold-window", "claude", None).await;
+                    let id = live.id().to_owned();
+                    let listener = start_managed_listener(scope, &live.state).await;
+                    let request = live.start_prompt("go").await;
+                    let locked = live.state.clone();
+                    let mirror = locked.instances.write().await;
+                    for index in 0..content_frames {
+                        live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text","text":format!("out {index}")}}
+                        }})).await;
+                    }
+                    live.finish_prompt(&request, None).await;
+                    let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                    assert!(frontier > content_frames as u64);
+                    drop(mirror);
+                    let row = await_row(&live.state, &id, |row| row.unread,
+                        "queued genuine running-to-idle transition marks unread").await;
+                    assert_eq!(row.status, Status::Idle);
+                    let durable = crate::session::Storage::open_reference("test").unwrap().load().unwrap();
+                    assert!(durable.iter().find(|row| row.id == id).unwrap().unread);
+                    listener.abort();
+                    let _ = listener.await;
+                })).await;
         }
     }
 
-    /// A startup error whose event-store write failed is substituted by the
-    /// sink and never reaches the log or the fold; the frame alone must still
-    /// move the row to Error.
+    /// Replay-only diagnostics cannot overwrite current runtime status.
     #[tokio::test]
     #[serial_test::serial]
-    async fn acp_event_listener_applies_a_startup_error_that_never_reached_the_log() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+    async fn acp_event_listener_ignores_a_historical_startup_error_outside_the_log() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("acp-unpersisted", "/tmp/acp");
         inst.view = crate::session::View::Structured;
         inst.status = Status::Idle;
         let id = inst.id.clone();
         let state = test_support::build_test_app_state(vec![inst]);
-
         let listener = tokio::spawn(acp_event_listener(state.clone()));
         await_subscribed(&state).await;
-        state
-            .acp_events_tx
-            .send(AcpBroadcastFrame {
-                session_id: id.clone(),
-                seq: 7,
-                event: Arc::new(crate::acp::Event::startup_error(
-                    "event store write failed at seq 7",
-                )),
-                worker_generation: None,
-                sidebar_status: None,
-            })
-            .expect("listener is subscribed");
-
-        let row = await_row(
-            &state,
-            &id,
-            |i| i.status == Status::Error,
-            "a non-persisted startup error must turn the row Error",
-        )
-        .await;
+        let event = Arc::new(Event::AgentStartupError {
+            message: "retained startup diagnostic".into(),
+            native_subject: None,
+            cause: None,
+        });
+        let gate = assignment_listener_gate_for_test(&id, Some(8));
+        for (seq, event) in [
+            (7, event),
+            (
+                8,
+                Arc::new(Event::AcpSessionAssigned {
+                    acp_session_id: "history-only".into(),
+                    connection_ready: false,
+                    native_subject: None,
+                }),
+            ),
+        ] {
+            state
+                .acp_events_tx
+                .send(AcpBroadcastFrame::from_qualified(
+                    id.clone(),
+                    seq,
+                    event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                    None,
+                    None,
+                    None,
+                ))
+                .unwrap();
+        }
+        gate.arrived.await.unwrap();
+        assert_eq!(state.instances.read().await[0].status, Status::Idle);
+        gate.release.send(()).unwrap();
+        gate.applied.await.unwrap();
+        assert_eq!(state.acp_event_store.highest_seq(&id).unwrap(), 0);
         listener.abort();
         let _ = listener.await;
-        assert_eq!(row.status, Status::Error);
     }
 
-    /// #4001: after a daemon restart the control cache is cold. A reattached
-    /// worker's first live frame is either its sub-agent's completion with the
-    /// main turn still open, or the main turn's `Stopped` with the sub-agent
-    /// still running. Projecting a cold fold would resolve Idle and mark the
-    /// still-open work unread, so the listener hydrates the whole log first
-    /// and the row stays Running.
+    /// A cold fold reuses actual Native provenance, including live resource custody.
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_event_listener_rebuilds_a_frame_published_to_a_cold_cache() {
-        use crate::acp::Event;
-        let completed = Event::BackgroundAgentCompleted {
-            agent_id: "bg-1".into(),
-            status: crate::acp::state::BackgroundAgentStatus::Completed,
-            tools: Vec::new(),
-            result: Some("done".into()),
-            warning: None,
-            ended_at: crate::time::Timestamp::now(),
-        };
-        let stopped = Event::Stopped {
-            reason: "prompt_complete".into(),
-        };
-        let cases: [(&str, Event); 2] = [
-            ("mid-turn completion", completed),
-            ("stopped with an outstanding agent", stopped),
-        ];
-        for (name, live_frame) in cases {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-            crate::session::set_unread_enabled(true);
-
-            let profile = "acp-listener-cold";
-            let mut inst = Instance::new("acp-cold", "/tmp/acp");
-            inst.view = crate::session::View::Structured;
-            inst.source_profile = profile.to_string();
-            // Seeded Idle, so the poll below must observe the listener drive
-            // Idle -> Running; a Running seed would pass without the fix.
-            inst.status = Status::Idle;
-            let id = inst.id.clone();
-            seed_profile_store(profile, vec![inst.clone()]);
-
-            let state = test_support::build_test_app_state(vec![inst]);
-
-            // The pre-restart log, persisted but never folded into this cold cache.
-            let log = [
-                Event::UserPromptSent {
-                    merged_prompt_ids: Vec::new(),
-                    text: "spawn and go".into(),
-                    attachments: Vec::new(),
-                    prompt_id: None,
-                    synthesized: false,
-                    origin_plugin: None,
-                    origin: crate::daemon::PromptOrigin::Unknown,
-                },
-                Event::BackgroundAgentLaunched {
-                    agent_id: "bg-1".into(),
-                    tool_call_id: "tc-1".into(),
-                    description: "map backend".into(),
-                    prompt: "do it".into(),
-                    model: "claude-opus-4-8".into(),
-                    output_file: "/tmp/bg-1.output".into(),
-                    started_at: crate::time::Timestamp::now(),
-                    workflow: None,
-                },
-                live_frame.clone(),
-            ];
-            for (seq, event) in (1..).zip(&log) {
-                state
-                    .acp_event_store
-                    .record(&id, seq, event)
-                    .expect("record");
-            }
-            assert!(
-                !state.acp_control_cache.is_hydrated(&id),
-                "{name}: precondition: a fresh process starts with a cold cache"
-            );
-
-            let listener = tokio::spawn(acp_event_listener(state.clone()));
-            // A broadcast only reaches receivers that subscribed before the send,
-            // and the spawned listener subscribes as its first act. Wait for that
-            // rather than racing it; nothing else in this test subscribes, so the
-            // count reaching 1 is precisely "the listener is listening".
-            for _ in 0..500 {
-                if state.acp_events_tx.receiver_count() > 0 {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-            assert!(
-                state.acp_events_tx.receiver_count() > 0,
-                "listener never subscribed"
-            );
-            state
-                .acp_events_tx
-                .send(AcpBroadcastFrame {
-                    session_id: id.clone(),
-                    seq: 3,
-                    event: Arc::new(live_frame),
-                    worker_generation: None,
-                    sidebar_status: None,
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        for main_running in [false, true] {
+            with_managed(|scope| {
+                Box::pin(async move {
+                    crate::session::set_unread_enabled(true);
+                    let mut live = test_support::managed_control_session(
+                        scope,
+                        "listener-cold",
+                        "gemini",
+                        None,
+                    )
+                    .await;
+                    let state = live.state.clone();
+                    let id = live.id().to_owned();
+                    let mut publications = state.acp_events_tx.subscribe();
+                    let request = live.start_prompt("spawn and go").await;
+                    let path = start_projection_resource(&mut live, true).await;
+                    state.acp_control_cache.forget(&id);
+                    assert!(!state.acp_control_cache.is_hydrated(&id));
+                    if main_running {
+                        finish_projection_resource(&mut live, &path, true).await;
+                    } else {
+                        live.finish_prompt(&request, None).await;
+                    }
+                    let frame = observed_frame(&mut publications, &id, |event| {
+                        if main_running {
+                            matches!(event, Event::BackgroundAgentCompleted { .. })
+                        } else {
+                            matches!(event, Event::Stopped { .. })
+                        }
+                    })
+                    .await;
+                    assert!(
+                        frame.sidebar_status.is_none(),
+                        "the source really published to a cold cache"
+                    );
+                    state
+                        .instances
+                        .write()
+                        .await
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .status = Status::Idle;
+                    let listener = start_managed_listener(scope, &state).await;
+                    state.acp_events_tx.send(frame).unwrap();
+                    let row = await_row(
+                        &state,
+                        &id,
+                        |row| row.status == Status::Running,
+                        "cold fold must preserve genuinely open work",
+                    )
+                    .await;
+                    assert!(!row.unread);
+                    assert!(state.acp_control_cache.is_hydrated(&id));
+                    assert_eq!(
+                        state
+                            .session_service
+                            .fold_control_state(&id)
+                            .await
+                            .unwrap()
+                            .sidebar_status(),
+                        Status::Running
+                    );
+                    listener.abort();
+                    let _ = listener.await;
                 })
-                .expect("listener is subscribed");
-
-            // Status is the discriminating signal: `should_mark_acp_unread` only
-            // marks off an old Running, so unread cannot flip from the Idle seed.
-            let mut resolved = false;
-            for _ in 0..500 {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                let instances = state.instances.read().await;
-                if instances
-                    .iter()
-                    .any(|i| i.id == id && i.status == Status::Running)
-                {
-                    resolved = true;
-                    break;
-                }
-            }
-            listener.abort();
-
-            assert!(
-                resolved,
-                "{name}: live work must not drop to Idle off a cold-cache miss"
-            );
-            assert!(
-                !state.instances.read().await[0].unread,
-                "{name}: a resolved live turn must not be unread"
-            );
-            assert!(state.acp_control_cache.is_hydrated(&id), "{name}");
-            assert_eq!(
-                state.acp_control_cache.sidebar_status(&id),
-                Some(Status::Running),
-                "{name}"
-            );
+            })
+            .await;
         }
     }
 
-    // #2237: a worker coming live (AcpSessionAssigned) must clear a stale
-    // idle-dormant marker, even when the acp_session_id is unchanged (a
-    // session/load reattach reuses it). Without this, a stale marker left by a
-    // non-user respawn keeps the reconciler's resume filter skipping the
-    // session forever once the worker dies, deadlocking a queued prompt.
     #[test]
-    fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.view = crate::session::View::Structured;
-        inst.acp_session_id = Some("sid-1".to_string());
-        inst.idle_dormant_since = Some(crate::time::Timestamp::now());
-
-        // Same id as already stored: the only reason to persist is the
-        // stale-dormant clear, so the function must return Some(profile).
-        let persist = apply_acp_session_change(
-            &mut inst,
-            "seed",
-            Some(&AcpSessionChange::Assigned("sid-1".to_string())),
-            true,
-        );
-        assert!(
-            inst.idle_dormant_since.is_none(),
-            "dormant marker must be cleared when a worker (re)assigns"
-        );
-        assert!(
-            persist.is_some(),
-            "clearing a stale marker must trigger a persist even on an unchanged id"
-        );
+    fn acp_session_assigned_preserves_dormancy_on_first_and_same_id() {
+        for previous in [None, Some("sid-1")] {
+            let mut inst = Instance::new("seed", "/tmp/seed");
+            inst.view = crate::session::View::Structured;
+            inst.acp_session_id = previous.map(str::to_owned);
+            let dormant = crate::time::Timestamp::now();
+            inst.idle_dormant_since = Some(dormant);
+            let persist = apply_acp_session_change(
+                &mut inst,
+                "seed",
+                Some(&AcpSessionChange::Assigned("sid-1".to_string())),
+                false,
+                false,
+            );
+            assert_eq!(inst.idle_dormant_since, Some(dormant));
+            assert_eq!(inst.acp_session_id.as_deref(), Some("sid-1"));
+            assert_eq!(persist.is_some(), previous.is_none());
+        }
     }
 
     // A structured fork mints a brand-new child id on its first session/fork,
@@ -2386,6 +3428,7 @@ mod tests {
             &mut inst,
             "sess-1",
             Some(&AcpSessionChange::Assigned("forked-child-id".into())),
+            true,
             true,
         );
 
@@ -2421,6 +3464,7 @@ mod tests {
             "sess-1",
             Some(&AcpSessionChange::Assigned("some-new-id".into())),
             true,
+            true,
         );
 
         assert_eq!(inst.acp_session_id.as_deref(), Some("some-new-id"));
@@ -2435,65 +3479,6 @@ mod tests {
         );
     }
 
-    // A SessionContextReset that finds a structured fork still pending clears the
-    // one-shot fork marker (and its paired import marker) with the conversation it
-    // seeded. A refused session/fork emits no reset (the spawn fails and keeps the
-    // seed); the reset carries no new id, so acp_session_id is cleared too.
-    #[test]
-    fn reset_clears_fork_pending_and_import_pending() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.view = crate::session::View::Structured;
-        inst.acp_session_id = Some("stale-parent-id".into());
-        inst.fork_pending = Some("parent-acp-id".into());
-        inst.import_pending = Some(true);
-
-        let profile = apply_acp_session_change(
-            &mut inst,
-            "sess-1",
-            Some(&AcpSessionChange::Reset("context reset".into())),
-            true,
-        );
-
-        assert_eq!(inst.acp_session_id, None, "reset clears the stored id");
-        assert_eq!(
-            inst.fork_pending, None,
-            "a failed fork's one-shot marker must clear so it is not retried"
-        );
-        assert_eq!(
-            inst.import_pending, None,
-            "import_pending is consumed alongside fork_pending on reset"
-        );
-        assert!(profile.is_some(), "the reset must persist");
-    }
-
-    // A SessionContextReset from a plain session/load failure (no fork pending)
-    // must clear the dead id but leave import_pending untouched: that marker
-    // belongs to the import flow, and clearing it here would block a legitimate
-    // import retry. Mirrors the non-fork assignment guard.
-    #[test]
-    fn reset_without_fork_pending_preserves_import_pending() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.view = crate::session::View::Structured;
-        inst.acp_session_id = Some("dead-id".into());
-        inst.fork_pending = None;
-        inst.import_pending = Some(true);
-
-        let profile = apply_acp_session_change(
-            &mut inst,
-            "sess-1",
-            Some(&AcpSessionChange::Reset("session/load failed: gone".into())),
-            true,
-        );
-
-        assert_eq!(inst.acp_session_id, None, "reset clears the dead id");
-        assert_eq!(
-            inst.import_pending,
-            Some(true),
-            "a non-fork reset must not consume import_pending"
-        );
-        assert!(profile.is_some(), "the reset must persist");
-    }
-
     #[test]
     fn acp_session_assigned_same_id_no_marker_is_noop() {
         let mut inst = Instance::new("seed", "/tmp/seed");
@@ -2504,52 +3489,13 @@ mod tests {
             &mut inst,
             "seed",
             Some(&AcpSessionChange::Assigned("sid-1".to_string())),
-            true,
+            false,
+            false,
         );
         assert!(
             persist.is_none(),
             "unchanged id with no stale marker is a no-op"
         );
-    }
-
-    // #3080: a user /clear emits Event::SessionCleared. Before the fix this
-    // derived no session change, so the stale ACP id survived on disk and the
-    // next worker restart replayed the pre-clear conversation via session/load.
-    // It must now derive a Cleared change so the stored id is dropped.
-    #[test]
-    fn session_cleared_derives_cleared_change() {
-        assert_eq!(
-            derive_acp_session_change(&crate::acp::Event::SessionCleared),
-            Some(AcpSessionChange::Cleared),
-            "a /clear must invalidate the persisted ACP resume id"
-        );
-    }
-
-    // Applying Cleared must null the stored id and force a clean restart by
-    // dropping the paired fork/import markers too: a /clear issued before a
-    // pending fork/import resolves must still restart as session/new, not
-    // re-session/fork the parent. See #3080.
-    #[test]
-    fn cleared_nulls_stored_id_and_pending_markers() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.view = crate::session::View::Structured;
-        inst.acp_session_id = Some("pre-clear-id".into());
-        inst.fork_pending = Some("parent-acp-id".into());
-        inst.import_pending = Some(true);
-
-        let profile =
-            apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared), true);
-
-        assert_eq!(inst.acp_session_id, None, "clear drops the stored id");
-        assert_eq!(
-            inst.fork_pending, None,
-            "clear drops fork_pending so restart does not re-fork the parent"
-        );
-        assert_eq!(
-            inst.import_pending, None,
-            "clear drops import_pending so restart is a clean session/new"
-        );
-        assert!(profile.is_some(), "the clear must persist");
     }
 
     #[test]
@@ -2561,41 +3507,40 @@ mod tests {
             transcript_path: None,
         };
         let new_id = AcpSessionChange::Assigned("new-id".into());
-        for (provenance, kept) in [
-            (crate::session::ConversationProvenance::Asserted, false),
-            (crate::session::ConversationProvenance::Observed, true),
+        for (provenance, pinned, kept) in [
+            (
+                crate::session::ConversationProvenance::Asserted,
+                false,
+                false,
+            ),
+            (
+                crate::session::ConversationProvenance::Observed,
+                false,
+                true,
+            ),
+            (crate::session::ConversationProvenance::Asserted, true, true),
         ] {
             let mut inst = Instance::new("seed", "/tmp/seed");
             inst.view = crate::session::View::Structured;
             inst.acp_session_id = Some("old-id".into());
             inst.resume_binding = Some(binding(provenance));
-            apply_acp_session_change(&mut inst, "sess-1", Some(&new_id), true);
+            if pinned {
+                inst.resume_intent = crate::session::ResumeIntent::Use("old-id".into());
+            }
+            apply_acp_session_change(&mut inst, "sess-1", Some(&new_id), true, true);
             assert_eq!(inst.resume_binding.is_some(), kept);
+            assert_eq!(inst.acp_session_id.as_deref(), Some("new-id"));
+            if pinned {
+                assert_eq!(
+                    inst.resume_intent,
+                    crate::session::ResumeIntent::Use("old-id".into())
+                );
+            }
         }
     }
 
-    // Regression for the event-ordering the listener sees: an id assigned at
-    // connect followed by a later /clear must end with no stored id. See #3080.
     #[test]
-    fn assign_then_clear_leaves_no_stored_id() {
-        let mut inst = Instance::new("seed", "/tmp/seed");
-        inst.view = crate::session::View::Structured;
-
-        apply_acp_session_change(
-            &mut inst,
-            "sess-1",
-            Some(&AcpSessionChange::Assigned("old-id".into())),
-            true,
-        );
-        assert_eq!(inst.acp_session_id, Some("old-id".into()));
-
-        apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared), true);
-        assert_eq!(
-            inst.acp_session_id, None,
-            "a /clear after an assignment must not leave the old id on disk"
-        );
-
-        // A terminal conversation is not this listener's to mutate.
+    fn identity_observation_cannot_mutate_terminal_conversation() {
         let mut inst = Instance::new("terminal", "/tmp/terminal");
         inst.view = crate::session::View::Terminal;
         inst.resume_intent = crate::session::ResumeIntent::Use("native-id".into());
@@ -2606,7 +3551,8 @@ mod tests {
                 &mut inst,
                 "terminal",
                 Some(&AcpSessionChange::Assigned("acp-id".into())),
-                true,
+                false,
+                false,
             ),
             None
         );
@@ -2619,24 +3565,12 @@ mod tests {
         use crate::acp::Event;
         let ev = Event::AcpSessionAssigned {
             acp_session_id: "uuid-1234".into(),
+            connection_ready: false,
+            native_subject: None,
         };
         assert_eq!(
             derive_acp_session_change(&ev),
             Some(AcpSessionChange::Assigned("uuid-1234".into()))
-        );
-    }
-
-    #[test]
-    fn derive_acp_session_change_extracts_reset_reason() {
-        use crate::acp::Event;
-        let ev = Event::SessionContextReset {
-            reason: "session/load failed: bad id".into(),
-        };
-        assert_eq!(
-            derive_acp_session_change(&ev),
-            Some(AcpSessionChange::Reset(
-                "session/load failed: bad id".into()
-            ))
         );
     }
 
@@ -2688,6 +3622,15 @@ mod tests {
             (chunk("x"), Some(Authoritative)),
             (Event::ThinkingStarted, Some(Authoritative)),
             (stopped("prompt_complete"), Some(Authoritative)),
+            (stopped("prompt_failed"), Some(Authoritative)),
+            (
+                Event::PromptRuntimeError {
+                    message: "request failed".into(),
+                    evidence: None,
+                    native_subject: None,
+                },
+                Some(Authoritative),
+            ),
             (Event::startup_error("boom"), Some(Authoritative)),
             (
                 Event::ApprovalResolved {
@@ -2711,6 +3654,7 @@ mod tests {
                     subagent: crate::acp::state::SubagentRecord {
                         session_id: "child".into(),
                         parent_session_id: "root".into(),
+                        provenance: None,
                         parent_tool_call_id: None,
                         title: None,
                         description: None,
@@ -2729,6 +3673,15 @@ mod tests {
             (
                 Event::AcpSessionAssigned {
                     acp_session_id: "a".into(),
+                    connection_ready: false,
+                    native_subject: None,
+                },
+                None,
+            ),
+            (
+                Event::RateLimitAutoResumed {
+                    resets_at: crate::time::Timestamp::now(),
+                    manual: false,
                 },
                 Some(Heal),
             ),
@@ -2888,44 +3841,51 @@ mod tests {
         }
     }
 
-    /// Daemon restart: an in-flight turn unblocks a persisted Stopped, a
-    /// deliberate stop stays Stopped.
+    /// Daemon restart uses the original request's real admission and terminal.
     #[tokio::test]
+    #[serial_test::serial]
     async fn seed_acp_statuses_follows_the_folded_status() {
-        use crate::acp::Event;
-        let cases = [
-            (
-                Event::UserPromptSent {
-                    merged_prompt_ids: Vec::new(),
-                    prompt_id: None,
-                    text: "go".into(),
-                    attachments: Vec::new(),
-                    synthesized: false,
-                    origin_plugin: None,
-                    origin: crate::daemon::PromptOrigin::Unknown,
-                },
-                Status::Running,
-            ),
-            (
-                Event::Stopped {
-                    reason: "prompt_complete".into(),
-                },
-                Status::Stopped,
-            ),
-        ];
-        for (event, want) in cases {
-            let inst = stopped_structured_instance();
-            let id = inst.id.clone();
-            let state = test_support::build_test_app_state(vec![inst]);
-            state
-                .acp_event_store
-                .record(&id, 1, &event)
-                .expect("record");
-            seed_acp_statuses(state.clone()).await;
-            assert_eq!(state.instances.read().await[0].status, want, "{event:?}");
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        for running in [false, true] {
+            with_managed(|scope| {
+                Box::pin(async move {
+                    let mut live =
+                        test_support::managed_control_session(scope, "seed-status", "claude", None)
+                            .await;
+                    let id = live.id().to_owned();
+                    let request = live.start_prompt("go").await;
+                    if !running {
+                        live.finish_prompt(&request, None).await;
+                    }
+                    live.state.acp_control_cache.forget(&id);
+                    live.state
+                        .instances
+                        .write()
+                        .await
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .status = Status::Stopped;
+                    seed_acp_statuses(live.state.clone()).await;
+                    assert_eq!(
+                        live.state
+                            .instances
+                            .read()
+                            .await
+                            .iter()
+                            .find(|row| row.id == id)
+                            .unwrap()
+                            .status,
+                        if running {
+                            Status::Running
+                        } else {
+                            Status::Stopped
+                        },
+                    );
+                })
+            })
+            .await;
         }
-
-        // A session with no events has nothing to project and keeps its row.
         let mut fresh = stopped_structured_instance();
         fresh.status = Status::Starting;
         let state = test_support::build_test_app_state(vec![fresh]);
@@ -2934,155 +3894,957 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn seeded_task_activity_preserves_an_open_main_turn() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
         for main_running in [false, true] {
-            let instance = stopped_structured_instance();
-            let id = instance.id.clone();
-            let state = test_support::build_test_app_state(vec![instance]);
-            let mut events = vec![
-                crate::acp::Event::UserPromptSent {
-                    merged_prompt_ids: Vec::new(),
-                    prompt_id: None,
-                    text: "go".into(),
-                    attachments: Vec::new(),
-                    synthesized: false,
-                    origin_plugin: None,
-                    origin: crate::daemon::PromptOrigin::Unknown,
-                },
-                crate::acp::Event::BackgroundTaskStarted {
-                    task_id: "task-1".into(),
-                    tool_call_id: Some("toolu_1".into()),
-                    description: "sleep".into(),
-                    workflow: None,
-                    started_at: None,
-                },
-            ];
-            if !main_running {
-                events.push(crate::acp::Event::Stopped {
-                    reason: "prompt_complete".into(),
-                });
-            }
-            for (index, event) in events.iter().enumerate() {
-                state
-                    .acp_event_store
-                    .record(&id, index as u64 + 1, event)
-                    .unwrap();
-            }
-            seed_acp_statuses(state.clone()).await;
-            assert_eq!(state.instances.read().await[0].status, Status::Running);
-            // The store write bypasses the cache; a reboot starts cold.
-            state.acp_control_cache.forget(&id);
-            state
-                .acp_event_store
-                .record(
-                    &id,
-                    events.len() as u64 + 1,
-                    &crate::acp::Event::BackgroundTaskFinished {
-                        task_id: "task-1".into(),
-                        ended_at: None,
-                    },
-                )
-                .unwrap();
-            seed_acp_statuses(state.clone()).await;
-            assert_eq!(
-                state.instances.read().await[0].status,
-                if main_running {
-                    Status::Running
-                } else {
-                    Status::Idle
-                },
-            );
+            with_managed(|scope| {
+                Box::pin(async move {
+                    let mut live =
+                        test_support::managed_control_session(scope, "seed-task", "claude", None)
+                            .await;
+                    let id = live.id().to_owned();
+                    let request = live.start_prompt("go").await;
+                    let path = start_projection_resource(&mut live, false).await;
+                    if !main_running {
+                        live.finish_prompt(&request, None).await;
+                    }
+                    for task_running in [true, false] {
+                        if !task_running {
+                            finish_projection_resource(&mut live, &path, false).await;
+                        }
+                        let expected = if main_running || task_running {
+                            Status::Running
+                        } else {
+                            Status::Idle
+                        };
+                        let baseline = if expected == Status::Running {
+                            Status::Stopped
+                        } else {
+                            Status::Running
+                        };
+                        let _pause = live.client.pause_drain().await;
+                        live.state
+                            .instances
+                            .write()
+                            .await
+                            .iter_mut()
+                            .find(|row| row.id == id)
+                            .unwrap()
+                            .status = baseline;
+                        // The live task tailer still takes the observation fences for file I/O.
+                        // Startup seeding deliberately leaves the row alone on contention.
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            loop {
+                                live.state.acp_control_cache.forget(&id);
+                                seed_acp_statuses(live.state.clone()).await;
+                                let actual = live.state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == id)
+                                    .unwrap()
+                                    .status;
+                                if actual == expected {
+                                    break;
+                                }
+                                assert_eq!(actual, baseline);
+                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "seed did not reach {expected:?}: main={main_running}, task={task_running}"
+                            )
+                        });
+                        let folded = live
+                            .state
+                            .session_service
+                            .fold_control_state(&id)
+                            .await
+                            .unwrap();
+                        assert_eq!(folded.turn_active, main_running);
+                        let task = folded
+                            .background_tasks
+                            .iter()
+                            .find(|task| task.task_id == "projection-task");
+                        assert_eq!(task.is_some(), task_running);
+                        if let Some(task) = task {
+                            assert!(task.resource_ref.is_some());
+                        }
+                        assert_eq!(folded.sidebar_status(), expected);
+                    }
+                })
+            })
+            .await;
         }
     }
-    /// Whether the row's own agent binding carries the attested route.
-    fn attested_marker(row: &Instance) -> bool {
-        row.agent_session_binding
-            .as_ref()
-            .and_then(|binding| binding.execution.as_ref())
-            .is_some_and(|execution| execution.exported_default_store == Some(true))
-    }
 
-    /// #4127: a first `session/load` reattaching a legacy session re-assigns the
-    /// very id the row already carries, so `apply_acp_session_change` takes its
-    /// same-id arm and returns without persisting anything. The route the
-    /// launch applied must still be attested there (on disk and in memory) or
-    /// the legacy binding keeps deriving it from the configuration as it
-    /// stands, which is the guess #4127 forbids.
+    /// Reattachment preserves the route attested by the actual original establishment.
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_event_listener_attests_the_observed_store_on_a_reused_acp_session() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let store = temp.path().join(".claude");
-        std::fs::create_dir_all(&store).expect("store");
-
-        let profile = "acp-listener-attested-store";
-        let sid = "11111111-1111-4111-8111-111111111111";
-        let binding = |marker: Option<bool>| crate::session::ConversationBinding {
-            session_id: sid.into(),
-            execution: Some(crate::session::ExecutionBinding {
-                agent: "claude".into(),
-                stores: vec![store.clone()],
-                configuration: Vec::new(),
-                cwd: temp.path().to_path_buf(),
-                cwd_filesystem: "host".into(),
-                filesystem: "host".into(),
-                exported_default_store: marker,
-            }),
-            provenance: crate::session::ConversationProvenance::Observed,
-            transcript_path: None,
-        };
-        let mut inst = Instance::new("acp-session", "/tmp/acp");
-        inst.view = crate::session::View::Structured;
-        inst.source_profile = profile.to_string();
-        inst.agent_session_id = Some(sid.into());
-        inst.acp_session_id = Some("attested-acp-id".to_string());
-        // Legacy: no routing marker at all.
-        inst.agent_session_binding = Some(binding(None));
-        let id = inst.id.clone();
-        seed_profile_store(profile, vec![inst.clone()]);
-        let state = test_support::build_test_app_state(vec![inst]);
-
-        // What the drain published before the frame: the assigned id, and the
-        // store route this launch actually applied.
-        let observed = binding(Some(true)).execution.unwrap();
-        state
-            .acp_supervisor
-            .test_insert_worker_with_native_handoff(&id, "attested-acp-id", Some(observed))
-            .await;
-
-        let listener = tokio::spawn(acp_event_listener(state.clone()));
-        await_subscribed(&state).await;
-
-        state
-            .acp_events_tx
-            .send(AcpBroadcastFrame {
-                session_id: id.clone(),
-                seq: 1,
-                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
-                    acp_session_id: "attested-acp-id".to_string(),
-                }),
-                worker_generation: None,
-                sidebar_status: None,
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let live =
+                    test_support::managed_control_session(scope, "attested-reuse", "claude", None)
+                        .await;
+                let observed_store = live
+                    .client
+                    .establishment_projection()
+                    .unwrap()
+                    .receipt_snapshot()
+                    .unwrap()
+                    .store
+                    .clone()
+                    .expect("actual Native store observation");
+                let id = live.id().to_owned();
+                let sid = live.sid.clone();
+                let original = load_profile_row("test", &id).unwrap();
+                assert_eq!(
+                    original
+                        .agent_session_binding
+                        .as_ref()
+                        .and_then(|binding| binding.execution.as_ref()),
+                    Some(&observed_store)
+                );
+                let binding = original.agent_session_binding.clone();
+                let (listener, handoff) = prepare_managed_listener(scope);
+                let (attached_state, reconciled_state) = tokio::sync::oneshot::channel();
+                let attached = scope
+                    .reconcile_after(live.client, |state, id| async move {
+                        activate_managed_listener(handoff, &state).await;
+                        attached_state
+                            .send(state.clone())
+                            .unwrap_or_else(|_| panic!("reconciled state receiver remains open"));
+                        let project = state
+                            .instances
+                            .read()
+                            .await
+                            .iter()
+                            .find(|row| row.id == id)
+                            .unwrap()
+                            .project_path
+                            .clone();
+                        state
+                            .acp_supervisor
+                            .attach(id.clone(), project.into(), Vec::new(), false, None)
+                            .await
+                            .unwrap();
+                    })
+                    .await;
+                let state = reconciled_state.await.unwrap();
+                assert_eq!(attached.selected_native_session(), sid);
+                let row = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .clone();
+                let durable = load_profile_row("test", &id).unwrap();
+                for row in [&row, &durable] {
+                    assert_eq!(row.acp_session_id.as_deref(), Some(sid.as_str()));
+                    assert_eq!(row.agent_session_binding, binding);
+                    assert_eq!(
+                        row.agent_session_binding
+                            .as_ref()
+                            .and_then(|binding| binding.execution.as_ref()),
+                        Some(&observed_store),
+                        "reuse cannot replace the observed store with configuration"
+                    );
+                }
+                listener.abort();
+                let _ = listener.await;
             })
-            .expect("listener is subscribed");
-
-        let row = await_row(
-            &state,
-            &id,
-            attested_marker,
-            "the reused acp session id returned before the attestation",
-        )
+        })
         .await;
-        listener.abort();
-        let _ = listener.await;
+    }
 
-        assert_eq!(row.acp_session_id.as_deref(), Some("attested-acp-id"));
-        assert!(
-            attested_marker(&load_profile_row(profile, &id).expect("row")),
-            "the attestation must be durable, or the next reload derives the \
-             route from the configuration again"
-        );
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delayed_assignment_preserves_newer_choice_and_uncompleted_flow() {
+        use crate::acp::establishment::{
+            EstablishmentExpected, EstablishmentRecovery, EstablishmentRecoveryAction,
+        };
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::session::{ConversationProvenance, ResumeIntent};
+        for case in [
+            "use_other",
+            "use_same",
+            "cleared",
+            "fork",
+            "import_new",
+            "import_same",
+        ] {
+            with_managed(|scope| {
+                Box::pin(async move {
+                    let mut publications = scope.state.acp_events_tx.subscribe();
+                    let live = test_support::managed_control_session(
+                        scope,
+                        "delayed-assignment",
+                        "claude",
+                        None,
+                    )
+                    .await;
+                    let state = live.state.clone();
+                    let id = live.id().to_owned();
+                    await_row(
+                        &state,
+                        &id,
+                        Instance::launch_is_finalized,
+                        "actual original creation finalizes before a newer user choice",
+                    )
+                    .await;
+                    let submission = state.session_service.prompt_submission(&id).await;
+                    drop(submission);
+                    let original = load_profile_row("test", &id).unwrap();
+                    let frame = observed_frame(&mut publications, &id, |event| {
+                        matches!(
+                            event,
+                            Event::AcpSessionAssigned {
+                                connection_ready: true,
+                                ..
+                            }
+                        )
+                    })
+                    .await;
+                    let original_epoch = live.client.lease.epoch();
+                    assert_ne!(
+                        frame.scope,
+                        crate::acp::protocol::AcpEventScope::HistoryOnly
+                    );
+                    let gate = pause_assignment_listener_for_test(&id, frame.seq);
+                    let listener = start_managed_listener(scope, &state).await;
+                    state.acp_events_tx.send(frame).unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let storage =
+                        Arc::new(crate::session::Storage::open_reference("test").unwrap());
+                    let mut chosen = original.clone();
+                    chosen.lifecycle_generation += 1;
+                    match case {
+                        "use_other" | "use_same" => {
+                            let target = if case == "use_same" {
+                                live.sid.clone()
+                            } else {
+                                "33333333-3333-4333-8333-333333333333".into()
+                            };
+                            chosen.resume_intent = ResumeIntent::Use(target.clone());
+                            let mut pin = original.agent_session_binding.clone().unwrap();
+                            pin.session_id = target;
+                            pin.provenance = ConversationProvenance::Asserted;
+                            chosen.resume_binding = Some(pin);
+                            chosen.import_pending = Some(true);
+                        }
+                        "cleared" => {
+                            let recovery = EstablishmentRecovery {
+                                expected: EstablishmentExpected::capture(&chosen, &storage)
+                                    .unwrap(),
+                                action: EstablishmentRecoveryAction::Fresh,
+                            };
+                            chosen
+                                .arm_acp_establishment(&storage, Some(&recovery))
+                                .unwrap();
+                        }
+                        "fork" => {
+                            let parent = "44444444-4444-4444-8444-444444444444".to_owned();
+                            chosen.resume_intent = ResumeIntent::Fork {
+                                from: parent.clone(),
+                            };
+                            chosen.fork_pending = Some(parent);
+                            chosen.import_pending = Some(true);
+                        }
+                        "import_new" => {
+                            chosen.acp_session_id =
+                                Some("55555555-5555-4555-8555-555555555555".into());
+                            chosen.import_pending = Some(true);
+                        }
+                        "import_same" => chosen.import_pending = Some(true),
+                        _ => unreachable!(),
+                    }
+                    if case != "cleared" {
+                        chosen.arm_acp_establishment(&storage, None).unwrap();
+                    }
+                    chosen.validate_acp_establishment(&storage).unwrap();
+                    let disk = storage.clone();
+                    let replacement = chosen.clone();
+                    let disk_id = id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _lifecycle = disk.acquire_instance_lifecycle_lock(&disk_id)?;
+                        disk.update(|rows, _| {
+                            *rows.iter_mut().find(|row| row.id == disk_id).unwrap() = replacement;
+                            Ok(())
+                        })
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    let mut cached = chosen.clone();
+                    cached.status = Status::Error;
+                    cached.last_error.set("operation A failed".to_owned());
+                    *state
+                        .instances
+                        .write()
+                        .await
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .unwrap() = cached;
+                    let before_effect = state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    gate.release.send(()).unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), gate.applied)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    listener.abort();
+                    let _ = listener.await;
+                    let cached = state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    let durable = load_profile_row("test", &id).unwrap();
+                    let observed_epoch = state
+                        .acp_supervisor
+                        .current_lease(&id)
+                        .map(|lease| lease.epoch());
+                    let restore = original.clone();
+                    let restore_id = id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        storage.update(|rows, _| {
+                            *rows.iter_mut().find(|row| row.id == restore_id).unwrap() = restore;
+                            Ok(())
+                        })
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    *state
+                        .instances
+                        .write()
+                        .await
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .unwrap() = original;
+                    for candidate in [&cached, &durable] {
+                        assert_eq!(
+                            candidate.acp_session_id, chosen.acp_session_id,
+                            "{case}: no stale SID grant"
+                        );
+                        assert!(
+                            chosen.conversation_state().matches(candidate),
+                            "{case}: preserve newer choice"
+                        );
+                        assert_eq!(candidate.fork_pending, chosen.fork_pending, "{case}");
+                        assert_eq!(candidate.import_pending, chosen.import_pending, "{case}");
+                        assert_eq!(
+                            candidate.lifecycle_generation, chosen.lifecycle_generation,
+                            "{case}"
+                        );
+                        assert_eq!(
+                            candidate.acp_establishment, chosen.acp_establishment,
+                            "{case}"
+                        );
+                    }
+                    assert_eq!(cached.status, Status::Error);
+                    assert_eq!(cached.last_error, before_effect.last_error, "{case}");
+                    assert_eq!(
+                        observed_epoch,
+                        Some(original_epoch),
+                        "same original epoch does not authorize a different physical context"
+                    );
+                })
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn real_attach_commits_pending_fork_and_same_sid_import_without_reseeding_history() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        for fork in [false, true] {
+            with_managed(|scope| Box::pin(async move {
+                let project = scope.tempdir();
+                let native_store = project.path().join("native-store");
+                std::fs::create_dir(&native_store).unwrap();
+                scope.save_environment(&["CLAUDE_CONFIG_DIR"]);
+                std::env::set_var("CLAUDE_CONFIG_DIR", &native_store);
+                let parent = uuid::Uuid::new_v4().to_string();
+                let child = uuid::Uuid::new_v4().to_string();
+                let source_sid = parent.clone();
+                let source_cwd = project.path().to_path_buf();
+                let source_transcripts = native_store.join("projects").join("managed-native");
+                std::fs::create_dir_all(&source_transcripts).unwrap();
+                let (source_config, _source_native) = scope.native_peer(
+                    project.path().into(), "claude", "claude", move |request| {
+                        Some(match request["method"].as_str().unwrap() {
+                            "initialize" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                                "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}),
+                            "session/new" => {
+                                std::fs::write(
+                                    source_transcripts.join(format!("{source_sid}.jsonl")),
+                                    format!("{}\n", serde_json::json!({
+                                        "type":"system","subtype":"init","sessionId":source_sid,"cwd":source_cwd,
+                                    })),
+                                ).unwrap();
+                                serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                                    "result":{"sessionId":source_sid}})
+                            }
+                            "session/cancel" => return None,
+                            method => panic!("unexpected original Native method: {method}"),
+                        })
+                    },
+                );
+                let original = scope.spawn(source_config, "attach-source").await.unwrap();
+                original.ready().await;
+                let selected = if fork { child.clone() } else { parent.clone() };
+                let (sent, mut prompts) = tokio::sync::mpsc::unbounded_channel();
+                let (config, native) = scope.native_peer(
+                    project.path().into(), "claude", "claude", move |request| {
+                        Some(match request["method"].as_str().unwrap() {
+                            "initialize" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                                "result":{"protocolVersion":1,"agentCapabilities":{
+                                    "loadSession":true,"sessionCapabilities":{"fork":{}}}}}),
+                            "session/load" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{}}),
+                            "session/fork" => serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                                "result":{"sessionId":child}}),
+                            "session/prompt" => { sent.send(request.clone()).unwrap(); return None; }
+                            "session/cancel" => return None,
+                            method => panic!("unexpected Native method: {method}"),
+                        })
+                    },
+                );
+                let mut client = if fork {
+                    scope.fork_after(original, config, "attach-pending-context").await
+                } else {
+                    scope.import_after(original, config, "attach-pending-context").await
+                };
+                client.ready().await;
+                let id = client.id.clone();
+                let owner = client.connected_runner();
+                assert_eq!(client.selected_native_session(), selected);
+                use axum::response::IntoResponse;
+                let state = client.app_state();
+                let response = crate::server::api::acp_prompt(
+                    axum::extract::State(state.clone()), axum::extract::Path(id.clone()),
+                    axum::http::HeaderMap::new(),
+                    Ok(axum::Json(crate::acp::protocol::PromptRequest {
+                        text: "original explicit request".into(), attachments: Vec::new(),
+                        prompt_id: None, no_revive: false, queued_prompt_id: None,
+                    })),
+                ).await.into_response();
+                assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+                let request = tokio::time::timeout(std::time::Duration::from_secs(10), prompts.recv())
+                    .await.unwrap().unwrap();
+                native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":selected,"update":{"sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"history before daemon restart"}}}})).await;
+                native.send(serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                    "result":{"stopReason":"end_turn"}})).await;
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !matches!(client.next_event().await.unwrap(), Event::Stopped { .. }) {}
+                }).await.unwrap();
+                let original_inputs = native.requests();
+                for round in 0..2 {
+                    client = scope.adopt(client, false).await;
+                    client.ready().await;
+                    let state = client.app_state();
+                    let cached = state.instances.read().await.iter().find(|row| row.id == id).unwrap().clone();
+                    let durable = load_profile_row("test", &id).unwrap();
+                    for row in [&cached, &durable] {
+                        assert_eq!(row.acp_session_id.as_deref(), Some(selected.as_str()), "round {round}");
+                        assert!(row.fork_pending.is_none(), "never fork the parent twice");
+                        assert!(row.import_pending.is_none(), "never seed imported history twice");
+                    }
+                    let history = state.acp_event_store.replay_from(&id, 0).unwrap();
+                    assert_eq!(history.iter().filter(|stored| matches!(stored.event.as_ref(),
+                        Event::UserPromptSent { text, .. } if text == "original explicit request"
+                    )).count(), 1, "round {round}: retain actual user request");
+                    assert_eq!(history.iter().filter(|stored| matches!(stored.event.as_ref(),
+                        Event::AgentMessageChunk { text, .. } if text == "history before daemon restart"
+                    )).count(), 1, "round {round}: retain actual output without replay duplicates");
+                    assert_eq!(client.connected_runner(), owner);
+                    for method in ["session/new", "session/load", "session/fork", "session/prompt"] {
+                        assert_eq!(native.requests().iter().filter(|seen| seen.as_str() == method).count(),
+                            original_inputs.iter().filter(|seen| seen.as_str() == method).count(),
+                            "round {round}: attach does not repeat {method}");
+                    }
+                }
+            })).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_sidebar_observation_cannot_replace_a_later_native_failure() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+
+        with_managed(|scope| {
+            Box::pin(async move {
+                let state = scope.state.clone();
+                let listener = start_managed_listener(scope, &state).await;
+                let mut live =
+                    test_support::managed_control_session(scope, "stale-sidebar", "claude", None)
+                        .await;
+                let id = live.id().to_owned();
+                let first = live.start_prompt("the original completed input").await;
+                live.finish_prompt(&first, None).await;
+                await_row(
+                    &state,
+                    &id,
+                    |row| row.status == Status::Idle,
+                    "the first actual Native result reaches the sidebar",
+                )
+                .await;
+                let mut observation = folded_sidebar_observation(&state.session_service, &id)
+                    .await
+                    .expect("actual qualified completed Native observation");
+                assert_eq!(observation.status, Status::Idle);
+                let frontier = state
+                    .session_service
+                    .fold_control_state(&id)
+                    .await
+                    .unwrap()
+                    .last_seq;
+
+                let failed = live.start_prompt("a distinct later input fails").await;
+                live.finish_prompt(&failed, Some("internal_error")).await;
+                let failure = await_row(
+                    &state,
+                    &id,
+                    |row| row.status == Status::Error,
+                    "the later real Native failure reaches the sidebar before the old commit",
+                )
+                .await;
+                assert!(
+                    state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .unwrap()
+                        .last_seq
+                        > frontier
+                );
+                assert!(live.client.connection_ready());
+                assert!(live.client.connection_unavailable().is_none());
+                let namespace = state.profile_namespace.read().await;
+                let mut rows = state.instances.write().await;
+                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                let applied = observation.try_apply(&id, row, |row, _, captured| {
+                    apply_status_seed(row, captured.status, &state.status_tx);
+                    Ok(())
+                });
+                assert_eq!(
+                    row.status,
+                    Status::Error,
+                    "the old Idle observation cannot overwrite a later same-owner Native failure"
+                );
+                assert_eq!(row.last_error, failure.last_error);
+                assert!(
+                    applied.is_none(),
+                    "a changed control frontier refuses the old observation"
+                );
+                drop(rows);
+                drop(namespace);
+                listener.abort();
+                let _ = listener.await;
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_channel_ready_heals_only_the_current_identity_fenced_connection_error() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        const TEST_NAME: &str = "server::acp_events::tests::owned_channel_ready_heals_only_the_current_identity_fenced_connection_error";
+        for condition in ["ready", "sticky_loss", "superseded", "operation_error"] {
+            with_managed(|scope| {
+                Box::pin(async move {
+                    let inspection = scope.inspect_next_runner(TEST_NAME);
+                    let initial_state = scope.state.clone();
+                    let initial_listener = start_managed_listener(scope, &initial_state).await;
+                    let mut live = test_support::managed_control_session(
+                        scope,
+                        "ready-repair",
+                        "claude",
+                        None,
+                    )
+                    .await;
+                    let (attached_state, reconciled_state) = tokio::sync::oneshot::channel();
+                    let id = live.id().to_owned();
+                    let original = load_profile_row("test", &id).unwrap();
+                    let owner = live.client.connected_runner();
+                    let original_receipt = live
+                        .client
+                        .establishment_projection()
+                        .unwrap()
+                        .receipt_snapshot()
+                        .unwrap();
+                    let request = live
+                        .start_prompt("original operation before control loss")
+                        .await;
+                    await_row(
+                        &live.state,
+                        &id,
+                        |row| row.status == Status::Running,
+                        "the original Native input reaches the sidebar before its result",
+                    )
+                    .await;
+                    live.finish_prompt(
+                        &request,
+                        (condition == "operation_error").then_some("internal_error"),
+                    )
+                    .await;
+                    let terminal = await_row(
+                        &live.state,
+                        &id,
+                        |row| matches!(row.status, Status::Idle | Status::Error),
+                        "the original Native result reaches the sidebar before control loss",
+                    )
+                    .await;
+                    assert_eq!(
+                        terminal.status,
+                        if condition == "operation_error" {
+                            Status::Error
+                        } else {
+                            Status::Idle
+                        },
+                        "{condition}"
+                    );
+                    let folded = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        loop {
+                            if let Some(status) =
+                                folded_sidebar_status(&live.state.session_service, &id).await
+                            {
+                                break status;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the fenced original sidebar becomes observable");
+                    assert_eq!(
+                        folded,
+                        if condition == "operation_error" {
+                            Status::Error
+                        } else {
+                            Status::Idle
+                        },
+                        "the original Native turn, not establishment metadata, owns the sidebar"
+                    );
+                    let native_requests = live.native.requests();
+                    initial_listener.abort();
+                    let _ = initial_listener.await;
+                    let mut publications = live.client.subscribe_publications();
+                    let (loss_gate, original_drain, loss_published) = scope.gate();
+                    live.client
+                        .actual()
+                        .gate_connection_loss_publication(loss_gate);
+                    inspection.query("close-control").await;
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while live.client.connection_unavailable().is_none() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("actual daemon control EOF becomes observable");
+                    assert_eq!(
+                        live.client.connection_unavailable().unwrap().source,
+                        crate::acp::state::AcpConnectionSource::Control
+                    );
+                    let loss = observed_frame(&mut publications, &id, |event| {
+                        matches!(
+                            event,
+                            Event::AcpConnectionUnavailable {
+                                source: crate::acp::state::AcpConnectionSource::Control,
+                                ..
+                            }
+                        )
+                    })
+                    .await;
+                    assert!(loss.availability_denial);
+                    assert_eq!(loss.native_origin.unwrap().owner, owner);
+                    assert_eq!(loss.native_subject.unwrap().owner, owner);
+                    assert_eq!(loss.worker_generation, Some(live.client.lease.epoch()));
+                    tokio::time::timeout(std::time::Duration::from_secs(10), loss_published)
+                        .await
+                        .unwrap()
+                        .expect("the original loss publishes before recovery");
+                    let folded = live
+                        .state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        folded.connection_unavailable,
+                        live.client.connection_unavailable(),
+                        "the current original connection retains its actual Control loss"
+                    );
+                    assert_eq!(
+                        folded.sidebar_status(),
+                        Status::Error,
+                        "the actual Control loss denies current input"
+                    );
+                    seed_acp_statuses(live.state.clone()).await;
+                    let failed = await_row(
+                        &live.state,
+                        &id,
+                        |row| row.status == Status::Error,
+                        "qualified actual control loss seeds the connection Error",
+                    )
+                    .await;
+                    let error_baseline = failed.last_error.clone();
+                    assert!(original_drain.release());
+                    let gate = assignment_listener_gate_for_test(&id, None);
+                    let (listener, handoff) = prepare_managed_listener(scope);
+                    let attached = scope
+                        .reconcile_after(live.client, |state, id| async move {
+                            activate_managed_listener(handoff, &state).await;
+                            attached_state
+                                .send((state.clone(), state.acp_events_tx.subscribe()))
+                                .unwrap_or_else(|_| {
+                                    panic!("reconciled state receiver remains open")
+                                });
+                            {
+                                let mut rows = state.instances.write().await;
+                                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                                assert_eq!(row.source_profile, failed.source_profile);
+                                assert_eq!(row.created_at, failed.created_at);
+                                assert_eq!(row.lifecycle_generation, failed.lifecycle_generation);
+                                assert!(row.conversation_state().matches(&failed));
+                                assert_eq!(row.acp_establishment, failed.acp_establishment);
+                                row.merge_runtime_from_reload(&failed);
+                            }
+                            let project = state
+                                .instances
+                                .read()
+                                .await
+                                .iter()
+                                .find(|row| row.id == id)
+                                .unwrap()
+                                .project_path
+                                .clone();
+                            state
+                                .acp_supervisor
+                                .attach(id, project.into(), Vec::new(), false, None)
+                                .await
+                                .unwrap();
+                        })
+                        .await;
+                    let (state, mut attached_publications) = reconciled_state.await.unwrap();
+                    let attached_receipt = attached
+                        .establishment_projection()
+                        .unwrap()
+                        .receipt_snapshot()
+                        .unwrap();
+                    assert_eq!(attached_receipt.owner, original_receipt.owner);
+                    assert_eq!(attached_receipt.attempt, original_receipt.attempt);
+                    assert_eq!(attached.connected_runner(), owner);
+                    let timeout = std::time::Duration::from_secs(10);
+                    tokio::time::timeout(timeout, gate.arrived)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let assignment = observed_frame(&mut attached_publications, &id, |event| {
+                        matches!(
+                            event,
+                            Event::AcpSessionAssigned {
+                                connection_ready: true,
+                                ..
+                            }
+                        )
+                    })
+                    .await;
+                    assert!(assignment.seq > loss.seq);
+                    assert_eq!(assignment.worker_generation, Some(attached.lease.epoch()));
+                    assert_eq!(
+                        assignment.scope,
+                        crate::acp::protocol::AcpEventScope::HistoryOnly,
+                        "read-only attach does not create an Original constructor observation"
+                    );
+                    // Assignment usability precedes the final SDK capability publication.
+                    // Finish that real frontier before pausing and taking a fenced seed.
+                    let capabilities = observed_frame(&mut attached_publications, &id, |event| {
+                        matches!(event, Event::PromptCapabilities { .. })
+                    })
+                    .await;
+                    assert_eq!(capabilities.worker_generation, Some(attached.lease.epoch()));
+                    assert!(attached.connection_ready());
+                    assert!(attached.connection_unavailable().is_none());
+                    assert_eq!(
+                        state
+                            .instances
+                            .read()
+                            .await
+                            .iter()
+                            .find(|row| row.id == id)
+                            .unwrap()
+                            .status,
+                        Status::Error
+                    );
+                    let drain_pause = attached.pause_drain().await;
+                    if condition == "sticky_loss" {
+                        live.native.close_stdout().await;
+                        tokio::time::timeout(timeout, async {
+                            while attached.connection_unavailable().is_none() {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("real Native EOF precedes the current-availability refresh");
+                    } else if condition == "superseded" {
+                        let disk_id = id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::session::Storage::open_reference("test")
+                                .unwrap()
+                                .update(|rows, _| {
+                                    rows.iter_mut()
+                                        .find(|row| row.id == disk_id)
+                                        .unwrap()
+                                        .lifecycle_generation += 1;
+                                    Ok(())
+                                })
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        state
+                            .instances
+                            .write()
+                            .await
+                            .iter_mut()
+                            .find(|row| row.id == id)
+                            .unwrap()
+                            .lifecycle_generation += 1;
+                    }
+                    gate.release.send(()).unwrap();
+                    tokio::time::timeout(timeout, gate.applied)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    // The delayed assignment is history, not fresh readiness authority.
+                    // Refresh through the actual current actor at this receive frontier.
+                    seed_acp_statuses(state.clone()).await;
+                    let row = state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    listener.abort();
+                    let _ = listener.await;
+                    if condition == "superseded" {
+                        let restore = original.clone();
+                        let restore_id = id.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::session::Storage::open_reference("test")
+                                .unwrap()
+                                .update(|rows, _| {
+                                    *rows.iter_mut().find(|row| row.id == restore_id).unwrap() =
+                                        restore;
+                                    Ok(())
+                                })
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        *state
+                            .instances
+                            .write()
+                            .await
+                            .iter_mut()
+                            .find(|row| row.id == id)
+                            .unwrap() = original;
+                    }
+                    assert_eq!(
+                        row.status,
+                        if condition == "ready" {
+                            Status::Idle
+                        } else {
+                            Status::Error
+                        },
+                        "{condition}"
+                    );
+                    assert_eq!(row.last_error, error_baseline, "{condition}");
+                    assert_eq!(
+                        live.native.requests(),
+                        native_requests,
+                        "same-owner reattachment must not repeat Native input"
+                    );
+                    if condition == "ready" {
+                        let folded = state.session_service.fold_control_state(&id).await.unwrap();
+                        assert!(folded.connection_ready && folded.connection_unavailable.is_none());
+                        assert_eq!(folded.sidebar_status(), Status::Idle);
+                        assert_eq!(folded.native_availability.unwrap().0, loss.seq);
+                        assert_eq!(folded.sidebar_observation_seq, loss.seq);
+                        assert_eq!(state.acp_supervisor.running_identity(&id), owner);
+                    }
+                    drop(drain_pause);
+                })
+            })
+            .await;
+        }
+    }
+    fn prepare_managed_listener(
+        scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+    ) -> (
+        crate::acp::supervisor::test_support::managed::ManagedTask,
+        tokio::sync::oneshot::Sender<Arc<AppState>>,
+    ) {
+        let (handoff, state) = tokio::sync::oneshot::channel();
+        let listener = scope.spawn_helper(async move {
+            if let Ok(state) = state.await {
+                acp_event_listener(state).await;
+            }
+        });
+        (listener, handoff)
+    }
+
+    async fn activate_managed_listener(
+        handoff: tokio::sync::oneshot::Sender<Arc<AppState>>,
+        state: &Arc<AppState>,
+    ) {
+        let before = state.acp_events_tx.receiver_count();
+        handoff
+            .send(state.clone())
+            .unwrap_or_else(|_| panic!("managed listener awaits its actual AppState"));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state.acp_events_tx.receiver_count() <= before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the new listener subscribes, not an existing managed observer");
+    }
+
+    async fn start_managed_listener(
+        scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+        state: &Arc<AppState>,
+    ) -> crate::acp::supervisor::test_support::managed::ManagedTask {
+        let (listener, handoff) = prepare_managed_listener(scope);
+        activate_managed_listener(handoff, state).await;
+        listener
     }
     /// A broadcast only reaches receivers that subscribed before the send, and a spawned
     /// listener subscribes as its first act.
@@ -3123,10 +4885,10 @@ mod tests {
     /// full command), so an inline credential must never reach the log.
     #[test]
     fn approval_request_log_carries_the_call_id_and_never_the_title() {
-        let frame = AcpBroadcastFrame {
-            session_id: "sess1".into(),
-            seq: 1,
-            event: Arc::new(crate::acp::Event::ApprovalRequested {
+        let frame = AcpBroadcastFrame::from_qualified(
+            "sess1".into(),
+            1,
+            Arc::new(crate::acp::Event::ApprovalRequested {
                 approval: crate::acp::approvals::Approval {
                     nonce: crate::acp::approvals::Nonce("n1".into()),
                     tool_call: crate::acp::state::ToolCall {
@@ -3148,9 +4910,11 @@ mod tests {
                     resolved: None,
                 },
             }),
-            worker_generation: None,
-            sidebar_status: None,
-        };
+            &crate::acp::event_sender::EventMetadata::history(),
+            None,
+            None,
+            None,
+        );
         let out = test_support::capture_log(|| log_frame(&frame));
         assert!(out.contains("approval requested"), "{out}");
         assert!(out.contains("call=call-7"), "{out}");

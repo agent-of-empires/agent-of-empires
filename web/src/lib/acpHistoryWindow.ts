@@ -22,6 +22,7 @@ export function initialHistoryWindow(
   rows: readonly ActivityRow[],
   defaultWindow: number = DEFAULT_HISTORY_WINDOW,
 ): number {
+  rows = clearHistoryProjection(rows);
   const boundary = lastUserBoundaryIndex(rows);
   if (boundary < 0) return defaultWindow;
   return Math.max(defaultWindow, rows.length - boundary);
@@ -48,6 +49,7 @@ function snapBackToSubagentParent(rows: readonly ActivityRow[], start: number): 
 
 /** Render start for `visibleRows`: never below the cap, snapped forward to a user turn, then back to a sub-agent parent. 0 when everything fits. */
 export function historyWindowStart(rows: readonly ActivityRow[], visibleRows: number): number {
+  rows = clearHistoryProjection(rows);
   if (visibleRows <= 0) return 0;
   const cap = Math.max(0, rows.length - visibleRows);
   if (cap === 0) return 0;
@@ -61,10 +63,57 @@ export function historyWindowStart(rows: readonly ActivityRow[], visibleRows: nu
   return snapBackToSubagentParent(rows, start);
 }
 
+const clearProjections = new WeakMap<readonly ActivityRow[], readonly ActivityRow[]>();
+
+/** Immutable state arrays share one display view; journal chronology stays untouched. */
+export function clearHistoryProjection(rows: readonly ActivityRow[]): readonly ActivityRow[] {
+  const cached = clearProjections.get(rows);
+  if (cached) return cached;
+  if (!rows.some((row) => row.kind === "session_cleared" && row.clearAfterSeq != null)) {
+    clearProjections.set(rows, rows);
+    return rows;
+  }
+  const clears = rows.filter((row) => row.kind === "session_cleared");
+  const suffixCuts = new Float64Array(clears.length);
+  let minimum = Infinity;
+  for (let i = clears.length - 1; i >= 0; i -= 1) {
+    minimum = Math.min(minimum, clears[i]!.clearAfterSeq ?? Infinity);
+    suffixCuts[i] = minimum;
+  }
+  const epochs: ActivityRow[][] = Array.from({ length: clears.length + 1 }, () => []);
+  let seenClears = 0;
+  for (const row of rows) {
+    if (row.kind === "session_cleared") {
+      seenClears += 1;
+      continue;
+    }
+    let target = seenClears;
+    if (row.seq != null) {
+      // The last later cut below this sequence owns its logical display epoch.
+      let end = clears.length;
+      while (target < end) {
+        const middle = Math.floor((target + end) / 2);
+        if (suffixCuts[middle]! < row.seq) target = middle + 1;
+        else end = middle;
+      }
+    }
+    epochs[target]!.push(row);
+  }
+  const projected: ActivityRow[] = [];
+  for (let i = 0; i < epochs.length; i += 1) {
+    for (const row of epochs[i]!) projected.push(row);
+    if (i < clears.length) projected.push(clears[i]!);
+  }
+  clearProjections.set(rows, projected);
+  clearProjections.set(projected, projected);
+  return projected;
+}
+
 /** The fold pins to the last `/clear`; the message tree, runtime key, and banner all measure from here. */
 export function lastClearIndex(rows: readonly ActivityRow[]): number {
-  for (let i = rows.length - 1; i >= 0; i -= 1) {
-    if (rows[i]!.kind === "session_cleared") return i;
+  const projected = clearHistoryProjection(rows);
+  for (let i = projected.length - 1; i >= 0; i -= 1) {
+    if (projected[i]!.kind === "session_cleared") return i;
   }
   return -1;
 }
@@ -80,6 +129,7 @@ export function historyWindow(
   visibleRows: number,
   showClearedTurns: boolean,
 ): HistoryWindow {
+  rows = clearHistoryProjection(rows);
   const start = historyWindowStart(rows, visibleRows);
   return { start, canLoadEarlier: canLoadEarlierFrom(rows, start, showClearedTurns) };
 }

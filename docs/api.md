@@ -495,6 +495,34 @@ curl -sS \
   "http://localhost:8080/api/sessions?state=live"
 ```
 
+### Shared recovery observations
+
+Session rows and CLI `session show --json` expose nullable `recovery`. It contains
+`reason`, a public-safe `diagnostic`, optional historical operation `evidence`,
+the independent current `runtime` observation, `work_in_progress`, optional
+`uncertainty`, actionable `guidance`, `actions`, and opaque `expected`.
+The action keys are `attach`, `retry_operation`, `restart_same`, `stop`, and
+`fresh`. Clients render these server grants rather than infer them from `Error`,
+a raw Native session ID, a tool label or a historical Ready event.
+
+Terminal recovery also supplies nullable `observe_expected`, an equality token
+for the exact observed pane. Connect to `/api/sessions/{id}/live-ws` with
+`observe=true`, `expected`, and `observe_expected` to observe without Native
+input permission. Missing witnesses return `400`; stale or unavailable
+observations return `409`. The stream refuses input, resize and ownership
+claims, and closes when its profile, generation, selection or physical pane
+changes. It never ensures or replaces a pane.
+
+`evidence` describes the failed operation, not current liveness. Unknown or
+absent retryability is not permission to retry. ACP transport readiness is not
+proof that the OS process is alive. A stale or partial observation does not
+grant mutation permission. WebSocket omission of recovery is not a clear:
+an explicit current `null` clears it.
+
+`last_error` and `recovery` are runtime observations, not persisted session
+fields or a cross-daemon-restart retention guarantee. See the canonical
+[recovery actions and consequences](guides/session-resume.md#diagnosing-and-recovering-an-existing-session).
+
 ### Status values
 
 The `status` field on each session is **PascalCase** on the wire, and the same
@@ -960,6 +988,44 @@ Read-only and CityHall modes return 403. Escaping paths, binary files, and unver
 
 Both take `?scope=` for what the working tree is compared against: `branch` (the default) is the merge-base with the session's diff base branch, and `uncommitted` is HEAD. Any other value is a `400`. `/diff/file` also takes `?path=` and, for a workspace session, `?repo=`.
 
+An unproved terminal launch or readiness check can return HTTP `409` with
+`aoe-error-code: launch_indeterminate` and a finite `cause`: `command_timed_out`,
+`observation_failed`, `stabilization_expired`, or `ownership_unproven`. This is
+not a ready target or a confirmed Agent exit. The response retains a mutation
+receipt when launch state was committed; no wake message or pending send is
+delivered. Clients validate any committed receipt before classifying this refusal,
+without requiring a response body. See
+[Native Session Resume](guides/session-resume.md#pinning-or-resetting-a-conversation)
+for preservation and inspection guidance.
+
+An explicit recovery uses the current row's `expected` selection witness:
+
+```json
+{ "recovery": { "action": "same", "expected": "<current opaque value>" } }
+```
+
+`action` is `same` or `fresh`. This cannot also change execution settings or
+send a nonempty wake message. The server rechecks the current selection and
+admission before committing; an unknown, withdrawn or changed selection refuses
+without substituting Fresh. `expected` is only a concurrency witness, not Native
+identity or authority. Do not decode it or construct it from a saved ID.
+
+Same preserves the exact qualified target and sends no previous input. Fresh
+abandons pending AoE input and attachments without replay and retains native
+and transcript history. Omitting AoE restore flags cannot prevent an undeclared
+wrapper from restoring its own history. The
+[canonical recovery workflow](guides/session-resume.md#diagnosing-and-recovering-an-existing-session)
+describes CLI and interactive consent.
+
+
+A terminal resume or fresh-pinned readiness probe can return HTTP `409` with
+`aoe-error-code: launch_indeterminate` and a finite `cause`: `command_timed_out`,
+`observation_failed`, `stabilization_expired`, or `ownership_unproven`. This is
+not a ready target or a confirmed Agent exit. The response retains a mutation
+receipt when launch state was committed; no wake message or pending send is
+delivered. See [Native Session Resume](guides/session-resume.md#pinning-or-resetting-a-conversation)
+for preservation and inspection guidance.
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's
@@ -985,14 +1051,15 @@ Before delivery, the HTTP endpoint removes bracketed-paste delimiters and remain
 | `403` | `{"error": "read_only"}` | Server is in read-only mode |
 | `404` | `{"error": "not_found"}` | No session with that id |
 | `409` | `{"error": "session_not_running"}` | Session exists but the tmux pane is gone |
-| `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited during the probe. The ID and failure marker are preserved in this call; the next default revival can start fresh. |
+| `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited during the probe. The ID, binding and durable failure marker are preserved; exit does not prove that history was never loaded. |
+| `409` | `{"error": "managed_resume_refused", "message": "..."}` | A previous failed probe blocks revival before another native invocation. The cause header is `previous_probe_failed`; input is not sent to a new conversation. |
 | `409` | `{"error": "session_transient", "status": "..."}` | Session is mid-lifecycle and cannot accept input yet |
 | `409` | `{"error": "input_line_busy", "message": "..."}` | Claude Code's input box held text a person typed and had not sent for the whole 3 s wait, so nothing was typed. See below. |
 | `409` | `{"error": "session_archived" \| "session_trashed", "message": "..."}` | Session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, `/container-terminal` and structured-view prompts refuse the same way. |
 | `409` | `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?}` | Reviving a sandbox needs the sandbox login of its agent (`sandbox.shared_credential = "separate_login"`); `tool` is the one to log in. `profile` is the profile the session runs under (pass it as `-p <profile>`, or in the login request's `profile`); `command` only when the session runs its own command for the tool and `aoe sandbox login --tool <tool>` alone would log in another file than the launch waits for (pass it as `--command <command>`). Terminal sessions have no queue, so the message is not kept; send it again after `aoe sandbox login --tool <tool>` |
 | `500` | `{"error": "tmux_error"}` or `{"error": "internal"}` | Unexpected failure (logged server-side) |
 
-After a prior failed resume probe, a default restart or send-driven revival can start a new conversation and deliver input there. The old native transcript is not deleted, but its AoE association is abandoned. `/ensure` reports this as `resume_outcome: "fresh_after_failed_resume"` with `prior_session_id` and a message, rather than claiming a successful resume. See [session recovery policy](guides/session-resume.md#pinning-or-resetting-a-conversation) for explicit retry and direct CLI start behavior.
+After a failed resume probe, automatic recovery and send-driven revival preserve the conversation instead of starting Fresh. Manual `Default` start/restart refuse too unless `auto_resume_on_restart = false` selects the existing configured-Fresh policy. Retrying the same target requires an explicit qualified assertion, except for a persistent `Use` pin retried manually. Fresh never replays a blocked message. See the canonical [session recovery policy](guides/session-resume.md#pinning-or-resetting-a-conversation).
 
 A structured-view prompt (`POST /api/sessions/{id}/acp/prompt`) that would revive a sandbox needing the login answers `409` with `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?, "queued_id"}` instead (`profile` and `command` as in the `409` above): the prompt is kept in the session's queue under `queued_id` and delivered after the login, so do not send it again. The session also shows the instruction as its startup error until the login exists.
 
@@ -1118,7 +1185,7 @@ attachment is delivered. Genuine authority loss or an unknown outcome remains
 blocked until reconciled.
 
 A failed launch can still commit a lifecycle generation. The finite
-`aoe-error-code` values `start_failed`, `resume_failed`, and
+`aoe-error-code` values `start_failed`, `resume_failed`, `launch_indeterminate`, and
 `managed_resume_refused`, with valid same-epoch runtime receipt headers,
 acknowledge that preparation commit, not a successful
 launch. Clients must apply its snapshot before retrying. A later send or target
@@ -1127,8 +1194,16 @@ message delivery. Transport loss, local request-task failure, or malformed
 mutation receipts remain unknown; effect-free daemon refusals do not acknowledge
 a commit.
 
+A `launch_indeterminate` response with a valid committed receipt is a known
+refusal, not an unknown RPC outcome. It stays fenced until its snapshot is
+applied. The TUI then displays the refusal without quarantining the row or
+automatically attaching, sending, or replaying input; a new operation requires
+explicit user submission. Readiness itself remains unconfirmed.
+
 `409 managed_resume_refused` preserves the managed conversation. Its finite
-`aoe-managed-resume-cause` header supplies an application-owned recovery reason.
+`aoe-managed-resume-cause` header supplies an application-owned recovery reason,
+including `previous_probe_failed` for a retained failed target and
+`automatic_resume_disabled` for automatic recovery under the opt-out setting.
 The `omp_transcript_binding_required` cause identifies an absent OMP conversation
 binding or exact transcript path. `pi_transcript_binding_required` identifies
 the refusal when a matching Pi binding lacks the required transcript path
@@ -1138,7 +1213,8 @@ context AoE cannot attest whose conversation could not be verified from its
 local rollout either. Missing, unknown, or ambiguous cause metadata keeps
 the refusal generic; native clients do not read response bodies to derive that
 reason. See
-[managed resume recovery](guides/session-resume.md#common-managed-resume-and-fork-refusals).
+[managed resume recovery](guides/session-resume.md#common-managed-resume-and-fork-refusals)
+and [pinning or resetting a conversation](guides/session-resume.md#pinning-or-resetting-a-conversation).
 
 Sandbox preparation failures use `409 sandbox_migration_deferred` or
 `500 sandbox_migration_failed`, with the finite code header and canonical receipt.

@@ -89,6 +89,8 @@ pub struct PaneObservation {
     pub tmux_session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_tool: Option<LegacyToolObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical: Option<std::sync::Arc<LegacyToolObservation>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

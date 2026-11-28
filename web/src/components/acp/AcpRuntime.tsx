@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type
 
 import { useAcpSession } from "../../hooks/useAcpSession";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
+import { useLatestRef } from "../../hooks/useLatestRef";
 import {
   clearDraft,
   exclusiveRestore,
@@ -19,7 +20,7 @@ import {
   setDraftAttachments,
 } from "../../lib/acpDrafts";
 import { MAX_ATTACHMENTS } from "./composerInput";
-import { isVisiblyBusy } from "../../lib/acpTypes";
+import { isVisiblyBusy, nativeInputAvailable } from "../../lib/acpTypes";
 import type {
   AcpState,
   ApprovalDecision,
@@ -31,6 +32,7 @@ import { useAgentProfile } from "../../lib/agentProfileContext";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { activityToThreadMessages, clearFoldGeneration } from "./activityMessages";
 import { useCancelEscalation } from "./useCancelEscalation";
+import type { ComposerCompositionControl, CompositionSendResult } from "./useComposerHooks";
 
 type Session = ReturnType<typeof useAcpSession>;
 
@@ -61,10 +63,17 @@ export interface AcpContext {
   manualReconnect: () => void;
   resolveApproval: (nonce: string, decision: ApprovalDecision, optionId?: string) => Promise<void>;
   resolveElicitation: (nonce: string, resolution: ElicitationResolution) => Promise<void>;
-  sendPrompt: (text: string, attachments?: PromptAttachmentInput[]) => Promise<void>;
+  /** Consumed hands composition to the existing send flow; it does not prove Native delivery. */
+  sendPrompt: (text: string, attachments?: PromptAttachmentInput[]) => Promise<CompositionSendResult>;
+  beginOperationRetry: () => boolean;
+  operationRetryActive: boolean;
+  cancelOperationRetry: () => void;
+  compositionControlRef: React.RefObject<ComposerCompositionControl | null>;
+  attachmentReadGenerationRef: React.RefObject<number>;
   retryRejectedPrompt: (prompt: RejectedPrompt) => Promise<void>;
   /** The composer's Stop, escalating a cancel the Agent ignores. */
   stopTurn: () => void;
+  canForceEndTurn: boolean;
   /** Staged for the next send; owned here so assistant-ui's `onNew` can send them. */
   pendingAttachments: PromptAttachmentInput[];
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
@@ -114,6 +123,7 @@ function usePendingAttachments(sessionId: string) {
   // The view remounts per session. Writes wait for the async restore so the empty initial
   // state cannot delete the stored draft.
   const hydratedRef = useRef(false);
+  const restoreGeneration = useRef(0);
   const setPendingAttachments = useCallback(
     (action: SetStateAction<PromptAttachmentInput[]>) => {
       const next = typeof action === "function" ? action(pendingAttachmentsRef.current) : action;
@@ -123,10 +133,17 @@ function usePendingAttachments(sessionId: string) {
     },
     [sessionId],
   );
+  const resetPendingAttachments = useCallback(() => {
+    restoreGeneration.current += 1;
+    hydratedRef.current = true;
+    setPendingAttachments([]);
+  }, [setPendingAttachments]);
   useEffect(() => {
     let cancelled = false;
+    const generation = restoreGeneration.current;
     void exclusiveRestore(sessionId, async () => {
       const stored = await getDraftAttachments(sessionId);
+      if (generation !== restoreGeneration.current) return;
       // A failed read leaves the runtime unhydrated, so a staged attachment cannot overwrite
       // the draft that may still be intact in storage.
       if (stored === null) {
@@ -153,7 +170,13 @@ function usePendingAttachments(sessionId: string) {
       cancelled = true;
     };
   }, [sessionId]);
-  return { pendingAttachments, setPendingAttachments, pendingAttachmentsRef };
+  return {
+    pendingAttachments,
+    setPendingAttachments,
+    pendingAttachmentsRef,
+    resetPendingAttachments,
+    attachmentReadGenerationRef: restoreGeneration,
+  };
 }
 
 export function AcpRuntime({
@@ -167,14 +190,72 @@ export function AcpRuntime({
 }: Props) {
   const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, queuedCount);
   const agentProfile = useAgentProfile();
-  const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
-  const onCancel = useCancelEscalation(
+  const {
+    pendingAttachments,
+    setPendingAttachments,
+    pendingAttachmentsRef,
+    resetPendingAttachments,
+    attachmentReadGenerationRef,
+  } = usePendingAttachments(sessionId);
+  const acpRef = useLatestRef(acp);
+  const operationRetry = useRef<{ sessionId: string; expected: string } | null>(null);
+  const [operationRetryActive, setOperationRetryActive] = useState(false);
+  const compositionControlRef = useRef<ComposerCompositionControl | null>(null);
+  const beginOperationRetry = useCallback(() => {
+    const current = acpRef.current;
+    if (
+      !compositionControlRef.current ||
+      current.status !== "open" ||
+      !nativeInputAvailable(current.state) ||
+      !current.state.recovery?.actions.retry_operation
+    ) {
+      return false;
+    }
+    operationRetry.current = { sessionId, expected: current.state.recovery.expected };
+    compositionControlRef.current.reset();
+    resetPendingAttachments();
+    clearDraft(sessionId);
+    setOperationRetryActive(true);
+    return true;
+  }, [acpRef, resetPendingAttachments, sessionId]);
+  const cancelOperationRetry = useCallback(() => {
+    if (!operationRetry.current) return;
+    operationRetry.current = null;
+    compositionControlRef.current?.reset();
+    resetPendingAttachments();
+    clearDraft(sessionId);
+    setOperationRetryActive(false);
+  }, [resetPendingAttachments, sessionId]);
+  const sendPrompt = useCallback(
+    async (text: string, attachments?: PromptAttachmentInput[]): Promise<CompositionSendResult> => {
+      const retry = operationRetry.current;
+      if (retry) {
+        if (retry.sessionId !== sessionId) return "retained";
+        const accepted = await acpRef.current.retryOperation(text, attachments, retry.expected);
+        if (!accepted || operationRetry.current !== retry) return "retained";
+        operationRetry.current = null;
+        setOperationRetryActive(false);
+        return "consumed";
+      }
+      await acpRef.current.sendPrompt(text, attachments);
+      return "consumed";
+    },
+    [acpRef, sessionId],
+  );
+  const { onCancel: cancelNativeTurn, canForceEndTurn: canForceNativeTurn } = useCancelEscalation(
     sessionId,
     acp.state.promptSeq,
     acp.state.cancelling,
     acp.cancelPrompt,
     acp.forceEndTurn,
   );
+  const hostOnly = acp.state.hostPromptIntent != null && !(acp.state.turnActive && nativeInputAvailable(acp.state));
+  const onCancel = hostOnly
+    ? async () => {
+        await acp.cancelPrompt();
+      }
+    : cancelNativeTurn;
+  const canForceEndTurn = !hostOnly && canForceNativeTurn;
   // Only the recent slice renders, so a long session does not block first paint.
   const { windowedActivity, canLoadEarlier, loadEarlier } = useHistoryWindow(
     sessionId,
@@ -219,16 +300,32 @@ export function AcpRuntime({
     convertMessage: identityMessage,
     // The idle Enter path: text comes from the message, attachments from our staging.
     onNew: async (msg) => {
-      const text = msg.content
-        .map((c) => (c.type === "text" ? c.text : ""))
-        .join("")
-        .trim();
-      const attachments = [...pendingAttachmentsRef.current];
+      const draftText = msg.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+      const text = draftText.trim();
+      const attachmentSnapshot = pendingAttachmentsRef.current;
+      const attachments = [...attachmentSnapshot];
       if (!text && attachments.length === 0) return;
+      if (operationRetry.current) {
+        const composition = compositionControlRef.current;
+        if (!composition) return;
+        composition.restoreText(draftText);
+        const ownsComposition = composition.captureOwnership();
+        if (
+          (await sendPrompt(text, attachments)) === "retained" ||
+          pendingAttachmentsRef.current !== attachmentSnapshot ||
+          !ownsComposition()
+        ) {
+          return;
+        }
+        composition.reset();
+        clearDraft(sessionId);
+        resetPendingAttachments();
+        return;
+      }
       // Clear drafts before awaiting: an unmount mid-send must not rehydrate what was sent.
       clearDraft(sessionId);
       setPendingAttachments([]);
-      await acp.sendPrompt(text, attachments);
+      await sendPrompt(text, attachments);
     },
     onCancel,
   };
@@ -246,9 +343,15 @@ export function AcpRuntime({
         manualReconnect: acp.manualReconnect,
         resolveApproval: acp.resolveApproval,
         resolveElicitation: acp.resolveElicitation,
-        sendPrompt: acp.sendPrompt,
+        sendPrompt,
+        beginOperationRetry,
+        operationRetryActive,
+        cancelOperationRetry,
+        compositionControlRef,
+        attachmentReadGenerationRef,
         retryRejectedPrompt: acp.retryRejectedPrompt,
         stopTurn: () => void onCancel(),
+        canForceEndTurn,
         pendingAttachments,
         setPendingAttachments,
         forceEndTurn: acp.forceEndTurn,

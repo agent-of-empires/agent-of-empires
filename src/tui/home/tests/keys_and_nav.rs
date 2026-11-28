@@ -586,10 +586,7 @@ fn unread_dot_never_paints_in_terminal_view() {
     );
 }
 
-/// Stop targets what the user is looking at: Agent view arms the
-/// `stop_session` confirm (agent + container stop), while Terminal and Tool
-/// views route to their respective pane-kill paths and never arm an agent
-/// stop. The routing decision lives in `stop_selected`.
+/// Agent Stop and auxiliary-pane Stop must remain distinct.
 #[test]
 #[serial]
 fn stop_in_terminal_view_does_not_target_agent_session() {
@@ -603,15 +600,14 @@ fn stop_in_terminal_view_does_not_target_agent_session() {
     env.view.view_mode = ViewMode::Structured;
     env.view.stop_selected();
     assert_eq!(
-        env.view.pending_stop_session.as_deref(),
-        Some(id.as_str()),
-        "agent view stop must arm the agent-session stop"
-    );
-    assert_eq!(
         env.view.confirm_dialog.as_ref().map(|d| d.action()),
         Some("stop_session"),
         "agent view stop must open the stop-session confirm"
     );
+    assert!(matches!(
+        env.view.handle_key(key(KeyCode::Char('y')), None),
+        Some(crate::tui::app::Action::StopSession(stopped)) if stopped == id
+    ));
 
     env.view.confirm_dialog = None;
     env.view.pending_stop_session = None;
@@ -662,6 +658,7 @@ fn second_stop_key_press_confirms_the_stop() {
                         state: crate::session::PanePresence::Alive,
                         tmux_session: Some("host".into()),
                         legacy_tool: None,
+                        physical: None,
                     },
                 }];
             });

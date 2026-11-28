@@ -9,10 +9,12 @@ const drafts = new Map<string, string>();
 interface Props {
   readOnly: boolean;
   draftKey: string;
+  /** Explicit recovery composition starts empty and never loads or overwrites a saved draft. */
+  freshDraft?: boolean;
   /** Soft keyboard height above the home-indicator inset, which the sheet adds since its parent drops it. */
   bottomInset: number;
   /** Whether the pane will receive the text. */
-  onSubmit: (text: string, submit: boolean) => boolean;
+  onSubmit: (text: string, submit: boolean) => boolean | Promise<boolean>;
   onClose: (refocusTerminal: boolean) => void;
 }
 
@@ -20,10 +22,27 @@ interface Props {
  * A native textarea for writing a prompt with autocorrect, dictation, and long-press paste, delivered as one paste.
  * It is uncontrolled so a React re-render never rewrites text iOS dictation is still inserting.
  */
-export function TerminalComposeSheet({ draftKey, bottomInset, readOnly, onSubmit, onClose }: Props) {
+export function TerminalComposeSheet({
+  draftKey,
+  bottomInset,
+  readOnly,
+  freshDraft = false,
+  onSubmit,
+  onClose,
+}: Props) {
   const textRef = useRef<HTMLTextAreaElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
-  const [empty, setEmpty] = useState(() => !drafts.get(draftKey)?.trim());
+  const [empty, setEmpty] = useState(() => freshDraft || !drafts.get(draftKey)?.trim());
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pendingRef = useRef(false);
+  const mountedRef = useRef(true);
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const grow = useCallback(() => {
     const ta = textRef.current;
@@ -46,11 +65,39 @@ export function TerminalComposeSheet({ draftKey, bottomInset, readOnly, onSubmit
 
   const deliver = (submit: boolean, keepTyping = !submit) => {
     const text = textRef.current?.value ?? "";
-    if (readOnly || !text.trim() || !onSubmit(text, submit)) return;
-    drafts.delete(draftKey);
-    // A tapped Send drops the keyboard; Insert and the hardware chord keep typing in the terminal.
-    if (!keepTyping) textRef.current?.blur();
-    onClose(keepTyping);
+    if (readOnly || pendingRef.current || !text.trim() || (freshDraft && !submit)) return;
+    const accepted = () => {
+      if (!mountedRef.current) return;
+      if (!freshDraft) drafts.delete(draftKey);
+      if (!keepTyping) textRef.current?.blur();
+      onClose(keepTyping);
+    };
+    setError(null);
+    let result: boolean | Promise<boolean>;
+    try {
+      result = onSubmit(text, submit);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "The operation could not be sent.");
+      return;
+    }
+    if (typeof result === "boolean") {
+      if (result) accepted();
+      return;
+    }
+    pendingRef.current = true;
+    setPending(true);
+    void result
+      .then((ok) => {
+        if (ok) accepted();
+        else if (mountedRef.current) setError("The operation was refused. Your draft is retained.");
+      })
+      .catch((cause: unknown) => {
+        if (mountedRef.current) setError(cause instanceof Error ? cause.message : "The operation could not be sent.");
+      })
+      .finally(() => {
+        pendingRef.current = false;
+        if (mountedRef.current) setPending(false);
+      });
   };
 
   const onKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -81,12 +128,13 @@ export function TerminalComposeSheet({ draftKey, bottomInset, readOnly, onSubmit
         <textarea
           ref={textRef}
           aria-label="Message"
-          defaultValue={drafts.get(draftKey) ?? ""}
+          defaultValue={freshDraft ? "" : (drafts.get(draftKey) ?? "")}
           placeholder="Type, dictate, or long-press to paste"
+          disabled={pending}
           rows={2}
           onInput={(e) => {
             const value = e.currentTarget.value;
-            drafts.set(draftKey, value);
+            if (!freshDraft) drafts.set(draftKey, value);
             setEmpty(!value.trim());
             grow();
           }}
@@ -94,21 +142,33 @@ export function TerminalComposeSheet({ draftKey, bottomInset, readOnly, onSubmit
           style={{ fontSize: "16px" }}
           className={`${INPUT} max-h-[40vh] resize-none overflow-y-auto`}
         />
+        {error && (
+          <div role="alert" className="text-status-error">
+            {error}
+          </div>
+        )}
         {/* preventDefault keeps the keyboard up until the terminal input takes focus. */}
         <div className="flex items-center gap-2" onMouseDown={(e) => e.preventDefault()}>
           <button type="button" className={BUTTON_GHOST} onClick={() => onClose(false)}>
             Close
           </button>
           <span className="flex-1" />
+          {!freshDraft && (
+            <button
+              type="button"
+              disabled={readOnly || empty || pending}
+              className={BUTTON_SECONDARY}
+              onClick={() => deliver(false)}
+            >
+              Insert
+            </button>
+          )}
           <button
             type="button"
-            disabled={readOnly || empty}
-            className={BUTTON_SECONDARY}
-            onClick={() => deliver(false)}
+            disabled={readOnly || empty || pending}
+            className={BUTTON_PRIMARY}
+            onClick={() => deliver(true)}
           >
-            Insert
-          </button>
-          <button type="button" disabled={readOnly || empty} className={BUTTON_PRIMARY} onClick={() => deliver(true)}>
             Send
           </button>
         </div>

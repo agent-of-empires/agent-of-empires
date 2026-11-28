@@ -46,6 +46,10 @@ pub enum ContextMenuAction {
     ToggleSectionCollapse,
     /// Restore a trashed session.
     Restore,
+    Recovery,
+    ObserveExisting,
+    RetryOperation,
+    StopExisting,
     RetryTrash,
 }
 
@@ -154,6 +158,40 @@ impl ContextMenuDialog {
             items.push((ContextMenuAction::SwitchView, label));
         }
         Self::new(anchor, items)
+    }
+
+    pub fn with_recovery(
+        mut self,
+        recovery: Option<&crate::session::SessionRecovery>,
+        current: bool,
+        controls_available: bool,
+    ) -> Self {
+        let Some(recovery) = recovery else {
+            return self;
+        };
+        self.items.push((
+            ContextMenuAction::Recovery,
+            "Recovery diagnostic and choices",
+        ));
+        if current && recovery.actions.attach {
+            self.items.push((
+                ContextMenuAction::ObserveExisting,
+                "Observe existing runtime / transcript",
+            ));
+        }
+        if current && controls_available {
+            if recovery.actions.retry_operation {
+                self.items.push((
+                    ContextMenuAction::RetryOperation,
+                    "Retry operation with explicit input",
+                ));
+            }
+            if recovery.actions.stop {
+                self.items
+                    .push((ContextMenuAction::StopExisting, "Stop owned runtime"));
+            }
+        }
+        self
     }
 
     pub fn for_trashed_session(anchor: (u16, u16), unfinished: bool) -> Self {

@@ -12,7 +12,6 @@ import {
   HOLD,
   chunk,
   endTurn,
-  enableStructuredViewAndWait,
   openSession,
   openStructuredView,
   postAcp,
@@ -22,6 +21,7 @@ import {
   replayJson,
   script,
   sessionIdByTitle,
+  spawnAcpAgentAndWait,
   startAcpSession,
   stopButton,
   waitForStructuredView,
@@ -33,7 +33,9 @@ const PNG_1X1_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mN
 const IMAGE_CAPABLE = { promptCapabilities: { image: true } };
 
 function aoeAdd(env: NodeJS.ProcessEnv, projectDir: string, title: string) {
-  const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", title, "-c", "claude"], { env });
+  const res = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", title, "-c", "claude", "--structured-view"], {
+    env,
+  });
   if (res.status !== 0)
     throw new Error(`aoe add ${title} failed: status=${res.status} stderr=${res.stderr?.toString() ?? "<none>"}`);
 }
@@ -43,20 +45,88 @@ const expect2xx = (res: Response) => {
   expect(res.status).toBeLessThan(300);
 };
 
+test("original Native partial tool output survives a correlated prompt failure until its real terminal", async ({
+  page,
+  spawnServe,
+}, testInfo) => {
+  const toolId = "original-native-open-tool";
+  const partial = "NATIVE_PARTIAL_TOOL_OUTPUT";
+  const final = "NATIVE_REAL_TERMINAL_OUTPUT";
+  const failure = "NATIVE_LOCAL_REQUEST_FAILURE";
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "native-partial-tool-custody",
+    fakeAcpScript: script(
+      {
+        updates: [
+          {
+            sessionUpdate: "tool_call",
+            toolCallId: toolId,
+            title: "printf native-stream",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: { command: "printf native-stream" },
+          },
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: toolId,
+            status: "in_progress",
+            content: [{ type: "content", content: { type: "text", text: partial } }],
+          },
+        ],
+        error: { code: -32603, message: failure },
+      },
+      endTurn({
+        sessionUpdate: "tool_call_update",
+        toolCallId: toolId,
+        status: "completed",
+        content: [{ type: "content", content: { type: "text", text: final } }],
+      }),
+    ),
+  });
+  await openStructuredView(page, serve, sessionId);
+  await postPrompt(serve.baseUrl, sessionId, "start the original tool");
+  await expect
+    .poll(async () => {
+      const frames = JSON.stringify(await replayFrames(serve.baseUrl, sessionId));
+      return frames.includes(failure) && frames.includes("prompt_failed");
+    })
+    .toBe(true);
+  await expect(page.getByText(partial, { exact: true }).first()).toBeVisible();
+  const rows = (await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?view=rows&since=0`).then(
+    (response) => response.json(),
+  )) as { rows: { kind: string; tool_call_id?: string }[] };
+  expect(rows.rows.filter((row) => row.tool_call_id === toolId).map((row) => row.kind)).toEqual(["tool_start"]);
+  await page.reload();
+  await expect(page.getByText(partial, { exact: true }).first()).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("native-partial-after-local-failure.png"), fullPage: true });
+  await page.getByRole("button", { name: /printf native-stream/ }).click();
+  await postPrompt(serve.baseUrl, sessionId, "finish the same original tool explicitly");
+  await expect(page.getByText(final, { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(partial, { exact: true })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("native-real-tool-terminal.png"), fullPage: true });
+});
+
 test("structured view prompt carries an image attachment end to end", async ({ spawnServe }) => {
   // #1000, #965
   const { serve, sessionId } = await startAcpSession(spawnServe, { title: "acp-attach", fakeAcpScript: IMAGE_CAPABLE });
+  await expect
+    .poll(async () =>
+      (
+        (await replayFrames(serve.baseUrl, sessionId)) as { event?: { PromptCapabilities?: { image: boolean } } }[]
+      ).some(({ event }) => event?.PromptCapabilities?.image === true),
+    )
+    .toBe(true);
   const prompt = (text: string, attachment: object) =>
     postAcp(serve.baseUrl, sessionId, "/prompt", { text, attachments: [attachment] });
 
-  expect2xx(
-    await prompt("what is in this image?", {
-      kind: "image",
-      mime_type: "image/png",
-      data: PNG_1X1_B64,
-      name: "shot.png",
-    }),
-  );
+  const response = await prompt("what is in this image?", {
+    kind: "image",
+    mime_type: "image/png",
+    data: PNG_1X1_B64,
+    name: "shot.png",
+  });
+  expect(response.status).toBeGreaterThanOrEqual(200);
+  expect(response.status, await response.text()).toBeLessThan(300);
 
   // The persisted UserPromptSent carries a metadata-only ref to the stored blob.
   const attachment = async () =>
@@ -113,14 +183,21 @@ test("uploaded image in a user message is capped in height and never overflows",
     title: "acp-image-size",
     fakeAcpScript: IMAGE_CAPABLE,
   });
-  expect2xx(
-    await postAcp(serve.baseUrl, sessionId, "/prompt", {
-      text: "tall picture",
-      attachments: [
-        { kind: "image", mime_type: "image/png", data: solidPng(100, 1200).toString("base64"), name: "tall.png" },
-      ],
-    }),
-  );
+  await expect
+    .poll(async () =>
+      (
+        (await replayFrames(serve.baseUrl, sessionId)) as { event?: { PromptCapabilities?: { image: boolean } } }[]
+      ).some(({ event }) => event?.PromptCapabilities?.image === true),
+    )
+    .toBe(true);
+  const response = await postAcp(serve.baseUrl, sessionId, "/prompt", {
+    text: "tall picture",
+    attachments: [
+      { kind: "image", mime_type: "image/png", data: solidPng(100, 1200).toString("base64"), name: "tall.png" },
+    ],
+  });
+  expect(response.status).toBeGreaterThanOrEqual(200);
+  expect(response.status, await response.text()).toBeLessThan(300);
 
   await openStructuredView(page, serve, sessionId);
   const image = page.locator("img.acp-artifact-image");
@@ -141,15 +218,13 @@ test("staged composer image survives session switch and reload", async ({ page, 
   const serve = await spawnServe({
     acp: true,
     fakeAcpScript: IMAGE_CAPABLE,
-    seedFn: ({ home, env }) => {
-      aoeAdd(env, initWorkingRepo(join(home, "project-a"), env).path, "draft-source");
-      aoeAdd(env, initWorkingRepo(join(home, "project-b"), env).path, "draft-target");
-    },
   });
+  aoeAdd(serve.env, initWorkingRepo(join(serve.home, "project-a"), serve.env).path, "draft-source");
+  aoeAdd(serve.env, initWorkingRepo(join(serve.home, "project-b"), serve.env).path, "draft-target");
   const source = await sessionIdByTitle(serve.baseUrl, "draft-source");
   const target = await sessionIdByTitle(serve.baseUrl, "draft-target");
-  await enableStructuredViewAndWait(serve.baseUrl, source, 30_000, serve.home);
-  await enableStructuredViewAndWait(serve.baseUrl, target, 30_000, serve.home);
+  await spawnAcpAgentAndWait(serve.baseUrl, source, 30_000, serve.home);
+  await spawnAcpAgentAndWait(serve.baseUrl, target, 30_000, serve.home);
 
   await openStructuredView(page, serve, source);
   // Attach stays disabled until the agent's image capability arrives.
@@ -216,12 +291,10 @@ test("staged photo past the localStorage quota survives reload without a storage
   const serve = await spawnServe({
     acp: true,
     fakeAcpScript: IMAGE_CAPABLE,
-    seedFn: ({ home, env }) => {
-      aoeAdd(env, initWorkingRepo(join(home, "project-a"), env).path, "photo-draft");
-    },
   });
+  aoeAdd(serve.env, initWorkingRepo(join(serve.home, "project-a"), serve.env).path, "photo-draft");
   const id = await sessionIdByTitle(serve.baseUrl, "photo-draft");
-  await enableStructuredViewAndWait(serve.baseUrl, id, 30_000, serve.home);
+  await spawnAcpAgentAndWait(serve.baseUrl, id, 30_000, serve.home);
 
   await openStructuredView(page, serve, id);
   await expect(page.getByRole("button", { name: /Attach files/ })).toBeEnabled({ timeout: 30_000 });
@@ -266,11 +339,11 @@ test("structured view transcript file links open in-app, scroll to cited line, a
       // project_path is the working tree, so absolute links under it resolve to repo files.
       const text = `See [a.ts](${projectDir}/src/a.ts:1), [b.ts](${projectDir}/src/b.ts:1), [deep](${projectDir}/src/long.ts:80) and [missing](/tmp/aoe-1718-not-a-repo/missing.ts:1).`;
       writeFileSync(fakeAcpScriptPath(home), JSON.stringify(script(endTurn(chunk(text)))));
-      aoeAdd(env, projectDir, "acp-filelink");
     },
   });
+  aoeAdd(serve.env, join(serve.home, "project"), "acp-filelink");
   const sessionId = await sessionIdByTitle(serve.baseUrl, "acp-filelink");
-  await enableStructuredViewAndWait(serve.baseUrl, sessionId);
+  await spawnAcpAgentAndWait(serve.baseUrl, sessionId);
   await openStructuredView(page, serve, sessionId);
   expect2xx(await postPrompt(serve.baseUrl, sessionId, "show me the file"));
 
@@ -405,7 +478,7 @@ test("the spinner names the compaction phase and hides the force-end hatch", asy
   const spinner = page.getByTestId("acp-working-spinner");
   await expect(spinner).toContainText(/Compaction in progress/i, { timeout: 10_000 });
   await composer.fill("also check the tests");
-  await composer.press("Enter");
+  await page.getByRole("button", { name: "Send message into the current turn", exact: true }).click();
   await expect(page.getByRole("button", { name: /^also check the tests$/ })).toBeVisible({ timeout: 5_000 });
   await expect(spinner).toContainText(/Compaction in progress/i);
   await expect(page.getByText("answered after compaction")).toHaveCount(0);

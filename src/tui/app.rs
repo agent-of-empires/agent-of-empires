@@ -106,6 +106,7 @@ pub struct App {
     mosh_active: bool,
     // Actions that need the async loop, picked up after `execute_action`.
     pending_structured_view_open: Option<String>,
+    pending_operation_retry: Option<OperationRetryIntent>,
     pending_view_switch: Option<String>,
 
     pending_smart_rename: Option<String>,
@@ -333,6 +334,7 @@ impl App {
             host_title: super::host_title::HostTitleTracker::default(),
             mosh_active,
             pending_structured_view_open: None,
+            pending_operation_retry: None,
             preview_mount_pending: None,
             structured_mount: None,
             structured_mount_failed: None,
@@ -979,11 +981,7 @@ impl App {
                             ) {
                                 let _ = self.home.clear_preview_selection();
                                 self.execute_action(action, terminal)?;
-                                if let Some(session_id) =
-                                    self.pending_structured_view_open.take()
-                                {
-                                    self.open_structured_view(&session_id).await?;
-                                }
+                                self.drain_pending_session_actions().await?;
                                 if self.should_quit {
                                     break;
                                 }
@@ -1152,13 +1150,12 @@ impl App {
                             }
                             if let Some(action) = click_action {
                                 self.execute_action(action, terminal)?;
-                                if let Some(session_id) = self.pending_structured_view_open.take() {
-                                    self.open_structured_view(&session_id).await?;
-                                }
+                                self.drain_pending_session_actions().await?;
                             }
                             // Actions stashed by dialog button clicks.
                             if let Some(action) = self.home.pending_dialog_click_action.take() {
                                 self.execute_action(action, terminal)?;
+                                self.drain_pending_session_actions().await?;
                                 if let Some(session_id) = self.pending_view_switch.take() {
                                     self.perform_view_switch(&session_id, terminal).await;
                                 }
@@ -1314,7 +1311,7 @@ impl App {
                         self.update_status = None;
                         match self.home.enter_live_send_with(
                             &ready.id,
-                            &ready.tmux_name,
+                            &ready.terminal.tmux_session,
                             target,
                             ready.lease,
                         ) {
@@ -1326,7 +1323,7 @@ impl App {
                         self.update_status = None;
                         self.home.finish_send(
                             &ready.id,
-                            &ready.tmux_name,
+                            &ready.terminal,
                             target,
                             &message,
                             &ready.lease,
@@ -1349,9 +1346,7 @@ impl App {
                 .or_else(|| self.home.take_created_attach());
             if let Some(session_id) = created_attach {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
-                if let Some(sid) = self.pending_structured_view_open.take() {
-                    self.open_structured_view(&sid).await?;
-                }
+                self.drain_pending_session_actions().await?;
                 needs_full_refresh = true;
             }
 
@@ -2276,9 +2271,7 @@ impl App {
             self.perform_view_switch(&session_id, terminal).await;
         }
 
-        if let Some(session_id) = self.pending_structured_view_open.take() {
-            self.open_structured_view(&session_id).await?;
-        }
+        self.drain_pending_session_actions().await?;
 
         if let Some(session_id) = self.pending_smart_rename.take() {
             self.perform_smart_rename(&session_id);
@@ -2345,6 +2338,54 @@ impl App {
             Ok(()) => format!("\"{title}\" switched to the terminal view"),
             Err(e) => format!("view switch failed: {e}"),
         });
+    }
+
+    async fn drain_pending_session_actions(&mut self) -> Result<()> {
+        if let Some(OperationRetryIntent {
+            session_id: id,
+            text,
+            expected,
+        }) = self.pending_operation_retry.take()
+        {
+            let result: Result<()> = async {
+                anyhow::ensure!(
+                    self.home
+                        .operation_retry_projection(&id)
+                        .is_some_and(|current| current.expected == expected),
+                    "Current recovery no longer offers Retry; no input sent"
+                );
+                let structured = self
+                    .home
+                    .get_instance(&id)
+                    .ok_or_else(|| anyhow::anyhow!("Session no longer available"))?
+                    .is_structured();
+                let client = crate::acp::client::HttpClient::new(
+                    crate::acp::client::locate_daemon().await?,
+                )?;
+                if structured {
+                    client
+                        .prompt(&id, &text, true, crate::daemon::PromptOrigin::Tui)
+                        .await?;
+                } else {
+                    client.send_terminal_existing(&id, &text).await?;
+                }
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => self.set_status("Explicit input submitted without revival"),
+                Err(error) => {
+                    self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                        "Operation Retry Refused",
+                        &error.to_string(),
+                    ));
+                }
+            }
+        }
+        if let Some(id) = self.pending_structured_view_open.take() {
+            self.open_structured_view(&id).await?;
+        }
+        Ok(())
     }
 
     /// Enter the structured view against the located runtime.
@@ -2496,8 +2537,17 @@ impl App {
     /// Deliver paste buffered for the row whose in-flight mount just took the
     /// screen for Enter; `poll_structured_mount` names that row.
     async fn drain_structured_paste(&mut self) {
-        if let Some(sid) = self.structured_paste_drain.take() {
-            self.drain_pending_paste_for_structured_view(&sid).await;
+        let Some(sid) = self.structured_paste_drain.as_deref() else {
+            return;
+        };
+        match self.home.structured_preview.as_ref() {
+            Some(view) if view.session_id() == sid && !view.can_submit_prompt_intent() => {}
+            Some(view) if view.session_id() == sid => {
+                if let Some(sid) = self.structured_paste_drain.take() {
+                    self.drain_pending_paste_for_structured_view(&sid).await;
+                }
+            }
+            _ => self.structured_paste_drain = None,
         }
     }
 
@@ -3245,6 +3295,9 @@ impl App {
                 }
                 self.spawn_image_pull(image);
             }
+            Action::RetryOperation(intent) => {
+                self.pending_operation_retry = Some(intent);
+            }
             Action::SendMessage(id, message) => {
                 // Cold starts show "Reviving" feedback; warm sessions skip the
                 // toast, whose row would shift the preview for a frame.
@@ -3339,7 +3392,7 @@ impl App {
     fn attach_session(
         &mut self,
         session_id: &str,
-        terminal: &mut Terminal<TuiBackend>,
+        _terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         let instance = match self.home.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -3351,38 +3404,13 @@ impl App {
             return Ok(());
         }
 
-        let tmux_session = instance.tmux_session()?;
-
-        // Hook status and wrapper commands are stronger than shell detection
-        // when deciding whether a running row needs an explicit restart.
-        let exists = tmux_session.exists();
-        let pane_dead = exists && tmux_session.is_pane_dead();
-        let needs_restart = if !exists || pane_dead {
-            true
-        } else if crate::hooks::read_hook_status(&instance.id).is_some()
-            || instance.has_command_override()
-        {
-            false
-        } else {
-            !instance.expects_shell() && tmux_session.is_pane_running_shell()
-        };
-        tracing::debug!(target: "tui.input",
-            session_id,
-            exists,
-            pane_dead,
-            needs_restart,
-            "attach_session: restart decision"
-        );
-        // A row about to be started must not be one the user shelved: the
-        // trashed/archived agent stays stopped, so refuse visibly and point at
-        // the restore key instead of letting the runtime reject the start
-        // (#4118). The predicate is this branch's own, so the Stopped case the
-        // thin-client rework added to it is refused the same way.
-        let starts_agent = needs_restart || instance.status == crate::session::Status::Stopped;
-        if starts_agent && self.home.refuse_start_if_shelved(session_id) {
+        // Advisory only for the launch warning. The daemon must independently
+        // prove Missing/Dead before any implicit start; Enter is never Restart.
+        let may_start_agent = instance.agent_pane.state != crate::session::PanePresence::Alive;
+        if may_start_agent && self.home.refuse_start_if_shelved(session_id) {
             return Ok(());
         }
-        if starts_agent {
+        if may_start_agent {
             // Warn once when the agent can't take the sandbox's custom instruction.
             if instance.is_sandboxed() {
                 let has_instruction = instance
@@ -3423,51 +3451,9 @@ impl App {
                     }
                 }
             }
-
-            let size = crate::terminal::get_size();
-            if instance.status == crate::session::Status::Stopped {
-                self.home.start_then_attach(session_id, size);
-            } else {
-                self.home.restart_then_attach(session_id, size, false);
-            }
-            return Ok(());
         }
 
-        self.attach_live_session(session_id, terminal)
-    }
-
-    /// Attach to `session_id`'s running tmux pane and settle the row on return.
-    fn attach_live_session(
-        &mut self,
-        session_id: &str,
-        terminal: &mut Terminal<TuiBackend>,
-    ) -> Result<()> {
-        if !self.home.session_feed.native_interaction_available() {
-            return Ok(());
-        }
-        let tmux_session = match self.home.get_instance(session_id) {
-            Some(inst) => inst.tmux_session()?,
-            None => return Ok(()),
-        };
-        // Undo manual preview sizing so the attaching client gets the full
-        // terminal, and re-assert preview geometry afterwards.
-        tmux_session.reset_size_to_latest_client();
-        self.home.clear_preview_pane_sync(session_id);
-        let attach_result = self.with_raw_mode_disabled(terminal, || tmux_session.attach())?;
-
-        self.needs_redraw = true;
-        crate::tmux::refresh_session_cache();
-        self.home.apply_session_feed_before_input();
-        self.home.reload();
-        self.home.try_present_reload_failure_dialog();
-        self.home.clear_unread_on_view(session_id);
-        self.home.stamp_last_accessed(session_id);
-        self.home.select_session_by_id(session_id);
-
-        if let Err(e) = attach_result {
-            tracing::warn!(target: "tui.input", "tmux attach returned error: {}", e);
-        }
-
+        self.prepare_native_attachment(session_id, crate::tui::home::panes::NativePane::Agent);
         Ok(())
     }
 
@@ -3481,23 +3467,26 @@ impl App {
         } else {
             crate::session::AuxiliaryTarget::Host { index: 0 }
         };
-        self.prepare_native_attachment(session_id, target);
+        self.prepare_native_attachment(
+            session_id,
+            crate::tui::home::panes::NativePane::Auxiliary(target),
+        );
     }
 
     fn attach_tool_session(&mut self, session_id: &str, tool_name: &str) {
         self.prepare_native_attachment(
             session_id,
-            crate::session::AuxiliaryTarget::Tool {
+            crate::tui::home::panes::NativePane::Auxiliary(crate::session::AuxiliaryTarget::Tool {
                 tool_name: tool_name.into(),
-            },
+            }),
         );
     }
 
-    fn prepare_native_attachment(&mut self, id: &str, target: crate::session::AuxiliaryTarget) {
-        use crate::tui::home::panes::{NativePane, PaneIntent};
+    fn prepare_native_attachment(&mut self, id: &str, pane: crate::tui::home::panes::NativePane) {
+        use crate::tui::home::panes::PaneIntent;
         if let Err(error) = self.home.prepare_native_attachment(
             id,
-            NativePane::Auxiliary(target),
+            pane,
             crate::terminal::get_size(),
             PaneIntent::Attach,
         ) {
@@ -3516,7 +3505,12 @@ impl App {
         if !ready.lease.is_valid() {
             return Ok(());
         }
-        let target = crate::tmux::Session::from_name(&ready.tmux_name);
+        let Some(physical) = ready.terminal.physical.clone() else {
+            return Err(anyhow::anyhow!(
+                "Native target has no physical ownership receipt"
+            ));
+        };
+        let target = crate::tmux::Session::from_observation(&ready.terminal.tmux_session, physical);
         let lease = ready.lease;
         self.home.clear_preview_pane_sync(&ready.id);
         let attach_result = self.with_raw_mode_disabled(
@@ -3712,6 +3706,7 @@ pub enum Action {
     SpawnImagePull(String),
     /// Deferred so the loop can show "Reviving..." before `ensure_pane_ready`.
     SendMessage(String, String),
+    RetryOperation(OperationRetryIntent),
     EnterLiveSend(String),
     /// (session id, tool name indexing `Config.tools`).
     AttachToolSession(String, String),
@@ -3722,6 +3717,13 @@ pub enum Action {
     SwitchSessionView(String),
 
     SmartRenameNow(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperationRetryIntent {
+    pub session_id: String,
+    pub text: String,
+    pub expected: String,
 }
 
 #[cfg(test)]
@@ -5516,6 +5518,7 @@ mod tests {
                     text: "OLD-RETAINED\n\n".repeat(80),
                     message_id: None,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         let router = Router::new()
@@ -5674,6 +5677,7 @@ mod tests {
                     text: "NEW-RETAINED".into(),
                     message_id: Some("next".into()),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         tokio::time::timeout(Duration::from_secs(8), async {
@@ -5992,32 +5996,6 @@ mod tests {
         assert_eq!(disk_decision, DiskRefreshDecision::FullHeartbeat);
         assert!(!config_dirty.load(std::sync::atomic::Ordering::Acquire));
         assert!(!disk_dirty.load(std::sync::atomic::Ordering::Acquire));
-    }
-
-    #[test]
-    fn test_action_enum() {
-        let quit = Action::Quit;
-        let attach = Action::AttachSession("test-id".to_string());
-        let attach_terminal =
-            Action::AttachTerminal("test-id".to_string(), TerminalMode::Container);
-
-        assert_eq!(quit, Action::Quit);
-        assert_eq!(attach, Action::AttachSession("test-id".to_string()));
-        assert_eq!(
-            attach_terminal,
-            Action::AttachTerminal("test-id".to_string(), TerminalMode::Container)
-        );
-    }
-
-    #[test]
-    fn test_action_clone() {
-        let original = Action::AttachSession("session-123".to_string());
-        let cloned = original.clone();
-        assert_eq!(original, cloned);
-
-        let terminal_action = Action::AttachTerminal("session-123".to_string(), TerminalMode::Host);
-        let terminal_cloned = terminal_action.clone();
-        assert_eq!(terminal_action, terminal_cloned);
     }
 
     #[test]

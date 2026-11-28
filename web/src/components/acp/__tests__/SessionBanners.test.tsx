@@ -1,15 +1,36 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
-import { useReducer } from "react";
-
-import { emptyAcpState, type AcpEvent } from "../../../lib/acpTypes";
-import { reducer, type Action } from "../../../hooks/acpSession/reducer";
-import { isNewSessionStarting } from "../startupWait";
+import { applyEvent, applyReducedState, emptyAcpState, nativeInputAvailable } from "../../../lib/acpTypes";
+import type {
+  AcpEvent,
+  AcpState,
+  Approval,
+  Elicitation,
+  EstablishmentRevision,
+  IntegrationLostReason,
+  ReducedState,
+} from "../../../lib/acpTypes";
+import { setServerDown } from "../../../lib/connectionState";
+import { clearAcpCache, useAcpSession } from "../../../hooks/useAcpSession";
 import {
-  ScheduledWakeupBanner,
+  currentControlSnapshot,
+  flushAsync,
+  installAcpFakes,
+  json,
+  lastSocket,
+  profileWrapper,
+} from "../../../hooks/__tests__/acpHarness";
+import { ApprovalCard } from "../ApprovalCard";
+import { AskUserQuestionCard } from "../AskUserQuestionCard";
+import { reducer, type Action } from "../../../hooks/acpSession/reducer";
+import { useReducer } from "react";
+import { isNewSessionStarting } from "../startupWait";
+
+import {
   SessionBanners,
+  ScheduledWakeupBanner,
   SnoozedWorkerStoppedBanner,
   StartupWaitLine,
   TrashedWorkerStoppedBanner,
@@ -19,6 +40,249 @@ import {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+});
+
+describe("operation and interaction error banners", () => {
+  it.each([
+    undefined,
+    null,
+    {
+      source: "local_prompt_result",
+      operation: "prompt",
+      runtime: "unknown",
+      observed_at_ms: 100,
+    },
+  ] as const)("reveals the retained operation failure after an interaction retry succeeds (%j)", (evidence) => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s",
+      seq: 1,
+      event: { PromptRuntimeError: { message: "canonical operation failure", evidence } },
+    });
+    state = reducer(state, {
+      kind: "error",
+      message: "approval HTTP request failed",
+      target: { kind: "approval", nonce: "pending-card" },
+    });
+    const props = {
+      sessionId: "s",
+      acpWorkerState: "running" as const,
+      startingAgent: null,
+      trashedAt: null,
+      archivedAt: null,
+      snoozedUntil: null,
+      dismissError: vi.fn(),
+    };
+    const { rerender } = render(<SessionBanners {...props} state={state} />);
+    expect(screen.getByText("approval HTTP request failed")).toBeTruthy();
+    expect(screen.queryByText("canonical operation failure")).toBeNull();
+    state = reducer(state, { kind: "approval_resolved_locally", nonce: "pending-card" });
+    rerender(<SessionBanners {...props} state={state} />);
+    expect(screen.getByText("canonical operation failure")).toBeTruthy();
+    expect(screen.queryByText("approval HTTP request failed")).toBeNull();
+    expect(state.lastErrorEvidence).toEqual(evidence ?? null);
+  });
+});
+
+describe("interaction card retries through the session hook", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    clearAcpCache();
+    setServerDown(false);
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    clearAcpCache();
+    localStorage.clear();
+  });
+
+  for (const kind of ["approval", "elicitation"] as const) {
+    for (const failure of ["http", "network"] as const) {
+      it.each(["success", "already-resolved"] as const)(
+        `${kind} ${failure} failure enables retry and reveals the canonical error after %s`,
+        async (confirmation) => {
+          const sessionId = "interaction-retry";
+          const nonce = "pending-card";
+          const path = kind === "approval" ? "approvals" : "elicitations";
+          let attempts = 0;
+          const calls = installAcpFakes((call) => {
+            if (call.method !== "POST" || !call.url.endsWith(`/acp/${path}/${nonce}`)) return undefined;
+            attempts += 1;
+            if (attempts === 1) {
+              if (failure === "network") throw new TypeError("offline request");
+              return new Response("INTERACTION_HTTP_FAILURE", { status: 503 });
+            }
+            return confirmation === "success" ? json({}) : new Response(`No pending ${kind} ${nonce}`, { status: 404 });
+          });
+          let latest!: AcpState;
+          function InteractionSession() {
+            const acp = useAcpSession(sessionId);
+            latest = acp.state;
+            return (
+              <>
+                <SessionBanners
+                  sessionId={sessionId}
+                  state={acp.state}
+                  acpWorkerState="running"
+                  startingAgent={null}
+                  trashedAt={null}
+                  archivedAt={null}
+                  snoozedUntil={null}
+                  dismissError={acp.dismissError}
+                />
+                {acp.state.pendingApprovals.map((approval) => (
+                  <ApprovalCard
+                    key={approval.nonce}
+                    approval={approval}
+                    canDecide={acp.status === "open" && nativeInputAvailable(acp.state)}
+                    onResolve={(decision, optionId) => acp.resolveApproval(approval.nonce, decision, optionId)}
+                  />
+                ))}
+                {acp.state.pendingElicitations.map((elicitation) => (
+                  <AskUserQuestionCard
+                    key={elicitation.nonce}
+                    elicitation={elicitation}
+                    canDecide={acp.status === "open" && nativeInputAvailable(acp.state)}
+                    onResolve={(resolution) => acp.resolveElicitation(elicitation.nonce, resolution)}
+                  />
+                ))}
+              </>
+            );
+          }
+          render(<InteractionSession />, { wrapper: profileWrapper });
+          await flushAsync();
+          lastSocket().open();
+          await flushAsync();
+          lastSocket().message(currentControlSnapshot(latest, { ready: true }));
+          const approval: Approval = {
+            nonce,
+            destructive: false,
+            requested_at: "2026-01-01T00:00:00Z",
+            tool_call: {
+              id: "pending-tool",
+              name: "Bash",
+              kind: "execute",
+              args_preview: "{}",
+              started_at: "2026-01-01T00:00:00Z",
+            },
+          };
+          const elicitation: Elicitation = {
+            nonce,
+            message: "Answer the question",
+            tool_call_id: null,
+            requested_at: "2026-01-01T00:00:00Z",
+            resolved: null,
+            questions: [
+              {
+                field_key: "answer",
+                title: null,
+                description: null,
+                required: true,
+                kind: "free_text",
+                options: [],
+                default: "yes",
+              },
+            ],
+          };
+          const canonical = "canonical operation failure";
+          const evidence = {
+            source: "local_prompt_result",
+            operation: "prompt",
+            runtime: "unknown",
+            observed_at_ms: 100,
+          } as const;
+          const requested: ReducedState = {
+            agent: "claude",
+            model: null,
+            mode: "Default",
+            current_plan: null,
+            in_flight_tool: null,
+            pending_approvals: kind === "approval" ? [approval] : [],
+            pending_elicitations: kind === "elicitation" ? [elicitation] : [],
+            thinking: null,
+            rate_limit: null,
+            available_commands: [],
+            available_modes: [],
+            current_mode_id: null,
+            turn_active: true,
+            cancelling: false,
+            compacting: false,
+            operation_error: null,
+            connection_ready: true,
+          };
+          const buttonName = kind === "approval" ? "Allow" : "Submit";
+          lastSocket().message({ session_id: sessionId, seq: 1, event: { UserPromptSent: { text: "request A" } } });
+          lastSocket().message({
+            session_id: sessionId,
+            seq: 2,
+            event:
+              kind === "approval" ? { ApprovalRequested: { approval } } : { ElicitationRequested: { elicitation } },
+          });
+          // Pending cards are daemon-folded control state, not a client fold
+          // of the raw request event. Establish the actual card before failure.
+          lastSocket().message({ kind: "reduced_state", seq: 2, state: requested });
+          await flushAsync();
+          expect((screen.getByRole("button", { name: buttonName }) as HTMLButtonElement).disabled).toBe(false);
+          expect(latest.pendingApprovals.map((card) => card.nonce)).toEqual(kind === "approval" ? [nonce] : []);
+          expect(latest.pendingElicitations.map((card) => card.nonce)).toEqual(kind === "elicitation" ? [nonce] : []);
+          expect(attempts).toBe(0);
+          lastSocket().message({
+            session_id: sessionId,
+            seq: 3,
+            event: { PromptRuntimeError: { message: canonical, evidence } },
+          });
+          lastSocket().message({ session_id: sessionId, seq: 4, event: { Stopped: { reason: "prompt_failed" } } });
+          lastSocket().message({
+            kind: "reduced_state",
+            seq: 4,
+            state: { ...requested, turn_active: false, operation_error: evidence },
+          });
+          await flushAsync();
+          expect(screen.getByText(canonical)).toBeTruthy();
+          if (kind === "elicitation") {
+            fireEvent.change(screen.getByPlaceholderText("Type your answer"), { target: { value: "retained answer" } });
+          }
+          fireEvent.click(screen.getByRole("button", { name: buttonName }));
+          const noun = kind === "approval" ? "approval" : "question";
+          const message =
+            failure === "http"
+              ? `Could not resolve ${noun} (503). INTERACTION_HTTP_FAILURE`
+              : `Network error resolving ${noun}: offline request`;
+          expect(await screen.findByText(message)).toBeTruthy();
+          await waitFor(() =>
+            expect((screen.getByRole("button", { name: buttonName }) as HTMLButtonElement).disabled).toBe(false),
+          );
+          if (kind === "approval") {
+            for (const name of ["Always", "Deny"]) {
+              expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(false);
+            }
+          }
+          if (failure === "http") expect(screen.queryByText(/Network error resolving/)).toBeNull();
+          expect(screen.queryByText(canonical)).toBeNull();
+          expect(latest.lastError).toBe(canonical);
+          expect(latest.lastErrorEvidence).toEqual(evidence);
+          expect(latest.interactionError?.target).toEqual({ kind, nonce });
+          fireEvent.click(screen.getByRole("button", { name: buttonName }));
+          await waitFor(() => expect(screen.queryByRole("button", { name: buttonName })).toBeNull());
+          expect(screen.getByText(canonical)).toBeTruthy();
+          expect(screen.queryByText(message)).toBeNull();
+          expect(latest.lastError).toBe(canonical);
+          expect(latest.lastErrorEvidence).toEqual(evidence);
+          expect(latest.interactionError).toBeNull();
+          expect(latest.pendingApprovals).toHaveLength(0);
+          expect(latest.pendingElicitations).toHaveLength(0);
+          const resolutions = calls.filter(
+            (call) => call.method === "POST" && call.url.endsWith(`/acp/${path}/${nonce}`),
+          );
+          expect(resolutions).toHaveLength(2);
+          expect(resolutions[1]!.body).toBe(resolutions[0]!.body);
+          expect(JSON.parse(resolutions[1]!.body!)).toEqual(
+            kind === "approval" ? { decision: "Allow" } : { action: "accept", answers: { answer: "retained answer" } },
+          );
+        },
+      );
+    }
+  }
 });
 
 describe("SnoozedWorkerStoppedBanner", () => {
@@ -194,6 +458,85 @@ describe("StartupWaitLine", () => {
       vi.fn((query: string) => ({ matches: reduce && query.includes("reduce"), media: query })),
     );
   afterEach(() => vi.unstubAllGlobals());
+  const startupRevision = (version = 1): EstablishmentRevision => Array<number>(32).fill(version);
+
+  const recoveringLine = (revision: EstablishmentRevision | null, sessionId = "s1") => (
+    <StartupWaitLine
+      sessionId={sessionId}
+      agent="Claude Code"
+      sentPending
+      queuedPending={false}
+      canRestart
+      restartEpoch={0}
+      sentStopped={false}
+      establishmentRevision={revision}
+    />
+  );
+
+  it("refuses Start fresh without a current recovery comparison", () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const post = vi.fn();
+    vi.stubGlobal("fetch", post);
+    render(recoveringLine(null));
+    act(() => vi.advanceTimersByTime(30_000));
+    const fresh = screen.getByRole("button", { name: "Start fresh Claude Code" });
+    expect((fresh as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(fresh);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("requires renewed human consent when the recovery attempt changes before confirmation", async () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const post = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    vi.stubGlobal("fetch", post);
+    const before = startupRevision(1);
+    const after = startupRevision(2);
+    const { rerender } = render(recoveringLine(before));
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    expect(post).not.toHaveBeenCalled();
+    rerender(recoveringLine(after));
+    await act(async () => fireEvent.click(screen.getByTestId("startup-fresh-confirm")));
+    expect(post).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("startup-wait-restart-error").textContent).toContain(
+      "The conversation changed. Review Start fresh again.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    await act(async () => fireEvent.click(screen.getByTestId("startup-fresh-confirm")));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]![0]).toBe("/api/sessions/s1/acp/restart");
+    expect(JSON.parse(post.mock.calls[0]![1].body)).toEqual({
+      recovery: { revision: after, action: "fresh" },
+    });
+  });
+
+  it("invalidates a pending Start fresh confirmation when the selected session changes", async () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const post = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    vi.stubGlobal("fetch", post);
+    const { rerender } = render(recoveringLine(startupRevision(1)));
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    const next = startupRevision(2);
+    rerender(recoveringLine(next, "s2"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Start fresh Claude Code" })).toBeNull();
+    expect(post).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    await act(async () => fireEvent.click(screen.getByTestId("startup-fresh-confirm")));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]![0]).toBe("/api/sessions/s2/acp/restart");
+    expect(JSON.parse(post.mock.calls[0]![1].body)).toEqual({
+      recovery: { revision: next, action: "fresh" },
+    });
+  });
 
   it("names the Agent and counts up, then says it's still starting, with no duration", () => {
     vi.useFakeTimers();
@@ -269,18 +612,24 @@ describe("StartupWaitLine", () => {
         canRestart
         restartEpoch={3}
         sentStopped={false}
+        establishmentRevision={startupRevision()}
         onRestarted={onRestarted}
       />,
     );
-    const restart = () => screen.queryByRole("button", { name: "Restart Claude Code" });
+    const restart = () => screen.queryByRole("button", { name: "Start fresh Claude Code" });
     act(() => vi.advanceTimersByTime(29_000));
     expect(restart()).toBeNull();
     act(() => vi.advanceTimersByTime(1_000));
+    fireEvent.click(restart()!);
+    expect(spawn).not.toHaveBeenCalled();
     await act(async () => {
-      fireEvent.click(restart()!);
+      fireEvent.click(screen.getByTestId("startup-fresh-confirm"));
     });
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(spawn.mock.calls[0]![0]).toBe("/api/sessions/s1/acp/restart");
+    expect(JSON.parse(spawn.mock.calls[0]![1].body)).toEqual({
+      recovery: { revision: startupRevision(), action: "fresh" },
+    });
     act(() => vi.advanceTimersByTime(1_000));
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe(elapsedAfter);
     expect(restart() === null).toBe(failure === null);
@@ -306,12 +655,14 @@ describe("StartupWaitLine", () => {
         canRestart
         restartEpoch={restartEpoch}
         sentStopped={false}
+        establishmentRevision={startupRevision()}
         onRestarted={onRestarted}
       />
     );
     const { rerender } = render(line(0));
     act(() => vi.advanceTimersByTime(30_000));
-    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    fireEvent.click(screen.getByTestId("startup-fresh-confirm"));
     // The replacement is assigned before the restart request answers.
     rerender(line(1));
     await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
@@ -338,8 +689,12 @@ describe("StartupWaitLine", () => {
       ),
     );
     let dispatch!: (action: Action) => void;
+    const sent = reducer(emptyAcpState(), frame(1, { UserPromptSent: { text: "hi" } }));
+    const snapshot = currentControlSnapshot(sent, { ready: false, wakeEligible: true }, 1);
+    snapshot.state.establishment_revision = startupRevision();
+    const initialState = reducer(sent, snapshot);
     function Owner() {
-      const [state, send] = useReducer(reducer, reducer(emptyAcpState(), frame(1, { UserPromptSent: { text: "hi" } })));
+      const [state, send] = useReducer(reducer, initialState);
       dispatch = send;
       const connection = {
         status: "open",
@@ -354,7 +709,7 @@ describe("StartupWaitLine", () => {
           state={state}
           startingAgent={isNewSessionStarting(state, connection, "resuming", false) ? "Claude Code" : null}
           canRestart
-          onRestarted={(epoch, stoppedSent) => send({ kind: "restart_started", epoch, stoppedSent })}
+          onStartupRestarted={(epoch, stoppedSent) => send({ kind: "restart_started", epoch, stoppedSent })}
           onRestartFailed={(epoch, message, stoppedSent) =>
             send({ kind: "restart_failed", epoch, message, stoppedSent })
           }
@@ -368,7 +723,8 @@ describe("StartupWaitLine", () => {
     }
     render(<Owner />);
     act(() => vi.advanceTimersByTime(30_000));
-    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    fireEvent.click(screen.getByTestId("startup-fresh-confirm"));
     return {
       dispatch: (action: Action) => act(() => dispatch(action)),
       respond: (status: number, body: string) =>
@@ -465,7 +821,9 @@ describe("StartupWaitLine", () => {
       />,
     );
     act(() => vi.advanceTimersByTime(30_000));
-    const describedBy = screen.getByRole("button", { name: "Restart Claude Code" }).getAttribute("aria-describedby");
+    const describedBy = screen
+      .getByRole("button", { name: "Start fresh Claude Code" })
+      .getAttribute("aria-describedby");
     expect(describedBy ? document.getElementById(describedBy)?.textContent : "").toBe(description);
     expect(screen.queryByTestId("startup-wait-restart-cost")?.textContent ?? "").toBe(description);
   });
@@ -511,7 +869,7 @@ describe("SessionBanners Retry", () => {
           state={state}
           startingAgent={isNewSessionStarting(state, connection, "running", true) ? "Claude Code" : null}
           canRestart
-          onRestarted={(epoch, stoppedSent, retriedError) =>
+          onStartupRestarted={(epoch, stoppedSent, retriedError) =>
             send({ kind: "restart_started", epoch, stoppedSent, retriedError })
           }
           onRestartFailed={(epoch, message, stoppedSent) =>
@@ -535,10 +893,10 @@ describe("SessionBanners Retry", () => {
 
   it.each<[string, (owner: ReturnType<typeof renderFailed>) => Promise<void>, string | null]>([
     [
-      "the Agent starting ends the line",
+      "the Agent's current input receipt ends the line",
       async (o) => {
         await o.respond(200, "");
-        o.dispatch(frame(2, { AcpSessionAssigned: { acp_session_id: "acp-2" } }));
+        o.dispatch(currentControlSnapshot(emptyAcpState(), { ready: true }, 2));
       },
       null,
     ],
@@ -611,5 +969,312 @@ describe("SessionBanners startup line", () => {
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:31");
     expect(screen.queryByTestId("startup-wait-restart") !== null).toBe(canRestart);
     expect(screen.queryByTestId("startup-wait-restart-cost") !== null).toBe(canRestart);
+  });
+
+  it("never offers legacy startup Restart over a canonical recovery selection", () => {
+    vi.useFakeTimers();
+    const state = emptyAcpState();
+    state.recovery = {
+      reason: "operation_failed",
+      diagnostic: "The provider could not complete this operation.",
+      evidence: {
+        source: "local_prompt_result",
+        operation: "prompt",
+        runtime: "unknown",
+        blocking_scope: "operation",
+        retryable: true,
+        reported_code: -32603,
+        observed_at_ms: 10,
+      },
+      runtime: "acp_transport_ready",
+      work_in_progress: false,
+      uncertainty: null,
+      guidance: "Repair the provider configuration before composing a new operation.",
+      actions: { attach: true, retry_operation: true, restart_same: false, stop: false, fresh: false },
+      expected: "original-selection",
+    };
+    render(
+      <SessionBanners
+        sessionId="s1"
+        state={state}
+        startingAgent="Claude Code"
+        canRestart
+        recoveryCurrent
+        acpWorkerState="running"
+        trashedAt={null}
+        archivedAt={null}
+        snoozedUntil={null}
+        dismissError={vi.fn()}
+      />,
+    );
+    act(() => vi.advanceTimersByTime(31_000));
+    expect(screen.queryByTestId("startup-wait-restart")).toBeNull();
+    expect((screen.getByTestId("session-recovery-restart-same") as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe("accepted integration-loss snapshot diagnostics", () => {
+  const message = /The integration held back too many messages/;
+  const banners = (state: AcpState) => (
+    <SessionBanners
+      sessionId="snapshot-diagnostic"
+      state={state}
+      startingAgent={null}
+      canRestart={false}
+      acpWorkerState="running"
+      trashedAt={null}
+      archivedAt={null}
+      snoozedUntil={null}
+      dismissError={vi.fn()}
+    />
+  );
+  const snapshot = (
+    state: AcpState,
+    reason: IntegrationLostReason | null,
+    seq: number,
+    receipt: Parameters<typeof currentControlSnapshot>[1] = { ready: false },
+  ) => {
+    const header = currentControlSnapshot(state, receipt, seq);
+    const wire = { ...header.state, integration_lost: reason };
+    return applyReducedState(state, wire, header.unchanged, header.seq);
+  };
+
+  beforeEach(() => setServerDown(false));
+
+  it.each<[IntegrationLostReason, string]>([
+    [{ kind: "contract_violation", detail: "invalid primitive epoch" }, "invalid primitive epoch"],
+    [{ kind: "hold_overflow" }, "held back too many messages"],
+    [{ kind: "lease_overflow" }, "left too many requests open"],
+    [{ kind: "proxy_exited" }, "process exited"],
+  ])("renders snapshot-only reason %j without a raw frame or native authority (%s)", (reason, detail) => {
+    const state = snapshot(emptyAcpState(), reason, 20);
+    render(banners(state));
+    expect(screen.getAllByTestId("integration-lost-banner")).toHaveLength(1);
+    expect(screen.getByTestId("integration-lost-line").textContent).toContain(detail);
+    expect(screen.queryByTestId("startup-error-banner")).toBeNull();
+    expect(screen.queryByRole("button", { name: /retry/i })).toBeNull();
+    expect(state).toMatchObject({
+      connectionReady: false,
+      connectionUnavailable: null,
+      promptWakeEligible: false,
+      nativeSnapshotSeq: 20,
+    });
+    expect(nativeInputAvailable(state)).toBe(false);
+  });
+
+  it.each<[string, Parameters<typeof currentControlSnapshot>[1]]>([
+    ["Available", { ready: true }],
+    ["governed wake", { ready: false, wakeEligible: true }],
+    [
+      "qualified native loss",
+      {
+        ready: false,
+        unavailable: { source: "native", cause: "stdout_eof", phase: "established" },
+      },
+    ],
+  ])("keeps integration diagnostics separate from the %s native receipt", (_label, receipt) => {
+    const header = currentControlSnapshot(emptyAcpState(), receipt, 20);
+    const baseline = applyReducedState(emptyAcpState(), header.state, [], header.seq);
+    const state = snapshot(baseline, { kind: "hold_overflow" }, 20, receipt);
+    render(banners(state));
+    expect(screen.getByText(message)).toBeTruthy();
+    expect({
+      ready: state.connectionReady,
+      unavailable: state.connectionUnavailable,
+      wake: state.promptWakeEligible,
+    }).toEqual({
+      ready: baseline.connectionReady,
+      unavailable: baseline.connectionUnavailable,
+      wake: baseline.promptWakeEligible,
+    });
+    expect(nativeInputAvailable(state)).toBe(nativeInputAvailable(baseline));
+  });
+
+  it.each<["current reason" | "current clear", IntegrationLostReason | null]>([
+    ["current reason", { kind: "hold_overflow" }],
+    ["current clear", null],
+  ])("protects the %s from covered raw loss/reset history and an older snapshot", (_label, reason) => {
+    let state = snapshot(emptyAcpState(), reason, 20);
+    const view = render(banners(state));
+    const expectDiagnostic = () => {
+      if (reason) expect(screen.getByText(message)).toBeTruthy();
+      else expect(screen.queryByTestId("integration-lost-banner")).toBeNull();
+      expect(nativeInputAvailable(state)).toBe(false);
+    };
+    expectDiagnostic();
+    state = applyEvent(state, {
+      session_id: "snapshot-diagnostic",
+      seq: 5,
+      event: { IntegrationLost: { reason: { kind: "contract_violation", detail: "older raw loss" } } },
+    });
+    view.rerender(banners(state));
+    expectDiagnostic();
+    state = applyEvent(state, {
+      session_id: "snapshot-diagnostic",
+      seq: 6,
+      event: { UserPromptSent: { text: "older raw prompt" } },
+    });
+    view.rerender(banners(state));
+    expectDiagnostic();
+    expect(snapshot(state, { kind: "lease_overflow" }, 19)).toEqual(state);
+    for (const [index, connectionReady] of [undefined, false, true].entries()) {
+      state = applyEvent(state, {
+        session_id: "snapshot-diagnostic",
+        seq: 21 + index,
+        event: {
+          AcpSessionAssigned: {
+            acp_session_id: "new-current-native",
+            ...(connectionReady === undefined ? {} : { connection_ready: connectionReady }),
+            native_subject: null,
+          },
+        },
+      });
+      view.rerender(banners(state));
+      expectDiagnostic();
+      expect(state.integrationLost).toEqual(reason);
+    }
+    state = snapshot(state, null, 24);
+    view.rerender(banners(state));
+    expect(screen.queryByTestId("integration-lost-banner")).toBeNull();
+    expect(state.integrationLost).toBeNull();
+    expect(nativeInputAvailable(state)).toBe(false);
+  });
+
+  it("keeps raw integration diagnostics when a legacy snapshot omits the optional field", () => {
+    const initial = applyEvent(emptyAcpState(), {
+      session_id: "snapshot-diagnostic",
+      seq: 1,
+      event: { IntegrationLost: { reason: { kind: "hold_overflow" } } },
+    });
+    const header = currentControlSnapshot(initial, { ready: false }, 20);
+    delete header.state.integration_lost;
+    const state = applyReducedState(initial, header.state, [], header.seq);
+    render(banners(state));
+    expect(screen.getByText(message)).toBeTruthy();
+    expect(nativeInputAvailable(state)).toBe(false);
+  });
+
+  it("clears only the current integration diagnostic while preserving unrelated errors", () => {
+    let initial = applyEvent(emptyAcpState(), {
+      session_id: "snapshot-diagnostic",
+      seq: 1,
+      event: { AgentStartupError: { message: "Unrelated startup diagnostic" } },
+    });
+    initial = applyEvent(initial, {
+      session_id: "snapshot-diagnostic",
+      seq: 2,
+      event: { PromptRuntimeError: { message: "Retained operation diagnostic" } },
+    });
+    initial = reducer(initial, { kind: "error", message: "Retained callback failure" });
+    const lost = snapshot(initial, { kind: "hold_overflow" }, 20);
+    const view = render(banners(lost));
+    expect(screen.getByText(message)).toBeTruthy();
+    fireEvent.click(screen.getByTestId("startup-error-banner-details"));
+    expect(screen.getByText("Unrelated startup diagnostic")).toBeTruthy();
+    expect(screen.getByText("Retained callback failure")).toBeTruthy();
+    expect(screen.getByText(message)).toBeTruthy();
+    const cleared = snapshot(lost, null, 21);
+    view.rerender(banners(cleared));
+    expect(screen.queryByTestId("integration-lost-banner")).toBeNull();
+    expect(cleared.startupError).toBe("Unrelated startup diagnostic");
+    expect(cleared.lastError).toBe("Retained operation diagnostic");
+    expect(cleared.interactionError).toEqual(initial.interactionError);
+    expect(screen.getByText("Unrelated startup diagnostic")).toBeTruthy();
+    expect(screen.getByText("Retained callback failure")).toBeTruthy();
+    expect(nativeInputAvailable(cleared)).toBe(false);
+  });
+});
+
+describe("host-only Stop while the same Native constructor is pending", () => {
+  const connection = {
+    status: "open" as const,
+    hasEverOpened: true,
+    reconnecting: false,
+    retryCount: 0,
+    maxRetries: 5,
+  };
+  const intent = "5fdcc941-9be3-4f26-ab31-21b612084392";
+  const revision = Array.from({ length: 32 }, (_, i) => i) as EstablishmentRevision;
+  const props = {
+    sessionId: "pending-host-worker",
+    acpWorkerState: "running" as const,
+    canRestart: true,
+    trashedAt: null,
+    archivedAt: null,
+    snoozedUntil: null,
+    dismissError: vi.fn(),
+  };
+
+  it.each(["before", "after"] as const)(
+    "does not report physical retirement when the host stop arrives %s its live snapshot",
+    (order) => {
+      const initial = currentControlSnapshot(emptyAcpState(), { ready: false, wakeEligible: true }, 2);
+      initial.state.host_prompt_intent = intent;
+      initial.state.establishment_revision = revision;
+      let state = reducer(emptyAcpState(), initial);
+      const stopped = {
+        kind: "frame" as const,
+        frame: {
+          session_id: props.sessionId,
+          seq: 3,
+          scope: "history_only",
+          event: { Stopped: { reason: "user_stopped" } },
+        },
+      };
+      const settled = currentControlSnapshot(state, { ready: false, wakeEligible: true }, 3);
+      settled.state.host_prompt_intent = null;
+      settled.unchanged.push("establishment_revision");
+      delete settled.state.establishment_revision;
+      if (order === "before") {
+        state = reducer(state, stopped);
+        expect(state.hostPromptIntent).toBe(intent);
+        expect(state.establishmentRevision).toEqual(revision);
+        state = reducer(state, settled);
+      } else {
+        state = reducer(state, settled);
+        state = reducer(state, stopped);
+      }
+      expect(state.hostPromptIntent).toBeNull();
+      expect(state.establishmentRevision).toEqual(revision);
+      expect(nativeInputAvailable(state)).toBe(false);
+      expect(state.turnActive).toBe(false);
+      render(
+        <SessionBanners
+          {...props}
+          state={state}
+          startingAgent={isNewSessionStarting(state, connection, "running", false) ? "Claude Code" : null}
+        />,
+      );
+      expect(screen.getByTestId("startup-wait-line")).toBeTruthy();
+      expect(screen.queryByText("Structured view worker stopped")).toBeNull();
+    },
+  );
+
+  it("retains the real worker-stop explanation when the live constructor is gone", () => {
+    const initial = currentControlSnapshot(emptyAcpState(), { ready: false, wakeEligible: true }, 2);
+    initial.state.host_prompt_intent = intent;
+    initial.state.establishment_revision = revision;
+    let state = reducer(emptyAcpState(), initial);
+    state = reducer(state, {
+      kind: "frame",
+      frame: { session_id: props.sessionId, seq: 3, event: { Stopped: { reason: "user_stopped" } } },
+    });
+    const retired = currentControlSnapshot(state, { ready: false, wakeEligible: false }, 3);
+    retired.state.host_prompt_intent = null;
+    retired.state.establishment_revision = null;
+    state = reducer(state, retired);
+    render(
+      <SessionBanners
+        {...props}
+        state={state}
+        acpWorkerState="absent"
+        startingAgent={isNewSessionStarting(state, connection, "absent", false) ? "Claude Code" : null}
+      />,
+    );
+    expect(nativeInputAvailable(state)).toBe(false);
+    expect(state.hostPromptIntent).toBeNull();
+    expect(state.establishmentRevision).toBeNull();
+    expect(screen.queryByTestId("startup-wait-line")).toBeNull();
+    expect(screen.getByText("Structured view worker stopped")).toBeTruthy();
   });
 });

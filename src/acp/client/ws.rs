@@ -70,6 +70,8 @@ pub enum WsMessage {
         seq: u64,
         state: Box<AcpState>,
         unchanged: Vec<String>,
+        /// Missing revokes action freshness without clearing an older diagnostic.
+        recovery_present: bool,
     },
     /// Daemon's in-memory ring evicted events the client missed.
     /// Consumer should drop local reducer state and call
@@ -113,6 +115,23 @@ pub struct WsHandle {
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
 
 impl WsHandle {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let token = shutdown.clone();
+        let task = tokio::spawn(async move {
+            token.cancelled().await;
+            drop(tx);
+        });
+        Self {
+            rx,
+            task,
+            _drop_guard: shutdown.clone().drop_guard(),
+            shutdown,
+        }
+    }
+
     pub async fn recv(&mut self) -> Option<Result<WsMessage, WsError>> {
         self.rx.recv().await
     }
@@ -335,6 +354,20 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
         #[serde(default)]
         unchanged: Vec<String>,
     }
+    #[derive(serde::Deserialize)]
+    struct RecoveryPresenceFrame {
+        state: RecoveryPresence,
+    }
+    #[derive(serde::Deserialize)]
+    struct RecoveryPresence {
+        #[serde(default, deserialize_with = "recovery_present")]
+        recovery: bool,
+    }
+    fn recovery_present<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<bool, D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
+    }
     if let Ok(KindProbe { kind: Some(kind) }) = serde_json::from_str::<KindProbe>(raw) {
         let kind = kind.unwrap_or(serde_json::Value::Null);
         match kind.as_str() {
@@ -356,12 +389,18 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
             // Server-folded control state (Tier 1.3), sent on connect and
             // after every event.
             Some("reduced_state") => {
+                // Probe only presence; do not allocate a second JSON tree for the full ACP state.
+                let recovery_present = serde_json::from_str::<RecoveryPresenceFrame>(raw)
+                    .map_err(|_| WsError::Parse)?
+                    .state
+                    .recovery;
                 let frame: ReducedStateFrame =
                     serde_json::from_str(raw).map_err(|_| WsError::Parse)?;
                 return Ok(Some(WsMessage::ReducedState {
                     seq: frame.seq,
                     state: Box::new(frame.state),
                     unchanged: frame.unchanged,
+                    recovery_present,
                 }));
             }
             // A sentinel a newer daemon grew. Dropping it is safe: every
@@ -594,6 +633,35 @@ mod tests {
             value_of(header::SEC_WEBSOCKET_PROTOCOL).as_deref(),
             Some("aoe-auth, aoe-device.the-binding-secret")
         );
+    }
+
+    #[test]
+    fn reduced_recovery_distinguishes_absent_authority_from_an_explicit_current_clear() {
+        let state = AcpState::new(
+            crate::acp::state::AcpSessionId("presence".into()),
+            crate::acp::state::AgentName("claude".into()),
+            None,
+        );
+        let mut frame = serde_json::json!({
+            "kind":"reduced_state", "seq":1, "state":state,
+        });
+        for expected in [false, true] {
+            if expected {
+                frame["state"]["recovery"] = serde_json::Value::Null;
+            }
+            match parse_text(&frame.to_string()).unwrap().unwrap() {
+                WsMessage::ReducedState {
+                    state,
+                    recovery_present,
+                    ..
+                } => {
+                    assert_eq!(recovery_present, expected);
+                    assert!(state.recovery.is_none());
+                    assert!(!state.connection_ready);
+                }
+                other => panic!("expected reduced state, got {other:?}"),
+            }
+        }
     }
 
     #[test]

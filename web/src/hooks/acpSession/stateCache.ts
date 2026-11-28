@@ -5,6 +5,7 @@ import { lastUserBoundaryIndex } from "../../lib/acpHistoryWindow";
 import {
   emptyAcpState,
   normaliseTurnState,
+  revokeNativeAuthority,
   type AcpState,
   type ActivityRow,
   type BackgroundAgent,
@@ -25,6 +26,33 @@ import { safeSetItem } from "../../lib/safeStorage";
 const STATE_CACHE_CAP = 32;
 const stateCache = new Map<string, AcpState>();
 const stateListeners = new Map<string, Set<() => void>>();
+
+export const NATIVE_INPUT_UNCONFIRMED =
+  "Native input is not currently confirmed. The retained conversation has not been replaced.";
+
+export interface LiveAcpActions {
+  cancelPrompt: () => Promise<string | null>;
+  cancelSubagent: (childId: string) => Promise<string | null>;
+}
+
+const liveActions = new Map<string, { owner: symbol; actions: LiveAcpActions }>();
+
+/** Live callbacks have their own lifetime, never the cached state's lifetime. */
+export function registerLiveAcpActions(sessionId: string, owner: symbol, actions: LiveAcpActions): () => void {
+  const entry = { owner, actions };
+  liveActions.set(sessionId, entry);
+  return () => {
+    if (liveActions.get(sessionId) === entry) liveActions.delete(sessionId);
+  };
+}
+
+export function getLiveAcpActions(sessionId: string): LiveAcpActions | undefined {
+  return liveActions.get(sessionId)?.actions;
+}
+
+export function ownsLiveAcpActions(sessionId: string, owner: symbol): boolean {
+  return liveActions.get(sessionId)?.owner === owner;
+}
 
 function storageKey(sessionId: string): string {
   return STORAGE_KEY_PREFIX + sessionId;
@@ -82,17 +110,20 @@ export function evictOldestPersistedAcpState(currentKey: string): boolean {
 // Optimistic rows and in-flight ids are ephemeral, and attachment bytes would blow the quota
 // (text alone would drain a degraded prompt on reload), so none of them are persisted.
 function toPersistedState(state: AcpState, durable: (id: string) => boolean): AcpState {
+  state = revokeNativeAuthority(state);
   const base: AcpState =
     state.optimisticRows.length > 0 ||
     state.inflightPromptIds.length > 0 ||
     state.restartInFlight ||
     state.restartStoppedSent ||
     state.restartFailure !== null ||
+    state.interactionError ||
     state.retriedError !== null
       ? {
           ...state,
           optimisticRows: [],
           inflightPromptIds: [],
+          interactionError: null,
           restartInFlight: false,
           restartStoppedSent: false,
           restartFailure: null,
@@ -234,6 +265,7 @@ export function persistState(sessionId: string, state: AcpState, savedAt = Date.
 // Rows with no user prompt and older history pending would open mid-turn. Drop the rows and cursor so replay
 // reloads the transcript from the tail; folded control state keeps its own cursor and is untouched.
 function reopenState(state: AcpState): AcpState {
+  state = revokeNativeAuthority(state);
   if (state.oldestSeq > 1 && lastUserBoundaryIndex(state.activity) < 0) return { ...state, activity: [], oldestSeq: 0 };
   return state;
 }

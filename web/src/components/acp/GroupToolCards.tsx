@@ -12,7 +12,14 @@ import {
   useOpenBackgroundAgentsPane,
   useSubagentFor,
 } from "./backgroundAgentsContext";
-import { CardChrome, spanTimes, useToolCardExpansion, type Status, type ToolCardProps } from "./ToolCardChrome";
+import {
+  CardChrome,
+  spanTimes,
+  toolOutput,
+  useToolCardExpansion,
+  type Status,
+  type ToolCardProps,
+} from "./ToolCardChrome";
 import { useToolDisplayMode } from "./ToolDisplayMode";
 import { useToolExpansionStore } from "./ToolExpansion";
 import { ToolCard } from "./ToolCards";
@@ -134,10 +141,11 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
 export function SubagentCard({ tool, result, children }: ToolCardProps & { children: ToolCardProps[] }) {
   const roster = useSubagentFor(tool.id);
   const record = useMemo(() => fromInline(tool, result, children, roster), [tool, result, children, roster]);
+  const output = toolOutput(tool, result);
   return (
     <>
       <SubagentDetail record={record} stopChildId={isStoppable(roster) ? roster.session_id : undefined} />
-      {result?.output?.length ? <ToolOutputMedia blocks={result.output} /> : null}
+      {output?.length ? <ToolOutputMedia blocks={output} /> : null}
     </>
   );
 }

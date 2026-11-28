@@ -679,8 +679,7 @@ impl Instance {
         })
     }
 
-    /// The cached terminal resume answer, with the profile config resolved by the caller so a
-    /// projection resolves once per profile.
+    /// Project cached resume facts with one config resolution per profile.
     pub(crate) fn terminal_context_resume_cached_with<'a>(
         &self,
         profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
@@ -1093,12 +1092,22 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
         sid: &str,
+        generation: u64,
+        expected: &ConversationState,
     ) -> Result<()> {
         storage.update(|rows, _| {
             let row = rows
                 .iter_mut()
                 .find(|row| row.id == self.id)
                 .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                LifecycleReservationError::Superseded
+            );
+            anyhow::ensure!(
+                expected.matches_launch_observation(row),
+                LifecycleReservationError::Superseded
+            );
             if row.agent_session_id.as_deref() == Some(sid) {
                 row.resume_probe_failed_sid = Some(sid.to_owned());
             }

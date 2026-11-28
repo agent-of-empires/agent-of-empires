@@ -13,6 +13,10 @@
 //! client renders and scrolls natively, and the agent keeps running while
 //! the user reads.
 //!
+//! Input retains its admitted native generation, physical pane and original
+//! channel. Every effect revalidates that scope, including a delayed Enter;
+//! a failed pipe write is never replayed through another transport.
+//!
 //! Pane JSON shapes are defined in `crate::daemon::live`.
 //! One WebSocket serves each viewer at `/sessions/{id}/live-ws`.
 //!
@@ -104,6 +108,7 @@
 //!     `size_owner` and close frames stay text/control always. Old
 //!     servers ignore the unknown message type harmlessly.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -270,92 +275,49 @@ fn paste_payload(mut text: String, submit: bool) -> String {
     text
 }
 
-/// Paste, then Enter after the agent's paste-burst delay when submitting. A live input
-/// channel (tmux 3.8) is the pane's single writer, so the paste and the Enter ride it to
-/// stay ordered with keystrokes; otherwise tmux's paste path takes them. `false` when the
-/// pane took nothing.
-fn deliver_paste(tmux_name: &str, text: &str, submit: bool, enter_delay_ms: u64) -> bool {
-    #[cfg(unix)]
-    if crate::tmux::vt::input_mode(tmux_name).is_some()
-        && deliver_paste_via_channel(tmux_name, text, submit, enter_delay_ms)
-    {
-        return true;
-    }
-    let session = crate::tmux::Session::from_name(tmux_name);
-    let result = if submit {
-        session.send_keys_with_delay(text, enter_delay_ms)
-    } else {
-        session.paste_text(text)
-    };
-    if let Err(e) = &result {
-        warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "paste failed: {}", e);
-    }
-    result.is_ok()
-}
-
-/// `send_keys_with_delay` over the input channel; `false` when the channel is gone before
-/// anything was written.
-#[cfg(unix)]
-fn deliver_paste_via_channel(
-    tmux_name: &str,
+/// Keep paste and Enter on the captured writer, ordered with earlier keystrokes.
+fn deliver_paste(
+    session: &crate::tmux::Session,
     text: &str,
     submit: bool,
     enter_delay_ms: u64,
-) -> bool {
-    use crate::tmux::vt::{try_send_input, try_send_paste};
-    use crate::tmux::SubmitText;
-    let sent = match (submit, crate::tmux::submit_text(text)) {
-        (true, SubmitText::Literal(payload)) => try_send_input(tmux_name, payload.as_bytes()),
-        _ => try_send_paste(tmux_name, text),
-    };
-    if sent && submit {
+    body_delivered: impl FnOnce(),
+) -> anyhow::Result<()> {
+    if session.live_input_mode().is_none() {
+        return if submit {
+            session.send_keys_with_delivery(text, enter_delay_ms, body_delivered)
+        } else {
+            session.paste_live_text(text)?;
+            body_delivered();
+            Ok(())
+        };
+    }
+    deliver_paste_via_channel(session, text, submit, body_delivered, || {
         if enter_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
+            std::thread::sleep(Duration::from_millis(enter_delay_ms));
         }
-        try_send_input(tmux_name, b"\r");
-    }
-    sent
+    })
 }
 
-/// Input the pane accepted is the operator typing in this session, so an ignored row wakes
-/// the way `send` wakes it rather than staying hidden under its own keystrokes.
-///
-/// The check reads the canonical store, which decodes every session and group behind a lock,
-/// so the receive loop hands wakes to a worker instead of awaiting a decode per accepted
-/// frame. Requests coalesce into one read per burst; input that lands while a read is in
-/// flight queues one more.
-struct InputWake {
-    requests: tokio::sync::mpsc::Sender<()>,
-    worker: tokio::task::JoinHandle<()>,
-}
-
-impl InputWake {
-    fn spawn(wake: (Arc<AppState>, String)) -> Self {
-        let (requests, mut queued) = tokio::sync::mpsc::channel::<()>(1);
-        let worker = tokio::spawn(async move {
-            let (state, id) = wake;
-            while queued.recv().await.is_some() {
-                if let Err(error) = state.session_service.touch_after_direct_input(&id).await {
-                    warn!(target: "terminal.ws", session = %id, %error,
-                        "failed to wake an ignored session after input");
-                }
-            }
-        });
-        Self { requests, worker }
+fn deliver_paste_via_channel(
+    session: &crate::tmux::Session,
+    text: &str,
+    submit: bool,
+    body_delivered: impl FnOnce(),
+    wait_before_enter: impl FnOnce(),
+) -> anyhow::Result<()> {
+    match (submit, crate::tmux::submit_text(text)) {
+        (true, crate::tmux::SubmitText::Literal(payload)) => {
+            session.send_live_raw_bytes(payload.as_bytes())?;
+        }
+        _ => session.paste_live_text(text)?,
     }
-
-    /// A full queue already holds a wake that runs after this input, so a dropped request
-    /// is not a missed one.
-    fn request(&self) {
-        let _ = self.requests.try_send(());
+    body_delivered();
+    if submit {
+        wait_before_enter();
+        session.send_live_raw_bytes(b"\r")?;
     }
-
-    /// Closing the sender lets a queued wake, or one already reading the store, finish, so
-    /// input the pane accepted is not lost when the tab closes.
-    async fn stop(self) {
-        drop(self.requests);
-        let _ = self.worker.await;
-    }
+    Ok(())
 }
 
 /// Which transport renders a live surface. The agent pane takes the shared VT
@@ -366,6 +328,13 @@ impl InputWake {
 pub(crate) enum LiveTransport {
     Grid,
     Snapshot,
+}
+
+struct LiveCaptureOptions {
+    transport: LiveTransport,
+    observation: Option<Arc<TerminalObservation>>,
+    #[cfg(test)]
+    witness_cycles: bool,
 }
 
 /// Shared per-connection knobs the recv loop writes and the capture
@@ -573,11 +542,13 @@ fn translate_cursor_keys(bytes: &[u8], app_cursor: bool) -> std::borrow::Cow<'_,
 /// translates keys (the socket bypasses tmux, `send-keys -H` is literal), so
 /// cursor keys are re-encoded for the pane's DECCKM state whenever a live grid
 /// knows it, including an output-only channel on tmux older than 3.8.
-#[cfg(unix)]
-fn pane_input_bytes(tmux_name: &str, raw: Vec<u8>) -> Vec<u8> {
-    match crate::tmux::vt::cursor_mode(tmux_name) {
-        Some(app_cursor) => translate_cursor_keys(&raw, app_cursor).into_owned(),
-        None => raw,
+fn pane_input_bytes<'a>(
+    session: &crate::tmux::Session,
+    raw: &'a [u8],
+) -> std::borrow::Cow<'a, [u8]> {
+    match session.live_cursor_mode() {
+        Some(app_cursor) => translate_cursor_keys(raw, app_cursor),
+        None => std::borrow::Cow::Borrowed(raw),
     }
 }
 
@@ -802,53 +773,273 @@ enum CaptureOutcome {
 
 static LIVE_CLIENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Default, serde::Deserialize)]
+pub struct LiveTerminalQuery {
+    #[serde(default)]
+    observe: bool,
+    expected: Option<String>,
+    observe_expected: Option<String>,
+}
+
+struct TerminalObservation {
+    fence: Arc<crate::session::NativeInputFence>,
+    physical: Arc<crate::session::LegacyToolObservation>,
+    expected: String,
+    observe_expected: String,
+}
+
+impl TerminalObservation {
+    fn sample(&self, lines: usize) -> anyhow::Result<(String, Option<crate::tmux::PaneCursor>)> {
+        let (guard, ()) = self
+            .fence
+            .lock_pane_observation_project(|row, storage| {
+                let expected = crate::session::projection::recovery_selection(row, storage)?;
+                anyhow::ensure!(expected == self.expected, "observation selection changed");
+                anyhow::ensure!(
+                    crate::session::projection::recovery_observation_selection(
+                        &expected,
+                        &self.physical,
+                    )? == self.observe_expected,
+                    "observation pane changed"
+                );
+                Ok(())
+            })?
+            .ok_or_else(|| anyhow::anyhow!("observation unavailable"))?;
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let probe = || -> anyhow::Result<()> {
+            let observed =
+                crate::tmux::utils::probe_owned_pane_readiness(&self.physical, &deadline)?;
+            anyhow::ensure!(
+                observed.is_some_and(|(state, _, _)| matches!(
+                    state,
+                    crate::tmux::utils::PaneProbe::Alive | crate::tmux::utils::PaneProbe::Dead
+                )),
+                "observation pane unavailable"
+            );
+            Ok(())
+        };
+        probe()?;
+        let result = crate::tmux::Session::from_observation("", Arc::clone(&self.physical))
+            .capture_pane_with_cursor_with_deadline(lines, &deadline)?;
+        probe()?;
+        drop(guard);
+        Ok(result)
+    }
+}
+
+type LiveWake = (
+    Arc<AppState>,
+    String,
+    crate::daemon::NativePreparationIdentity,
+);
+
+fn split_live_route(
+    route: anyhow::Result<(
+        crate::tmux::Session,
+        crate::daemon::NativePreparationIdentity,
+    )>,
+    state: Arc<AppState>,
+    id: String,
+) -> (anyhow::Result<crate::tmux::Session>, Option<LiveWake>) {
+    match route {
+        Ok((session, expected)) => (Ok(session), Some((state, id, expected))),
+        Err(error) => (Err(error), None),
+    }
+}
+
+fn capture_live_route(
+    instance: &crate::session::Instance,
+    name: &str,
+    physical: Option<Arc<crate::session::LegacyToolObservation>>,
+) -> anyhow::Result<(
+    crate::tmux::Session,
+    crate::daemon::NativePreparationIdentity,
+)> {
+    let storage = crate::session::Storage::open_reference(&instance.source_profile)?;
+    let binding = storage.bound_profile_identity()?;
+    let expected = crate::daemon::NativePreparationIdentity::from_instance(instance, binding);
+    let fence = crate::session::NativeInputFence::capture(
+        &instance.source_profile,
+        &instance.id,
+        instance.created_at,
+        instance.lifecycle_generation,
+        false,
+        Some(binding),
+    )?;
+    Ok((
+        capture_live_input_with_fence(name, physical, fence)?,
+        expected,
+    ))
+}
+
+#[cfg(test)]
+fn capture_live_input(
+    instance: &crate::session::Instance,
+    name: &str,
+    physical: Option<Arc<crate::session::LegacyToolObservation>>,
+) -> anyhow::Result<crate::tmux::Session> {
+    let fence = instance.native_input_fence(false)?;
+    capture_live_input_with_fence(name, physical, fence)
+}
+
+fn capture_live_input_with_fence(
+    name: &str,
+    physical: Option<Arc<crate::session::LegacyToolObservation>>,
+    fence: Arc<crate::session::NativeInputFence>,
+) -> anyhow::Result<crate::tmux::Session> {
+    let physical = match physical {
+        Some(physical) => physical,
+        None => Arc::new(
+            crate::tmux::utils::observe_pane(name, &crate::tmux::TmuxCommandDeadline::new())?
+                .ok_or(crate::session::NativeInputError::Ownership)?
+                .0,
+        ),
+    };
+    Ok(crate::tmux::Session::from_observation(name, physical).with_native_input_fence(fence))
+}
+
+async fn reject_live_input(
+    out_tx: &tokio::sync::mpsc::Sender<Message>,
+    stop: &tokio_util::sync::CancellationToken,
+    name: &str,
+    error: anyhow::Error,
+) {
+    warn!(target: "terminal.ws", tmux = %name, kind = "live", "input delivery stopped: {}", error);
+    let close = Message::Close(Some(axum::extract::ws::CloseFrame {
+        code: CLOSE_CODE_TRY_AGAIN_LATER,
+        reason: "input_unavailable".into(),
+    }));
+    if out_tx.send(close).await.is_ok() {
+        stop.cancelled().await;
+    }
+}
+
 pub async fn live_terminal_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<LiveTerminalQuery>,
 ) -> impl IntoResponse {
     debug!(target: "terminal.ws", session = %id, kind = "live", "ws route entered");
     if let Some(resp) = super::api::cityhall_block(&state) {
         return resp;
     }
     let instances = state.instances.read().await;
-    let target = instances.iter().find(|i| i.id == id).map(|inst| {
-        (
-            crate::tmux::Session::resolve_name(&inst.id, &inst.title),
-            inst.clone(),
-        )
-    });
+    let target = instances.iter().find(|i| i.id == id).cloned();
     drop(instances);
-    // The pace is read from configuration for a plugin-declared tool, so it
-    // resolves after the guard is dropped: resolving it under the read guard
-    // blocks a worker, and every writer of `instances` behind it, on disk I/O.
-    let target = target.map(|(tmux_name, instance)| (tmux_name, instance.send_keys_enter_delay()));
 
     let read_only = state.read_only;
     let shutdown = state.shutdown.clone();
     let work = state.runtime.work.clone();
 
     // Input into the pane is the operator typing in this session, which wakes it.
-    let wake = Some((state.clone(), id.clone()));
     match target {
-        Some((tmux_name, enter_delay_ms)) => ws
-            .protocols(["aoe-auth"])
-            .on_upgrade(move |socket| async move {
-                let _ = work
-                    .run(
-                        "server.live_terminal",
-                        handle_live_ws(
-                            socket,
-                            tmux_name,
-                            LiveInput { read_only, wake },
-                            shutdown,
-                            LiveTransport::Grid,
-                            enter_delay_ms,
-                        ),
+        Some(inst) => {
+            let tmux_name = crate::tmux::Session::resolve_name(&inst.id, &inst.title);
+            let enter_delay_ms = inst.send_keys_enter_delay();
+            if query.observe {
+                let (Some(expected), Some(observe_expected)) =
+                    (query.expected, query.observe_expected)
+                else {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "observation witnesses required",
                     )
-                    .await;
+                        .into_response();
+                };
+                if expected.is_empty() || observe_expected.is_empty() {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "observation witnesses required",
+                    )
+                        .into_response();
+                }
+                let Some(physical) = inst.agent_pane.physical.clone() else {
+                    return (axum::http::StatusCode::CONFLICT, "observation_unavailable")
+                        .into_response();
+                };
+                let observation = tokio::task::spawn_blocking(move || {
+                    let fence = crate::session::NativeInputFence::capture_route(
+                        &inst.source_profile,
+                        &inst.id,
+                        inst.created_at,
+                        inst.lifecycle_generation,
+                        true,
+                        None,
+                    )?;
+                    let observation = Arc::new(TerminalObservation {
+                        fence,
+                        physical,
+                        expected,
+                        observe_expected,
+                    });
+                    observation.sample(1)?;
+                    Ok::<_, anyhow::Error>(observation)
+                })
+                .await;
+                let Ok(Ok(observation)) = observation else {
+                    return (axum::http::StatusCode::CONFLICT, "observation_unavailable")
+                        .into_response();
+                };
+                let input = crate::tmux::Session::from_observation(
+                    &tmux_name,
+                    Arc::clone(&observation.physical),
+                );
+                return ws
+                    .protocols(["aoe-auth"])
+                    .on_upgrade(move |socket| async move {
+                        let _ = work
+                            .run(
+                                "server.observe_terminal",
+                                handle_live_ws_inner(
+                                    socket,
+                                    tmux_name,
+                                    Ok(input),
+                                    LiveInput {
+                                        read_only: true,
+                                        wake: None,
+                                    },
+                                    shutdown,
+                                    LiveCaptureOptions {
+                                        transport: LiveTransport::Snapshot,
+                                        observation: Some(observation),
+                                        #[cfg(test)]
+                                        witness_cycles: false,
+                                    },
+                                    0,
+                                ),
+                            )
+                            .await;
+                    })
+                    .into_response();
+            }
+            let input_name = tmux_name.clone();
+            let input = tokio::task::spawn_blocking(move || {
+                let physical = inst.agent_pane.physical.clone();
+                capture_live_route(&inst, &input_name, physical)
             })
-            .into_response(),
+            .await
+            .unwrap_or_else(|error| Err(error.into()));
+            let (input, wake) = split_live_route(input, state, id);
+            ws.protocols(["aoe-auth"])
+                .on_upgrade(move |socket| async move {
+                    let _ = work
+                        .run(
+                            "server.live_terminal",
+                            handle_live_ws(
+                                socket,
+                                tmux_name,
+                                input,
+                                LiveInput { read_only, wake },
+                                shutdown,
+                                LiveTransport::Grid,
+                                enter_delay_ms,
+                            ),
+                        )
+                        .await;
+                })
+                .into_response()
+        }
         None => {
             warn!(target: "terminal.ws", session = %id, kind = "live", "session not found, returning 404");
             (axum::http::StatusCode::NOT_FOUND, "Session not found").into_response()
@@ -880,7 +1071,10 @@ pub async fn live_paired_terminal_ws(
         q.index,
         "paired-live",
         |state, id, inst, index| {
-            Box::pin(super::pane::respawn_paired_if_dead(state, id, inst, index))
+            Box::pin(async move {
+                let name = super::pane::respawn_paired_if_dead(state, id, inst, index).await?;
+                Ok((name, None))
+            })
         },
     )
     .await
@@ -900,9 +1094,27 @@ pub async fn live_container_terminal_ws(
         q.index,
         "container-live",
         |state, id, inst, index| {
-            Box::pin(super::pane::respawn_container_if_dead(
-                state, id, inst, index,
-            ))
+            Box::pin(async move {
+                if state.read_only {
+                    let name =
+                        super::pane::respawn_container_if_dead(state, id, inst, index).await?;
+                    return Ok((name, None));
+                }
+                let binding = crate::session::Storage::open_reference(&inst.source_profile)?;
+                let expected = crate::daemon::NativePreparationIdentity::from_instance(
+                    inst,
+                    binding.bound_profile_identity()?,
+                );
+                let (target, _) = super::pane::ensure_native_container_terminal(
+                    state,
+                    id,
+                    index,
+                    None,
+                    Some(expected),
+                )
+                .await?;
+                Ok((target.tmux_session.clone(), Some(target)))
+            })
         },
     )
     .await
@@ -914,7 +1126,11 @@ type RespawnFn = for<'a> fn(
     &'a crate::session::Instance,
     u32,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send + 'a>,
+    Box<
+        dyn Future<Output = anyhow::Result<(String, Option<crate::daemon::TerminalTarget>)>>
+            + Send
+            + 'a,
+    >,
 >;
 
 async fn live_shell_ws(
@@ -948,17 +1164,18 @@ async fn live_shell_ws(
         return (axum::http::StatusCode::NOT_FOUND, "Session not found").into_response();
     };
 
+    let prepare_inst = inst.clone();
     let revive_state = state.clone();
     let revive_id = id.clone();
     let revived = state
         .runtime
         .work
         .run("server.revive_shell", async move {
-            respawn(&revive_state, &revive_id, &inst, index).await
+            respawn(&revive_state, &revive_id, &prepare_inst, index).await
         })
         .await;
-    let tmux_name = match revived {
-        Ok(Ok(name)) => name,
+    let (tmux_name, prepared_target) = match revived {
+        Ok(Ok(target)) => target,
         Ok(Err(e)) => {
             if let Some(response) = super::api::lifecycle_rejection(&state, &e) {
                 return response;
@@ -981,10 +1198,31 @@ async fn live_shell_ws(
         }
     };
 
+    let input_name = tmux_name.clone();
+    let input = tokio::task::spawn_blocking(move || {
+        let mut instance = inst;
+        let physical = if let Some(target) = prepared_target {
+            anyhow::ensure!(
+                target.profile == instance.source_profile,
+                crate::session::NativeInputError::Ownership
+            );
+            instance.lifecycle_generation = target.lifecycle_generation;
+            Some(
+                target
+                    .physical
+                    .ok_or(crate::session::NativeInputError::Ownership)?,
+            )
+        } else {
+            None
+        };
+        capture_live_route(&instance, &input_name, physical)
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.into()));
     let read_only = state.read_only;
     let shutdown = state.shutdown.clone();
     let work = state.runtime.work.clone();
-    let wake = Some((state.clone(), id.clone()));
+    let (input, wake) = split_live_route(input, state, id);
     ws.protocols(["aoe-auth"])
         .on_upgrade(move |socket| async move {
             let _ = work
@@ -993,6 +1231,7 @@ async fn live_shell_ws(
                     handle_live_ws(
                         socket,
                         tmux_name,
+                        input,
                         LiveInput { read_only, wake },
                         shutdown,
                         LiveTransport::Snapshot,
@@ -1008,14 +1247,48 @@ async fn live_shell_ws(
 /// so accepted input clears that row's Ignore marker.
 struct LiveInput {
     read_only: bool,
-    wake: Option<(Arc<AppState>, String)>,
+    wake: Option<LiveWake>,
+}
+
+struct InputWake {
+    requests: tokio::sync::mpsc::Sender<()>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl InputWake {
+    fn spawn((state, id, expected): LiveWake) -> Self {
+        let (requests, mut queued) = tokio::sync::mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            while queued.recv().await.is_some() {
+                if let Err(error) = state
+                    .session_service
+                    .touch_after_direct_input(id.clone(), expected.clone())
+                    .await
+                {
+                    warn!(target: "terminal.ws", session = %id, %error,
+                        "failed to wake an ignored session after input");
+                }
+            }
+        });
+        Self { requests, worker }
+    }
+
+    fn request(&self) {
+        let _ = self.requests.try_send(());
+    }
+
+    async fn stop(self) {
+        drop(self.requests);
+        let _ = self.worker.await;
+    }
 }
 
 /// `enter_delay_ms` is the agent's paste-burst guard before a submitting Enter; 0 for shells.
 async fn handle_live_ws(
     socket: WebSocket,
     tmux_name: String,
-    input: LiveInput,
+    input: anyhow::Result<crate::tmux::Session>,
+    access: LiveInput,
     shutdown: tokio_util::sync::CancellationToken,
     transport: LiveTransport,
     enter_delay_ms: u64,
@@ -1024,11 +1297,15 @@ async fn handle_live_ws(
         socket,
         tmux_name,
         input,
+        access,
         shutdown,
-        transport,
+        LiveCaptureOptions {
+            transport,
+            observation: None,
+            #[cfg(test)]
+            witness_cycles: false,
+        },
         enter_delay_ms,
-        #[cfg(test)]
-        false,
     )
     .await;
 }
@@ -1052,27 +1329,46 @@ impl Drop for CaptureCycleWitness {
 async fn handle_live_ws_inner(
     mut socket: WebSocket,
     tmux_name: String,
-    input: LiveInput,
+    input: anyhow::Result<crate::tmux::Session>,
+    access: LiveInput,
     shutdown: tokio_util::sync::CancellationToken,
-    transport: LiveTransport,
+    capture: LiveCaptureOptions,
     enter_delay_ms: u64,
-    #[cfg(test)] witness_cycles: bool,
 ) {
-    let LiveInput { read_only, wake } = input;
-    let wake = wake.map(InputWake::spawn);
-    match wait_for_tmux_ready(&tmux_name).await {
-        PaneReadiness::Ready => {}
-        PaneReadiness::Dead => {
-            warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "pane dead, closing 4001");
-            close_early(&mut socket, CLOSE_CODE_PTY_DEAD, "pty_dead").await;
+    let transport = capture.transport;
+    let observation = capture.observation;
+    let observing = observation.is_some();
+    #[cfg(test)]
+    let witness_cycles = capture.witness_cycles;
+    let input = match input {
+        Ok(input) => input,
+        Err(error) => {
+            warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "input admission refused: {}", error);
+            close_early(&mut socket, CLOSE_CODE_TRY_AGAIN_LATER, "input_unavailable").await;
             return;
         }
-        PaneReadiness::NotReady => {
-            warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "tmux not ready, closing 1013");
-            close_early(&mut socket, CLOSE_CODE_TRY_AGAIN_LATER, "tmux_not_ready").await;
-            return;
+    };
+    if !observing {
+        match wait_for_tmux_ready(&tmux_name).await {
+            PaneReadiness::Ready => {}
+            PaneReadiness::Dead => {
+                warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "pane dead, closing 4001");
+                close_early(&mut socket, CLOSE_CODE_PTY_DEAD, "pty_dead").await;
+                return;
+            }
+            PaneReadiness::NotReady => {
+                warn!(target: "terminal.ws", tmux = %tmux_name, kind = "live", "tmux not ready, closing 1013");
+                close_early(&mut socket, CLOSE_CODE_TRY_AGAIN_LATER, "tmux_not_ready").await;
+                return;
+            }
         }
     }
+    let LiveInput { read_only, wake } = access;
+    let wake = if read_only {
+        None
+    } else {
+        wake.map(InputWake::spawn)
+    };
 
     let settings = Arc::new(LiveSettings::new());
     // Identifies this connection in the cross-process size-owner lock (shared
@@ -1124,6 +1420,11 @@ async fn handle_live_ws_inner(
         None
     };
 
+    let input = Arc::new(if observing {
+        input
+    } else {
+        input.capture_input_channel()
+    });
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Frames and pings funnel through one channel so the sender task is
@@ -1249,77 +1550,99 @@ async fn handle_live_ws_inner(
             // Set from the sample itself, not from a later hold check.
             #[cfg(unix)]
             let mut grid_incomplete = false;
-            #[cfg(unix)]
-            {
-                if (live_grid.is_some() || vt_pipe_owned)
-                    && pane_count.1.elapsed() >= PANE_COUNT_PROBE_INTERVAL
+            if let Some(observation) = observation.as_ref() {
+                let observation = Arc::clone(observation);
+                outcome = match tokio::task::spawn_blocking(move || observation.sample(lines)).await
+                {
+                    Ok(Ok((content, cursor))) => CaptureOutcome::Frame(content, cursor, Vec::new()),
+                    _ => {
+                        let _ = capture_tx
+                            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: CLOSE_CODE_TRY_AGAIN_LATER,
+                                reason: "observation_unavailable".into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                };
+            } else {
+                #[cfg(unix)]
+                {
+                    if (live_grid.is_some() || vt_pipe_owned)
+                        && pane_count.1.elapsed() >= PANE_COUNT_PROBE_INTERVAL
+                    {
+                        let name = capture_tmux.clone();
+                        // Advance the probe clock even on failure, or a tmux that cannot answer
+                        // would be re-forked on every capture cycle instead of once a second.
+                        let probed =
+                            tokio::task::spawn_blocking(move || window_pane_count(&name)).await;
+                        pane_count = (probed.ok().flatten().or(pane_count.0), Instant::now());
+                    }
+                    outcome = match live_grid {
+                        Some(ch) if grid_transport_eligible(pane_count.0, lines) => {
+                            grid_frame = true;
+                            match tokio::task::spawn_blocking(move || {
+                                let deadline = crate::tmux::TmuxCommandDeadline::new();
+                                ch.sample_with_deadline(lines, &deadline)
+                            })
+                            .await
+                            {
+                                Ok(sample) => {
+                                    grid_incomplete = sample.incomplete;
+                                    CaptureOutcome::Frame(
+                                        sample.content,
+                                        sample.cursor,
+                                        sample.wrapped,
+                                    )
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        _ => {
+                            let name = capture_tmux.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                crate::tmux::Session::from_name(&name)
+                                    .capture_window_with_wraps(lines)
+                            })
+                            .await
+                            {
+                                Ok(Ok(capture))
+                                    if !capture.content.is_empty()
+                                        || capture
+                                            .cursor
+                                            .as_ref()
+                                            .is_some_and(|c| c.position_reliable) =>
+                                {
+                                    CaptureOutcome::Frame(
+                                        capture.content,
+                                        capture.cursor,
+                                        capture.wrapped,
+                                    )
+                                }
+                                Ok(Ok(_)) => CaptureOutcome::Dead,
+                                _ => break,
+                            }
+                        }
+                    };
+                }
+                #[cfg(not(unix))]
                 {
                     let name = capture_tmux.clone();
-                    // Advance the probe clock even on failure, or a tmux that cannot answer
-                    // would be re-forked on every capture cycle instead of once a second.
-                    let probed =
-                        tokio::task::spawn_blocking(move || window_pane_count(&name)).await;
-                    pane_count = (probed.ok().flatten().or(pane_count.0), Instant::now());
-                }
-                outcome = match live_grid {
-                    Some(ch) if grid_transport_eligible(pane_count.0, lines) => {
-                        grid_frame = true;
-                        match tokio::task::spawn_blocking(move || {
-                            let deadline = crate::tmux::TmuxCommandDeadline::new();
-                            ch.sample_with_deadline(lines, &deadline)
-                        })
-                        .await
-                        {
-                            Ok(sample) => {
-                                grid_incomplete = sample.incomplete;
-                                CaptureOutcome::Frame(sample.content, sample.cursor, sample.wrapped)
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    _ => {
-                        let name = capture_tmux.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            crate::tmux::Session::from_name(&name).capture_window_with_wraps(lines)
-                        })
-                        .await
-                        {
-                            Ok(Ok(capture))
-                                if !capture.content.is_empty()
-                                    || capture
-                                        .cursor
-                                        .as_ref()
-                                        .is_some_and(|c| c.position_reliable) =>
-                            {
-                                CaptureOutcome::Frame(
-                                    capture.content,
-                                    capture.cursor,
-                                    capture.wrapped,
-                                )
-                            }
-                            Ok(Ok(_)) => CaptureOutcome::Dead,
-                            _ => break,
-                        }
-                    }
-                };
-            }
-            #[cfg(not(unix))]
-            {
-                let name = capture_tmux.clone();
-                outcome = match tokio::task::spawn_blocking(move || {
-                    crate::tmux::Session::from_name(&name).capture_window_with_wraps(lines)
-                })
-                .await
-                {
-                    Ok(Ok(capture))
-                        if !capture.content.is_empty()
-                            || capture.cursor.as_ref().is_some_and(|c| c.position_reliable) =>
+                    outcome = match tokio::task::spawn_blocking(move || {
+                        crate::tmux::Session::from_name(&name).capture_window_with_wraps(lines)
+                    })
+                    .await
                     {
-                        CaptureOutcome::Frame(capture.content, capture.cursor, capture.wrapped)
-                    }
-                    Ok(Ok(_)) => CaptureOutcome::Dead,
-                    _ => break,
-                };
+                        Ok(Ok(capture))
+                            if !capture.content.is_empty()
+                                || capture.cursor.as_ref().is_some_and(|c| c.position_reliable) =>
+                        {
+                            CaptureOutcome::Frame(capture.content, capture.cursor, capture.wrapped)
+                        }
+                        Ok(Ok(_)) => CaptureOutcome::Dead,
+                        _ => break,
+                    };
+                }
             }
 
             #[cfg(test)]
@@ -1810,42 +2133,23 @@ async fn handle_live_ws_inner(
                         {
                             continue;
                         }
-                        let send_nudge = Arc::clone(&nudge);
-                        let name = tmux_name.clone();
-                        let bytes = data.to_vec();
-                        // A live VT channel with socket input (ours or another
-                        // surface's) is the pane's single input writer;
-                        // otherwise input goes through tmux send-keys. Cursor
-                        // keys are re-encoded for the pane's DECCKM state
-                        // before either.
-                        let sent = tokio::task::spawn_blocking(move || {
-                            #[cfg(unix)]
-                            let bytes = pane_input_bytes(&name, bytes);
-                            #[cfg(unix)]
-                            if crate::tmux::vt::input_mode(&name).is_some()
-                                && crate::tmux::vt::try_send_input(&name, &bytes)
-                            {
-                                return true;
-                            }
-                            let session = crate::tmux::Session::from_name(&name);
-                            match session.send_raw_bytes(&bytes) {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    warn!(target: "terminal.ws", tmux = %name, kind = "live", "send_raw_bytes failed: {}", e);
-                                    false
-                                }
-                            }
+                        let session = Arc::clone(&input);
+                        let result = tokio::task::spawn_blocking(move || {
+                            let bytes = pane_input_bytes(&session, &data);
+                            session.send_live_raw_bytes(&bytes)
                         })
                         .await
-                        .unwrap_or(false);
-                        if sent {
-                            if let Some(wake) = wake.as_ref() {
-                                wake.request();
-                            }
+                        .unwrap_or_else(|error| Err(error.into()));
+                        if let Err(error) = result {
+                            reject_live_input(&out_tx, &capture_stop, &tmux_name, error).await;
+                            break;
+                        }
+                        if let Some(wake) = &wake {
+                            wake.request();
                         }
                         // Capture the echo promptly rather than waiting out
                         // the current sleep.
-                        send_nudge.notify_one();
+                        nudge.notify_one();
                     }
                     Some(Ok(Message::Text(text))) => {
                         let Ok(control) = serde_json::from_str::<LiveClientMessage>(&text) else {
@@ -1994,17 +2298,21 @@ async fn handle_live_ws_inner(
                                 if text.is_empty() {
                                     continue;
                                 }
-                                let name = tmux_name.clone();
+                                let session = Arc::clone(&input);
+                                let requests = wake.as_ref().map(|wake| wake.requests.clone());
                                 // Awaited like binary input, so it lands after earlier keystrokes.
-                                let sent = tokio::task::spawn_blocking(move || {
-                                    deliver_paste(&name, &text, submit, enter_delay_ms)
+                                let result = tokio::task::spawn_blocking(move || {
+                                    deliver_paste(&session, &text, submit, enter_delay_ms, || {
+                                        if let Some(requests) = requests {
+                                            let _ = requests.try_send(());
+                                        }
+                                    })
                                 })
                                 .await
-                                .unwrap_or(false);
-                                if sent {
-                                    if let Some(wake) = wake.as_ref() {
-                                        wake.request();
-                                    }
+                                .unwrap_or_else(|error| Err(error.into()));
+                                if let Err(error) = result {
+                                    reject_live_input(&out_tx, &capture_stop, &tmux_name, error).await;
+                                    break;
                                 }
                                 nudge.notify_one();
                             }
@@ -2035,7 +2343,7 @@ async fn handle_live_ws_inner(
 
     // Release only this viewer's size lease. The last owner restores
     // window-size latest; another viewer's lease remains untouched.
-    {
+    if !observing {
         let name = tmux_name.clone();
         let who = owner_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
@@ -2209,6 +2517,83 @@ fn frame_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct NativeLiveInputFixture {
+        storage: crate::session::Storage,
+        instance: crate::session::Instance,
+        pane: crate::tmux::test_helpers::TmuxTestSession,
+        record: std::path::PathBuf,
+        _directory: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl NativeLiveInputFixture {
+        fn new(profile: &str, tool: bool) -> anyhow::Result<Self> {
+            let storage = crate::session::Storage::new_unwatched(profile)?;
+            let mut instance = crate::session::Instance::new("live raw input", "/tmp");
+            instance.source_profile = profile.into();
+            instance.lifecycle_generation = 7;
+            instance.view = crate::session::View::Structured;
+            instance.status = crate::session::Status::Stopped;
+            instance.archived_at = Some(crate::time::Timestamp::now());
+            storage.update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })?;
+            let directory = tempfile::tempdir()?;
+            let record = directory.path().join("input");
+            let command = format!(
+                "stty raw -echo; exec cat > {}",
+                crate::session::environment::shell_escape_script_word(&record.to_string_lossy())
+            );
+            let pane = if tool {
+                let terminal =
+                    crate::tmux::ToolSession::new(&instance.id, &instance.title, "live-probe");
+                let pane =
+                    crate::tmux::test_helpers::TmuxTestSession::from_name(terminal.session_name());
+                terminal.create_with_size(
+                    "/tmp",
+                    &command,
+                    Some((80, 24)),
+                    profile,
+                    &instance.id,
+                    "live-probe",
+                )?;
+                pane
+            } else {
+                let terminal = crate::tmux::TerminalSession::new(&instance.id, &instance.title)?;
+                let pane = crate::tmux::test_helpers::TmuxTestSession::from_name(terminal.name());
+                terminal.create_with_size("/tmp", Some(&command), Some((80, 24)), profile)?;
+                pane
+            };
+            let target = crate::tmux::test_helpers::only_pane_id(pane.name());
+            crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
+            Ok(Self {
+                storage,
+                instance,
+                pane,
+                record,
+                _directory: directory,
+            })
+        }
+
+        fn wait_for_bytes(&self, expected: &[u8]) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let actual = std::fs::read(&self.record).expect("read native input record");
+                if actual.len() >= expected.len() {
+                    assert_eq!(actual, expected);
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native input did not arrive: {actual:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 
     #[test]
     fn paste_message_parses_and_sanitizes_its_payload() {
@@ -2611,10 +2996,19 @@ mod tests {
         let name = format!("aoe_test_ws_cursor_{}", std::process::id());
         let dir = tempfile::tempdir().expect("tempdir");
         let _channel = crate::tmux::vt::register_live_for_test(&name, dir.path(), false, true);
-        assert_eq!(pane_input_bytes(&name, b"\x1b[A".to_vec()), b"\x1bOA");
+        let session = crate::tmux::Session::from_name(&name).capture_input_channel();
+        assert_eq!(&*pane_input_bytes(&session, b"\x1b[A"), b"\x1bOA");
         crate::tmux::vt::unregister_for_test(&name);
-        // No live grid: nothing knows the mode, bytes pass through.
-        assert_eq!(pane_input_bytes(&name, b"\x1b[A".to_vec()), b"\x1b[A");
+        let absent = crate::tmux::Session::from_name(&name).capture_input_channel();
+        assert_eq!(&*pane_input_bytes(&absent, b"\x1b[A"), b"\x1b[A");
+        let replacement_dir = tempfile::tempdir().expect("replacement tempdir");
+        let _replacement =
+            crate::tmux::vt::register_live_for_test(&name, replacement_dir.path(), false, false);
+        assert_eq!(&*pane_input_bytes(&session, b"\x1b[A"), b"\x1bOA");
+        assert_eq!(&*pane_input_bytes(&absent, b"\x1b[A"), b"\x1b[A");
+        let fresh = crate::tmux::Session::from_name(&name).capture_input_channel();
+        assert_eq!(&*pane_input_bytes(&fresh, b"\x1b[A"), b"\x1b[A");
+        crate::tmux::vt::unregister_for_test(&name);
 
         let normal = b"\x1b[A\x1b[D";
         assert_eq!(&*translate_cursor_keys(normal, false), normal);
@@ -2626,6 +3020,572 @@ mod tests {
         );
         // A trailing partial sequence is passed through untouched.
         assert_eq!(&*translate_cursor_keys(b"\x1b[", true), b"\x1b[");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vt_pipe_bridge_child() {
+        use std::io::Write;
+        let Ok(socket) = std::env::var("AOE_VT_BRIDGE_TEST_SOCKET") else {
+            return;
+        };
+        // Harness output belongs to the private launcher log, never the pane.
+        std::io::stdout().flush().unwrap();
+        assert_eq!(
+            unsafe { libc::dup2(3, libc::STDOUT_FILENO) },
+            libc::STDOUT_FILENO
+        );
+        assert_eq!(unsafe { libc::close(3) }, 0);
+        let result = crate::tmux::vt::run_pipe(&socket);
+        if let Err(error) = &result {
+            eprintln!("native VT bridge failed: {error}");
+        }
+        // Do not run the libtest footer after handing stdout to the actual bridge.
+        unsafe { libc::_exit(i32::from(result.is_err())) }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn live_raw_host_and_tool_preserve_their_original_transport_without_agent_readiness(
+    ) -> anyhow::Result<()> {
+        let home = crate::session::test_support::isolate_app_dir();
+        let _socket = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            home.path().join("tmux.sock"),
+        )]);
+        if !crate::tmux::test_helpers::tmux_available() {
+            eprintln!("Skipping test: tmux unavailable");
+            return Ok(());
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let executable = std::env::current_exe()?;
+        let child = concat!(module_path!(), "::vt_pipe_bridge_child");
+        let child = child.split_once("::").unwrap().1;
+        let launcher = home.path().join("vt-bridge-launcher");
+        let log = home.path().join("vt-bridge-harness.log");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = __vt-pipe ] || exit 64\n\
+             export AOE_VT_BRIDGE_TEST_SOCKET=\"$2\"\nexec 3>&1\n\
+             exec {} --exact {} --nocapture >> {} 2>&1\n",
+                crate::session::environment::shell_escape_script_word(
+                    &executable.to_string_lossy()
+                ),
+                crate::session::environment::shell_escape_script_word(child),
+                crate::session::environment::shell_escape_script_word(&log.to_string_lossy()),
+            ),
+        )?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))?;
+        let _bridge = crate::process::test_support::NativeLaunchExecutable::install(launcher);
+        for tool in [false, true] {
+            let profile = if tool {
+                "live-raw-tool"
+            } else {
+                "live-raw-host"
+            };
+            let mut fixture = NativeLiveInputFixture::new(profile, tool)?;
+            let fallback = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
+                .capture_input_channel();
+            assert!(fallback.live_input_mode().is_none());
+            let channel = crate::tmux::vt::VtChannel::acquire(fixture.pane.name())
+                .expect("the real production VT bridge must connect");
+            assert_eq!(
+                channel.input_mode().is_some(),
+                crate::tmux::vt::pipe_input_supported_for_test(),
+                "supported raw transport must not silently fall back",
+            );
+            let input = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
+                .capture_input_channel();
+            assert_eq!(input.live_input_mode(), channel.input_mode());
+
+            let mut expected = b"FALLBACK\0\x1b[A".to_vec();
+            fallback.send_live_raw_bytes(&expected)?;
+            fixture.wait_for_bytes(&expected);
+            input.send_live_raw_bytes(b"LIVE\0\x1b[D")?;
+            expected.extend_from_slice(b"LIVE\0\x1b[D");
+            fixture.wait_for_bytes(&expected);
+            deliver_paste(&input, "line\nnext", false, 0, || {})?;
+            expected.extend_from_slice(b"line\rnext");
+            fixture.wait_for_bytes(&expected);
+            deliver_paste(&input, "/go", true, 0, || {})?;
+            expected.extend_from_slice(b"/go \r");
+            fixture.wait_for_bytes(&expected);
+
+            fixture.storage.update(|rows, _| {
+                rows[0].lifecycle_generation += 1;
+                Ok(())
+            })?;
+            fixture.instance.lifecycle_generation += 1;
+            assert!(input.send_live_raw_bytes(b"STALE-RAW").is_err());
+            assert!(deliver_paste(&input, "STALE-PASTE", true, 0, || panic!(
+                "stale paste delivered"
+            ))
+            .is_err());
+            let fresh = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
+                .capture_input_channel();
+            fresh.send_live_raw_bytes(b"FRESH-BARRIER")?;
+            expected.extend_from_slice(b"FRESH-BARRIER");
+            fixture.wait_for_bytes(&expected);
+            assert_eq!(
+                fixture.storage.load_instances_complete()?[0].status,
+                crate::session::Status::Stopped
+            );
+
+            crate::tmux::vt::unregister_for_test(fixture.pane.name());
+            let retired = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
+                .capture_input_channel();
+            assert!(retired.live_input_mode().is_none());
+            let killed = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", fixture.pane.name()])
+                .output()?;
+            assert!(killed.status.success());
+            let command = format!(
+                "stty raw -echo; exec cat > {}",
+                crate::session::environment::shell_escape_script_word(
+                    &fixture.record.to_string_lossy()
+                )
+            );
+            crate::tmux::Session::from_name(fixture.pane.name()).create_with_size(
+                "/tmp",
+                Some(&command),
+                Some((80, 24)),
+                profile,
+            )?;
+            let target = crate::tmux::test_helpers::only_pane_id(fixture.pane.name());
+            crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
+            assert!(retired.send_live_raw_bytes(b"RETIRED-RAW").is_err());
+            assert!(deliver_paste(&retired, "RETIRED-PASTE", true, 0, || panic!(
+                "retired paste delivered"
+            ))
+            .is_err());
+            let replacement = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
+                .capture_input_channel();
+            replacement.send_live_raw_bytes(b"REPLACEMENT-BARRIER")?;
+            fixture.wait_for_bytes(b"REPLACEMENT-BARRIER");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn captured_channel_and_delayed_enter_never_adopt_a_replacement_or_replay_a_failed_write(
+    ) -> anyhow::Result<()> {
+        use std::io::Read;
+
+        let home = crate::session::test_support::isolate_app_dir();
+        let _socket = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            home.path().join("tmux.sock"),
+        )]);
+        if !crate::tmux::test_helpers::tmux_available() {
+            eprintln!("Skipping test: tmux unavailable");
+            return Ok(());
+        }
+        let mut fixture = NativeLiveInputFixture::new("live-paste-scope", false)?;
+        let physical = Arc::new(
+            crate::tmux::utils::observe_pane(
+                fixture.pane.name(),
+                &crate::tmux::TmuxCommandDeadline::new(),
+            )?
+            .expect("original physical pane")
+            .0,
+        );
+        let original_dir = tempfile::tempdir()?;
+        let (_original, mut original_peer) = crate::tmux::vt::register_live_with_physical_for_test(
+            fixture.pane.name(),
+            original_dir.path(),
+            physical.clone(),
+            true,
+        );
+        original_peer.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let input = capture_live_input(
+            &fixture.instance,
+            fixture.pane.name(),
+            Some(physical.clone()),
+        )?
+        .capture_input_channel();
+        let replacement_dir = tempfile::tempdir()?;
+        let (_replacement, mut replacement_peer) =
+            crate::tmux::vt::register_live_with_physical_for_test(
+                fixture.pane.name(),
+                replacement_dir.path(),
+                physical.clone(),
+                false,
+            );
+        replacement_peer.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let cursor = pane_input_bytes(&input, b"\x1b[A");
+        assert_eq!(&*cursor, b"\x1bOA");
+        input.send_live_raw_bytes(&cursor)?;
+        let mut got_cursor = [0; 3];
+        original_peer.read_exact(&mut got_cursor)?;
+        assert_eq!(&got_cursor, b"\x1bOA");
+
+        let delivered = std::cell::Cell::new(false);
+        let delayed = deliver_paste_via_channel(
+            &input,
+            "BODY",
+            true,
+            || delivered.set(true),
+            || {
+                assert!(
+                    delivered.get(),
+                    "accepted body must trigger wake before Enter"
+                );
+                let mut body = [0; 4];
+                original_peer
+                    .read_exact(&mut body)
+                    .expect("paste body before delay");
+                assert_eq!(&body, b"BODY");
+                fixture
+                    .storage
+                    .update(|rows, _| {
+                        rows[0].lifecycle_generation += 1;
+                        Ok(())
+                    })
+                    .expect("generation changes during paste delay");
+            },
+        );
+        assert!(delayed.is_err(), "Enter must revalidate native generation");
+        fixture.instance.lifecycle_generation += 1;
+        assert!(input.send_live_raw_bytes(b"STALE-RAW").is_err());
+        assert!(deliver_paste(&input, "STALE-PASTE", true, 0, || panic!(
+            "stale paste delivered"
+        ))
+        .is_err());
+        original_peer.set_nonblocking(true)?;
+        let mut unexpected = [0; 1];
+        assert_eq!(
+            original_peer.read(&mut unexpected).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the original writer must not receive the delayed Enter"
+        );
+
+        let fresh = capture_live_input(&fixture.instance, fixture.pane.name(), Some(physical))?
+            .capture_input_channel();
+        assert_eq!(&*pane_input_bytes(&fresh, b"\x1b[A"), b"\x1b[A");
+        fresh.send_live_raw_bytes(b"FRESH-BARRIER")?;
+        let mut barrier = [0; 13];
+        replacement_peer.read_exact(&mut barrier)?;
+        assert_eq!(&barrier, b"FRESH-BARRIER");
+
+        drop(replacement_peer);
+        assert!(deliver_paste(&fresh, "NO-REPLAY", false, 0, || panic!(
+            "stale paste replayed"
+        ))
+        .is_err());
+        crate::tmux::vt::unregister_for_test(fixture.pane.name());
+        let fallback = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
+            .capture_input_channel();
+        fallback.send_live_raw_bytes(b"NATIVE-BARRIER")?;
+        fixture.wait_for_bytes(b"NATIVE-BARRIER");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_observer_reads_error_without_writes_and_revokes_generation(
+    ) -> anyhow::Result<()> {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+        let home = crate::session::test_support::isolate_app_dir();
+        let _socket = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            home.path().join("tmux.sock"),
+        )]);
+        if !crate::tmux::test_helpers::tmux_available() {
+            return Ok(());
+        }
+        let mut fixture = NativeLiveInputFixture::new("observe-error", false)?;
+        fixture.instance.view = crate::session::View::Terminal;
+        fixture.instance.status = crate::session::Status::Error;
+        fixture.instance.last_error.set("RETAINED_DIAGNOSTIC");
+        fixture.storage.update(|rows, _| {
+            rows[0] = fixture.instance.clone();
+            Ok(())
+        })?;
+        let original_row = serde_json::to_value(fixture.storage.load_instances_complete()?)?;
+        let target = crate::tmux::test_helpers::only_pane_id(fixture.pane.name());
+        let command = format!(
+            "printf 'EXACT_OBSERVER_OUTPUT'; stty raw -echo; exec cat > {}",
+            crate::session::environment::shell_escape_script_word(
+                &fixture.record.to_string_lossy()
+            )
+        );
+        let output = crate::tmux::tmux_command()
+            .args(["respawn-pane", "-k", "-t", &target, &command])
+            .output()?;
+        anyhow::ensure!(output.status.success(), "respawn private fixture");
+        crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
+        let physical = Arc::new(
+            crate::tmux::utils::observe_pane(
+                fixture.pane.name(),
+                &crate::tmux::TmuxCommandDeadline::new(),
+            )?
+            .expect("private pane observed")
+            .0,
+        );
+        let expected =
+            crate::session::projection::recovery_selection(&fixture.instance, &fixture.storage)?;
+        let observation = Arc::new(TerminalObservation {
+            fence: crate::session::NativeInputFence::capture_route(
+                &fixture.instance.source_profile,
+                &fixture.instance.id,
+                fixture.instance.created_at,
+                fixture.instance.lifecycle_generation,
+                true,
+                None,
+            )?,
+            observe_expected: crate::session::projection::recovery_observation_selection(
+                &expected, &physical,
+            )?,
+            physical,
+            expected,
+        });
+        assert!(fixture.instance.native_input_fence(true).is_err());
+        fixture.instance.agent_pane.physical = Some(Arc::clone(&observation.physical));
+        let state =
+            crate::server::test_support::build_test_app_state(vec![fixture.instance.clone()]);
+        let shutdown = state.shutdown.clone();
+        let router = axum::Router::new()
+            .route(
+                "/sessions/{id}/live-ws",
+                axum::routing::get(live_terminal_ws),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                .await
+        });
+        let base = format!("ws://{address}/sessions/{}/live-ws", fixture.instance.id);
+        for (query, status) in [
+            ("?observe=true".to_owned(), 400),
+            (
+                format!(
+                    "?observe=true&expected={}&observe_expected=stale",
+                    observation.expected
+                ),
+                409,
+            ),
+        ] {
+            let error = tokio_tungstenite::connect_async(format!("{base}{query}"))
+                .await
+                .expect_err("unqualified observer must fail before upgrade");
+            let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+                anyhow::bail!("unexpected observation refusal: {error}");
+            };
+            assert_eq!(response.status().as_u16(), status);
+        }
+        let (mut client, _) = tokio_tungstenite::connect_async(format!(
+            "{base}?observe=true&expected={}&observe_expected={}",
+            observation.expected, observation.observe_expected,
+        ))
+        .await?;
+        let bound = crate::tmux::TMUX_COMMAND_TIMEOUT * 3;
+        tokio::time::timeout(bound, async {
+            while let Some(message) = client.next().await {
+                if let ClientMessage::Text(text) = message? {
+                    if text.contains("EXACT_OBSERVER_OUTPUT") {
+                        return anyhow::Ok(());
+                    }
+                }
+            }
+            anyhow::bail!("observer closed before actual output")
+        })
+        .await??;
+        client
+            .send(ClientMessage::Binary(b"NO_INPUT".to_vec().into()))
+            .await?;
+        for control in [
+            serde_json::json!({"type":"paste","text":"NO_PASTE","submit":true}),
+            serde_json::json!({"type":"resize","cols":21,"rows":5}),
+            serde_json::json!({"type":"claim"}),
+            serde_json::json!({"type":"claim_if_vacant"}),
+            serde_json::json!({"type":"resync"}),
+        ] {
+            client
+                .send(ClientMessage::Text(control.to_string().into()))
+                .await?;
+        }
+        client
+            .send(ClientMessage::Ping(
+                b"observer-write-barrier".to_vec().into(),
+            ))
+            .await?;
+        tokio::time::timeout(bound, async {
+            while let Some(message) = client.next().await {
+                if let ClientMessage::Pong(bytes) = message? {
+                    if bytes.as_ref() == b"observer-write-barrier" {
+                        return anyhow::Ok(());
+                    }
+                }
+            }
+            anyhow::bail!("observer closed before capture barrier")
+        })
+        .await??;
+        assert!(std::fs::read(&fixture.record)?.is_empty());
+        let retained = fixture.storage.load_instances_complete()?;
+        assert_eq!(retained[0].status, crate::session::Status::Error);
+        assert_eq!(serde_json::to_value(&retained)?, original_row);
+        fixture.storage.update(|rows, _| {
+            rows[0].lifecycle_generation += 1;
+            Ok(())
+        })?;
+        client
+            .send(ClientMessage::Text(
+                serde_json::json!({"type":"resync"}).to_string().into(),
+            ))
+            .await?;
+        tokio::time::timeout(bound, async {
+            while let Some(message) = client.next().await {
+                if let ClientMessage::Close(close) = message? {
+                    assert_eq!(
+                        close.expect("explicit close").reason,
+                        "observation_unavailable"
+                    );
+                    return anyhow::Ok(());
+                }
+            }
+            anyhow::bail!("observer ended without explicit revocation")
+        })
+        .await??;
+        assert!(observation.sample(10).is_err());
+        shutdown.cancel();
+        server.await??;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn websocket_raw_and_paste_refusals_close_without_marking_a_live_pane_dead(
+    ) -> anyhow::Result<()> {
+        use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+        let home = crate::session::test_support::isolate_app_dir();
+        let _socket = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_TMUX_SOCKET",
+            home.path().join("tmux.sock"),
+        )]);
+        if !crate::tmux::test_helpers::tmux_available() {
+            eprintln!("Skipping test: tmux unavailable");
+            return Ok(());
+        }
+        let mut fixture = NativeLiveInputFixture::new("live-ws-refusal", false)?;
+        let inputs = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            capture_live_input(&fixture.instance, fixture.pane.name(), None)?,
+            capture_live_input(&fixture.instance, fixture.pane.name(), None)?,
+        ])));
+        let name = fixture.pane.name().to_owned();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let route_shutdown = shutdown.clone();
+        let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let router = axum::Router::new().route(
+            "/live",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let input = inputs
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("admitted input scope");
+                let name = name.clone();
+                let shutdown = route_shutdown.clone();
+                let closed_tx = closed_tx.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        handle_live_ws(
+                            socket,
+                            name,
+                            Ok(input),
+                            LiveInput {
+                                read_only: false,
+                                wake: None,
+                            },
+                            shutdown,
+                            LiveTransport::Snapshot,
+                            0,
+                        )
+                        .await;
+                        let _ = closed_tx.send(());
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                .await
+        });
+        let progress_timeout = crate::tmux::TMUX_COMMAND_TIMEOUT * 3;
+        let messages = [
+            ClientMessage::Binary(b"REFUSED-RAW".to_vec().into()),
+            ClientMessage::Text(
+                serde_json::json!({"type": "paste", "text": "REFUSED-PASTE", "submit": true})
+                    .to_string()
+                    .into(),
+            ),
+        ];
+        for (index, message) in messages.into_iter().enumerate() {
+            let (mut client, _) =
+                tokio_tungstenite::connect_async(format!("ws://{address}/live")).await?;
+            client
+                .send(ClientMessage::Text(r#"{"type":"claim_if_vacant"}"#.into()))
+                .await?;
+            tokio::time::timeout(progress_timeout, async {
+                loop {
+                    let message = client.next().await.expect("open websocket")?;
+                    if let ClientMessage::Text(text) = message {
+                        let value: serde_json::Value = serde_json::from_str(&text)?;
+                        if value["type"] == "size_owner" && value["is_owner"] == true {
+                            return anyhow::Ok(());
+                        }
+                    }
+                }
+            })
+            .await??;
+            if index == 0 {
+                fixture.storage.update(|rows, _| {
+                    rows[0].lifecycle_generation += 1;
+                    Ok(())
+                })?;
+                fixture.instance.lifecycle_generation += 1;
+            }
+            client.send(message).await?;
+            let close = tokio::time::timeout(progress_timeout, async {
+                loop {
+                    let message = client.next().await.expect("close frame before EOF")?;
+                    if let ClientMessage::Close(close) = message {
+                        return anyhow::Ok(close.expect("explicit refusal close"));
+                    }
+                }
+            })
+            .await??;
+            assert_eq!(u16::from(close.code), CLOSE_CODE_TRY_AGAIN_LATER);
+            assert_eq!(close.reason, "input_unavailable");
+            tokio::time::timeout(progress_timeout, closed_rx.recv())
+                .await?
+                .expect("upgraded handler exits");
+        }
+        shutdown.cancel();
+        server.await??;
+        let fresh = capture_live_input(&fixture.instance, fixture.pane.name(), None)?
+            .capture_input_channel();
+        fresh.send_live_raw_bytes(b"LIVE-PANE-BARRIER")?;
+        fixture.wait_for_bytes(b"LIVE-PANE-BARRIER");
+        assert_eq!(
+            fixture.storage.load_instances_complete()?[0].status,
+            crate::session::Status::Stopped
+        );
+        Ok(())
     }
 
     #[test]
@@ -2709,18 +3669,23 @@ mod tests {
                     let shutdown = route_shutdown.clone();
                     let closed_tx = closed_tx.clone();
                     async move {
+                        let input = crate::tmux::Session::from_name(&name);
                         ws.on_upgrade(move |socket| async move {
                             handle_live_ws_inner(
                                 socket,
                                 name,
+                                Ok(input),
                                 LiveInput {
                                     read_only: true,
                                     wake: None,
                                 },
                                 shutdown,
-                                LiveTransport::Grid,
+                                LiveCaptureOptions {
+                                    transport: LiveTransport::Grid,
+                                    observation: None,
+                                    witness_cycles: true,
+                                },
                                 0,
-                                true,
                             )
                             .await;
                             let _ = closed_tx.send(());
@@ -2938,18 +3903,23 @@ mod tests {
                     let shutdown = route_shutdown.clone();
                     let closed_tx = closed_tx.clone();
                     async move {
+                        let input = crate::tmux::Session::from_name(&name);
                         ws.on_upgrade(move |socket| async move {
                             handle_live_ws_inner(
                                 socket,
                                 name,
+                                Ok(input),
                                 LiveInput {
                                     read_only: false,
                                     wake: None,
                                 },
                                 shutdown,
-                                LiveTransport::Grid,
+                                LiveCaptureOptions {
+                                    transport: LiveTransport::Grid,
+                                    observation: None,
+                                    witness_cycles: false,
+                                },
                                 0,
-                                false,
                             )
                             .await;
                             let _ = closed_tx.send(());
@@ -3147,10 +4117,15 @@ mod tests {
             "default",
             vec![managed.clone()],
         );
+        let storage = crate::session::Storage::open_reference("default").unwrap();
+        let expected = crate::daemon::NativePreparationIdentity::from_instance(
+            &managed,
+            storage.bound_profile_identity().unwrap(),
+        );
         let state = crate::server::test_support::build_test_app_state(vec![managed]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
-        let wake = InputWake::spawn((Arc::clone(&state), "typed".into()));
+        let wake = InputWake::spawn((Arc::clone(&state), "typed".into(), expected));
         wake.request();
         wake.stop().await;
 

@@ -22,6 +22,7 @@ export interface ModelDefaultTarget {
 
 interface Props {
   configOptions: AcpState["configOptions"];
+  nativeAvailable: boolean;
   pendingConfigOption: AcpState["pendingConfigOption"];
   onSetConfigOption: (configId: string, value: string) => void | Promise<void>;
   /** Pinned LLM backend, or null when the host environment decides. */
@@ -92,6 +93,7 @@ function providerDescriptor(provider: string | null | undefined): ConfigOptionDe
 
 export function SessionConfigControls({
   configOptions,
+  nativeAvailable,
   pendingConfigOption,
   onSetConfigOption,
   provider,
@@ -102,6 +104,7 @@ export function SessionConfigControls({
 }: Props) {
   const model = findByCategory(configOptions, "model");
   const effort = findByCategory(configOptions, "thought_level");
+  const nativeLockedReason = nativeAvailable ? null : "Native input is not currently confirmed";
   const toggles = configOptions.filter(isModelConfigToggle);
 
   if (!model && !effort && toggles.length === 0 && !onSetProvider) return null;
@@ -113,6 +116,7 @@ export function SessionConfigControls({
           option={model}
           pending={pendingConfigOption?.configId === model.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(model.id, value)}
+          lockedReason={nativeLockedReason}
           modelDefault={modelDefault}
         />
       )}
@@ -121,6 +125,7 @@ export function SessionConfigControls({
           option={effort}
           pending={pendingConfigOption?.configId === effort.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(effort.id, value)}
+          lockedReason={nativeLockedReason}
         />
       )}
       {toggles.map((toggle) => (
@@ -129,6 +134,7 @@ export function SessionConfigControls({
           option={toggle}
           pending={pendingConfigOption?.configId === toggle.id ? pendingConfigOption.value : null}
           onSelect={(value) => onSetConfigOption(toggle.id, value)}
+          lockedReason={nativeLockedReason}
         />
       ))}
       {onSetProvider && (
@@ -509,7 +515,7 @@ function EffortControl(props: SubProps) {
 }
 
 /** Shows the confirmed value; a rejected flip never shows as on. */
-function ModelConfigToggle({ option, pending, onSelect }: SubProps) {
+function ModelConfigToggle({ option, pending, onSelect, lockedReason }: SubProps) {
   const isOn = option.current_value === "on";
   return (
     <button
@@ -517,16 +523,19 @@ function ModelConfigToggle({ option, pending, onSelect }: SubProps) {
       role="switch"
       aria-checked={isOn}
       aria-label={option.name}
-      disabled={pending !== null}
-      onClick={() => void onSelect(isOn ? "off" : "on")}
-      title={option.description ?? `${option.name}: ${isOn ? "On" : "Off"}`}
+      disabled={!!lockedReason || pending !== null}
+      onClick={() => {
+        if (lockedReason || pending !== null) return;
+        void onSelect(isOn ? "off" : "on");
+      }}
+      title={lockedReason ?? option.description ?? `${option.name}: ${isOn ? "On" : "Off"}`}
       data-testid={`config-option-${option.id}`}
       className={[
         "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium transition-colors",
         isOn
           ? "border-brand-600/60 bg-brand-600/20 text-text-primary"
           : "border-surface-700 bg-surface-800/60 text-text-secondary hover:text-text-primary",
-        pending !== null ? "cursor-not-allowed opacity-50" : "",
+        lockedReason || pending !== null ? "cursor-not-allowed opacity-50" : "",
       ].join(" ")}
     >
       {option.name}
@@ -535,7 +544,7 @@ function ModelConfigToggle({ option, pending, onSelect }: SubProps) {
   );
 }
 
-function EffortSegmented({ option, pending, onSelect }: SubProps) {
+function EffortSegmented({ option, pending, onSelect, lockedReason }: SubProps) {
   return (
     <div
       role="radiogroup"
@@ -552,12 +561,12 @@ function EffortSegmented({ option, pending, onSelect }: SubProps) {
             type="button"
             role="radio"
             aria-checked={isCurrent}
-            disabled={isPending}
+            disabled={!!lockedReason || isPending}
             onClick={() => {
-              if (isPending || isCurrent) return;
+              if (lockedReason || isPending || isCurrent) return;
               void onSelect(opt.value);
             }}
-            title={opt.description ?? `${option.name}: ${opt.name}`}
+            title={lockedReason ?? opt.description ?? `${option.name}: ${opt.name}`}
             data-testid={`config-option-${option.id}-value-${opt.value}`}
             className={[
               "rounded px-2 py-0.5 text-[11px] font-medium transition-colors",

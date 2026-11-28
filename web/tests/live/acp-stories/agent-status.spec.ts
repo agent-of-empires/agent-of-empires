@@ -1,5 +1,6 @@
 // Agent status surfaces: rate-limit parking, plan progress, and startup failures.
 
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Page } from "@playwright/test";
 import { test, expect } from "../../helpers/liveTest";
@@ -12,10 +13,12 @@ import {
   replayFrames,
   script,
   sessionIdByTitle,
+  spawnAcpAgent,
   startAcpSession,
   waitForReplayContains,
 } from "../../helpers/acp";
-import { seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import { listSessions, appDirFor, resolveAoeBinary, seedSessionViaAoeAdd } from "../../helpers/aoeServe";
+import type { SessionRecovery } from "../../../src/lib/acpTypes";
 
 // The fake reports the reset only on a usage_update's meta, like claude-agent-acp.
 const rateLimitedTurn = (resetsAt: number, extra: object = {}) => ({
@@ -47,7 +50,7 @@ async function expectResetBanner(page: Page, resetSecs: number, timeout: number)
 }
 
 test("resume re-issues the interrupted prompt so the agent continues", async ({ page, spawnServe }) => {
-  // #3028: resume must respawn the worker and re-send the rate-limited prompt.
+  // Resume delivers the interrupted prompt on the retained native conversation.
   const reset = resetIn(2, 37);
   const { serve, sessionId } = await startAcpSession(spawnServe, {
     title: "rl-resume",
@@ -197,20 +200,16 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
         },
       },
     },
-    seedFn: seedSessionViaAoeAdd({ title: "story-native-binary" }),
   });
+  seedSessionViaAoeAdd({ title: "story-native-binary", structuredView: true })(serve);
   const sessionId = await sessionIdByTitle(serve.baseUrl, "story-native-binary");
-  // enableStructuredViewAndWait throws on the AgentStartupError this test wants.
-  const enableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
-  expect(enableRes.ok).toBe(true);
+  // Spawn without waiting for readiness so the startup error remains observable.
+  await spawnAcpAgent(serve.baseUrl, sessionId);
   const startupError = async () =>
     ((await replayFrames(serve.baseUrl, sessionId)) as { event?: { AgentStartupError?: { message?: string } } }[])
       .map((f) => f.event?.AgentStartupError?.message)
       .find((m) => typeof m === "string" && m.length > 0) ?? "";
   await expect.poll(startupError, { timeout: 20_000, intervals: [200] }).not.toBe("");
-  const msg = await startupError();
-  expect(msg).toContain("native binary");
-  expect(msg).toContain("failed to launch");
 
   await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(sessionId)}`);
   // "Claude Code", not the message's "claude": the name comes from the daemon's install-info.
@@ -224,10 +223,203 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
   const toggle = page.getByTestId("acp-agent-log-toggle");
   await expect(toggle).toBeVisible();
   await toggle.click();
-  // Any terminal state of the disclosure proves the log endpoint round-tripped.
   const body = page.getByTestId("acp-agent-log-body");
   await expect(body).toBeVisible({ timeout: 10_000 });
-  await expect(body).toHaveText(/Loading log|Could not load log|No log output yet|Log file exists but is empty|.+/);
   await page.getByTestId("acp-agent-log-refresh").click();
   await expect(body).toBeVisible({ timeout: 5_000 });
+  await expect(body).not.toContainText("Loading log");
+  const capture = test.info().outputPath("startup-native-binary-disclosure.png");
+  await page.screenshot({ path: capture, fullPage: true });
+  await test.info().attach("startup-native-binary-disclosure", { path: capture, contentType: "image/png" });
 });
+
+test("request refusal preserves the real Native owner, retained diagnostic, and explicit retry", async ({
+  page,
+  spawnServe,
+}) => {
+  const diagnostic = "Provider refused this request";
+  const continued = "The next explicit request used the same native conversation.";
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "request-error-owner",
+    fakeAcpScript: script(
+      {
+        updates: [chunk("Partial work survives the request failure.")],
+        error: {
+          code: -32603,
+          message: diagnostic,
+          data: { errorKind: "provider_error", privateTokenMarker: "must-not-leak" },
+        },
+      },
+      endTurn(chunk(continued)),
+    ),
+  });
+  const xdg = serve.env.XDG_CONFIG_HOME;
+  expect(xdg).toBeTruthy();
+  const registry = join(appDirFor(serve.home, xdg!, resolveAoeBinary()), "acp-workers", `${sessionId}.json`);
+  const owner = () => {
+    const raw = readFileSync(registry, "utf8");
+    const record = JSON.parse(raw) as { pid: number; runner_identity: unknown };
+    const generation = raw.match(/"generation"\s*:\s*(\d+)/)?.[1];
+    expect(record.pid).toBeGreaterThan(1);
+    expect(record.runner_identity).toEqual(expect.any(Object));
+    expect(generation).toMatch(/^\d+$/);
+    return { pid: record.pid, birth: record.runner_identity, generation };
+  };
+  const nativePrompts = () =>
+    readFileSync(join(serve.home, "fake-acp.log"), "utf8")
+      .split("\n")
+      .filter((line) => line.includes("session/prompt prompt="));
+  type Frame = { event?: Record<string, unknown> };
+  const events = async () =>
+    ((await replayFrames(serve.baseUrl, sessionId)) as Frame[]).map((frame) => frame.event ?? {});
+  await waitForReplayContains(serve.baseUrl, sessionId, '"AcpSessionAssigned"');
+  const originalOwner = owner();
+  const assigned = (await events()).flatMap((event) =>
+    event.AcpSessionAssigned === undefined ? [] : [event.AcpSessionAssigned],
+  );
+  expect(assigned).toHaveLength(1);
+  const box = await openStructuredView(page, serve, sessionId, "First explicit request");
+  await waitForReplayContains(serve.baseUrl, sessionId, diagnostic);
+  const failed = await events();
+  const failures = failed.flatMap((event) =>
+    event.PromptRuntimeError === undefined
+      ? []
+      : [event.PromptRuntimeError as { message: string; evidence: Record<string, unknown> }],
+  );
+  expect(failures).toHaveLength(1);
+  expect(failures[0].message).toBe(diagnostic);
+  expect(failures[0].evidence).toMatchObject({
+    source: "local_prompt_result",
+    operation: "prompt",
+    runtime: "unknown",
+    blocking_scope: "operation",
+    reported_code: -32603,
+  });
+  expect(failures[0].evidence).not.toHaveProperty("origin");
+  expect(failures[0].evidence).not.toHaveProperty("retryable");
+  expect(JSON.stringify(failed)).not.toContain("must-not-leak");
+  expect(failed.some((event) => event.AgentStartupError !== undefined || event.SessionContextReset !== undefined)).toBe(
+    false,
+  );
+  expect(nativePrompts()).toHaveLength(1);
+  expect(owner()).toEqual(originalOwner);
+  await expect(page.getByText("Action did not complete", { exact: true })).toBeVisible();
+  await expect(page.getByText(diagnostic, { exact: true })).toBeVisible();
+  await expect(page.getByText("Structured view worker stopped", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: /couldn't start in Structured view/ })).toHaveCount(0);
+  await expect(box).toBeEditable();
+  await page.reload();
+  await expect(page.getByText(diagnostic, { exact: true })).toBeVisible();
+  await expect(box).toBeEditable();
+  expect(owner()).toEqual(originalOwner);
+  expect(nativePrompts()).toHaveLength(1);
+  const capture = test.info().outputPath("request-refusal-native-owner-retained.png");
+  await page.screenshot({ path: capture, fullPage: true, animations: "disabled" });
+  await test.info().attach("request-refusal-native-owner-retained", { path: capture, contentType: "image/png" });
+  await box.fill("Second explicit request");
+  await box.press("Enter");
+  await waitForReplayContains(serve.baseUrl, sessionId, continued);
+  await expect(page.getByText(continued, { exact: true })).toBeVisible();
+  await expect(page.getByText("Action did not complete", { exact: true })).toHaveCount(0);
+  const after = await events();
+  expect(owner()).toEqual(originalOwner);
+  expect(after.flatMap((event) => (event.AcpSessionAssigned === undefined ? [] : [event.AcpSessionAssigned]))).toEqual(
+    assigned,
+  );
+  expect(after.filter((event) => event.UserPromptSent !== undefined)).toHaveLength(2);
+  expect(after.filter((event) => event.PromptRuntimeError !== undefined)).toHaveLength(1);
+  expect(after.some((event) => event.AgentStartupError !== undefined || event.SessionContextReset !== undefined)).toBe(
+    false,
+  );
+  expect(nativePrompts()).toHaveLength(2);
+  await test.info().attach("request-refusal-native-owner-proof", {
+    body: JSON.stringify(
+      { originalOwner, currentOwner: owner(), assigned, failures, nativePrompts: nativePrompts() },
+      null,
+      2,
+    ),
+    contentType: "application/json",
+  });
+});
+
+for (const incident of [
+  { name: "provider", message: "Provider request failed" },
+  { name: "auth", message: "Authentication required in the Agent" },
+]) {
+  test(`${incident.name} operation failure survives reopen and accepts only a new explicit operation on the same native history`, async ({
+    page,
+    spawnServe,
+  }) => {
+    const { serve, sessionId } = await startAcpSession(spawnServe, {
+      title: `shared-recovery-${incident.name}`,
+      fakeAcpScript: script(
+        {
+          updates: [chunk("Partial work before the rejected operation.")],
+          error: { code: -32603, message: incident.message, data: { provider_body: "PRIVATE_PROVIDER_BODY_5055" } },
+        },
+        endTurn(chunk("The new explicit operation completed.")),
+      ),
+    });
+    await expect
+      .poll(async () => (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)?.acp_session_id, {
+        timeout: 20_000,
+      })
+      .toEqual(expect.any(String));
+    const before = (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)!;
+    const mutations: Array<{ path: string; body: unknown }> = [];
+    page.on("request", (request) => {
+      const path = new URL(request.url()).pathname;
+      if (request.method() === "POST" && path.startsWith(`/api/sessions/${sessionId}/`)) {
+        mutations.push({ path, body: request.postDataJSON() });
+      }
+    });
+    const rejected = `original blocked operation ${incident.name}`;
+    await openStructuredView(page, serve, sessionId, rejected);
+    let diagnostic = "";
+    await expect
+      .poll(
+        async () => {
+          const current = (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)!;
+          const projection = current.recovery as SessionRecovery | null | undefined;
+          diagnostic = projection?.diagnostic ?? "";
+          return projection?.reason;
+        },
+        { timeout: 20_000 },
+      )
+      .toBe("operation_failed");
+    const banner = page.getByTestId("session-recovery");
+    await expect(banner).toHaveAttribute("data-session-id", sessionId);
+    await expect(banner).toHaveAttribute("data-reason", "operation_failed");
+    await expect(banner).toContainText(diagnostic);
+    await expect(page.getByTestId("session-recovery-scope")).toContainText("Blocking scope: operation");
+    await expect(page.getByTestId("session-recovery-runtime")).toContainText("does not prove the OS process is alive");
+    // A generic RPC result contains no affirmative retryability evidence.
+    await expect(page.getByTestId("session-recovery-retry-operation")).toBeDisabled();
+    await expect(page.getByText("PRIVATE_PROVIDER_BODY_5055")).toHaveCount(0);
+
+    await page.reload();
+    await expect(banner).toContainText(diagnostic);
+    await page.getByTestId("session-recovery-attach").click();
+    const reopened = (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)!;
+    expect(reopened.acp_session_id).toBe(before.acp_session_id);
+    expect(reopened.id).toBe(before.id);
+    expect(mutations.filter(({ path }) => /\/(?:restart|ensure|spawn)$/.test(path))).toEqual([]);
+    expect(mutations.filter(({ path }) => path.endsWith("/acp/prompt")).map(({ body }) => body)).toEqual([
+      expect.objectContaining({ text: rejected }),
+    ]);
+
+    const composer = page.getByRole("textbox", { name: /Send a message/i });
+    const explicit = `new explicit operation after ${incident.name} intervention`;
+    await composer.fill(explicit);
+    await composer.press("Enter");
+    await expect(page.getByText("The new explicit operation completed.")).toBeVisible({ timeout: 20_000 });
+    await expect(banner).toHaveCount(0);
+    const after = (await listSessions(serve.baseUrl)).find((row) => row.id === sessionId)!;
+    expect(after.acp_session_id).toBe(before.acp_session_id);
+    expect(mutations.filter(({ path }) => path.endsWith("/acp/prompt")).map(({ body }) => body)).toEqual([
+      expect.objectContaining({ text: rejected }),
+      expect.objectContaining({ text: explicit }),
+    ]);
+    expect(mutations.filter(({ path }) => /\/(?:restart|ensure|spawn)$/.test(path))).toEqual([]);
+  });
+}

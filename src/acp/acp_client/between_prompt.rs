@@ -1,7 +1,7 @@
 //! Between-prompt idle detection: ending agent-initiated turns (a Monitor
 //! or scheduled wake resuming the agent) that no aoe prompt owns (#2325).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -134,7 +134,7 @@ pub(super) struct BetweenPromptTracker {
     state: Mutex<TrackerState>,
     /// Async background agents with a live tailer, which removes its id on
     /// completion. Tracked precisely, so they never latch the floor.
-    pub(super) bg_agents: Arc<Mutex<HashSet<String>>>,
+    pub(super) bg_agents: Arc<crate::acp::background_agent::ActiveAgents>,
 }
 
 impl BetweenPromptTracker {
@@ -157,9 +157,8 @@ impl BetweenPromptTracker {
         let mut state = self.state();
         let mut armed = false;
         if let Some(u) = between_prompt_signal_update(lifecycle, wakeup, now_ms, state.wake_at) {
-            if !state.active {
+            if !state.active && terminal_claim.begin_unowned_turn() {
                 state.active = true;
-                terminal_claim.begin_turn();
                 armed = true;
             }
             // Child traffic proves liveness, not that accounting is stale.
@@ -196,19 +195,34 @@ impl BetweenPromptTracker {
         armed
     }
 
+    /// Native tool activity blocks Fresh without arming idle recovery.
+    pub(super) fn record_native_tool(&self, id: &str, in_flight: bool) {
+        let mut state = self.state();
+        if in_flight {
+            if !state.tools.contains_key(id) {
+                state.tools.insert(id.to_owned(), false);
+            }
+        } else {
+            state.tools.remove(id);
+        }
+    }
+
     pub(super) fn work_state(&self) -> BetweenPromptWorkState {
         BetweenPromptWorkState {
             tool_calls: !self.state().tools.is_empty(),
-            background_agents: !self
-                .bg_agents
-                .lock()
-                .expect("between-prompt bg-agents mutex poisoned")
-                .is_empty(),
+            background_agents: !self.bg_agents.is_empty(),
         }
     }
 
     pub(super) fn deactivate(&self) {
         self.state().active = false;
+    }
+
+    pub(super) fn deactivate_unsuccessful_turn(&self, terminal: &TerminalClaim, turn: u64) {
+        let mut state = self.state();
+        if terminal.failed() && terminal.claimed_turn() == Some(turn) {
+            state.active = false;
+        }
     }
 
     /// A real prompt supersedes any tracked agent-initiated turn.
@@ -244,10 +258,7 @@ impl BetweenPromptTracker {
         let cost_seen = state.cost_seen;
         state.reset();
         drop(state);
-        self.bg_agents
-            .lock()
-            .expect("between-prompt bg-agents mutex poisoned")
-            .clear();
+        self.bg_agents.clear();
         Some(cost_seen)
     }
 }
@@ -578,6 +589,47 @@ mod tests {
             assert_eq!(between_prompt_stop_reason(false, true), "agent_idle");
             assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
             assert_eq!(between_prompt_stop_reason(true, false), "reattach_idle");
+        }
+    }
+    #[test]
+    fn failed_main_outcome_fences_ambiguous_progress_but_keeps_background_bookkeeping() {
+        for explicit_prompt in [true, false] {
+            let tracker = BetweenPromptTracker::default();
+            let claim = TerminalClaim::new();
+            assert!(claim.claim_failed());
+            let failed_turn = claim.current_turn();
+            let tool = LifecycleSignal::ToolStarted {
+                id: "still-owned-background-tool".into(),
+                is_background_task: true,
+            };
+            assert!(!tracker.observe(Some(&tool), None, 1_000, false, &claim));
+            assert!(
+                tracker.work_state().tool_calls,
+                "native background work still flows"
+            );
+            assert!(!tracker.observe(Some(&LifecycleSignal::Progress), None, 2_000, false, &claim));
+            assert!(!tracker.observe(
+                Some(&LifecycleSignal::TerminalUsage),
+                None,
+                3_000,
+                false,
+                &claim
+            ));
+            assert_eq!(
+                tracker.take_idle_fire(10_000_000, false, false),
+                None,
+                "an already-failed operation cannot gain another synthetic terminal"
+            );
+            assert_eq!(claim.current_turn(), failed_turn);
+            if explicit_prompt {
+                claim.begin_turn();
+                tracker.reset_for_prompt();
+            } else {
+                claim.clear_failed_outcome();
+            }
+            assert!(!claim.failed());
+            assert!(tracker.observe(Some(&LifecycleSignal::Progress), None, 4_000, false, &claim));
+            assert!(claim.current_turn() > failed_turn);
         }
     }
 }

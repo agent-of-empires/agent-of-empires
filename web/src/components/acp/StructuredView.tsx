@@ -9,7 +9,12 @@ import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
-import { visibleSessionNotices } from "../../lib/acpTypes";
+import {
+  canDecideRequest,
+  canSubmitPromptIntent,
+  nativeInputAvailable,
+  visibleSessionNotices,
+} from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { isNewSessionStarting, notRunningCopy } from "./startupWait";
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
@@ -26,6 +31,7 @@ import { AttentionChime } from "./AttentionChime";
 import { BackgroundAgentsContext } from "./backgroundAgentsContext";
 import { CompactionReminderBanner } from "./CompactionReminderBanner";
 import { Composer } from "./Composer";
+import { AuthStatusHint } from "./ComposerControls";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { PlanStrip } from "./PlanStrip";
 import { ModeSwitchFailedNotice, QueuedPromptsStrip, RejectedPromptsStrip, SessionNoticesStrip } from "./PromptStrips";
@@ -49,6 +55,7 @@ type WorkerState = "absent" | "resuming" | "running" | "stopping";
 
 interface Props {
   sessionId: string;
+  readOnly?: boolean;
   /** False for a retained view that is hidden or covered: no keyboard reservation. */
   active?: boolean;
   /** False for a non-selected retained view: no chime. Stays true while the stack is covered. */
@@ -221,12 +228,14 @@ function AcpChrome({
     : null;
   const notRunning = notRunningCopy(state, agentName(state.agent ?? acpAgent));
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
-  const readOnly = !!view.trashedAt || !!view.archivedAt;
+  const readOnly = !!view.readOnly || !!view.trashedAt || !!view.archivedAt;
+  const nativeReady = status === "open" && nativeInputAvailable(state);
+  const canDecide = (nonce: string) => !readOnly && status === "open" && canDecideRequest(state, nonce);
   // Rows before the latest `/clear` divider are the hidden history.
   const hiddenCount = lastClearIndex(state.activity);
   const [primerPrefill, setPrimerPrefill] = useState<Prefill>(null);
   // The usage-limit banner covers a cap park while the limit is still known.
-  const exhaustedWithoutLimit = state.rateLimitRetriesExhausted && !state.rateLimit;
+  const exhaustedWithoutLimit = state.rateLimitRetriesExhausted === true && !state.rateLimit;
   // Phone-width only: fold the composer away for reading.
   const composerCollapsible = !useIsWideViewport();
   const [composerCollapsed, setComposerCollapsed] = useState(false);
@@ -249,8 +258,8 @@ function AcpChrome({
     localInflight: state.inflightPromptIds.length > 0,
   });
 
-  // An adapter that failed the compatibility check never runs, so no chat surface.
-  if (state.incompatibleAgent) {
+  // Structured compatibility diagnostics do not override a current healthy native receipt.
+  if (state.incompatibleAgent && !nativeReady && !state.recovery && !state.recoveryNotice) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
         <StartupErrorScreen
@@ -303,8 +312,16 @@ function AcpChrome({
           dismissError={ctx.dismissError}
           startingAgent={startingAgent}
           canRestart={!!view.canRestartAgent}
-          onRestarted={ctx.markRestartStarted}
+          onStartupRestarted={ctx.markRestartStarted}
           onRestartFailed={ctx.markRestartFailed}
+          readOnly={readOnly}
+          recoveryCurrent={status === "open" && !state.lagged && state.nativeSnapshotSeq !== null}
+          onAttach={scrollToBottom}
+          onRestarted={ctx.manualReconnect}
+          onRetryOperation={() => {
+            if (!ctx.beginOperationRetry()) return;
+            setComposerCollapsed(false);
+          }}
           recreateContainerTitle={view.recreateContainerTitle}
           recreateContainerBlock={view.recreateContainerBlock}
           newSession={view.newSessionLike}
@@ -378,16 +395,26 @@ function AcpChrome({
                 <ApprovalCard
                   key={approval.nonce}
                   approval={approval}
-                  onResolve={(decision, optionId) => ctx.resolveApproval(approval.nonce, decision, optionId)}
+                  canDecide={canDecide(approval.nonce)}
+                  onResolve={(decision, optionId) => {
+                    if (!canDecide(approval.nonce)) return Promise.reject(new Error("Decision authority unavailable"));
+                    return ctx.resolveApproval(approval.nonce, decision, optionId);
+                  }}
                 />
               ))}
 
               {state.pendingElicitations.map((elicitation) => (
-                <AskUserQuestionCard
-                  key={elicitation.nonce}
-                  elicitation={elicitation}
-                  onResolve={(resolution) => ctx.resolveElicitation(elicitation.nonce, resolution)}
-                />
+                <fieldset key={elicitation.nonce} disabled={!canDecide(elicitation.nonce)} className="contents">
+                  <AskUserQuestionCard
+                    elicitation={elicitation}
+                    canDecide={canDecide(elicitation.nonce)}
+                    onResolve={(resolution) => {
+                      if (!canDecide(elicitation.nonce))
+                        return Promise.reject(new Error("Decision authority unavailable"));
+                      return ctx.resolveElicitation(elicitation.nonce, resolution);
+                    }}
+                  />
+                </fieldset>
               ))}
             </div>
           </ThreadPrimitive.Viewport>
@@ -408,6 +435,20 @@ function AcpChrome({
 
         {/* Always mounted: the scroll observers need it even for a read-only session. */}
         <div ref={belowViewportRef}>
+          {view.readOnly && !view.trashedAt && !view.archivedAt && state.authStatus && (
+            <div className="flex items-center border-t border-surface-700 px-4 py-2 text-xs">
+              <AuthStatusHint
+                authStatus={state.authStatus}
+                signIn={{
+                  sessionId,
+                  agent: state.agent ?? acpAgent ?? view.tool,
+                  agentName: agentName(state.agent ?? acpAgent ?? view.tool),
+                  sandboxed: !!view.isSandboxed,
+                  canRestart: false,
+                }}
+              />
+            </div>
+          )}
           {!readOnly && (
             <ComposerDock
               view={view}
@@ -486,7 +527,7 @@ function ComposerDock({
         rateLimit={state.rateLimit}
         autoResume={view.rateLimitAutoResume}
         failoverTo={view.rateLimitFailoverTo}
-        retriesExhausted={state.rateLimitRetriesExhausted}
+        retriesExhausted={state.rateLimitRetriesExhausted === true}
         settingsHref={view.settingsHref ?? null}
         onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
       />
@@ -503,7 +544,7 @@ function ComposerDock({
           online: status === "open",
           anyPending: state.queuedPrompts.some((q) => q.pending),
           waitingFor: startingAgent,
-          rateLimitParked: state.rateLimitParked,
+          rateLimitParked: state.rateLimitParked === true,
           rateLimit: state.rateLimit,
           rateLimitAutoResume: view.rateLimitAutoResume,
           // Idle-dormant and rate-limit-parked Workers wake on a send, so they aren't down.
@@ -529,7 +570,7 @@ function ComposerDock({
         onRetry={ctx.retryRejectedPrompt}
         onDismiss={ctx.dismissRejectedPrompt}
         disabled={
-          state.workerRestarting || state.workerStopped || Boolean(state.startupError) || Boolean(state.integrationLost)
+          !!blockedReason || status !== "open" || !canSubmitPromptIntent(state) || Boolean(state.integrationLost)
         }
       />
 
@@ -555,7 +596,9 @@ function ComposerDock({
       {!blockedReason && (
         <CompactionReminderBanner
           state={state}
-          onCompact={() => ctx.sendPrompt("/compact")}
+          onCompact={async () => {
+            await ctx.sendPrompt("/compact");
+          }}
           onDismiss={ctx.dismissCompactionReminder}
         />
       )}
@@ -569,6 +612,23 @@ function ComposerDock({
           controlsId={`conversation-composer-${sessionId}`}
           testId="composer-collapse-toggle"
         />
+      )}
+
+      {ctx.operationRetryActive && (
+        <div
+          data-testid="operation-retry-composition"
+          className="flex items-center justify-between gap-2 border-t border-surface-700 px-4 py-2 text-xs text-text-secondary"
+        >
+          <span>New input for this operation retry. Cancel discards this unsent draft.</span>
+          <button
+            type="button"
+            data-testid="operation-retry-cancel"
+            className="shrink-0 rounded border border-surface-600 px-2 py-1 text-text-primary hover:bg-surface-800"
+            onClick={ctx.cancelOperationRetry}
+          >
+            Cancel retry
+          </button>
+        </div>
       )}
 
       <CollapsibleRegion id={`conversation-composer-${sessionId}`} collapsed={collapsible && collapsed}>
@@ -597,12 +657,24 @@ function ComposerDock({
             canRestart: !!view.canRestartAgent,
           }}
           availableCommands={state.availableCommands}
-          connected={status === "open" && !state.workerStopped && !state.workerRestarting}
+          connected={status === "open" && nativeInputAvailable(state)}
+          canCancelHostIntent={
+            status === "open" &&
+            state.nativeSnapshotSeq != null &&
+            state.connectionUnavailable === null &&
+            state.hostPromptIntent != null
+          }
+          canForceEndTurn={ctx.canForceEndTurn}
+          stopTurn={ctx.stopTurn}
+          canSubmit={status === "open" && canSubmitPromptIntent(state)}
           turnActive={state.turnActive}
           enqueuePrompt={ctx.sendPrompt}
           promptCapabilities={state.promptCapabilities}
           pendingAttachments={ctx.pendingAttachments}
           setPendingAttachments={ctx.setPendingAttachments}
+          operationRetryActive={ctx.operationRetryActive}
+          compositionControlRef={ctx.compositionControlRef}
+          attachmentReadGenerationRef={ctx.attachmentReadGenerationRef}
           primerPrefill={primerPrefill}
           queuedPrompts={state.queuedPrompts}
           editQueuedPrompt={ctx.editQueuedPrompt}
@@ -613,7 +685,7 @@ function ComposerDock({
   );
 }
 
-function EmptyState({ onPick, notRunning }: { onPick: (text: string) => Promise<void>; notRunning: string | null }) {
+function EmptyState({ onPick, notRunning }: { onPick: (text: string) => Promise<unknown>; notRunning: string | null }) {
   if (notRunning)
     return (
       <div data-testid="acp-empty-not-running" className="mt-12 text-center text-sm text-text-muted">

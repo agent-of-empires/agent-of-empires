@@ -14,14 +14,21 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use super::AppState;
-use crate::acp::event_store::EventStore;
+use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
+use crate::acp::event_store::{ControlKnowledge, EventStore};
 use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 
+#[cfg(test)]
 pub(crate) use rate_limit::install_rate_limit_continuation;
 #[cfg(test)]
-pub(crate) use rate_limit::{failover_in_flight, reap_rate_limit_resumes, ContinuationOutcome};
+pub(crate) use rate_limit::{failover_in_flight, reap_rate_limit_resumes};
 pub(crate) use rate_limit::{failover_target, FailoverSettings};
+pub(crate) use rate_limit::{
+    install_prepared_continuation, resolve_continuation, ContinuationOutcome, PreparedContinuation,
+};
+pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
+pub(crate) use resume::ensure_rate_limit_worker;
 pub(crate) use resume::{trigger_resume_background, trigger_resume_observing, ResumeTrigger};
 
 use resume::{resume_one, ResumeTarget};
@@ -68,12 +75,12 @@ fn forget_session_budget(
     attempted: &mut HashSet<String>,
     parked: &mut HashSet<String>,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
-    capacity_deferred: &mut HashSet<String>,
+    resume_deferred: &mut HashMap<String, ResumeDeferral>,
 ) {
     attempted.remove(id);
     parked.remove(id);
     respawn_history.remove(id);
-    capacity_deferred.remove(id);
+    resume_deferred.remove(id);
 }
 
 /// Banner for a parked session. A missing project path embeds the
@@ -95,10 +102,35 @@ fn park_message(project_path: &str) -> String {
 const STOP_FENCE_MESSAGE: &str = "Structured view worker was stopped (aoe acp stop); queued prompts wait until the session is started again.";
 
 #[derive(Debug, Clone)]
+pub struct ResumeDeferral {
+    entry: DeferredResume,
+}
+
+#[derive(Debug, Clone)]
+enum DeferredResume {
+    Capacity,
+    Unavailable {
+        scope: crate::acp::state::NativeObservationScope,
+        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+        originating_epoch: Option<u64>,
+    },
+}
+
+impl ResumeDeferral {
+    pub(crate) fn capacity() -> Self {
+        Self {
+            entry: DeferredResume::Capacity,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
     /// Attachment, retirement or launch prep lost a race; retry next tick unless parked.
     Retry,
+    /// No admission occurred; refund only the attempt charged by this tick.
+    RegistryBusy,
     /// A purge fenced admission; re-arm without charging the crash-loop budget.
     AdmissionDeferred,
     /// Spawn finished with or without error; `attempted` stays set so a
@@ -111,6 +143,54 @@ enum ResumeOutcome {
         source_profile: String,
         lifecycle_generation: u64,
     },
+    Unavailable {
+        scope: Option<crate::acp::state::NativeObservationScope>,
+        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+        originating_epoch: Option<u64>,
+    },
+}
+
+#[cfg(test)]
+type ResumeDispatchGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+#[cfg(test)]
+static RESUME_DISPATCH_GATE: std::sync::Mutex<Option<ResumeDispatchGate>> =
+    std::sync::Mutex::new(None);
+async fn defer_control_refusal(
+    state: &Arc<AppState>,
+    id: &str,
+    scope: crate::acp::state::NativeObservationScope,
+    refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+    originating_epoch: Option<u64>,
+    deferred: &mut HashMap<String, ResumeDeferral>,
+) {
+    let same = deferred.get(id).is_some_and(|entry| match &entry.entry {
+        DeferredResume::Unavailable {
+            scope: previous,
+            refusal: previous_refusal,
+            ..
+        } => previous.context == scope.context && *previous_refusal == refusal,
+        DeferredResume::Capacity => false,
+    });
+    if !same
+        && state
+            .acp_supervisor
+            .publish_control_refusal(id, &scope, refusal, originating_epoch)
+            .await
+    {
+        deferred.insert(
+            id.to_owned(),
+            ResumeDeferral {
+                entry: DeferredResume::Unavailable {
+                    scope,
+                    refusal,
+                    originating_epoch,
+                },
+            },
+        );
+    }
 }
 
 /// When each cadence-gated pass last ran.
@@ -139,18 +219,20 @@ fn is_untriaged_structured(i: &Instance) -> bool {
 }
 
 /// Eligible for a reconciler-driven worker.
-fn is_resumable(i: &Instance) -> bool {
+pub(super) fn is_resumable(i: &Instance) -> bool {
     is_untriaged_structured(i) && !i.is_idle_dormant() && i.launch_is_finalized()
 }
 
-/// `(user-prompt turn, agent-initiated turn)` open in the log; `None` when unreadable.
-/// Only the first goes to attach: a runner replays the completion of its last user
-/// prompt on every attach, which would close an agent-initiated turn mid-flight.
-fn open_turn_kinds(store: &EventStore, id: &str) -> Option<(bool, bool)> {
-    Some((
-        store.try_in_flight_turn(id)?,
+/// Scoped `(user-prompt turn, agent-initiated turn)` knowledge in the log.
+/// Only the first goes to attach: cached prompt completion cannot close an agent turn.
+fn open_turn_kinds(store: &EventStore, id: &str) -> anyhow::Result<ControlKnowledge<(bool, bool)>> {
+    match (
+        store.has_in_flight_turn(id)?,
         store.has_open_agent_turn(id)?,
-    ))
+    ) {
+        (Known(prompt), Known(agent)) => Ok(Known((prompt, agent))),
+        _ => Ok(Indeterminate),
+    }
 }
 
 /// `query_store` after the writer has stored every queued worker event: a probe that
@@ -188,6 +270,23 @@ async fn query_store<T: Send + 'static>(
     }
 }
 
+async fn query_control<T: Send + 'static>(
+    store: &Arc<EventStore>,
+    id: &str,
+    what: &str,
+    query: impl FnOnce(&EventStore, &str) -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, crate::acp::supervisor::SupervisorError> {
+    use crate::acp::supervisor::SupervisorError;
+    match query_store(store, id, what, query).await {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(error)) => {
+            tracing::warn!(target: "acp.supervisor", session = %id, %error, "{what} query refused");
+            Err(SupervisorError::NativeStoreUnavailable)
+        }
+        None => Err(SupervisorError::NativeStoreUnavailable),
+    }
+}
+
 /// Resolves a config value once per distinct profile, off the runtime.
 async fn resolve_per_profile<T: Send + 'static>(
     profiles: impl Iterator<Item = String>,
@@ -214,7 +313,7 @@ pub async fn reconcile_acp_workers(
     cadence: &mut ReapCadence,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
-    capacity_deferred: &mut HashSet<String>,
+    resume_deferred: &mut HashMap<String, ResumeDeferral>,
     stop_notified: &mut HashSet<String>,
 ) {
     let supervisor = &state.acp_supervisor;
@@ -231,8 +330,9 @@ pub async fn reconcile_acp_workers(
     // `aoe acp stop|kill|restart` runs out of process; the reaper surfaces it
     // and returns restart ids, which, like respawn requests (#2109), get a clean slate.
     for id in supervisor.reap_user_stopped().await {
-        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+        forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
     }
+    crate::server::acp_events::commit_background_bindings(state).await;
     for id in supervisor.take_respawn_requests() {
         // A teardown in flight settles later; the request waits for it, or the
         // loop below would pin the session as attempted.
@@ -243,10 +343,9 @@ pub async fn reconcile_acp_workers(
             supervisor.request_respawn(&id);
             continue;
         }
-        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+        forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
     }
-    // Pre-session startup failures re-arm under the ordinary budget.
-    for id in supervisor.take_startup_failures() {
+    for id in supervisor.take_startup_requeues() {
         attempted.remove(&id);
     }
     for id in supervisor.take_respawned_in_place() {
@@ -261,15 +360,12 @@ pub async fn reconcile_acp_workers(
     if due(&mut cadence.terminal_repair, idle::TERMINAL_REPAIR_INTERVAL) {
         idle::repair_missing_terminal(state).await;
     }
-    // Before the snapshot so a released park respawns this same tick.
-    let mut released_from_park = if due(
+    if due(
         &mut cadence.rate_limit,
         rate_limit::RATE_LIMIT_RESUME_INTERVAL,
     ) {
-        rate_limit::reap_rate_limit_resumes(state, attempted, parked).await
-    } else {
-        HashSet::new()
-    };
+        rate_limit::reap_rate_limit_resumes(state, attempted, parked).await;
+    }
 
     // Triaged sessions are excluded so an archive/snooze teardown is not undone (#1581).
     let (targets, with_queued_prompts, queued_not_stopped): (
@@ -302,7 +398,7 @@ pub async fn reconcile_acp_workers(
     attempted.retain(|id| live.contains(id));
     parked.retain(|id| live.contains(id));
     respawn_history.retain(|id, _| live.contains(id));
-    capacity_deferred.retain(|id| live.contains(id));
+    resume_deferred.retain(|id, _| live.contains(id));
     stop_notified
         .retain(|id| live.contains(id) && crate::process::worker_registry::stop_requested(id));
 
@@ -315,56 +411,124 @@ pub async fn reconcile_acp_workers(
 
     let login = &state.session_service.sandbox_login;
     for id in release_logged_in(state, login.held_ids()).await {
-        login.release(&id);
-        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
-        // A turn kept for the login waits on this resume; a rate-limit park must not strand it.
-        if with_queued_prompts.contains(&id) {
-            released_from_park.insert(id);
+        if with_queued_prompts.contains(&id)
+            && !crate::process::worker_registry::stop_requested(&id)
+        {
+            match query_control(
+                &state.acp_event_store,
+                &id,
+                "login queue release",
+                |store, id| store.rate_limit_park(id),
+            )
+            .await
+            {
+                Ok(Known(Some(park))) => {
+                    let Some(submission) = state.session_service.try_prompt_submission(&id).await
+                    else {
+                        continue;
+                    };
+                    rate_limit::schedule_quota_release(
+                        state.clone(),
+                        id.clone(),
+                        submission,
+                        rate_limit::QuotaResume::LoginQueue { park_seq: park.seq },
+                    );
+                    continue;
+                }
+                Ok(Known(None)) => {}
+                Ok(Indeterminate) | Err(_) => continue,
+            }
         }
+        login.release(&id);
+        forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
     }
 
     let mut tasks = Vec::new();
     for mut target in targets {
         let id = target.id.clone();
+        match supervisor.resume_deferred(&id).await {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(error) => {
+                tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                    "retained construction remains governed by its existing lease");
+                continue;
+            }
+        }
         // A session with a queue and no worker is retried under the normal
         // budget, whatever its status short of Stopped (a failed spawn leaves
         // Error): an earlier attempt must not strand the queue (#5200).
         let retry_for_queue = attempted.contains(&id)
             && queued_not_stopped.contains(&id)
             && supervisor.worker_state(&id).await == AcpWorkerState::Absent;
-        if attempted.contains(&id) {
-            // A restart marker can land after the reaper ran: add-project (#3103)
-            // writes it only once the moved workspace is durable.
-            let restart_marker = supervisor.worker_state(&id).await != AcpWorkerState::Stopping
-                && supervisor.take_late_restart_marker(&id);
-            if !retry_for_queue && !restart_marker {
+        let worker_state = supervisor.worker_state(&id).await;
+        let previous = resume_deferred
+            .get(&id)
+            .and_then(|entry| match &entry.entry {
+                DeferredResume::Unavailable {
+                    scope,
+                    refusal,
+                    originating_epoch,
+                } => Some((scope.clone(), *refusal, *originating_epoch)),
+                DeferredResume::Capacity => None,
+            });
+        if worker_state == AcpWorkerState::Absent
+            || (worker_state == AcpWorkerState::Resuming && previous.is_some())
+        {
+            if let Err(error) = target
+                .freeze_native_scope(previous.as_ref().map(|(scope, _, _)| scope.clone()))
+                .await
+            {
+                tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                    "native scope changed before resume admission");
                 continue;
             }
-            if restart_marker {
-                forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+            let scope = target
+                .native_scope
+                .as_ref()
+                .expect("frozen native scope")
+                .clone();
+            let previous = previous.filter(|(old, _, _)| old.context == scope.context);
+            let probe_id = id.clone();
+            let refusal = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let registry = crate::process::worker_registry::try_registry_lock(&probe_id)?
+                    .ok_or(crate::process::worker_registry::RegistryBusy)?;
+                if let Some((_, refusal, epoch)) = previous {
+                    if registry.refusal_still_applies(&refusal) {
+                        return Ok(Some((refusal, epoch)));
+                    }
+                }
+                Ok(registry
+                    .control_admission()
+                    .err()
+                    .map(|refusal| (refusal, None)))
+            })
+            .await;
+            match refusal {
+                Ok(Ok(Some((refusal, epoch)))) => {
+                    defer_control_refusal(state, &id, scope, refusal, epoch, resume_deferred).await;
+                    attempted.remove(&id);
+                    continue;
+                }
+                Ok(Ok(None)) => {
+                    if resume_deferred.get(&id).is_some_and(|entry| {
+                        matches!(&entry.entry, DeferredResume::Unavailable { .. })
+                    }) {
+                        resume_deferred.remove(&id);
+                        attempted.remove(&id);
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(target: "acp.supervisor", session = %id, %error,
+                        "control admission deferred without charging resume budget");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "acp.supervisor", session = %id, %error,
+                        "control admission observation failed");
+                    continue;
+                }
             }
-        }
-        match supervisor.worker_state(&id).await {
-            AcpWorkerState::Running | AcpWorkerState::Resuming => {
-                // Already owned; a live worker is also the user's retry, so un-park.
-                forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
-                attempted.insert(id);
-                continue;
-            }
-            AcpWorkerState::Stopping => {
-                attempted.insert(id);
-                continue;
-            }
-            AcpWorkerState::Absent => {}
-        }
-        if parked.contains(&id) {
-            attempted.insert(id);
-            continue;
-        }
-        // Waiting on the sandbox login spends no respawn budget.
-        if login.is_held(&id) {
-            attempted.insert(id);
-            continue;
         }
         // A stop fences automatic resumes, but is not a crash-loop park.
         if crate::process::worker_registry::stop_requested(&id) {
@@ -390,31 +554,64 @@ pub async fn reconcile_acp_workers(
             attempted.insert(id);
             continue;
         }
-        // A rate-limit park (#3514) is left to the auto-resume pass; a cap park
-        // (#3688) is released by a queued prompt.
-        if !released_from_park.contains(&id) {
-            let park = query_store(&state.acp_event_store, &id, "rate-limit park", |s, id| {
-                s.rate_limit_park(id)
-            })
-            .await
-            .flatten();
-            if let Some(park) =
-                park.filter(|p| !p.cap_reached || !with_queued_prompts.contains(&id))
-            {
-                tracing::debug!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    cap_reached = park.cap_reached,
-                    "holding respawn: session is parked on a rate limit"
-                );
+        match query_control(
+            &state.acp_event_store,
+            &id,
+            "rate-limit hold",
+            |store, id| store.rate_limit_park(id),
+        )
+        .await
+        {
+            Ok(Known(Some(park))) => {
+                if park.cap_reached
+                    && with_queued_prompts.contains(&id)
+                    && !login.is_held(&id)
+                    && !parked.contains(&id)
+                {
+                    rate_limit::schedule_capped_queue(state, &id, park.seq).await;
+                }
+                attempted.insert(id.clone());
+                continue;
+            }
+            Ok(Known(None)) => {}
+            Ok(Indeterminate) => target.historical_control_known = false,
+            Err(_) => continue,
+        }
+        if attempted.contains(&id) {
+            // A restart marker can land after the reaper ran: add-project (#3103)
+            // writes it only once the moved workspace is durable.
+            let restart_marker = supervisor.worker_state(&id).await != AcpWorkerState::Stopping
+                && supervisor.take_late_restart_marker(&id);
+            if !retry_for_queue && !restart_marker {
+                continue;
+            }
+            if restart_marker {
+                forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
+            }
+        }
+        match supervisor.worker_state(&id).await {
+            AcpWorkerState::Running | AcpWorkerState::Resuming => {
+                // Current ownership clears crash bookkeeping only after quota hold ends.
+                forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
                 attempted.insert(id);
                 continue;
             }
+            AcpWorkerState::Stopping => {
+                attempted.insert(id);
+                continue;
+            }
+            AcpWorkerState::Absent => {}
         }
-        // Probed before the respawn budget is charged: a failure retries on the next pass,
-        // unpinned and uncharged. Replacing a dead runner
-        // without closing its orphaned turn would leave the session Running.
-        let Some((in_flight, agent_turn)) = query_flushed(
+        if parked.contains(&id) {
+            attempted.insert(id);
+            continue;
+        }
+        // Waiting on the sandbox login spends no respawn budget.
+        if login.is_held(&id) {
+            attempted.insert(id);
+            continue;
+        }
+        match query_flushed(
             &state.acp_supervisor,
             &state.acp_event_store,
             &id,
@@ -422,25 +619,41 @@ pub async fn reconcile_acp_workers(
             open_turn_kinds,
         )
         .await
-        .flatten() else {
-            continue;
-        };
-        target.in_flight_turn = in_flight;
-        target.agent_turn_open = agent_turn;
-        // A failed probe counts as busy so a stale runner is not replaced under live work.
-        target.holds_live_work = in_flight
-            || agent_turn
-            || query_flushed(
-                &state.acp_supervisor,
-                &state.acp_event_store,
-                &id,
-                "live work",
-                |s, id| s.holds_live_work(id),
-            )
-            .await
-            .flatten()
-            .unwrap_or(true);
-        if record_and_check_respawn_budget(respawn_history, &id, Instant::now()) {
+        {
+            Some(Ok(Known((prompt, agent)))) => {
+                target.in_flight_turn = prompt;
+                target.agent_turn_open = agent;
+            }
+            Some(Ok(Indeterminate)) => target.historical_control_known = false,
+            Some(Err(error)) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error, "open turn query refused");
+                continue;
+            }
+            None => continue,
+        }
+        match query_flushed(
+            &state.acp_supervisor,
+            &state.acp_event_store,
+            &id,
+            "live work",
+            |store, id| store.holds_live_work(id),
+        )
+        .await
+        {
+            Some(Ok(Known(live))) => target.holds_live_work = live,
+            Some(Ok(Indeterminate)) => {
+                target.historical_control_known = false;
+                target.holds_live_work = true;
+            }
+            Some(Err(error)) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error, "live work query refused");
+                continue;
+            }
+            None => continue,
+        }
+        if target.historical_control_known
+            && record_and_check_respawn_budget(respawn_history, &id, Instant::now())
+        {
             tracing::warn!(
                 target: "acp.supervisor",
                 session = %id,
@@ -473,6 +686,13 @@ pub async fn reconcile_acp_workers(
         .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
     let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();
+    #[cfg(test)]
+    let gate = { RESUME_DISPATCH_GATE.lock().unwrap().take() };
+    #[cfg(test)]
+    if let Some((entered, release)) = gate {
+        let _ = entered.send(());
+        let _ = release.await;
+    }
     for target in tasks {
         let state = Arc::clone(state);
         let sem = Arc::clone(&semaphore);
@@ -487,6 +707,10 @@ pub async fn reconcile_acp_workers(
 
     while let Some(result) = set.join_next().await {
         match result {
+            Ok((id, ResumeOutcome::RegistryBusy)) => {
+                refund_respawn_attempt(respawn_history, &id);
+                attempted.remove(&id);
+            }
             Ok((id, ResumeOutcome::Retry)) => {
                 if !parked.contains(&id) {
                     attempted.remove(&id);
@@ -508,7 +732,11 @@ pub async fn reconcile_acp_workers(
                 // Never pin: `attempted` would skip the session forever.
                 attempted.remove(&id);
                 // `publish_startup_error` does not dedup, so publish once per transition.
-                if capacity_deferred.insert(id.clone()) {
+                if !resume_deferred
+                    .get(&id)
+                    .is_some_and(|entry| matches!(&entry.entry, DeferredResume::Capacity))
+                {
+                    resume_deferred.insert(id.clone(), ResumeDeferral::capacity());
                     crate::server::api::publish_startup_error_if_current(
                         state,
                         &id,
@@ -519,8 +747,30 @@ pub async fn reconcile_acp_workers(
                     .await;
                 }
             }
+            Ok((
+                id,
+                ResumeOutcome::Unavailable {
+                    scope,
+                    refusal,
+                    originating_epoch,
+                },
+            )) => {
+                refund_respawn_attempt(respawn_history, &id);
+                attempted.remove(&id);
+                if let Some(scope) = scope {
+                    defer_control_refusal(
+                        state,
+                        &id,
+                        scope,
+                        refusal,
+                        originating_epoch,
+                        resume_deferred,
+                    )
+                    .await;
+                }
+            }
             Ok((id, ResumeOutcome::Attached | ResumeOutcome::SpawnFinished)) => {
-                capacity_deferred.remove(&id);
+                resume_deferred.remove(&id);
             }
             Err(e) => {
                 tracing::error!(target: "acp.supervisor", "resume task panicked: {e}");
@@ -640,7 +890,9 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
                 !i.queued_prompts.is_empty()
                     && matches!(
                         i.status,
-                        crate::session::Status::Idle | crate::session::Status::Running
+                        crate::session::Status::Idle
+                            | crate::session::Status::Running
+                            | crate::session::Status::Error
                     )
                     && is_untriaged_structured(i)
             })
@@ -649,7 +901,8 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
     };
     for (id, dormant) in candidates {
         let service = Arc::clone(&state.session_service);
-        if !service.fold_control_state(&id).await.accepts_queue_drain() {
+        if !matches!(service.fold_control_state(&id).await, Ok(control) if control.accepts_queue_drain())
+        {
             continue;
         }
         if state.acp_supervisor.is_running(&id).await {
@@ -755,6 +1008,701 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 mod tests {
     use super::test_fixtures::{capacity_startup_errors, startup_errors, test_state, Tick};
     use super::*;
+    use crate::acp::Event;
+
+    #[derive(Clone, Copy)]
+    enum ConstructorOutcome {
+        Resume,
+        SupervisorStop,
+        HttpStop,
+        CliStop,
+    }
+
+    async fn owned_constructor_registry_deferral_recovers(
+        installation_ready: bool,
+        outcome: ConstructorOutcome,
+    ) {
+        use crate::acp::runner_lifecycle::{ProcessControl as _, SystemProcessControl};
+        use crate::acp::supervisor::test_support::{
+            pause_owned_installation, runner_record, ScriptedAcpAgent,
+        };
+        let thread = std::thread::current();
+        if crate::process::runner::test_support::managed_runner::child_if_requested(
+            thread.name().expect("managed libtest name"),
+        )
+        .await
+        {
+            return;
+        }
+        let stop_deferred = !matches!(outcome, ConstructorOutcome::Resume);
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| state.has_acknowledged_agent_hooks = true)
+            .expect("acknowledge fixture hooks");
+        let project = tempfile::tempdir().unwrap();
+        let spec = crate::server::session_spawn::StructuredSessionSpec {
+            session_id: None,
+            suggestion: None,
+            title: Some("owned-constructor-registry-deferral".into()),
+            title_typed: false,
+            size: None,
+            path: project.path().to_string_lossy().into_owned(),
+            group: String::new(),
+            parent_session_id: None,
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: None,
+            pull_latest_image: false,
+            yolo_mode: false,
+            extra_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: Vec::new(),
+            workspace: false,
+            repo_base_branches: Vec::new(),
+            scratch: false,
+            trust_hooks: None,
+            trust_review: None,
+            skip_on_create: false,
+            custom_instruction: None,
+            callback_url: None,
+            idempotency_key: None,
+            profile: "default".into(),
+            created_by_plugin: None,
+            plugin_create_idempotency: None,
+            pending_initial_turn: None,
+            acp_mode_id: Some("plan".into()),
+            view: crate::session::View::Structured,
+            agent_name: Some("claude-code".into()),
+            agent_model: None,
+            agent_effort: None,
+            import_acp_session_id: None,
+            import_binding: None,
+            fork_seed: None,
+            cli: None,
+            progress: None,
+        };
+        crate::server::test_support::seed_instances_on_disk_for_test("default", Vec::new());
+        let agent = ScriptedAcpAgent::new();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            Vec::new(),
+            agent.managed_launcher(),
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        struct Listener(tokio::task::JoinHandle<()>);
+        impl Drop for Listener {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _listener = if stop_deferred {
+            let subscribers = state.acp_events_tx.receiver_count();
+            let listener = Listener(tokio::spawn(crate::server::acp_events::acp_event_listener(
+                state.clone(),
+            )));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.acp_events_tx.receiver_count() <= subscribers {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the real observation listener subscribed before construction");
+            Some(listener)
+        } else {
+            None
+        };
+        let (registration, installation, release) = if installation_ready {
+            let (waiting, release) = pause_owned_installation();
+            (None, Some(waiting), release)
+        } else {
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            *crate::acp::acp_client::OWNED_REGISTRATION_GATE
+                .lock()
+                .unwrap() = Some((entered, released));
+            (Some(waiting), None, release)
+        };
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .session_service
+                    .create_structured_session(spec, None, None, None)
+                    .await
+                    .expect("real absent-row creation carries its original New permission")
+            }
+        });
+        let (owner, original_client) = if let Some(waiting) = registration {
+            let owner = tokio::time::timeout(Duration::from_secs(15), waiting)
+                .await
+                .expect("real owned child reached registration-observation boundary")
+                .unwrap();
+            (owner, None)
+        } else {
+            let client = tokio::time::timeout(Duration::from_secs(15), installation.unwrap())
+                .await
+                .expect("real SDK client reached installation boundary")
+                .unwrap();
+            let owner = agent.owned_runner();
+            assert_eq!(client.runner_pid(), Some(owner.pid));
+            (owner, Some(client))
+        };
+        let created_id = state.instances.read().await[0].id.clone();
+        let id = created_id.as_str();
+        let prior = vec![Instant::now() - Duration::from_secs(1)];
+        let mut tick = Tick::default();
+        tick.respawn_history.insert(id.into(), prior.clone());
+        let native = agent.started().await;
+        if installation_ready {
+            agent.wait_for_call("session/new", 1).await;
+        }
+        if stop_deferred && installation_ready {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let (registry, record) = agent.registered_runner(id).await;
+                    let established = record.stored_acp_session_id.as_deref().is_some_and(|sid| {
+                        original_client
+                            .as_ref()
+                            .and_then(|client| client.establishment_projection())
+                            .and_then(|projection| projection.receipt_snapshot())
+                            .is_some_and(|receipt| {
+                                receipt.owner == owner
+                                    && receipt.session_id() == Some(sid)
+                                    && receipt.replay.closed
+                                    && !receipt.replay.lost
+                            })
+                    });
+                    drop(registry);
+                    if established {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the original native session-ready receipt arrived before the refused install");
+        }
+        if installation_ready
+            && matches!(
+                outcome,
+                ConstructorOutcome::HttpStop | ConstructorOutcome::CliStop
+            )
+        {
+            assert!(
+                !state
+                    .acp_event_store
+                    .replay_from(id, 0)
+                    .expect("read retained events")
+                    .iter()
+                    .any(|stored| matches!(
+                        stored.event.as_ref(),
+                        Event::AcpSessionAssigned { .. }
+                    )),
+                "the genuine SDK assignment must still be only in the original inbound receiver"
+            );
+        }
+        let (registry, registered) = agent.registered_runner(id).await;
+        assert!(owner.owns_record(&registered));
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("the original creation request returned")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), state.session_service.work.drain())
+            .await
+            .expect("the original bounded construction attempt returned");
+        let after_attempt = tick.respawn_history.get(id).cloned();
+        assert!(SystemProcessControl::default().is_alive(owner));
+        let calls_while_refused = agent.calls();
+        tokio::time::timeout(Duration::from_secs(20), tick.run(&state))
+            .await
+            .unwrap();
+        let after_uncharged_tick = tick.respawn_history.get(id).cloned();
+        drop(registry);
+        if stop_deferred {
+            let before_stop_generation = state.instances.read().await[0].lifecycle_generation;
+            let mut cli_stop = None;
+            let stopped = tokio::time::timeout(Duration::from_secs(8), async {
+                match outcome {
+                    ConstructorOutcome::SupervisorStop => state
+                        .acp_supervisor
+                        .shutdown_and_wait(id, Duration::from_secs(5))
+                        .await
+                        .map_err(|error| error.to_string()),
+                    ConstructorOutcome::HttpStop => {
+                        let response = crate::server::api::sessions::stop_session(
+                            axum::extract::State(state.clone()),
+                            axum::extract::Path(id.to_owned()),
+                        )
+                        .await;
+                        let response = axum::response::IntoResponse::into_response(response);
+                        if response.status().is_success() {
+                            Ok(())
+                        } else {
+                            let status = response.status();
+                            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                                .await
+                                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                                .unwrap_or_else(|error| {
+                                    format!("<response body read failed: {error}>")
+                                });
+                            Err(format!("HTTP Stop returned {status}: {body}"))
+                        }
+                    }
+                    ConstructorOutcome::CliStop => {
+                        let count = crate::cli::acp::stop_all_workers(5)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        assert_eq!(count, 1, "the real CLI stop owns only this isolated runner");
+                        cli_stop = Some(
+                            crate::process::worker_registry::stop_intent(id)
+                                .unwrap()
+                                .expect("CLI published the exact original stop intent"),
+                        );
+                        Ok(())
+                    }
+                    ConstructorOutcome::Resume => unreachable!("stop branch"),
+                }
+            })
+            .await;
+            let cli_custody_settled = if matches!(outcome, ConstructorOutcome::CliStop) {
+                Some(
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            tick.run(&state).await;
+                            if !state.acp_supervisor.is_owned(id).await {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .is_ok(),
+                )
+            } else {
+                None
+            };
+            let still_alive = SystemProcessControl::default().is_alive(owner);
+            let native_reaped = if matches!(&stopped, Ok(Ok(()))) {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !agent.native_reaped() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .is_ok()
+            } else {
+                agent.native_reaped()
+            };
+            if matches!(outcome, ConstructorOutcome::SupervisorStop) {
+                // Physical Stop leaves the canonical binding commit to maintenance.
+                crate::server::acp_events::commit_background_bindings(&state).await;
+            }
+            let record_absent = runner_record(id).await.is_none();
+            let calls = agent.calls();
+            let expected_sid = registered.stored_acp_session_id.as_deref();
+            let selected_identity_preserved =
+                if matches!(outcome, ConstructorOutcome::SupervisorStop) {
+                    None
+                } else {
+                    Some(
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                let cached = state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == id)
+                                    .and_then(|row| row.acp_session_id.clone());
+                                let durable = crate::session::Storage::new_unwatched("default")
+                                    .unwrap()
+                                    .load()
+                                    .unwrap()
+                                    .into_iter()
+                                    .find(|row| row.id == id)
+                                    .and_then(|row| row.acp_session_id);
+                                if cached.as_deref() == expected_sid
+                                    && durable.as_deref() == expected_sid
+                                {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        })
+                        .await
+                        .is_ok(),
+                    )
+                };
+            let stopped_events = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .expect("read retained events");
+            let retired_identity_checkpointed = original_client
+                .as_ref()
+                .and_then(|client| client.establishment_projection())
+                .and_then(|projection| projection.receipt_snapshot())
+                .is_some_and(|receipt| {
+                    receipt.owner == owner
+                        && receipt.session_id() == expected_sid
+                        && state.acp_event_store.establishment_seal(&receipt).is_ok()
+                        && crate::session::Storage::open_reference("default")
+                            .and_then(|storage| storage.load())
+                            .unwrap()
+                            .iter()
+                            .find(|row| row.id == id)
+                            .is_some_and(|row| {
+                                row.acp_session_id.as_deref() == expected_sid
+                                    && row.acp_establishment
+                                        == Some(
+                                            crate::acp::establishment::AcpEstablishment::Applied {
+                                                attempt_id: receipt.attempt.id,
+                                            },
+                                        )
+                            })
+                });
+            assert!(!stopped_events.iter().any(|stored| matches!(
+                stored.event.as_ref(),
+                Event::AcpSessionAssigned {
+                    connection_ready: true,
+                    ..
+                }
+            )));
+            let any_assignment_before_cleanup = stopped_events
+                .iter()
+                .any(|stored| matches!(stored.event.as_ref(), Event::AcpSessionAssigned { .. }));
+            let stop_generation_advanced = if matches!(outcome, ConstructorOutcome::HttpStop) {
+                Some(
+                    crate::session::Storage::new_unwatched("default")
+                        .unwrap()
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .lifecycle_generation
+                        > before_stop_generation,
+                )
+            } else {
+                None
+            };
+            let cli_stop_preserved = cli_stop.as_ref().map(|original| {
+                crate::process::worker_registry::stop_intent(id)
+                    .unwrap()
+                    .as_ref()
+                    == Some(original)
+            });
+            let memory_sid = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == id)
+                .and_then(|row| row.acp_session_id.clone());
+            let disk_sid = crate::session::Storage::open_reference("default")
+                .and_then(|storage| storage.load())
+                .map(|rows| {
+                    rows.into_iter()
+                        .find(|row| row.id == id)
+                        .and_then(|row| row.acp_session_id)
+                })
+                .map_err(|error| format!("{error:#}"));
+            let health = state.canonical_health.read().await.clone();
+            let diagnostics = format!("expected_sid={expected_sid:?}; memory_sid={memory_sid:?}; disk_sid={disk_sid:?}; health={health:?}");
+            agent.settle(&state.acp_supervisor, id).await;
+            drop(agent);
+            assert!(matches!(stopped, Ok(Ok(()))),
+                    "Stop must claim a deferred owned constructor without a vanished producer: {stopped:?}; {diagnostics}");
+            assert!(
+                !still_alive,
+                "the accepted stop must physically retire the original runner"
+            );
+            assert!(
+                native_reaped,
+                "Stop must retire and reap the captured native process before fixture cleanup"
+            );
+            assert!(
+                record_absent,
+                "Stop must settle the original runner's registry record"
+            );
+            if let Some(advanced) = stop_generation_advanced {
+                assert!(
+                    advanced,
+                    "the actual HTTP Stop must commit its newer native generation"
+                );
+            }
+            if let Some(settled) = cli_custody_settled {
+                assert!(settled, "the real daemon tick must settle a CLI-killed deferred constructor without an installed handle");
+                assert_eq!(
+                    cli_stop_preserved,
+                    Some(true),
+                    "settling the dead original must preserve its exact CLI stop token"
+                );
+                assert!(
+                    calls.iter().all(|call| !matches!(
+                        call["method"].as_str(),
+                        Some("session/load" | "session/prompt")
+                    )),
+                    "CLI settlement must not replay native work"
+                );
+            }
+            if expected_sid.is_some() {
+                assert!(retired_identity_checkpointed,
+                        "the real retirement consumer must checkpoint the exact original Native receipt and SID without readiness");
+            } else {
+                assert!(
+                    !any_assignment_before_cleanup,
+                    "a never-established constructor must not fabricate a conversation receipt"
+                );
+            }
+            if let Some(preserved) = selected_identity_preserved {
+                assert!(preserved,
+                        "the native controller must preserve the original queued SID in memory and on disk before fixture cleanup; {diagnostics}");
+            }
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["method"] == "session/new")
+                    .count(),
+                if installation_ready { 1 } else { 0 }
+            );
+        } else {
+            tokio::time::timeout(Duration::from_secs(20), tick.run(&state))
+                .await
+                .unwrap();
+            let sent = tokio::time::timeout(
+                Duration::from_secs(3),
+                state.acp_supervisor.send_prompt(
+                    id,
+                    "same owned conversation after registry refusal",
+                    &[],
+                ),
+            )
+            .await;
+            let delivered = matches!(&sent, Ok(Ok(())));
+            if delivered {
+                agent.wait_for_call("session/prompt", 1).await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                        while !state.acp_event_store.replay_from(id, 0).expect("read retained events").iter().any(|stored| matches!(stored.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete")) {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                agent.wait_for_call("session/set_mode", 1).await;
+                if let Some(original) = original_client.as_ref() {
+                    state
+                        .acp_supervisor
+                        .test_assert_installed_client(id, original)
+                        .await;
+                }
+                assert_eq!(agent.started().await, native);
+            }
+            let retained = runner_record(id).await;
+            let calls = agent.calls();
+            let active_owner = state.acp_supervisor.running_identity(id);
+            if delivered {
+                state
+                    .acp_supervisor
+                    .shutdown_and_wait(id, Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            }
+            agent.settle(&state.acp_supervisor, id).await;
+            drop(agent);
+            assert!(
+                delivered,
+                "the next real reconcile must install a usable same-actor worker: {sent:?}"
+            );
+            assert_eq!(active_owner, Some(owner));
+            let retained = retained.unwrap();
+            assert!(owner.owns_record(&retained));
+            let sid = retained
+                .stored_acp_session_id
+                .as_deref()
+                .expect("genuine initial session established");
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["method"] == "initialize")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["method"] == "session/new")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call["method"] == "session/load")
+                    .count(),
+                0
+            );
+            let modes: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "session/set_mode")
+                .collect();
+            assert_eq!(modes.len(), 1);
+            assert_eq!(modes[0]["params"]["modeId"], "plan");
+            let prompts: Vec<_> = calls
+                .iter()
+                .filter(|call| call["method"] == "session/prompt")
+                .collect();
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(prompts[0]["params"]["sessionId"], sid);
+            assert!(calls
+                .iter()
+                .all(|call| call["native_pid"].as_u64() == Some(native.0 as u64)));
+        }
+        assert_eq!(
+            after_attempt,
+            Some(prior.clone()),
+            "creation does not spend the reconciler's prior retry budget"
+        );
+        assert_eq!(
+            after_uncharged_tick,
+            Some(prior),
+            "deferred ownership is not a successful retry or a history reset"
+        );
+        assert_eq!(
+            calls_while_refused
+                .iter()
+                .filter(|call| call["method"] == "session/new")
+                .count(),
+            if installation_ready { 1 } else { 0 },
+            "registration continuation must preserve the not-yet-established original New"
+        );
+        assert!(!state
+            .acp_event_store
+            .replay_from(id, 0)
+            .expect("read retained events")
+            .iter()
+            .any(|stored| matches!(stored.event.as_ref(), Event::SessionContextReset { .. })));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_registration_contention_reconciles_original_authorized_new_once() {
+        owned_constructor_registry_deferral_recovers(false, ConstructorOutcome::Resume).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_installation_contention_reconciles_original_client_and_mode_once() {
+        owned_constructor_registry_deferral_recovers(true, ConstructorOutcome::Resume).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_physically_retires_a_deferred_owned_constructor_without_reinstallation() {
+        owned_constructor_registry_deferral_recovers(true, ConstructorOutcome::SupervisorStop)
+            .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_stop_preserves_original_inbound_assignment_across_its_native_commit() {
+        owned_constructor_registry_deferral_recovers(true, ConstructorOutcome::HttpStop).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_stop_settles_handleless_owned_constructor_and_preserves_its_native_binding() {
+        owned_constructor_registry_deferral_recovers(true, ConstructorOutcome::CliStop).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cli_stop_settles_handleless_registration_without_establishing_a_conversation() {
+        owned_constructor_registry_deferral_recovers(false, ConstructorOutcome::CliStop).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn registry_contention_preserves_prior_budget_and_refunds_only_charged_dispatch() {
+        for charged in [false, true] {
+            let id = "registry-budget";
+            let (_home, state, _project) = test_state(id);
+            let mut tick = Tick::default();
+            let prior = vec![
+                Instant::now() - Duration::from_secs(2),
+                Instant::now() - Duration::from_secs(1),
+            ];
+            tick.respawn_history.insert(id.to_owned(), prior.clone());
+            let entry = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(
+                    crate::process::worker_registry::record_path(id)
+                        .unwrap()
+                        .with_extension("lock"),
+                )
+                .unwrap();
+            let (release, entered) = if charged {
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                *RESUME_DISPATCH_GATE.lock().unwrap() = Some((entered_tx, release_rx));
+                (Some(release_tx), Some(entered_rx))
+            } else {
+                fs2::FileExt::lock_exclusive(&entry).unwrap();
+                (None, None)
+            };
+            let tick_state = Arc::clone(&state);
+            let task = tokio::spawn(async move {
+                tick.run(&tick_state).await;
+                tick
+            });
+            if let Some(entered) = entered {
+                tokio::time::timeout(Duration::from_secs(5), entered)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                fs2::FileExt::lock_exclusive(&entry).unwrap();
+                release.unwrap().send(()).unwrap();
+            }
+            let tick = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                tick.respawn_history.get(id),
+                Some(&prior),
+                "charged={charged}"
+            );
+            assert!(
+                !tick.attempted.contains(id),
+                "the refused observation remains retryable"
+            );
+            assert!(
+                !tick.parked.contains(id),
+                "contention is not a crash-loop decision"
+            );
+            assert_eq!(startup_errors(&state, id), 0);
+            assert_eq!(
+                state.acp_supervisor.worker_state(id).await,
+                AcpWorkerState::Absent
+            );
+            assert!(
+                state
+                    .acp_event_store
+                    .replay_from(id, 0)
+                    .expect("read retained events")
+                    .is_empty(),
+                "registry contention does not fabricate a native-loss event"
+            );
+            drop(entry);
+        }
+    }
 
     #[test]
     #[serial_test::serial]
@@ -882,33 +1830,6 @@ mod tests {
     }
 
     #[test]
-    fn park_message_classifies_missing_project_path() {
-        let missing = "/tmp/aoe-does-not-exist-2260/worktrees/Burmese";
-        let msg = park_message(missing);
-        assert!(msg.contains(&format!("project path no longer exists: {missing}")));
-        assert!(!msg.contains("Retry from the dashboard"));
-
-        let msg = park_message(&std::env::temp_dir().to_string_lossy());
-        assert!(!msg.contains("project path no longer exists"));
-        assert!(msg.contains("Retry from the dashboard"));
-
-        use crate::acp::supervisor::SupervisorError;
-        use crate::server::api::structured_spawn_error_message;
-
-        let capacity = SupervisorError::CapacityFull {
-            current: 1,
-            limit: 1,
-        };
-        let msg = structured_spawn_error_message(&capacity, "claude-code");
-        assert!(msg.contains("capacity full") && msg.contains("max_concurrent_workers"));
-        assert!(!msg.contains("Failed to start structured view agent"));
-
-        let generic = SupervisorError::UnknownAgent("bogus".to_string());
-        assert!(structured_spawn_error_message(&generic, "bogus")
-            .contains("Failed to start structured view agent"));
-    }
-
-    #[test]
     fn respawn_budget_parks_after_cap_and_recovers_after_window() {
         let mut history = HashMap::new();
         let id = "sess-loop";
@@ -926,6 +1847,164 @@ mod tests {
         assert!(!record_and_check_respawn_budget(&mut history, "other", now));
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_legacy_refusal_never_dials_or_spends_reconciler_budget() {
+        use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::process::worker_registry;
+        struct RestoreRecord {
+            path: std::path::PathBuf,
+            bytes: Vec<u8>,
+        }
+        impl Drop for RestoreRecord {
+            fn drop(&mut self) {
+                crate::session::atomic_write(&self.path, &self.bytes).unwrap();
+            }
+        }
+        with_managed(|scope| {
+            Box::pin(async move {
+                for shape in ["missing", "null", "v3"] {
+                    let mut live = crate::server::test_support::managed_control_session(
+                        scope, shape, "claude", None,
+                    )
+                    .await;
+                    let id = live.id().to_owned();
+                    live.park("interrupted explicit intent").await;
+                    let park = match live.state.acp_event_store.rate_limit_park(&id).unwrap() {
+                        Known(Some(park)) => park,
+                        other => panic!("real quota park missing: {other:?}"),
+                    };
+                    live.state
+                        .acp_event_store
+                        .test_conn()
+                        .execute(
+                            "DELETE FROM acp_events WHERE session_id=?1 AND seq<?2",
+                            rusqlite::params![id, i64::try_from(park.seq).unwrap()],
+                        )
+                        .unwrap();
+                    live.state.acp_event_store.control_cache().forget(&id);
+                    let budget = live
+                        .state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap();
+                    assert_eq!(budget, Known(0));
+                    let methods = live.native.requests();
+                    live.client = scope
+                        .reconcile_after(live.client, |state, id| async move {
+                            // Closing the SDK socket precedes the Native runner's
+                            // final registry write. Install legacy bytes only after
+                            // that real detach has completed.
+                            tokio::time::timeout(Duration::from_secs(10), async {
+                                loop {
+                                    let record = worker_registry::load(&id).unwrap().unwrap();
+                                    if record.detached_at.is_some() {
+                                        break;
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
+                                }
+                            })
+                            .await
+                            .expect("original Native runner recorded its detach");
+                            let path = worker_registry::record_path(&id).unwrap();
+                            let bytes = std::fs::read(&path).unwrap();
+                            let restore = RestoreRecord {
+                                path: path.clone(),
+                                bytes: bytes.clone(),
+                            };
+                            let mut data: serde_json::Value =
+                                serde_json::from_slice(&bytes).unwrap();
+                            match shape {
+                                "missing" => {
+                                    data.as_object_mut()
+                                        .unwrap()
+                                        .remove("control_protocol_version");
+                                }
+                                "null" => {
+                                    data["control_protocol_version"] = serde_json::Value::Null
+                                }
+                                "v3" => data["control_protocol_version"] = serde_json::json!(3),
+                                _ => unreachable!(),
+                            }
+                            crate::session::atomic_write(
+                                &path,
+                                &serde_json::to_vec(&data).unwrap(),
+                            )
+                            .unwrap();
+                            let incompatible = std::fs::read(&path).unwrap();
+                            let mut tick = Tick::default();
+                            let prior = vec![Instant::now()];
+                            tick.respawn_history.insert(id.clone(), prior.clone());
+                            for _ in 0..2 {
+                                tick.run(&state).await;
+                                assert_eq!(state.acp_supervisor.running_identity(&id), None);
+                                assert!(state
+                                    .acp_supervisor
+                                    .current_native_availability(&id)
+                                    .await
+                                    .is_none_or(|availability| availability.owner.is_none()));
+                                assert_eq!(tick.respawn_history.get(&id), Some(&prior));
+                                assert_eq!(
+                                    state
+                                        .acp_event_store
+                                        .rate_limit_redelivery_streak(&id)
+                                        .unwrap(),
+                                    budget
+                                );
+                                assert!(matches!(
+                                    state.acp_event_store.rate_limit_park(&id).unwrap(),
+                                    Indeterminate
+                                ));
+                                assert!(state
+                                    .session_service
+                                    .queued_prompts_snapshot(&id)
+                                    .await
+                                    .is_empty());
+                                assert!(state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == id)
+                                    .unwrap()
+                                    .pending_initial_turn
+                                    .is_none());
+                                let events = state.acp_event_store.replay_from(&id, 0).unwrap();
+                                assert!(!events.iter().any(|stored| matches!(
+                                    stored.event.as_ref(),
+                                    Event::RateLimitAutoResumed { .. }
+                                        | Event::UserPromptSent { .. }
+                                )));
+                                assert_eq!(std::fs::read(&path).unwrap(), incompatible);
+                            }
+                            drop(restore);
+                            tick.run(&state).await;
+                        })
+                        .await;
+                    live.client.ready().await;
+                    live.state = live.client.app_state();
+                    assert_eq!(live.native.requests(), methods);
+                    assert_eq!(
+                        live.state
+                            .acp_event_store
+                            .rate_limit_redelivery_streak(&id)
+                            .unwrap(),
+                        budget
+                    );
+                    assert!(matches!(
+                        live.state.acp_event_store.rate_limit_park(&id).unwrap(),
+                        Indeterminate
+                    ));
+                    live.client.shutdown().await.expect(
+                        "settle this case's retained Native actor before creating the next",
+                    );
+                }
+            })
+        })
+        .await;
+    }
+
     /// A late restart marker (#3103) re-arms and is consumed; without one an
     /// attempted id stays pinned, or the crash-loop budget would be void.
     #[tokio::test]
@@ -937,7 +2016,7 @@ mod tests {
             let mut tick = Tick::default();
             tick.attempted.insert(id.to_string());
             if with_marker {
-                crate::process::worker_registry::mark_restart_pending(id, 5);
+                crate::process::worker_registry::mark_restart_pending(id, 5).unwrap();
             }
             tick.run(&state).await;
 
@@ -945,7 +2024,11 @@ mod tests {
             // The bogus agent fails fast, so a spawn attempt records one startup error.
             let expected_events = usize::from(with_marker);
             assert_eq!(
-                state.acp_event_store.replay_from(id, 0).len(),
+                state
+                    .acp_event_store
+                    .replay_from(id, 0)
+                    .expect("read retained events")
+                    .len(),
                 expected_events,
                 "with_marker={with_marker}"
             );
@@ -986,9 +2069,10 @@ mod tests {
             let errors = state
                 .acp_event_store
                 .replay_from(id, 0)
+                .unwrap()
                 .into_iter()
-                .filter_map(|(_, event)| match event {
-                    crate::acp::Event::AgentStartupError { message, .. } => Some(message),
+                .filter_map(|stored| match stored.event.as_ref() {
+                    crate::acp::Event::AgentStartupError { message, .. } => Some(message.clone()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -1005,7 +2089,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_purge_fence_during_attach_defers_and_refunds_the_fallback_spawn() {
+    async fn an_unconfirmed_attach_preserves_the_runner_without_charging_budget() {
         let id = "s-purge-at-fallback";
         let (_home, state, project) = test_state(id);
         let sockets = tempfile::TempDir::with_prefix_in("aoe-attach-", "/tmp").unwrap();
@@ -1018,7 +2102,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let record = crate::process::worker_registry::WorkerRecord::new(
+        let mut record = crate::process::worker_registry::WorkerRecord::new(
             id.into(),
             child.id().unwrap(),
             socket,
@@ -1032,37 +2116,44 @@ mod tests {
             Some("default".into()),
         )
         .with_generation(17);
+        record.control_protocol_version =
+            Some(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION);
         crate::process::worker_registry::save(&record).unwrap();
-
-        let first_tick = tokio::spawn({
-            let state = Arc::clone(&state);
-            async move {
-                let mut tick = Tick::default();
-                tick.run(&state).await;
-                tick
-            }
-        });
-        // The runner is still live when attach connects. Fence admission before
-        // allowing attach to fail, so only the fallback can see the purge fence.
-        let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .expect("reconciliation must try to attach")
+        let clear = crate::acp::Event::SessionCleared;
+        let metadata = crate::acp::event_sender::EventMetadata::host(&clear);
+        state
+            .acp_event_store
+            .record(id, 1, &clear, &metadata)
             .unwrap();
-        let purge = state.acp_supervisor.fence_spawn_admission(id);
-        child.kill().await.unwrap();
-        drop(stream);
 
-        let mut tick = first_tick.await.unwrap();
-        assert!(crate::process::worker_registry::load(id).unwrap().is_none());
+        let (entered, arrived) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *RESUME_DISPATCH_GATE.lock().unwrap() = Some((entered, released));
+        let mut tick = Tick::default();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let ((), ()) = tokio::join!(tick.run(&state), async {
+                arrived
+                    .await
+                    .expect("reconciliation dispatches the retained runner");
+                release.send(()).unwrap();
+            });
+        })
+        .await
+        .expect("reconciliation settles without an establishment seal");
+        tokio::select! {
+            biased;
+            accepted = listener.accept() => panic!("uncertified attach reached socket: {accepted:?}"),
+            () = std::future::ready(()) => {}
+        }
+        let retained = crate::process::worker_registry::load(id).unwrap().unwrap();
+        assert_eq!(retained.runner_identity, record.runner_identity);
+        assert_eq!(retained.generation, record.generation);
         assert!(!tick.attempted.contains(id));
         assert!(!tick.respawn_history.contains_key(id));
         assert_eq!(startup_errors(&state, id), 0);
 
-        drop(purge);
-        tick.run(&state).await;
-        assert!(tick.attempted.contains(id));
-        assert_eq!(tick.respawn_history[id].len(), 1);
-        assert_eq!(startup_errors(&state, id), 1);
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().await.unwrap();
     }
 
     /// An unreadable event log neither spawns nor pins the session: it stays
@@ -1093,42 +2184,45 @@ mod tests {
     /// A runner retains the completion of its last user prompt and replays it on attach. An
     /// agent-initiated turn after that prompt must not be classified as a prompt in flight
     /// (which would let the replay close it), and only its own terminal releases the hold.
-    #[test]
-    fn an_agent_turn_after_a_completed_prompt_is_not_a_prompt_in_flight() {
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_agent_turn_after_a_completed_prompt_is_not_a_prompt_in_flight() {
         use crate::acp::Event;
-        let (_home, state, _project) = test_state("s-reattach");
-        let id = "s-reattach";
-        let store = &state.acp_event_store;
-        let events = [
-            Event::UserPromptSent {
-                text: "go".into(),
-                attachments: Vec::new(),
-                prompt_id: None,
-                merged_prompt_ids: Vec::new(),
-                synthesized: false,
-                origin_plugin: None,
-                origin: crate::daemon::PromptOrigin::Unknown,
-            },
-            Event::Stopped {
-                reason: "prompt_complete".into(),
-            },
-            Event::AgentMessageChunk {
-                text: "woken".into(),
-                message_id: None,
-            },
-        ];
-        for (i, event) in events.iter().enumerate() {
-            store.record(id, i as u64 + 1, event).unwrap();
-        }
-        assert_eq!(open_turn_kinds(store, id), Some((false, true)));
-        assert_eq!(store.holds_live_work(id), Some(true));
-
-        let stop = Event::Stopped {
-            reason: "agent_idle".into(),
-        };
-        store.record(id, 4, &stop).unwrap();
-        assert_eq!(open_turn_kinds(store, id), Some((false, false)));
-        assert_eq!(store.holds_live_work(id), Some(false));
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(
+                scope, "independent-agent-turn", "claude", None,
+            ).await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            let store = &state.acp_event_store;
+            let prompt = live.start_prompt("go").await;
+            live.finish_prompt(&prompt, None).await;
+            let run = uuid::Uuid::new_v4();
+            live.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}
+            })).await;
+            live.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"session/update","params":{"sessionId":live.sid,
+                    "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}}
+            })).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await.expect("genuine own output"),
+                    Event::AgentMessageChunk { text, .. } if text == "woken") {}
+            }).await.unwrap();
+            assert_eq!(open_turn_kinds(store, &id).unwrap(), Known((false, true)));
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(true));
+            live.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"_omp/autonomous_turn/end",
+                "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc","stopReason":"end_turn"}
+            })).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(live.client.next_event().await.expect("genuine own terminal"),
+                    Event::Stopped { reason } if reason == "agent_idle") {}
+            }).await.unwrap();
+            assert_eq!(open_turn_kinds(store, &id).unwrap(), Known((false, false)));
+            assert_eq!(store.holds_live_work(&id).unwrap(), Known(false));
+        })).await;
     }
 
     #[tokio::test]
@@ -1140,13 +2234,20 @@ mod tests {
         tick.attempted.insert(id.to_string());
         tick.respawn_history
             .insert(id.to_string(), vec![Instant::now()]);
-        state.acp_supervisor.note_startup_failure(id);
+        state.acp_supervisor.note_startup_requeue(id);
 
         tick.run(&state).await;
 
-        assert_eq!(state.acp_event_store.replay_from(id, 0).len(), 1);
+        assert_eq!(
+            state
+                .acp_event_store
+                .replay_from(id, 0)
+                .expect("read retained events")
+                .len(),
+            1
+        );
         assert_eq!(tick.respawn_history[id].len(), 2, "counted, not wiped");
-        assert!(state.acp_supervisor.take_startup_failures().is_empty());
+        assert!(state.acp_supervisor.take_startup_requeues().is_empty());
     }
 
     /// CapacityFull re-arms instead of pinning (a restart would hide a stuck
@@ -1164,7 +2265,7 @@ mod tests {
         for _ in 0..3 {
             tick.run(&state).await;
             assert!(!tick.attempted.contains("s-cap"));
-            assert!(tick.capacity_deferred.contains("s-cap"));
+            assert!(tick.resume_deferred.contains_key("s-cap"));
             assert!(!tick.parked.contains("s-cap"));
         }
         assert_eq!(tick.respawn_history.get("s-cap").map(Vec::len), Some(2));
@@ -1182,7 +2283,7 @@ mod tests {
             state.acp_supervisor.test_insert_worker("occupant").await;
             let mut tick = Tick::default();
             tick.run(&state).await;
-            assert!(tick.capacity_deferred.contains(id), "precondition");
+            assert!(tick.resume_deferred.contains_key(id), "precondition");
 
             if slot_freed {
                 state.acp_supervisor.test_remove_worker("occupant").await;
@@ -1191,7 +2292,7 @@ mod tests {
             }
             tick.run(&state).await;
             assert!(
-                !tick.capacity_deferred.contains(id),
+                !tick.resume_deferred.contains_key(id),
                 "slot_freed={slot_freed}"
             );
             assert_eq!(capacity_startup_errors(&state, id), 1);
@@ -1255,108 +2356,348 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn queue_drain_ignores_background_work_but_preserves_foreground_barriers() {
-        use crate::acp::state::test_support::{chunk, prompt, stopped};
-        use crate::acp::state::Event;
-        use crate::acp::supervisor::{BroadcastSink, ChannelSink};
-        use crate::session::{Instance, Status, View};
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::acp::task_transcript::resource_test_support::append;
+        use crate::acp::Event;
+        use crate::server::test_support;
 
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        let task = Event::BackgroundTaskStarted {
-            task_id: "task".into(),
-            tool_call_id: None,
-            description: "build".into(),
-            workflow: None,
-            started_at: None,
-        };
-        let agent = Event::BackgroundAgentLaunched {
-            agent_id: "agent".into(),
-            tool_call_id: "tool".into(),
-            description: "research".into(),
-            prompt: "research".into(),
-            model: "model".into(),
-            output_file: String::new(),
-            started_at: crate::time::Timestamp::now(),
-            workflow: None,
-        };
-        for (name, events, text, drains) in [
-            (
-                "task",
-                vec![prompt("go"), task.clone(), stopped("end_turn")],
-                "follow up",
-                true,
-            ),
-            (
-                "agent",
-                vec![prompt("go"), agent, stopped("end_turn")],
-                "follow up",
-                true,
-            ),
-            ("main", vec![prompt("go"), task.clone()], "follow up", false),
-            (
-                "notification",
-                vec![task.clone(), chunk("result")],
-                "follow up",
-                false,
-            ),
-            (
-                "cancel",
-                vec![
-                    task.clone(),
-                    Event::CancelRequested {
-                        escalates_at: crate::time::Timestamp::now(),
-                    },
-                ],
-                "follow up",
-                false,
-            ),
-            (
-                "compact",
-                vec![task.clone(), Event::ConversationCompactionStarted],
-                "follow up",
-                false,
-            ),
-            ("clear", vec![task.clone()], "/clear", false),
-        ] {
-            let mut inst = Instance::new(name, "/tmp/aoe-queue-background");
-            inst.id = name.into();
-            inst.view = View::Structured;
-            inst.agent_name = Some("claude".into());
-            // The display stays busy even after the foreground turn ends.
-            inst.status = Status::Running;
-            let state = crate::server::test_support::build_test_app_state(vec![inst]);
-            let commands = state
-                .acp_supervisor
-                .test_insert_worker_cmd_recording(name)
-                .await;
-            let _live =
-                crate::acp::supervisor::test_support::save_agent_record(name, "claude", true);
-            let sink = ChannelSink::new(
-                state.acp_events_tx.clone(),
-                Arc::clone(&state.acp_event_store),
-                Arc::clone(&state.acp_control_cache),
-            );
-            for (seq, event) in events.iter().enumerate() {
-                assert!(sink.publish_persisted(name, seq as u64 + 1, event));
+        with_managed(|scope| Box::pin(async move {
+            for (name, text, drains) in [
+                ("task", "follow up", true),
+                ("agent", "follow up", true),
+                ("main", "follow up", false),
+                ("notification", "follow up", false),
+                ("cancel", "follow up", false),
+                ("compact", "follow up", false),
+                ("clear", "/clear", false),
+            ] {
+                // Gemini leaves transcript tailing to AoE; Codex advertises ACP subagents.
+                let agent = if name == "agent" { "gemini" } else { "claude" };
+                let mut live = test_support::managed_control_session(
+                    scope, name, agent, None,
+                ).await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                let row = state.instances.read().await.iter()
+                    .find(|row| row.id == id).unwrap().clone();
+                let task_transcript = if name != "agent" {
+                let binding = live.client.actual().native_store.as_ref()
+                    .filter(|binding| binding.agent == "claude" && binding.filesystem == "host")
+                    .expect("the actual original owns its Claude resource store").clone();
+                let store_root = binding.stores.first().unwrap();
+                let task_transcript = store_root.join("projects")
+                    .join(crate::session::capture::encode_claude_project_path(&row.project_path))
+                    .join(format!("{}.jsonl", live.sid));
+                std::fs::create_dir_all(task_transcript.parent().unwrap()).unwrap();
+                std::fs::write(&task_transcript, "").unwrap();
+                    Some(task_transcript)
+                } else {
+                    None
+                };
+                let output = scope.tempdir();
+                let agent_transcript = output.path().join("agent.jsonl");
+                std::fs::write(&agent_transcript, "").unwrap();
+                let request = live.start_prompt("go").await;
+                let allocation = live.start_background(name == "agent", &agent_transcript).await;
+                assert!(state.acp_event_store.replay_from(&id, 0).unwrap().iter().any(|stored| {
+                    stored.metadata.resource_ref == Some(allocation)
+                        && stored.metadata.resource_witness.as_ref()
+                            .is_some_and(|witness| witness.allocation == allocation)
+                }), "{name}: background work is a real first-I/O allocation, not history");
+                if !matches!(name, "main" | "cancel") {
+                    live.finish_prompt(&request, None).await;
+                    let control = live.wait_control(|control| !control.turn_active).await;
+                    assert!(control.has_active_background_agent(), "{name}");
+                    assert_eq!(control.sidebar_status(), crate::session::Status::Running,
+                        "the display remains busy for the actual background allocation");
+                }
+                if name == "notification" {
+                    let run = uuid::Uuid::new_v4();
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,"source":"irc"}
+                    })).await;
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":live.sid,"update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text","text":"result"}
+                            }
+                        }
+                    })).await;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !matches!(live.client.next_event().await.expect("actual own output"),
+                            Event::AgentMessageChunk { text, .. } if text == "result") {}
+                    }).await.unwrap();
+                    let control = live.wait_control(|control| control.native_autonomous_active).await;
+                    assert_eq!(control.sidebar_status(), crate::session::Status::Running);
+                }
+                if name == "cancel" {
+                    live.client.cancel_prompt().await.unwrap();
+                    live.wait_control(|control| control.cancelling).await;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !live.native.requests().iter().any(|method| method == "session/cancel") {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.expect("the actual original received cancel");
+                }
+                if name == "compact" {
+                    let run = uuid::Uuid::new_v4();
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                        "params":{"version":1,"sessionId":live.sid,"runId":run,
+                            "source":"scheduled_continuation"}
+                    })).await;
+                    live.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":live.sid,"update":{
+                                "sessionUpdate":"compaction_update",
+                                "compactionId":"queue-background-compact", "status":"in_progress"
+                            }
+                        }
+                    })).await;
+                    live.wait_control(|control| control.compacting).await;
+                }
+                // Preserve the original test's busy display input. Native control and
+                // readiness continue to come only from this original's real events.
+                state.instances.write().await.iter_mut().find(|row| row.id == id).unwrap()
+                    .status = crate::session::Status::Running;
+                let prompt_count = || live.native.requests().iter()
+                    .filter(|method| method.as_str() == "session/prompt").count();
+                let before = prompt_count();
+                state.session_service.enqueue_prompt(
+                    &id, "q".into(), text.into(), Vec::new(), None, crate::server::session_service::QueueSender::default(),
+                ).await.unwrap();
+                if drains {
+                    drain_queued_prompts(&state).await;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while !state.session_service.queued_prompts_snapshot(&id).await.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                    }).await.expect("reconciler must deliver while background work runs");
+                    let delivered = live.next_prompt().await;
+                    assert_eq!(delivered["params"]["prompt"][0]["text"], text, "{name}");
+                } else {
+                    // Await the real delivery path before asserting non-delivery.
+                    state.session_service.drain_queued_prompts_once(&id).await;
+                    assert_eq!(state.session_service.queued_prompts_snapshot(&id).await.len(), 1, "{name}");
+                }
+                let after = live.native.requests().iter()
+                    .filter(|method| method.as_str() == "session/prompt").count();
+                assert_eq!(after - before, usize::from(drains), "{name}");
+                if name == "clear" {
+                    // End the same actual task through its original transcript. Its
+                    // real tailer publishes the matching resource_ref terminal.
+                    let line = serde_json::json!({
+                        "type":"queue-operation", "operation":"enqueue",
+                        "timestamp":crate::time::Timestamp::now().to_rfc3339(),
+                        "content":"<task-notification>\n<task-id>task</task-id>\n<tool-use-id>tool-background</tool-use-id>\n<status>completed</status>\n</task-notification>"
+                    });
+                    // FSEvents can defer write notifications until the writer closes.
+                    append(task_transcript.as_ref().unwrap(), &format!("{line}\n"));
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let event = live.client.next_event().await.expect("original task observer");
+                            if let Event::BackgroundTaskFinished { task_id, ended_at } = event {
+                                if task_id != "task" {
+                                    continue;
+                                }
+                                assert!(ended_at.is_some(), "the original tailer observed completion");
+                                assert!(state.acp_event_store.replay_from(&id, 0).unwrap().iter().any(|stored| {
+                                    stored.metadata.resource_ref == Some(allocation)
+                                        && matches!(stored.event.as_ref(), Event::BackgroundTaskFinished { task_id, .. }
+                                            if task_id == "task")
+                                }));
+                                break;
+                            }
+                        }
+                    }).await.expect("the original allocation's tailer publishes its actual end");
+                    live.wait_control(|control| !control.has_active_background_agent()).await;
+                    let resets_before = live.native.requests().iter()
+                        .filter(|method| method.as_str() == "session/new").count();
+                    state.session_service.drain_queued_prompts_once(&id).await;
+                    assert!(state.session_service.queued_prompts_snapshot(&id).await.is_empty());
+                    let resets_after = live.native.requests().iter()
+                        .filter(|method| method.as_str() == "session/new").count();
+                    assert_eq!(resets_after, resets_before + 1,
+                        "the queued /clear issues one genuine Native reset");
+                }
+                live.client.shutdown().await.unwrap();
             }
-            state
-                .session_service
-                .enqueue_prompt(
-                    name,
-                    "q".into(),
-                    text.into(),
-                    Vec::new(),
-                    None,
-                    crate::server::session_service::QueueSender::default(),
-                )
-                .await
+        })).await;
+    }
+
+    /// Wake-on-drain: a dormant session with a queue must be woken, or its
+    /// queue sits behind a worker the resume pass never respawns.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn drain_queued_prompts_wakes_a_dormant_session_with_a_queue() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::acp::Event;
+        use crate::server::test_support;
+
+        with_managed(|scope| {
+            Box::pin(async move {
+                crate::session::config::update_config(|config| {
+                    config.acp.auto_stop_idle_secs = 60;
+                })
                 .unwrap();
-            if drains {
+                test_support::refresh_canonical_metadata_for_test(&scope.state).await;
+                let mut original = test_support::managed_control_session(
+                    scope,
+                    "queue-drain-wake",
+                    "claude",
+                    None,
+                )
+                .await;
+                let id = original.id().to_owned();
+                let state = original.state.clone();
+                let sid = original.sid.clone();
+                let old_turn = original
+                    .start_prompt("completed work must not replay")
+                    .await;
+                original.finish_prompt(&old_turn, None).await;
+                original.make_quota_due();
+                original.client.lease.test_backdate_idle_baseline(
+                    (crate::time::Timestamp::now() - crate::time::Duration::hours(1)).as_millis(),
+                );
+                idle::reap_idle_workers(&state).await;
+                assert!(!state.acp_supervisor.is_running(&id).await);
+                let storage = crate::session::Storage::open_reference("test").unwrap();
+                for row in [
+                    state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone(),
+                    storage
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap(),
+                ] {
+                    assert!(
+                        row.is_idle_dormant(),
+                        "real idle retirement precedes queued input"
+                    );
+                    row.require_resolved_acp_selection().unwrap();
+                    assert_eq!(row.acp_session_id.as_deref(), Some(sid.as_str()));
+                }
+                original.client.shutdown().await.unwrap();
+                let submission = state.session_service.prompt_submission(&id).await;
+                let queued = state
+                    .session_service
+                    .enqueue_prompt(
+                        &id,
+                        "queue-after-native-idle".into(),
+                        "new explicit queued input".into(),
+                        Vec::new(),
+                        None,
+                        crate::server::session_service::QueueSender::default(),
+                    )
+                    .await
+                    .unwrap();
+                drop(submission);
+                let row = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .clone();
+                assert!(row.is_idle_dormant(), "enqueue does not perform the wake");
+                let expected_sid = sid.clone();
+                let (sent, mut prompts) = tokio::sync::mpsc::unbounded_channel();
+                let (config, native) = scope.native_peer(
+                    std::path::PathBuf::from(&row.project_path),
+                    "claude",
+                    "claude",
+                    move |request| match request["method"].as_str().unwrap() {
+                        "initialize" => Some(serde_json::json!({
+                            "jsonrpc":"2.0","id":request["id"],
+                            "result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}
+                        })),
+                        "session/load" => {
+                            assert_eq!(request["params"]["sessionId"], expected_sid);
+                            Some(
+                                serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{}}),
+                            )
+                        }
+                        "session/prompt" => {
+                            sent.send(request.clone()).unwrap();
+                            None
+                        }
+                        "session/cancel" => None,
+                        other => {
+                            panic!("queued input must load the original conversation: {other}")
+                        }
+                    },
+                );
+                let events = scope.bind_external_launch(&id, config);
                 drain_queued_prompts(&state).await;
                 tokio::time::timeout(Duration::from_secs(5), async {
+                    while state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .is_idle_dormant()
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("qualified dormant Native wakes for new queued input");
+                assert_eq!(
+                    storage
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .queued_prompts,
+                    vec![queued]
+                );
+                let mut tick = test_fixtures::Tick::default();
+                tick.run(&state).await;
+                let mut resumed = scope.observe_external_resume(id.clone(), events).await;
+                resumed.ready().await;
+                drain_queued_prompts(&state).await;
+                let request = tokio::time::timeout(Duration::from_secs(5), prompts.recv())
+                    .await
+                    .expect("queued input reaches the actual resumed Native")
+                    .unwrap();
+                assert_eq!(request["params"]["sessionId"], sid);
+                assert_eq!(
+                    request["params"]["prompt"][0]["text"],
+                    "new explicit queued input"
+                );
+                native
+                    .send(serde_json::json!({
+                        "jsonrpc":"2.0","id":request["id"],"result":{"stopReason":"end_turn"}
+                    }))
+                    .await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if matches!(
+                            resumed.next_event().await.unwrap(),
+                            Event::Stopped { reason } if reason == "prompt_complete"
+                        ) {
+                            break;
+                        }
+                    }
                     while !state
                         .session_service
-                        .queued_prompts_snapshot(name)
+                        .queued_prompts_snapshot(&id)
                         .await
                         .is_empty()
                     {
@@ -1364,467 +2705,40 @@ mod tests {
                     }
                 })
                 .await
-                .expect("reconciler must deliver while background work runs");
-            } else {
-                // Await the delivery path itself before asserting non-delivery.
-                state.session_service.drain_queued_prompts_once(name).await;
+                .expect("actual completion and queue retirement settle");
+                tick.run(&state).await;
+                state.session_service.drain_queued_prompts_once(&id).await;
+                let methods = native.requests();
+                for method in ["initialize", "session/load", "session/prompt"] {
+                    assert_eq!(
+                        methods.iter().filter(|got| got.as_str() == method).count(),
+                        1
+                    );
+                }
+                assert!(!methods.iter().any(|method| method == "session/new"));
+                assert!(prompts.try_recv().is_err());
                 assert_eq!(
-                    state
-                        .session_service
-                        .queued_prompts_snapshot(name)
-                        .await
-                        .len(),
+                    original
+                        .native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "session/prompt")
+                        .count(),
                     1,
-                    "{name}"
+                    "the completed original turn is not replayed"
                 );
-            }
-            state.acp_supervisor.test_flush_worker_commands(name).await;
-            assert_eq!(
-                commands
-                    .lock()
+                assert!(!tick.parked.contains(&id));
+                assert!(storage
+                    .load()
                     .unwrap()
-                    .iter()
-                    .filter(|cmd| **cmd == "prompt")
-                    .count(),
-                usize::from(drains),
-                "{name}"
-            );
-            if name == "clear" {
-                assert!(sink.publish_persisted(
-                    name,
-                    2,
-                    &Event::BackgroundTaskFinished {
-                        task_id: "task".into(),
-                        ended_at: None
-                    }
-                ));
-                state.session_service.drain_queued_prompts_once(name).await;
-                assert!(state
-                    .session_service
-                    .queued_prompts_snapshot(name)
-                    .await
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .queued_prompts
                     .is_empty());
-                state.acp_supervisor.test_flush_worker_commands(name).await;
-                assert!(commands.lock().unwrap().contains(&"reset_session"));
-            }
-        }
-    }
-
-    /// A sandboxed row in `separate_login` mode with a `{}` shared credential,
-    /// re-armed by a startup failure before every tick, after enough ticks to
-    /// spend the respawn budget.
-    #[cfg(unix)]
-    async fn held_for_login(id: &str, tick: &mut Tick) -> HeldForLogin {
-        let home = crate::session::test_support::isolate_app_dir();
-        let (runtime, calls) = crate::session::test_support::failing_container_runtime(home.path());
-        let project = tempfile::TempDir::new().unwrap();
-        let mut inst = test_fixtures::structured_instance(id, &project.path().to_string_lossy());
-        let shared = crate::session::test_support::sandbox_needing_login(home.path(), &mut inst);
-        let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
-        let login = &state.session_service.sandbox_login;
-        let mut notices = login.subscribe();
-
-        for _ in 0..RECONCILER_MAX_RESPAWNS_IN_WINDOW + 2 {
-            state.acp_supervisor.note_startup_failure(id);
-            tick.run(&state).await;
-        }
-
-        let login_message = crate::session::test_support::login_required("claude").to_string();
-        let login_errors = state
-            .acp_event_store
-            .replay_from(id, 0)
-            .into_iter()
-            .filter(|(_, e)| {
-                matches!(e, crate::acp::Event::AgentStartupError { message, .. } if *message == login_message)
             })
-            .count();
-        assert_eq!(login_errors, 1, "one launch reached the gate");
-        assert_eq!(
-            test_fixtures::startup_errors(&state, id),
-            1,
-            "no park message"
-        );
-        assert!(!tick.parked.contains(id));
-        assert!(login.is_held(id));
-        assert_eq!(
-            login.held_origin(id),
-            Some(crate::server::sandbox_login::LaunchOrigin::Unattended)
-        );
-        assert!(notices.try_recv().is_ok(), "one notice");
-        assert!(notices.try_recv().is_err(), "only one notice");
-        assert_eq!(
-            std::fs::read_to_string(&calls).unwrap_or_default(),
-            "",
-            "the gate runs before any runtime call"
-        );
-        HeldForLogin {
-            state,
-            calls,
-            shared,
-            _project: project,
-            _runtime: runtime,
-            _home: home,
-        }
-    }
-
-    /// Fields drop in order: the PATH guard before the app dir guard that owns the env lock.
-    #[cfg(unix)]
-    struct HeldForLogin {
-        state: Arc<AppState>,
-        calls: std::path::PathBuf,
-        shared: std::path::PathBuf,
-        _project: tempfile::TempDir,
-        _runtime: crate::session::test_support::EnvGuard,
-        _home: crate::session::test_support::AppDirGuard,
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn sandbox_login_hold_skips_respawn_and_budget() {
-        let id = "s-login-hold";
-        let mut tick = Tick::default();
-        let held = held_for_login(id, &mut tick).await;
-
-        // An archived row no longer waits on a launch, so it leaves the held set.
-        held.state.instances.write().await[0].archived_at = Some(crate::time::Timestamp::now());
-        tick.run(&held.state).await;
-        assert!(!held.state.session_service.sandbox_login.is_held(id));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn sandbox_login_hold_releases_after_credential_appears() {
-        let id = "s-login-release";
-        let mut tick = Tick::default();
-        let held = held_for_login(id, &mut tick).await;
-        let (state, calls) = (&held.state, &held.calls);
-
-        crate::session::test_support::write_fake_shared_credential(&held.shared);
-        tick.run(state).await;
-
-        assert!(!state.session_service.sandbox_login.is_held(id));
-        assert_eq!(tick.respawn_history.get(id).map(Vec::len), Some(1));
-        let errors: Vec<String> = state
-            .acp_event_store
-            .replay_from(id, 0)
-            .into_iter()
-            .filter_map(|(_, e)| match e {
-                crate::acp::Event::AgentStartupError { message, .. } => Some(message),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(errors.len(), 2, "{errors:?}");
-        assert!(
-            errors[1].starts_with("sandbox container ensure failed:"),
-            "the launch passed the gate: {errors:?}"
-        );
-        assert!(
-            !std::fs::read_to_string(calls)
-                .unwrap_or_default()
-                .is_empty(),
-            "the launch reached the container runtime"
-        );
-    }
-
-    /// A turn refused for the login on a session parked on a rate limit (not at its cap,
-    /// auto-resume off) is delivered after the login: the release resumes past the park.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn sandbox_login_hold_release_resumes_a_parked_session_with_a_kept_turn() {
-        use crate::server::session_service::{SendTurnError, SendTurnRequest, SessionCaller};
-        let id = "s-login-parked";
-        let home = crate::session::test_support::isolate_app_dir();
-        let (_runtime, calls) =
-            crate::session::test_support::failing_container_runtime(home.path());
-        let project = tempfile::TempDir::new().unwrap();
-        let mut inst = test_fixtures::structured_instance(id, &project.path().to_string_lossy());
-        let shared = crate::session::test_support::sandbox_needing_login(home.path(), &mut inst);
-        let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
-        let store = &state.acp_event_store;
-        store
-            .record(
-                id,
-                1,
-                &crate::acp::Event::RateLimit {
-                    info: crate::acp::state::RateLimitInfo {
-                        status: "limited".into(),
-                        resets_at: Some(
-                            crate::time::Timestamp::now() + crate::time::Duration::days(3),
-                        ),
-                        kind: "usage".into(),
-                    },
-                },
-            )
-            .unwrap();
-        store
-            .record(
-                id,
-                2,
-                &crate::acp::Event::Stopped {
-                    reason: "rate_limited".into(),
-                },
-            )
-            .unwrap();
-        state.acp_supervisor.hydrate_seqs([(id.to_string(), 2)]);
-        assert!(store.rate_limit_park(id).is_some_and(|p| !p.cap_reached));
-
-        // What a plugin message does: refused for the login, then kept in the queue.
-        let service = &state.session_service;
-        let caller = SessionCaller::PluginMessage {
-            plugin_id: "cron".to_string(),
-        };
-        let refused = service
-            .send_turn(
-                &caller,
-                id,
-                SendTurnRequest {
-                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
-                    text: "PR #7 was merged",
-                    attachments: &[],
-                    woke_idle_dormant: false,
-                    prompt_ids: Vec::new(),
-                    synthesized: false,
-                    no_revive: false,
-                    origin: crate::daemon::PromptOrigin::Unknown,
-                },
-            )
-            .await;
-        assert!(matches!(refused, Err(SendTurnError::LoginRequired(_))));
-        service
-            .enqueue_prompt(
-                id,
-                "kept".into(),
-                "PR #7 was merged".into(),
-                Vec::new(),
-                None,
-                crate::server::session_service::QueueSender {
-                    plugin: Some("cron".into()),
-                    origin: crate::daemon::PromptOrigin::Unknown,
-                },
-            )
-            .await
-            .unwrap();
-
-        let mut tick = Tick::default();
-        tick.run(&state).await;
-        assert!(service.sandbox_login.is_held(id));
-        crate::session::test_support::write_fake_shared_credential(&shared);
-        tick.run(&state).await;
-        assert!(!service.sandbox_login.is_held(id));
-        assert!(
-            !std::fs::read_to_string(&calls)
-                .unwrap_or_default()
-                .is_empty(),
-            "the release resumed the parked session"
-        );
-
-        // The fake runtime cannot start the worker; a recording fake stands in for it.
-        let _cmds = state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(id)
-            .await;
-        let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
-        state.acp_supervisor.test_publish_worker_attached(id);
-        state.instances.write().await[0].status = crate::session::Status::Idle;
-        service.drain_queued_prompts_once(id).await;
-        assert!(service.queued_prompts_snapshot(id).await.is_empty());
-        let delivered: Vec<String> = store
-            .replay_from(id, 0)
-            .into_iter()
-            .filter_map(|(_, e)| match e {
-                crate::acp::Event::UserPromptSent { text, .. } => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(delivered, ["PR #7 was merged"]);
-    }
-
-    /// What `aoe acp stop` leaves once the worker is gone: the durable stop token, no record.
-    #[cfg(unix)]
-    fn settle_a_stop(id: &str) {
-        use crate::process::worker_registry as registry;
-        let record = registry::WorkerRecord::new(
-            id.into(),
-            std::process::id(),
-            registry::socket_path_for(id).unwrap(),
-            "agent".into(),
-            "agent".into(),
-            "/tmp".into(),
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-            None,
-        );
-        registry::save(&record).unwrap();
-        registry::request_stop(&record).unwrap();
-        registry::retire_selected(&record).unwrap();
-        assert!(registry::stop_requested(id));
-        assert!(registry::load(id).unwrap().is_none());
-    }
-
-    /// A plugin message to a stopped, login-less sandbox: refused for the login and
-    /// kept in the queue, as the plugin API does.
-    #[cfg(unix)]
-    async fn plugin_message_kept_for_login(
-        service: &Arc<crate::server::session_service::SessionService>,
-        id: &str,
-    ) {
-        use crate::server::session_service::{SendTurnError, SendTurnRequest, SessionCaller};
-        let caller = SessionCaller::PluginMessage {
-            plugin_id: "cron".to_string(),
-        };
-        let refused = service
-            .send_turn(
-                &caller,
-                id,
-                SendTurnRequest {
-                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
-                    text: "PR #7 was merged",
-                    attachments: &[],
-                    woke_idle_dormant: false,
-                    prompt_ids: Vec::new(),
-                    synthesized: false,
-                    no_revive: false,
-                    origin: crate::daemon::PromptOrigin::Unknown,
-                },
-            )
-            .await;
-        assert!(matches!(refused, Err(SendTurnError::LoginRequired(_))));
-        service
-            .enqueue_prompt(
-                id,
-                "kept".into(),
-                "PR #7 was merged".into(),
-                Vec::new(),
-                None,
-                crate::server::session_service::QueueSender {
-                    plugin: Some("cron".into()),
-                    origin: crate::daemon::PromptOrigin::Unknown,
-                },
-            )
-            .await
-            .unwrap();
-    }
-
-    /// The explicit revival a plugin message asks for crosses the stop fence before the hold,
-    /// so the automatic resume after the login is admitted and delivers the message once.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn sandbox_login_hold_keeps_the_explicit_revival_across_a_settled_stop() {
-        let id = "s-login-stopped";
-        let home = crate::session::test_support::isolate_app_dir();
-        let (_runtime, calls) =
-            crate::session::test_support::failing_container_runtime(home.path());
-        let project = tempfile::TempDir::new().unwrap();
-        let mut inst = test_fixtures::structured_instance(id, &project.path().to_string_lossy());
-        let shared = crate::session::test_support::sandbox_needing_login(home.path(), &mut inst);
-        let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
-        let service = &state.session_service;
-
-        settle_a_stop(id);
-        plugin_message_kept_for_login(service, id).await;
-        assert!(
-            !crate::process::worker_registry::stop_requested(id),
-            "the explicit revival consumed the stop token it observed"
-        );
-
-        let mut tick = Tick::default();
-        tick.run(&state).await;
-        assert!(service.sandbox_login.is_held(id));
-        crate::session::test_support::write_fake_shared_credential(&shared);
-        tick.run(&state).await;
-        assert!(!service.sandbox_login.is_held(id));
-        assert!(
-            !std::fs::read_to_string(&calls)
-                .unwrap_or_default()
-                .is_empty(),
-            "the release resumed the stopped session"
-        );
-
-        let _cmds = state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(id)
-            .await;
-        let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
-        state.acp_supervisor.test_publish_worker_attached(id);
-        state.instances.write().await[0].status = crate::session::Status::Idle;
-        service.drain_queued_prompts_once(id).await;
-        assert!(service.queued_prompts_snapshot(id).await.is_empty());
-        service.drain_queued_prompts_once(id).await;
-        let delivered: Vec<String> = state
-            .acp_event_store
-            .replay_from(id, 0)
-            .into_iter()
-            .filter_map(|(_, e)| match e {
-                crate::acp::Event::UserPromptSent { text, .. } => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(delivered, ["PR #7 was merged"]);
-    }
-
-    /// A stop that lands after the explicit revival was admitted still fences the resume.
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn sandbox_login_hold_respects_a_newer_stop() {
-        let id = "s-login-newer-stop";
-        let home = crate::session::test_support::isolate_app_dir();
-        let (_runtime, calls) =
-            crate::session::test_support::failing_container_runtime(home.path());
-        let project = tempfile::TempDir::new().unwrap();
-        let mut inst = test_fixtures::structured_instance(id, &project.path().to_string_lossy());
-        let shared = crate::session::test_support::sandbox_needing_login(home.path(), &mut inst);
-        let state = crate::server::test_support::build_native_test_app_state(vec![inst]).await;
-        let service = &state.session_service;
-
-        settle_a_stop(id);
-        plugin_message_kept_for_login(service, id).await;
-        settle_a_stop(id);
-
-        let mut tick = Tick::default();
-        crate::session::test_support::write_fake_shared_credential(&shared);
-        tick.run(&state).await;
-        assert!(!service.sandbox_login.is_held(id));
-        assert_eq!(
-            std::fs::read_to_string(&calls).unwrap_or_default(),
-            "",
-            "the newer stop fenced the resume"
-        );
-        assert!(crate::process::worker_registry::stop_requested(id));
-        assert_eq!(service.queued_prompts_snapshot(id).await.len(), 1);
-    }
-
-    /// Wake-on-drain: a dormant session with a queue must be woken, or its
-    /// queue sits behind a worker the resume pass never respawns.
-    #[tokio::test]
-    async fn drain_queued_prompts_wakes_a_dormant_session_with_a_queue() {
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        use crate::session::{Instance, Status, View};
-
-        let mut inst = Instance::new("queue", "/tmp/aoe-drain-wake");
-        inst.id = "sess-dw".to_string();
-        inst.view = View::Structured;
-        inst.status = Status::Idle;
-        inst.mark_idle_dormant();
-        inst.queued_prompts.push(test_fixtures::queued_prompt());
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-
-        drain_queued_prompts(&state).await;
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while state.instances.read().await[0].is_idle_dormant() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "session was not woken"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        })
+        .await;
     }
 
     /// A resume attempt that launch admission cancelled (row still `Stopped`)
@@ -1877,6 +2791,7 @@ mod tests {
         let stopped = {
             let mut instances = state.instances.write().await;
             instances[0].status = Status::Stopped;
+            crate::server::test_support::select_retained_for_test(&mut instances[0]);
             instances[0].clone()
         };
         crate::server::test_support::seed_instances_on_disk_for_test(
@@ -1891,7 +2806,27 @@ mod tests {
             "stopped admission was attempted"
         );
         assert_eq!(test_fixtures::startup_errors(&state, id), 0);
+        {
+            let instances = state.instances.read().await;
+            assert_eq!(
+                instances[0].lifecycle_generation,
+                stopped.lifecycle_generation
+            );
+            assert_eq!(instances[0].resume_intent, stopped.resume_intent);
+            assert_eq!(instances[0].acp_establishment, stopped.acp_establishment);
+        }
+        let persisted = crate::session::Storage::new_unwatched(&stopped.source_profile)
+            .unwrap()
+            .load_instances_complete()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(persisted.lifecycle_generation, stopped.lifecycle_generation);
+        assert_eq!(persisted.resume_intent, stopped.resume_intent);
+        assert_eq!(persisted.acp_establishment, stopped.acp_establishment);
 
+        let mut publications = state.acp_events_tx.subscribe();
         let response = crate::server::api::sessions::start_session(
             State(Arc::clone(&state)),
             Path(id.to_string()),
@@ -1901,11 +2836,47 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         tick.run(&state).await;
+        let startup = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = publications
+                    .recv()
+                    .await
+                    .expect("actual startup publication");
+                if frame.session_id == id
+                    && matches!(frame.event.as_ref(), Event::AgentStartupError { .. })
+                {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("the explicit background attempt reports its real startup failure");
+        let Event::AgentStartupError { message, .. } = startup.event.as_ref() else {
+            unreachable!("selected the actual startup failure");
+        };
+        let expected_error = crate::acp::supervisor::SupervisorError::UnknownAgent(
+            stopped
+                .agent_name
+                .clone()
+                .expect("the fixture selects an unknown agent"),
+        )
+        .to_string();
+        assert!(
+            message.contains(&expected_error),
+            "explicit start must reach agent resolution, not a selection refusal: {message}"
+        );
         assert_eq!(
             test_fixtures::startup_errors(&state, id),
             1,
             "explicit start must retry the fake agent without a queued prompt"
         );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.acp_supervisor.worker_state(id).await != AcpWorkerState::Absent {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the explicit construction settles before checking the no-loop tick");
         tick.run(&state).await;
         assert_eq!(
             test_fixtures::startup_errors(&state, id),
@@ -2085,9 +3056,10 @@ mod tests {
         state
             .acp_event_store
             .replay_from(id, 0)
+            .unwrap()
             .into_iter()
-            .filter(|(_, e)| {
-                matches!(e, crate::acp::Event::AgentStartupError { message, .. } if message == text)
+            .filter(|stored| {
+                matches!(stored.event.as_ref(), crate::acp::Event::AgentStartupError { message, .. } if message == text)
             })
             .count()
     }

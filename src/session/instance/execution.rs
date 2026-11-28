@@ -3327,14 +3327,124 @@ pub(crate) struct ConversationState {
 }
 
 impl ConversationState {
-    pub(crate) fn matches(&self, instance: &Instance) -> bool {
+    fn matches_context(&self, instance: &Instance) -> bool {
         self.tool == instance.tool
             && self.session_id == instance.agent_session_id
             && self.binding == instance.agent_session_binding
-            && self.intent == instance.resume_intent
             && self.resume_binding == instance.resume_binding
             && self.active == instance.active_execution
             && self.pi_session_path == instance.pi_session_path
+    }
+    fn checkpoint_routes(
+        binding: &Option<ConversationBinding>,
+        resume: &Option<ConversationBinding>,
+        active: &Option<ActiveExecution>,
+    ) -> [Option<Option<bool>>; 3] {
+        let marker = |binding: &Option<ConversationBinding>| {
+            binding
+                .as_ref()
+                .and_then(|binding| binding.execution.as_ref())
+                .map(|execution| execution.exported_default_store)
+        };
+        [
+            marker(binding),
+            marker(resume),
+            active
+                .as_ref()
+                .map(|active| active.binding.exported_default_store),
+        ]
+    }
+    pub(crate) fn same_checkpoint(&self, other: &Self) -> bool {
+        self == other
+            && Self::checkpoint_routes(&self.binding, &self.resume_binding, &self.active)
+                == Self::checkpoint_routes(&other.binding, &other.resume_binding, &other.active)
+    }
+    pub(crate) fn matches_checkpoint(&self, row: &Instance) -> bool {
+        self.matches(row)
+            && Self::checkpoint_routes(&self.binding, &self.resume_binding, &self.active)
+                == Self::checkpoint_routes(
+                    &row.agent_session_binding,
+                    &row.resume_binding,
+                    &row.active_execution,
+                )
+    }
+    pub(crate) fn establish_acp_identity(
+        &mut self,
+        sid: &str,
+        observed: Option<&ExecutionBinding>,
+        sandboxed: bool,
+        retained_load: bool,
+    ) {
+        if !retained_load {
+            self.intent = ResumeIntent::Default;
+            if self.session_id.as_deref() != Some(sid) {
+                self.session_id = None;
+            }
+            if self
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.session_id != sid)
+            {
+                self.binding = None;
+            }
+        }
+        if self.resume_binding.as_ref().is_some_and(|binding| {
+            binding.provenance == ConversationProvenance::Asserted && binding.session_id != sid
+        }) {
+            self.resume_binding = None;
+        }
+        if sandboxed {
+            return;
+        }
+        for binding in [self.binding.as_mut(), self.resume_binding.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            attest_observed_default_store(binding, observed);
+        }
+        let Some(observed) =
+            observed.filter(|store| store.agent == "claude" && store.filesystem == "host")
+        else {
+            return;
+        };
+        self.session_id = Some(sid.to_owned());
+        if !self.binding.as_ref().is_some_and(|binding| {
+            binding.session_id == sid
+                && (binding.provenance != ConversationProvenance::Observed
+                    || binding.execution.as_ref().is_some_and(|known| {
+                        known.stores == observed.stores && known.cwd == observed.cwd
+                    }))
+        }) {
+            self.binding = Some(ConversationBinding {
+                session_id: sid.to_owned(),
+                execution: Some(observed.clone()),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: None,
+            });
+        }
+    }
+    pub(crate) fn matches(&self, instance: &Instance) -> bool {
+        self.intent == instance.resume_intent && self.matches_context(instance)
+    }
+    pub(super) fn matches_launch_observation(&self, instance: &Instance) -> bool {
+        let confirmed = match self.active.as_ref() {
+            Some(ActiveExecution {
+                binding,
+                capture: Some(CaptureContext::Omp(metadata)),
+                ..
+            }) => {
+                if binding.agent != "omp"
+                    || instance.omp_capture_generation.as_deref()
+                        != Some(metadata.launch_id.as_str())
+                {
+                    return false;
+                }
+                matches!(&self.intent, ResumeIntent::Use(sid) if self.session_id.as_ref() == Some(sid))
+                    && instance.resume_intent == ResumeIntent::Default
+            }
+            _ => false,
+        };
+        (self.intent == instance.resume_intent || confirmed) && self.matches_context(instance)
     }
 
     /// Whether a launch from this state resumes a conversation, as `Instance::conversation_target` decides.

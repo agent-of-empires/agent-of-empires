@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::session::SessionScope;
+use crate::session::{Instance, SessionScope};
 
 #[derive(Serialize, Deserialize)]
 pub struct InstallPreviewBody {
@@ -460,16 +460,57 @@ pub struct TerminalSize {
     pub rows: std::num::NonZeroU16,
 }
 
+/// Preconditions captured when one native preparation is admitted, before it is queued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativePreparationIdentity {
+    pub created_at: String,
+    pub lifecycle_generation: u64,
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_identity: Option<(u64, u64)>,
+    /// Missing means unknown and cannot authorize preparation of an absent Agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<[u8; 32]>,
+}
+
+impl NativePreparationIdentity {
+    pub(crate) fn from_instance(instance: &Instance, profile_identity: (u64, u64)) -> Self {
+        Self {
+            created_at: instance.created_at.to_rfc3339(),
+            lifecycle_generation: instance.lifecycle_generation,
+            profile: instance.source_profile.clone(),
+            profile_identity: Some(profile_identity),
+            selection: instance.native_preparation_selection().ok(),
+        }
+    }
+
+    pub(crate) fn matches(&self, instance: &Instance) -> bool {
+        crate::time::Timestamp::parse_rfc3339(&self.created_at).ok() == Some(instance.created_at)
+            && self.lifecycle_generation == instance.lifecycle_generation
+            && self.profile == instance.source_profile
+    }
+
+    pub(crate) fn matches_source(&self, storage: &crate::session::Storage) -> bool {
+        self.profile_identity.is_some()
+            && storage.verify_bound_profile().is_ok()
+            && self.profile_identity == storage.bound_profile_identity().ok()
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct StartSessionBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<TerminalSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<NativePreparationIdentity>,
 }
 
 /// Explicit relaunch; omitted launch settings preserve the authoritative values.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestartSessionBody {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<crate::session::SessionRecoveryRequest>,
     pub size: Option<TerminalSize>,
     pub profile: Option<String>,
     pub tool: Option<String>,
@@ -541,6 +582,8 @@ pub struct EnsureToolBody {
     pub size: Option<TerminalSize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adoption: Option<crate::session::LegacyToolAdoption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<NativePreparationIdentity>,
 }
 
 #[cfg(test)]
@@ -654,6 +697,20 @@ pub struct TerminalTarget {
     /// Source profile observed under the same lock.
     #[serde(default)]
     pub profile: String,
+    /// Physical pane and server observed by this preparation, independent of Status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical: Option<std::sync::Arc<crate::session::LegacyToolObservation>>,
+}
+
+/// A completed native input may stamp recency, but cannot wake or rewrite its row.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputRecencyBody {
+    pub created_at: crate::time::Timestamp,
+    pub lifecycle_generation: u64,
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_identity: Option<(u64, u64)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1235,6 +1292,8 @@ pub struct SessionResponse {
     /// `last_accessed_at` but leaves `idle_entered_at` alone.
     pub idle_entered_at: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_evidence: Option<crate::session::OperationErrorEvidence>,
     /// Why the initial prompt was not typed into a terminal session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt_error: Option<String>,
@@ -1405,6 +1464,9 @@ pub struct SessionResponse {
     /// lifecycle transition. This does not report current start eligibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_resume: Option<ContextResumeAvailability>,
+    /// Ephemeral shared diagnostic and current, source-qualified recovery admission.
+    #[serde(default)]
+    pub recovery: Option<crate::session::SessionRecovery>,
     /// Live structured view worker lifecycle. `absent` for tmux sessions or
     /// structured view sessions whose worker has not been spawned/attached
     /// yet; `resuming` while the reconciler is mid-spawn or mid-attach;
@@ -1422,6 +1484,9 @@ pub struct SessionResponse {
     /// sidebar badge clears when a resume lands with no tab open (#3514).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<crate::acp::state::RateLimitInfo>,
+    /// Whether the durable quota history is attestable; false is not an absent park.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_known: Option<bool>,
     /// Whether `[acp] rate_limit_auto_resume` is on for this session's
     /// profile, so the rate-limit banner can say whether the park ends by
     /// itself. Set by the list handler; omitted by single-session responses,
@@ -1612,6 +1677,8 @@ pub struct SessionsEnvelope {
 pub struct ListSessionsQuery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<SessionScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[cfg(test)]

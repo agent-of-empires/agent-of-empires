@@ -8,7 +8,9 @@
 //! org and status collapse lists go with their groupings. The web keys stay, since the
 //! dashboard still reads them.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::fs;
+use std::io;
 use std::path::Path;
 use tracing::info;
 
@@ -16,34 +18,56 @@ const WEB_AXIS_KEY: &str = "aoe-sidebar-axis";
 const WEB_SORT_KEY: &str = "aoe-sidebar-sort-mode";
 
 pub fn run() -> Result<()> {
-    run_in(&crate::session::get_app_dir()?)
+    run_in(&crate::session::get_app_dir()?, false)
 }
 
-fn run_in(app_dir: &Path) -> Result<()> {
+pub(super) fn reconcile() -> Result<()> {
+    run_in(&crate::session::get_app_dir()?, true)
+}
+
+fn run_in(app_dir: &Path, reconcile: bool) -> Result<()> {
     let path = app_dir.join("state.toml");
-    if !path.exists() {
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut state: toml::Table = content.parse().with_context(|| {
+        let version = if reconcile { "v069" } else { "v068" };
+        format!(
+            "Failed to parse {} during {version} migration",
+            path.display()
+        )
+    })?;
+    if !migrate(&mut state, reconcile) {
         return Ok(());
     }
     crate::session::backup_before_migration(&path)?;
-    super::config_file::rewrite_strict(&path, "v068", migrate)
+    crate::session::atomic_write(&path, toml::to_string_pretty(&state)?.as_bytes())
 }
 
-fn migrate(state: &mut toml::Table) -> bool {
-    let before = state.clone();
-    let web = state.get("web_ui_state").and_then(toml::Value::as_table);
-    let web_axis = web
-        .and_then(|t| t.get(WEB_AXIS_KEY))
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned);
-    let web_sort = web
-        .and_then(|t| t.get(WEB_SORT_KEY))
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned);
-
+fn migrate(state: &mut toml::Table, reconcile: bool) -> bool {
     let tui_group = state.get("group_by").and_then(toml::Value::as_str);
-    let group = web_axis
-        .as_deref()
-        .and_then(web_group)
+    let tui_sort = state.get("sort_order").and_then(toml::Value::as_str);
+    let removed_collapse =
+        state.contains_key("org_group_collapsed") || state.contains_key("status_group_collapsed");
+    // A v068 marker is ambiguous. Retained web mirrors may predate a shared pick.
+    let preserve_shared = reconcile
+        && tui_group.is_none_or(|mode| matches!(mode, "group" | "project"))
+        && tui_sort.is_none_or(|order| matches!(order, "custom" | "newest" | "name"))
+        && !removed_collapse;
+    if preserve_shared && (tui_group == Some("group") || tui_sort == Some("name")) {
+        return false;
+    }
+    let web = state.get("web_ui_state").and_then(toml::Value::as_table);
+    let web_pref = |key| {
+        web.and_then(|table| table.get(key))
+            .and_then(toml::Value::as_str)
+    };
+    let group = tui_group
+        .filter(|_| preserve_shared)
+        .map(tui_group_by)
+        .or_else(|| web_pref(WEB_AXIS_KEY).and_then(web_group))
         .or_else(|| tui_group.map(tui_group_by))
         .or_else(|| {
             let seen_tui = state
@@ -52,13 +76,25 @@ fn migrate(state: &mut toml::Table) -> bool {
                 .unwrap_or(false);
             seen_tui.then_some("group")
         });
-    let tui_sort = state.get("sort_order").and_then(toml::Value::as_str);
     // The web offered Manual, Last activity and Attention; none of them orders by name.
-    let sort = web_sort
-        .filter(|mode| matches!(mode.as_str(), "manual" | "lastActivity" | "attention"))
-        .map(|_| "custom")
+    let sort = tui_sort
+        .filter(|_| preserve_shared)
+        .map(tui_sort_order)
+        .or_else(|| {
+            web_pref(WEB_SORT_KEY)
+                .filter(|mode| matches!(*mode, "manual" | "lastActivity" | "attention"))
+                .map(|_| "custom")
+        })
         .or_else(|| tui_sort.map(tui_sort_order));
 
+    if group == tui_group
+        && sort == tui_sort
+        && !(group.is_none() && state.contains_key("group_by"))
+        && !(sort.is_none() && state.contains_key("sort_order"))
+        && !removed_collapse
+    {
+        return false;
+    }
     match group {
         Some(group) => state.insert("group_by".into(), group.into()),
         None => state.remove("group_by"),
@@ -70,11 +106,8 @@ fn migrate(state: &mut toml::Table) -> bool {
     state.remove("org_group_collapsed");
     state.remove("status_group_collapsed");
 
-    let changed = *state != before;
-    if changed {
-        info!(target: "migrations.v068", ?group, ?sort, "folded the sidebar grouping and sort into one shared value");
-    }
-    changed
+    info!(target: "migrations.sidebar_view", ?group, ?sort, "folded the sidebar grouping and sort into one shared value");
+    true
 }
 
 /// An axis the web never wrote is not a pick, so it leaves the TUI's grouping in place.
@@ -109,7 +142,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
         std::fs::write(&path, state).unwrap();
-        run_in(dir.path()).unwrap();
+        run_in(dir.path(), false).unwrap();
         std::fs::read_to_string(&path).unwrap()
     }
 
