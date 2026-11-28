@@ -433,6 +433,11 @@ pub(super) async fn spawn_runner_detached(
     if let Some(name) = &config.degraded {
         cmd.arg("--degraded").arg(name);
     }
+    if let Some(compat) = &config.adapter_compat {
+        let encoded = serde_json::to_string(compat)
+            .map_err(|e| AcpError::Spawn(format!("encode adapter compat: {e}")))?;
+        cmd.arg("--adapter-compat").arg(encoded);
+    }
     if let Some(path) = &launch_config {
         cmd.arg("--proxy-launch-config").arg(path);
     }

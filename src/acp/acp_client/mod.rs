@@ -148,6 +148,7 @@ struct ReattachSpec {
     proxy: Option<ProxySpec>,
     /// A `neutral_boot` fallback ran the adapter raw; it keeps the neutral profile.
     degraded: bool,
+    adapter_compat: Option<crate::acp::agent_compat::DeclaredCompat>,
     state: Arc<SessionState>,
 }
 
@@ -647,6 +648,7 @@ impl AcpClient {
                 claude_home: launch.claude_home.clone(),
                 proxy: launch.proxy.clone(),
                 degraded: config.degraded.is_some(),
+                adapter_compat: launch.adapter_compat.clone(),
                 state: launch.state.clone(),
             };
             let mut client = Self::connect_via_socket(socket_path, launch, None).await?;
@@ -776,6 +778,7 @@ impl AcpClient {
         claude_home: Option<PathBuf>,
         proxy: Option<ProxySpec>,
         degraded: bool,
+        adapter_compat: Option<crate::acp::agent_compat::DeclaredCompat>,
     ) -> Result<Self, AcpError> {
         let spec = ReattachSpec {
             socket_path,
@@ -787,6 +790,7 @@ impl AcpClient {
             claude_home,
             proxy,
             degraded,
+            adapter_compat,
             state: Arc::default(),
         };
         let mode = ConnectMode::Resume {
@@ -811,14 +815,6 @@ impl AcpClient {
         let install_binary = agent
             .map(|agent| agent.spec.command.clone())
             .unwrap_or_default();
-        // A degraded launch has no proxy on record; its adapter still answers to the declaration.
-        let adapter_compat = match &spec.proxy {
-            Some(proxy) => Some(proxy.adapter.clone()),
-            None if spec.degraded => agent
-                .and_then(|agent| agent.proxy.as_ref())
-                .map(|proxy| proxy.adapter.clone()),
-            None => None,
-        };
         let launch = Launch {
             session_id,
             mode,
@@ -827,7 +823,7 @@ impl AcpClient {
             sandbox: spec.sandbox.clone(),
             profile: launch_profile(&spec.agent_key, spec.degraded),
             install_binary,
-            adapter_compat,
+            adapter_compat: spec.adapter_compat.clone(),
             proxy: spec.proxy.clone(),
             source_profile: spec.source_profile.clone(),
             // Resume sends no session/new or load, so defaults and MCP servers

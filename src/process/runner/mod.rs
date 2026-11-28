@@ -116,6 +116,9 @@ pub struct AcpRunnerArgs {
     /// Display name of the proxy a `neutral_boot` fallback dropped.
     #[arg(long)]
     pub degraded: Option<String>,
+    /// JSON `DeclaredCompat` the adapter is judged by.
+    #[arg(long)]
+    pub adapter_compat: Option<String>,
     /// Launch config the daemon wrote for the proxy; the runner removes it at exit.
     #[arg(long)]
     pub proxy_launch_config: Option<PathBuf>,
@@ -226,6 +229,12 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         .transpose()
         .context("parsing proxy spec")?;
     record.degraded = args.degraded.clone();
+    record.adapter_compat = args
+        .adapter_compat
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("parsing adapter compat")?;
     let (control_listener, mut agent_child, agent_stdin, agent_stdout, agent_stderr) =
         register_and_spawn_agent(&args, &record)?;
     let agent_started_at = std::time::Instant::now();
@@ -758,6 +767,7 @@ mod tests {
             prime_runtime: None,
             proxy: None,
             degraded: None,
+            adapter_compat: None,
             proxy_launch_config: None,
             agent_argv: vec!["sh".into(), "-c".into(), "printf born > agent-born".into()],
         };

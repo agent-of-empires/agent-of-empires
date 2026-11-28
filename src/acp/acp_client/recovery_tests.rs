@@ -102,6 +102,7 @@ impl Runner {
             None,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -222,6 +223,35 @@ async fn stopped(client: &mut AcpClient) -> String {
     })
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn reattach_judges_the_adapter_by_the_compat_it_launched_under() {
+    let _env = crate::session::test_support::EnvGuard::read_lock();
+    let runner = Runner::new();
+    let mut first = runner.attach(false).await;
+    first.reattach.as_mut().unwrap().adapter_compat =
+        Some(crate::acp::agent_compat::DeclaredCompat {
+            min_version: Some(semver::Version::new(9, 0, 0)),
+            ..Default::default()
+        });
+    runner.disconnect(&mut first).await;
+    let lease = LifecycleTable::new(1)
+        .admit("recovery", ResumeKind::Attach)
+        .unwrap();
+    let refused = first
+        .reattach(
+            "native".into(),
+            false,
+            Instant::now() + Duration::from_secs(5),
+            lease,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(AcpError::IncompatibleAgent(_))),
+        "{:?}",
+        refused.err()
+    );
 }
 
 #[tokio::test]

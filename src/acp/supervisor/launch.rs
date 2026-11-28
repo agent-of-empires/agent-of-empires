@@ -1064,6 +1064,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 claude_home,
                 record.proxy.clone(),
                 record.degraded.is_some(),
+                record.adapter_compat.clone(),
             ),
         )
         .await;
