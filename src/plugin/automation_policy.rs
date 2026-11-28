@@ -44,6 +44,27 @@ pub(crate) fn classify_mode(
     mode_id: Option<&str>,
     catalog: Option<&AgentOptionEntry>,
 ) -> ModeDecision {
+    // A reviewed agent is a built-in, which declares no modes.
+    let declared = (!crate::acp::agent_profiles::is_reviewed(agent_key))
+        .then(|| {
+            crate::acp::AgentRegistry::with_defaults()
+                .resolved(agent_key)
+                .map(|agent| agent.modes.clone())
+        })
+        .flatten()
+        .unwrap_or_default();
+    classify_mode_with(&declared, agent_key, mode_id, catalog)
+}
+
+/// [`classify_mode`] given the modes the agent's plugin declared. A declared class outranks
+/// the static tables, except where a table already says the mode is unattended: a plugin
+/// cannot relabel `yolo` or `bypassPermissions` as safer.
+fn classify_mode_with(
+    declared: &[aoe_plugin_api::agent_integration::AcpMode],
+    agent_key: &str,
+    mode_id: Option<&str>,
+    catalog: Option<&AgentOptionEntry>,
+) -> ModeDecision {
     let profile = crate::acp::agent_profiles::resolve(agent_key);
     let reviewed = crate::acp::agent_profiles::is_reviewed(agent_key);
 
@@ -57,7 +78,13 @@ pub(crate) fn classify_mode(
     if profile.yolo_mode_id == Some(mode_id) {
         return ModeDecision::Class(ApprovalClass::Unattended);
     }
-    if let Some((_, class)) = TRUSTED_MODE_TABLE.iter().find(|(id, _)| *id == mode_id) {
+    let trusted = TRUSTED_MODE_TABLE.iter().find(|(id, _)| *id == mode_id);
+    if trusted.is_none_or(|(_, class)| *class != ApprovalClass::Unattended) {
+        if let Some(mode) = declared.iter().find(|mode| mode.id == mode_id) {
+            return ModeDecision::Class(mode.approval_class);
+        }
+    }
+    if let Some((_, class)) = trusted {
         let effective = if *class == ApprovalClass::Unattended || reviewed {
             *class
         } else {
@@ -290,6 +317,55 @@ mod tests {
             assert_eq!(seen, expected, "{agent} {mode:?} discovered={discovered}");
         }
     }
+
+    #[test]
+    fn a_plugin_agents_declared_mode_class_outranks_the_static_tables() {
+        use ApprovalClass::*;
+        use ModeDecision::*;
+        let mode = |id: &str, approval_class| aoe_plugin_api::agent_integration::AcpMode {
+            id: id.into(),
+            approval_class,
+        };
+        let declared = [
+            mode("review", Guarded),
+            mode("default", Interactive),
+            mode("auto", Unattended),
+            // A plugin cannot soften a mode the host already treats as unattended.
+            mode("bypassPermissions", Interactive),
+        ];
+        let catalog = catalog_with_modes(&["review", "other"]);
+        // mode, catalog discovered, decision
+        let cases = [
+            (Some("review"), false, Class(Guarded)),
+            (Some("auto"), false, Class(Unattended)),
+            // The static table fails an unreviewed agent closed; the declaration reopens it.
+            (Some("default"), false, Class(Interactive)),
+            (Some("bypassPermissions"), false, Class(Unattended)),
+            // Not declared: the usual catalog fallback.
+            (Some("other"), true, Class(Unattended)),
+            (Some("nope"), true, UnknownMode),
+            (Some("other"), false, CatalogNotDiscovered),
+            (None, false, Class(Unattended)),
+        ];
+        for (mode, discovered, expected) in cases {
+            let seen = classify_mode_with(
+                &declared,
+                "acme-agent",
+                mode,
+                discovered.then_some(&catalog),
+            );
+            assert_eq!(seen, expected, "{mode:?} discovered={discovered}");
+        }
+        assert_eq!(
+            classify_mode_with(&declared, "claude", Some("default"), None),
+            Class(Interactive)
+        );
+        assert_eq!(
+            classify_mode_with(&[], "acme-agent", Some("default"), None),
+            Class(Unattended)
+        );
+    }
+
     #[test]
     fn limits_and_reservations() {
         let dir = tempfile::tempdir().expect("tempdir");
