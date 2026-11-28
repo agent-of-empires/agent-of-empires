@@ -1,9 +1,10 @@
 name: Kache build cache
 description: >
   Wraps rustc with kache backed by the shared S3 bucket. main pushes write
-  `artifacts/`; same-repo PRs read it and write `artifacts-pr/`; fork PRs get
-  no OIDC token and build without a remote, as does every job while the
-  RUNS_ON_DISABLED killswitch is on. The calling job needs
+  `artifacts/`; same-repo PRs read it and write `artifacts-pr/`. Only RunsOn
+  (EC2, us-east-1) jobs use the remote: GitHub-hosted runners, including
+  macOS, fork PRs and the RUNS_ON_DISABLED fallback, read from outside AWS
+  and pay S3 egress, so they build without one. A calling RunsOn job needs
   `id-token: write`.
 
 inputs:
@@ -21,7 +22,7 @@ runs:
         HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       run: |
         set -euo pipefail
-        if [ "${RUNS_ON_DISABLED:-}" = true ]; then
+        if [ "${RUNS_ON_DISABLED:-}" = true ] || [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then
           echo "role=" >> "$GITHUB_OUTPUT"
         elif [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
           echo "role=" >> "$GITHUB_OUTPUT"
