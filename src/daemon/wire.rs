@@ -1296,7 +1296,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt_error: Option<String>,
     /// Machine-readable `initial_prompt_error` cause when one applies:
-    /// `agent_folder_not_trusted` or `agent_bypass_not_accepted`.
+    /// `agent_folder_not_trusted`, `agent_bypass_not_accepted` or `input_line_busy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt_error_code: Option<String>,
     pub branch: Option<String>,
@@ -1548,22 +1548,14 @@ pub struct SessionResponse {
     /// non-preserving pairings.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keeps_context: bool,
-    /// Slash-command aliases that reset the conversation for this session's
-    /// agent (claude `/clear`, codex/opencode `/new`). Server-owned from
-    /// `acp::agent_profiles::resolve(...).clear_aliases` so the composer's `/`
-    /// palette and queued-prompt batching do not mirror the per-agent list.
-    /// Omitted for agents with no clear alias.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub clear_aliases: Vec<String>,
-    /// Slash-command aliases that compact the conversation (claude `/compact`). With the clear
-    /// aliases they're the commands that run as their own turn, which the queued strip names.
-    /// Omitted for agents with no compact alias.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub compact_aliases: Vec<String>,
-    /// True when the session is a Claude Code session AND the user has
-    /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
-    /// `~/.claude/settings.json`). The web client uses this to skip
-    /// scrollback-tracking workarounds that target tmux copy-mode.
+    /// The server-side profile of the agent that classifies this session's
+    /// prompts and tool calls: reset and compact aliases, capability gates, card
+    /// aliases and the evaluated fullscreen setting. Clients read it instead of
+    /// mirroring the per-agent tables.
+    #[serde(default)]
+    pub agent_profile: crate::acp::agent_profiles::AgentProfileWire,
+    /// Deprecated: use `agent_profile.fullscreen`. Removed in the next minor release.
+    /// True for a Claude session whose user enabled Claude's fullscreen renderer.
     #[serde(default)]
     pub claude_fullscreen: bool,
     /// Repos in the multi-repo workspace (empty for single-repo sessions).

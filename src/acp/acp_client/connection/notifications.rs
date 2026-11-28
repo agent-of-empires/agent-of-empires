@@ -20,7 +20,7 @@ use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal, TerminalClaim,
 };
-use crate::acp::acp_client::rate_limit::record_rate_limit_report;
+use crate::acp::acp_client::rate_limit::{record_rate_limit_report, AgentTurnText};
 use crate::acp::acp_client::session_identity::SessionIngress;
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
@@ -89,6 +89,7 @@ pub(super) struct Shared {
     pub(super) context_reset_emitted: AtomicBool,
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
+    pub(super) agent_turn_text: std::sync::Mutex<AgentTurnText>,
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
     /// Merged snapshot per subagent session; see `subagents.rs`.
@@ -103,6 +104,8 @@ pub(super) struct Shared {
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
     pub(super) aoe: AoeIngress,
+    /// The agent closed the transport, as opposed to any other connection error.
+    pub(super) transport_closed: AtomicBool,
     claude_home: Option<std::path::PathBuf>,
 }
 
@@ -153,6 +156,7 @@ impl Shared {
             adopted_completion_tx: watch::channel(None).0,
             context_reset_emitted: AtomicBool::new(false),
             agent_msg_dedup: Default::default(),
+            agent_turn_text: Default::default(),
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             subagents: Default::default(),
@@ -162,6 +166,7 @@ impl Shared {
             bg_transcript_source,
             bg_tasks: Arc::default(),
             aoe: AoeIngress::default(),
+            transport_closed: AtomicBool::new(false),
             claude_home,
         }
     }
@@ -207,11 +212,22 @@ impl Shared {
     }
 
     pub(super) async fn emit(&self, event: Event) {
+        self.observe_turn_text(&event);
         let _ = self.event_tx.send(event).await;
+    }
+
+    pub(super) fn observe_turn_text(&self, event: &Event) {
+        self.agent_turn_text
+            .lock()
+            .expect("agent turn text mutex poisoned")
+            .observe(event);
     }
 
     /// A claimed terminal must reach the drain even if SDK teardown cancels its caller.
     pub(super) async fn publish_terminal(&self, reason: String, preceding: Vec<Event>) {
+        self.observe_turn_text(&Event::Stopped {
+            reason: reason.clone(),
+        });
         let event_tx = self.event_tx.clone();
         let publication = tokio::spawn(async move {
             for event in preceding {
@@ -578,6 +594,9 @@ impl Shared {
                 &mut event,
                 &update_for_tool_context,
             );
+            if !suppressing {
+                self.observe_turn_text(&event);
+            }
             if self.event_tx.send(event).await.is_err() {
                 break;
             }

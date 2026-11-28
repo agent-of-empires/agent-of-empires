@@ -5,7 +5,7 @@ import { ListChecks } from "lucide-react";
 import { parseJsonObject, todoItemsFromArgs } from "../../lib/acpArgs";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
-import type { AgentProfile } from "../../lib/agentProfiles";
+import type { AgentProfile } from "../../lib/agentProfile";
 import { checklistMarkdown, type ChecklistStatus } from "../../lib/checklistMarkdown";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
 import {
@@ -33,7 +33,7 @@ export function classifyTodoWrite(
   tool: ToolCall,
   profile: AgentProfile,
 ): { isTodoWrite: true; todos: TodoItem[] } | { isTodoWrite: false } {
-  if (!profile.capabilities.todos) return { isTodoWrite: false };
+  if (!profile.todos) return { isTodoWrite: false };
   const args = parseJsonObject(tool.args_preview);
   if (!Array.isArray(args?.todos)) return { isTodoWrite: false };
   const todos = todoItemsFromArgs(args).map((entry) => ({

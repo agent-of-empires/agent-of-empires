@@ -96,7 +96,7 @@ See [File Locations](configuration.md#file-locations) for `<app_dir>`. `aoe proj
 
 Registered Projects appear in pickers even without sessions. **Pinning** keeps a project header visible when empty; unpinning leaves the registration intact. Only **Remove** or `aoe project remove` deletes the entry.
 
-Pin from the TUI project view (`g`, Project grouping, then `p` on a header or its context menu), or the web project header's actions menu. Pinning registers an unregistered repo globally and marks it with `◆`. Empty pinned web projects sort below active repositories and retain their **New session** action. Pins live in the registry and appear on the other surface when refreshed.
+Pin from the TUI project view (`g`, Repository grouping, then `p` on a header or its context menu), or the web project header's actions menu. Pinning registers an unregistered repo globally and marks it with `◆`. Empty pinned web projects sort below active repositories and retain their **New session** action. Pins live in the registry and appear on the other surface when refreshed.
 
 ## CLI
 

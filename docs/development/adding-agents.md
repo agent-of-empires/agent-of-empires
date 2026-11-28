@@ -11,7 +11,7 @@
 | `src/session/instance/hooks.rs` | Hook wiring plus the `AOE_INSTANCE_ID` env prefix |
 | `src/session/config/container_config.rs` | Config mount for the sandbox |
 | `src/acp/agent_registry.rs` | ACP adapter entry, if the agent ships an ACP server |
-| `src/acp/agent_profiles.rs`, `web/src/lib/agentProfiles.ts` | Structured view profile |
+| `src/acp/agent_profiles.rs` | Structured view profile, sent to the dashboard on each session |
 | `src/acp/install_hints.rs` | Install hint for `aoe acp doctor` and handshake failures |
 | `docker/Dockerfile` | Install the agent in the sandbox image |
 | `docs/structured-view.md`, `docs/index.md`, `README.md` | Supported-agent lists |
@@ -56,7 +56,7 @@ Evidence may also borrow a diagnostic from the original capture. Extract only th
 
 **6. Dockerfile**: install the agent and add its config dir to the `mkdir -p` block.
 
-**7. Structured view profile**, if the agent ships an ACP server (its CLI accepts `acp` / `--acp`, or it ships a `*-acp` adapter): add the binary to `agent_registry.rs::with_defaults()` keyed on the `src/agents.rs` name, an install hint, a server profile registered in `resolve()`, and a mirrored frontend profile in `PROFILES`. Keep profiles conservative: until you have observed the adapter's `_meta` convention for child tool calls, leave `parent_meta_namespaces` and the alias map empty, since missing indentation is safer than fake parent links and an empty alias map renders the correct generic card.
+**7. Structured view profile**, if the agent ships an ACP server (its CLI accepts `acp` / `--acp`, or it ships a `*-acp` adapter): add the binary to `agent_registry.rs::with_defaults()` keyed on the `src/agents.rs` name, an install hint, and a server profile registered in `resolve()`. That profile in `src/acp/agent_profiles.rs` is the only place to describe the agent: the web reads it from the session's `agent_profile`. Keep profiles conservative: until you have observed the adapter's `_meta` convention for child tool calls, leave `parent_meta_namespaces` and the alias map empty, since missing indentation is safer than fake parent links and an empty alias map renders the correct generic card.
 
 **8. Tests**: update the registry matrix and settings round-trip tests, then cover resume argv, the capture backend, host and sandbox contexts, missing-id fail-closed behavior, `/clear` rotation where supported, restart persistence, and two concurrent sessions in the same cwd. Managed-store tests must prove the launch floor and ownership lease reject stale or peer-owned ids, and hook agents that the declared identity field reaches the pane-scoped sidecar.
 

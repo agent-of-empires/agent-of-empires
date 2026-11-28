@@ -40,8 +40,8 @@ tui-input = "0.15"
 # drops the unused HTML renderer.
 pulldown-cmark = { version = "0.13", default-features = false }
 
-# Async runtime
-tokio = { version = "1.52", features = ["full"] }
+# Async runtime. `test-util` matches the test build so both share one tokio (#5797).
+tokio = { version = "1.52", features = ["full", "test-util"] }
 
 # Settings single-source-of-truth derive (#1692)
 aoe-settings-derive = { path = "aoe-settings-derive" }
@@ -52,7 +52,7 @@ aoe-plugin-api = { path = "aoe-plugin-api" }
 # Serialization
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_ignored = "0.1"
-serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_json = { version = "1.0", features = ["float_roundtrip", "preserve_order"] }
 ts-rs = { version = "12", optional = true }
 serde-saphyr = "1.3"
 granit-parser = { version = "1.3", features = ["std"] }
@@ -122,6 +122,10 @@ rattles = "0.3"
 # Regex
 regex = "1.10"
 
+# Pin test-only feature unification so tests reuse the build's artifacts (#5797).
+regex-automata = { version = "0.4", default-features = false, features = ["nfa", "perf"] }
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
+
 # Git operations
 git2 = "0.21"
 
@@ -183,7 +187,7 @@ getrandom = "0.4"
 agent-client-protocol = { version = "5", features = ["unstable_end_turn_token_usage", "unstable_plan_operations", "unstable_session_fork", "unstable_subagents"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
-semver = "1"
+semver = { version = "1", features = ["serde"] }
 
 # Tar stream handling: the structured view's bundled-Node fallback (with xz2
 # for tar.xz) and external plugin install (with flate2 for tar.gz). The
@@ -245,10 +249,6 @@ typescript = ["dep:ts-rs"]
 [dev-dependencies]
 serial_test = "4.0"
 jsonschema = { version = "0.59.0", default-features = false }
-# Test-only tokio clock control (`start_paused`), so the token-rotation
-# loop's grace deadline can be asserted without sleeping through it.
-# `cargo build` and released binaries never enable `test-util`.
-tokio = { version = "1.52", features = ["test-util"] }
 # Integration tests are separate crates and don't inherit the normal
 # `serde_json` dependency; the acp-runner orphan test parses a worker
 # registry record to mutate its pid structurally.

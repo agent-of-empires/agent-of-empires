@@ -914,3 +914,371 @@ fn composer_status_slot_parses_at_api_25() {
     assert_eq!(parsed.ui[0].slot, UiSlot::ComposerStatus);
     assert!(parsed.ui[0].slot.is_per_session());
 }
+
+const HOOKS: &str = "[agent_integrations.hooks]\n\
+    settings_rel_path = \".example/settings.json\"\n\
+    config_dir_env_var = \"EXAMPLE_CONFIG_DIR\"\n\
+    format = \"json_settings\"\n\
+    [[agent_integrations.hooks.events]]\n\
+    event = \"PreToolUse\"\n\
+    status = \"running\"\n\
+    waiting_tools = [\"AskUserQuestion\"]\n\
+    [[agent_integrations.hooks.events]]\n\
+    event = \"Notification\"\n\
+    matcher = \"permission_prompt\"\n\
+    status = \"waiting\"\n";
+const TRUST: &str = "[agent_integrations.trust]\n\
+    file = \".example.json\"\n\
+    location = \"config_dir_or_home\"\n\
+    config_dir_env_var = \"EXAMPLE_CONFIG_DIR\"\n\
+    pointer = \"/projects/{path}/trusted\"\n\
+    value = true\n\
+    sandbox = \"always\"\n";
+
+fn agent(tables: &str) -> String {
+    format!(
+        "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
+         [agent_integrations.launch.container_env]\nEXAMPLE_CONFIG_DIR = \"/opt/example\"\n{tables}"
+    )
+}
+
+#[test]
+fn hooks_and_trust_require_api_26() {
+    let body = agent(&format!("{HOOKS}{TRUST}"));
+    let parsed = parse(28, &body);
+    let integration = &parsed.agent_integrations[0];
+    assert_eq!(integration.hooks.as_ref().unwrap().events.len(), 2);
+    assert!(integration.trust.is_some());
+    assert_eq!(
+        PluginManifest::from_toml_str(&toml::to_string(&parsed).unwrap())
+            .expect("round-trips")
+            .agent_integrations[0],
+        *integration
+    );
+
+    let errors = invalid(27, &body);
+    for table in ["hooks", "trust"] {
+        let want = format!("agent_integrations[0].{table} requires api_version >= 28");
+        assert!(
+            errors.iter().any(|error| error.contains(&want)),
+            "{errors:?}"
+        );
+    }
+}
+
+#[test]
+fn hooks_declarations_are_validated() {
+    let with = |from: &str, to: &str| agent(&HOOKS.replace(from, to));
+    let cases = [
+        (with(".example/settings.json", "/etc/settings.json"), "settings_rel_path"),
+        (with(".example/settings.json", "../settings.json"), "settings_rel_path"),
+        (with(".example/settings.json", ".example/./settings.json"), "settings_rel_path"),
+        (with(".example/settings.json", ""), "settings_rel_path"),
+        (with(".example/settings.json", ".zshrc"), "settings_rel_path"),
+        (with(".example/settings.json", ".example:invalid/settings.json"), "settings_rel_path"),
+        (with(".example/settings.json", ".ex,ample/settings.json"), "settings_rel_path"),
+        (with(".example/settings.json", ".ex\\\\ample/settings.json"), "settings_rel_path"),
+        (with(".example/settings.json", ".example/.zshrc"), "settings_rel_path"),
+        (with(".example/settings.json", "settings.json"), "settings_rel_path"),
+        (with("EXAMPLE_CONFIG_DIR", "1BAD"), "config_dir_env_var"),
+        (with("\"PreToolUse\"", "\"Bogus\""), "events[0].event"),
+        (with("json_settings", "toml"), "unknown variant"),
+        (with("status = \"running\"", "status = \"busy\""), "unknown variant"),
+        (
+            agent(&format!(
+                "{HOOKS}[[agent_integrations.hooks.events]]\nevent = \"Stop\"\n"
+            )),
+            "needs a status or an identity_field",
+        ),
+        (
+            agent(&format!(
+                "{HOOKS}[[agent_integrations.hooks.events]]\nevent = \"Notification\"\nmatcher = \"permission_prompt\"\n"
+            )),
+            "repeats an event and matcher",
+        ),
+        (
+            agent(
+                "[agent_integrations.hooks]\nsettings_rel_path = \".x/s.json\"\nformat = \"json_settings\"\nevents = []\n",
+            ),
+            "hooks.events must hold",
+        ),
+    ];
+    for (body, want) in cases {
+        match PluginManifest::from_toml_str(&manifest(28, &body)) {
+            Err(error) => assert!(error.to_string().contains(want), "{want}: {error}"),
+            Ok(_) => panic!("{want}: should be rejected\n{body}"),
+        }
+    }
+    // The same event may repeat with different matchers.
+    parse(28, &agent(&format!("{HOOKS}[[agent_integrations.hooks.events]]\nevent = \"Notification\"\nmatcher = \"idle_prompt\"\nstatus = \"idle\"\n")));
+}
+
+#[test]
+fn trust_declarations_are_validated() {
+    let with = |from: &str, to: &str| agent(&TRUST.replace(from, to));
+    let pointers = [
+        "projects/{path}/trusted",
+        "/projects/trusted",
+        "/projects/{path}/{path}",
+        "/projects//{path}/trusted",
+        "/projects/{path}/0",
+        "/projects/x{path}/trusted",
+        "/projects/{path}/a~1b",
+        "/a/b/c/d/e/f/g/{path}/h",
+    ];
+    for pointer in pointers {
+        let body = with("/projects/{path}/trusted", pointer);
+        assert!(
+            PluginManifest::from_toml_str(&manifest(28, &body))
+                .unwrap_err()
+                .to_string()
+                .contains("trust.pointer"),
+            "{pointer}"
+        );
+    }
+    for file in ["sub/.example.json", "../x.json", "/abs.json", ".."] {
+        let body = with(".example.json", file);
+        assert!(
+            PluginManifest::from_toml_str(&manifest(28, &body))
+                .unwrap_err()
+                .to_string()
+                .contains("trust.file"),
+            "{file}"
+        );
+    }
+    for (from, to, want) in [
+        (
+            "location = \"config_dir_or_home\"",
+            "location = \"elsewhere\"",
+            "unknown variant",
+        ),
+        (
+            "sandbox = \"always\"",
+            "sandbox = \"sometimes\"",
+            "unknown variant",
+        ),
+        ("value = true", "value = 3", "data did not match"),
+    ] {
+        let error = PluginManifest::from_toml_str(&manifest(28, &with(from, to))).unwrap_err();
+        assert!(error.to_string().contains(want), "{want}: {error}");
+    }
+    parse(28, &with("value = true", "value = \"TRUST_FOLDER\""));
+    parse(28, &with("/projects/{path}/trusted", "/{path}"));
+    parse(28, &with("sandbox = \"always\"", "sandbox = \"yolo_only\""));
+}
+
+#[test]
+fn declaration_bounds_each_reject() {
+    let hooks_with = |from: &str, to: &str| agent(&HOOKS.replace(from, to));
+    let trust_with = |from: &str, to: &str| agent(&TRUST.replace(from, to));
+    let with_env = |tables: &str, var: &str, dir: &str| {
+        format!(
+            "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
+             [agent_integrations.launch.container_env]\n{var} = \"{dir}\"\n{}",
+            tables.replace("EXAMPLE_CONFIG_DIR", var)
+        )
+    };
+    let event = |n: usize| {
+        format!("[[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\nmatcher = \"m{n}\"\n")
+    };
+    let long_path = format!("{}/settings.json", "d".repeat(260));
+    let too_many_tools = format!(
+        "waiting_tools = [{}]",
+        (0..33)
+            .map(|n| format!("\"t{n}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    // Without a config-dir variable the hooks directory is `/root/.example.json`.
+    let home_relative = |hooks_path: &str| {
+        let tables = format!("{HOOKS}{TRUST}")
+            .replace("config_dir_env_var = \"EXAMPLE_CONFIG_DIR\"\n", "")
+            .replace(".example/settings.json", hooks_path);
+        agent(&tables)
+    };
+    parse(28, &home_relative(".example/settings.json"));
+    let cases: Vec<(String, &str)> = vec![
+        (
+            home_relative(".example.json/settings.json"),
+            "must not be, or contain, the sandbox path",
+        ),
+        (
+            agent(&format!(
+                "{HOOKS}{}",
+                TRUST.replace(".example.json", "settings.json")
+            )),
+            "must not be, or contain, the sandbox path",
+        ),
+        (
+            hooks_with(".example/settings.json", &long_path),
+            "settings_rel_path",
+        ),
+        (
+            agent(&format!(
+                "{}{}",
+                HOOKS
+                    .split("[[agent_integrations.hooks.events]]")
+                    .next()
+                    .unwrap(),
+                (0..33).map(event).collect::<String>()
+            )),
+            "hooks.events must hold",
+        ),
+        (
+            hooks_with("waiting_tools = [\"AskUserQuestion\"]", &too_many_tools),
+            "waiting_tools",
+        ),
+        (
+            hooks_with(
+                "waiting_tools = [\"AskUserQuestion\"]",
+                &format!("waiting_tools = [\"{}\"]", "w".repeat(129)),
+            ),
+            "waiting_tools",
+        ),
+        (
+            hooks_with("permission_prompt", &"m".repeat(257)),
+            "matcher must be 1..=256",
+        ),
+        (
+            trust_with("value = true", &format!("value = \"{}\"", "v".repeat(257))),
+            "trust.value must be 1..=256",
+        ),
+        (trust_with(".example.json", ".example"), "trust.file"),
+        (trust_with(".example.json", "a:b.json"), "trust.file"),
+        (trust_with(".example.json", "a,b.json"), "trust.file"),
+        (trust_with(".example.json", ".example.yaml"), "trust.file"),
+        (
+            trust_with(
+                "/projects/{path}/trusted",
+                &format!("/{}/{{path}}", ["s"; 8].join("/")),
+            ),
+            "trust.pointer",
+        ),
+        (
+            trust_with(
+                "/projects/{path}/trusted",
+                &format!("/{}/{{path}}", "s".repeat(257)),
+            ),
+            "trust.pointer",
+        ),
+    ];
+    for (body, want) in cases {
+        match PluginManifest::from_toml_str(&manifest(28, &body)) {
+            Err(error) => assert!(error.to_string().contains(want), "{want}: {error}"),
+            Ok(_) => panic!("{want}: should be rejected\n{body}"),
+        }
+    }
+
+    // Another file in the shared directory is fine.
+    parse(
+        28,
+        &agent(&format!(
+            "{HOOKS}{}",
+            TRUST.replace(".example.json", "other.json")
+        )),
+    );
+
+    // Config-directory variables: credential-shaped, reserved and undeclared names.
+    for var in [
+        "HOME",
+        "PATH",
+        "AOE_CONFIG_DIR",
+        "LD_LIBRARY_DIR",
+        "DYLD_FALLBACK_DIR",
+        "XDG_CONFIG_HOME",
+        "GITHUB_TOKEN",
+        "API_KEY_DIR",
+        "DB_PASSWORD",
+        "CLIENT_SECRET_DIR",
+        "1BAD",
+        "BAD-NAME",
+    ] {
+        for tables in [HOOKS, TRUST] {
+            let body = with_env(tables, var, "/opt/example");
+            let error = PluginManifest::from_toml_str(&manifest(28, &body))
+                .map(|_| ())
+                .expect_err(var);
+            assert!(
+                error.to_string().contains("config_dir_env_var"),
+                "{var}: {error}"
+            );
+        }
+    }
+    let undeclared =
+        format!("[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n{HOOKS}");
+    assert!(PluginManifest::from_toml_str(&manifest(28, &undeclared))
+        .unwrap_err()
+        .to_string()
+        .contains("launch.container_env key"));
+
+    // Container directories the sandbox would mount read-write.
+    let too_long = format!("/{}", "d".repeat(300));
+    for dir in [
+        "relative/dir",
+        "/",
+        "/root",
+        "/opt/../etc",
+        "/opt/./x",
+        "/opt//x",
+        "/opt/x/",
+        "/opt/a:b",
+        "/opt/a,b",
+        "/workspace",
+        "/workspace/project",
+        "/aoe/artifacts",
+        "/tmp/aoe-hooks/x",
+        "/proc/self",
+        &too_long,
+    ] {
+        let body = with_env(HOOKS, "EXAMPLE_CONFIG_DIR", dir);
+        let error = PluginManifest::from_toml_str(&manifest(28, &body))
+            .map(|_| ())
+            .expect_err(dir);
+        assert!(
+            error.to_string().contains("container_env"),
+            "{dir}: {error}"
+        );
+    }
+    for dir in ["/opt/example", "/root/.example", "/home/agent/.cfg"] {
+        parse(28, &with_env(HOOKS, "EXAMPLE_CONFIG_DIR", dir));
+    }
+}
+
+#[test]
+fn identity_hooks_need_a_bare_executable_name() {
+    let body = |command: &str, identity: bool| {
+        let events = if identity {
+            "[[agent_integrations.hooks.events]]\nevent = \"SessionStart\"\nidentity_field = \"session_id\"\n"
+        } else {
+            ""
+        };
+        format!(
+            "[[agent_integrations]]\ntool = \"example\"\ncommand = \"{command}\"\n\
+             [agent_integrations.launch.container_env]\nEXAMPLE_CONFIG_DIR = \"/opt/example\"\n\
+             {HOOKS}{events}"
+        )
+    };
+    for command in [
+        "example+cli",
+        "/opt/bin/example",
+        "FOO=bar ex@mple",
+        "ex,ample",
+    ] {
+        let error = PluginManifest::from_toml_str(&manifest(28, &body(command, true)))
+            .map(|_| ())
+            .expect_err(command);
+        assert!(
+            error.to_string().contains("bare name"),
+            "{command}: {error}"
+        );
+        // Without an identity event there is no publisher guard to lose.
+        parse(28, &body(command, false));
+    }
+    for command in [
+        "example-cli",
+        "example.v2 --flag",
+        "PATH_HINT=x example_cli",
+    ] {
+        parse(28, &body(command, true));
+    }
+}

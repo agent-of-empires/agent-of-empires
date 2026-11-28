@@ -175,7 +175,7 @@ export function ModePicker({
     currentModeId,
     legacyMode,
     pendingConfigOption,
-    allowLegacyFallback: profile.capabilities.legacyModeFallback,
+    allowLegacyFallback: profile.legacy_mode_fallback,
   });
 
   useEffect(() => {

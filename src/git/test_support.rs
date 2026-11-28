@@ -1,5 +1,6 @@
 //! Git repository fixtures shared by in-crate tests.
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use git2::{Oid, Repository, Signature, Time};
@@ -7,8 +8,18 @@ use tempfile::TempDir;
 
 /// Runs Git without inherited repository state or user configuration, asserting success.
 pub(crate) fn run_git(path: &Path, args: &[&str]) -> String {
+    run_git_os(path, args)
+}
+
+/// [`run_git`] for arguments that need not be UTF-8.
+pub(crate) fn run_git_os<I, S>(path: &Path, args: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
     let output = std::process::Command::new("git")
-        .args(args)
+        .args(&args)
         .current_dir(path)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")

@@ -10,7 +10,7 @@ import {
   type TranscriptRow,
   transcriptRowToActivity,
 } from "../../lib/acpTypes";
-import { resolveAgentProfile } from "../../lib/agentProfiles";
+import { profileFor } from "../../lib/__tests__/agentProfileFixtures";
 import {
   activityToThreadMessages,
   clearFoldGeneration,
@@ -465,7 +465,7 @@ describe("subagents", () => {
         false,
         false,
         true,
-        resolveAgentProfile(toolKey),
+        profileFor(toolKey),
       )
         .flatMap((m) => m.content as Part[])
         .filter((p) => p.type === "tool-call");

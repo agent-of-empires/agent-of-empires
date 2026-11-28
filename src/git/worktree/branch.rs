@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use super::relocate::{classify_ref_observations, TimedMutationOutcome};
+use super::relocate::{classify_ref_observations, path_from_git_bytes, TimedMutationOutcome};
 use super::{GitWorktree, FETCH_REMOTE, MUTATION_OBSERVATION_TIMEOUT, WORKTREE_MUTATION_TIMEOUT};
 use crate::git::command::{run_git, run_git_with_timeout};
 use crate::git::error::{GitError, Result};
@@ -302,9 +302,15 @@ impl GitWorktree {
         }
     }
 
-    /// The registered checkout path holding `branch`, including a stale locked
-    /// entry whose checkout no longer exists.
+    /// The first registered checkout path holding `branch`, including a stale
+    /// locked entry whose checkout no longer exists.
     pub(crate) fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+        Ok(self.worktree_paths_for_branch(branch)?.into_iter().next())
+    }
+
+    /// Every registered checkout path holding `branch`; `worktree add --force`
+    /// can register one branch more than once.
+    fn worktree_paths_for_branch(&self, branch: &str) -> Result<Vec<PathBuf>> {
         let output = run_git(&self.repo_path, ["worktree", "list", "--porcelain", "-z"])?;
         if !output.status.success() {
             return Err(GitError::WorktreeCommandFailed(format!(
@@ -313,17 +319,27 @@ impl GitWorktree {
             )));
         }
         let wanted = format!("refs/heads/{branch}");
-        let mut path = None;
+        let mut raw_path: Option<&[u8]> = None;
+        let mut paths = Vec::new();
         for field in output.stdout.split(|byte| *byte == 0) {
-            if let Some(raw_path) = field.strip_prefix(b"worktree ") {
-                path = Some(PathBuf::from(
-                    String::from_utf8_lossy(raw_path).into_owned(),
-                ));
+            if let Some(bytes) = field.strip_prefix(b"worktree ") {
+                raw_path = Some(bytes);
             } else if field.strip_prefix(b"branch ") == Some(wanted.as_bytes()) {
-                return Ok(path);
+                if let Some(bytes) = raw_path {
+                    paths.push(path_from_git_bytes(bytes, "worktree path")?);
+                }
             }
         }
-        Ok(None)
+        Ok(paths)
+    }
+
+    /// The checkout holding `branch` unless it is confirmed absent. A stale
+    /// entry whose checkout is gone is skipped; `delete_branch` reaps those.
+    pub(crate) fn live_checkout_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+        Ok(self
+            .worktree_paths_for_branch(branch)?
+            .into_iter()
+            .find(|path| !checkout_confirmed_absent(path.try_exists())))
     }
 
     /// Unlock and prune the one entry git ties to the branch being deleted.
@@ -442,7 +458,7 @@ fn observe_local_branch_ref(repo_path: &Path, branch: &str) -> Option<bool> {
 mod tests {
     use super::super::create::tests::fork_upstream_layout;
     use super::*;
-    use crate::git::test_support::{commit, init_repo, run_git};
+    use crate::git::test_support::{commit, init_repo, run_git, run_git_os};
     use git2::Repository;
     use tempfile::TempDir;
 
@@ -714,5 +730,106 @@ mod tests {
         assert!(!checkout_confirmed_absent(Err(Error::from(
             ErrorKind::PermissionDenied
         ))));
+    }
+
+    #[test]
+    fn live_checkout_for_branch_ignores_vanished_and_absent() {
+        let (dir, _repo) = init_repo();
+        let main = dir.path();
+        let git = GitWorktree::new(main.to_path_buf()).unwrap();
+
+        let live = main.join("wt-live");
+        run_git(
+            main,
+            &["worktree", "add", "-b", "live", live.to_str().unwrap()],
+        );
+        let gone = main.join("wt-gone");
+        run_git(
+            main,
+            &["worktree", "add", "-b", "gone", gone.to_str().unwrap()],
+        );
+        git.lock_worktree(&gone).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        // One branch registered twice: the vanished entry is listed first.
+        let dup_gone = main.join("wt-dup-a");
+        run_git(
+            main,
+            &["worktree", "add", "-b", "dup", dup_gone.to_str().unwrap()],
+        );
+        let dup_live = main.join("wt-dup-b");
+        run_git(
+            main,
+            &[
+                "worktree",
+                "add",
+                "--force",
+                dup_live.to_str().unwrap(),
+                "dup",
+            ],
+        );
+        git.lock_worktree(&dup_gone).unwrap();
+        std::fs::remove_dir_all(&dup_gone).unwrap();
+        let listed = git.worktree_paths_for_branch("dup").unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(!listed[0].exists() && listed[1].exists(), "{listed:?}");
+        assert_eq!(
+            git.live_checkout_for_branch("dup")
+                .unwrap()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            dup_live.canonicalize().unwrap()
+        );
+
+        for (branch, held) in [("live", true), ("gone", false), ("absent", false)] {
+            let found = git.live_checkout_for_branch(branch).unwrap();
+            assert_eq!(found.is_some(), held, "{branch}");
+        }
+        assert_eq!(
+            git.live_checkout_for_branch("live")
+                .unwrap()
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            live.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_checkout_for_branch_finds_non_utf8_path() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStringExt;
+
+        let (dir, _repo) = init_repo();
+        let main = dir.path();
+        let git = GitWorktree::new(main.to_path_buf()).unwrap();
+
+        let mut name = b"wt-".to_vec();
+        name.push(0xFF);
+        let foreign = main.join(OsString::from_vec(name));
+        if std::fs::create_dir(&foreign).is_err() {
+            return; // filesystem rejects non-UTF-8 names
+        }
+        std::fs::remove_dir(&foreign).unwrap();
+        run_git_os(
+            main,
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("-b"),
+                OsStr::new("foreign"),
+                foreign.as_os_str(),
+            ],
+        );
+
+        // git reports the canonical path; TMPDIR may sit behind a symlink.
+        assert_eq!(
+            git.live_checkout_for_branch("foreign")
+                .unwrap()
+                .map(|p| p.canonicalize().unwrap()),
+            Some(foreign.canonicalize().unwrap())
+        );
     }
 }

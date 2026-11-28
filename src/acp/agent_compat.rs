@@ -129,6 +129,38 @@ impl ExpectedAgent {
     }
 }
 
+/// Which adapters a plugin proxy supports; empty means any.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProxyCompat {
+    /// Accepted `agent_info.name` values.
+    pub agent_names: Vec<String>,
+    pub version_req: Option<semver::VersionReq>,
+}
+
+impl ProxyCompat {
+    /// The reason the forwarded `agent_info` is outside the proxy's support.
+    pub fn check(
+        &self,
+        info: Option<&agent_client_protocol::v1::schema::Implementation>,
+    ) -> Result<(), String> {
+        if self.agent_names.is_empty() && self.version_req.is_none() {
+            return Ok(());
+        }
+        let info = info.ok_or("the adapter reported no agent_info")?;
+        if !self.agent_names.is_empty() && !self.agent_names.contains(&info.name) {
+            return Err(format!("adapter `{}` is not supported", info.name));
+        }
+        if let Some(req) = &self.version_req {
+            let version = semver::Version::parse(info.version.trim())
+                .map_err(|_| format!("adapter version `{}` is not valid semver", info.version))?;
+            if !req.matches(&version) {
+                return Err(format!("adapter version {version} does not satisfy {req}"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Why aoe refuses a session after a successful `initialize`; the same
 /// shape the structured view event carries.
 pub type StartupError = StartupErrorDetail;

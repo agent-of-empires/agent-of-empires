@@ -4676,14 +4676,13 @@
       "risk": "medium",
       "specs": [
         "src/components/acp/ToolCards.render.test.tsx",
-        "src/lib/agentProfiles.test.ts",
         "src/lib/acpTypes.test.ts",
         "src/components/acp/activityMessages.test.ts"
       ],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
-        "web/src/lib/agentProfiles.ts",
+        "web/src/lib/agentProfile.ts",
         "web/src/lib/acpArgs.ts",
         "web/src/lib/acpTypes.ts",
         "web/src/components/acp/CoreToolCards.tsx",
@@ -4695,11 +4694,21 @@
       ]
     },
     {
-      "id": "acp.omp-profile",
+      "id": "acp.agent-profile",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/lib/agentProfiles.test.ts"],
-      "components": ["web/src/lib/agentProfiles.ts"]
+      "specs": [
+        "src/lib/agentProfile.test.ts",
+        "src/lib/agentProfileContext.test.tsx",
+        "src/lib/memoryClassify.test.ts",
+        "tests/mobile-keyboard.spec.ts"
+      ],
+      "components": [
+        "web/src/lib/agentProfile.ts",
+        "web/src/lib/agentProfileContext.tsx",
+        "web/src/lib/memoryClassify.ts"
+      ],
+      "notes": "tests/mobile-keyboard.spec.ts opens a session whose profile has an unsupported version and mobile_monitor_only set, and asserts the keyboard proxy takes focus after both sidebar (workspace) and in-app (session) selection."
     },
     {
       "id": "acp.compaction-reminder-banner",
@@ -4707,6 +4716,20 @@
       "risk": "medium",
       "specs": ["src/components/acp/CompactionReminderBanner.test.tsx"],
       "components": ["web/src/components/acp/CompactionReminderBanner.tsx"]
+    },
+    {
+      "id": "acp.integration-lost-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/__tests__/IntegrationLostBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/components/sidebar/sessionQueuedReason.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/IntegrationLostBanner.tsx",
+        "web/src/components/sidebar/sessionQueuedReason.ts"
+      ]
     },
     {
       "id": "acp.context-primer-banner",

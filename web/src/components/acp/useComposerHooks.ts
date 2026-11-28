@@ -7,7 +7,7 @@ import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from "@assistant-u
 
 import { getDraft, setDraft } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
-import { useClearAliases } from "../../lib/agentProfileContext";
+import { useAgentProfile } from "../../lib/agentProfileContext";
 import { fileToBase64, fitTextareaFallback, kindSupported, MAX_ATTACHMENTS, mimeToKind } from "./composerInput";
 import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
 import { fuzzyFilter, useFilesIndex } from "./useFilesIndex";
@@ -154,7 +154,7 @@ export function useTriggerAdapters(sessionId: string, availableCommands: AcpStat
       ),
     [files],
   );
-  const clearAliases = useClearAliases();
+  const { clear_aliases: clearAliases } = useAgentProfile();
   const slashAdapter = useMemo(() => {
     const advertised = new Set(availableCommands.map((c) => c.name));
     const items: Unstable_TriggerItem[] = availableCommands.map((c) => ({

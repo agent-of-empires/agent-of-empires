@@ -1,4 +1,5 @@
-//! Build-version watches must resolve worktree HEAD and ignore index churn.
+//! Release build-version watches must resolve worktree HEAD and ignore index
+//! churn; debug builds must not watch git at all.
 
 #[path = "../../build_git_watch.rs"]
 mod build_git_watch;
@@ -292,4 +293,12 @@ fn watched_paths_move_on_a_commit_but_not_on_a_plain_status() {
         snapshot(&repo),
         "a commit must disturb a watched path so the build version recomputes"
     );
+}
+
+#[test]
+#[serial_test::parallel]
+fn only_release_based_profiles_stamp_git() {
+    for (profile, stamps) in [("debug", false), ("release", true)] {
+        assert_eq!(build_git_watch::stamps_git(profile), stamps, "{profile}");
+    }
 }
