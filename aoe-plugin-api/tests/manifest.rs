@@ -1349,7 +1349,7 @@ const ACP: &str = "[agent_integrations.acp]\n\
     expected_agent_name = \"example\"\n\
     min_version = \"1.0.0\"\n\
     [agent_integrations.acp.compat.capability_min_versions]\n\
-    fork = \"1.1.0\"\n\
+    steering = \"1.1.0\"\n\
     [[agent_integrations.acp.profile.modes]]\n\
     id = \"plan\"\n\
     approval_class = \"guarded\"\n";
@@ -1387,7 +1387,7 @@ fn acp_declaration_is_gated_and_round_trips() {
 
 #[test]
 fn acp_declaration_rejects_bad_fields() {
-    let cases: [(&str, &str, &str); 33] = [
+    let cases: [(&str, &str, &str); 34] = [
         ("id = \"example\"", "id = \"Bad Id\"", "acp.id"),
         ("id = \"example\"", "id = \"\"", "acp.id"),
         ("[\"example-cli\"]", "[\"example\"]", "aliases"),
@@ -1418,7 +1418,8 @@ fn acp_declaration_rejects_bad_fields() {
         ("EXAMPLE_MODE = \"fast\"", "EXAMPLE_MODE = \"a\\u0000b\"", "env.defaults"),
         ("EXAMPLE_MODE = \"fast\"", "\"BAD-NAME\" = \"x\"", "env.defaults"),
         ("min_version = \"1.0.0\"", "min_version = \"one\"", "compat"),
-        ("fork = \"1.1.0\"", "fork = \"latest\"", "compat"),
+        ("steering = \"1.1.0\"", "steering = \"latest\"", "compat"),
+        ("steering = \"1.1.0\"", "fork = \"1.1.0\"", "capability_min_versions"),
         ("id = \"plan\"", "id = \"\"", "profile.modes"),
         ("approval_class = \"guarded\"\n", "approval_class = \"guarded\"\n[[agent_integrations.acp.profile.modes]]\nid = \"plan\"\napproval_class = \"interactive\"\n", "profile.modes"),
     ];

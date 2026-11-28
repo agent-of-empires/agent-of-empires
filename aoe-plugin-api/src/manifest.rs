@@ -1047,7 +1047,8 @@ fn validate_acp_declaration(
     check: &mut impl FnMut(bool, String),
 ) {
     use crate::agent_integration::{
-        ACP_PRIMITIVE_SCHEMA_VERSION, ACP_PROXY_PROTOCOL_VERSION, AGENT_DISPLAY_NAME_MAX,
+        ACP_PRIMITIVE_SCHEMA_VERSION, ACP_PROXY_PROTOCOL_VERSION, ACP_STEERING_CAPABILITY,
+        AGENT_DISPLAY_NAME_MAX,
     };
     let at = format!("agent_integrations[{i}].acp");
     check(
@@ -1154,11 +1155,10 @@ fn validate_acp_declaration(
             versions
                 .into_iter()
                 .all(|v| semver::Version::parse(v).is_ok())
-                && compat
-                    .capability_min_versions
-                    .keys()
-                    .all(|k| acp_asset_name_ok(k)),
-            format!("{at}.compat versions must be semver versions and capability names nonblank"),
+                && compat.capability_min_versions.keys().all(|k| k == ACP_STEERING_CAPABILITY),
+            format!(
+                "{at}.compat versions must be semver versions and the only capability_min_versions key is `{ACP_STEERING_CAPABILITY}`"
+            ),
         );
     }
     let mut modes = std::collections::HashSet::new();

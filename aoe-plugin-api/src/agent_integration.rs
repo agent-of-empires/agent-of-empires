@@ -46,6 +46,9 @@ pub struct AgentIntegrationContribution {
 
 /// Proxy wire versions the host speaks; `AcpProxy` must declare exactly these.
 pub const ACP_PROXY_PROTOCOL_VERSION: u32 = 1;
+
+/// The only `compat.capability_min_versions` key the host enforces: it floors `_session/steering`.
+pub const ACP_STEERING_CAPABILITY: &str = "steering";
 pub const ACP_PRIMITIVE_SCHEMA_VERSION: u32 = 1;
 
 /// How a plugin supplies an agent's ACP adapter and proxy.
@@ -139,7 +142,7 @@ pub struct AcpCompat {
     /// Lowest adapter version the host accepts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_version: Option<String>,
-    /// Lowest adapter version that offers each named capability.
+    /// Lowest adapter version that offers each named capability; only `steering` is accepted.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub capability_min_versions: BTreeMap<String, String>,
 }

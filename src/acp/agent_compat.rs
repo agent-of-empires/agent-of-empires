@@ -162,7 +162,7 @@ impl ProxyCompat {
 }
 
 /// Capability key in `acp.compat.capability_min_versions` that floors `_session/steering`.
-pub const STEERING_CAPABILITY: &str = "steering";
+pub const STEERING_CAPABILITY: &str = aoe_plugin_api::agent_integration::ACP_STEERING_CAPABILITY;
 
 /// The compat a plugin declared for its adapter. It replaces the `ExpectedAgent` policy of a
 /// proxied launch, so an adapter is never judged by a guess from its command name.
