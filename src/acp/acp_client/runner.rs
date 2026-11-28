@@ -7,7 +7,7 @@ use super::resolve_command::{on_agent_path, resolve_agent_command, Unresolved};
 use super::session_sandbox::{build_sandbox_docker_argv, SessionSandbox};
 use super::spawn::{
     apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
-    SpawnConfig,
+    ProxySpec, SpawnConfig,
 };
 
 /// Deadline for the runner socket to appear. 10s suffices in production, but
@@ -121,6 +121,35 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
     }
 }
 
+/// What the runner hands the adapter as `ACP_AGENT_ENV`. The minted MCP credentials ride
+/// it last; a sandbox forwards them through `docker exec -e` instead, so the carrier never
+/// holds them there.
+fn carrier_environment(config: &SpawnConfig, sandboxed: bool) -> Vec<(String, String)> {
+    let credentials = (!sandboxed)
+        .then_some(&config.mcp_credentials)
+        .into_iter()
+        .flatten();
+    config
+        .host_environment
+        .iter()
+        .chain(&config.provider_routing)
+        .chain(credentials)
+        .filter(|(key, _)| match host_environment_denyreason(key) {
+            Some(reason) => {
+                warn!(
+                    target: "acp",
+                    key = %key,
+                    reason,
+                    "rejecting configured host environment key",
+                );
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// A Worker started for a bare adapter name that resolved nowhere can only exit
 /// before its Hello, which loses the cause (#4576). `unresolved` is `None` when
 /// the name resolved or a sandbox resolves it inside its container; paths and
@@ -188,6 +217,49 @@ fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
          build that was removed. Rebuild or reinstall aoe and restart `aoe serve`",
         exe.display()
     )))
+}
+
+/// Everything after the runner's `--`: the proxy, when present, then the
+/// adapter command it wraps.
+pub(super) fn agent_argv(proxy: Option<&ProxySpec>, command: &str, args: &[String]) -> Vec<String> {
+    let mut argv = Vec::new();
+    if let Some(proxy) = proxy {
+        argv.push(proxy.command.clone());
+        argv.extend(proxy.args.iter().cloned());
+    }
+    argv.push(command.to_string());
+    argv.extend(args.iter().cloned());
+    argv
+}
+
+fn proxy_launch_config_json(
+    config: &SpawnConfig,
+    session_id: &str,
+    store_root: &std::path::Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "session_id": session_id,
+        "container_id": config.sandbox_info.as_ref().and_then(|s| s.container_id.as_deref()),
+        "store_root": store_root,
+    })
+}
+
+/// Replaces any config left by a previous runner of this session. Holds no
+/// secrets: it only locates the session for the proxy.
+fn write_proxy_launch_config(
+    config: &SpawnConfig,
+    session_id: &str,
+) -> Result<std::path::PathBuf, AcpError> {
+    let spawn_err = |e: anyhow::Error| AcpError::ProxyLaunchConfig(format!("{e:#}"));
+    crate::process::worker_registry::remove_proxy_launch_configs(session_id).map_err(spawn_err)?;
+    let store_root = crate::session::get_app_dir().map_err(spawn_err)?;
+    let contents = proxy_launch_config_json(config, session_id, &store_root);
+    crate::process::worker_registry::write_proxy_launch_config(
+        session_id,
+        contents.to_string().as_bytes(),
+    )
+    .map_err(spawn_err)
 }
 
 /// The runner owns the agent subprocess and outlives the daemon; its Child is
@@ -262,24 +334,7 @@ pub(super) async fn spawn_runner_detached(
     // the adapter only: they ride a carrier key the runner strips and applies to
     // its child, because HOME, PATH or XDG_CONFIG_HOME set on the runner itself
     // would move its worker registry (#1383) or change which binary it loads.
-    let host_environment: Vec<(String, String)> = config
-        .host_environment
-        .iter()
-        .chain(&config.provider_routing)
-        .filter(|(key, _)| match host_environment_denyreason(key) {
-            Some(reason) => {
-                warn!(
-                    target: "acp",
-                    key = %key,
-                    reason,
-                    "rejecting configured host environment key",
-                );
-                false
-            }
-            None => true,
-        })
-        .cloned()
-        .collect();
+    let host_environment = carrier_environment(config, sandbox_argv.is_some());
     refuse_unresolved_adapter(
         config,
         resolution.as_ref().and_then(|r| r.as_ref().err()),
@@ -296,6 +351,16 @@ pub(super) async fn spawn_runner_detached(
             ),
             (None, None) => (config.spec.command.clone(), Vec::new()),
         };
+
+    let launch_config = if config.proxy.is_some() {
+        Some(write_proxy_launch_config(config, &session_id)?)
+    } else {
+        // A fallback to the raw adapter must not leave the failed proxy runner's config behind.
+        if let Err(e) = crate::process::worker_registry::remove_proxy_launch_configs(&session_id) {
+            tracing::warn!(session_id, "stale proxy launch config not removed: {e:#}");
+        }
+        None
+    };
 
     let prefix = {
         let id = session_id.clone();
@@ -360,21 +425,25 @@ pub(super) async fn spawn_runner_detached(
     if let crate::process::worker_registry::ScopeOwnership::Owned { unit } = &scope {
         cmd.arg("--systemd-scope").arg(unit);
     }
-    cmd.arg("--");
-    if let Some(s) = &sandbox_argv {
-        cmd.arg(&s.docker_binary);
-        for a in &s.docker_args {
-            cmd.arg(a);
-        }
-    } else {
-        // Pass the resolved absolute path (or fall back to the bare command).
-        // The runner spawns whatever it receives, so an absolute path bypasses
-        // any PATH lookup inside the runner.
-        cmd.arg(&spawn_command);
-        for a in &config.spec.args {
-            cmd.arg(a);
-        }
+    if let Some(proxy) = &config.proxy {
+        let encoded = serde_json::to_string(proxy)
+            .map_err(|e| AcpError::Spawn(format!("encode proxy spec: {e}")))?;
+        cmd.arg("--proxy").arg(encoded);
     }
+    if let Some(name) = &config.degraded {
+        cmd.arg("--degraded").arg(name);
+    }
+    if let Some(path) = &launch_config {
+        cmd.arg("--proxy-launch-config").arg(path);
+    }
+    cmd.arg("--");
+    let (command, args) = match &sandbox_argv {
+        Some(s) => (s.docker_binary.as_str(), s.docker_args.as_slice()),
+        // The resolved absolute path (or the bare command) bypasses any PATH
+        // lookup inside the runner.
+        None => (spawn_command.as_str(), config.spec.args.as_slice()),
+    };
+    cmd.args(agent_argv(config.proxy.as_ref(), command, args));
 
     // The runner inherits this env when it spawns the agent, so one filter
     // pass covers both. AOE_TOKEN is stripped here and reaches neither.
@@ -389,6 +458,12 @@ pub(super) async fn spawn_runner_detached(
         let encoded = serde_json::to_string(&host_environment)
             .map_err(|e| AcpError::Spawn(format!("encode host environment: {e}")))?;
         cmd.env(crate::process::runner::ACP_AGENT_ENV, encoded);
+    }
+    if let Some(path) = &launch_config {
+        cmd.env(
+            crate::process::worker_registry::PROXY_LAUNCH_CONFIG_ENV,
+            path,
+        );
     }
     if let Some(s) = &sandbox_argv {
         // docker reads each `-e KEY` value from its own process env, so set
@@ -562,12 +637,103 @@ pub(super) async fn spawn_runner_detached(
 mod tests {
     use super::*;
     use crate::process::systemd::ScopePrefix;
+
+    /// Minted MCP credentials reach a host agent through the owner-only carrier, after the
+    /// configured environment, and never through the carrier of a sandboxed one.
+    #[test]
+    fn carrier_holds_mcp_credentials_for_host_agents_only() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config =
+            super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
+        config.host_environment = vec![("HOOK_VALUE".into(), "kept".into())];
+        config.mcp_credentials = vec![(
+            "AOE_PLUGIN_MCP_CRED_01".to_string(),
+            "fake-credential".to_string(),
+        )]
+        .into();
+        assert_eq!(
+            carrier_environment(&config, false),
+            [
+                ("HOOK_VALUE".to_string(), "kept".to_string()),
+                (
+                    "AOE_PLUGIN_MCP_CRED_01".to_string(),
+                    "fake-credential".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            carrier_environment(&config, true),
+            [("HOOK_VALUE".to_string(), "kept".to_string())]
+        );
+    }
+
     use crate::session::test_support::EnvGuard;
     use std::ffi::{OsStr, OsString};
 
     const XDG: &str = "XDG_RUNTIME_DIR";
     const BUS: &str = "DBUS_SESSION_BUS_ADDRESS";
     const ENV: &str = "/usr/bin/env";
+
+    #[test]
+    fn proxy_launch_config_locates_the_session() {
+        let root = std::path::Path::new("/store");
+        let mut config = crate::acp::acp_client::test_helpers::env_test_spawn_config("/w".into());
+        assert_eq!(
+            proxy_launch_config_json(&config, "sess-1", root),
+            serde_json::json!({
+                "version": 1,
+                "session_id": "sess-1",
+                "container_id": null,
+                "store_root": "/store",
+            })
+        );
+
+        config.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: Some("abc123".into()),
+            image: "alpine:latest".into(),
+            container_name: "c".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert_eq!(
+            proxy_launch_config_json(&config, "sess-1", root)["container_id"],
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn agent_argv_prepends_proxy_and_keeps_arguments_intact() {
+        let proxy = ProxySpec {
+            plugin_id: "p".into(),
+            command: "/opt/my proxy".into(),
+            args: vec!["--flag".into(), "a b".into(), "it's \"x\"".into()],
+            failure_policy: super::super::ProxyFailurePolicy::Refuse,
+            display_name: "P".into(),
+            compat: Default::default(),
+        };
+        let adapter_args = ["--stdio".to_string(), "q r".to_string()];
+        assert_eq!(
+            agent_argv(Some(&proxy), "/bin/adapter", &adapter_args),
+            [
+                "/opt/my proxy",
+                "--flag",
+                "a b",
+                "it's \"x\"",
+                "/bin/adapter",
+                "--stdio",
+                "q r"
+            ],
+        );
+        assert_eq!(
+            agent_argv(None, "/bin/adapter", &adapter_args),
+            ["/bin/adapter", "--stdio", "q r"],
+        );
+    }
 
     #[test]
     fn missing_runner_exe_names_path_and_remedy() {

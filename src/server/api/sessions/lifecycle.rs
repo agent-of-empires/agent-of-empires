@@ -1,4 +1,4 @@
-//! Pin, color, archive, trash/restore, rename/summarize triggers, and
+//! Pin, archive, trash/restore, rename/summarize triggers, and
 //! stop/start/snooze/unread endpoints.
 
 use super::*;
@@ -62,6 +62,7 @@ pub async fn update_session_pin(
 pub async fn update_session_favorite(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<UpdateFavoriteBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
@@ -71,37 +72,57 @@ pub async fn update_session_favorite(
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
+    let favorited = match body {
+        UpdateFavoriteBody::Scoped {
+            profile,
+            selector,
+            select_favorited,
+        } => {
+            use crate::daemon::{ApiErrorCode, FAVORITE_BY_SELECTOR, RUNTIME_EPOCH_HEADER};
+            if id != FAVORITE_BY_SELECTOR {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            if !headers.contains_key(RUNTIME_EPOCH_HEADER) {
+                return crate::server::api::api_error_with_code_header(
+                    ApiErrorCode::RuntimeEpochMismatch,
+                    "An epoch is required for selector-based favorite updates.",
+                );
+            }
+            return update_favorite_by_selector(&state, profile, selector, select_favorited).await;
+        }
+        UpdateFavoriteBody::Unscoped { favorited } => favorited,
+    };
 
     let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let guard = lock.lock().await;
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
-    }
+    let cityhall_mode = state.cityhall_mode;
     let profile = {
         let instances = state.instances.read().await;
-        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+        let target = instances.iter().find(|instance| instance.id == id);
+        if cityhall_mode && !target.is_some_and(Instance::is_structured) {
+            return crate::server::api::cityhall_response();
+        }
+        let Some(instance) = target else {
             return crate::server::api::session_not_found();
         };
         instance.source_profile.clone()
     };
-    let favorited = body.favorited;
     let persist_id = id.clone();
-    let committed = commit_profile_update(
+    let committed = commit_profile_update_with_refusal(
         &state,
         profile,
         "favorite update",
         move |instances| {
-            if let Some(instance) = instances
+            let instance = instances
                 .iter_mut()
                 .find(|instance| instance.id == persist_id)
-            {
-                if body.favorited {
-                    instance.favorite();
-                } else {
-                    instance.unfavorite();
-                }
+                .ok_or_else(crate::server::api::session_not_found)?;
+            if cityhall_mode && !instance.is_structured() {
+                return Err(crate::server::api::cityhall_response());
             }
+            apply_favorite(instance, favorited);
+            Ok(())
         },
         None,
     )
@@ -113,6 +134,119 @@ pub async fn update_session_favorite(
     drop(guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+
+fn apply_favorite(row: &mut Instance, favorited: bool) {
+    if favorited {
+        row.favorite();
+    } else {
+        row.unfavorite();
+    }
+}
+
+async fn update_favorite_by_selector(
+    state: &Arc<AppState>,
+    mut profile: String,
+    selector: String,
+    favorited: bool,
+) -> axum::response::Response {
+    use crate::daemon::{ApiErrorCode, FavoriteOutcome, SessionLookupError};
+    // A purge can hold a namespace lease past the client's request deadline.
+    let admission = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.profile_namespace.write(),
+    );
+    let Ok(namespace) = admission.await else {
+        return crate::server::api::api_error_with_code_header(
+            ApiErrorCode::FavoriteNamespaceBusy,
+            "Profile namespace is busy; no favorite change was made.",
+        );
+    };
+    {
+        let metadata = state.canonical_metadata.read().await;
+        if profile.is_empty() {
+            profile.clone_from(&metadata.default_profile);
+        }
+        if !metadata.profiles.iter().any(|entry| entry.name == profile) {
+            return favorite_selection_refused(crate::daemon::SessionLookupError::ProfileNotFound(
+                profile,
+            ));
+        }
+    }
+    let cityhall_mode = state.cityhall_mode;
+    let committed = commit_profile_update_with_refusal(
+        state,
+        profile,
+        "favorite update",
+        move |rows| {
+            if cityhall_mode
+                && rows
+                    .iter()
+                    .any(|row| row.id == selector && !row.is_structured())
+            {
+                return Err(favorite_selection_refused(SessionLookupError::NotFound));
+            }
+            let (index, _) = crate::cli::lookup_session(
+                &selector,
+                rows.iter()
+                    .enumerate()
+                    .filter(|(_, row)| !cityhall_mode || row.is_structured()),
+            )
+            .map_err(favorite_selection_refused)?;
+            let row = &mut rows[index];
+            apply_favorite(row, favorited);
+            Ok(FavoriteOutcome {
+                title: row.title.clone(),
+            })
+        },
+        None,
+    )
+    .await;
+    let outcome = match committed {
+        Ok(outcome) => outcome,
+        Err(response) => return response,
+    };
+    drop(namespace);
+    match state.runtime.publish(state).await {
+        Ok(snapshot) => {
+            crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+        }
+        Err(error) => {
+            tracing::debug!(target: "server.runtime", %error, "favorite publication failed");
+            outcome_unconfirmed_response()
+        }
+    }
+}
+
+fn favorite_selection_refused(
+    mut error: crate::daemon::SessionLookupError,
+) -> axum::response::Response {
+    if let crate::daemon::SessionLookupError::Ambiguous { candidates, .. } = &mut error {
+        candidates.sort_unstable();
+        // Budget for worst-case JSON escaping within the client's error response limit.
+        let mut remaining = 1000usize;
+        let keep = candidates
+            .iter()
+            .take(12)
+            .take_while(|(id, title)| {
+                let bytes = id.len() + title.len();
+                if bytes > remaining {
+                    return false;
+                }
+                remaining -= bytes;
+                true
+            })
+            .count();
+        candidates.truncate(keep);
+    }
+    if let crate::daemon::SessionLookupError::ProfileNotFound(name) = &mut error {
+        if name.len() > 1000 {
+            name.truncate(name.floor_char_boundary(1000));
+            name.push('…');
+        }
+    }
+    let code = crate::daemon::ApiErrorCode::FavoriteSelectionRefused;
+    (code.status(), code.header(), Json(error)).into_response()
 }
 
 /// 409 for ignore refusing a sunk row. The codes stay the ones clients already
@@ -272,73 +406,6 @@ pub async fn reclaim_session_ownership(
     }
     tracing::info!(target: "session.sync", session = %id, field = "ownership", value = "reclaimed", "session updated");
     drop(guard);
-    drop(namespace);
-    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
-}
-
-pub async fn update_session_color(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    body: Result<Json<UpdateColorBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if state.read_only {
-        return crate::server::api::read_only_response();
-    }
-    let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
-    };
-
-    // Validate up front so an unknown color never reaches disk; `None` clears
-    // the label. Mirrors the CLI's palette check.
-    let new_color = body.color.map(|c| c.trim().to_lowercase());
-    if let Some(c) = &new_color {
-        if !crate::session::is_valid_session_color(c) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("invalid color {c:?}; expected one of: red, amber, green, or null"),
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    let namespace = state.profile_namespace.read().await;
-    let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
-    }
-
-    let profile = {
-        let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
-        };
-        inst.source_profile.clone()
-    };
-
-    let color = new_color.clone();
-    let persist_id = id.clone();
-    let committed = commit_profile_update(
-        &state,
-        profile,
-        "color update",
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                // Pre-validated above, so this cannot fail.
-                let _ = inst.set_color(new_color);
-            }
-        },
-        None,
-    )
-    .await;
-    if let Err(response) = committed {
-        return response;
-    }
-    tracing::info!(target: "session.sync", session = %id, field = "color", value = ?color, "session updated");
-    drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
@@ -2298,88 +2365,6 @@ pub async fn recreate_container(
     .await
 }
 
-/// Restart a session whose agent binary was replaced after launch (#4214). Eligibility is
-/// re-checked here because the list that offered it may be several seconds old.
-pub async fn restart_for_update(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> axum::response::Response {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
-    let instance = {
-        let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
-        };
-        inst.clone()
-    };
-    let structured_ready = state
-        .acp_supervisor
-        .worker_states_snapshot()
-        .await
-        .get(&id)
-        .is_some_and(|(worker, _)| *worker == crate::daemon::AcpWorkerState::Running)
-        && state
-            .acp_event_store
-            .pending_approval_requests(&id)
-            .is_empty();
-    let resume_available = update_restart_resumable(&instance, &context_resume_for(&instance));
-    if !crate::session::update_restart::offer_pending(&instance, resume_available, structured_ready)
-    {
-        return api_error(
-            StatusCode::CONFLICT,
-            "not_eligible",
-            "Session is busy or its agent is not out of date".to_string(),
-        );
-    }
-    apply_update_restart(&state, id, instance).await
-}
-
-/// Restart an eligible session onto the updated agent.
-pub(super) async fn apply_update_restart(
-    state: &Arc<AppState>,
-    id: String,
-    instance: Instance,
-) -> axum::response::Response {
-    if instance.is_structured() {
-        // The reconciler terminates the worker once its turn drains and respawns it against the
-        // stored conversation.
-        state.acp_supervisor.mark_build_respawn_pending(&id);
-        let response = session_response_from_instance(
-            &instance,
-            crate::claude_settings::read_tui_fullscreen(),
-        );
-        return (StatusCode::ACCEPTED, Json(response)).into_response();
-    }
-    // The offer promises the conversation survives, and a restart that honors
-    // `auto_resume_on_restart` would start a new one when it is off.
-    let auto_resume = crate::session::resolve_config(&instance.effective_profile())
-        .map(|config| config.session.auto_resume_on_restart)
-        .unwrap_or(true);
-    if !auto_resume {
-        return api_error(
-            StatusCode::CONFLICT,
-            "auto_resume_disabled",
-            "auto_resume_on_restart is off, so a restart would start a new conversation"
-                .to_string(),
-        );
-    }
-    let body = crate::daemon::RestartSessionBody {
-        wake_message: Some(String::new()),
-        only_if_idle: true,
-        ..Default::default()
-    };
-    prepare_agent_session(
-        state.clone(),
-        id,
-        Ok(None),
-        AgentPreparation::Restart,
-        Some(Arc::new(body)),
-    )
-    .await
-}
-
 /// `GET /api/sessions/{id}/account-targets`: the configured tool names this session can swap to
 /// without losing its conversation. Names only; `agent_config_dir` paths never leave the host.
 pub async fn session_account_targets(
@@ -2605,7 +2590,6 @@ async fn admit_restart_sandbox_login(
     // A restart a cheaper check refuses never runs the hook: those checks answer first.
     if row.ensure_startable().is_err()
         || matches!(row.status, Status::Creating | Status::Deleting)
-        || (body.only_if_idle && row.status != Status::Idle)
         || (state.cityhall_mode && !row.is_structured())
         || *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy
     {
@@ -2800,7 +2784,6 @@ struct StructuredRestartLaunch {
     /// The restart changed only the account, so the conversation continues where it stopped.
     account_swap: bool,
     carry: Option<crate::session::conversation_carry::ConversationCarry>,
-    wake: Option<String>,
     reason: &'static str,
     /// A limit rejecting this launch is the target account's: it comes back on the error and
     /// parks nothing.
@@ -2821,33 +2804,15 @@ pub(super) fn terminal_resume_refusal(
     })
 }
 
-/// An explicit wake outranks a continuation an earlier failed resume left pending. Runs under the
-/// submission authority, before the replacement worker exists to drain it.
-pub(super) async fn discard_stale_continuation(
-    state: &Arc<AppState>,
-    id: &str,
-    resumes_rate_limit: bool,
-    explicit_wake: bool,
-) {
-    if resumes_rate_limit && explicit_wake {
-        state.session_service.clear_pending_initial_turn(id).await;
-    }
-}
-
-/// After an account swap out of a rate-limit park: same sequence as `/acp/spawn`, with the
-/// submission authority covering the checks and the install. Returns whether the interrupted
-/// prompt (or a queued one) is now the next turn, so the default wake message can give way.
-///
-/// A restart that was superseded meanwhile (a stop or a newer launch) installs nothing. An explicit
-/// wake message takes precedence over the interrupted prompt, but the manual breadcrumb still
-/// disarms the auto-resume budget exactly once.
+/// After an account swap out of a rate-limit park, continue the interrupted prompt: same sequence
+/// as `/acp/spawn`, with the submission authority covering the checks and the install. A restart
+/// that was superseded meanwhile (a stop or a newer launch) installs nothing.
 pub(super) async fn continue_interrupted_prompt(
     state: &Arc<AppState>,
     id: &str,
     generation: u64,
     resets_at: crate::time::Timestamp,
-    explicit_wake: bool,
-) -> bool {
+) {
     let submission = state.session_service.prompt_submission(id).await;
     let current = state.instances.read().await.iter().any(|row| {
         row.id == id
@@ -2856,34 +2821,16 @@ pub(super) async fn continue_interrupted_prompt(
             && row.ensure_startable().is_ok()
     });
     if !current {
-        return false;
+        return;
     }
     // Published while this task still owns the submission authority, so a newer limit and its
     // automatic resume cannot slip in between and be disarmed by an older breadcrumb.
     state
         .acp_supervisor
         .publish_rate_limit_auto_resumed(id, resets_at, true);
-    if explicit_wake {
-        // The stale-continuation clear belongs before the spawn (`discard_stale_continuation`); by
-        // now newer work may have been installed, and it must survive.
-        drop(submission);
-        return false;
-    }
-    // A continuation already pending is work too, even when the interrupted prompt is gone.
-    let pending_before = state
-        .instances
-        .read()
-        .await
-        .iter()
-        .any(|row| row.id == id && row.pending_initial_turn.is_some());
-    use crate::server::acp_reconciler::ContinuationOutcome;
-    let outcome =
+    // The manual breadcrumb above already covers every outcome.
+    let _ =
         crate::server::acp_reconciler::install_rate_limit_continuation(state, id, submission).await;
-    pending_before
-        || matches!(
-            outcome,
-            ContinuationOutcome::Installed | ContinuationOutcome::SupersededByQueue
-        )
 }
 
 async fn finish_structured_restart(
@@ -2906,7 +2853,6 @@ async fn finish_structured_restart(
             hooks,
             account_swap,
             carry,
-            wake,
             reason: _,
             defers_rate_limit,
         } = launch;
@@ -2916,8 +2862,7 @@ async fn finish_structured_restart(
         } else {
             None
         };
-        let wake_requested = wake.is_some();
-        let (started, native, wake, reservation) = tokio::task::spawn_blocking(move || {
+        let (started, native, reservation) = tokio::task::spawn_blocking(move || {
             let sandbox_info = started.sandbox_info.take();
             let ownership =
                 match started.reacquire_launch_locks_after_hooks(&native, generation, hooks) {
@@ -2946,15 +2891,6 @@ async fn finish_structured_restart(
                 if let Some(carry) = carry {
                     carry.run_for(&mut started)?;
                 }
-                let wake = match wake {
-                    Some(wake) => wake,
-                    None => {
-                        native
-                            .configuration(Some(&started.source_profile))?
-                            .session
-                            .restart_wake_message
-                    }
-                };
                 (&native as &dyn SessionStore).update(|rows, _| {
                     let row = rows
                         .iter_mut()
@@ -2975,10 +2911,10 @@ async fn finish_structured_restart(
                     );
                     Ok(())
                 })?;
-                Ok::<_, anyhow::Error>((reservation, wake))
+                Ok::<_, anyhow::Error>(reservation)
             })();
 
-            let (reservation, wake) = match prepared {
+            let reservation = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     drop(ownership);
@@ -2991,12 +2927,9 @@ async fn finish_structured_restart(
             started.status = Status::Starting;
             started.lifecycle_reservation = None;
             native.adopt_runtime_fields(&started)?;
-            Ok::<_, anyhow::Error>((started, Arc::new(native), wake, reservation))
+            Ok::<_, anyhow::Error>((started, Arc::new(native), reservation))
         })
         .await??;
-        // Past the pre-launch hooks and the reservation, so a refused launch keeps the turn; still
-        // under the submission authority, so the new worker cannot drain it before the wake.
-        discard_stale_continuation(state, id, resumes_rate_limit.is_some(), wake_requested).await;
         let agent = state
             .acp_supervisor
             .pick_agent_for_tool(
@@ -3032,63 +2965,8 @@ async fn finish_structured_restart(
             state, native, id, generation, spawned,
         )
         .await?;
-        let continued = match resumes_rate_limit {
-            Some(resets_at) => {
-                continue_interrupted_prompt(state, id, generation, resets_at, wake_requested).await
-            }
-            None => false,
-        };
-        let wake = if continued { String::new() } else { wake };
-        if !wake.is_empty() {
-            let state = state.clone();
-            let id = id.to_owned();
-            let profile = profile.clone();
-            state
-                .session_service
-                .work
-                .clone()
-                .spawn("acp.restart_wake", async move {
-                    let _submission = state.session_service.prompt_submission(&id).await;
-                    let matches = state.instances.read().await.iter().any(|row| {
-                        row.id == id
-                            && row.lifecycle_generation == generation
-                            && row.source_profile == profile
-                            && row.launch_is_finalized()
-                            && row.ensure_startable().is_ok()
-                    });
-                    let dispatch = state
-                        .session_service
-                        .prompt_dispatch_under_submission(&id, &wake, false, true)
-                        .await;
-                    if matches
-                        && !matches!(
-                            dispatch,
-                            crate::acp::dispatch::PromptDispatch::Queued { .. }
-                        )
-                    {
-                        let result = state
-                            .session_service
-                            .send_turn(
-                                &crate::server::session_service::SessionCaller::User,
-                                &id,
-                                crate::server::session_service::SendTurnRequest {
-                                    resume_authority:
-                                        crate::process::worker_registry::ResumeAuthority::Automatic,
-                                    text: &wake,
-                                    attachments: &[],
-                                    woke_idle_dormant: false,
-                                    prompt_ids: Vec::new(),
-                                    synthesized: true,
-                                    origin: crate::daemon::PromptOrigin::Aoe,
-                                    no_revive: true,
-                                },
-                            )
-                            .await;
-                        if let Err(error) = result {
-                            tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart wake failed");
-                        }
-                    }
-                });
+        if let Some(resets_at) = resumes_rate_limit {
+            continue_interrupted_prompt(state, id, generation, resets_at).await;
         }
         Ok::<_, anyhow::Error>((generation, profile))
     }
@@ -3175,26 +3053,8 @@ fn restart_reason(
     match (origin, body) {
         (RestartOrigin::StartupRecovery, _) => "startup_recovery",
         (_, Some(body)) if body.discard_sandbox_container => "recreate_container",
-        (_, Some(body)) if body.only_if_idle => "agent_update",
         _ => "user",
     }
-}
-
-fn select_restart_wake_message(
-    origin: RestartOrigin,
-    requested: Option<String>,
-    profile: &str,
-) -> String {
-    requested.unwrap_or_else(|| {
-        let session = crate::session::resolve_config(profile)
-            .map(|config| config.session)
-            .unwrap_or_default();
-        if matches!(origin, RestartOrigin::StartupRecovery) && !session.startup_recovery_wake {
-            String::new()
-        } else {
-            session.restart_wake_message
-        }
-    })
 }
 
 pub(super) async fn prepare_agent_session(
@@ -3554,15 +3414,6 @@ async fn prepare_agent_session_inner(
     }
     if state.cityhall_mode && !instance.is_structured() {
         return crate::server::api::cityhall_response();
-    }
-    // The eligibility check that asked for this ran before these locks, and a prompt can land
-    // while it waited, so the idle promise is enforced on the row this request reloaded.
-    if restart.as_ref().is_some_and(|body| body.only_if_idle) && instance.status != Status::Idle {
-        return api_error(
-            StatusCode::CONFLICT,
-            "not_eligible",
-            "Session is busy or its agent is not out of date".to_string(),
-        );
     }
     // #4116: a shelved row refuses every start path with its own code, decided on
     // the row this request reloaded. It answers before the lifecycle reservation,
@@ -3965,7 +3816,6 @@ async fn prepare_agent_session_inner(
     #[cfg(test)]
     launch_hook_gate::pause(&id, launch_hook_gate::Stage::BeforeHooks).await;
     let reason = restart_reason(restart_origin, restart.as_deref());
-    let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
         Ok(Ok(Some((generation, mut started, native, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || {
@@ -4006,7 +3856,6 @@ async fn prepare_agent_session_inner(
                     hooks,
                     account_swap: carry.0,
                     carry: carry.1,
-                    wake: requested_wake_message,
                     reason,
                     defers_rate_limit: matches!(restart_origin, RestartOrigin::Failover { .. }),
                 },
@@ -4222,34 +4071,7 @@ async fn prepare_agent_session_inner(
                 profile: profile.clone(),
             })
         };
-        let mut wake = None;
-        if matches!(
-            outcome,
-            Some(
-                crate::session::StartOutcome::Fresh
-                    | crate::session::StartOutcome::Resumed
-                    | crate::session::StartOutcome::FreshAfterFailedResume { .. }
-            )
-        ) {
-            let wake_message =
-                select_restart_wake_message(restart_origin, requested_wake_message, &profile);
-            if !wake_message.is_empty() {
-                wake = Some((wake_message, row.clone()));
-            }
-        }
         drop(rows);
-        if let Some((wake_message, wake_row)) = wake {
-            // The pace reads configuration, so it resolves outside the guard.
-            let delay = wake_row.send_keys_enter_delay();
-            crate::session::restart::spawn_wake_worker(
-                id.clone(),
-                wake_row.title.clone(),
-                wake_row.tool.clone(),
-                wake_message,
-                Some((profile.clone(), generation)),
-                delay,
-            );
-        }
         tracing::info!(target: "session.restart", session = %id, view = "terminal", reason, "session restarted");
         return crate::server::runtime::session_mutation_response(
             &state,
@@ -4826,7 +4648,6 @@ mod durable_stop_tests {
                 Path(row.id.clone()),
                 Ok(Some(Json(crate::daemon::RestartSessionBody {
                     skip_on_launch: true,
-                    wake_message: Some(String::new()),
                     ..Default::default()
                 }))),
             )
@@ -4978,7 +4799,6 @@ mod durable_stop_tests {
             Path(row.id.clone()),
             Ok(Some(Json(crate::daemon::RestartSessionBody {
                 skip_on_launch: true,
-                wake_message: Some(String::new()),
                 ..Default::default()
             }))),
         )
@@ -5469,72 +5289,4 @@ pub async fn update_session_unread(
     drop(_guard);
     drop(namespace);
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
-}
-
-#[cfg(test)]
-mod restart_wake_tests {
-    use super::{select_restart_wake_message, RestartOrigin};
-
-    #[test]
-    #[serial_test::serial]
-    fn restart_wake_selection_respects_origin_and_profile_policy() -> anyhow::Result<()> {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let config_path = crate::session::get_app_dir()?.join("config.toml");
-        let profile = "wake-policy";
-        let default_message = "wake up: pick up what you were doing";
-        for (global, overrides, recovered, explicit) in [
-            ("", "", "", default_message),
-            (
-                "startup_recovery_wake = false\nrestart_wake_message = '  custom text  '",
-                "",
-                "",
-                "  custom text  ",
-            ),
-            (
-                "startup_recovery_wake = true",
-                "",
-                default_message,
-                default_message,
-            ),
-            (
-                "startup_recovery_wake = true\nrestart_wake_message = '  custom text  '",
-                "",
-                "  custom text  ",
-                "  custom text  ",
-            ),
-            (
-                "startup_recovery_wake = true\nrestart_wake_message = ''",
-                "",
-                "",
-                "",
-            ),
-            (
-                "startup_recovery_wake = false",
-                "startup_recovery_wake = true\nrestart_wake_message = 'profile text'",
-                "profile text",
-                "profile text",
-            ),
-            (
-                "startup_recovery_wake = true",
-                "startup_recovery_wake = false",
-                "",
-                default_message,
-            ),
-        ] {
-            std::fs::write(&config_path, format!("[session]\n{global}\n"))?;
-            let profile_config = toml::from_str(&format!("[session]\n{overrides}\n"))?;
-            crate::session::config::profile_config::save_profile_config(profile, &profile_config)?;
-            for (origin, expected) in [
-                (RestartOrigin::StartupRecovery, recovered),
-                (RestartOrigin::Explicit, explicit),
-            ] {
-                assert_eq!(
-                    select_restart_wake_message(origin, None, profile),
-                    expected,
-                    "global={global:?}, profile={overrides:?}"
-                );
-            }
-        }
-        Ok(())
-    }
 }

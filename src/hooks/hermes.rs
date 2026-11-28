@@ -25,7 +25,7 @@ fn yaml_command_is_aoe(hook: &Value) -> bool {
 fn event_commands(event: &ResolvedHookEvent, target: HookInstallTarget) -> Vec<String> {
     let identity = event
         .identity_field
-        .map(|field| hook_command_session_id(target, field, event.publisher));
+        .map(|field| hook_command_session_id(target, field, event.publisher.as_deref()));
     let status = event
         .status
         .map(|status| hook_command(status.as_str(), target));

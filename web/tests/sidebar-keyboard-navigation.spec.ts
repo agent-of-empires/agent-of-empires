@@ -52,6 +52,29 @@ test("arrow keys skip deleting session rows", async ({ page }) => {
   await expect(page).toHaveURL("/");
 });
 
+test("arrow keys up a scrolled list keep the focused row clear of the pinned title row", async ({ page }) => {
+  const sessions = Array.from({ length: 20 }, (_, i) => ({
+    id: `s-${i}`,
+    title: `row-${i}`,
+    project_path: "/tmp/repo",
+    branch: `b/${i}`,
+  }));
+  await installSidebarMocks(page, { sessions });
+  await page.setViewportSize({ width: 1280, height: 500 });
+  await page.goto("/");
+
+  const rows = page.getByTestId("sidebar-session-row");
+  await expect(rows).toHaveCount(20);
+  await rows.last().focus();
+  const pinned = page.locator('[aria-label="Sessions sidebar"] div.sticky').first();
+  for (let i = 0; i < 19; i++) {
+    await page.keyboard.press("ArrowUp");
+    const box = (await pinned.boundingBox())!;
+    const focusedTop = await page.evaluate(() => document.activeElement!.getBoundingClientRect().top);
+    expect(focusedTop).toBeGreaterThanOrEqual(box.y + box.height - 1);
+  }
+});
+
 // Two repos that are also two Groups, so both axes show two headers of two rows each.
 const twoByTwo: MockSessionInput[] = [
   { id: "s-a1", title: "a-one", project_path: "/tmp/repo-a", branch: "a/one", group: "g-a" },
@@ -61,7 +84,7 @@ const twoByTwo: MockSessionInput[] = [
 ];
 
 async function showAxis(page: Page, axis: string) {
-  const toggle = page.getByTestId("sidebar-axis-toggle");
+  const toggle = page.getByTestId("sidebar-view-toggle");
   await toggle.click();
   await page.getByTestId(`sidebar-axis-option-${axis}`).click();
   await expect(toggle).toHaveAttribute("data-axis", axis);

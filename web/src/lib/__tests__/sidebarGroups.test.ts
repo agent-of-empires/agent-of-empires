@@ -76,9 +76,6 @@ function repoGroup(id: string, over: Partial<RepoGroup> = {}): RepoGroup {
     id,
     repoPath: id,
     displayName: id,
-    defaultDisplayName: id,
-    alias: null,
-    color: null,
     remoteOwner: null,
     remoteOwnerKey: over.remoteOwner ? `${over.remoteOwner}@example.com` : null,
     workspaces: [ws(`${id}-w`, "")],
@@ -162,7 +159,7 @@ describe("buildSessionGroups", () => {
   it("reflects collapse state and exposes no repo-only affordances", () => {
     const [group] = build([ws("w1", "feature")], (id) => id === "feature");
     expect(group!.collapsed).toBe(true);
-    expect(group!.capabilities).toEqual({ appearance: false, reorder: false, create: "generic" });
+    expect(group!.capabilities).toEqual({ reorder: false, create: "generic" });
   });
 
   it("reports liveness", () => {
@@ -175,14 +172,13 @@ describe("repoGroupToSidebarGroup", () => {
   it("maps a real repo with repo capabilities and id keys", () => {
     const sg = repoGroupToSidebarGroup(repoGroup("/repo-a"));
     expect(sg).toMatchObject({ kind: "repo", repoPath: "/repo-a" });
-    expect(sg.capabilities).toEqual({ appearance: true, reorder: true, create: "repo" });
+    expect(sg.capabilities).toEqual({ reorder: true, create: "repo" });
     expect(sg.workspaces[0]).toMatchObject({ key: "/repo-a-w", workspace: { id: "/repo-a-w" } });
   });
 
   it("gives synthetic buckets a generic create action", () => {
     expect(repoGroupToSidebarGroup(repoGroup(MULTI_REPO_GROUP_ID)).capabilities).toMatchObject({
       create: "generic",
-      appearance: true,
     });
   });
 });
@@ -203,7 +199,7 @@ describe("buildNestedSidebarGroups", () => {
       repoGroup("/repo-a", { workspaces: [ws("w1", "feature"), ws("w2", ""), ws("w3", "fix")] }),
     ]);
     expect(nested!.repo).toMatchObject({ kind: "repo", repoPath: "/repo-a" });
-    expect(nested!.repo.capabilities).toEqual({ appearance: true, reorder: false, create: "repo" });
+    expect(nested!.repo.capabilities).toEqual({ reorder: false, create: "repo" });
     expect(nested!.subgroups.map((sg) => [sg.id, sg.kind, sg.groupPath])).toEqual([
       ["feature", "sessionGroup", "feature"],
       ["fix", "sessionGroup", "fix"],
@@ -284,7 +280,7 @@ describe("buildOrgGroups", () => {
 
   it("drops manual reorder on member repos and aggregates their workspaces", () => {
     const [org] = buildOrg([repoGroup("/a", { remoteOwner: "acme" }), repoGroup("/b", { remoteOwner: "acme" })]);
-    expect(org!.repos[0]!.capabilities).toMatchObject({ reorder: false, appearance: true });
+    expect(org!.repos[0]!.capabilities).toMatchObject({ reorder: false });
     expect(wsIds(org!.org)).toEqual(["/a-w", "/b-w"]);
   });
 });
@@ -337,7 +333,7 @@ describe("buildStatusGroups", () => {
   it("reflects collapse state and exposes no repo-only affordances", () => {
     const [group] = buildStatus([ws("w1", "", { status: "Waiting" })], (id) => id === statusGroupId("Waiting"));
     expect(group!.collapsed).toBe(true);
-    expect(group!.capabilities).toEqual({ appearance: false, reorder: false, create: "generic" });
+    expect(group!.capabilities).toEqual({ reorder: false, create: "generic" });
   });
 });
 

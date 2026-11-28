@@ -416,6 +416,7 @@ mod tests {
             detect_cursor_status,
             Status::Idle,
             &[
+                "  changes were allowed, shallow copy approved\n\n  \u{2192} Add a follow-up",
                 "\
   → Add a follow-up
 
@@ -1104,6 +1105,8 @@ run this command? (y/n)
                 "some output\n❯",
                 "some output\n❯ ",
                 "some output\n⚡",
+                // No prompt: `ready_prompt` would outrank the approval rule.
+                "changes were allowed, shallow copy approved",
                 "pondering the question\ntask complete\n❯",
                 "anything",
                 "",

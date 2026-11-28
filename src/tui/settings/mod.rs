@@ -349,6 +349,10 @@ impl SettingsView {
         push_tab(&mut rows, SettingsCategory::Session);
         push_tab(&mut rows, SettingsCategory::Agents);
         push_tab(&mut rows, SettingsCategory::Interaction);
+        // `[keybinds]` is global-only.
+        if scope == SettingsScope::Global {
+            push_tab(&mut rows, SettingsCategory::Keybinds);
+        }
         push_tab(&mut rows, SettingsCategory::Diff);
         push_tab(&mut rows, SettingsCategory::Acp);
 
@@ -607,32 +611,94 @@ impl SettingsView {
         Ok(())
     }
 
-    /// Ensure the selected field is visible within the given viewport height.
-    /// Call this after changing `selected_field`.
-    pub(super) fn ensure_field_visible(&mut self, viewport_height: u16) {
+    /// Content-space top and height of the selected field.
+    fn selected_field_span(&self) -> (u16, u16) {
         let mut y = 0u16;
-        let mut selected_y = 0u16;
-        let mut selected_h = 0u16;
-
         for (i, field) in self.fields.iter().enumerate() {
             let h = self.field_height(field, i);
             if i == self.selected_field {
-                selected_y = y;
-                selected_h = h;
-                break;
+                return (y, h);
             }
             y += h + 1; // +1 spacing
         }
+        (y, 0)
+    }
 
-        // Scroll up if field starts above viewport
-        if selected_y < self.fields_scroll_offset {
-            self.fields_scroll_offset = selected_y;
-        }
-        // Scroll down if field ends below viewport
+    /// Ensure the selected field is visible within the given viewport height.
+    /// Call this after changing `selected_field`. A field taller than the
+    /// viewport shows from its top, so its label stays in view.
+    pub(super) fn ensure_field_visible(&mut self, viewport_height: u16) {
+        let (selected_y, selected_h) = self.selected_field_span();
         let field_bottom = selected_y + selected_h;
-        if field_bottom > self.fields_scroll_offset + viewport_height {
+        if selected_y < self.fields_scroll_offset || selected_h > viewport_height {
+            self.fields_scroll_offset = selected_y;
+        } else if field_bottom > self.fields_scroll_offset + viewport_height {
             self.fields_scroll_offset = field_bottom.saturating_sub(viewport_height);
         }
+    }
+
+    /// Scroll one line through a selected field taller than the viewport,
+    /// so the keyboard reaches all of it before Up/Down leaves it. Returns
+    /// false when the panel has no field rows, the field fits, or its edge in
+    /// that direction is in view.
+    pub(super) fn scroll_within_selected_field(&mut self, up: bool) -> bool {
+        let viewport = self.fields_viewport_height;
+        let (top, height) = self.selected_field_span();
+        // Every field is at least one row, so an empty panel would scroll forever.
+        if viewport == 0 || height <= viewport {
+            return false;
+        }
+        // The wheel or scrollbar moved the view off the field: reveal it first.
+        let offset = self.fields_scroll_offset;
+        if offset >= top + height || offset + viewport <= top {
+            self.ensure_field_visible(viewport);
+            return true;
+        }
+        if up && self.fields_scroll_offset > top {
+            self.fields_scroll_offset -= 1;
+            return true;
+        }
+        if !up && self.fields_scroll_offset + viewport < top + height {
+            self.fields_scroll_offset += 1;
+            return true;
+        }
+        false
+    }
+
+    /// Scroll the selected field's open editor into view: a text or number
+    /// editor's value row, or an open list's header through its selected item
+    /// (its add prompt while adding).
+    pub(super) fn reveal_selected_field_value(&mut self) {
+        let Some(field) = self.fields.get(self.selected_field) else {
+            return;
+        };
+        let (top, height) = self.selected_field_span();
+        let header = top + 1 + self.description_height(&field.description);
+        let (start, end) = match (&field.value, &self.list_edit_state) {
+            (FieldValue::List(_), Some(state)) if !state.adding_new => {
+                (header, header + 2 + state.selected_index as u16)
+            }
+            _ => ((top + height).saturating_sub(1), top + height),
+        };
+        let viewport = self.fields_viewport_height;
+        // When the header and selected item cannot both fit, the item wins.
+        let start = if end - start > viewport {
+            end - 1
+        } else {
+            start
+        };
+        if start < self.fields_scroll_offset {
+            self.fields_scroll_offset = start;
+        } else if end > self.fields_scroll_offset + viewport {
+            self.fields_scroll_offset = end.saturating_sub(viewport);
+        }
+    }
+
+    /// Bring the selected field back into view after it shrinks, keeping the
+    /// offset in range.
+    pub(super) fn clamp_fields_scroll(&mut self) {
+        self.fields_scroll_offset = self.fields_scroll_offset.min(self.max_fields_scroll());
+        self.ensure_field_visible(self.fields_viewport_height);
     }
 
     /// Total height of all field rows plus inter-row spacing, in the same
@@ -1082,8 +1148,11 @@ impl SettingsView {
 
         let (scope_for_fields, global_ref, profile_ref) = self.field_build_inputs();
 
-        let mut scored: Vec<(SearchHit, u32)> = Vec::new();
+        let tokens: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        let mut scored: Vec<(SearchHit, (u32, bool))> = Vec::new();
         for category in self.categories.iter().filter_map(|r| r.as_tab()) {
+            let label = category.label().to_lowercase();
+            let names_tab = tokens.iter().any(|t| label.starts_with(t.as_str()));
             let fields = fields::build_fields_for_category(
                 category,
                 scope_for_fields,
@@ -1094,8 +1163,8 @@ impl SettingsView {
                 if field.is_section_header() {
                     continue;
                 }
-                // The category label is part of the title so "sandbox"
-                // matches (and ranks) every field on the Sandbox tab.
+                // The category label is part of the title so "sandbox" matches every
+                // field on the Sandbox tab; `names_tab` wins them any score tie.
                 let title = format!("{} {}", category.label(), field.label);
                 let full = format!("{} {}", title, field.description);
                 let Some(score) = fuzzy_settings_score(&query, &title, &full) else {
@@ -1109,14 +1178,14 @@ impl SettingsView {
                         category_label: category.label(),
                         value_display: field.display_value(),
                     },
-                    score,
+                    (score, names_tab),
                 ));
             }
         }
 
-        // Stable sort by score descending: ties (and the empty-query case where
-        // every field scores 0) keep their natural (category, field) order.
-        scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+        // Stable sort descending: ties (and the empty query, where every field
+        // scores 0) keep their natural (category, field) order.
+        scored.sort_by_key(|(_, rank)| std::cmp::Reverse(*rank));
         self.search_hits = scored.into_iter().map(|(hit, _)| hit).collect();
         if self.search_selected >= self.search_hits.len() {
             self.search_selected = self.search_hits.len().saturating_sub(1);
@@ -1319,9 +1388,11 @@ mod categories_for_scope_tests {
             "repo-overridable"
         );
         let profile = SettingsView::categories_for_scope(SettingsScope::Profile);
-        assert!(has_tab(&global, SettingsCategory::Systemd));
-        assert!(!has_tab(&profile, SettingsCategory::Systemd), "global-only");
-        assert!(!has_tab(&repo, SettingsCategory::Systemd), "global-only");
+        for cat in [SettingsCategory::Systemd, SettingsCategory::Keybinds] {
+            assert!(has_tab(&global, cat), "{cat:?}");
+            assert!(!has_tab(&profile, cat), "{cat:?} is global-only");
+            assert!(!has_tab(&repo, cat), "{cat:?} is global-only");
+        }
     }
 }
 

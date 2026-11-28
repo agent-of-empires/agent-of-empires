@@ -1,6 +1,7 @@
 import { useId, useRef, useState, type ReactNode } from "react";
 import { layerCount, type SandboxImageBannerView } from "../hooks/useSandboxImageBanner";
 import { writeClipboard } from "../lib/clipboard";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 const WHY = [
   "Sandboxed Sessions run in the current image. Newer AoE versions may need this update, or Structured view stops with an adapter error.",
@@ -17,7 +18,6 @@ const TONES = {
 };
 
 export const CANCEL_NOT_READY = "Available once the Daemon confirms the download.";
-const linkButton = "min-h-8 underline cursor-pointer hover:opacity-80";
 
 /** Top-of-app banner for a newer sandbox image, with the pull and its outcome. */
 export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
@@ -26,7 +26,7 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
       return (
         <Bar tone="brand" status="Sandbox image update available" onDismiss={view.onDismiss}>
           <Image name={view.image} />
-          <button type="button" onClick={view.onUpdate} className={linkButton}>
+          <button type="button" onClick={view.onUpdate} className={BUTTON_INLINE}>
             Update now
           </button>
           <Disclosure label="Why?">
@@ -66,7 +66,7 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
               onClick={view.onCancel}
               disabled={view.cancelling || !view.cancelReady}
               title={view.cancelReady ? undefined : CANCEL_NOT_READY}
-              className={`${linkButton} disabled:opacity-50 disabled:cursor-default`}
+              className={BUTTON_INLINE}
             >
               Cancel
             </button>
@@ -85,7 +85,7 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
       return (
         <Bar tone="brand" status="Update cancelled. Sessions keep the current image." onDismiss={view.onDismiss}>
           {view.onUpdate && (
-            <button type="button" onClick={view.onUpdate} className={linkButton}>
+            <button type="button" onClick={view.onUpdate} className={BUTTON_INLINE}>
               Update now
             </button>
           )}
@@ -103,7 +103,7 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
       return (
         <Bar tone="failed" status={view.message} onDismiss={view.onDismiss}>
           {view.onRetry && (
-            <button type="button" onClick={view.onRetry} className={linkButton}>
+            <button type="button" onClick={view.onRetry} className={BUTTON_INLINE}>
               Retry
             </button>
           )}
@@ -181,7 +181,7 @@ function Image({ name }: { name: string }) {
   return <span className="text-text-subtle break-all">· {name}</span>;
 }
 
-/** A link-styled toggle with its panel below the banner; Escape closes it. */
+/** A toggle with its panel below the banner; Escape closes it. */
 function Disclosure({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const panelId = useId();
@@ -192,7 +192,7 @@ function Disclosure({ label, children }: { label: string; children: ReactNode })
         aria-expanded={open}
         aria-controls={panelId}
         onClick={() => setOpen((o) => !o)}
-        className={linkButton}
+        className={BUTTON_INLINE}
       >
         {label}
       </button>
@@ -229,7 +229,7 @@ export function CopyCommand({ command, announce = false }: { command: string; an
       <code ref={codeRef} className="whitespace-pre-wrap break-all text-text-primary">
         {command}
       </code>
-      <button type="button" onClick={() => void copy()} className={linkButton} aria-label={`Copy ${command}`}>
+      <button type="button" onClick={() => void copy()} className={BUTTON_INLINE} aria-label={`Copy ${command}`}>
         Copy
       </button>
       <span role={announce ? "status" : undefined}>

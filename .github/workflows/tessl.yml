@@ -1,0 +1,37 @@
+name: Tessl
+
+# Token-free checks for the Tessl config: a bad tessl.json block stops sync.
+# https://docs.tessl.io/schedules/validate-in-ci.md
+
+on:
+  pull_request:
+    paths:
+      - 'tessl.json'
+      - '.tessl/**'
+      - 'tessl-plugins/**'
+      - '.tessl-code-review.yml'
+      - '.github/workflows/tessl.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tessl-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate Tessl config
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-tessl-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: tesslio/setup-tessl@v2
+        with:
+          version: '0.123.0'
+      - name: Validate schedules, triggers and actions
+        run: tessl schedule validate
+      - name: Lint aoe-maintainer plugin
+        run: tessl plugin lint tessl-plugins/aoe-maintainer

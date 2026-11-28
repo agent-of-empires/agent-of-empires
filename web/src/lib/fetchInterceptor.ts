@@ -39,6 +39,10 @@ export function isLoginAttemptPath(path: string): boolean {
   );
 }
 
+/** GETs whose failure Home, /suggestions and the plugin views show inline; the sidebar group just hides. */
+// `/api/sessions` is the poll that raises the Daemon unreachable banner, so its own failure is that banner.
+const SELF_REPORTED = new Set(["/api/sessions", "/api/suggestions", "/api/plugins/discover"]);
+
 const ACP_PROMPT_PATH = /^\/api\/sessions\/[^/]+\/acp\/prompt$/;
 
 /** The retryable `worker_not_ready` 503 of a prompt POST to a resuming worker. Reads a clone. */
@@ -67,6 +71,8 @@ export function installFetchErrorToasts(): void {
     const path = toPath(rawUrl);
     const isApi = path.startsWith("/api/");
     const sameOrigin = isSameOrigin(rawUrl);
+    const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+    const toastFailures = isApi && !(method === "GET" && SELF_REPORTED.has(path.split("?")[0]!));
 
     // A 401 or a rotation answers the token the request carried, not one saved while it was in flight.
     const sentToken = sameOrigin ? getToken() : null;
@@ -114,7 +120,7 @@ export function installFetchErrorToasts(): void {
           // Body not JSON; ignore.
         }
       }
-      if (isApi && res.status >= 500 && !isServerDown()) {
+      if (toastFailures && res.status >= 500 && !isServerDown()) {
         // The structured view treats this 503 as "queued, will retry", so don't toast it.
         if (await isTransientWorkerNotReady(res, path)) {
           return res;
@@ -126,8 +132,8 @@ export function installFetchErrorToasts(): void {
       if (err instanceof DOMException && (err.name === "AbortError" || err.name === "TimeoutError")) {
         throw err;
       }
-      // The DisconnectBanner covers a known-down server.
-      if (isApi && !isServerDown() && !isPageLifecycleNetworkGlitch()) {
+      // The DisconnectBanner covers a known-down server and a device with no network.
+      if (toastFailures && !isServerDown() && navigator.onLine !== false && !isPageLifecycleNetworkGlitch()) {
         reportError(`Network error contacting ${path}. Check your connection.`);
       }
       throw err;

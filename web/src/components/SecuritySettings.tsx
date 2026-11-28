@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
+import { CARD, CAPTION } from "../lib/surfaces";
+
 import { fetchAbout, type ServerAbout } from "../lib/api";
 
 function Row({ label, value }: { label: string; value: string | React.ReactNode }) {
   return (
     <div className="flex items-start justify-between gap-4 py-2 border-b border-surface-700/40 last:border-0">
-      <span className="font-mono text-[11px] uppercase tracking-wider text-text-muted">{label}</span>
+      <span className="text-[13px] text-text-secondary">{label}</span>
       <span className="text-[13px] text-text-primary text-right">{value}</span>
     </div>
   );
@@ -35,11 +37,11 @@ export function SecuritySettings() {
 
   return (
     <div>
-      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">Security</h3>
+      <h3 className={CAPTION}>Security</h3>
 
       {loadError && <p className="text-[13px] text-status-error mb-3">Could not load server status.</p>}
 
-      <div className="rounded-lg border border-surface-700/50 bg-surface-900 px-4 py-2">
+      <div className={`${CARD} py-2`}>
         <Row
           label="Auth mode"
           value={

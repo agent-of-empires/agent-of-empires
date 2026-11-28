@@ -9,7 +9,7 @@ describe("settingTags", () => {
     ["restart", descriptor({ section: "logging", field: "output", label: "L", restart: true }), ["Needs restart"]],
     [
       "web_only",
-      descriptor({ section: "session", field: "show_session_colors", label: "L", web_only: true }),
+      descriptor({ section: "web", field: "auto_open_diff_pane", label: "L", web_only: true }),
       ["Web dashboard only"],
     ],
     ["tui_only", descriptor({ section: "session", field: "f", label: "L", tui_only: true }), ["Terminal app only"]],

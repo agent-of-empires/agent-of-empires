@@ -224,6 +224,16 @@ _Avoid_: server, agent daemon
 A program that pilots a Daemon: the TUI, the CLI or the Web dashboard. Target (#2734): reaches the Daemon only through its API, holding no Session runtime state. Today the Web dashboard and both local and remote TUI use the Daemon for canonical Session state; the CLI cutover is incomplete.
 _Avoid_: surface, frontend
 
+**Client-only build**:
+An `aoe` build without the Daemon. It cannot start one, so it only pilots a Daemon that is already running. Target (#4504): what Windows ships.
+
+**Pane lifecycle**:
+Creating, respawning and killing the tmux sessions that host a Session's panes, and syncing their environment. Target (#3840): owned by the Daemon.
+_Avoid_: tmux ownership
+
+**Pane I/O**:
+Reading and writing an existing pane without changing its lifecycle: Attach, Live-send, capture and the live preview stream. The TUI does it locally; the Daemon does it for the Web dashboard terminal.
+
 **Remote Daemon**:
 A Daemon on another machine that a Client reaches over the network. Plain Daemon means the one on the user's own machine.
 _Avoid_: remote server, host

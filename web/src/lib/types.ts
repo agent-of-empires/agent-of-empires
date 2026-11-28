@@ -1,7 +1,22 @@
 import type { RateLimitInfo } from "./acpTypes";
-import type { RepoColor } from "./repoAppearance";
-import type { AgentLifecycleInfo } from "./agentProfiles";
+import type { AgentProfile } from "./agentProfile";
 import type { SchemaSettings } from "./generated/settingsKeys";
+
+export interface AuxiliaryObservation {
+  target: { kind: "host"; index: number } | { kind: "container"; index: number } | { kind: "tool"; tool_name: string };
+  state: "absent" | "alive" | "dead" | "unknown";
+  tmux_session?: string | null;
+}
+
+/** Mirrors `AgentLifecycle` in src/agents.rs. */
+export type AgentLifecycleInfo =
+  | { state: "active" }
+  | {
+      state: "deprecated";
+      since: string;
+      note: string;
+      replacement: string | null;
+    };
 
 export interface SessionResponse {
   id: string;
@@ -29,6 +44,10 @@ export interface SessionResponse {
   /** Last transition into Idle; unlike `last_accessed_at`, viewing does not bump it. */
   idle_entered_at: string | null;
   last_error: string | null;
+  /** Why the initial prompt was not typed into this terminal session. */
+  initial_prompt_error?: string | null;
+  /** `agent_folder_not_trusted`, `agent_bypass_not_accepted`, or absent for other causes. */
+  initial_prompt_error_code?: string | null;
   branch: string | null;
   main_repo_path: string | null;
   /** Base branch of an AoE-created worktree; null for pre-existing or default branches. */
@@ -48,7 +67,6 @@ export interface SessionResponse {
    *  scratch sessions out. */
   scratch: boolean;
   favorited: boolean;
-  color?: string | null;
   urgent?: boolean;
   /** Web pin time; `pinned_at != null` is the pinned state. */
   pinned_at?: string | null;
@@ -67,6 +85,8 @@ export interface SessionResponse {
   /** Renaming also moves the worktree directory. */
   tie_workdir_to_name?: boolean;
   has_terminal: boolean;
+  /** The Daemon's latest look at the Session's paired shells and tool panes. */
+  auxiliary?: AuxiliaryObservation[];
   profile: string;
   cleanup_defaults: CleanupDefaults;
   remote_owner: string | null;
@@ -103,17 +123,13 @@ export interface SessionResponse {
   acp_provider?: string;
   /** Switching views preserves the conversation (server-computed). */
   keeps_context?: boolean;
-  /** Slash commands that reset the conversation for this agent. */
-  clear_aliases?: string[];
-  /** Slash commands that compact the conversation for this agent. */
-  compact_aliases?: string[];
+  /** The agent's capabilities and classifier data; absent from an older daemon. */
+  agent_profile?: AgentProfile;
   /** The agent implements ACP `session/fork` (resume-only agents do not). */
   acp_can_fork?: boolean;
-  /** The agent binary was replaced after launch and a restart is safe to offer now. */
-  update_restart?: boolean;
   /** `acp.structured_view = off` for this session: a terminal session cannot switch to structured. */
   structured_view_off?: boolean;
-  /** Claude's fullscreen renderer is on, so mobile skips copy-mode scrollback workarounds. */
+  /** @deprecated Read `agent_profile.fullscreen`. */
   claude_fullscreen: boolean;
   workspace_repos: WorkspaceRepoSummary[];
   /** Non-fatal notes: on create, rename, trash and restore responses. */
@@ -284,9 +300,6 @@ export interface RepoGroup {
   id: string;
   repoPath: string;
   displayName: string;
-  defaultDisplayName: string;
-  alias: string | null;
-  color: RepoColor | null;
   remoteOwner: string | null;
   /** "owner@host"; null when `remoteOwner` is null. */
   remoteOwnerKey: string | null;
@@ -438,6 +451,10 @@ export interface CreateSessionRequest {
   repo_bases?: { repo: string; base_branch: string }[];
   command_override?: string;
   custom_instruction?: string;
+  /** Typed into the agent as its first turn once it is ready. */
+  initial_prompt?: string;
+  /** Links the new Session to the suggestion it starts from; omitted by "Start another". */
+  suggestion?: { provider_id: string; id: string };
   profile?: string;
   view?: "structured" | "terminal";
   agent_model?: string;
@@ -605,4 +622,151 @@ export interface SettingsFieldDescriptor {
   default?: unknown;
   /** Plugin field that can also be set per registered project. */
   per_project?: boolean;
+}
+
+export interface SuggestionSource {
+  criterion: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+  /** Placeholder names every item of this criterion carries. */
+  variables: string[];
+  /** Set when open items of this kind start on their own, at most `cap` per refresh. */
+  auto_start?: { cap: number } | null;
+}
+
+/** How a kind starts a Session. `prompt` is a template with `{variables}` filled from each item; null uses the plugin's own prompt. */
+export interface SuggestionPreset {
+  agent: string;
+  view: "structured" | "terminal";
+  worktree: boolean;
+  sandbox: boolean;
+  yolo: boolean;
+  prompt: string | null;
+}
+
+export interface SuggestionPresetEntry {
+  provider_id: string;
+  criterion: string;
+  preset: SuggestionPreset;
+  customized: boolean;
+  defaults: SuggestionPreset;
+}
+
+/** One setup check a provider reports. `detail` and `fix` are provider text and untrusted. */
+export interface SuggestionSetupCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+  fix: string;
+}
+
+export interface SuggestionProvider {
+  id: string;
+  name: string;
+  status: "pending" | "ok" | "error";
+  error?: string;
+  enabled: boolean;
+  /** Unix seconds of the last report; absent before the first one. */
+  updated_at?: number;
+  /** The provider runs an agent itself, which spends the user's agent usage. */
+  uses_agent?: boolean;
+  /** Present with an error: the plugin's own one-step fix. */
+  fix?: { label: string };
+  /** A refresh the host requested is unanswered. */
+  refreshing?: boolean;
+  sources: SuggestionSource[];
+  checks?: SuggestionSetupCheck[];
+}
+
+/** The oldest live Session started from a suggestion. */
+export interface StartedSession {
+  id: string;
+  title: string;
+  status: SessionStatus;
+  archived: boolean;
+  created_at: string;
+  /** How the link was claimed: one-click Start or Start with changes. Older links read as "wizard". */
+  started_via?: "start" | "wizard";
+  /** The exact prompt a one-click Start sent; null for a wizard Session or an older link. */
+  initial_prompt?: string | null;
+  /** From the live sessions poll, not the snapshot. */
+  initial_prompt_error?: string | null;
+  initial_prompt_error_code?: string | null;
+}
+
+export interface SuggestionPrefs {
+  homepage: boolean;
+  sidebar: boolean;
+  refresh_minutes: number;
+  /** Rows show each item's `source_ref`. */
+  show_source_ref: boolean;
+  /** Every provider id, in the order the user set. */
+  provider_order: string[];
+}
+
+export interface SuggestionMapping {
+  provider_id: string;
+  mapping_key: string;
+  /** Registered Project paths; the first is primary. */
+  projects: string[];
+}
+
+/** A registered Project a mapping may name, with the `owner/repo` of its git `origin`. */
+export interface SuggestionProject {
+  name: string;
+  path: string;
+  origin: string | null;
+}
+
+/** `preview` and `reason` are provider text and untrusted; only `draft` seeds a prompt. */
+export interface SuggestionItem {
+  id: string;
+  provider_id: string;
+  title: string;
+  reason: string;
+  source_url: string;
+  source_ref: string;
+  preview: string;
+  project?: string | null;
+  criterion: string;
+  mapping_key?: string | null;
+  variables?: Record<string, string>;
+  draft: { title: string; prompt: string };
+  dismissed: boolean;
+  started_session?: StartedSession;
+  /** What Start would run for this item, resolved for its Project. */
+  start?: {
+    agent: string;
+    view: "structured" | "terminal";
+    worktree: boolean;
+    sandbox: boolean;
+    project?: { name: string; path: string };
+  };
+  /** The source closed or changed; the row is dimmed and cannot start. */
+  stale?: boolean;
+  /** The registered Project the item resolves to; the provider's `project` is only a hint. */
+  resolved_project?: { name: string; path: string } | null;
+  /** Why auto start left this item alone, or that its start failed. */
+  auto_note?: string;
+}
+
+export interface SuggestionsSnapshot {
+  providers: SuggestionProvider[];
+  items: SuggestionItem[];
+  prefs: SuggestionPrefs;
+}
+
+export interface SuggestionPrepared {
+  title: string;
+  initial_prompt: string;
+  source_ref: string;
+  project: { name: string; path: string } | null;
+  tool: string;
+  /** The view a new session opens in, resolved like the wizard's default. */
+  view: "structured" | "terminal";
+  yolo: boolean;
+  sandbox: boolean;
+  worktree: boolean;
 }

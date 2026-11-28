@@ -317,6 +317,58 @@ fn restart_selected_session_requests_unsnooze_without_a_local_write() {
     );
 }
 
+/// Outside Attention a snooze toggle has no row marker to show, so the flash is
+/// the only confirmation. It must wait for the snapshot that carries the
+/// change rather than claim it on admission.
+#[test]
+#[serial]
+fn snooze_flash_waits_for_the_applied_snapshot() {
+    use crate::session::config::SortOrder;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.sort_order = SortOrder::Newest;
+    let mut respond = env.view.session_feed.command_driver_for_test();
+
+    env.view.snooze_session_for(&id, 30).expect("admission");
+    assert_eq!(
+        env.view.status_flash_text(),
+        None,
+        "a submitted snooze must not announce itself before the snapshot"
+    );
+    // A snapshot taken before the daemon applied it leaves the message queued.
+    assert!(!env.view.apply_pending_snooze_flash());
+    assert!(env.view.pending_snooze_flash.is_some());
+
+    env.view.mutate_instance(&id, |inst| inst.snooze(30));
+    assert!(env.view.apply_pending_snooze_flash());
+    assert_eq!(env.view.status_flash_text(), Some("Snoozed for 30m"));
+    assert!(env.view.pending_snooze_flash.is_none());
+    respond(Ok(crate::daemon::RuntimeCursor {
+        epoch: "test".into(),
+        revision: 2,
+    }));
+
+    // Waking reports the same way, again only once the row proves it.
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.sort_order = SortOrder::Newest;
+    env.view.mutate_instance(&id, |inst| inst.snooze(30));
+    let mut respond = env.view.session_feed.command_driver_for_test();
+
+    env.view.toggle_snooze_at_cursor().expect("admission");
+    assert_eq!(env.view.status_flash_text(), None);
+    env.view.mutate_instance(&id, |inst| inst.unsnooze());
+    assert!(env.view.apply_pending_snooze_flash());
+    assert_eq!(env.view.status_flash_text(), Some("Unsnoozed"));
+    respond(Ok(crate::daemon::RuntimeCursor {
+        epoch: "test".into(),
+        revision: 2,
+    }));
+}
+
 #[test]
 #[serial]
 fn restart_selected_session_skips_creating_row() {
@@ -600,6 +652,7 @@ fn build_flat_items_by_org_groups_by_resolved_owner() {
                     membership.insert(inst.title.clone(), current_group.clone().unwrap());
                 }
             }
+            _ => {}
         }
     }
 
@@ -728,13 +781,12 @@ fn project_grouping_survives_attention_sort() {
         for item in &env.view.flat_items {
             match item {
                 Item::Group { name, .. } => current_group = Some(name.clone()),
-                Item::Session { id, .. } => {
-                    if current_group.as_deref() == Some("alpha") {
-                        if let Some(inst) = env.view.instances.get(id) {
-                            alpha_session_order.push(inst.title.clone());
-                        }
+                Item::Session { id, .. } if current_group.as_deref() == Some("alpha") => {
+                    if let Some(inst) = env.view.instances.get(id) {
+                        alpha_session_order.push(inst.title.clone());
                     }
                 }
+                _ => {}
             }
         }
         assert_eq!(
@@ -1834,7 +1886,7 @@ fn group_by_toggle_preserves_selected_session() {
             .expect("cursor must point into flat_items");
         match cursor_item {
             Item::Session { id, .. } => assert_eq!(id, &target_id),
-            Item::Group { .. } => panic!("cursor landed on a group header, not the session"),
+            _ => panic!("cursor landed on a non-session row"),
         }
     }
     // Newest to Attention under Project grouping.
@@ -2466,7 +2518,7 @@ fn archived_section_nests_by_project_in_project_mode() {
             .iter()
             .filter(|it| match it {
                 Item::Group { path, .. } => is_within_archived_section(path),
-                Item::Session { .. } => false,
+                _ => false,
             })
             .collect();
         assert_eq!(
@@ -3130,6 +3182,7 @@ fn status_grouping_orders_headers_and_persists_collapse() {
                 view.get_instance(id)
                     .map_or("?", |inst| inst.title.as_str())
             ),
+            other => panic!("unexpected row {other:?}"),
         })
         .collect();
     assert_eq!(

@@ -57,9 +57,10 @@ without a token. To connect an agent, see
 | --- | --- | --- |
 | `list_sessions` | `state` (`live`, default, or `all`), `group` (exact path and descendants), `children_of` (direct parent id) | The `{sessions, workspace_ordering}` envelope from the published canonical snapshot. |
 | `whoami` | none | `{session}`: the calling session (same row shape as `GET /api/sessions`) when the request carries its own session credential, `null` otherwise. |
-| `create_session` | `path`, `tool`, and optionally `title`, `view` (`terminal`, default, or `structured`), `agent_name`, `agent_model`, `agent_effort`, `group`, `worktree_enabled`, `worktree_branch`, `create_new_branch`, `base_branch`, `sandbox`, `sandbox_image`, `yolo_mode`, `profile`, `prompt`, `parent_session_id`, `idempotency_key` | `{session, fresh, prompt_sent, prompt_delivery, prompt_error?}`. `fresh` is false when `idempotency_key` matched an earlier create, whose session it returns. `prompt_delivery` is one of: `none` (no `prompt`); `pending_initial_turn` (a structured session stored it as its first turn); `sent` (typed into a terminal session once its agent's status rules show an empty or live input box); `blocked_waiting` (the terminal agent is waiting on a dialog, such as Claude's folder-trust question, so nothing was typed: a person answers it in the terminal, then `send` the prompt); `not_ready` (the terminal agent did not reach its input prompt within 30 s, so nothing was typed; an agent without a status manifest has no input-prompt rule to read, so it gets `not_ready` at once. `send` can deliver the prompt, but it has no dialog check for such an agent either, so check the pane first (`read_output`)); `ignored` (the session was ignored, because another session manages it, before the prompt could be typed, so nothing was typed: take ownership back, then `send` the prompt); `not_running` (the terminal session did not start); `replayed` (a retry of an earlier create with the same key; the prompt is not delivered again, and the first create's outcome is not reported, so read it with `read_output`); `failed` (typing it failed). `prompt_error` explains `failed`, `blocked_waiting`, `not_ready` and `ignored`. A `prompt` that strips to nothing is refused with `invalid_request`. An omitted `parent_session_id` defaults to the calling session when that session is top-level, in the profile being created in, and no `group` is given; otherwise the new session is top-level. |
-| `send` | `session_id`, `message` | `{disposition, reason?, queued_id?, seq?}`. A structured session reports `sent`, `steered` or `queued` and the prompt's event `seq`; a terminal session reports `sent` with no seq. A message that strips to nothing is refused with `invalid_request` in either view. A terminal session is refused with `waiting`, and nothing is typed, when its agent's status rules detect a dialog or question waiting on a person (such as Claude's folder-trust question), or, for an agent with a status manifest, when its pane can't be captured. This check is only as good as those rules: a dialog they don't recognise, or any pane of an agent without a status manifest, is typed into, so `send` is not a way to keep an agent's questions or approvals for a person. HTTP `POST /send` still types into such a pane. A stopped terminal session is refused with `not_running`; `send` doesn't start it. A structured prompt that was recorded before its agent stopped is refused with `send_failed`; `read_output` shows it, so don't resend it. A structured prompt held for the sandbox login, or because the session's `before_start` hook failed, stays in the queue and is refused with `send_failed` naming its `queued_id`; it goes out after the login, so don't resend it. |
+| `create_session` | `path`, `tool`, and optionally `title`, `view` (`terminal`, default, or `structured`), `agent_name`, `agent_model`, `agent_effort`, `group`, `worktree_enabled`, `worktree_branch`, `create_new_branch`, `base_branch`, `sandbox`, `sandbox_image`, `yolo_mode`, `profile`, `prompt`, `parent_session_id`, `idempotency_key` | `{session, fresh, prompt_sent, prompt_delivery, prompt_error?, prompt_error_code?}`. `fresh` is false when `idempotency_key` matched an earlier create, whose session it returns. `prompt_delivery` is one of: `none` (no `prompt`); `pending_initial_turn` (a structured session stored it as its first turn); `sent` (typed into a terminal session once its agent's status rules show an empty or live input box); `blocked_waiting` (the terminal agent is waiting on a dialog, such as Claude's folder-trust question, so nothing was typed: a person answers it in the terminal, then `send` the prompt); `not_ready` (the terminal agent did not reach its input prompt within 30 s, or its input box held a person's unsent text, so nothing was typed; an agent without a status manifest has no input-prompt rule to read, so it gets `not_ready` at once. `send` can deliver the prompt, but it has no dialog check for such an agent either, so check the pane first (`read_output`)); `ignored` (the session was ignored, because another session manages it, before the prompt could be typed, so nothing was typed: take ownership back, then `send` the prompt); `not_running` (the terminal session did not start); `replayed` (a retry of an earlier create with the same key; the prompt is not delivered again, and the first create's outcome is not reported, so read it with `read_output`); `failed` (typing it failed). `prompt_error` explains `failed`, `blocked_waiting`, `not_ready` and `ignored`. `prompt_error_code` is `input_line_busy` when the input box held a person's draft, the code `send` returns for one; it is absent otherwise. With `input_line_busy`, nothing was typed, whether `prompt_delivery` is `not_ready` or `failed`: once the draft clears, `send` the prompt to the returned session, since a retried create with the same key is `replayed` and doesn't deliver it. A `prompt` that strips to nothing is refused with `invalid_request`. An omitted `parent_session_id` defaults to the calling session when that session is top-level, in the profile being created in, and no `group` is given; otherwise the new session is top-level. |
+| `send` | `session_id`, `message` | `{disposition, reason?, queued_id?, seq?}`. A structured session reports `sent`, `steered` or `queued` and the prompt's event `seq`; a terminal session reports `sent` with no seq. A message that strips to nothing is refused with `invalid_request` in either view. A terminal session is refused with `waiting`, and nothing is typed, when its agent's status rules detect a dialog or question waiting on a person (such as Claude's folder-trust question), or, for an agent with a status manifest, when its pane can't be captured. It is refused with `input_line_busy`, without waiting, when Claude Code's input box holds text a person typed and has not sent. This check is only as good as those rules: a dialog they don't recognise, or any pane of an agent without a status manifest, is typed into, so `send` is not a way to keep an agent's questions or approvals for a person. HTTP `POST /send` still types into such a pane. A stopped terminal session is refused with `not_running`; `send` doesn't start it. A structured prompt that was recorded before its agent stopped is refused with `send_failed`; `read_output` shows it, so don't resend it. A structured prompt held for the sandbox login, or because the session's `before_start` hook failed, stays in the queue and is refused with `send_failed` naming its `queued_id`; it goes out after the login, so don't resend it. |
 | `send_to_parent` | `message` | What `send` returns, for a prompt sent to the calling session's parent. Listed in `tools/list` only when the caller has a parent in its own profile that is neither archived nor trashed; otherwise refused with `no_parent`. |
+| `suggest_session` | `title`, `prompt`, and optionally `reason`, `project`, `id` | `{id}`. Adds a suggestion under Suggested sessions (the built-in Agent provider, [guide](guides/suggested-sessions.md#without-a-plugin)); the same `id` replaces it. The item's source reads as the calling session's title. |
 | `read_output` | `session_id`, `since` and `raw` (structured), `lines` (terminal, 1 to 2000, default 200) | A structured session's transcript after `since` as text, or its raw events, with `next_since` and `has_more`; a terminal session's pane capture. A text page holds whole events up to 48 KB, so following `next_since` reads every event once; one event that alone renders past 48 KB comes back whole as the only event on its page. |
 | `wait_for` | `session_id`, and optionally `states` (HTTP status spellings; default `Idle`, `Waiting`, `Stopped`, `Error`), `timeout_s` (default 60, at most 300), `after_seq` (structured) | `{status, timed_out, messages?, next_since?, has_more?, pending_approvals}`. Returns as soon as the status is in `states`, including when it already is; on timeout, `timed_out` is true and `status` is the current one. With `after_seq` (the `seq` from `send`), `Idle` counts only once that turn has ended, and `messages` is the transcript after it, paged like `read_output`; a terminal session ignores it. A session being deleted is refused with `not_found`, and a daemon shutting down with `busy`. |
 | `list_approvals` | `session_id` | `{approvals}`: a structured session's pending approvals, each `{nonce, tool_name, summary, destructive, choice, options}`. Empty for a terminal session, or while the agent is not running. |
@@ -78,14 +79,14 @@ caller, so one session can list every session.
 Every tool declares an `outputSchema` and returns `structuredContent`. A refusal is a
 tool error (`isError`) whose `structuredContent` carries a `code`, such as
 `read_only`, `not_found`, `not_running`, `busy` (retryable), `invalid_request`,
-`waiting` (a terminal pane shows a dialog), `send_failed`, `internal`, `no_parent`, `parent_not_found`, `parent_is_sub_session` or
+`waiting` (a terminal pane shows a dialog), `input_line_busy` (a terminal agent's input box holds a person's unsent text), `send_failed`, `internal`, `no_parent`, `parent_not_found`, `parent_is_sub_session` or
 `hooks_need_trust`, and a `message`.
 `create_session` takes no hook-trust, callback, command-override, environment or
 fork fields, so repository hooks that need approval are refused with
 `hooks_need_trust` until someone trusts them in the dashboard.
 Listing does not persist workspace ordering or rebuild rows from mutable state.
 Read-only mode permits `list_sessions`, `whoami`, `read_output`, `wait_for` and
-`list_approvals`, and refuses `create_session`, `send`, `send_to_parent` and `approve`
+`list_approvals`, and refuses `create_session`, `send`, `send_to_parent`, `suggest_session` and `approve`
 with `read_only`. CityHall rejects `POST /mcp` with `403`,
 as it does other non-allowlisted POST routes, including over the owner socket.
 MCP POST requests remain tracked runtime work: shutdown interrupts them, and a
@@ -279,6 +280,43 @@ including updates whose recorded source is local. Other principals receive
 Preview and apply retain read-only and CityHall restrictions; apply also requires
 elevation. See [plugin consent and job recovery](plugins.md#installing-external-plugins).
 
+## Sandbox login
+
+With `sandbox.shared_credential = "separate_login"`, these endpoints run the same login as [`aoe sandbox login`](cli/reference.md#aoe-sandbox-login) for the daemon's profile, or for the `profile` a request names. One login runs at a time. The sign-in link and the code never appear in logs or error text.
+
+The login belongs to one shared credential file per profile and agent tool. `tool` names the agent whose file to read or log in (default: the profile's default tool when it has a sandbox login, else the only agent that has one): a wrapper agent with its own `session.agent_config_dir` entry has a file of its own, and a session of it waits on that file. The file follows the command the tool launches (`agent_command_override`, else `custom_agents`, else the built-in agent), as the launch gate reads it. `command` is the command a session's launch runs for `tool` when it has its own, the same value `aoe sandbox login --command` takes and the `command` of a `sandbox_login_required` error; it needs `tool` (without it the request answers `400` `sandbox_login_command_needs_tool`), and an empty one counts as none. Send what the error named: a session with its own command waits on that command's file, which the profile's command for the tool does not reach. `profile` is the profile of the session, the same value `aoe -p` takes and the `profile` of a `sandbox_login_required` error: the file, the default tool, the status and the login are those of that profile. Absent or empty is the daemon's profile. A name that is not an existing profile answers `400` `sandbox_login_unknown_profile`. Unlike `command`, `profile` does not need `tool`: without it the tool is that profile's default, as `aoe -p <profile> sandbox login` resolves it. Status, `running` and `held_sessions` describe that file only. A start while a login for another tool's file runs answers `409` `sandbox_login_busy`, and a tool with no sandbox login (or none named or implied) answers `400` `sandbox_login_tool_unsupported`.
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /api/sandbox/login?tool=&command=&profile=` | `{"status": {"state": "needed" \| "ok" \| "not_applicable"}, "running": {"login_id"} \| null, "held_sessions"}` for the file of `tool` and `command` under `profile`. On Apple Container a login that is needed reads `not_applicable` with `"reason"` carrying the refusal message; a usable credential still reads `ok`. Needs no elevation and never returns the link. |
+| `POST /api/sandbox/login` | Optional body `{"force": false, "tool": "<tool>", "command": "<command>", "profile": "<profile>"}` (at most 4 KiB). Starts a login for the file of `tool` and `command` under `profile`, or returns the running one: `{"login_id", "url", "lease"}`. `force` logs in again although the credential is usable. An optional `"lease"` (1 to 64 letters, digits, `-` or `_`) is the dialog's own lease: a start repeated with it returns the same lease, so a dialog that lost the answer can still leave. |
+| `DELETE /api/sandbox/login?lease=` | A dialog that never got the answer to its start leaves by the lease it chose, without the login id. Ends the login only with its last lease; a lease nobody holds changes nothing. `204`, or `400 invalid_lease` when `lease` is missing or not an id. |
+| `POST /api/sandbox/login/{login_id}/code` | Body `{"code"}` (at most 4 KiB). Hands the code to the login client: `{"ok": true}`. |
+| `GET /api/sandbox/login/{login_id}` | `{"outcome": "succeeded" \| "failed" \| "pending" \| "unknown"}`: what the code exchange of that login came to, for a client that lost the answer to its code. An exchange in progress is waited for (up to 5 s); `pending` while the login still waits for its code or the exchange runs longer; `unknown` for an id that never exchanged a code or is no longer remembered. Needs no elevation. |
+| `DELETE /api/sandbox/login/{login_id}?lease=` | A dialog leaves the login. Dialogs for one credential share a login and each start returns its own `lease`; the login ends with the last lease, or at once without `lease`. `204`, also when it already ended. A code exchange in progress is left to settle. |
+
+The mutating endpoints need a read-write server and an elevated session when login is enabled, and are unavailable in CityHall mode. Errors are `{"error", "message"}`:
+
+| Status | `error` | When |
+| --- | --- | --- |
+| `400` / `415` / `422` | none | The JSON body is malformed, has the wrong content type or the wrong field types. An unelevated caller gets the `403` first |
+| `400` | `invalid_code` | The code is malformed. Nothing reached the login client and the same `login_id` accepts a corrected code |
+| `400` | `sandbox_login_command_needs_tool` | A `command` came without the `tool` it is for (the status read answers it too) |
+| `400` | `sandbox_login_unknown_profile` | A `profile` that is not an existing profile (the status read answers it too) |
+| `404` | `login_not_found` | Unknown `login_id`, or that login already ended |
+| `409` | `sandbox_login_not_separate_login` | The setting is `host_seed` |
+| `409` | `sandbox_login_already_ok` | The credential is usable; send `force` to log in again |
+| `409` | `sandbox_login_cancelled` | The login was cancelled while the request waited, or the daemon is shutting down |
+| `409` | `sandbox_login_busy` | Another process runs a login for the same credential file, or this daemon runs one for another tool's file |
+| `409` | `sandbox_login_unsupported` | The container runtime is Apple Container, which cannot run the login helper, and a login is wanted (the credential is unusable, or `force` was sent); `message` says to use `host_seed` or Docker/Podman. A usable credential answers `sandbox_login_already_ok` instead |
+| `413` | none | The request body is over 4 KiB |
+| `500` | `internal` | An unexpected helper failure; the detail is in the daemon log only |
+| `422` | `sandbox_login_no_url` | The login client printed no sign-in link; `message` holds its redacted output |
+| `422` | `login_failed` | The login client rejected the code or the login failed. The login has ended: start a new one for a new link |
+| `504` | `sandbox_login_timeout` | No link or no answer in time |
+
+After a successful code, the sessions that waited for the login resume within one reconciler tick. The startup error that keeps a session waiting is an `AgentStartupError` event whose `cause` is `{"kind": "sandbox_login_required"}`, which the dashboard keys its Log in button on, with the `profile` and, when the recovery needs it, the `command` of the `409` above inside `cause`. The dashboard shows the message as the server wrote it and starts the login with that `command` and `profile`, so the login lands in the file the session waits on, as the `-p <profile>` in the message says.
+
 ## Runtime CLI reads
 
 The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws`, over the Daemon's local Unix socket by default and over HTTP when `--daemon-url` or `AOE_DAEMON_URL` selects an endpoint. `/api/runtime/ws` remains the separate TUI stream.
@@ -410,7 +448,7 @@ read `sessions`; the array is never returned unwrapped.
 `aoe-runtime-epoch` and `aoe-runtime-revision` identify the exact returned
 snapshot. Revisions are decimal unsigned 64-bit integers; clients must preserve
 their precision. A stale list must not replace newer canonical rows or ordering.
-Color and notification mutation receipts identify one session: another session
+Notification mutation receipts identify one session: another session
 at a higher revision cannot satisfy that receipt.
 
 **Query parameters**
@@ -439,6 +477,15 @@ an object tagged by `state`, with a `reason` on every state but `available`.
 
 A daemon older than this field omits it entirely. Treat an absent
 `context_resume` as unreported rather than as `unavailable`.
+
+Each row carries `agent_profile`, the server-side profile of the agent that
+classifies the session's prompts and tool calls (reset and compact aliases,
+capability gates, card aliases, the daemon-evaluated `fullscreen` setting).
+`agent_profile.v` is its shape version; a client must ignore a profile with a
+`v` it does not know. The top-level `clear_aliases` and `compact_aliases` are
+removed (read `agent_profile.clear_aliases` and `agent_profile.compact_aliases`).
+`claude_fullscreen` is deprecated in favor of `agent_profile.fullscreen` and is
+removed in the next minor release.
 
 **Example**
 
@@ -680,7 +727,8 @@ remain sanitized rather than exposing their internal causes.
 `initial_prompt` is sent to the agent as its first turn, never before the
 agent is ready. Structured sessions deliver it once the worker is live and
 retry until it lands. A terminal session running an agent with a ready marker
-waits up to 60 seconds for that marker, then types it. A shell, a
+waits up to 60 seconds for that marker, then types it. A terminal session that has not been launched (`aoe add` without
+`--launch`, status `stopped`) keeps its prompt until the agent starts. A shell, a
 command-override session or an agent without a ready marker is refused
 immediately and surfaces `initial_prompt_error`. On timeout nothing is typed;
 a send error can leave partial input in the pane. Either way the session row
@@ -689,7 +737,10 @@ its one-time Bypass Permissions screen stop the wait within about a second;
 nothing is typed and neither screen is ever accepted for the user. The row
 then also carries `initial_prompt_error_code`: `agent_folder_not_trusted`
 (turn on `session.pre_trust_agent_folders`, or trust the folder once) or
-`agent_bypass_not_accepted` (open the session once and accept it). The code is
+`agent_bypass_not_accepted` (open the session once and accept it). Text a
+person typed into Claude Code's input box and has not sent keeps the wait
+going; if it is still there at the end, nothing is typed and the code is
+`input_line_busy`. The code is
 absent for every other failure, which has only the message. A failed terminal prompt is not retried, unless
 persisting the error fails: the error then lives only in memory and a daemon
 restart retries the prompt. A consumed turn whose clear cannot be persisted is suppressed until a daemon restart, which can retype it. A crash between delivery and bookkeeping can
@@ -905,6 +956,10 @@ PUT accepts `{ "path", "version", "content" }` for an existing project UTF-8 tex
 
 Read-only and CityHall modes return 403. Escaping paths, binary files, and unverified or separate Sandbox volumes cannot be edited. The browser's opt-in setting and workflow are described in [Editing project files](guides/web/dashboard.md#editing-project-files).
 
+## GET /api/sessions/{id}/diff/files and /diff/file
+
+Both take `?scope=` for what the working tree is compared against: `branch` (the default) is the merge-base with the session's diff base branch, and `uncommitted` is HEAD. Any other value is a `400`. `/diff/file` also takes `?path=` and, for a workspace session, `?repo=`.
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's
@@ -932,8 +987,9 @@ Before delivery, the HTTP endpoint removes bracketed-paste delimiters and remain
 | `409` | `{"error": "session_not_running"}` | Session exists but the tmux pane is gone |
 | `409` | `{"error": "resume_failed", "message": "...", "resume_session_id": "..."}` | Auto-revive tried to resume a stored conversation, but the pane exited during the probe. The ID and failure marker are preserved in this call; the next default revival can start fresh. |
 | `409` | `{"error": "session_transient", "status": "..."}` | Session is mid-lifecycle and cannot accept input yet |
+| `409` | `{"error": "input_line_busy", "message": "..."}` | Claude Code's input box held text a person typed and had not sent for the whole 3 s wait, so nothing was typed. See below. |
 | `409` | `{"error": "session_archived" \| "session_trashed", "message": "..."}` | Session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, `/container-terminal` and structured-view prompts refuse the same way. |
-| `409` | `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?}` | Reviving a sandbox needs the sandbox login of its agent (`sandbox.shared_credential = "separate_login"`); `tool` is the one to log in. `profile` is present only when the session runs under a profile other than the default one (pass it as `-p <profile>`); `command` only when the session runs its own command for the tool and `aoe sandbox login --tool <tool>` alone would log in another file than the launch waits for (pass it as `--command <command>`). Terminal sessions have no queue, so the message is not kept; send it again after `aoe sandbox login --tool <tool>` |
+| `409` | `{"error": "sandbox_login_required", "message", "tool", "profile"?, "command"?}` | Reviving a sandbox needs the sandbox login of its agent (`sandbox.shared_credential = "separate_login"`); `tool` is the one to log in. `profile` is the profile the session runs under (pass it as `-p <profile>`, or in the login request's `profile`); `command` only when the session runs its own command for the tool and `aoe sandbox login --tool <tool>` alone would log in another file than the launch waits for (pass it as `--command <command>`). Terminal sessions have no queue, so the message is not kept; send it again after `aoe sandbox login --tool <tool>` |
 | `500` | `{"error": "tmux_error"}` or `{"error": "internal"}` | Unexpected failure (logged server-side) |
 
 After a prior failed resume probe, a default restart or send-driven revival can start a new conversation and deliver input there. The old native transcript is not deleted, but its AoE association is abandoned. `/ensure` reports this as `resume_outcome: "fresh_after_failed_resume"` with `prior_session_id` and a message, rather than claiming a successful resume. See [session recovery policy](guides/session-resume.md#pinning-or-resetting-a-conversation) for explicit retry and direct CLI start behavior.
@@ -942,7 +998,18 @@ A structured-view prompt (`POST /api/sessions/{id}/acp/prompt`) that would reviv
 
 If the session's `host_hooks.before_start` hook fails while that launch is admitted, the prompt is kept the same way and the answer is `502` with `{"error": "before_start_hook_failed", "message", "queued_id"}`. Nothing is held: the next launch that works delivers the queue. `message` is fixed text and never carries the hook's command or output.
 
-`/start`, `/ensure`, `/restart`, `/recreate-container` and `/acp/spawn` refuse a launch that needs the login the same way (`409` `sandbox_login_required`, or `502` `before_start_hook_failed`), without `queued_id`. A restart or recreate is refused before the running agent is stopped or its container is discarded. With Apple Container, which cannot run the login helper, they answer `409` `{"error": "sandbox_login_unsupported", "message"}` instead, and nothing is held.
+`/start`, `/ensure`, `/restart`, `/recreate-container` and `/acp/spawn` refuse a launch that needs the login the same way (`409` `sandbox_login_required`, or `502` `before_start_hook_failed`), without `queued_id`. A restart or recreate is refused before the running agent is stopped or its container is discarded. With Apple Container, which cannot run the login helper, they answer `409` `{"error": "sandbox_login_unsupported", "message"}` instead, and nothing is held. Any other launch (a prompt that revives the session, the reconciler, a terminal send) reports the same message as a launch error, such as the session's startup error, whose `cause` is `{"kind": "sandbox_login_unsupported"}`.
+
+A message typed after a person's unsent text would merge with it and be
+submitted together, so the send first waits up to 3 seconds for Claude Code's
+input box to clear, then refuses with `input_line_busy`. A box showing only
+Claude Code's dimmed suggestion counts as empty. Typing replaces the suggestion,
+so even one typed character is a draft. Other agents, text in a
+colour the check cannot place, and a box not drawn in Claude Code's usual
+layout are typed into as before. The light theme's
+suggestion styling has not been measured, so there it can only fail open.
+MCP `send` refuses a draft at once with the same code, and the TUI's send
+dialog refuses it without waiting.
 
 Concurrent POSTs to the same `id` are serialized server-side, so two
 orchestrators racing on the same session won't interleave keystrokes

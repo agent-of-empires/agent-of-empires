@@ -16,31 +16,14 @@ You are free to:
 - Distribute
 - Use without attribution
 
-## Default State Transition Sounds
+## Built-in Sounds
 
-- `start.wav` - Played when a session starts
-- `running.wav` - Played when a session enters running state
-- `waiting.wav` - Played when a session enters waiting state
-- `idle.wav` - Played when a session enters idle state
-- `error.wav` - Played when a session encounters an error
+aoe embeds these in its binary:
 
-## Additional Sounds
+- `start.wav`, `running.wav`, `waiting.wav`, `idle.wav`, `error.wav`: the matching Session status
+- `gem.wav`: the Structured view approval chime
 
-- `spell.wav` - Alternative spell/magic sound
-- `coins.wav` - Coin/reward sound
-- `metal.wav` - Metal impact sound
-- `chain.wav` - Chain/lock sound
-- `gem.wav` - Gem/crystal sound
-
-## Installation
-
-Run `aoe sounds install` to download these sounds from GitHub to your config directory:
-- **Linux**: `~/.config/agent-of-empires/sounds/`
-- **macOS**: `~/.agent-of-empires/sounds/`
-
-The sounds are downloaded from this repository at runtime, not bundled with the binary.
-
-You can replace or add your own `.wav` or `.ogg` files to customize the sounds.
+`spell.wav`, `coins.wav`, `metal.wav` and `chain.wav` are unused; older releases download the whole directory with `aoe sounds install`.
 
 ## Credits
 

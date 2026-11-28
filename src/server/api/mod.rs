@@ -18,9 +18,13 @@ pub mod plugins;
 mod projects;
 mod queue;
 mod sandbox_image;
+mod sandbox_login;
 pub(crate) mod sessions;
 mod setup;
 mod skills;
+mod suggestions;
+#[cfg(test)]
+pub(crate) mod suggestions_tests;
 pub(crate) mod system;
 mod telemetry;
 
@@ -34,7 +38,8 @@ pub use acp::{
     spawn_acp, switch_acp_agent, switch_acp_provider,
 };
 pub(crate) use acp::{
-    publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
+    publish_startup_error_if_current, publish_startup_error_with_cause_if_current,
+    recover_pending_terminal_handoffs, HandoffRecovery,
 };
 
 pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
@@ -65,20 +70,25 @@ pub(crate) use sandbox_image::{
 pub use sandbox_image::{
     sandbox_image_cancel, sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status,
 };
+pub(crate) use sandbox_login::CODE_BODY_LIMIT as SANDBOX_LOGIN_CODE_BODY_LIMIT;
+pub use sandbox_login::{
+    cancel_sandbox_login, get_sandbox_login, get_sandbox_login_outcome, leave_sandbox_login,
+    start_sandbox_login, submit_sandbox_login_code,
+};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,
     create_session_progress, delete_session, delete_workspace, empty_trash,
     ensure_container_terminal, ensure_session, ensure_terminal, ensure_tool, force_smart_rename,
     get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
-    read_output, reclaim_session_ownership, recreate_container, rename_session, restart_for_update,
-    restart_session, restore_session, review_creation_trust, save_session_file, search_sessions,
-    send_message, serve_session_artifact, session_account_targets, session_diff_file,
-    session_diff_file_raw, session_diff_files, session_file, session_file_raw, set_worktree_name,
-    start_session, stop_auxiliary, stop_session, summarize_session, touch_session_access,
-    trash_session, update_session_archive, update_session_color, update_session_diff_base,
-    update_session_favorite, update_session_group, update_session_ignored,
-    update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
-    update_workspace_ordering, OutputQuery, SendMessageRequest,
+    read_output, reclaim_session_ownership, recreate_container, rename_session, restart_session,
+    restore_session, review_creation_trust, save_session_file, search_sessions, send_message,
+    serve_session_artifact, session_account_targets, session_diff_file, session_diff_file_raw,
+    session_diff_files, session_file, session_file_raw, set_worktree_name, start_session,
+    stop_auxiliary, stop_session, summarize_session, touch_session_access, trash_session,
+    update_session_archive, update_session_diff_base, update_session_favorite,
+    update_session_group, update_session_ignored, update_session_notifications, update_session_pin,
+    update_session_snooze, update_session_unread, update_workspace_ordering, OutputQuery,
+    SendMessageRequest,
 };
 pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
@@ -88,6 +98,15 @@ pub use setup::{get_setup, get_setup_runtimes, patch_setup};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
+pub use suggestions::{
+    delete_suggestion_mapping, delete_suggestion_preset, dismiss_suggestion,
+    get_suggestion_presets, get_suggestions, list_suggestion_mappings, list_suggestion_projects,
+    patch_suggestion_prefs, prepare_suggestion, push_suggestion, put_suggestion_auto_start,
+    put_suggestion_mapping, put_suggestion_preset, refresh_suggestions, run_suggestion_checks,
+    run_suggestion_fix, start_suggestion, start_suggestions, undismiss_suggestion,
+    update_suggestion_source, StartBody,
+};
+pub(crate) use suggestions::{push_agent_suggestion, spawn_auto_start};
 
 pub use system::{
     apply_cityhall_bundle, browse_filesystem, create_profile, default_profile, delete_profile,
@@ -95,10 +114,10 @@ pub use system::{
     get_cityhall_bundle, get_current_theme, get_profile_settings, get_resolved_theme,
     get_session_agent_default_model, get_settings, get_settings_resolved, get_settings_schema,
     get_tips, get_update_status, get_web_ui_state, list_agents, list_groups, list_profiles,
-    list_sounds, list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged,
-    mark_web_tour_seen, patch_web_ui_state, post_dashboard_presence, rename_profile,
-    serve_sound_file, set_agent_default_model, set_show_tips, system_health,
-    update_profile_settings, update_settings, update_theme,
+    list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged, mark_web_tour_seen,
+    patch_web_ui_state, post_dashboard_presence, rename_profile, serve_sound,
+    set_agent_default_model, set_show_tips, system_health, update_profile_settings,
+    update_settings, update_theme,
 };
 pub use telemetry::{
     get_telemetry_status, post_telemetry_feature_use, post_telemetry_seen,
@@ -575,7 +594,6 @@ mod tests {
             &[
                 "force_smart_rename",
                 "recreate_container",
-                "restart_for_update",
                 "restart_session",
                 "restore_session",
                 "start_session",
@@ -584,7 +602,6 @@ mod tests {
                 "touch_session_access",
                 "trash_session",
                 "update_session_archive",
-                "update_session_color",
                 "update_session_favorite",
                 "update_session_ignored",
                 "update_session_pin",
@@ -636,6 +653,16 @@ mod tests {
             ],
         ),
         ("setup.rs", include_str!("setup.rs"), &["patch_setup"]),
+        (
+            "sandbox_login.rs",
+            include_str!("sandbox_login.rs"),
+            &[
+                "cancel_sandbox_login",
+                "leave_sandbox_login",
+                "start_sandbox_login",
+                "submit_sandbox_login_code",
+            ],
+        ),
         (
             "system.rs",
             include_str!("system.rs"),
@@ -723,6 +750,27 @@ mod tests {
             ],
         ),
         (
+            "suggestions.rs",
+            include_str!("suggestions.rs"),
+            &[
+                "delete_suggestion_mapping",
+                "delete_suggestion_preset",
+                "dismiss_suggestion",
+                "patch_suggestion_prefs",
+                "put_suggestion_auto_start",
+                "put_suggestion_mapping",
+                "push_suggestion",
+                "put_suggestion_preset",
+                "refresh_suggestions",
+                "run_suggestion_checks",
+                "run_suggestion_fix",
+                "start_suggestion",
+                "start_suggestions",
+                "undismiss_suggestion",
+                "update_suggestion_source",
+            ],
+        ),
+        (
             "skills.rs",
             include_str!("skills.rs"),
             &[
@@ -795,6 +843,12 @@ mod tests {
             "/api/plugins/{id}/settings/options/resolve",
             "api::resolve_options",
             "UI option discovery may run capability probes and populate the shared catalog.",
+        ),
+        (
+            "POST",
+            "/api/suggestions/prepare",
+            "api::prepare_suggestion",
+            "Resolves a wizard prefill; mutates nothing.",
         ),
         (
             "POST",
@@ -879,6 +933,30 @@ mod tests {
             "/mcp",
             "super::mcp::service(state.clone())",
             "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
+        ),
+        (
+            "POST",
+            "/mcp/plugins/{plugin}/{server}",
+            "super::mcp_plugins::service(state.clone())",
+            "Read-only daemons run no plugin host, so the endpoint forwards nothing there.",
+        ),
+        (
+            "PUT",
+            "/mcp/plugins/{plugin}/{server}",
+            "super::mcp_plugins::service(state.clone())",
+            "Read-only daemons run no plugin host, so the endpoint forwards nothing there.",
+        ),
+        (
+            "PATCH",
+            "/mcp/plugins/{plugin}/{server}",
+            "super::mcp_plugins::service(state.clone())",
+            "Read-only daemons run no plugin host, so the endpoint forwards nothing there.",
+        ),
+        (
+            "DELETE",
+            "/mcp/plugins/{plugin}/{server}",
+            "super::mcp_plugins::service(state.clone())",
+            "Read-only daemons run no plugin host, so the endpoint forwards nothing there.",
         ),
     ];
 
@@ -1860,7 +1938,6 @@ mod tests {
             (Method::PATCH, "/api/sessions/missing/access"),
             (Method::POST, "/api/sessions/missing/purge/abandon"),
             (Method::POST, "/api/sessions/missing/restart"),
-            (Method::POST, "/api/sessions/missing/restart-for-update"),
             (Method::POST, "/api/sessions/missing/tools/ensure"),
             (Method::POST, "/api/sessions/missing/auxiliary/stop"),
             (Method::POST, "/api/sessions/missing/acp/switch-agent"),
@@ -1883,6 +1960,21 @@ mod tests {
             (Method::POST, "/api/plugins/missing/update/apply"),
             (Method::POST, "/api/plugins/missing/update/dismiss"),
             (Method::PATCH, "/api/theme"),
+            (Method::POST, "/api/suggestions/refresh"),
+            (Method::POST, "/api/suggestions/checks/run"),
+            (Method::POST, "/api/suggestions/fix"),
+            (Method::POST, "/api/suggestions/start"),
+            (Method::POST, "/api/suggestions/start-batch"),
+            (Method::POST, "/api/suggestions/push"),
+            (Method::POST, "/api/suggestions/dismiss"),
+            (Method::POST, "/api/suggestions/undismiss"),
+            (Method::PATCH, "/api/suggestions/sources"),
+            (Method::PUT, "/api/suggestions/auto-start"),
+            (Method::PATCH, "/api/suggestions/prefs"),
+            (Method::PUT, "/api/suggestions/presets"),
+            (Method::DELETE, "/api/suggestions/presets"),
+            (Method::PUT, "/api/suggestions/mappings"),
+            (Method::DELETE, "/api/suggestions/mappings"),
             (Method::POST, "/api/sandbox/image-pull"),
             (Method::POST, "/api/sandbox/image-pull/cancel"),
             (Method::POST, "/api/sandbox/image-dismiss"),

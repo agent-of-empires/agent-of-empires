@@ -2028,11 +2028,10 @@ async fn test_strict_mode_h_collapses_group() {
 
 #[tokio::test]
 #[serial]
-async fn test_non_strict_h_snoozes_only_in_attention_sort() {
-    // Snooze is Attention-only: there `h` toggles snooze on the cursor's session and the
-    // group below stays expanded, while every other sort falls through to the unconditional
-    // `Left | Char('h')` collapse. Before the gate, snooze caught first in non-strict mode
-    // regardless of sort and silently mutated persisted state.
+async fn test_non_strict_h_snoozes_on_a_session_row_in_any_sort() {
+    // `h` snoozes the cursor's session in every sort; on a group header there is no
+    // session to snooze, so it falls through to the unconditional `Left | Char('h')`
+    // collapse.
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_groups();
@@ -2063,9 +2062,26 @@ async fn test_non_strict_h_snoozes_only_in_attention_sort() {
     env.view.snooze_duration_dialog = None;
     env.view.pending_snooze_session = None;
 
-    // Now flip back to a non-Attention sort and confirm `h` falls
-    // through to the collapse handler instead of snoozing.
+    // Newest sort: a session row is still snoozable, so the dialog opens there too.
     env.view.sort_order = SortOrder::Newest;
+    env.view.flat_items = env.view.build_flat_items();
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { .. }))
+        .expect("setup should produce a session in Newest sort");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+    env.view.handle_key(key(KeyCode::Char('h')), None);
+    assert!(
+        env.view.snooze_duration_dialog.is_some(),
+        "`h` on a session row must open the snooze dialog in every sort"
+    );
+    env.view.snooze_duration_dialog = None;
+    env.view.pending_snooze_session = None;
+
+    // On a group header `h` still collapses instead of snoozing.
     env.view.flat_items = env.view.build_flat_items();
     let group_idx = env
         .view
@@ -2096,7 +2112,7 @@ async fn test_non_strict_h_snoozes_only_in_attention_sort() {
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(
             *collapsed,
-            "non-strict 'h' outside Attention sort must collapse the group, not snooze"
+            "non-strict 'h' on a group header must collapse the group, not snooze"
         );
     }
 }
@@ -2187,7 +2203,7 @@ fn test_non_strict_w_cycles_through_all_idle_sessions_in_attention_sort() {
         .iter()
         .filter_map(|item| match item {
             Item::Session { id, .. } => Some(id.clone()),
-            Item::Group { .. } => None,
+            _ => None,
         })
         .collect();
     assert_eq!(session_ids.len(), 4);
@@ -2522,6 +2538,21 @@ fn test_command_palette_diff_invokes_diff_in_strict_mode() {
 
 #[test]
 #[serial]
+fn test_command_palette_opens_suggested_sessions() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        None,
+    );
+    for ch in "suggested".chars() {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.suggestions_view.is_some());
+}
+
+#[test]
+#[serial]
 fn test_f5_and_e_both_open_restart_dialog() {
     // Pin the equivalence: F5 and `e`/`E` all open the restart dialog, which is what makes
     // the help overlay's "Restart session (also F5)" row honest.
@@ -2557,13 +2588,12 @@ fn work_group_titles(view: &HomeView) -> Vec<&str> {
     for item in &view.flat_items {
         match item {
             Item::Group { name, .. } => in_work_group = name == "work",
-            Item::Session { id, .. } => {
-                if in_work_group {
-                    if let Some(inst) = view.get_instance(id) {
-                        titles.push(inst.title.as_str());
-                    }
+            Item::Session { id, .. } if in_work_group => {
+                if let Some(inst) = view.get_instance(id) {
+                    titles.push(inst.title.as_str());
                 }
             }
+            _ => {}
         }
     }
     titles

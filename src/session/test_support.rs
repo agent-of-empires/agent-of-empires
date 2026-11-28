@@ -212,6 +212,34 @@ pub(crate) fn probing_container_runtime(root: &Path) -> (EnvGuard, PathBuf) {
     )
 }
 
+/// As [`probing_container_runtime`], except an image pull logs itself and then runs for a
+/// minute, as a slow registry would; the image is never present.
+#[cfg(unix)]
+pub(crate) fn hanging_pull_container_runtime(root: &Path) -> (EnvGuard, PathBuf) {
+    hanging_container_runtime(root, "pull*")
+}
+
+/// As [`hanging_pull_container_runtime`], for the listing of containers (`ps`) that the
+/// stale-helper sweep starts with.
+#[cfg(unix)]
+pub(crate) fn hanging_listing_container_runtime(root: &Path) -> (EnvGuard, PathBuf) {
+    hanging_container_runtime(root, "ps*")
+}
+
+/// The calls matching `verb` (a shell pattern over the arguments) are logged and then run
+/// for a minute.
+#[cfg(unix)]
+fn hanging_container_runtime(root: &Path, verb: &str) -> (EnvGuard, PathBuf) {
+    let calls = root.join("runtime-calls");
+    fake_container_runtime(
+        root,
+        &format!(
+            "case \"$*\" in --version|info|'system status') exit 0;; {verb}) printf '%s\\n' \"$*\" >> '{}'; exec sleep 60;; esac\n",
+            calls.display()
+        ),
+    )
+}
+
 #[cfg(unix)]
 fn fake_container_runtime(root: &Path, prelude: &str) -> (EnvGuard, PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
@@ -523,14 +551,18 @@ host = "pane_scoped"
 sandbox = "pane_scoped"
 "#
     );
-    let dir = crate::plugin::plugins_dir()
-        .unwrap()
-        .join("acme.omp-cutover");
+    install_agent_plugin("acme.omp-cutover", &manifest);
+}
+
+/// Installs an approved plugin from `manifest`. Bind an isolated app directory and
+/// `crate::plugin::ReloadRegistryOnDrop` around the caller.
+pub(crate) fn install_agent_plugin(id: &str, manifest: &str) {
+    let dir = crate::plugin::plugins_dir().unwrap().join(id);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+    std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
     crate::session::update_config(|config| {
         config.plugins.insert(
-            "acme.omp-cutover".into(),
+            id.into(),
             crate::session::PluginConfig {
                 grant: Some(crate::session::CapabilityGrant {
                     manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
@@ -564,7 +596,7 @@ pub(crate) fn login_required_under(
         tool: tool.to_string(),
         credential: home.join(".claude/sandbox-v2/.credentials.json"),
         command: None,
-        profile: None,
+        profile: Some(crate::session::config::effective_profile("")),
     }
 }
 

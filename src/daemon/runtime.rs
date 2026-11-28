@@ -33,7 +33,6 @@ pub enum SessionMutation {
     Access,
     Pin(super::UpdatePinBody),
     Favorite(super::UpdateFavoriteBody),
-    Color(super::UpdateColorBody),
     Group(super::UpdateGroupBody),
     Notifications(super::UpdateNotificationsBody),
     Snooze(super::UpdateSnoozeBody),
@@ -53,7 +52,6 @@ impl SessionMutation {
             Self::Access => "access",
             Self::Pin(_) => "pin",
             Self::Favorite(_) => "favorite",
-            Self::Color(_) => "color",
             Self::Group(_) => "group",
             Self::Notifications(_) => "notifications",
             Self::Snooze(_) => "snooze",
@@ -149,7 +147,7 @@ pub struct RuntimeInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_instance_id: Option<String>,
     pub protocol_version: u16,
-    /// The Daemon's `CARGO_PKG_VERSION` semver, as `/api/about` reports; not `BUILD_VERSION`.
+    /// The Daemon's `CARGO_PKG_VERSION` semver, as `/api/about` reports; not `build_version()`.
     /// `None` means unknown: the Daemon predates this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,

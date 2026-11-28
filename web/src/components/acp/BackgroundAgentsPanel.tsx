@@ -29,6 +29,7 @@ import { ShellDetailModal, ShellRow } from "./BackgroundShells";
 import { fromBackground } from "./subagents/model";
 import { StopSession, StopSubagent } from "./subagents/StopSession";
 import { SubagentDetail } from "./subagents/SubagentDetail";
+import { BUTTON_GHOST_SM, CAPTION_INLINE, ROW_CAPTION } from "../../lib/surfaces";
 
 type Entry =
   | { kind: "agent"; agent: BackgroundAgent }
@@ -115,7 +116,7 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
 
   if (agents.length === 0 && shells.length === 0) {
     return (
-      <div className="flex h-full items-center justify-center px-4 text-center text-xs text-text-dim">
+      <div className="flex h-full items-center justify-center px-4 text-center text-[13px] leading-normal text-text-dim">
         No background work yet. Async <span className="font-mono">Task</span> sub-agents,{" "}
         <span className="font-mono">Workflow</span> runs and background shell commands show up here.
       </div>
@@ -161,7 +162,7 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
       type="button"
       aria-pressed={kind === value}
       onClick={() => setKind(value)}
-      className={`rounded px-1.5 py-0.5 text-[11px] ${kind === value ? "bg-surface-700 text-text-primary" : "text-text-dim hover:text-text-secondary"}`}
+      className={`h-6 max-md:h-9 cursor-pointer rounded-md px-2 text-[12px] transition-colors ${kind === value ? "bg-surface-700/70 text-text-primary" : "text-text-dim hover:text-text-secondary"}`}
     >
       {label}
     </button>
@@ -169,10 +170,8 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <div className="flex flex-wrap items-center gap-2 border-b border-surface-700 px-3 py-1.5">
-        <span className="text-[11px] uppercase tracking-wider text-text-dim">
-          Background · {agents.length + shells.length}
-        </span>
+      <div className="flex flex-wrap items-center gap-2 border-b border-surface-700/50 px-3 py-1.5">
+        <span className={CAPTION_INLINE}>Background · {agents.length + shells.length}</span>
         <span className="flex flex-1 items-center gap-0.5" role="group" aria-label="Filter background work">
           {agents.length > 0 &&
             shells.length > 0 && [
@@ -186,8 +185,8 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
       {groups.map(
         (group) =>
           group.shells.length + group.entries.length > 0 && (
-            <div key={group.label} className="border-b border-surface-700">
-              <div className="px-3 pt-1.5 text-[10px] uppercase tracking-wider text-text-dim">
+            <div key={group.label} className="border-b border-surface-700/50">
+              <div className={ROW_CAPTION}>
                 {group.label} · {group.shells.length + group.entries.length}
               </div>
               {group.shells.map((s) => (
@@ -256,7 +255,7 @@ function AgentDetailView({
   const NAV = "rounded p-1 text-text-dim hover:text-text-secondary disabled:opacity-30";
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <div className="flex items-center gap-2 border-b border-surface-700 px-2 py-1.5 text-[11px] text-text-dim">
+      <div className="flex items-center gap-2 border-b border-surface-700/50 px-2 py-1.5 text-[12px] text-text-dim">
         <button type="button" onClick={onBack} className="inline-flex items-center gap-0.5 hover:text-text-secondary">
           <ChevronLeft className="h-3.5 w-3.5" />
           All background work
@@ -301,7 +300,7 @@ function AgentDetailView({
                       ?.scrollIntoView({ block: "center" }),
                   );
                 }}
-                className="text-[11px] text-text-dim hover:text-text-secondary"
+                className={BUTTON_GHOST_SM}
               >
                 Show in thread
               </button>
@@ -331,7 +330,7 @@ function WorkflowGroup({
   const [open, setOpen] = useState(true);
   const done = agents.filter((a) => !isActiveAgent(a)).length;
   return (
-    <div className="border-b border-surface-700">
+    <div className="border-b border-surface-700/50">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -351,7 +350,7 @@ function WorkflowGroup({
         workflowPhases(agents).map(({ phase, agents: phaseAgents }) => (
           <div key={phase} className="pl-3">
             {phase && (
-              <div className="px-3 pt-1 text-[10px] uppercase tracking-wider text-text-dim">
+              <div className={ROW_CAPTION}>
                 {phase} · {phaseAgents.filter((a) => !isActiveAgent(a)).length}/{phaseAgents.length}
               </div>
             )}
@@ -379,7 +378,7 @@ function AgentRow({
   const roster = findSubagent(subagents, agent.toolCallId);
   const stoppable = !!roster?.cancel_capable && !!sessionId && isActiveAgent(agent);
   return (
-    <div className="border-b border-surface-800">
+    <div className="border-b border-surface-700/30">
       <div className="flex flex-wrap items-center pr-2 hover:bg-surface-800">
         <button
           type="button"

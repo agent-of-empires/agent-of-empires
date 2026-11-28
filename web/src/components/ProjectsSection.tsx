@@ -1,6 +1,5 @@
 import { memo, useRef } from "react";
 import type { ProjectInfo, RepoGroup } from "../lib/types";
-import { repoColorStyle } from "../lib/repoAppearance";
 import { MARK_MEANING, meaningText } from "../lib/sidebarMarks";
 import { useSidebarCompact } from "../lib/sidebarCompact";
 import { ContextMenu, MenuItem, MenuSeparator } from "./ContextMenu";
@@ -51,13 +50,13 @@ export function ProjectsSection({
 
   return (
     <div data-testid="sidebar-projects-section">
-      <div className="w-full flex items-center gap-2 border-t border-surface-800/60">
+      <div className="w-full flex items-center gap-2 border-t border-surface-800/60 max-md:mt-4 max-md:border-t-0">
         <button
           onClick={toggle}
           data-testid="sidebar-projects-toggle"
           aria-expanded={expanded}
-          className={`flex-1 min-w-0 flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors ${
-            compact ? "px-2" : "px-3 tracking-wider"
+          className={`flex-1 min-w-0 flex items-center gap-2 py-1.5 rounded-md text-[12px] font-medium text-text-dim hover:text-text-secondary hover:bg-surface-800/60 cursor-pointer transition-colors max-md:text-[12px] max-md:uppercase max-md:tracking-[0.06em] max-md:font-semibold ${
+            compact ? "px-2" : "px-3 md:tracking-wider"
           }`}
         >
           <FoldChevron className={`shrink-0 transition-transform duration-75 ${expanded ? "" : "-rotate-90"}`} />
@@ -93,7 +92,8 @@ export function ProjectsSection({
           />
         ))}
       {expanded && visible.length === 0 && !compact && (
-        <p className="px-3 py-2 text-[12px] text-text-dim">
+        // A phone keeps the list to sessions; the add button says the rest.
+        <p className="px-3 py-2 text-[12px] text-text-dim max-md:hidden">
           {query ? "No matching projects." : "No registered Projects. Add one to keep a repo handy without a session."}
         </p>
       )}
@@ -156,7 +156,6 @@ const ProjectRow = memo(function ProjectRow({
             : undefined
         }
         className="group flex items-center gap-2 px-3 py-1.5 text-text-secondary hover:bg-surface-800/50 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-600 select-none [-webkit-touch-callout:none]"
-        style={repoColorStyle(project.color)}
       >
         {/* Listed here when the axis draws no pinned header (#5065), so the row carries the pin itself. */}
         <Tooltip text={meaningText(pinned ? MARK_MEANING.pinnedProject : MARK_MEANING.project)}>

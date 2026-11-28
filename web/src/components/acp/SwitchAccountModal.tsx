@@ -4,6 +4,8 @@ import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { fetchAccountTargets } from "../../lib/api";
 import type { AuthStatus } from "../../lib/acpTypes";
 import { dispatchFocusTerminal } from "../../lib/terminalFocus";
+import { CancelButton, ConfirmButton, Dialog } from "../Dialog";
+import { CHOICE, CHOICE_SELECTED } from "../../lib/surfaces";
 
 interface Props {
   open: boolean;
@@ -95,90 +97,73 @@ function SwitchAccountDialog({
   const loading = targets === undefined;
 
   return (
-    <div
-      ref={dialogRef}
-      tabIndex={-1}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="switch-account-title"
-      data-testid="switch-account-modal"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div className="w-full max-w-lg rounded-lg border border-surface-700 bg-surface-900 p-5 text-text-primary shadow-xl">
-        <h2 id="switch-account-title" className="text-base font-semibold">
-          Switch account
-        </h2>
-        <p className="mt-1 text-xs text-text-muted">
-          Currently <span className="font-medium text-text-primary">{currentTool}</span>
-          {identity.length > 0 && <> ({[...new Set(identity)].join(" · ")})</>}. The conversation continues on the
-          account you pick.
-        </p>
-        <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-text-muted">
-          <li>The transcript is copied into the other account&apos;s store; the original stays where it is.</li>
-          <li>The next turn runs uncached on the new account, so it can take longer and use more of its limit.</li>
-        </ul>
-
-        {loading ? (
-          <div className="mt-4 text-xs text-text-muted">Loading accounts...</div>
-        ) : !targets || targets.length === 0 ? (
-          <div className="mt-4 text-xs text-text-muted" data-testid="switch-account-empty">
-            {targets === null
-              ? "Couldn't list the accounts. Reload to try again."
-              : "No other account can take this conversation over. Declare another tool for the same agent with its own agent_config_dir in the aoe config."}
-          </div>
-        ) : (
-          <ul className="mt-4 max-h-64 space-y-1 overflow-y-auto">
-            {targets.map((name) => (
-              <li key={name}>
-                <label
-                  className={`flex cursor-pointer items-center gap-3 rounded border px-3 py-2 text-sm transition-colors ${
-                    selected === name ? "border-brand-500 bg-brand-900/30" : "border-surface-700 hover:bg-surface-800"
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    name="account-target"
-                    value={name}
-                    checked={selected === name}
-                    onChange={() => setChoice(name)}
-                  />
-                  {name}
-                </label>
-              </li>
-            ))}
-          </ul>
-        )}
-
-        {failoverTo && (
-          <div className="mt-3 text-xs text-text-muted" data-testid="switch-account-failover">
-            Already switching to {failoverTo}. Wait for it to finish before choosing an account.
-          </div>
-        )}
-
-        <div className="mt-5 flex justify-end gap-2">
-          <button
-            ref={cancelRef}
-            type="button"
-            onClick={onClose}
-            className="rounded border border-surface-700 px-3 py-1 text-xs font-medium hover:bg-surface-800"
-          >
-            Cancel
-          </button>
-          <button
-            ref={confirmRef}
-            type="button"
-            data-testid="switch-account-confirm"
+    <Dialog
+      id="switch-account"
+      testId="switch-account-modal"
+      title="Switch account"
+      rootRef={dialogRef}
+      rootTabIndex={-1}
+      describedBy={false}
+      panelClassName="md:w-[32rem] md:max-h-[90vh]"
+      onDismiss={onClose}
+      footer={
+        <>
+          <CancelButton buttonRef={cancelRef} onClick={onClose} />
+          <ConfirmButton
+            buttonRef={confirmRef}
+            testId="switch-account-confirm"
             onClick={confirm}
             disabled={!selected || !!failoverTo}
-            className="rounded border border-brand-700 bg-brand-900/40 px-3 py-1 text-xs font-medium text-brand-100 hover:bg-brand-900/60 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {`Switch to ${selected ?? ""}`}
-          </button>
+          </ConfirmButton>
+        </>
+      }
+    >
+      <p className="text-[13px] md:text-xs text-text-muted">
+        Currently <span className="font-medium text-text-primary">{currentTool}</span>
+        {identity.length > 0 && <> ({[...new Set(identity)].join(" · ")})</>}. The conversation continues on the account
+        you pick.
+      </p>
+      <ul className="mt-2 list-disc space-y-1 pl-4 text-[13px] md:text-xs text-text-muted">
+        <li>The transcript is copied into the other account&apos;s store; the original stays where it is.</li>
+        <li>The next turn runs uncached on the new account, so it can take longer and use more of its limit.</li>
+      </ul>
+
+      {loading ? (
+        <div className="mt-4 text-xs text-text-muted">Loading accounts...</div>
+      ) : !targets || targets.length === 0 ? (
+        <div className="mt-4 text-xs text-text-muted" data-testid="switch-account-empty">
+          {targets === null
+            ? "Couldn't list the accounts. Reload to try again."
+            : "No other account can take this conversation over. Declare another tool for the same agent with its own agent_config_dir in the aoe config."}
         </div>
-      </div>
-    </div>
+      ) : (
+        <ul className="mt-4 max-h-64 space-y-1.5 overflow-y-auto">
+          {targets.map((name) => (
+            <li key={name}>
+              <label
+                className={`${selected === name ? CHOICE_SELECTED : CHOICE} flex cursor-pointer items-center gap-3 text-[15px] md:text-sm`}
+              >
+                <input
+                  type="radio"
+                  name="account-target"
+                  value={name}
+                  checked={selected === name}
+                  onChange={() => setChoice(name)}
+                />
+                {name}
+              </label>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {failoverTo && (
+        <div className="mt-3 text-xs text-text-muted" data-testid="switch-account-failover">
+          Already switching to {failoverTo}. Wait for it to finish before choosing an account.
+        </div>
+      )}
+    </Dialog>
   );
 }

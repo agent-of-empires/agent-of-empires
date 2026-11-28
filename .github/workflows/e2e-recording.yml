@@ -20,18 +20,18 @@ jobs:
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-record-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 45
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
 
-      - uses: ./.github/actions/rust-toolchain
+      - uses: $/.github/actions/rust-toolchain
 
       # The e2e suite drives Node helpers (the fake ACP agent), so Node is
       # needed at run time even though the default build invokes no npm.
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
 
@@ -67,91 +67,40 @@ jobs:
         run: cargo test --features e2e-tests --test e2e -- --nocapture
 
       - name: Upload recordings as artifact
+        id: upload
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
-          name: e2e-recordings
+          name: e2e-media
           path: |
-            target/e2e-recordings/*.gif
-            target/e2e-recordings/*.cast
+            target/e2e-media/*.gif
+            target/e2e-media/*.cast
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Publish GIFs and comment on PR
+      # GITHUB_TOKEN cannot upload with `gh --attach`, so link the artifact.
+      - name: Link recordings on the PR
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
         run: |
           shopt -s nullglob
-          gifs=(target/e2e-recordings/*.gif)
-
-          if [ ${#gifs[@]} -eq 0 ]; then
-            echo "No GIF recordings found, skipping PR comment."
+          gifs=(target/e2e-media/*.gif)
+          if [ ${#gifs[@]} -eq 0 ] || [ -z "$ARTIFACT_URL" ]; then
+            echo "No uploaded GIF recordings, skipping PR comment."
             exit 0
           fi
 
-          # Push GIFs to the e2e-recordings orphan branch so they are
-          # accessible via raw.githubusercontent.com and render inline.
-          RUN_DIR="run-${{ github.run_id }}"
-          REPO="${{ github.repository }}"
-          BRANCH="e2e-recordings"
-
-          # Set up a temporary worktree for the orphan branch.
-          tmp=$(mktemp -d)
-          git clone --depth 1 --branch "$BRANCH" \
-            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$tmp" 2>/dev/null \
-          || {
-            # Branch doesn't exist yet -- create an orphan.
-            git clone --depth 1 \
-              "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$tmp"
-            cd "$tmp"
-            git checkout --orphan "$BRANCH"
-            git rm -rf . > /dev/null 2>&1 || true
-            echo "# E2E Test Recordings" > README.md
-            echo "" >> README.md
-            echo "GIFs published by the E2E Recordings workflow. Each run-* directory" >> README.md
-            echo "corresponds to a GitHub Actions run." >> README.md
-            git add README.md
-            git commit -m "init: e2e-recordings branch"
-            cd -
-          }
-
-          # Copy GIFs into the run directory.
-          mkdir -p "$tmp/$RUN_DIR"
-          cp "${gifs[@]}" "$tmp/$RUN_DIR/"
-
-          cd "$tmp"
-          git add "$RUN_DIR"
-          git commit -m "recordings: PR #${{ github.event.pull_request.number }} (run ${{ github.run_id }})"
-          git push origin "$BRANCH"
-          cd -
-
-          # Build PR comment with inline GIF images.
-          RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}/${RUN_DIR}"
           body="## E2E Test Recordings"$'\n\n'
+          body+="GIFs and .cast files for ${#gifs[@]} tests: [e2e-media artifact]($ARTIFACT_URL), kept 30 days."
 
-          for gif in "${gifs[@]}"; do
-            name=$(basename "$gif" .gif)
-            body+="### ${name}"$'\n\n'
-            body+="![${name}](${RAW_BASE}/${name}.gif)"$'\n\n'
-          done
-
-          body+="---"$'\n'
-          body+="*Raw recordings (.cast) available in the [e2e-recordings artifact](${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}).*"
-
-          # Post or update the comment to avoid duplicates on re-runs.
-          existing=$(gh api \
-            "repos/${REPO}/issues/${{ github.event.pull_request.number }}/comments" \
-            --jq '.[] | select(.body | startswith("## E2E Test Recordings")) | .id' \
+          existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("## E2E Test Recordings"))) | .id' \
             | head -1)
-
           if [ -n "$existing" ]; then
-            gh api \
-              "repos/${REPO}/issues/comments/${existing}" \
-              -X PATCH \
-              -f body="$body"
-            echo "Updated existing PR comment ${existing}"
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -f body="$body"
           else
-            gh pr comment "${{ github.event.pull_request.number }}" --body "$body"
-            echo "Posted new PR comment"
+            gh pr comment "$PR" -R "$GITHUB_REPOSITORY" --body "$body"
           fi

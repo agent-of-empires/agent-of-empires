@@ -35,12 +35,17 @@ const initialA = sessionResponse({
   title: "alpha",
   project_path: "/tmp/repo",
   branch: "feature/a",
-  color: null,
   notify_on_waiting: null,
   notify_on_idle: null,
   notify_on_error: null,
 });
-const B = sessionResponse({ id: "B", title: "beta", project_path: "/tmp/repo", branch: "feature/b", color: null });
+const B = sessionResponse({ id: "B", title: "beta", project_path: "/tmp/repo", branch: "feature/b" });
+const notify = <T extends object>(row: T, on: boolean | null) => ({
+  ...row,
+  notify_on_waiting: on,
+  notify_on_idle: on,
+  notify_on_error: on,
+});
 async function boot(page: Page) {
   await installSidebarMocks(page, {
     sessions: [
@@ -58,89 +63,91 @@ async function menu(page: Page, title: string) {
   await row(page, title).click({ button: "right" });
 }
 
-for (const setting of ["color", "notifications"] as const) {
-  test(`${setting} cancellation installs a held lower receipt after another row ACK and accepts the next canonical writer`, async ({
-    page,
-  }) => {
-    const next = await boot(page);
-    const base = 9007199254740992n;
-    const selectedA =
-      setting === "color"
-        ? { ...initialA, color: "red" }
-        : { ...initialA, notify_on_waiting: true, notify_on_idle: true, notify_on_error: true };
-    const selectedB = { ...B, color: "green" };
-    const list = (a = initialA, b = B) => ({ sessions: [a, b], workspace_ordering: [] });
-    await consume(page, await next(), list(), base + 9n);
-    await expect(row(page, "alpha")).toBeVisible();
-    const pending: Route[] = [];
-    const path = "/api/sessions/A/" + setting;
-    await page.route("**" + path, (r) => {
-      pending.push(r);
-    });
-    await page.route("**/api/sessions/B/color", (r) => r.fulfill({ headers: headers(base + 12n), json: selectedB }));
-    const earlier = setting === "color" ? "sidebar-context-menu-color-red" : "sidebar-context-menu-notify-all";
-    const latest = setting === "color" ? "sidebar-context-menu-color-clear" : "sidebar-context-menu-notify-default";
-    await menu(page, "alpha");
-    await page.getByTestId(earlier).click();
-    await expect.poll(() => pending.length).toBe(1);
-    await page.getByTestId(latest).click();
-    await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
-    await consume(page, await next(), list(selectedA), base + 10n);
-    await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
-    expect((await publishedRequests(page, path, "PATCH")).length).toBe(1);
-    await menu(page, "beta");
-    await page.getByTestId("sidebar-context-menu-color-green").click();
-    await expect(row(page, "beta").getByTestId("sidebar-session-color-dot")).toHaveAttribute("data-color", "green");
-    await menu(page, "alpha");
-    await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
-    const first = pending.shift()!;
-    expect(first.request().postDataJSON()).toEqual(
-      setting === "color" ? { color: "red" } : { notify_on_waiting: true, notify_on_idle: true, notify_on_error: true },
-    );
-    await consume(page, first, selectedA, base + 10n);
-    await expect.poll(() => pending.length).toBe(1);
-    const cancel = pending.shift()!;
-    expect(cancel.request().postDataJSON()).toEqual(
-      setting === "color" ? { color: null } : { notify_on_waiting: null, notify_on_idle: null, notify_on_error: null },
-    );
-    await consume(page, cancel, initialA, base + 11n);
-    await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
-    await consume(page, await next(), list(selectedA, selectedB), base + 11n);
-    await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
-    if (setting === "color") await expect(row(page, "alpha").getByTestId("sidebar-session-color-dot")).toHaveCount(0);
-    await consume(page, await next(), list(selectedA, selectedB), base + 13n);
-    await expect(page.getByTestId(earlier)).toHaveAttribute("aria-pressed", "true");
-    await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "false");
-    if (setting === "color")
-      await expect(row(page, "alpha").getByTestId("sidebar-session-color-dot")).toHaveAttribute("data-color", "red");
+test("notifications cancellation installs a held lower receipt after another row ACK and accepts the next canonical writer", async ({
+  page,
+}) => {
+  const next = await boot(page);
+  const base = 9007199254740992n;
+  const selectedA = notify(initialA, true);
+  const selectedB = notify(B, false);
+  const list = (a = initialA, b = B) => ({ sessions: [a, b], workspace_ordering: [] });
+  await consume(page, await next(), list(), base + 9n);
+  await expect(row(page, "alpha")).toBeVisible();
+  const pending: Route[] = [];
+  const path = "/api/sessions/A/notifications";
+  await page.route("**" + path, (r) => {
+    pending.push(r);
   });
-}
+  await page.route("**/api/sessions/B/notifications", (r) =>
+    r.fulfill({ headers: headers(base + 12n), json: selectedB }),
+  );
+  const earlier = "sidebar-context-menu-notify-all";
+  const latest = "sidebar-context-menu-notify-default";
+  await menu(page, "alpha");
+  await page.getByTestId(earlier).click();
+  await expect.poll(() => pending.length).toBe(1);
+  await page.getByTestId(latest).click();
+  await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
+  await consume(page, await next(), list(selectedA), base + 10n);
+  await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
+  expect((await publishedRequests(page, path, "PATCH")).length).toBe(1);
+  await menu(page, "beta");
+  await page.getByTestId("sidebar-context-menu-notify-off").click();
+  await expect(page.getByTestId("sidebar-context-menu-notify-off")).toHaveAttribute("aria-pressed", "true");
+  await menu(page, "alpha");
+  await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
+  const first = pending.shift()!;
+  expect(first.request().postDataJSON()).toEqual({
+    notify_on_waiting: true,
+    notify_on_idle: true,
+    notify_on_error: true,
+  });
+  await consume(page, first, selectedA, base + 10n);
+  await expect.poll(() => pending.length).toBe(1);
+  const cancel = pending.shift()!;
+  expect(cancel.request().postDataJSON()).toEqual({
+    notify_on_waiting: null,
+    notify_on_idle: null,
+    notify_on_error: null,
+  });
+  await consume(page, cancel, initialA, base + 11n);
+  await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
+  await consume(page, await next(), list(selectedA, selectedB), base + 11n);
+  await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "true");
+  await consume(page, await next(), list(selectedA, selectedB), base + 13n);
+  await expect(page.getByTestId(earlier)).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId(latest)).toHaveAttribute("aria-pressed", "false");
+});
 
-test("accepted color reset survives navigating Settings before its first ACK", async ({ page }) => {
+test("accepted notifications reset survives navigating Settings before its first ACK", async ({ page }) => {
   const next = await boot(page);
   const list = { sessions: [initialA, B], workspace_ordering: [] };
   await consume(page, await next(), list, 10n);
   const pending: Route[] = [];
-  await page.route("**/api/sessions/A/color", (route) => {
+  await page.route("**/api/sessions/A/notifications", (route) => {
     pending.push(route);
   });
   await menu(page, "alpha");
-  await page.getByTestId("sidebar-context-menu-color-red").click();
+  await page.getByTestId("sidebar-context-menu-notify-all").click();
   await expect.poll(() => pending.length).toBe(1);
-  await page.getByTestId("sidebar-context-menu-color-clear").click();
+  await page.getByTestId("sidebar-context-menu-notify-default").click();
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await expect(row(page, "alpha")).toHaveCount(0);
-  await consume(page, pending.shift()!, { ...initialA, color: "red" }, 11n);
+  await consume(page, pending.shift()!, notify(initialA, true), 11n);
   await expect.poll(() => pending.length).toBe(1);
   const reset = pending.shift()!;
-  expect(reset.request().postDataJSON()).toEqual({ color: null });
+  expect(reset.request().postDataJSON()).toEqual({
+    notify_on_waiting: null,
+    notify_on_idle: null,
+    notify_on_error: null,
+  });
   expect(reset.request().headers()["aoe-runtime-epoch"]).toBe("boot");
   await consume(page, reset, initialA, 12n);
   await page.getByRole("button", { name: "Go to dashboard" }).click();
   await expect(row(page, "alpha")).toBeVisible();
   await row(page, "alpha").click({ button: "right" });
-  await expect(page.getByTestId("sidebar-context-menu-color-clear")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByTestId("sidebar-context-menu-notify-default")).toHaveAttribute("aria-pressed", "true");
 });
 
 test("attach keeps the failed restart result through canonical Multi-repo regrouping", async ({ page }) => {
@@ -197,12 +204,11 @@ for (const staleKind of ["same epoch", "abandoned epoch"] as const) {
     await consume(page, await next(), good, 10n, "current-boot");
     await expect.poll(() => readVisibleSessionTitles(page)).toEqual(["alpha", "beta"]);
     await (await next()).fulfill({ status: 503 });
-    const offline = page.locator('[title="Disconnected from backend"]');
+    const offline = page.getByText("Daemon unreachable. Reconnecting…");
     await expect(offline).toBeVisible();
     const poisoned = {
       ...initialA,
       title: "stale-title",
-      color: "red",
       notify_on_waiting: true,
       notify_on_idle: true,
       notify_on_error: true,
@@ -220,7 +226,6 @@ for (const staleKind of ["same epoch", "abandoned epoch"] as const) {
     await expect(row(page, "stale-title")).toHaveCount(0);
     await expect.poll(() => readVisibleSessionTitles(page)).toEqual(["alpha", "beta"]);
     await menu(page, "alpha");
-    await expect(page.getByTestId("sidebar-context-menu-color-clear")).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByTestId("sidebar-context-menu-notify-default")).toHaveAttribute("aria-pressed", "true");
     await page.keyboard.press("Escape");
     await consume(
@@ -232,7 +237,6 @@ for (const staleKind of ["same epoch", "abandoned epoch"] as const) {
     );
     await expect.poll(() => readVisibleSessionTitles(page)).toEqual(["beta", "canonical-next"]);
     await menu(page, "canonical-next");
-    await expect(page.getByTestId("sidebar-context-menu-color-red")).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByTestId("sidebar-context-menu-notify-all")).toHaveAttribute("aria-pressed", "true");
   });
 }
@@ -250,7 +254,7 @@ test("a hung sessions poll aborts at its deadline and the next canonical poll re
     timeout: 20_000,
   });
   await failed;
-  await expect(page.locator('[title="Disconnected from backend"]')).toBeVisible();
+  await expect(page.getByText("Daemon unreachable. Reconnecting…")).toBeVisible();
   await expect(row(page, "alpha")).toBeVisible();
   await consume(
     page,
@@ -258,8 +262,8 @@ test("a hung sessions poll aborts at its deadline and the next canonical poll re
     { sessions: [{ ...initialA, title: "recovered-after-deadline" }, B], workspace_ordering: [] },
     2n,
   );
-  await expect(page.locator('[title="Disconnected from backend"]')).toHaveCount(0);
+  await expect(page.getByText("Daemon unreachable. Reconnecting…")).toHaveCount(0);
   await expect(row(page, "recovered-after-deadline")).toBeVisible();
   await menu(page, "recovered-after-deadline");
-  await expect(page.getByTestId("sidebar-context-menu-color-red")).toBeEnabled();
+  await expect(page.getByTestId("sidebar-context-menu-notify-all")).toBeEnabled();
 });

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { BUTTON_GHOST, BUTTON_PRIMARY, INPUT } from "../../lib/surfaces";
 import { createPortal } from "react-dom";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import { renameSession, type RuntimeCursor } from "../../lib/api";
@@ -10,7 +11,6 @@ import { useContextMenu } from "../useContextMenu";
 import { SessionActionsMenu, type SessionActionHandlers, type SessionMenuState } from "../sidebar/SessionActions";
 import { useSessionRowModel, type RowObservation } from "../sidebar/useSessionRowModel";
 import { SidebarModal } from "../sidebar/SidebarModal";
-import { MODAL_CANCEL, MODAL_INPUT, MODAL_PRIMARY } from "../sidebar/styles";
 
 // The page picks when and where the menu opens, so it could put an item under a click it asked for.
 const ARM_MS = 300;
@@ -110,7 +110,7 @@ function HostMenu({
   observedById: RowObservation["observedById"];
   runtimeEpoch: RowObservation["runtimeEpoch"];
 }) {
-  const { model, setNotify, setColor } = useSessionRowModel(workspace, optimistic, false, {
+  const { model, setNotify } = useSessionRowModel(workspace, optimistic, false, {
     observedById,
     runtimeEpoch,
     onSessionMutation: handlers.onSessionMutation,
@@ -167,7 +167,6 @@ function HostMenu({
         workspace={workspace}
         model={model}
         setNotify={setNotify}
-        setColor={setColor}
         readOnly={readOnly}
         handlers={handlers}
         onRename={() => {
@@ -281,7 +280,7 @@ function RenameModal({
           value={value}
           onChange={(e) => setValue(e.target.value)}
           data-testid="rename-modal-input"
-          className={MODAL_INPUT}
+          className={`${INPUT} font-mono`}
         />
         {unknown && (
           <p role="alert" className="text-sm text-text-dim">
@@ -289,10 +288,10 @@ function RenameModal({
           </p>
         )}
         <div className="flex justify-end gap-2">
-          <button type="button" disabled={locked} onClick={onClose} className={MODAL_CANCEL}>
+          <button type="button" disabled={locked} onClick={onClose} className={BUTTON_GHOST}>
             Cancel
           </button>
-          <button type="submit" disabled={locked} className={MODAL_PRIMARY}>
+          <button type="submit" disabled={locked} className={BUTTON_PRIMARY}>
             Rename
           </button>
         </div>

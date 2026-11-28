@@ -183,10 +183,10 @@ export function GroupCombobox({
         <div
           data-testid="group-combobox-popup"
           style={inline ? undefined : { maxHeight: placement.maxHeight }}
-          className={`flex flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-900 ${
+          className={`flex flex-col overflow-hidden rounded-xl border border-surface-700/60 bg-surface-800 ${
             inline
               ? "relative mt-1"
-              : `absolute left-0 right-0 z-20 shadow-lg ${placement.up ? "bottom-full mb-1" : "top-full mt-1"}`
+              : `absolute left-0 right-0 z-20 shadow-xl ${placement.up ? "bottom-full mb-1" : "top-full mt-1"}`
           }`}
         >
           {/* In a cramped popup the help yields first, so at least one row stays usable. */}
@@ -209,8 +209,8 @@ export function GroupCombobox({
                   e.preventDefault();
                   pick(option);
                 }}
-                className={`flex min-h-11 cursor-pointer items-center justify-between gap-2 px-3 py-1.5 text-sm md:min-h-0 ${
-                  i === active ? "bg-surface-800 text-text-primary" : "text-text-subtle"
+                className={`flex min-h-11 cursor-pointer items-center justify-between gap-2 px-3 py-1.5 text-[15px] md:text-sm md:min-h-0 ${
+                  i === active ? "bg-surface-700/60 text-text-primary" : "text-text-subtle"
                 }`}
               >
                 {option.kind === "group" ? (

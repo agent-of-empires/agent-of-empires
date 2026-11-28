@@ -17,14 +17,23 @@ export type FeatureUse =
   | "unread_toggle"
   | "row_reorder"
   | "attention_jump"
-  | "session_color"
   | "focus_mode"
   | "fork"
   | "auto_name"
   | "summarize"
   | "files_pane"
   | "agents_pane"
-  | "cheat_code";
+  | "cheat_code"
+  | "suggest_tip_shown"
+  | "suggest_tip_dismissed"
+  | "suggest_tip_clicked"
+  | "suggest_setup_opened"
+  | "suggest_setup_finished"
+  | "suggest_setup_later"
+  | "suggest_start_another"
+  | "suggest_from_home"
+  | "suggest_from_page"
+  | "suggest_from_sidebar";
 
 // Count one use of an accessory feature for the daemon's next opt-in snapshot. Best-effort.
 export function reportFeatureUse(feature: FeatureUse): void {

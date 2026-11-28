@@ -19,6 +19,7 @@ import { ProvenanceBadge } from "./ProvenanceBadge";
 import { labelForProvenance } from "../lib/skillProvenance";
 import { Markdown } from "./acp/Markdown";
 import { skillBody } from "../lib/skillBody";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 function sourceId(skill: SkillSummary): string {
   return skill.provenance.kind === "aoe-managed" ? "aoe-managed" : skill.provenance.root;
@@ -340,7 +341,7 @@ export function SkillsManager({ readOnly = false }: { readOnly?: boolean } = {})
     return (
       <div className="rounded-lg border border-status-error/30 bg-status-error/10 p-4 text-[13px] text-status-error">
         Could not load skills.{" "}
-        <button onClick={() => void load()} className="underline">
+        <button type="button" onClick={() => void load()} className={BUTTON_INLINE}>
           Retry
         </button>
       </div>

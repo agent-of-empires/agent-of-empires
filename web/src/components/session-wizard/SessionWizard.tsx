@@ -28,7 +28,7 @@ import {
 } from "../../lib/api";
 import { VolumeIgnoresGlobDialog } from "./VolumeIgnoresGlobDialog";
 import { HooksTrustDialog } from "./HooksTrustDialog";
-import { ACP_CAPABLE_TOOLS, acpAdapterMissing, isAcpEligible, structuredAvailable } from "../../lib/acpCapableTools";
+import { acpAdapterMissing, isAcpCapable, isAcpEligible, structuredAvailable } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { normalizeProjectPathKey, overridesForPath } from "../../lib/registeredProjects";
@@ -37,6 +37,7 @@ import {
   claimPendingCreate,
   isPendingCreateExpired,
   PENDING_CREATE_EXPIRED_MESSAGE,
+  newIdempotencyKey,
   peekPendingCreate,
   registerPendingCreate,
   releasePendingCreate,
@@ -61,6 +62,7 @@ import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SegmentedRow, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
 import { agentsView, initialData, reducer, type WizardData } from "./wizardReducer";
+import { slugifyBranch } from "./sessionNames";
 import { buildCreateRequest, launchEligible } from "./createRequest";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
@@ -70,17 +72,19 @@ import { PULL_GATED_HINT, PULL_LATEST_HINT, pullLatestChecked, pullLatestOffer }
 import { WaitForUpdateChoice } from "./WaitForUpdateChoice";
 import { CopyCommand } from "../SandboxImageBanner";
 import { notifySandboxImagePulled, notifySandboxImagePullStarted } from "../../lib/sandboxImageEvents";
+import { BUTTON_INLINE, BUTTON_SECONDARY } from "../../lib/surfaces";
+import { CloseButton, DialogHeader, ModalFrame } from "../Dialog";
+import { DIALOG_BODY } from "../../lib/surfaces";
 
-// Validated against ACP_CAPABLE_TOOLS on read, since another install may have written it.
 const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
 const LAST_USED_INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 
 // Path of the last launched session, seeded into a plain open. Absolute paths only.
 const LAST_USED_PROJECT_KEY = "aoe-new-session-last-project";
 
+// Validated against the loaded agents list, since another install may have written it.
 function loadLastUsedTool(): string {
-  const stored = safeGetItem(LAST_USED_TOOL_KEY);
-  return stored && ACP_CAPABLE_TOOLS.has(stored) ? stored : "claude";
+  return safeGetItem(LAST_USED_TOOL_KEY) || "claude";
 }
 
 export interface WizardPrefill {
@@ -96,6 +100,25 @@ export interface WizardPrefill {
   worktreeEnabled?: boolean;
   /** Kept over the profile's view default, as a direct edit would be. */
   useStructuredView?: boolean;
+  /** A preset's worktree choice, kept over project and profile defaults like a direct edit. */
+  useWorktree?: boolean;
+  /** A preset's sandbox choice, kept over project and profile defaults like a direct edit. */
+  useSandbox?: boolean;
+  initialPrompt?: string;
+  title?: string;
+  /** Where a suggested session came from, shown as the "From" strip. */
+  source?: {
+    label: string;
+    title: string;
+    url: string;
+    kindLabel?: string;
+    /** The Start that just failed, so the dialog says why. */
+    failure?: { reason: string; hint?: string };
+  };
+  /** Set when a kind's preset produced `initialPrompt`. */
+  template?: { providerId: string; criterion: string };
+  /** Suggestion to link the created Session to. */
+  suggestion?: { provider_id: string; id: string };
 }
 
 function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean): WizardData {
@@ -117,6 +140,10 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     sandboxEnabled: prefill.sandboxEnabled ?? false,
     profile: prefill.profile || "",
     group: prefill.group || "",
+    // A name-only wizard shows no Prompt row, so a provider draft would be sent unseen.
+    initialPrompt: nameOnly ? "" : (prefill.initialPrompt ?? ""),
+    title: prefill.title ?? "",
+    worktreeBranch: prefill.title ? slugifyBranch(prefill.title) : base.worktreeBranch,
     scratch: prefill.scratch ?? false,
     useWorktree: prefill.scratch ? false : (prefill.worktreeEnabled ?? base.useWorktree),
     // Seeded here rather than dispatched so APPLY_PROFILE_DEFAULTS cannot clobber it.
@@ -126,6 +153,9 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
       useStructuredView: prefill.useStructuredView,
       structuredViewDirty: true,
     }),
+    ...(prefill.useWorktree !== undefined &&
+      !prefill.scratch && { useWorktree: prefill.useWorktree, worktreeDirty: true }),
+    ...(prefill.useSandbox !== undefined && { sandboxEnabled: prefill.useSandbox, sandboxDirty: true }),
   };
 }
 
@@ -157,12 +187,6 @@ const profileMissingError = (profile: string) =>
 
 const REGISTRY_UNRESOLVED_ERROR =
   "Could not load this project's settings, so its sandbox and worktree defaults are unknown. Select the project again to retry.";
-
-function newIdempotencyKey(): string {
-  // randomUUID needs a secure context, which a LAN or tunnel dashboard may not be.
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-}
 
 function waitUntilOnline(): Promise<void> {
   if (typeof navigator === "undefined" || navigator.onLine !== false) return Promise.resolve();
@@ -225,6 +249,7 @@ export interface WizardRestore {
   failure: CreateFailure;
   /** The create's last progress snapshot, for a failed hook's output tail. */
   progress?: CreateProgress | null;
+  suggestion?: WizardPrefill["suggestion"];
 }
 
 interface Props {
@@ -244,9 +269,34 @@ interface Props {
   onRetryServedProfile?: () => Promise<void>;
   /** CityHall client mode: only a title is asked; the server derives the rest. */
   nameOnly?: boolean;
+  /** Opens the preset that produced the prefilled fields for editing. */
+  onEditPreset?: (preset: NonNullable<WizardPrefill["template"]>) => void;
 }
 
 const NO_GROUPS: GroupInfo[] = [];
+
+function SourceStrip({ source }: { source: NonNullable<WizardPrefill["source"]> }) {
+  return (
+    <div
+      data-testid="wizard-source"
+      className="flex flex-wrap items-center gap-2 rounded-md border border-surface-700/60 bg-surface-900 px-2.5 py-2 text-xs text-text-secondary"
+    >
+      <span className="font-mono font-medium">{source.label}</span>
+      <span className="min-w-[200px] flex-1 text-text-primary">{source.title}</span>
+      <span className="text-[11px] text-text-dim">issue text not included</span>
+      {/^https?:\/\//i.test(source.url) && (
+        <a href={source.url} target="_blank" rel="noreferrer" className="text-brand-500 hover:underline">
+          Open &#8599;
+        </a>
+      )}
+      {source.failure && (
+        <p data-testid="wizard-source-failure" className="w-full text-status-error">
+          Couldn&apos;t start: {source.failure.reason}.{source.failure.hint ? ` ${source.failure.hint}` : ""}
+        </p>
+      )}
+    </div>
+  );
+}
 
 export function SessionWizard({
   onClose,
@@ -255,11 +305,14 @@ export function SessionWizard({
   onCreatedInBackground,
   onReopenFailure,
   restore,
-  prefill,
+  prefill: openedWith,
   servedProfile,
   onRetryServedProfile,
   nameOnly = false,
+  onEditPreset,
 }: Props) {
+  // The form is seeded once, so a later prefill (a slow Start with changes) must not swap its provenance.
+  const [prefill] = useState(openedWith);
   const [state, dispatch] = useReducer(reducer, {
     data: restore?.data ?? initialWizardData(prefill, nameOnly),
     isSubmitting: false,
@@ -284,6 +337,8 @@ export function SessionWizard({
   // A Retry found the Container runtime still down after a sandbox_unavailable failure.
   const [runtimeDown, setRuntimeDown] = useState(false);
   const [rechecking, setRechecking] = useState(false);
+  // The remembered tool, until the first agents list confirms it exists.
+  const storedToolRef = useRef(prefill?.tool || restore ? null : safeGetItem(LAST_USED_TOOL_KEY));
   const viewGroupRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -433,7 +488,17 @@ export function SessionWizard({
         if (Array.isArray(list)) {
           // The app-wide names describe the served profile; the project doesn't change them.
           if (agentsProfile === servedProfile) setAgentNames(list);
-          return dispatch({ type: "SET_AGENTS", agents: list, agentsFor: agentsKey, agentsProject: fetchProjectKey });
+          const stored = storedToolRef.current;
+          storedToolRef.current = null;
+          const resetTool =
+            stored && dataRef.current.tool === stored && !list.some((a) => a.name === stored) ? "claude" : undefined;
+          return dispatch({
+            type: "SET_AGENTS",
+            agents: list,
+            agentsFor: agentsKey,
+            agentsProject: fetchProjectKey,
+            resetTool,
+          });
         }
         const missing = list === "profile_not_found";
         dispatch({ type: "AGENTS_FAILED", agentsFor: agentsKey, missing });
@@ -752,7 +817,7 @@ export function SessionWizard({
       }
       if (result.ok) {
         dispatch({ type: "SUBMIT_SUCCESS" });
-        if (ACP_CAPABLE_TOOLS.has(tool)) safeSetItem(LAST_USED_TOOL_KEY, tool);
+        if (isAcpCapable(agents.find((a) => a.name === tool)?.acp_capable)) safeSetItem(LAST_USED_TOOL_KEY, tool);
         safeSetItem(LAST_USED_INSTRUCTION_KEY, body.custom_instruction ?? "");
         if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
         for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
@@ -763,7 +828,12 @@ export function SessionWizard({
       } else if (background) {
         const failure = result.failure;
         if (failure && onReopenFailure && sent) {
-          const restored = { data: sent, failure, progress: lastProgressRef.current };
+          const restored = {
+            data: sent,
+            failure,
+            progress: lastProgressRef.current,
+            suggestion: body.suggestion,
+          };
           const { title } = failureView(failure, { sandboxEnabled: restored.data.sandboxEnabled, runtimeDown: false });
           const reference = failure.reference ? ` Reference ${failure.reference.slice(0, 8)}… · in debug.log` : "";
           toastBus.handler?.action(`Session was not created: ${title}.${reference}`, "Reopen", () =>
@@ -823,12 +893,12 @@ export function SessionWizard({
       ...buildCreateRequest(
         d,
         structuredAvailable(
-          d.tool,
           agents.find((a) => a.name === d.tool),
           d,
         ),
         { skipOnCreate, pullLatest: pullLatestChecked(pullOfferRef.current, d.pullLatestImage) },
       ),
+      suggestion: prefill?.suggestion ?? restore?.suggestion,
       idempotency_key: newIdempotencyKey(),
     };
     // A failed preview counts as nothing to confirm, so it never blocks creation.
@@ -932,8 +1002,8 @@ export function SessionWizard({
         // On the host a missing adapter turns Structured into Terminal, so show that rather than send it.
         if (
           sent.useStructuredView &&
-          structuredAvailable(sent.tool, agent, sent) &&
-          !structuredAvailable(sent.tool, agent, { ...sent, sandboxEnabled: false })
+          structuredAvailable(agent, sent) &&
+          !structuredAvailable(agent, { ...sent, sandboxEnabled: false })
         ) {
           // The box held focus and is gone, so focus the row that explains why nothing launched.
           requestAnimationFrame(() =>
@@ -990,7 +1060,7 @@ export function SessionWizard({
     return !canResend || (resendsSandbox && d.sandboxEnabled && !state.dockerChecked);
   };
   const selectedAgent = agents.find((a) => a.name === d.tool);
-  const acpCapable = isAcpEligible(d.tool, selectedAgent);
+  const acpCapable = isAcpEligible(selectedAgent);
   // `agents` is the list loaded for the selected Profile and project, whose hooks `acp_create_ready` counts.
   const adapterMissing = acpCapable && acpAdapterMissing(selectedAgent, d);
   const structuredOn = acpCapable && !adapterMissing && d.useStructuredView;
@@ -1104,6 +1174,7 @@ export function SessionWizard({
     <RowGroup>{titleRow}</RowGroup>
   ) : (
     <div className="space-y-4">
+      {prefill?.source && <SourceStrip source={prefill.source} />}
       <RowGroup>
         {/* A deleted Profile needs a way out even when only one other is left. */}
         {(state.profiles.length > 1 || agentsStatus === "missing") && (
@@ -1245,6 +1316,25 @@ export function SessionWizard({
             groups={state.groupsFor === groupsKey ? state.groups : NO_GROUPS}
           />
         </FieldRow>
+        <FieldRow label="Prompt" htmlFor="wizard-initial-prompt">
+          <textarea
+            id="wizard-initial-prompt"
+            value={d.initialPrompt}
+            onChange={(e) => handleChange("initialPrompt", e.target.value)}
+            placeholder="Sent to the agent once it is ready"
+            rows={2}
+            className={`${ROW_INPUT} resize-y`}
+          />
+          {prefill?.template && onEditPreset && (
+            <p data-testid="wizard-template" className="pb-2 text-[11px] text-text-dim">
+              From the {prefill.source?.kindLabel ?? prefill.template.criterion} preset
+              {" \u00b7 "}
+              <button type="button" onClick={() => onEditPreset(prefill.template!)} className={BUTTON_INLINE}>
+                Edit preset
+              </button>
+            </p>
+          )}
+        </FieldRow>
       </RowGroup>
       {pullOffer?.running && (
         <div ref={pullLatestRef} className="mt-3">
@@ -1287,130 +1377,120 @@ export function SessionWizard({
 
   const creating = state.isSubmitting && showProgress && !globConfirm && !hooksTrust;
 
+  const footerClass = "px-5 max-md:px-4 py-3 border-t border-surface-700/50";
+
   // Portaled to the body: under the app shell's fixed layers its z-[60] would only rank
   // inside theirs, and body-level z-50 layers (hover tooltips) would paint over it.
   return createPortal(
-    <div className="fixed inset-0 z-[60] flex items-end md:items-center md:justify-center">
-      <div className="absolute inset-0 bg-black/60" onClick={creating ? undefined : onClose} />
-      <div
-        ref={panelRef}
-        data-testid="session-wizard"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="session-wizard-title"
-        style={{ paddingBottom: keyboardHeight || undefined }}
-        // Phones get a bottom sheet sized to its content, so Launch sits under the last row
-        // within thumb reach; a long panel grows it to just below the notch and scrolls.
-        className="relative w-full max-h-[calc(100dvh-env(safe-area-inset-top))] md:max-w-lg bg-surface-800 border-t border-surface-700/30 rounded-t-lg md:border md:rounded-lg flex flex-col md:max-h-[min(720px,90vh)]"
-      >
-        <div className="flex items-center justify-between px-4 md:px-5 py-3 border-b border-surface-700/20">
-          <h1 id="session-wizard-title" className="text-sm font-medium text-text-secondary">
-            {creating ? "Creating session" : "New session"}
-          </h1>
-          <button
-            ref={closeRef}
-            onClick={creating ? handleBackground : onClose}
-            className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-700/50 transition-colors"
-            aria-label="Close"
-          >
-            &times;
-          </button>
-        </div>
-        <div data-wizard-scroll className="flex-1 overflow-y-auto px-4 md:px-5 py-4">
-          {!nameOnly && !state.data.profile && !servedProfile && (
-            <div
-              role="alert"
-              className="mb-4 rounded-md border border-status-warning/40 px-3 py-2 text-sm text-text-secondary"
-            >
-              The server profile could not be loaded. Session defaults cannot be resolved yet.
-              <button
-                type="button"
-                disabled={resolvingServedProfile || !onRetryServedProfile}
-                onClick={() => void retryServedProfile()}
-                className="ml-2 text-brand-400 hover:underline cursor-pointer disabled:opacity-50"
-              >
-                Retry server profile
-              </button>
-            </div>
+    <ModalFrame
+      layer="z-[60]"
+      onBackdrop={creating ? undefined : onClose}
+      // Phones get a bottom sheet sized to its content, so Launch sits under the last row
+      // within thumb reach; a long panel grows it to just below the notch and scrolls.
+      panelClassName="md:max-w-lg md:max-h-[min(720px,90vh)]"
+      panelProps={{
+        ref: panelRef,
+        "data-testid": "session-wizard",
+        role: "dialog",
+        "aria-modal": true,
+        "aria-labelledby": "session-wizard-title",
+        style: { paddingBottom: keyboardHeight || undefined },
+      }}
+      outside={
+        <>
+          {globConfirm && (
+            <VolumeIgnoresGlobDialog globs={globConfirm.globs} onConfirm={handleGlobConfirm} onCancel={cancelPending} />
           )}
-          {creating ? (
-            <CreateProgressView progress={progress} waitingForUpdate={waitingForUpdate} />
-          ) : panel ? (
-            <>
-              <PanelHeader title={PANEL_TITLE[panel]} onBack={() => setPanel(null)} />
-              {renderPanel(panel)}
-            </>
-          ) : (
-            form
-          )}
-        </div>
-        {!panel || creating ? (
-          <div
-            className="px-4 md:px-5 pt-3 border-t border-surface-700/20"
-            style={{ paddingBottom: keyboardHeight ? "0.75rem" : "max(0.75rem, env(safe-area-inset-bottom))" }}
-          >
-            <LaunchFooter
-              data={d}
-              isSubmitting={state.isSubmitting}
-              held={rechecking}
-              failure={
-                state.failure &&
-                failed && (
-                  <CreateFailureBox
-                    key={state.failure.reference ?? ""}
-                    failure={state.failure}
-                    view={failed}
-                    output={progress?.output ?? []}
-                    onAction={(action) => void handleFailureAction(action)}
-                    busy={rechecking}
-                    blocked={resendBlocked}
-                  />
-                )
-              }
-              error={
-                state.error ??
-                // A deleted Profile also fails the project lookup, which reselecting can't fix.
-                (!nameOnly && agentsStatus === "missing" ? profileMissingError(agentsKey) : null) ??
-                (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
-                (!nameOnly && agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
-                (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
-              }
-              onSubmit={() => void handleSubmit()}
-              nameOnly={nameOnly}
-              defaultsReady={formReady && !(d.sandboxEnabled && !state.dockerChecked)}
-              onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
+          {hooksTrust && (
+            <HooksTrustDialog
+              onCreate={hooksTrust.info.onCreate}
+              onLaunch={hooksTrust.info.onLaunch}
+              onDestroy={hooksTrust.info.onDestroy}
+              needsMcpTrust={hooksTrust.info.needsMcpTrust}
+              mcpSummaries={hooksTrust.mcpSummaries}
+              onConfirm={handleHooksTrustConfirm}
+              onCancel={cancelPending}
             />
-          </div>
-        ) : (
+          )}
+        </>
+      }
+    >
+      <DialogHeader
+        as="h1"
+        titleId="session-wizard-title"
+        title={creating ? "Creating session" : "New session"}
+        end={<CloseButton buttonRef={closeRef} onClick={creating ? handleBackground : onClose} />}
+      />
+      <div data-wizard-scroll className={DIALOG_BODY}>
+        {!nameOnly && !state.data.profile && !servedProfile && (
           <div
-            className="px-4 md:px-5 pt-3 border-t border-surface-700/20"
-            style={{ paddingBottom: keyboardHeight ? "0.75rem" : "max(0.75rem, env(safe-area-inset-bottom))" }}
+            role="alert"
+            className="mb-4 rounded-lg border border-status-warning/40 bg-status-warning/5 px-3 py-2 text-[15px] md:text-sm text-text-secondary"
           >
+            The server profile could not be loaded. Session defaults cannot be resolved yet.
             <button
               type="button"
-              onClick={() => setPanel(null)}
-              className="w-full py-2.5 rounded-lg text-sm font-medium text-text-primary bg-surface-700 hover:bg-surface-600 cursor-pointer transition-colors"
+              disabled={resolvingServedProfile || !onRetryServedProfile}
+              onClick={() => void retryServedProfile()}
+              className={`${BUTTON_INLINE} ml-2`}
             >
-              Done
+              Retry server profile
             </button>
           </div>
         )}
+        {creating ? (
+          <CreateProgressView progress={progress} waitingForUpdate={waitingForUpdate} />
+        ) : panel ? (
+          <>
+            <PanelHeader title={PANEL_TITLE[panel]} onBack={() => setPanel(null)} />
+            {renderPanel(panel)}
+          </>
+        ) : (
+          form
+        )}
       </div>
-      {globConfirm && (
-        <VolumeIgnoresGlobDialog globs={globConfirm.globs} onConfirm={handleGlobConfirm} onCancel={cancelPending} />
+      {!panel || creating ? (
+        <div className={footerClass}>
+          <LaunchFooter
+            data={d}
+            isSubmitting={state.isSubmitting}
+            held={rechecking}
+            failure={
+              state.failure &&
+              failed && (
+                <CreateFailureBox
+                  key={state.failure.reference ?? ""}
+                  failure={state.failure}
+                  view={failed}
+                  output={progress?.output ?? []}
+                  onAction={(action) => void handleFailureAction(action)}
+                  busy={rechecking}
+                  blocked={resendBlocked}
+                />
+              )
+            }
+            error={
+              state.error ??
+              // A deleted Profile also fails the project lookup, which reselecting can't fix.
+              (!nameOnly && agentsStatus === "missing" ? profileMissingError(agentsKey) : null) ??
+              (projectUnresolved ? REGISTRY_UNRESOLVED_ERROR : null) ??
+              (!nameOnly && agentsStatus === "failed" ? AGENTS_UNAVAILABLE_ERROR : null) ??
+              (unknownOutcome ? UNKNOWN_OUTCOME_ERROR : null)
+            }
+            onSubmit={() => void handleSubmit()}
+            nameOnly={nameOnly}
+            defaultsReady={formReady && !(d.sandboxEnabled && !state.dockerChecked)}
+            onBackground={creating && onCreatedInBackground ? handleBackground : undefined}
+          />
+        </div>
+      ) : (
+        <div className={footerClass}>
+          <button type="button" onClick={() => setPanel(null)} className={`${BUTTON_SECONDARY} w-full`}>
+            Done
+          </button>
+        </div>
       )}
-      {hooksTrust && (
-        <HooksTrustDialog
-          onCreate={hooksTrust.info.onCreate}
-          onLaunch={hooksTrust.info.onLaunch}
-          onDestroy={hooksTrust.info.onDestroy}
-          needsMcpTrust={hooksTrust.info.needsMcpTrust}
-          mcpSummaries={hooksTrust.mcpSummaries}
-          onConfirm={handleHooksTrustConfirm}
-          onCancel={cancelPending}
-        />
-      )}
-    </div>,
+    </ModalFrame>,
     document.body,
   );
 }

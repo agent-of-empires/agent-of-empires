@@ -1,6 +1,9 @@
 import { useState } from "react";
 import type { McpSecretEntry, McpServerInput, McpServerView } from "../lib/api";
 import { hasFinePointer } from "../lib/platform";
+import { BUTTON_GHOST, BUTTON_SECONDARY, INPUT } from "../lib/surfaces";
+import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
+import { FIELD_LABEL } from "../lib/surfaces";
 
 type Transport = McpServerInput["transport"];
 
@@ -11,8 +14,10 @@ interface SecretRow {
   stored: boolean;
 }
 
-const inputClass =
-  "w-full bg-surface-900 border border-surface-700 rounded px-2 py-1 font-mono text-[12px] text-text-primary";
+const inputClass = `${INPUT} font-mono`;
+const LABEL = `${FIELD_LABEL} !mb-1`;
+const ROW_BUTTON = `${BUTTON_GHOST} shrink-0 !px-3`;
+const ADD_BUTTON = `${BUTTON_SECONDARY} self-start`;
 
 function toEntries(rows: SecretRow[]): McpSecretEntry[] {
   return rows
@@ -32,8 +37,8 @@ function SecretRows({
   const update = (i: number, patch: Partial<SecretRow>) =>
     onChange(rows.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   return (
-    <div className="space-y-1">
-      <span className="font-mono text-[11px] text-text-muted">{label}</span>
+    <div className="flex flex-col gap-1.5">
+      <span className={LABEL}>{label}</span>
       {rows.map((r, i) => (
         <div key={i} className="flex gap-2">
           <input
@@ -56,7 +61,7 @@ function SecretRows({
             type="button"
             aria-label={`remove ${label} ${i + 1}`}
             onClick={() => onChange(rows.filter((_, idx) => idx !== i))}
-            className="px-2 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700"
+            className={ROW_BUTTON}
           >
             Remove
           </button>
@@ -65,7 +70,7 @@ function SecretRows({
       <button
         type="button"
         onClick={() => onChange([...rows, { name: "", value: "", stored: false }])}
-        className="px-2 py-1 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700"
+        className={ADD_BUTTON}
       >
         Add {label}
       </button>
@@ -76,8 +81,8 @@ function SecretRows({
 /** One editor per argument, so empty and multiline arguments survive an unchanged save. */
 function ArgRows({ rows, onChange }: { rows: string[]; onChange: (rows: string[]) => void }) {
   return (
-    <div className="space-y-1">
-      <span className="font-mono text-[11px] text-text-muted">Arguments</span>
+    <div className="flex flex-col gap-1.5">
+      <span className={LABEL}>Arguments</span>
       {rows.map((a, i) => (
         <div key={i} className="flex gap-2">
           <textarea
@@ -91,17 +96,13 @@ function ArgRows({ rows, onChange }: { rows: string[]; onChange: (rows: string[]
             type="button"
             aria-label={`remove argument ${i + 1}`}
             onClick={() => onChange(rows.filter((_, idx) => idx !== i))}
-            className="px-2 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700"
+            className={ROW_BUTTON}
           >
             Remove
           </button>
         </div>
       ))}
-      <button
-        type="button"
-        onClick={() => onChange([...rows, ""])}
-        className="px-2 py-1 text-[12px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700"
-      >
+      <button type="button" onClick={() => onChange([...rows, ""])} className={ADD_BUTTON}>
         Add argument
       </button>
     </div>
@@ -140,93 +141,79 @@ export function McpServerForm({
   };
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label={initial ? `Edit MCP server ${initial.name}` : "Add MCP server"}
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
-    >
-      <div className="bg-surface-800 border border-surface-700/50 rounded-lg p-5 w-[min(36rem,90vw)] max-h-[90vh] overflow-y-auto">
-        <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-3">
-          {initial ? `Edit ${initial.name}` : "Add server"}
-        </h3>
-        <div className="space-y-3">
-          <label className="block">
-            <span className="font-mono text-[11px] text-text-muted">Name</span>
-            <input
-              aria-label="Name"
-              autoFocus={!initial && hasFinePointer()}
-              className={inputClass}
-              value={name}
-              readOnly={!!initial}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </label>
-          <label className="block">
-            <span className="font-mono text-[11px] text-text-muted">Transport</span>
-            <select
-              aria-label="Transport"
-              autoFocus={!!initial && hasFinePointer()}
-              className={inputClass}
-              value={transport}
-              onChange={(e) => setTransport(e.target.value as Transport)}
-            >
-              <option value="stdio">stdio</option>
-              <option value="http">http</option>
-              <option value="sse">sse</option>
-            </select>
-          </label>
-          {transport === "stdio" ? (
-            <>
-              <p className="font-body text-[12px] text-status-waiting">
-                The command runs on this machine with your permissions whenever an agent starts.
-              </p>
-              <label className="block">
-                <span className="font-mono text-[11px] text-text-muted">Command</span>
-                <input
-                  aria-label="Command"
-                  className={inputClass}
-                  value={command}
-                  onChange={(e) => setCommand(e.target.value)}
-                />
-              </label>
-              <ArgRows rows={args} onChange={setArgs} />
-              <SecretRows label="env" rows={env} onChange={setEnv} />
-            </>
-          ) : (
-            <>
-              <label className="block">
-                <span className="font-mono text-[11px] text-text-muted">URL</span>
-                <input aria-label="URL" className={inputClass} value={url} onChange={(e) => setUrl(e.target.value)} />
-              </label>
-              <SecretRows label="header" rows={headers} onChange={setHeaders} />
-            </>
-          )}
-        </div>
-        {error && (
-          <p className="font-body text-[12px] text-status-error mt-3" role="alert">
-            {error}
-          </p>
-        )}
-        <div className="flex justify-end gap-2 mt-4">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onClose}
-            className="px-3 py-1.5 text-[13px] rounded border border-surface-700 text-text-secondary hover:bg-surface-700 disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={submit}
-            className="px-3 py-1.5 text-[13px] rounded bg-brand-600 text-white hover:bg-brand-500 disabled:opacity-50"
-          >
+    <Dialog
+      id="mcp-server-form"
+      ariaLabel={initial ? `Edit MCP server ${initial.name}` : "Add MCP server"}
+      title={initial ? `Edit ${initial.name}` : "Add server"}
+      describedBy={false}
+      panelClassName="md:w-[36rem] md:max-h-[90vh]"
+      footer={
+        <>
+          <CancelButton onClick={onClose} disabled={busy} />
+          <ConfirmButton onClick={submit} disabled={busy}>
             Save
-          </button>
-        </div>
+          </ConfirmButton>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        <label className="block">
+          <span className={LABEL}>Name</span>
+          <input
+            aria-label="Name"
+            autoFocus={!initial && hasFinePointer()}
+            className={inputClass}
+            value={name}
+            readOnly={!!initial}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </label>
+        <label className="block">
+          <span className={LABEL}>Transport</span>
+          <select
+            aria-label="Transport"
+            autoFocus={!!initial && hasFinePointer()}
+            className={inputClass}
+            value={transport}
+            onChange={(e) => setTransport(e.target.value as Transport)}
+          >
+            <option value="stdio">stdio</option>
+            <option value="http">http</option>
+            <option value="sse">sse</option>
+          </select>
+        </label>
+        {transport === "stdio" ? (
+          <>
+            <p className="font-body text-[12px] text-status-waiting">
+              The command runs on this machine with your permissions whenever an agent starts.
+            </p>
+            <label className="block">
+              <span className={LABEL}>Command</span>
+              <input
+                aria-label="Command"
+                className={inputClass}
+                value={command}
+                onChange={(e) => setCommand(e.target.value)}
+              />
+            </label>
+            <ArgRows rows={args} onChange={setArgs} />
+            <SecretRows label="env" rows={env} onChange={setEnv} />
+          </>
+        ) : (
+          <>
+            <label className="block">
+              <span className={LABEL}>URL</span>
+              <input aria-label="URL" className={inputClass} value={url} onChange={(e) => setUrl(e.target.value)} />
+            </label>
+            <SecretRows label="header" rows={headers} onChange={setHeaders} />
+          </>
+        )}
       </div>
-    </div>
+      {error && (
+        <p className="text-[13px] text-status-error mt-3" role="alert">
+          {error}
+        </p>
+      )}
+    </Dialog>
   );
 }

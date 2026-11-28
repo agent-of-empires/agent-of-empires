@@ -6,15 +6,11 @@ use crate::session::config::StructuredView;
 use crate::session::projection::SessionProjection;
 use crate::time::Timestamp;
 
-/// Convert session facts with the user fullscreen setting read once per request.
-/// [`SessionResponse::claude_fullscreen`] exposes that setting only for Claude.
-pub(crate) fn session_response_from_instance(
-    inst: &Instance,
-    claude_fullscreen: bool,
-) -> SessionResponse {
+/// Convert session facts without runtime snapshots.
+pub(crate) fn session_response_from_instance(inst: &Instance) -> SessionResponse {
     let mut response = session_response_from_instance_with_plan(
         inst,
-        claude_fullscreen,
+        &crate::json_probe::Memo::default(),
         None,
         crate::daemon::AcpWorkerState::Absent,
         None,
@@ -28,7 +24,7 @@ pub(crate) fn session_response_from_instance(
 /// Convert backend session facts with the request's plan and runtime snapshots.
 pub(super) fn session_response_from_instance_with_plan(
     inst: &Instance,
-    claude_fullscreen: bool,
+    probes: &crate::json_probe::Memo,
     plan_summary: Option<PlanSummary>,
     acp_worker_state: crate::daemon::AcpWorkerState,
     next_wakeup_at: Option<String>,
@@ -48,6 +44,10 @@ pub(super) fn session_response_from_instance_with_plan(
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or(inst.tool.as_str()),
+    );
+    let agent_profile_wire = crate::acp::agent_profiles::AgentProfileWire::new(
+        agent_profile,
+        agent_profile.probe_fullscreen(probes),
     );
     let timestamp = |value: Option<Timestamp>| value.map(|t| t.to_rfc3339());
     let status = if inst
@@ -113,7 +113,6 @@ pub(super) fn session_response_from_instance_with_plan(
         created_without_setup: inst.created_without_setup,
         favorited: inst.is_favorited(),
         favorited_at: inst.favorited_at.map(|t| t.to_rfc3339()),
-        color: inst.color.clone(),
         urgent: inst.is_urgent(),
         pinned_at: timestamp(row.pinned_at),
         archived_at: timestamp(row.archived_at),
@@ -151,7 +150,6 @@ pub(super) fn session_response_from_instance_with_plan(
         context_resume: None,
         acp_worker_state,
         acp_worker_start: None,
-        update_restart: false,
         pending_approvals: Vec::new(),
         rate_limit: None,
         rate_limit_auto_resume: None,
@@ -201,20 +199,8 @@ pub(super) fn session_response_from_instance_with_plan(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(inst.tool.as_str()),
         ),
-        // The composer palette, the queued-prompt clear-boundary hint and
-        // the queued strip's reason read these instead of a client-side
-        // per-agent mirror.
-        clear_aliases: agent_profile
-            .clear_aliases
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        compact_aliases: agent_profile
-            .compact_aliases
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        claude_fullscreen: claude_fullscreen && inst.tool == "claude",
+        claude_fullscreen: inst.tool == "claude" && agent_profile_wire.fullscreen,
+        agent_profile: agent_profile_wire,
         // A session converted by `attach_project` (#3103) has a real
         // `workspace_info`, so both repos list here with no special case.
         workspace_repos: row
@@ -304,21 +290,6 @@ pub(super) fn truncate_title(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
-}
-
-/// A plain session keeps `RuntimeCheckRequired` until a resume probe runs, so a captured
-/// agent session id is the evidence that a restart keeps the conversation.
-pub(super) fn update_restart_resumable(
-    inst: &Instance,
-    resume: &ContextResumeAvailability,
-) -> bool {
-    match resume {
-        ContextResumeAvailability::Available => true,
-        ContextResumeAvailability::Indeterminate {
-            reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
-        } => inst.agent_session_id.is_some(),
-        _ => false,
-    }
 }
 
 pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {

@@ -5,6 +5,8 @@ import { EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 import { AgentPickerEssentials } from "./AgentPickerEssentials";
 import { LabeledInput } from "./LaunchFields";
 import type { WizardData } from "../wizardReducer";
+import { INPUT } from "../../../lib/surfaces";
+import { FIELD_HINT, FIELD_LABEL } from "../../../lib/surfaces";
 
 interface Props {
   data: WizardData;
@@ -17,7 +19,7 @@ interface Props {
 /** Agent choice, instructions and launch-command knobs behind the wizard's Agent row. */
 export function AgentPanel({ data, onChange, agents, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const selectedAgent = agents.find((a) => a.name === data.tool);
-  const willUseStructuredView = structuredAvailable(data.tool, selectedAgent, data) && data.useStructuredView;
+  const willUseStructuredView = structuredAvailable(selectedAgent, data) && data.useStructuredView;
   const resolvedCommand = resolveLaunchCommand({
     tool: data.tool,
     useStructuredView: willUseStructuredView,
@@ -36,7 +38,7 @@ export function AgentPanel({ data, onChange, agents, commandMaps = EMPTY_COMMAND
       <AgentPickerEssentials data={data} onChange={onChange} agents={agents} />
 
       <div>
-        <label htmlFor="wizard-instructions" className="block text-sm text-text-dim mb-1.5">
+        <label htmlFor="wizard-instructions" className={FIELD_LABEL}>
           Agent instructions
         </label>
         <textarea
@@ -45,7 +47,7 @@ export function AgentPanel({ data, onChange, agents, commandMaps = EMPTY_COMMAND
           onChange={(e) => onChange("customInstruction", e.target.value)}
           placeholder="Custom instructions for this session..."
           rows={3}
-          className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2 text-base md:text-sm text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none resize-y"
+          className={`${INPUT} resize-y`}
         />
       </div>
 
@@ -56,7 +58,7 @@ export function AgentPanel({ data, onChange, agents, commandMaps = EMPTY_COMMAND
         placeholder="e.g. --port 8080"
       >
         {extraArgsIgnored && (
-          <p className="mt-1.5 text-xs text-status-warning" data-testid="extra-args-ignored">
+          <p className="mt-1.5 text-[13px] md:text-xs text-status-warning" data-testid="extra-args-ignored">
             Extra args are ignored for structured-view sessions; use the command override to change the launch command.
           </p>
         )}
@@ -69,7 +71,7 @@ export function AgentPanel({ data, onChange, agents, commandMaps = EMPTY_COMMAND
         placeholder="Override the agent launch command"
       >
         {resolvedCommand && (
-          <p className="mt-1.5 text-xs text-text-dim" data-testid="resolved-launch-command">
+          <p className={`mt-1.5 ${FIELD_HINT}`} data-testid="resolved-launch-command">
             Resolved launch command: <code className="font-mono text-text-secondary">{resolvedCommand}</code>
           </p>
         )}

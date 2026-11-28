@@ -52,7 +52,7 @@ export function ToggleRow({
 }) {
   return (
     <label
-      className={`flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg ${className}`}
+      className={`flex items-center justify-between gap-3 min-h-12 px-4 py-3 bg-surface-900 border border-surface-700/50 rounded-xl max-md:rounded-2xl ${className}`}
       onClick={(e) => {
         // The switch already fired onChange; handling the bubbled click would toggle twice.
         if (disabled || (e.target as HTMLElement).closest('button[role="switch"]')) return;
@@ -60,8 +60,8 @@ export function ToggleRow({
       }}
     >
       <div className="flex-1">
-        <div className="text-sm font-medium text-text-primary">{title}</div>
-        <div className="text-xs text-text-dim mt-0.5 leading-snug">{description}</div>
+        <div className="text-[15px] md:text-sm font-medium text-text-primary">{title}</div>
+        <div className="text-[13px] md:text-xs text-text-dim mt-0.5 leading-snug">{description}</div>
       </div>
       <Toggle checked={checked} onChange={onChange} disabled={disabled} label={switchLabel} />
     </label>

@@ -1443,10 +1443,30 @@ pub struct TipsResponse {
 /// shared `crate::tips` catalog plus `app_state.tips_seen` and
 /// `session.show_tips`. A read projection, so it stays a plain GET behind the
 /// token wall like [`get_web_ui_state`]; the TUI-only tips never appear here.
-pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let result = tokio::task::spawn_blocking(|| {
+pub async fn get_tips(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let host = state.plugin_host.clone();
+    let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::Config::load()?;
-        let signals = crate::tips::TipSignals::from(&config);
+        let mut signals = crate::tips::TipSignals::from(&config);
+        // The same providers and switches GET /api/suggestions reports. A store
+        // error only drops this tip.
+        let snapshot = host.as_ref().and_then(|host| {
+            let providers = crate::plugin::suggestions::providers();
+            host.with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::snapshot(conn, profile, &providers)
+            })
+            .ok()
+        });
+        signals.suggestions_setup_available = snapshot.is_some_and(|snapshot| {
+            let enabled: Vec<bool> = snapshot["providers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["id"] != crate::plugin::suggestions::AGENT_PROVIDER_ID)
+                .map(|p| p["enabled"].as_bool().unwrap_or(false))
+                .collect();
+            crate::tips::suggestions_setup_available(&enabled)
+        });
         let seen = &config.app_state.tips_seen;
         let tips = crate::tips::eligible(crate::tips::TipSurface::Web, &signals)
             .into_iter()
@@ -1796,11 +1816,21 @@ pub async fn mark_volume_ignores_globs_acknowledged(
 
 // --- Themes ---
 
-pub async fn list_themes() -> Json<Vec<String>> {
+#[derive(serde::Serialize)]
+pub struct ThemeChoice {
+    name: String,
+    /// What a picker shows: "dark" (zinc) and "light" for the default pair, else the name.
+    label: String,
+}
+
+pub async fn list_themes() -> Json<Vec<ThemeChoice>> {
     Json(
         crate::tui::styles::available_themes()
             .into_iter()
-            .map(|s| s.to_string())
+            .map(|name| ThemeChoice {
+                label: crate::tui::styles::theme_label(&name).to_string(),
+                name,
+            })
             .collect(),
     )
 }
@@ -1946,33 +1976,6 @@ pub async fn filesystem_home(State(state): State<Arc<AppState>>) -> impl IntoRes
     }
 }
 
-/// Standard system folders that live directly under $HOME. On macOS several
-/// of these (Downloads, Desktop, Pictures/Photos, Music) are TCC-protected:
-/// opening them triggers a permission prompt. None is ever a git repo, so the
-/// directory browser skips its `.git` probe for them and avoids the prompt.
-const HOME_SYSTEM_DIRS: &[&str] = &[
-    "Desktop",
-    "Documents",
-    "Downloads",
-    "Movies",
-    "Music",
-    "Pictures",
-    "Public",
-    "Library",
-];
-
-/// The TCC prompt only exists on macOS, so gate the skip there. On other
-/// platforms these folders are probed normally and keep their git badge.
-fn skip_git_probe(parent: &std::path::Path, name: &str, home: Option<&std::path::Path>) -> bool {
-    if !cfg!(target_os = "macos") {
-        return false;
-    }
-    match home {
-        Some(home) => parent == home && HOME_SYSTEM_DIRS.contains(&name),
-        None => false,
-    }
-}
-
 pub async fn browse_filesystem(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BrowseQuery>,
@@ -2018,11 +2021,12 @@ pub async fn browse_filesystem(
             }
             // Probing `.git` opens the directory, which prompts under macOS
             // TCC. None of the standard $HOME folders is ever a repo.
-            let is_git_repo = if skip_git_probe(&canonical, &name, home.as_deref()) {
-                false
-            } else {
-                entry_path.join(".git").exists()
-            };
+            let is_git_repo =
+                if crate::process::is_tcc_protected_home_dir(&canonical, &name, home.as_deref()) {
+                    false
+                } else {
+                    entry_path.join(".git").exists()
+                };
             entries.push(DirEntry {
                 name,
                 path: entry_path.to_string_lossy().to_string(),
@@ -3032,58 +3036,21 @@ pub async fn update_profile_settings(
 
 // --- Sounds ---
 
-pub async fn list_sounds() -> Json<Vec<String>> {
-    Json(crate::sound::list_available_sounds())
-}
-
-/// Serve a sound file by name so the acp's browser-side approval
-/// player can fetch it from the same origin as the dashboard. The name
-/// is validated against `list_available_sounds()` to block path
-/// traversal: an attacker who can hit `/api/sounds/file/<x>` cannot
-/// read arbitrary disk paths, only files already present in the user's
-/// `sounds/` directory.
-pub async fn serve_sound_file(
-    axum::extract::Path(name): axum::extract::Path<String>,
-) -> impl IntoResponse {
-    // `list_available_sounds` does a sync `read_dir`, so validation stays on
-    // the blocking pool; the file read uses `tokio::fs::read`.
-    let lookup_name = name.clone();
-    let validated = tokio::task::spawn_blocking(move || {
-        if !crate::sound::list_available_sounds().contains(&lookup_name) {
-            return None;
-        }
-        crate::sound::get_sounds_dir().map(|dir| dir.join(&lookup_name))
-    })
-    .await;
-
-    let path = match validated {
-        Ok(Some(p)) => p,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+/// `GET /api/sounds/{event}`: a built-in sound for the dashboard to play. The
+/// bytes are fixed per build, so the browser may cache them.
+pub async fn serve_sound(
+    axum::extract::Path(event): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let Some(event) = crate::sound::SoundEvent::parse(&event) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let content_type = match std::path::Path::new(&name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("ogg") => "audio/ogg",
-        _ => "audio/wav",
-    };
-
     (
         StatusCode::OK,
         [
-            (axum::http::header::CONTENT_TYPE, content_type),
-            (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
+            (axum::http::header::CONTENT_TYPE, "audio/wav"),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=86400"),
         ],
-        bytes,
+        event.wav(),
     )
         .into_response()
 }
@@ -3969,34 +3936,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn skip_git_probe_avoids_protected_home_folders() {
-        let home = std::path::Path::new("/Users/alice");
-
-        // The TCC prompt is macOS-only, so other platforms probe normally.
-        let macos = cfg!(target_os = "macos");
-
-        // Protected folders directly under $HOME: skipped on macOS.
-        for name in ["Downloads", "Desktop", "Music", "Pictures", "Documents"] {
-            assert_eq!(
-                skip_git_probe(home, name, Some(home)),
-                macos,
-                "unexpected probe decision for ~/{name}"
-            );
-        }
-
-        // A real project directly under $HOME still gets probed, so its git
-        // badge is preserved.
-        assert!(!skip_git_probe(home, "myproject", Some(home)));
-
-        // A system-looking name that is not directly under $HOME is probed.
-        let sub = std::path::Path::new("/Users/alice/code");
-        assert!(!skip_git_probe(sub, "Downloads", Some(home)));
-
-        // No home resolved: never skip (falls back to normal probing).
-        assert!(!skip_git_probe(home, "Downloads", None));
-    }
-
     fn custom_agents(entries: &[(&str, &str)]) -> HashMap<String, String> {
         entries
             .iter()
@@ -4651,24 +4590,18 @@ command = "zzzeta"
     }
 
     #[tokio::test]
-    async fn serve_sound_file_rejects_unknown_name() {
-        let resp = serve_sound_file(axum::extract::Path("does-not-exist-xyz.wav".to_string()))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
+    async fn serve_sound_serves_events_and_refuses_anything_else() {
+        let resp = serve_sound(axum::extract::Path("idle".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&body[..], crate::sound::SoundEvent::Idle.wav());
 
-    #[tokio::test]
-    async fn serve_sound_file_rejects_path_traversal() {
-        let resp = serve_sound_file(axum::extract::Path("../../../etc/passwd".to_string()))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        // A NOT_FOUND that somehow still streamed a body would be a
-        // worse failure than the wrong status, so assert the body is
-        // empty rather than just "not /etc/passwd".
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert!(body.is_empty(), "unexpected body bytes: {body:?}");
+        for name in ["idle.wav", "../../../etc/passwd", "IDLE "] {
+            let resp = serve_sound(axum::extract::Path(name.to_string())).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            assert!(body.is_empty(), "{name}: unexpected body bytes");
+        }
     }
     /// A PATCH whose connection dropped can commit after the client's newer edit of the
     /// same leaf; the stamp makes the server drop it instead of restoring the old value.

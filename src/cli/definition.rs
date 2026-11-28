@@ -28,6 +28,7 @@ use super::settings::SettingsCommands;
 use super::skill::SkillCommands;
 use super::sounds::SoundsCommands;
 use super::status::StatusArgs;
+use super::suggest::SuggestArgs;
 use super::telemetry::TelemetryCommands;
 use super::theme::ThemeCommands;
 use super::tmux::TmuxCommands;
@@ -58,7 +59,7 @@ pub struct Cli {
     #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 
-    /// Select a daemon endpoint for read-only CLI commands or the TUI.
+    /// Select a Daemon endpoint for commands that use the Daemon API, or for the TUI.
     ///
     /// Explicit endpoints and `AOE_DAEMON_URL` never fall back to local storage
     /// or start a local daemon. Authenticate with `AOE_DAEMON_TOKEN` or
@@ -125,6 +126,9 @@ pub enum Commands {
 
     /// Send a message to a running agent session
     Send(SendArgs),
+
+    /// Suggest a session: it shows under Suggested sessions until started or dismissed
+    Suggest(SuggestArgs),
 
     /// Show session status summary
     ///
@@ -194,7 +198,7 @@ pub enum Commands {
         command: TmuxCommands,
     },
 
-    /// Manage sound effects for agent state transitions
+    /// Test the built-in sound effects
     Sounds {
         #[command(subcommand)]
         command: SoundsCommands,
@@ -344,6 +348,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "log_level",
     "remove",
     "send",
+    "suggest",
     "status",
     "killall",
     "daemon",
@@ -383,6 +388,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::LogLevel(_) => "log_level",
         Commands::Remove(_) => "remove",
         Commands::Send(_) => "send",
+        Commands::Suggest(_) => "suggest",
         Commands::Status(_) => "status",
         Commands::Killall(_) => "killall",
         Commands::Daemon { .. } => "daemon",
