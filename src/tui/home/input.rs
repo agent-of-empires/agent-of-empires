@@ -3927,21 +3927,18 @@ impl HomeView {
         let Some(to_structured) = self.session_switch_view_target(&id).map(|s| !s) else {
             return;
         };
-        // Claude keeps context on the way back to the terminal (the switch resumes
-        // `claude --resume`), so the warning must not threaten data loss for it. Mirrors
-        // the backend gate (agents::acp_transcript_cli_resumable), approximated here by
-        // agent_name or the tool. See #2252.
-        let keeps_context = self.get_instance(&id).is_some_and(|inst| {
-            let acp_agent = inst.agent_name.as_deref().unwrap_or(&inst.tool);
-            crate::agents::acp_transcript_cli_resumable(&inst.tool, acp_agent)
-        });
+        // Mirrors the backend gate (agents::acp_transcript_cli_resumable). See #2252.
+        let keeps_context = self
+            .get_instance(&id)
+            .is_some_and(|inst| inst.acp_transcript_cli_resumable(&inst.effective_acp_agent()));
         let (title, body) = if to_structured && keeps_context {
             (
                 "Switch to structured view",
                 "Switch this session to the structured view? The tmux pane and its \
                  scrollback are cleared, but the conversation continues in structured \
-                 view; the agent restarts under the aoe serve daemon (a local one is \
-                 started if none is running).",
+                 view when it has a saved transcript, otherwise it starts fresh; the \
+                 agent restarts under the aoe serve daemon (a local one is started if \
+                 none is running).",
             )
         } else if to_structured {
             (
@@ -3955,8 +3952,8 @@ impl HomeView {
             (
                 "Switch to terminal",
                 "Switch this session back to a tmux terminal? The conversation \
-                 continues in the terminal (the agent resumes it with \
-                 `--resume`); the structured view is closed.",
+                 continues in the terminal when it can be resumed with `--resume`, \
+                 otherwise the agent starts fresh; the structured view is closed.",
             )
         } else {
             (

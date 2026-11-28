@@ -173,7 +173,7 @@ impl<'a> ForkParentRef<'a> {
 
 /// Process-wide default ACP registry, used only to answer "does this built-in tool have an ACP
 /// adapter?" for capability checks that have no profile-resolved config handy.
-fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
+pub(crate) fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
     static REG: std::sync::OnceLock<crate::acp::AgentRegistry> = std::sync::OnceLock::new();
     REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
 }

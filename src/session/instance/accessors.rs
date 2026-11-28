@@ -221,16 +221,94 @@ impl Instance {
         self.execution_agent().ok()
     }
 
-    pub(crate) fn declared_agent(&self) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
-        if crate::agents::get_agent(&self.tool).is_some() {
-            return None;
+    /// Whether structured view can carry this terminal transcript to `acp_agent`.
+    /// Resolves config only for a non-claude tool paired with a claude agent.
+    pub(crate) fn acp_transcript_cli_resumable(&self, acp_agent: &str) -> bool {
+        crate::agents::acp_transcript_cli_resumable(
+            &self.execution_identity_name(acp_agent),
+            acp_agent,
+        )
+    }
+
+    /// As [`Self::acp_transcript_cli_resumable`], with the caller's resolved `config`.
+    pub(crate) fn acp_transcript_cli_resumable_with(
+        &self,
+        acp_agent: &str,
+        config: &crate::session::config::SessionConfig,
+    ) -> bool {
+        let identity = if self.tool == "claude"
+            || !matches!(acp_agent, "claude" | "claude-code")
+            || self.declared_agent_in(config).is_some()
+        {
+            self.tool.clone()
+        } else {
+            // No declaration applies under `config`, so the empty-command fallback must not
+            // look one up again from disk.
+            let command = if self.command.is_empty() {
+                self.tool_command_with(None)
+            } else {
+                std::borrow::Cow::Borrowed(self.command.as_str())
+            };
+            Self::execution_agent_for(&self.tool, &command, config)
+                .map_or_else(|_| self.tool.clone(), |agent| agent.name.to_string())
+        };
+        crate::agents::acp_transcript_cli_resumable(&identity, acp_agent)
+    }
+
+    /// The ACP agent a structured switch launches; resolves config at the repo
+    /// only for a custom tool.
+    pub(crate) fn effective_acp_agent(&self) -> String {
+        self.effective_acp_agent_with(|| {
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &self.effective_profile(),
+                self.repo_config_path(),
+            )
+            .session
+        })
+    }
+
+    /// Mirrors `pick_agent_for_tool` minus the live registry and default-agent
+    /// fallback. `session` runs only for a custom tool.
+    pub(crate) fn effective_acp_agent_with<
+        C: std::borrow::Borrow<crate::session::config::SessionConfig>,
+    >(
+        &self,
+        session: impl FnOnce() -> C,
+    ) -> String {
+        if let Some(name) = self.agent_name.as_deref().filter(|name| !name.is_empty()) {
+            return name.to_string();
         }
-        // Rule out the common no-declaration case before resolving config so a
-        // wrapper tool costs one resolve per session, not two.
-        if !crate::plugin::agent_integration::registry_declares(
-            &crate::plugin::registry(),
-            &self.tool,
-        ) {
+        if crate::session::fork::builtin_acp_registry()
+            .get(&self.tool)
+            .is_some()
+        {
+            return self.tool.clone();
+        }
+        let session = session();
+        let session = session.borrow();
+        if session
+            .agent_acp_cmd
+            .get(&self.tool)
+            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(&self.tool, cmd).is_ok())
+        {
+            return self.tool.clone();
+        }
+        crate::acp::inherited_acp_base(&self.tool, &session.agent_detect_as)
+            .unwrap_or_else(|| self.tool.clone())
+    }
+
+    /// Name of the native agent this session executes as, so a custom tool with
+    /// `agent_execution_as = "claude"` counts as claude. Falls back to the tool.
+    pub(crate) fn execution_identity_name(&self, acp_agent: &str) -> String {
+        if self.tool == "claude" || !matches!(acp_agent, "claude" | "claude-code") {
+            return self.tool.clone();
+        }
+        self.resolved_agent()
+            .map_or_else(|| self.tool.clone(), |agent| agent.name.to_string())
+    }
+
+    pub(crate) fn declared_agent(&self) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+        if !self.may_be_declared() {
             return None;
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo(
@@ -238,8 +316,18 @@ impl Instance {
             Path::new(&self.project_path),
         )
         .ok()?;
+        self.declared_agent_in(&config.session)
+    }
+
+    /// As [`Self::declared_agent`], with the caller's resolved `config`.
+    pub(crate) fn declared_agent_in(
+        &self,
+        config: &crate::session::config::SessionConfig,
+    ) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+        if !self.may_be_declared() {
+            return None;
+        }
         if config
-            .session
             .agent_command_override
             .get(&self.tool)
             .is_some_and(|command| !command.trim().is_empty())
@@ -250,7 +338,6 @@ impl Instance {
             crate::plugin::registry(),
             &self.tool,
             config
-                .session
                 .custom_agents
                 .iter()
                 .filter(|(_, command)| !command.trim().is_empty())
@@ -260,6 +347,15 @@ impl Instance {
             self.command.is_empty()
                 || agent.contribution().command.as_deref() == Some(self.command.as_str())
         })
+    }
+
+    /// Cheap config-free check: only a non-builtin tool the plugin registry declares can match.
+    fn may_be_declared(&self) -> bool {
+        crate::agents::get_agent(&self.tool).is_none()
+            && crate::plugin::agent_integration::registry_declares(
+                &crate::plugin::registry(),
+                &self.tool,
+            )
     }
 
     /// The pause to leave between typing into this session's pane and Enter.
@@ -1051,6 +1147,164 @@ pub(crate) fn resolved_agent_for(
 mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
+
+    /// A custom tool resumes a terminal transcript only when it declares it
+    /// executes as claude (#5938).
+    #[test]
+    #[serial_test::serial]
+    fn custom_tool_executing_as_claude_is_transcript_resumable() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        const PROFILE: &str = "custom-claude-resumable-test";
+        let mut inst = Instance::new("custom", home.path().join("project").to_str().unwrap());
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "corp-claude".to_string();
+        inst.command = "corp-wrapper --serve".to_string();
+        assert!(!inst.acp_transcript_cli_resumable("claude"));
+
+        declare_execution_aliases(PROFILE, &[("corp-claude", "claude")], home.path());
+        assert!(inst.acp_transcript_cli_resumable("claude"));
+        assert!(inst.acp_transcript_cli_resumable("claude-code"));
+        assert!(!inst.acp_transcript_cli_resumable("codex"));
+    }
+
+    /// A custom tool whose command runs claude directly needs no declaration.
+    #[test]
+    #[serial_test::serial]
+    fn custom_tool_running_claude_directly_is_transcript_resumable() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        const PROFILE: &str = "custom-claude-direct-test";
+        let mut inst = Instance::new("custom", home.path().join("project").to_str().unwrap());
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "my-claude".to_string();
+        inst.command = "corp-wrapper --serve".to_string();
+        assert!(!inst.acp_transcript_cli_resumable("claude"));
+
+        inst.command = "claude --model sonnet".to_string();
+        assert!(inst.acp_transcript_cli_resumable("claude"));
+        assert!(!inst.acp_transcript_cli_resumable("codex"));
+    }
+
+    /// The declaration lookup honors the caller's config instead of resolving
+    /// repository config again, so list rows sharing one cached config stay consistent.
+    #[test]
+    #[serial_test::serial]
+    fn declared_agent_in_uses_the_passed_config() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"
+id = "acme.wrapped-provider"
+name = "Integration test"
+version = "1.0.0"
+api_version = 19
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "wrapped-tool"
+command = "wrapped-tool"
+provider_versions = ["^18"]
+replies = true
+
+[[agent_integrations]]
+tool = "bare-tool"
+command = "claude"
+provider_versions = ["^18"]
+replies = true
+"#;
+        let dir = crate::plugin::plugins_dir()
+            .unwrap()
+            .join("acme.wrapped-provider");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.wrapped-provider".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: crate::time::Timestamp::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+
+        let mut inst = Instance::new("declared", home.path().join("project").to_str().unwrap());
+        inst.tool = "wrapped-tool".to_string();
+        inst.command = "wrapped-tool".to_string();
+        assert!(inst.declared_agent().is_some());
+
+        let mut overridden = crate::session::config::SessionConfig::default();
+        overridden
+            .agent_command_override
+            .insert("wrapped-tool".into(), "other --serve".into());
+        let default = crate::session::config::SessionConfig::default();
+        assert!(inst.declared_agent_in(&default).is_some());
+        assert!(inst.declared_agent_in(&overridden).is_none());
+
+        // The resumability preview follows the passed config, not the one on disk.
+        overridden
+            .agent_execution_as
+            .insert("wrapped-tool".into(), "claude".into());
+        overridden.agent_config_dir.insert(
+            "wrapped-tool".into(),
+            home.path().join(".claude").to_str().unwrap().into(),
+        );
+        assert!(!inst.acp_transcript_cli_resumable_with("claude", &default));
+        assert!(inst.acp_transcript_cli_resumable_with("claude", &overridden));
+
+        // An empty command takes its fallback from the passed config: a disk declaration
+        // of `claude` must not leak in once the passed config shadows it.
+        let mut bare = Instance::new("bare", home.path().join("project").to_str().unwrap());
+        bare.tool = "bare-tool".to_string();
+        assert!(bare.declared_agent().is_some());
+        let mut shadowed = crate::session::config::SessionConfig::default();
+        shadowed
+            .agent_command_override
+            .insert("bare-tool".into(), "other --serve".into());
+        assert!(!bare.acp_transcript_cli_resumable_with("claude", &shadowed));
+    }
+
+    /// The switch previews resolve the same ACP target as the daemon launch.
+    #[test]
+    #[serial_test::serial]
+    fn wrapper_inheriting_claude_previews_as_resumable() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolation = crate::session::test_support::isolate_app_dir_at(home.path());
+        const PROFILE: &str = "effective-acp-agent-test";
+        let mut inst = Instance::new("custom", home.path().join("project").to_str().unwrap());
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "corp-claude".to_string();
+        inst.command = "corp-wrapper --serve".to_string();
+        declare_execution_aliases(PROFILE, &[("corp-claude", "claude")], home.path());
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+        let mut config: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        config["session"].as_table_mut().unwrap().insert(
+            "agent_detect_as".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "corp-claude".into(),
+                toml::Value::String("claude".into()),
+            )])),
+        );
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+
+        assert_eq!(inst.effective_acp_agent(), "claude");
+        assert!(inst.acp_transcript_cli_resumable(&inst.effective_acp_agent()));
+
+        inst.agent_name = Some("codex".to_string());
+        assert_eq!(inst.effective_acp_agent(), "codex");
+        assert!(!inst.acp_transcript_cli_resumable(&inst.effective_acp_agent()));
+    }
 
     /// A session stored with the fallback's own command keeps its capture after
     /// an approved declaration takes over the OMP listing.

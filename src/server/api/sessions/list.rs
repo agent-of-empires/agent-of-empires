@@ -149,20 +149,26 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // the constructor. Distinct `(profile, project_path)` pairs resolve once via
     // the shared cache.
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
-        if !resp.acp_capable {
+        let needs_identity = inst.tool != "claude"
+            && matches!(resp.acp_agent.as_deref(), Some("claude" | "claude-code"));
+        if !resp.acp_capable || needs_identity {
             let cfg = session_cfg_cache.resolve(
                 &inst.source_profile,
                 &inst.repo_config_path().to_string_lossy(),
             );
-            // The key the constructor resolved built-ins with: `agent_name`, else `tool`.
-            let agent_key = inst
-                .agent_name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&inst.tool);
-            resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
-            resp.acp_can_fork =
-                crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
+            if !resp.acp_capable {
+                // The key the constructor resolved built-ins with: `agent_name`, else `tool`.
+                let agent_key = inst
+                    .agent_name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(&inst.tool);
+                resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
+                resp.acp_can_fork =
+                    crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
+            }
+            resp.keeps_context =
+                inst.acp_transcript_cli_resumable_with(&inst.effective_acp_agent_with(|| cfg), cfg);
         }
         // The solo commands of the agent that classifies this session's prompts, resolved as the
         // queue and publication resolve it, so a custom agent's declared reset is advertised.

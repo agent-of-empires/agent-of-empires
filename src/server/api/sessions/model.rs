@@ -192,12 +192,10 @@ pub(super) fn session_response_from_instance_with_plan(
         structured_view_off: false,
         // Same agent resolution as `acp_agent` above; computed once here so
         // the web dashboard and native TUI stop mirroring the gate.
+        // Config-free; the list overlay refines it from its cached config.
         keeps_context: crate::agents::acp_transcript_cli_resumable(
             &inst.tool,
-            inst.agent_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(inst.tool.as_str()),
+            &inst.effective_acp_agent_with(crate::session::config::SessionConfig::default),
         ),
         claude_fullscreen: inst.tool == "claude" && agent_profile_wire.fullscreen,
         agent_profile: agent_profile_wire,

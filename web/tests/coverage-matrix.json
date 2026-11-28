@@ -4231,14 +4231,16 @@
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SwitchViewDialog.tsx",
         "web/src/App.tsx"
-      ]
+      ],
+      "notes": "The switch dialogs say the conversation continues when it has a saved transcript or can be resumed, otherwise the agent starts fresh. SwitchViewDialog.test.tsx covers the conditional confirmation copy."
     },
     {
       "id": "acp.switch-view-api",
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/lib/api.test.ts", "src/lib/acpKeepContext.test.ts"],
-      "components": ["web/src/lib/api.ts", "web/src/lib/acpKeepContext.ts"]
+      "components": ["web/src/lib/api.ts", "web/src/lib/acpKeepContext.ts"],
+      "notes": "The keeps-context hint behind the switch confirmations says the conversation continues when it has a saved transcript or can be resumed, otherwise the agent starts fresh. acpKeepContext.test.ts covers the conditional hint."
     },
     {
       "id": "acp.keep-context-round-trip",
