@@ -8,6 +8,7 @@ import {
   emptyAcpState,
   hasActiveBackgroundAgent,
   isVisiblyBusy,
+  nativeInputAvailable,
   normaliseTurnState,
   visibleSessionNotices,
   type AcpEvent,
@@ -193,13 +194,14 @@ describe("applyEvent control state", () => {
     ],
     ...["user_stopped", "restart_pending", "idle_auto_stop", "prompt_orphaned"].map(
       (reason): [string, AcpEvent[], Partial<AcpState>] => [
-        `AcpSessionAssigned clears the ${reason} banner`,
+        `Raw AcpSessionAssigned cannot heal the ${reason} banner`,
         [stopped(reason), assigned],
         {
-          workerStopped: false,
-          workerRestarting: false,
-          workerIdleStopped: false,
-          agentOrphaned: false,
+          workerStopped: reason === "user_stopped",
+          workerRestarting: reason === "restart_pending" || reason === "prompt_orphaned",
+          workerIdleStopped: reason === "idle_auto_stop",
+          agentOrphaned: reason === "prompt_orphaned",
+          connectionReady: false,
         },
       ],
     ),
@@ -209,9 +211,9 @@ describe("applyEvent control state", () => {
       { incompatibleAgent: incompatibleDetail },
     ],
     [
-      "AcpSessionAssigned heals IncompatibleAgent",
+      "Raw AcpSessionAssigned cannot heal a compatibility diagnostic",
       [{ IncompatibleAgent: { detail: incompatibleDetail } }, assigned],
-      { incompatibleAgent: null },
+      { incompatibleAgent: incompatibleDetail, connectionReady: false },
     ],
     [
       "AgentStartupError closes the turn",
@@ -275,11 +277,10 @@ describe("applyEvent control state", () => {
       { startupError: null, startupCause: null },
     ],
     [
-      "IntegrationLost closes the turn and surfaces the reason",
+      "IntegrationLost closes the turn",
       [prompt(), { IntegrationLost: { reason: { kind: "contract_violation", detail: "bad key" } } }],
       {
         turnActive: false,
-        startupError: null,
         integrationLost: { kind: "contract_violation", detail: "bad key" },
       },
     ],
@@ -464,29 +465,29 @@ describe("applyEvent control state", () => {
     expect(applyReducedState(adopted, reduced()).sessionNotices).toEqual([]);
   });
 
-  it("adopts integration_lost from the daemon snapshot and clears a stale live loss", () => {
-    const reduced = (extra: object = {}) =>
-      ({
-        agent: "claude",
-        model: null,
-        mode: "default",
-        current_plan: null,
-        in_flight_tool: null,
-        pending_approvals: [],
-        pending_elicitations: [],
-        thinking: null,
-        rate_limit: null,
-        available_commands: [],
-        available_modes: [],
-        current_mode_id: null,
-        turn_active: false,
-        cancelling: false,
-        compacting: false,
-        ...extra,
-      }) as ReducedState;
+  it("adopts and clears integration loss only from a current, explicit daemon projection", () => {
+    const reduced = (extra: Partial<ReducedState> = {}): ReducedState => ({
+      agent: "claude",
+      model: null,
+      mode: "default",
+      current_plan: null,
+      in_flight_tool: null,
+      pending_approvals: [],
+      pending_elicitations: [],
+      thinking: null,
+      rate_limit: null,
+      available_commands: [],
+      available_modes: [],
+      current_mode_id: null,
+      turn_active: false,
+      cancelling: false,
+      compacting: false,
+      ...extra,
+    });
 
-    const adopted = applyReducedState(emptyAcpState(), reduced({ integration_lost: { kind: "proxy_exited" } }));
-    expect(adopted.integrationLost).toEqual({ kind: "proxy_exited" });
+    const loss = reduced({ integration_lost: { kind: "proxy_exited" } });
+    expect(applyReducedState(emptyAcpState(), loss).integrationLost).toBeNull();
+    expect(applyReducedState(emptyAcpState(), loss, [], 1).integrationLost).toEqual({ kind: "proxy_exited" });
 
     const live = applyEvent(emptyAcpState(), {
       session_id: "s-1",
@@ -494,7 +495,11 @@ describe("applyEvent control state", () => {
       event: { IntegrationLost: { reason: { kind: "hold_overflow" } } },
     });
     expect(live.integrationLost).toEqual({ kind: "hold_overflow" });
-    expect(applyReducedState(live, reduced()).integrationLost).toBeNull();
+    const noLoss = reduced({ integration_lost: null });
+    expect(applyReducedState(live, noLoss, [], 0).integrationLost).toEqual({ kind: "hold_overflow" });
+    const omitted = applyReducedState(live, reduced(), [], 2);
+    expect(omitted.integrationLost).toEqual({ kind: "hold_overflow" });
+    expect(applyReducedState(omitted, noLoss, [], 3).integrationLost).toBeNull();
   });
 
   it("adopts a live child whose last update is older than the replay tail", () => {
@@ -705,24 +710,25 @@ describe("cost baseline (#1354)", () => {
   });
 });
 
+const reduced = (turn_active: boolean): ReducedState => ({
+  agent: "claude",
+  model: null,
+  mode: "Default",
+  current_plan: null,
+  in_flight_tool: null,
+  pending_approvals: [],
+  pending_elicitations: [],
+  thinking: null,
+  rate_limit: null,
+  available_commands: [],
+  available_modes: [],
+  current_mode_id: null,
+  turn_active,
+  cancelling: false,
+  compacting: false,
+});
+
 describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
-  const reduced = (turn_active: boolean): ReducedState => ({
-    agent: "claude",
-    model: null,
-    mode: "Default",
-    current_plan: null,
-    in_flight_tool: null,
-    pending_approvals: [],
-    pending_elicitations: [],
-    thinking: null,
-    rate_limit: null,
-    available_commands: [],
-    available_modes: [],
-    current_mode_id: null,
-    turn_active,
-    cancelling: false,
-    compacting: false,
-  });
   const steering: AcpEvent = {
     PromptCapabilities: {
       image: false,
@@ -845,14 +851,17 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
 
   it("N prompts steered into one turn are all closed by its single Stopped", () => {
     let state = fold(emptyAcpState(), steering);
+    state = applyReducedState(state, { ...reduced(false), connection_ready: true }, [], state.lastSeq);
     for (const id of ["p1", "p2", "p3", "p4", "p5"]) {
       state = acpHookReducer(state, { kind: "user_prompt", id, text: id });
       expect(state.turnActive).toBe(true);
-      state = applyReducedState(fold(state, prompt(id, id)), reduced(true));
+      state = fold(state, prompt(id, id));
+      state = applyReducedState(state, { ...reduced(true), connection_ready: true }, [], state.lastSeq);
       expect(state.turnActive).toBe(true);
     }
     expect(state).toMatchObject({ inflightPromptIds: [], promptSeq: 5 });
-    state = applyReducedState(fold(state, stopped("prompt_complete")), reduced(false));
+    state = fold(state, stopped("prompt_complete"));
+    state = applyReducedState(state, { ...reduced(false), connection_ready: true }, [], state.lastSeq);
     expect(state).toMatchObject({ turnActive: false, serverTurnActive: false });
   });
 
@@ -891,11 +900,9 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
   });
 
   it("an idle session's own first prompt is not a steered continuation", () => {
-    let state: AcpState = {
-      ...fold(emptyAcpState(), steering),
-      workerStopped: true,
-      workerRestarting: true,
-    };
+    let state = fold(emptyAcpState(), steering);
+    state = applyReducedState(state, { ...reduced(false), connection_ready: true }, [], state.lastSeq);
+    state = { ...state, workerStopped: true, workerRestarting: true };
     state = acpHookReducer(state, {
       kind: "user_prompt",
       id: "cmp-first",
@@ -1169,17 +1176,37 @@ describe("a refused launch answered after a recovery event", () => {
     expect(refused(sent(emptyAcpState())).startupCause).toEqual({ kind: "sandbox_login_required" });
   });
 
-  it.each<[string, AcpEvent]>([
-    ["AcpSessionAssigned", assigned],
-    ["UserPromptSent", { UserPromptSent: { text: "hi" } } as AcpEvent],
-  ])("ignores the cause when %s landed while the response was in flight", (_name, event) => {
-    const state = refused(apply(sent(emptyAcpState()), event));
-    expect(state.startupCause).toBeNull();
-    expect(state.startupError).toBeNull();
+  it("ignores a refused launch after a new prompt starts", () => {
+    const state = refused(apply(sent(emptyAcpState()), prompt()));
+    expect(state).toMatchObject({ startupCause: null, startupError: null });
   });
 
-  it("keeps the guidance for a prompt sent after the recovery", () => {
-    const recovered = apply(emptyAcpState(), assigned);
+  it("does not treat a historical session assignment as recovery", () => {
+    const assignedState = apply(sent(emptyAcpState()), assigned);
+    expect(nativeInputAvailable(assignedState)).toBe(false);
+    expect(refused(assignedState).startupCause).toEqual({ kind: "sandbox_login_required" });
+  });
+
+  it("keeps guidance when replay catches up an older prompt", () => {
+    const cold = applyReducedState(emptyAcpState(), reduced(false), [], 2);
+    expect(refused(apply(sent(cold), prompt())).startupCause).toEqual({ kind: "sandbox_login_required" });
+  });
+
+  it("gives a current ready snapshot priority over launch failures and covered replay", () => {
+    const ready = { ...reduced(false), connection_ready: true };
+    const starting = sent(emptyAcpState());
+    const recovered = applyReducedState(starting, ready, [], 2);
+    expect(nativeInputAvailable(recovered)).toBe(true);
+    expect(refused(recovered)).toMatchObject({ startupCause: null, startupError: null });
+    expect(applyReducedState(refused(starting), ready, [], 2)).toMatchObject({
+      startupCause: null,
+      startupError: null,
+    });
+    expect(
+      apply(recovered, {
+        AgentStartupError: { message: "login", cause: { kind: "sandbox_login_required" } },
+      }),
+    ).toMatchObject({ startupCause: null, startupError: null });
     expect(refused(sent(recovered)).startupCause).toEqual({ kind: "sandbox_login_required" });
   });
 });

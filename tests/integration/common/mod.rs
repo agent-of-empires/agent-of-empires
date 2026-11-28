@@ -215,6 +215,9 @@ pub async fn spawn_runner(
     let xdg = temp.path().join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
+    let mut roots = EnvGuard::new(&["HOME", "XDG_CONFIG_HOME"]);
+    roots.set("HOME", &home);
+    roots.set("XDG_CONFIG_HOME", &xdg);
 
     // The daemon verifies the id the runner announces, so `session_id` must
     // match what the caller later attaches with.
@@ -273,11 +276,32 @@ pub async fn spawn_runner(
     if let Err(error) = bootstrap_runner(&control, deadline, exited, method, request).await {
         panic!("runner {session_id} didn't start: {error}");
     }
+    let runner_pid = child.id().expect("the bootstrap runner remains owned");
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if let Some(record) =
+                agent_of_empires::process::worker_registry::load(session_id).unwrap()
+            {
+                assert_eq!(record.pid, runner_pid, "detach belongs to the same runner");
+                if record.detached_at.is_some() {
+                    // Bootstrap has dropped its control peer. Re-saving its
+                    // unchanged record acquires/releases the detach writer's
+                    // registry flock before a later attach claims this owner.
+                    agent_of_empires::process::worker_registry::save(&record).unwrap();
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the same bootstrap runner completes and unlocks its detach record");
 
     (
         socket_path,
         RunnerGuard {
             _child: child,
+            _env: roots,
             _temp: temp,
         },
     )
@@ -420,9 +444,10 @@ async fn expect_frame(
 }
 
 #[cfg(debug_assertions)]
-/// Dropping this kills the runner, which takes the shim with it.
+/// Dropping this kills the runner, which takes its agent with it.
 pub struct RunnerGuard {
     _child: tokio::process::Child,
+    _env: EnvGuard,
     _temp: tempfile::TempDir,
 }
 
@@ -493,6 +518,7 @@ mod tests {
                     ControlBody::SessionReady {
                         acp_session_id: "acp".into(),
                         result: serde_json::json!({}),
+                        native_channel: control_protocol::NativeChannelAvailability::Available,
                         adapter_frames: 0,
                     },
                 ),

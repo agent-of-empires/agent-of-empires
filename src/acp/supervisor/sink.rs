@@ -45,11 +45,21 @@ pub trait BroadcastSink: Send + Sync + 'static {
         }
     }
     /// Publish an event pumped from a worker, tagged with that worker's generation.
-    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, _generation: u64) {
+    fn publish_from_worker(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        _generation: u64,
+        _native_subject: Option<crate::acp::state::NativeEventSubject>,
+    ) {
         self.publish(session_id, seq, event);
     }
     /// Drop all stored events for a session (import retry).
     fn clear_session_events(&self, _session_id: &str) {}
+    fn unsuccessful_main(&self, _session_id: &str) -> bool {
+        false
+    }
     /// Nonces of approvals requested on disk but never resolved.
     fn unresolved_approval_nonces(&self, _session_id: &str) -> Vec<Nonce> {
         Vec::new()
@@ -136,6 +146,7 @@ struct Publication {
     event: Event,
     attachments: Vec<AttachmentBlob>,
     worker_generation: Option<u64>,
+    native_subject: Option<crate::acp::state::NativeEventSubject>,
     persisted: Option<std::sync::mpsc::SyncSender<bool>>,
 }
 
@@ -272,13 +283,21 @@ impl BroadcastSink for ChannelSink {
 
     /// Queued, not awaited: the drain reading the worker's socket must not
     /// wait on SQLite.
-    fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, generation: u64) {
+    fn publish_from_worker(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        generation: u64,
+        native_subject: Option<crate::acp::state::NativeEventSubject>,
+    ) {
         self.submit(Job::Publish(Box::new(Publication {
             session_id: session_id.to_string(),
             seq,
             event: event.clone(),
             attachments: Vec::new(),
             worker_generation: Some(generation),
+            native_subject,
             persisted: None,
         })));
     }
@@ -286,6 +305,11 @@ impl BroadcastSink for ChannelSink {
     fn clear_session_events(&self, session_id: &str) {
         self.flushed_store().delete_session(session_id);
         self.persister.control_cache.forget(session_id);
+    }
+
+    fn unsuccessful_main(&self, session_id: &str) -> bool {
+        self.flushed_store()
+            .has_unsuccessful_main_outcome(session_id)
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
@@ -310,6 +334,7 @@ impl BroadcastSink for ChannelSink {
             event: event.clone(),
             attachments: attachments.to_vec(),
             worker_generation: None,
+            native_subject: None,
             persisted: Some(done),
         })));
         Persisted(Receipt::Pending(wait))
@@ -426,12 +451,19 @@ impl Persister {
                     event,
                     attachments,
                     worker_generation,
+                    native_subject,
                     persisted,
                 } = *publication;
                 let stored = attachments
                     .iter()
                     .all(|blob| self.event_store.record_attachment(&session_id, seq, blob))
-                    && self.publish_tagged(&session_id, seq, &event, worker_generation);
+                    && self.publish_tagged(
+                        &session_id,
+                        seq,
+                        &event,
+                        worker_generation,
+                        native_subject,
+                    );
                 if let Some(persisted) = persisted {
                     let _ = persisted.send(stored);
                 }
@@ -450,6 +482,7 @@ impl Persister {
         seq: u64,
         event: &Event,
         worker_generation: Option<u64>,
+        native_subject: Option<crate::acp::state::NativeEventSubject>,
     ) -> bool {
         let mut provenance = None;
         let inherited = match event {
@@ -483,6 +516,7 @@ impl Persister {
             _ => None,
         };
         let event = inherited.as_ref().map_or(event, |(event, _)| event);
+        let native_subject = native_subject.or_else(|| event.native_subject());
         let failure;
         let (event, persisted) = match blocking_io(|| match (&inherited, &provenance) {
             (Some((_, source_window)), Some(provenance)) => {
@@ -504,8 +538,11 @@ impl Persister {
                     seq,
                     "event store write failed; substituting AgentStartupError so the gap is visible: {e}"
                 );
-                failure =
-                    Event::startup_error(format!("event store write failed at seq {seq}: {e}"));
+                failure = Event::AgentStartupError {
+                    message: format!("event store write failed at seq {seq}: {e}"),
+                    cause: None,
+                    native_subject,
+                };
                 (&failure, false)
             }
         };
@@ -514,10 +551,12 @@ impl Persister {
         let sidebar_status = if persisted {
             self.control_cache.apply_if_cached(session_id, seq, event)
         } else {
-            self.control_cache.forget(session_id);
+            self.control_cache
+                .record_failed_observation(session_id, seq, native_subject);
             None
         };
         let _ = self.tx.send(crate::server::AcpBroadcastFrame {
+            native_subject,
             session_id: session_id.to_string(),
             seq,
             event: Arc::new(event.clone()),
@@ -548,7 +587,7 @@ mod tests {
         })));
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         for seq in 1..=2 {
-            sink.publish_from_worker("writer-panic", seq, &Event::ThinkingStarted, 7);
+            sink.publish_from_worker("writer-panic", seq, &Event::ThinkingStarted, 7, None);
         }
         // This barrier is also queued before the panic, so a later inline
         // fallback cannot hide the loss of buffered publications.
@@ -642,7 +681,7 @@ mod tests {
             }
             // What the drain does for each worker frame.
             let drained = super::super::publish_with_next_seq(&sup.next_seqs, "stalled", |seq| {
-                sink.publish_from_worker("stalled", seq, &Event::ThinkingEnded, 1);
+                sink.publish_from_worker("stalled", seq, &Event::ThinkingEnded, 1, None);
                 seq
             });
             assert_eq!(drained, 2, "{name}");
@@ -668,7 +707,7 @@ mod tests {
 
         let (sink, store, _rx, _tmp) = channel_sink();
         let release = stall_writer(&sink);
-        sink.publish_from_worker("shutdown", 1, &Event::ThinkingStarted, 1);
+        sink.publish_from_worker("shutdown", 1, &Event::ThinkingStarted, 1, None);
         let alive = Arc::downgrade(&sink);
         let (dropped, done) = std::sync::mpsc::sync_channel(1);
         let dropper = std::thread::spawn(move || {

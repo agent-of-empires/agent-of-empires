@@ -202,6 +202,17 @@ impl Drop for PersistedMutation {
 #[derive(Debug)]
 pub(crate) struct QueuePersistFailed;
 
+pub(crate) struct IdleDormancy {
+    pub stamp: crate::time::Timestamp,
+    context: crate::acp::state::NativeEventContext,
+    storage: crate::session::Storage,
+    _transaction: PersistedMutation,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("idle dormancy observation changed")]
+struct IdleDormancyDeclined;
+
 /// Cap on queue depth per session. The queue lives on the `Instance` and every mutation
 /// rewrites the whole profile session file, so depth costs disk I/O on each enqueue rather
 /// than just memory.
@@ -273,6 +284,21 @@ fn queue_drain_batch<'a>(
     (sub, combined)
 }
 
+pub(crate) struct NativeControlObservation {
+    pub projection: crate::acp::state::NativeAvailabilityProjection,
+    wait: Option<crate::acp::state::NativeObservationWait>,
+    identity: Option<(String, crate::time::Timestamp, u64)>,
+    current: Option<crate::acp::state::CurrentNativeAvailability>,
+    historical: Option<(u64, crate::acp::state::NativeEventSubject)>,
+    control_seq: u64,
+}
+
+impl NativeControlObservation {
+    pub(crate) fn is_contended(&self) -> bool {
+        self.wait.is_some()
+    }
+}
+
 pub struct SessionService {
     pub(crate) work: Arc<super::runtime::RuntimeWork>,
     native_state: std::sync::OnceLock<std::sync::Weak<super::AppState>>,
@@ -336,6 +362,14 @@ pub struct SessionService {
     #[cfg(test)]
     install_barrier: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
+    >,
+    /// Single-use gate for loss between final admission/publication and native delivery.
+    #[cfg(test)]
+    native_prompt_send_gate: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
     >,
     #[cfg(test)]
     creation_commit_barrier: std::sync::Mutex<
@@ -413,6 +447,8 @@ pub(crate) enum SendTurnError {
     /// coming; retryable, and nothing was published, so the transcript is
     /// not left with a prompt no agent ever received. See #1748 and #3172.
     WorkerNotReady,
+    /// Pre-publish: current qualified loss/refusal preserves the pending intent.
+    Unavailable(crate::acp::state::AcpConnectionUnavailability),
     /// Pre-publish: the ready worker runs a different agent from the one the turn was classified
     /// for (a resume picked another agent). Nothing was published; retryable.
     AgentChanged,
@@ -421,6 +457,8 @@ pub(crate) enum SendTurnError {
     RevivalRefused,
     /// Post-publish: the forward found the resumed worker gone.
     WorkerLostAfterPublish,
+    /// Post-publish: qualified channel loss refused the forward without replay.
+    UnavailableAfterPublish(crate::acp::state::AcpConnectionUnavailability),
     /// Pre-publish: resuming the worker needs the sandbox login first.
     LoginRequired(crate::session::SandboxLoginRequired),
     /// Pre-publish: the sandbox login admission ran a `host_hooks.before_start` hook and it
@@ -433,7 +471,10 @@ pub(crate) enum SendTurnError {
 impl SendTurnError {
     /// Whether the prompt reached the transcript before this error.
     pub(crate) fn published(&self) -> bool {
-        matches!(self, Self::WorkerLostAfterPublish | Self::Send(_))
+        matches!(
+            self,
+            Self::WorkerLostAfterPublish | Self::UnavailableAfterPublish(_) | Self::Send(_)
+        )
     }
 }
 
@@ -444,17 +485,21 @@ pub(crate) enum PromptTouch {
     /// `prompt_dispatch_under_submission` and `send_turn` need.
     Touched {
         idle_dormant: bool,
+        resume_reservation: Option<crate::acp::supervisor::ResumeReservation>,
     },
     /// `no_revive` was set and the session needed snoozed/idle-dormant
     /// revival to accept this prompt; refused before any mutation.
     RevivalRefused,
     /// The session is archived or trashed; refused before any mutation.
     Blocked(crate::session::StartBlocked),
+    /// Known native/control unavailability is not permission to wake or queue.
+    Unavailable(crate::acp::state::AcpConnectionUnavailability),
     /// The caller refuses ignored rows and this one is ignored; refused before
     /// any mutation. Checked under the per-session lock, so an ignore that
     /// committed after the caller's own read still wins.
     Ignored,
     WorkerNotReady,
+    AdmissionRefused(axum::response::Response),
 }
 
 /// Everything [`SessionService::send_turn`] needs beyond the caller and
@@ -462,6 +507,7 @@ pub(crate) enum PromptTouch {
 /// lint.
 pub(crate) struct SendTurnRequest<'a> {
     pub resume_authority: crate::process::worker_registry::ResumeAuthority,
+    pub resume_reservation: Option<crate::acp::supervisor::ResumeReservation>,
     pub text: &'a str,
     pub attachments: &'a [crate::acp::event_store::AttachmentBlob],
     /// Forces the resume trigger even when the worker looks alive, mirroring
@@ -492,6 +538,11 @@ impl std::fmt::Display for SendTurnError {
             Self::ModeApplication(e) => write!(f, "mode application failed: {e}"),
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
             Self::WorkerNotReady | Self::WorkerLostAfterPublish => write!(f, "worker not ready"),
+            Self::Unavailable(unavailable) | Self::UnavailableAfterPublish(unavailable) => write!(
+                f,
+                "native input unavailable ({:?}, {:?}, {:?})",
+                unavailable.source, unavailable.cause, unavailable.phase
+            ),
             Self::AgentChanged => write!(f, "the ready worker runs another agent"),
             Self::RevivalRefused => write!(f, "no_revive: reviving a stopped worker is required"),
             Self::LoginRequired(blocked) => write!(f, "{blocked}"),
@@ -546,6 +597,8 @@ impl SessionService {
             install_barrier: std::sync::Mutex::new(None),
             #[cfg(test)]
             creation_commit_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            native_prompt_send_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -887,7 +940,7 @@ impl SessionService {
     /// (#4081 review: a client-side liveness check before this call would
     /// race a concurrent archive, snooze, or wake).
     pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
-        self.touch_and_wake_on_prompt_with(id, no_revive, false)
+        self.touch_and_wake_on_prompt_with(id, no_revive, false, true)
             .await
     }
 
@@ -899,15 +952,16 @@ impl SessionService {
         id: &str,
         no_revive: bool,
     ) -> PromptTouch {
-        self.touch_and_wake_on_prompt_with(id, no_revive, true)
+        self.touch_and_wake_on_prompt_with(id, no_revive, true, false)
             .await
     }
 
-    async fn touch_and_wake_on_prompt_with(
+    pub(crate) async fn touch_and_wake_on_prompt_with(
         &self,
         id: &str,
         no_revive: bool,
         refuse_if_ignored: bool,
+        allow_explicit_stop: bool,
     ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
@@ -917,11 +971,31 @@ impl SessionService {
         let id = id.to_owned();
         work.run("server.prompt_touch", async move {
             service
-                .touch_and_wake_on_prompt_inner(&id, no_revive, refuse_if_ignored)
+                .touch_and_wake_on_prompt_inner(
+                    &id,
+                    no_revive,
+                    refuse_if_ignored,
+                    allow_explicit_stop,
+                )
                 .await
         })
         .await
         .unwrap_or(PromptTouch::WorkerNotReady)
+    }
+
+    /// Reuse the common qualified projection before any prompt-side mutation.
+    pub(crate) async fn prompt_native_unavailability(
+        &self,
+        id: &str,
+    ) -> Option<crate::acp::state::AcpConnectionUnavailability> {
+        match self.acp_control_cache.native_metadata(id) {
+            Some((historical, control_seq)) => {
+                self.native_control_projection(id, historical, control_seq)
+                    .await
+                    .unavailable
+            }
+            None => self.fold_control_state(id).await.connection_unavailable,
+        }
     }
 
     async fn touch_and_wake_on_prompt_inner(
@@ -929,10 +1003,15 @@ impl SessionService {
         id: &str,
         no_revive: bool,
         refuse_if_ignored: bool,
+        allow_explicit_stop: bool,
     ) -> PromptTouch {
         let Ok(state) = self.native_state() else {
             return PromptTouch::WorkerNotReady;
         };
+        if let Some(unavailable) = self.prompt_native_unavailability(id).await {
+            return PromptTouch::Unavailable(unavailable);
+        }
+        let mut current_native = self.acp_supervisor.current_native_availability(id).await;
         let namespace = state.profile_namespace.clone().read_owned().await;
         let guard = self.instance_lock(id).await.lock_owned().await;
         let (worker_id, profile, title, generation, provider, view, needs_resume, was_idle_dormant) = {
@@ -952,6 +1031,7 @@ impl SessionService {
                 row.is_idle_dormant(),
             )
         };
+        let mut resume_reservation = None;
         // Ordinary live prompts retain their single existing commit producer.
         let (native, worker_id, profile, title, generation, provider, view, namespace, guard) =
             if needs_resume {
@@ -1004,13 +1084,29 @@ impl SessionService {
                     }
                 };
                 // No lifecycle/title flock crosses late-construction retirement.
-                let expected =
-                    match crate::server::api::sessions::resume_structured_stop(&state, expected)
-                        .await
+                let (expected, reservation) =
+                    match crate::server::api::sessions::resume_structured_stop_with_restart(
+                        &state,
+                        expected,
+                        None,
+                        None,
+                        allow_explicit_stop,
+                    )
+                    .await
                     {
-                        Ok(expected) => expected,
-                        Err(_) => return PromptTouch::WorkerNotReady,
+                        Ok(prepared) => prepared,
+                        Err(response) => return PromptTouch::AdmissionRefused(response),
                     };
+                if reservation.is_none() && !allow_explicit_stop {
+                    return PromptTouch::Touched {
+                        idle_dormant: false,
+                        resume_reservation: None,
+                    };
+                }
+                if reservation.is_some() {
+                    current_native = None;
+                }
+                resume_reservation = reservation;
                 (
                     Some(native),
                     expected.id,
@@ -1043,16 +1139,32 @@ impl SessionService {
             let committed = store.update(|rows, _| {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
                     .ok_or(crate::session::SessionGone)?;
+                let unavailable = if let Some(current) = current_native.as_mut() {
+                    if current.context != crate::acp::state::NativeEventContext::capture(row, native.storage())?
+                        || !current.refresh(&worker_id).unwrap_or(false)
+                    {
+                        refused = Some(PromptTouch::WorkerNotReady);
+                        anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+                    }
+                    current.unavailable
+                } else {
+                    crate::process::worker_registry::control_admission(&worker_id)
+                        .err().map(|refusal| refusal.observation())
+                };
+                if let Some(unavailable) = unavailable {
+                    refused = Some(PromptTouch::Unavailable(unavailable));
+                    anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+                }
                 if refuse_if_ignored && row.is_ignored() {
                     refused = Some(PromptTouch::Ignored);
                     anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
                 }
                 if let Some(outcome) = prompt_touch_rejection(
-                    row, generation, &title, provider.as_deref(), view, no_revive,
-                ) {
-                    refused = Some(outcome);
-                    anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
-                }
+                row, generation, &title, provider.as_deref(), view, no_revive,
+            ) {
+                refused = Some(outcome);
+                anyhow::bail!(crate::session::LifecycleReservationError::Superseded);
+            }
                 let idle_dormant = was_idle_dormant || row.is_idle_dormant();
                 let wake = row.is_snoozed() || idle_dormant;
                 apply_prompt_persist_to_disk(row, wake);
@@ -1064,7 +1176,7 @@ impl SessionService {
                         tracing::info!(target: "acp.supervisor", session = %worker_id,
                             "waking idle-dormant structured view session on prompt; spawning a fresh worker");
                     }
-                    Ok(PromptTouch::Touched { idle_dormant })
+                    Ok(PromptTouch::Touched { idle_dormant, resume_reservation })
                 }
                 Err(error) => match refused {
                     Some(outcome) => Ok(outcome),
@@ -1116,42 +1228,39 @@ impl SessionService {
     /// stay hidden under the operator's own keystrokes. Only the marker and recency change,
     /// and only while the canonical row is still ignored and startable, so the write happens
     /// once rather than per keystroke.
-    pub(crate) async fn touch_after_direct_input(&self, id: &str) -> anyhow::Result<()> {
-        // The snapshot lags a peer's commit, so an already-ignored row is the only case
-        // that needs no store read here; anything else asks the canonical store.
-        if !self
-            .instances
-            .read()
-            .await
-            .iter()
-            .any(|row| row.id == id && row.is_ignored())
-            && !self.is_ignored_on_disk(id).await?
-        {
-            return Ok(());
-        }
+    pub(crate) async fn touch_after_direct_input(
+        &self,
+        id: String,
+        expected: crate::daemon::NativePreparationIdentity,
+    ) -> anyhow::Result<()> {
         let state = self.native_state()?;
-        let profile = self
-            .instances
-            .read()
-            .await
-            .iter()
-            .find(|row| row.id == id)
-            .map(|row| row.source_profile.clone())
-            .ok_or(crate::session::SessionGone)?;
-        let id = id.to_owned();
+        let _namespace = state.profile_namespace.read().await;
+        let state = state.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             use crate::session::SessionStore;
-            let native = super::session_store::NativeSessionStore::open(state, &profile, None)?;
+            let native =
+                super::session_store::NativeSessionStore::open(state, &expected.profile, None)?;
+            if !expected.matches_source(native.storage()) {
+                return Ok(());
+            }
+            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
             let store: &dyn SessionStore = &native;
+            if !store
+                .load()?
+                .iter()
+                .any(|row| row.id == id && expected.matches(row) && row.is_ignored())
+            {
+                return Ok(());
+            }
             store.update(|rows, _| {
-                if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-                    if row.is_ignored() {
-                        row.touch_after_input();
-                    }
+                if let Some(row) = rows
+                    .iter_mut()
+                    .find(|row| row.id == id && expected.matches(row) && row.is_ignored())
+                {
+                    row.touch_after_input();
                 }
                 Ok(())
-            })?;
-            Ok(())
+            })
         })
         .await?
     }
@@ -1211,6 +1320,7 @@ impl SessionService {
     ) -> Result<Option<u64>, SendTurnError> {
         let SendTurnRequest {
             resume_authority,
+            resume_reservation,
             text,
             attachments,
             woke_idle_dormant,
@@ -1237,16 +1347,22 @@ impl SessionService {
             }
             (inst.acp_mode_id.clone(), inst.yolo_mode)
         };
+        if let Some(unavailable) = self.prompt_native_unavailability(id).await {
+            return Err(SendTurnError::Unavailable(unavailable));
+        }
         if resume_authority == crate::process::worker_registry::ResumeAuthority::Automatic
             && crate::process::worker_registry::stop_requested(id)
         {
             return Err(SendTurnError::RevivalRefused);
         }
         // Resume a worker that is not currently live.
-        let needs_resume = woke_idle_dormant || !self.acp_supervisor.is_running(id).await;
+        let needs_resume = resume_reservation.is_some()
+            || woke_idle_dormant
+            || !self.acp_supervisor.is_running(id).await;
         if no_revive && needs_resume {
             return Err(SendTurnError::RevivalRefused);
         }
+        let mut stop_refusal = None;
         if needs_resume {
             let origin = match caller {
                 SessionCaller::User => crate::server::sandbox_login::LaunchOrigin::Interactive,
@@ -1303,17 +1419,25 @@ impl SessionService {
                     if resume_authority
                         == crate::process::worker_registry::ResumeAuthority::Explicit
                     {
-                        if let Err(e) = self
-                            .acp_supervisor
-                            .begin_resume_observing(
-                                id,
-                                crate::acp::supervisor::ResumeKind::Attach,
-                                resume_authority,
-                                observed_stop,
-                            )
-                            .await
-                        {
-                            return Err(SendTurnError::ResumeFailed(e));
+                        use crate::acp::supervisor::ResumeReservationOutcome;
+                        let outcome = match resume_reservation {
+                            Some(reservation) => ResumeReservationOutcome::Reserved(reservation),
+                            None => self
+                                .acp_supervisor
+                                .begin_resume_observing(
+                                    id,
+                                    crate::acp::supervisor::ResumeKind::Attach,
+                                    resume_authority,
+                                    observed_stop,
+                                )
+                                .await
+                                .map_err(SendTurnError::ResumeFailed)?,
+                        };
+                        if let ResumeReservationOutcome::Reserved(mut reservation) = outcome {
+                            self.acp_supervisor
+                                .consume_resume_stop(&mut reservation)
+                                .await
+                                .map_err(SendTurnError::ResumeFailed)?;
                         }
                     }
                     tracing::info!(target: "acp.supervisor", session = %id, "turn held for the sandbox login");
@@ -1325,26 +1449,50 @@ impl SessionService {
                     return Err(SendTurnError::LoginRequired(blocked));
                 }
             }
+            let stop_refused = if observed_stop.is_some() || resume_reservation.is_some() {
+                let (reply, result) = tokio::sync::oneshot::channel();
+                stop_refusal = Some(result);
+                Some(reply)
+            } else {
+                None
+            };
             match crate::server::acp_reconciler::trigger_resume_observing(
                 self,
                 id,
                 resume_authority,
                 origin,
+                resume_reservation,
                 observed_stop,
+                stop_refused,
             )
             .await
             {
                 Ok(ResumeTrigger::NotFound) => return Err(SendTurnError::SessionNotFound),
                 Ok(_) => {}
+                Err(crate::acp::supervisor::SupervisorError::Acp(
+                    crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+                )) => return Err(SendTurnError::Unavailable(unavailable)),
                 Err(e) => return Err(SendTurnError::ResumeFailed(e)),
             }
         }
         // Gate the publish below on the worker actually being there.
+        let deadline = tokio::time::Instant::now() + crate::acp::supervisor::WORKER_READY_TIMEOUT;
         if let Err(e) = self.acp_supervisor.wait_until_ready(id).await {
+            if let Some(result) = stop_refusal {
+                if let Ok(Ok(error)) = tokio::time::timeout_at(deadline, result).await {
+                    return Err(SendTurnError::ResumeFailed(error));
+                }
+            }
+            if let Some(unavailable) = self.prompt_native_unavailability(id).await {
+                return Err(SendTurnError::Unavailable(unavailable));
+            }
             return match e {
                 crate::acp::supervisor::SupervisorError::UnknownSession(_) => {
                     Err(SendTurnError::WorkerNotReady)
                 }
+                crate::acp::supervisor::SupervisorError::Acp(
+                    crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+                ) => Err(SendTurnError::Unavailable(unavailable)),
                 other => Err(SendTurnError::ResumeFailed(other)),
             };
         }
@@ -1355,7 +1503,12 @@ impl SessionService {
         ) {
             if let Some(mode_id) = &acp_mode_id {
                 if let Err(e) = self.acp_supervisor.set_mode(id, mode_id).await {
-                    return Err(SendTurnError::ModeApplication(e));
+                    return Err(match e {
+                        crate::acp::supervisor::SupervisorError::Acp(
+                            crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+                        ) => SendTurnError::Unavailable(unavailable),
+                        other => SendTurnError::ModeApplication(other),
+                    });
                 }
             }
         }
@@ -1363,6 +1516,9 @@ impl SessionService {
             && crate::process::worker_registry::stop_requested(id)
         {
             return Err(SendTurnError::RevivalRefused);
+        }
+        if let Some(unavailable) = self.prompt_native_unavailability(id).await {
+            return Err(SendTurnError::Unavailable(unavailable));
         }
         let mut receiver = None;
         let profile = match classified_as {
@@ -1407,6 +1563,18 @@ impl SessionService {
                 },
             )
             .await;
+        #[cfg(test)]
+        {
+            let gate = self
+                .native_prompt_send_gate
+                .lock()
+                .expect("prompt send gate poisoned")
+                .take();
+            if let Some((arrived, released)) = gate {
+                let _ = arrived.send(());
+                let _ = released.await;
+            }
+        }
         let receiver_ready = match &receiver {
             Some((_, _, epoch)) => {
                 self.acp_supervisor
@@ -1457,6 +1625,9 @@ impl SessionService {
         }
         match outcome {
             Ok(()) => Ok(published.seq),
+            Err(crate::acp::supervisor::SupervisorError::Acp(
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable),
+            )) => Err(SendTurnError::UnavailableAfterPublish(unavailable)),
             // Intentional override of the canonical UnknownSession 404.
             Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) if needs_resume => {
                 Err(SendTurnError::WorkerLostAfterPublish)
@@ -1595,11 +1766,11 @@ impl SessionService {
                     return Ok(false);
                 }
             }
-            let pane = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&target)?
-                .ok_or_else(|| anyhow::anyhow!("the agent is no longer running"))?;
-            // The waits ran before these guards; what is on screen now decides.
-            // Check, capture and type address the pane the process check saw.
-            let tmux = target.tmux_session()?;
+            let (name, physical) =
+                crate::server::api::sessions::ready_agent_target_for_automatic_input(&target)?
+                    .ok_or_else(|| anyhow::anyhow!("the agent is no longer running"))?;
+            let pane = physical.identity.pane_id.clone();
+            let tmux = crate::tmux::Session::from_observation(&name, physical);
             if !pane_accepts_automatic_input(&target, &tmux, &pane)? {
                 return Ok(false);
             }
@@ -1727,12 +1898,25 @@ impl SessionService {
     /// disk clear re-delivers after restart, which is the documented
     /// at-least-once contract.
     pub(crate) async fn drain_pending_initial_turn(self: &Arc<Self>, id: &str) {
-        let Some(_claim) = self.claim_pending_drain(id) else {
+        let Some(submission) = self.prompt_submission_for_session(id).await else {
             return;
         };
-        // Non-vivifying.
-        let Some(_submission) = self.prompt_submission_for_session(id).await else {
-            return;
+        let _ = self
+            .drain_pending_initial_turn_with_submission(id, &submission, None)
+            .await;
+    }
+
+    pub(crate) async fn drain_pending_initial_turn_with_submission(
+        self: &Arc<Self>,
+        id: &str,
+        _submission: &tokio::sync::OwnedMutexGuard<()>,
+        quota: Option<&crate::server::acp_reconciler::QuotaDelivery>,
+    ) -> bool {
+        if !self.quota_delivery_allowed(id, quota).await {
+            return false;
+        }
+        let Some(_claim) = self.claim_pending_drain(id) else {
+            return false;
         };
         let Some((text, attachment_refs, synthesized, origin, profile, caller)) = ({
             let instances = self.instances.read().await;
@@ -1764,7 +1948,7 @@ impl SessionService {
                         })
                 })
         }) else {
-            return;
+            return true;
         };
         // Reload the attachment blobs so a rate-limit resume continuation replays the
         // interrupted prompt's images/files, not just its text.
@@ -1773,10 +1957,10 @@ impl SessionService {
         } else {
             let store = Arc::clone(&self.acp_event_store);
             let id_load = id.to_string();
-            tokio::task::spawn_blocking(move || {
+            let loaded = tokio::task::spawn_blocking(move || {
                 attachment_refs
                     .into_iter()
-                    .filter_map(|r| {
+                    .map(|r| {
                         store
                             .load_attachment(&id_load, &r.id)
                             .map(
@@ -1789,16 +1973,22 @@ impl SessionService {
                                 },
                             )
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Option<Vec<_>>>()
             })
-            .await
-            .unwrap_or_default()
+            .await;
+            let Ok(Some(attachments)) = loaded else {
+                tracing::warn!(target: "acp.supervisor", session = %id,
+                    "pending turn attachments are unavailable; preserving the complete turn");
+                return false;
+            };
+            attachments
         };
         if let Err(e) = self
             .send_turn(
                 &caller,
                 id,
                 SendTurnRequest {
+                    resume_reservation: None,
                     resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: &text,
                     attachments: &attachments,
@@ -1816,7 +2006,7 @@ impl SessionService {
                 session = %id,
                 "pending initial turn delivery failed; the reconciler will retry: {e}"
             );
-            return;
+            return false;
         }
         {
             let mut instances = self.instances.write().await;
@@ -1853,6 +2043,7 @@ impl SessionService {
                 );
             }
         }
+        true
     }
 
     /// Queue `text` (with its `attachments` refs) as the session's next turn,
@@ -2123,6 +2314,157 @@ impl SessionService {
         .await
         .unwrap_or(false);
         Some((result, persisted))
+    }
+
+    pub(crate) async fn mark_idle_dormant(
+        self: &Arc<Self>,
+        id: &str,
+        scope: crate::acp::state::NativeObservationScope,
+    ) -> anyhow::Result<Option<IdleDormancy>> {
+        let ordered = self.persist_lock(id).await.lock_owned().await;
+        let reload = Arc::clone(&self.reload_gate).read_owned().await;
+        let profile = {
+            let rows = self.instances.read().await;
+            let Some(row) = rows.iter().find(|row| row.id == id) else {
+                return Ok(None);
+            };
+            if !super::acp_reconciler::is_resumable(row) || !row.queued_prompts.is_empty() {
+                return Ok(None);
+            }
+            row.source_profile.clone()
+        };
+        let state = self.native_state()?;
+        let service = self.clone();
+        let id = id.to_owned();
+        let stamp = crate::time::Timestamp::now();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let Some(_native) = scope.fence.try_lock_observation_matching(|_| true)? else {
+                return Ok(None);
+            };
+            let storage = crate::session::Storage::open_reference(&profile)?;
+            {
+                let registry = crate::process::worker_registry::try_registry_lock(&id)?
+                    .ok_or(crate::process::worker_registry::RegistryBusy)?;
+                if registry.stop()?.is_some() {
+                    return Ok(None);
+                }
+            }
+            let _publication = state.publication.blocking_write();
+            let mut memory = service.instances.blocking_write();
+            let Some(row) = memory.iter_mut().find(|row| row.id == id) else {
+                return Ok(None);
+            };
+            if crate::acp::state::NativeEventContext::capture(row, &storage)? != scope.context
+                || !super::acp_reconciler::is_resumable(row)
+                || !row.queued_prompts.is_empty()
+            {
+                return Ok(None);
+            }
+            let saved = storage.update_complete(|rows, _| {
+                let persisted = rows
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .ok_or(IdleDormancyDeclined)?;
+                anyhow::ensure!(
+                    crate::acp::state::NativeEventContext::capture(persisted, &storage)?
+                        == scope.context
+                        && super::acp_reconciler::is_resumable(persisted)
+                        && persisted.queued_prompts.is_empty(),
+                    IdleDormancyDeclined
+                );
+                persisted.idle_dormant_since = Some(stamp);
+                Ok(())
+            });
+            if let Err(error) = saved {
+                if error.is::<IdleDormancyDeclined>() {
+                    return Ok(None);
+                }
+                // A failed post-write check may still have installed this stamp.
+                if let Err(rollback_error) = storage.update_complete(|rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .ok_or(IdleDormancyDeclined)?;
+                    anyhow::ensure!(
+                        crate::acp::state::NativeEventContext::capture(row, &storage)?
+                            == scope.context
+                            && row.idle_dormant_since == Some(stamp),
+                        IdleDormancyDeclined
+                    );
+                    row.idle_dormant_since = None;
+                    Ok(())
+                }) {
+                    if !rollback_error.is::<IdleDormancyDeclined>() {
+                        tracing::warn!(target: "acp.supervisor", session = %id, %rollback_error,
+                            "failed idle mark rollback remains unconfirmed");
+                    }
+                }
+                return Err(error);
+            }
+            row.idle_dormant_since = Some(stamp);
+            service.invalidate_disk_snapshots();
+            state.runtime.request_publish();
+            Ok(Some(IdleDormancy {
+                stamp,
+                context: scope.context,
+                storage,
+                _transaction: PersistedMutation {
+                    epoch: service.mutation_epoch.clone(),
+                    _ordered: ordered,
+                    _reload: reload,
+                },
+            }))
+        })
+        .await?
+    }
+
+    pub(crate) async fn rollback_idle_dormancy(
+        self: &Arc<Self>,
+        id: &str,
+        receipt: IdleDormancy,
+    ) -> anyhow::Result<bool> {
+        let service = self.clone();
+        let state = self.native_state()?;
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let _publication = state.publication.blocking_write();
+            let mut memory = service.instances.blocking_write();
+            let Some(row) = memory.iter_mut().find(|row| row.id == id) else {
+                return Ok(false);
+            };
+            if crate::acp::state::NativeEventContext::capture(row, &receipt.storage)?
+                != receipt.context
+                || row.idle_dormant_since != Some(receipt.stamp)
+            {
+                return Ok(false);
+            }
+            let saved = receipt.storage.update_complete(|rows, _| {
+                let persisted = rows
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .ok_or(IdleDormancyDeclined)?;
+                anyhow::ensure!(
+                    crate::acp::state::NativeEventContext::capture(persisted, &receipt.storage)?
+                        == receipt.context
+                        && persisted.idle_dormant_since == Some(receipt.stamp),
+                    IdleDormancyDeclined
+                );
+                persisted.idle_dormant_since = None;
+                Ok(())
+            });
+            if let Err(error) = saved {
+                return if error.is::<IdleDormancyDeclined>() {
+                    Ok(false)
+                } else {
+                    Err(error)
+                };
+            }
+            row.idle_dormant_since = None;
+            service.invalidate_disk_snapshots();
+            state.runtime.request_publish();
+            Ok(true)
+        })
+        .await?
     }
 
     /// Whether the session's queue can take `text` as prompt `prompt_id`. Every path that
@@ -2423,6 +2765,15 @@ impl SessionService {
     /// events and 342ms at 100k, holding the event store's connection mutex
     /// for the whole scan, which stalls event recording daemon-wide.
     pub(crate) async fn fold_control_state(&self, id: &str) -> crate::acp::state::AcpState {
+        let mut reduced = self.fold_control_state_raw(id).await;
+        let projection = self
+            .native_control_projection(id, reduced.native_availability, reduced.native_control_seq)
+            .await;
+        reduced.apply_native_availability(projection);
+        reduced
+    }
+
+    async fn fold_control_state_raw(&self, id: &str) -> crate::acp::state::AcpState {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
         let (agent, model) = {
             let instances = self.instances.read().await;
@@ -2443,7 +2794,7 @@ impl SessionService {
         // The hydrate closure runs under the cache's per-session lock and does a locking
         // SQLite scan, so the whole thing goes off the runtime rather than just the scan.
         tokio::task::spawn_blocking(move || {
-            cache.get_or_hydrate(&sid.clone(), || {
+            cache.get_or_hydrate(&sid, || {
                 let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
                 let mut last_seq = 0;
                 for (seq, event) in store.replay_from(&sid, 0) {
@@ -2469,6 +2820,134 @@ impl SessionService {
         })
     }
 
+    pub(crate) async fn native_control_projection(
+        &self,
+        id: &str,
+        historical: Option<(u64, crate::acp::state::NativeEventSubject)>,
+        control_seq: u64,
+    ) -> crate::acp::state::NativeAvailabilityProjection {
+        let observation = self
+            .native_control_observation(id, historical, control_seq)
+            .await;
+        self.settle_native_control_observation(id, observation)
+            .await
+    }
+
+    pub(crate) async fn native_control_observation(
+        &self,
+        id: &str,
+        historical: Option<(u64, crate::acp::state::NativeEventSubject)>,
+        control_seq: u64,
+    ) -> NativeControlObservation {
+        let identity = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id && row.is_structured())
+            .map(|row| {
+                (
+                    row.source_profile.clone(),
+                    row.created_at,
+                    row.lifecycle_generation,
+                )
+            });
+        let current = self.acp_supervisor.current_native_availability(id).await;
+        let prompt_wake_eligible = current.is_none()
+            && self
+                .known_prompt_wake_eligibility(id, identity.as_ref())
+                .await;
+        let cache = Arc::clone(&self.acp_control_cache);
+        let sid = id.to_owned();
+        let captured_identity = identity.clone();
+        let captured_current = current.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            cache.native_projection(
+                &sid,
+                historical,
+                control_seq,
+                captured_identity,
+                captured_current,
+            )
+        })
+        .await;
+        let (projection, wait) = match result {
+            Ok(Ok(projection)) => {
+                let eligible = projection.prompt_wake_eligible || prompt_wake_eligible;
+                (projection.with_prompt_wake_eligibility(eligible), None)
+            }
+            Ok(Err(wait)) => (Default::default(), Some(wait)),
+            Err(_) => (Default::default(), None),
+        };
+        NativeControlObservation {
+            projection,
+            wait,
+            identity,
+            current,
+            historical,
+            control_seq,
+        }
+    }
+
+    pub(crate) async fn settle_native_control_observation(
+        &self,
+        id: &str,
+        mut observation: NativeControlObservation,
+    ) -> crate::acp::state::NativeAvailabilityProjection {
+        let mut context = observation.wait.as_ref().map(|wait| wait.context);
+        while let Some(wait) = observation.wait.take() {
+            if !wait.settle().await {
+                return Default::default();
+            }
+            let next = self
+                .native_control_observation(id, observation.historical, observation.control_seq)
+                .await;
+            let same_actor = match (&observation.current, &next.current) {
+                (Some(original), Some(current)) => original.same_actor(current),
+                (None, None) => true,
+                _ => false,
+            };
+            let next_context = next
+                .wait
+                .as_ref()
+                .map(|wait| wait.context)
+                .or_else(|| next.projection.context());
+            if observation.identity != next.identity || !same_actor || context != next_context {
+                return Default::default();
+            }
+            observation.projection = next.projection;
+            observation.wait = next.wait;
+            context = next_context;
+        }
+        observation.projection
+    }
+
+    /// Existing WorkerDown/startup prompt-intent admission, not native health.
+    /// The qualified projection separately rejects unreadable/refused owners.
+    async fn known_prompt_wake_eligibility(
+        &self,
+        id: &str,
+        identity: Option<&(String, crate::time::Timestamp, u64)>,
+    ) -> bool {
+        let Some((profile, created_at, generation)) = identity else {
+            return false;
+        };
+        let known = self.instances.read().await.iter().any(|row| {
+            row.id == id
+                && row.is_structured()
+                && row.archived_at.is_none()
+                && row.trashed_at.is_none()
+                && row.source_profile == *profile
+                && row.created_at == *created_at
+                && row.lifecycle_generation == *generation
+        });
+        known
+            && matches!(
+                self.acp_supervisor.worker_state(id).await,
+                crate::daemon::AcpWorkerState::Absent | crate::daemon::AcpWorkerState::Resuming
+            )
+    }
+
     /// The sidebar status projected at `seq`, for a frame published while the
     /// control cache was cold or behind, so no status rode with it.
     ///
@@ -2482,7 +2961,7 @@ impl SessionService {
         seq: u64,
     ) -> Option<crate::session::Status> {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
-        let fold = self.fold_control_state(id).await;
+        let fold = self.fold_control_state_raw(id).await;
         if fold.last_seq == seq {
             tracing::debug!(
                 target: "acp.sidebar_projection",
@@ -2492,13 +2971,18 @@ impl SessionService {
                 folded = 0,
                 "projected sidebar status from the cached fold"
             );
+            let mut fold = fold;
+            let projection = self
+                .native_control_projection(id, fold.native_availability, fold.native_control_seq)
+                .await;
+            fold.apply_native_availability(projection);
             return Some(fold.sidebar_status());
         }
         let store = Arc::clone(&self.acp_event_store);
         let sid = id.to_string();
         let since = fold.last_seq;
         let behind = fold.last_seq > seq;
-        tokio::task::spawn_blocking(move || {
+        let state = tokio::task::spawn_blocking(move || {
             if behind {
                 let mut state =
                     AcpState::new(AcpSessionId(sid.clone()), AgentName(String::new()), None);
@@ -2518,7 +3002,7 @@ impl SessionService {
                     folded,
                     "projected sidebar status from the event log"
                 );
-                return found_event.then(|| state.sidebar_status());
+                return found_event.then_some(state);
             }
             let mut state = fold;
             let mut folded = 0usize;
@@ -2535,11 +3019,17 @@ impl SessionService {
                 folded,
                 "projected sidebar status from the cached fold"
             );
-            Some(state.sidebar_status())
+            Some(state)
         })
         .await
         .ok()
-        .flatten()
+        .flatten()?;
+        let projection = self
+            .native_control_projection(id, state.native_availability, state.native_control_seq)
+            .await;
+        let mut state = state;
+        state.apply_native_availability(projection);
+        Some(state.sidebar_status())
     }
 
     /// Drain the leading batch of a session's server-owned queue into the live
@@ -2567,45 +3057,60 @@ impl SessionService {
     /// run of non-clear rows combines into one with blank-line separators.
     /// A batch's buffered attachment bytes are reloaded and forwarded with it.
     pub(crate) async fn drain_queued_prompts_once(self: &Arc<Self>, id: &str) {
+        let Some(submission) = self.prompt_submission_for_session(id).await else {
+            return;
+        };
+        let _ = self
+            .drain_queued_prompts_with_submission(id, &submission, None)
+            .await;
+    }
+
+    pub(crate) async fn drain_queued_prompts_with_submission(
+        self: &Arc<Self>,
+        id: &str,
+        _submission: &tokio::sync::OwnedMutexGuard<()>,
+        quota: Option<&crate::server::acp_reconciler::QuotaDelivery>,
+    ) -> bool {
+        if !self.quota_delivery_allowed(id, quota).await {
+            return false;
+        }
         {
             let mut drains = self
                 .pending_drains
                 .lock()
                 .expect("pending_drains mutex poisoned");
             if !drains.insert(id.to_string()) {
-                return;
+                return false;
             }
         }
         let _claim = PendingDrainGuard {
             service: Arc::clone(self),
             id: id.to_string(),
         };
-        // Non-vivifying, for the same reason as the pending-initial drain.
-        let Some(_submission) = self.prompt_submission_for_session(id).await else {
-            return;
-        };
 
         let (caller, queue) = {
             let instances = self.instances.read().await;
             let Some(inst) = instances.iter().find(|i| i.id == id) else {
-                return;
+                return false;
             };
             if inst.terminal_handoff.is_some()
                 || !inst.is_structured()
                 || inst.is_archived()
                 || inst.is_snoozed()
                 || inst.is_trashed()
-                || !matches!(
+                || !(matches!(
                     inst.status,
-                    crate::session::Status::Idle | crate::session::Status::Running
-                )
+                    crate::session::Status::Idle
+                        | crate::session::Status::Running
+                        | crate::session::Status::Error
+                ) || (quota.is_some() && inst.status == crate::session::Status::Stopped))
             {
-                return;
+                return false;
             }
             let mut queue = inst.queued_prompts.clone();
             queue.sort_by_key(|e| e.seq);
             if queue.is_empty() {
-                return;
+                return true;
             }
             let caller = match &inst.created_by_plugin {
                 Some(plugin_id) => SessionCaller::Plugin {
@@ -2617,18 +3122,18 @@ impl SessionService {
         };
 
         let control = self.fold_control_state(id).await;
-        if !control.accepts_queue_drain() {
-            return;
+        if !control.accepts_queue_drain() || (quota.is_some() && !control.connection_ready) {
+            return false;
         }
 
         // Leading batch up to a clear or compact boundary. Publication reuses this profile, so a
         // settings change during delivery cannot reclassify a row the batch already cut.
         let Some(classified) = self.agent_profile(id, None).await else {
-            return;
+            return false;
         };
         let (sub, combined) = queue_drain_batch(&queue, classified.profile);
         if classified.profile.is_clear_command(&combined) && control.has_active_background_agent() {
-            return;
+            return false;
         }
         let caller = match &sub[0].origin_plugin {
             Some(plugin_id) => SessionCaller::PluginMessage {
@@ -2665,7 +3170,7 @@ impl SessionService {
                  retiring them so the queue behind them can drain"
             );
             self.retire_drained_rows(id, sent_ids).await;
-            return;
+            return true;
         }
 
         // Deliver as a fresh turn on the live worker.
@@ -2674,6 +3179,7 @@ impl SessionService {
                 &caller,
                 id,
                 SendTurnRequest {
+                    resume_reservation: None,
                     resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: &combined,
                     attachments: &attachments,
@@ -2690,7 +3196,7 @@ impl SessionService {
             if !matches!(e, SendTurnError::AgentChanged) {
                 tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
             }
-            return;
+            return false;
         }
         tracing::info!(
             target: "acp.queue",
@@ -2704,6 +3210,23 @@ impl SessionService {
         // Retire only the delivered rows; prompts enqueued during the send
         // survive into the next drain.
         self.retire_drained_rows(id, sent_ids).await;
+        true
+    }
+
+    async fn quota_delivery_allowed(
+        &self,
+        id: &str,
+        release: Option<&crate::server::acp_reconciler::QuotaDelivery>,
+    ) -> bool {
+        let expected = release.map(|release| release.park_seq());
+        let store = Arc::clone(&self.acp_event_store);
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || match store.rate_limit_park(&id) {
+            Some(park) => expected == Some(park.seq),
+            None => expected.is_none(),
+        })
+        .await
+        .unwrap_or(false)
     }
 
     fn record_delivered_prompts(&self, id: &str, ids: &[String]) {
@@ -2762,6 +3285,16 @@ impl SessionService {
     /// `is_idle_dormant` so a session woken by another path between the
     /// reconciler snapshot and this call is left untouched.
     pub(crate) async fn wake_dormant_for_queue_drain(self: &Arc<Self>, id: &str) {
+        let control = self.fold_control_state(id).await;
+        if control.connection_unavailable.is_some()
+            || matches!(
+                control.sidebar_phase,
+                crate::acp::state::SidebarPhase::Error
+                    | crate::acp::state::SidebarPhase::PromptFailed
+            )
+        {
+            return;
+        }
         self.mutate_instance_persisted(id, |inst| {
             if inst.is_idle_dormant() {
                 inst.idle_dormant_since = None;
@@ -2952,6 +3485,10 @@ impl SessionService {
         idle_dormant: bool,
         no_revive: bool,
     ) -> crate::acp::dispatch::PromptDispatch {
+        let control = self.fold_control_state(id).await;
+        if let Some(unavailability) = control.connection_unavailable {
+            return crate::acp::dispatch::PromptDispatch::Unavailable { unavailability };
+        }
         let running = self.acp_supervisor.is_running(id).await;
         if no_revive && !running {
             return crate::acp::dispatch::PromptDispatch::Queued {
@@ -2966,7 +3503,7 @@ impl SessionService {
             idle_dormant,
             rate_limit_parked,
         };
-        let dispatch = crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness);
+        let dispatch = crate::acp::dispatch::decide(&control, liveness);
         crate::acp::dispatch::hold_solo_command(dispatch, self.is_solo_command(id, text).await)
     }
 
@@ -3083,6 +3620,22 @@ impl SessionService {
         if tx.send((id.to_string(), ack)).is_ok() {
             let _ = released.await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_native_prompt_send_gate(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *self
+            .native_prompt_send_gate
+            .lock()
+            .expect("prompt send gate poisoned") = Some((arrived, released));
+        (arrival, release)
     }
 
     /// Report every [`Self::prompt_submission`] claim at the one moment a
@@ -3246,11 +3799,12 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         budget.as_secs()
     );
     // A person's draft is "not yet" too, until the budget runs out.
-    if let Some(pane) =
-        crate::server::api::sessions::ready_agent_pane_for_automatic_input(instance)?
+    if let Some((name, physical)) =
+        crate::server::api::sessions::ready_agent_target_for_automatic_input(instance)?
     {
+        let tmux = crate::tmux::Session::from_observation(&name, Arc::clone(&physical));
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if !instance.wait_for_input_line(&tmux, &pane, remaining) {
+        if !instance.wait_for_input_line(&tmux, &physical.identity.pane_id, remaining) {
             return Err(TerminalPromptBlocker::InputLineBusy.into());
         }
     }
@@ -4116,6 +4670,7 @@ mod tests {
                     &cron,
                     "sess-user",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -4136,6 +4691,7 @@ mod tests {
                     &other,
                     "sess-cron",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -4156,6 +4712,7 @@ mod tests {
                     &cron,
                     "sess-gone",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -4180,6 +4737,7 @@ mod tests {
                     &cron,
                     "sess-cron",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -4200,6 +4758,7 @@ mod tests {
                     &SessionCaller::User,
                     "sess-user",
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -4436,6 +4995,7 @@ mod tests {
                 &SessionCaller::User,
                 id,
                 SendTurnRequest {
+                    resume_reservation: None,
                     resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: "/new",
                     attachments: &[],
@@ -4666,6 +5226,7 @@ mod tests {
                         &SessionCaller::User,
                         id,
                         SendTurnRequest {
+                            resume_reservation: None,
                             resume_authority:
                                 crate::process::worker_registry::ResumeAuthority::Automatic,
                             text: "/new",
@@ -4766,6 +5327,7 @@ mod tests {
                 &SessionCaller::User,
                 id,
                 SendTurnRequest {
+                    resume_reservation: None,
                     resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
                     text: "/clear\n\nafter",
                     attachments: &[],
@@ -5407,6 +5969,16 @@ mod tests {
             .expect("capture pane")
     }
 
+    async fn wait_for_pane_text(pane: &crate::tmux::test_helpers::TmuxTestSession, expected: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !pane_text(pane).contains(expected) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("pane did not receive {expected:?}: {}", pane_text(pane)));
+    }
+
     /// Claude Code 2.1.326 first-run folder-trust dialog, as `capture-pane -p -e` returns it.
     const TRUST_DIALOG_CAPTURE: &str = concat!(
         "\x1b[39m \x1b[1m\x1b[38;5;220mAccessing\x1b[0m \x1b[1m\x1b[38;5;220mworkspace:\x1b[0m\n",
@@ -5965,10 +6537,14 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let inst = terminal_turn_instance("sess-pane", "term-pane", "unused");
         let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
-        let tmux = crate::tmux::Session::from_name(pane.name());
-        let pane_id = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&inst)
-            .unwrap()
-            .expect("agent pane");
+        let target = crate::tmux::test_helpers::only_pane_id(pane.name());
+        crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
+        let (name, physical) =
+            crate::server::api::sessions::ready_agent_target_for_automatic_input(&inst)
+                .unwrap()
+                .expect("agent pane");
+        let pane_id = physical.identity.pane_id.clone();
+        let tmux = crate::tmux::Session::from_observation(&name, physical);
         let tmux_ok = |args: &[&str]| {
             let out = crate::tmux::tmux_command().args(args).output().unwrap();
             assert!(out.status.success(), "{args:?}");
@@ -6197,6 +6773,27 @@ mod tests {
             let inst = terminal_turn_instance(&id, &format!("term-{case}"), "must-not-be-typed");
             let pane =
                 (!script.is_empty()).then(|| start_terminal_pane(&inst, script, remain_on_exit));
+            if let Some(pane) = &pane {
+                let target = crate::tmux::test_helpers::only_pane_id(pane.name());
+                if remain_on_exit {
+                    crate::tmux::test_helpers::wait_for_pane_dead(&target);
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while !pane_text(pane).contains("login banner, nothing is running here")
+                            || !crate::tmux::utils::is_shell_command(
+                                &crate::tmux::test_helpers::pane_field(
+                                    &target,
+                                    "#{pane_current_command}",
+                                ),
+                            )
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the login shell is observable");
+                }
+            }
             let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
                 .session_service
                 .clone();
@@ -6538,7 +7135,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-term-super", "term-super", "initial-turn-A");
+        let mut inst = terminal_turn_instance("sess-term-super", "term-super", "initial-turn-A");
+        inst.source_profile = "default".into();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &inst.source_profile,
             vec![inst.clone()],
@@ -6569,10 +7167,10 @@ mod tests {
         assert!(text.contains("user-message-B"), "{text}");
         assert!(!text.contains("initial-turn-A"), "{text}");
         assert!(pending_turn(&service, "sess-term-super").await.is_none());
+        assert!(disk_turn("default", "sess-term-super").is_none());
     }
 
-    /// The supersession clear queues blocking work of its own, so a send must
-    /// not hold the only blocking slot while it waits for that clear.
+    /// A send must settle supersession without waiting for a second blocking slot.
     #[test]
     #[serial_test::serial]
     fn a_terminal_send_clears_the_pending_turn_with_one_blocking_slot() {
@@ -6587,7 +7185,8 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let _app_dir = crate::session::test_support::isolate_app_dir();
-            let inst = terminal_turn_instance("sess-one-slot", "one-slot", "initial-turn-A");
+            let mut inst = terminal_turn_instance("sess-one-slot", "one-slot", "initial-turn-A");
+            inst.source_profile = "default".into();
             crate::server::test_support::seed_instances_on_disk_for_test(
                 &inst.source_profile,
                 vec![inst.clone()],
@@ -6612,6 +7211,7 @@ mod tests {
             .expect("the send finished instead of waiting on the blocking pool");
             assert!(sent.is_ok());
             assert!(pending_turn(&service, "sess-one-slot").await.is_none());
+            assert!(disk_turn("default", "sess-one-slot").is_none());
         });
     }
 
@@ -6624,7 +7224,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-cancel-ns", "cancel-ns", "initial-turn-A");
+        let mut inst = terminal_turn_instance("sess-cancel-ns", "cancel-ns", "initial-turn-A");
+        inst.source_profile = "default".into();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &inst.source_profile,
             vec![inst.clone()],
@@ -6634,8 +7235,8 @@ mod tests {
         let service = state.session_service.clone();
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
-        // The clear after the typed text waits on this gate.
-        let gate = service.disk_reload_guard().await;
+        use crate::server::api::sessions::terminal_custody::{Boundary, Gate};
+        let mut acknowledged = Gate::install("sess-cancel-ns", Boundary::SendAcknowledged);
         let sender = {
             let service = service.clone();
             tokio::spawn(async move {
@@ -6650,24 +7251,38 @@ mod tests {
                 .await
             })
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !pane_text(&pane).contains("user-message-B") {
-            assert!(std::time::Instant::now() < deadline, "{}", pane_text(&pane));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        acknowledged.entered().await;
         sender.abort();
-        let _ = sender.await;
+        assert!(matches!(sender.await, Err(error) if error.is_cancelled()));
 
         assert!(
             state.profile_namespace.try_write().is_err(),
             "the detached send released the profile namespace"
         );
-        drop(gate);
-        while state.profile_namespace.try_write().is_err() {
-            assert!(std::time::Instant::now() < deadline, "send never finished");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        assert!(
+            service
+                .try_prompt_submission("sess-cancel-ns")
+                .await
+                .is_none(),
+            "the detached send released the submission gate"
+        );
+        assert!(pending_turn(&service, "sess-cancel-ns").await.is_some());
+        acknowledged.release();
+        let _namespace = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            state.profile_namespace.write(),
+        )
+        .await
+        .expect("detached send never released the profile namespace");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !pane_text(&pane).contains("user-message-B") {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the pane never displayed the acknowledged message");
         assert!(pending_turn(&service, "sess-cancel-ns").await.is_none());
+        assert!(disk_turn("default", "sess-cancel-ns").is_none());
     }
 
     /// The automatic drain holds the profile namespace through delivery and the
@@ -6679,7 +7294,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-drain-ns", "drain-ns", "run-the-nightly-task");
+        let mut inst = terminal_turn_instance("sess-drain-ns", "drain-ns", "run-the-nightly-task");
+        inst.source_profile = "default".into();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &inst.source_profile,
             vec![inst.clone()],
@@ -6749,7 +7365,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-disk-arch", "disk-arch", "after-unarchive");
+        let mut inst = terminal_turn_instance("sess-disk-arch", "disk-arch", "after-unarchive");
+        inst.source_profile = "default".into();
         let mut archived = inst.clone();
         archived.archive();
         crate::server::test_support::seed_instances_on_disk_for_test(
@@ -6777,7 +7394,7 @@ mod tests {
         service
             .drain_terminal_initial_turn_within("sess-disk-arch", std::time::Duration::from_secs(3))
             .await;
-        assert!(pane_text(&pane).contains("after-unarchive"));
+        wait_for_pane_text(&pane, "after-unarchive").await;
     }
 
     /// A trashed session receives nothing and records no delivery error, so
@@ -6790,6 +7407,7 @@ mod tests {
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut trashed = terminal_turn_instance("sess-trash", "term-trash", "after-restore");
+        trashed.source_profile = "default".into();
         trashed.trash();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &trashed.source_profile,
@@ -6819,7 +7437,7 @@ mod tests {
         service
             .drain_terminal_initial_turn_within("sess-trash", std::time::Duration::from_secs(3))
             .await;
-        assert!(pane_text(&pane).contains("after-restore"));
+        wait_for_pane_text(&pane, "after-restore").await;
     }
 
     /// A relaunch another process wrote to disk after the launch was probed
@@ -7490,6 +8108,11 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![managed.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let service = state.session_service.clone();
+        let bound = crate::session::Storage::open_reference("default").unwrap();
+        let expected = crate::daemon::NativePreparationIdentity::from_instance(
+            &managed,
+            bound.bound_profile_identity().unwrap(),
+        );
 
         // A peer commits the ignore; this daemon's snapshot still shows the row live.
         let mut ignored = managed;
@@ -7498,7 +8121,7 @@ mod tests {
         assert!(!state.instances.read().await[0].is_ignored());
 
         service
-            .touch_after_direct_input("peer-typed")
+            .touch_after_direct_input("peer-typed".into(), expected)
             .await
             .unwrap();
 
@@ -7532,11 +8155,16 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+            let bound = crate::session::Storage::open_reference("default").unwrap();
+            let expected = crate::daemon::NativePreparationIdentity::from_instance(
+                &row,
+                bound.bound_profile_identity().unwrap(),
+            );
             let state = crate::server::test_support::build_test_app_state(vec![row]);
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             state
                 .session_service
-                .touch_after_direct_input(id)
+                .touch_after_direct_input(id.into(), expected)
                 .await
                 .unwrap();
 
@@ -7590,7 +8218,7 @@ mod tests {
                     .session_service
                     .touch_and_wake_on_prompt(&row.id, true)
                     .await;
-                assert!(matches!(outcome, PromptTouch::RevivalRefused));
+                assert!(!matches!(outcome, PromptTouch::Touched { .. }));
                 assert!(!state.acp_supervisor.test_cancel_requested(&lease));
                 assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
                 drop(reservation);
@@ -7634,19 +8262,39 @@ mod tests {
             } else {
                 None
             };
+            let memory_before = serde_json::to_value(&state.instances.read().await[0]).unwrap();
+            let disk_before = std::fs::read(storage.sessions_path()).unwrap();
+            let stop_before = crate::process::worker_registry::stop_intent(&row.id).unwrap();
+            let mut status_rx = state.status_tx.subscribe();
             drop(reservation);
             state.acp_supervisor.retry_pending_teardowns().await;
             let outcome = wake.await.unwrap();
             let stored = storage.load().unwrap().remove(0);
             if let Some(newer) = newer {
-                assert!(matches!(outcome, PromptTouch::WorkerNotReady));
+                assert!(
+                    !matches!(outcome, PromptTouch::Touched { .. }),
+                    "a newer native Stop cannot authorize the old wake"
+                );
+                assert_eq!(
+                    serde_json::to_value(&state.instances.read().await[0]).unwrap(),
+                    memory_before
+                );
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
+                assert_eq!(
+                    crate::process::worker_registry::stop_intent(&row.id).unwrap(),
+                    stop_before
+                );
+                assert!(status_rx.try_recv().is_err());
                 assert_eq!(stored.lifecycle_generation, newer);
                 assert_eq!(stored.status, Status::Stopped);
                 assert!(stored.is_idle_dormant());
             } else {
                 assert!(matches!(
                     outcome,
-                    PromptTouch::Touched { idle_dormant: true }
+                    PromptTouch::Touched {
+                        idle_dormant: true,
+                        ..
+                    }
                 ));
                 assert!(stored.lifecycle_generation > observed);
                 assert_eq!(stored.status, Status::Idle);
@@ -7655,6 +8303,7 @@ mod tests {
                     store: Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: stored.lifecycle_generation,
                     namespace: None,
+                    native_scope: None,
                 };
                 let mut child = crate::acp::supervisor::with_durable_launch(
                     Some(admission),
@@ -7670,6 +8319,86 @@ mod tests {
                 assert!(child.wait().unwrap().success());
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stopped_prompt_without_dormancy_launches_its_existing_reservation_once() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("stopped-without-dormancy", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.agent_name = Some("claude".into());
+        row.acp_session_id = Some("retain-the-native-conversation".into());
+        row.status = crate::session::Status::Stopped;
+        assert!(row.idle_dormant_since.is_none());
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let (launcher, launches) = crate::server::test_support::counting_failing_launcher();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row.clone()],
+            launcher,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let _submission = state.session_service.prompt_submission(&row.id).await;
+        let PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } = state
+            .session_service
+            .touch_and_wake_on_prompt(&row.id, false)
+            .await
+        else {
+            panic!("the stopped native row must prepare its explicit resume");
+        };
+        assert!(!idle_dormant);
+        assert!(resume_reservation.is_some());
+        assert!(
+            state.acp_supervisor.is_running(&row.id).await,
+            "the admitted construction already counts as coming up"
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.session_service.send_turn(
+                &SessionCaller::User,
+                &row.id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                    resume_reservation,
+                    text: "one explicit wake",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_ids: Vec::new(),
+                    synthesized: false,
+                    origin: crate::daemon::PromptOrigin::Unknown,
+                    no_revive: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "the controlled launcher is a real construction failure"
+        );
+        assert_eq!(
+            launches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the same admitted reservation, not a second admission or an idle wait, reaches launch"
+        );
+        assert_eq!(
+            crate::session::Storage::open_reference("default")
+                .unwrap()
+                .load()
+                .unwrap()[0]
+                .acp_session_id,
+            row.acp_session_id
+        );
+        assert!(!state
+            .acp_event_store
+            .replay_from(&row.id, 0)
+            .iter()
+            .any(|(_, event)| matches!(event, crate::acp::Event::UserPromptSent { .. })));
     }
 
     #[tokio::test]
@@ -7783,6 +8512,7 @@ mod tests {
         let permissions = std::fs::metadata(directory).unwrap().permissions();
         let memory_before = serde_json::to_value(&instance).unwrap();
         let disk_before = std::fs::read(storage.sessions_path()).unwrap();
+        let stop_before = crate::process::worker_registry::stop_intent(&instance.id).unwrap();
         let mut status_rx = state.status_tx.subscribe();
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555)).unwrap();
         let outcome = state
@@ -7790,7 +8520,14 @@ mod tests {
             .touch_and_wake_on_prompt(&instance.id, false)
             .await;
         std::fs::set_permissions(directory, permissions).unwrap();
-        assert!(matches!(outcome, PromptTouch::WorkerNotReady));
+        assert!(
+            !matches!(outcome, PromptTouch::Touched { .. }),
+            "a failed native commit cannot accept the prompt wake"
+        );
+        assert_eq!(
+            crate::process::worker_registry::stop_intent(&instance.id).unwrap(),
+            stop_before
+        );
         assert_eq!(
             serde_json::to_value(&state.instances.read().await[0]).unwrap(),
             memory_before
@@ -8313,6 +9050,7 @@ mod tests {
                     &caller,
                     id,
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",
@@ -8387,6 +9125,7 @@ mod tests {
                 &SessionCaller::User,
                 id,
                 SendTurnRequest {
+                    resume_reservation: None,
                     resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
                     text: "hi",
                     attachments: &[],
@@ -8409,7 +9148,8 @@ mod tests {
             .into_iter()
             .map(|(_, e)| e)
             .collect();
-        let [crate::acp::Event::AgentStartupError { message, cause }] = events.as_slice() else {
+        let [crate::acp::Event::AgentStartupError { message, cause, .. }] = events.as_slice()
+        else {
             panic!("expected one startup error, got {events:?}");
         };
         assert_eq!(*message, blocked.to_string());
@@ -8451,6 +9191,7 @@ mod tests {
                 &SessionCaller::User,
                 id,
                 SendTurnRequest {
+                    resume_reservation: None,
                     resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
                     text: "hi",
                     attachments: &[],
@@ -8520,6 +9261,7 @@ mod tests {
                     },
                     id,
                     SendTurnRequest {
+                        resume_reservation: None,
                         resume_authority:
                             crate::process::worker_registry::ResumeAuthority::Explicit,
                         text: "hi",

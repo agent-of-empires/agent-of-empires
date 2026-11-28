@@ -856,6 +856,39 @@ mod tests {
             assert_eq!(status, want, "{uri}");
         }
 
+        for (cityhall, read_only, expected) in [
+            (true, false, StatusCode::FORBIDDEN),
+            (false, true, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let (state, _) = build_state_with(vec![], Some(TOKEN), |state| {
+                state.cityhall_mode = cityhall;
+                state.read_only = read_only;
+                state.plugin_host = None;
+            });
+            let app = test_support::build_router_for_test(state);
+            for method in ["POST", "PUT", "PATCH", "DELETE"] {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri("/mcp/plugins/acme.serve/srv")
+                    .header(header::HOST, "localhost")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                request.extensions_mut().insert(axum::extract::ConnectInfo(
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 5555)),
+                ));
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), expected, "{method}, CityHall={cityhall}");
+                if cityhall {
+                    assert_eq!(
+                        response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                        "cityhall_mode",
+                        "{method}"
+                    );
+                }
+            }
+        }
+
         // `web.mcp_enabled` off: the plugin endpoint is served while the secret exists, `/mcp`
         // is not, and the plain session credential authenticates nothing.
         let unmounted = if cfg!(feature = "web") {

@@ -92,7 +92,7 @@ export function WarningStrip({
   title: ReactNode;
   children?: ReactNode;
   actions?: ReactNode;
-  onDismiss: () => void;
+  onDismiss?: () => void;
   dismissLabel?: string;
   testId?: string;
   role?: "status" | "alert";
@@ -108,14 +108,16 @@ export function WarningStrip({
         {children && <> {children}</>}
       </span>
       {actions}
-      <button
-        type="button"
-        onClick={onDismiss}
-        aria-label={dismissLabel}
-        className="flex h-7 w-7 max-md:h-11 max-md:w-11 shrink-0 cursor-pointer items-center justify-center rounded-md text-base text-status-warning/80 transition-colors hover:bg-status-warning/20 hover:text-status-warning"
-      >
-        &times;
-      </button>
+      {onDismiss && (
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label={dismissLabel}
+          className="flex h-7 w-7 max-md:h-11 max-md:w-11 shrink-0 cursor-pointer items-center justify-center rounded-md text-base text-status-warning/80 transition-colors hover:bg-status-warning/20 hover:text-status-warning"
+        >
+          &times;
+        </button>
+      )}
     </div>
   );
 }

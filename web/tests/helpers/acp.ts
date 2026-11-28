@@ -45,12 +45,14 @@ async function throwOnStartupError(baseUrl: string, sessionId: string): Promise<
   const frames = await replayFrames(baseUrl, sessionId);
   const startupErr = findStartupError(frames);
   if (startupErr) throw new Error(`acp_enable spawn failed: ${startupErr} (frames=${frames.length})`);
-  return frames.length;
+  return frames.filter((frame) => {
+    const event = (frame as { event?: { AcpSessionAssigned?: { connection_ready?: boolean } } } | null)?.event;
+    return event?.AcpSessionAssigned?.connection_ready === true;
+  }).length;
 }
 
 /**
- * Enable is fire-and-forget, so wait until a replay frame exists (worker up) and the session
- * reports `acp_worker_state === "running"` (handshake done); a prompt sent earlier can be parked.
+ * Wait for a persisted native-ready assignment and a running worker before sending a prompt.
  */
 export async function waitForAcpReady(
   baseUrl: string,
@@ -64,7 +66,7 @@ export async function waitForAcpReady(
       .toBeGreaterThan(0);
   } catch (err) {
     throw new Error(
-      `waitForAcpReady phase 1 (replay frames) failed after ${timeoutMs}ms; the supervisor spawn task is wedged.\n` +
+      `waitForAcpReady phase 1 (native-ready assignment) failed after ${timeoutMs}ms; the supervisor spawn task is wedged.\n` +
         `Original: ${err instanceof Error ? err.message : String(err)}\n` +
         `--- debug.log tail ---\n${debugLogTail(home)}\n--- end debug.log ---`,
       { cause: err },
@@ -231,6 +233,7 @@ export async function openStructuredView(
   const box = composer(page);
   if (prompt !== undefined) {
     await box.fill(prompt);
+    await expect(page.getByTestId("composer-actions").getByRole("button").last()).toBeEnabled();
     await box.press("Enter");
   }
   return box;

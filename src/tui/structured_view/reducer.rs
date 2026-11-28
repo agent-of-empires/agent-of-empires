@@ -134,6 +134,12 @@ pub struct AcpTranscript {
     /// Highest seq applied from a `reduced_state` frame. Used as the `since`
     /// cursor for reconnect and to drop stale frames.
     pub last_seq: u64,
+    /// Authority belongs only to an accepted live snapshot, never transcript
+    /// replay or management transport presence. Revoked across reconnect.
+    pub native_snapshot_seq: Option<u64>,
+    pub connection_ready: bool,
+    pub connection_unavailable: Option<crate::acp::state::AcpConnectionUnavailability>,
+    pub prompt_wake_eligible: bool,
 }
 
 /// A tool card the renderer builds from a server `tool_start` row (plus its
@@ -258,7 +264,18 @@ impl AcpTranscript {
             current_plan: Vec::new(),
             lagged: false,
             last_seq: 0,
+            native_snapshot_seq: None,
+            connection_ready: false,
+            connection_unavailable: None,
+            prompt_wake_eligible: false,
         }
+    }
+
+    pub fn revoke_native_authority(&mut self) {
+        self.native_snapshot_seq = None;
+        self.connection_ready = false;
+        self.connection_unavailable = None;
+        self.prompt_wake_eligible = false;
     }
 
     /// Reconcile a batch of server-folded transcript rows (a WS
@@ -386,6 +403,11 @@ impl AcpTranscript {
             return;
         }
         self.last_seq = seq;
+        self.native_snapshot_seq = Some(seq);
+        self.connection_unavailable = state.connection_unavailable;
+        self.connection_ready = state.connection_ready && self.connection_unavailable.is_none();
+        self.prompt_wake_eligible =
+            state.prompt_wake_eligible == Some(true) && self.connection_unavailable.is_none();
 
         let holds = |field: &str| unchanged.iter().any(|f| f == field);
         if !holds("background_agents") {
@@ -992,6 +1014,7 @@ mod tests {
         };
         let reset = || Event::SessionContextReset {
             reason: "worker restarted".into(),
+            fork_rejection: None,
         };
         let cases: [(&str, Vec<Event>, bool); 5] = [
             ("empty", vec![], false),

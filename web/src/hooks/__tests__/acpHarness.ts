@@ -6,6 +6,8 @@ import { vi } from "vitest";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import { CLAUDE_PROFILE } from "../../lib/__tests__/agentProfileFixtures";
 
+export { currentControlSnapshot } from "../../../tests/helpers/acpControlSnapshot";
+
 export class FakeWebSocket {
   static CONNECTING = 0;
   static OPEN = 1;

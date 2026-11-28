@@ -309,16 +309,11 @@ fn structured_fork_mints_distinct_child_id_and_preserves_parent() {
     );
 }
 
-/// A structured fork whose `session/fork` handshake fails (the agent rejects it,
-/// simulated by `FAKE_ACP_FORK_FAIL`) fails the spawn without a context reset:
-/// the child keeps its one-shot `fork_pending` seed, so a later start forks
-/// again rather than opening an empty conversation in the fork row. It never
-/// captures an id (no `session/new` fallback), the parent is untouched, and the
-/// failing fork is not retried forever: attempts stop at the reconciler's
-/// respawn budget, after which the session is parked until an explicit retry.
+/// A correlated native fork rejection consumes its seed without creating a fresh
+/// conversation or altering the parent.
 #[test]
 #[parallel]
-fn structured_fork_failure_keeps_fork_pending_and_stops_retrying() {
+fn structured_fork_rejection_consumes_seed_without_fresh_fallback() {
     require_tmux!();
     require_node!();
 
@@ -463,12 +458,10 @@ fn structured_fork_failure_keeps_fork_pending_and_stops_retrying() {
         "a refused fork must not fall back to session/new"
     );
 
-    // The seed survives the failure, so the next start forks the same parent.
     let child = session_by_title(&h, "FailChild").expect("FailChild row");
-    assert_eq!(
-        child["fork_pending"].as_str(),
-        Some(parent_acp_id.as_str()),
-        "a refused fork must keep its fork_pending seed, got: {:?}",
+    assert!(
+        child["fork_pending"].is_null(),
+        "the correlated rejection must consume its seed, got: {:?}",
         child["fork_pending"]
     );
 

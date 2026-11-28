@@ -63,6 +63,7 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         vec![],
         "test-acp-session-id".into(),
         true, // in_flight_turn
+        false,
         AcpSessionId("midturn-true".into()),
         None,
         "claude".into(),
@@ -111,6 +112,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         vec![],
         "test-acp-session-id".into(),
         false, // NOT in flight
+        false,
         AcpSessionId("midturn-false".into()),
         None,
         "claude".into(),
@@ -179,6 +181,7 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         vec![],
         session_id.into(),
         true, // in_flight_turn
+        false,
         AcpSessionId("midturn-disarm".into()),
         None,
         "claude".into(),
@@ -337,6 +340,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         vec![],
         acp_session_id.clone(),
         in_flight_turn,
+        false,
         AcpSessionId(session.into()),
         None,
         "claude".into(),
@@ -358,11 +362,20 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
     .await;
     assert!(closed.is_ok(), "resumed client detached cleanly");
 
+    let record = agent_of_empires::process::worker_registry::record_path(session).unwrap();
+    let registry = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(record.with_extension("lock"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&registry).unwrap();
+
     let reopened = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
         vec![],
         acp_session_id,
+        false,
         false,
         AcpSessionId(session.into()),
         None,
@@ -373,15 +386,23 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         None,
         None,
         false,
-    )
-    .await
-    .expect("runner accepts a new daemon after clean shutdown");
+    );
+    tokio::pin!(reopened);
+    tokio::select! {
+        biased;
+        _ = &mut reopened => panic!("attach finished while the registry was locked"),
+        _ = std::future::ready(()) => {}
+    }
+    drop(registry);
+    let reopened = reopened
+        .await
+        .expect("runner accepts a new daemon after clean shutdown");
     reopened.shutdown().await.expect("shutdown reopened client");
     reason
 }
 
 #[tokio::test]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn cached_completion_obeys_durable_in_flight_state_on_attach() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");

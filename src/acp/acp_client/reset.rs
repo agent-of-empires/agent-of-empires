@@ -549,7 +549,17 @@ done
             &script,
             source.replace(
                 r#"    *'"method":"session/prompt"'*)"#,
-                &format!("    *'\"method\":\"session/prompt\"'*)\n{injected}"),
+                &format!(
+                    r#"    *'"method":"session/prompt"'*)
+{injected}
+      callback_replies=0
+      while [ "$callback_replies" -lt {} ]; do
+        IFS= read -r reply || exit 1
+        printf '%s\n' "$reply" >> "$CAPTURE"
+        callback_replies=$((callback_replies+1))
+      done"#,
+                    callbacks.len()
+                ),
             ),
         )
         .unwrap();
@@ -561,9 +571,7 @@ done
         .unwrap();
         client.send_prompt("exercise callbacks", &[]).await.unwrap();
         let events = identity_events_until_stop(&mut client).await;
-        // A second prompt is a wire barrier: the adapter has consumed every callback reply.
-        client.send_prompt("barrier", &[]).await.unwrap();
-        identity_events_until_stop(&mut client).await;
+        // The agent answers the prompt only after consuming every callback reply.
         client.shutdown().await.unwrap();
         assert!(!denied_file.exists());
         assert!(!denied_command.exists());
@@ -643,14 +651,29 @@ done
             let response = "      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"sessionId\":\"%s\"}}\\n' \"$id\" \"$sid\" ;;";
             let replacement = format!(
                 r#"      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"%s","configOptions":[{{"id":"effort","name":"Effort","category":"thought_level","type":"select","currentValue":"high","options":[{{"value":"high","name":"High"}}]}},{{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"code","options":[{{"value":"code","name":"Code"}}]}}]}}}}\n' "$id" "$sid"
+      callback_reply=
       printf '{{"jsonrpc":"2.0","id":"callback","method":"fs/write_text_file","params":{{"sessionId":"%s","path":"{}","content":"%s"}}}}\n' "$sid" "$sid" ;;
+    *'"id":"callback"'*)
+      callback_reply=$line ;;
     *'"method":"session/set_config_option"'*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"configOptions":[]}}}}\n' "$id" ;;"#,
                 written.display()
             );
             let source = std::fs::read_to_string(&script)
                 .unwrap()
-                .replace(response, &replacement);
+                .replace(response, &replacement)
+                .replace(
+                    r#"    *'"method":"session/prompt"'*)"#,
+                    r#"    *'"method":"session/prompt"'*)
+      # Config requests have been answered; only the callback reply can follow.
+      if [ -z "$callback_reply" ]; then
+        IFS= read -r callback_reply || exit 1
+      fi
+      case $callback_reply in
+        *'"id":"callback"'*'"result":'*|*'"result":'*'"id":"callback"'*) ;;
+        *) printf 'Expected a successful callback reply, got: %s\n' "$callback_reply" >&2; exit 1 ;;
+      esac"#,
+                );
             std::fs::write(&script, source).unwrap();
             let mut config = reset_fake_spawn_config(&script, temp.path());
             config.default_mode = Some("code".into());
@@ -673,7 +696,7 @@ done
                 ResetSessionOutcome::Reset { .. }
             ));
             identity_events_until_stop(&mut client).await;
-            // The prompt response is a wire barrier after the accepted callback.
+            // The agent gates prompt completion on the write callback's success.
             client.send_prompt("after", &[]).await.unwrap();
             identity_events_until_stop(&mut client).await;
             assert_eq!(
@@ -686,10 +709,10 @@ done
 
     #[tokio::test]
     async fn native_identity_pending_buffer_spans_runner_queue_and_fails_closed_on_overflow() {
-        // A reattach flushes the runner's detached control queue before the
-        // establish response, so the buffer must admit a backlog as large as
-        // that queue, then still fail closed one frame past it rather than
-        // publish a partial replay and retire the worker. See #3937.
+        // Direct stdio exercises the same pending-ingress capacity contract
+        // needed when a reattach flushes the runner's detached queue before
+        // establishment. Admit that entire backlog, then fail closed one frame
+        // past it without publishing partial replay. See #3937.
         let cap = crate::acp::control_protocol::MAX_CONTROL_QUEUE_FRAMES;
         for count in [cap, cap + 1] {
             let temp = tempfile::tempdir().unwrap();
@@ -724,12 +747,16 @@ done
                 .await
                 {
                     Ok(event) => event.unwrap(),
-                    Err(_) => panic!("no event within 10s of the previous one"),
+                    Err(_) => {
+                        panic!("pending backlog {count}: no event within 10s of the previous one")
+                    }
                 };
                 match event {
                     Event::AgentMessageChunk { text, .. } => texts.push(text),
                     Event::AcpSessionAssigned { .. } => assigned = true,
-                    Event::AgentStartupError { .. } => {
+                    Event::AcpConnectionUnavailable { source, cause, .. } => {
+                        assert_eq!(source, crate::acp::state::AcpConnectionSource::Sdk);
+                        assert_eq!(cause, crate::acp::state::AcpConnectionCause::ProtocolEnded);
                         failed = true;
                         break;
                     }
@@ -794,7 +821,7 @@ done
             .iter()
             .position(|event| matches!(event, Event::SessionContextReset { .. }))
             .unwrap();
-        let assigned = events.iter().position(|event| matches!(event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "sid-1")).unwrap();
+        let assigned = events.iter().position(|event| matches!(event, Event::AcpSessionAssigned { acp_session_id, .. } if acp_session_id == "sid-1")).unwrap();
         let replay = events
             .iter()
             .position(
@@ -853,10 +880,21 @@ done
             .await
             .unwrap();
         client.cancel_prompt().await.unwrap();
-        let events = identity_events_until_stop(&mut client).await;
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, Event::Stopped { reason } if reason == "cancelled")));
+        // ForceStop reserves terminal ownership for the supervisor's user_forced
+        // publication. A later Cancel must still reach native transport, but
+        // cannot invent a second private terminal. Flush commands, not events.
+        let (done, flushed) = tokio::sync::oneshot::channel();
+        client
+            .cmd_tx
+            .as_ref()
+            .unwrap()
+            .send(ClientCmd::FlushForTest(done))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), flushed)
+            .await
+            .unwrap()
+            .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let wire = std::fs::read_to_string(&capture).unwrap();
@@ -887,7 +925,12 @@ done
         }
         client.shutdown().await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while client.next_event().await.is_some() {}
+            while let Some(event) = client.next_event().await {
+                assert!(
+                    !matches!(event, Event::Stopped { .. }),
+                    "ForceStop's supervisor-owned terminal cannot be duplicated by Cancel"
+                );
+            }
         })
         .await
         .unwrap();
@@ -1129,7 +1172,7 @@ done
                 "{start} start: a refused fork must not reset the context: {events:?}"
             );
             let got = events.iter().find_map(|e| match e {
-                Event::AcpSessionAssigned { acp_session_id } => Some(acp_session_id.as_str()),
+                Event::AcpSessionAssigned { acp_session_id, .. } => Some(acp_session_id.as_str()),
                 _ => None,
             });
             assert_eq!(got, assigned, "{start} start");
@@ -1406,7 +1449,7 @@ done
         let cleared = position(&|e| matches!(e, Event::SessionCleared));
         let reset = position(&|e| matches!(e, Event::SessionContextReset { .. }));
         let assigned = position(
-            &|e| matches!(e, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "sid-2"),
+            &|e| matches!(e, Event::AcpSessionAssigned { acp_session_id, .. } if acp_session_id == "sid-2"),
         );
         assert!(cleared < reset && reset < assigned, "{events:?}");
         assert!(

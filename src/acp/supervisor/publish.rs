@@ -44,7 +44,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         message: String,
         cause: Option<StartupCause>,
     ) {
-        self.publish_next(session_id, &Event::AgentStartupError { message, cause });
+        self.publish_next(
+            session_id,
+            &Event::AgentStartupError {
+                message,
+                cause,
+                native_subject: None,
+            },
+        );
     }
 
     /// The startup error of a launch held for the sandbox login: the instruction, and the
@@ -59,6 +66,93 @@ impl<S: BroadcastSink> Supervisor<S> {
             blocked.to_string(),
             Some(blocked.startup_cause()),
         );
+    }
+
+    /// A retained runtime refused admission; this is not a native I/O/death
+    /// observation. Keep both native and worker exclusions through publication.
+    pub(crate) async fn publish_control_refusal(
+        &self,
+        session_id: &str,
+        scope: &crate::acp::state::NativeObservationScope,
+        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+        originating_epoch: Option<u64>,
+    ) -> bool {
+        loop {
+            if let Some(published) = self
+                .try_publish_control_refusal(session_id, scope, refusal, originating_epoch)
+                .await
+            {
+                return published;
+            }
+            let fence = std::sync::Arc::clone(&scope.fence);
+            if !matches!(
+                tokio::task::spawn_blocking(move || fence.lock_observation().map(drop)).await,
+                Ok(Ok(()))
+            ) {
+                return false;
+            }
+        }
+    }
+
+    async fn try_publish_control_refusal(
+        &self,
+        session_id: &str,
+        scope: &crate::acp::state::NativeObservationScope,
+        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
+        originating_epoch: Option<u64>,
+    ) -> Option<bool> {
+        let workers = self.workers.lock().await;
+        if workers.contains_key(session_id) {
+            return Some(false);
+        }
+        let lifecycle = super::lock_recover(&self.lifecycle);
+        let current = lifecycle.current_lease(session_id);
+        let epoch = match lifecycle.phase(session_id) {
+            crate::acp::runner_lifecycle::WorkerPhase::Absent => None,
+            crate::acp::runner_lifecycle::WorkerPhase::Resuming => {
+                let Some(lease) = current.as_ref().filter(|lease| {
+                    originating_epoch == Some(lease.epoch())
+                        && lease.spawned_runner() == refusal.owner
+                        && lease
+                            .native_scope()
+                            .ok()
+                            .flatten()
+                            .is_some_and(|native| native.context == scope.context)
+                }) else {
+                    return Some(false);
+                };
+                Some(lease.epoch())
+            }
+            _ => return Some(false),
+        };
+        let _native = match scope.fence.try_lock_observation_matching(|_| true) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return None,
+            Err(_) => return Some(false),
+        };
+        if !crate::process::worker_registry::refusal_still_applies(session_id, &refusal) {
+            return Some(false);
+        }
+        let observed = refusal.observation();
+        let subject = crate::acp::state::NativeEventSubject {
+            context: scope.context,
+            owner: refusal.owner,
+            kind: crate::acp::state::NativeSubjectEvent::AdmissionRefusal(refusal),
+        };
+        let event = Event::AcpConnectionUnavailable {
+            source: observed.source,
+            cause: observed.cause,
+            phase: observed.phase,
+            native_subject: Some(subject),
+        };
+        publish_with_next_seq(&self.next_seqs, session_id, |seq| match epoch {
+            Some(epoch) => {
+                self.sink
+                    .publish_from_worker(session_id, seq, &event, epoch, Some(subject))
+            }
+            None => self.sink.publish(session_id, seq, &event),
+        });
+        Some(true)
     }
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
@@ -129,11 +223,17 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         resets_at: crate::time::Timestamp,
         manual: bool,
-    ) -> u64 {
-        self.publish_next(
-            session_id,
-            &Event::RateLimitAutoResumed { resets_at, manual },
-        )
+    ) -> Result<u64, super::SupervisorError> {
+        publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+            self.sink
+                .publish_persisted(
+                    session_id,
+                    seq,
+                    &Event::RateLimitAutoResumed { resets_at, manual },
+                )
+                .then_some(seq)
+                .ok_or(super::SupervisorError::NativeStoreUnavailable)
+        })
     }
 
     /// Close a turn that was in flight when the previous daemon died.
@@ -608,7 +708,7 @@ mod tests {
 
         let frames = sink.frames.lock().unwrap().clone();
         assert_eq!(frames.len(), 2);
-        let Event::AgentStartupError { message, cause } = &frames[0].2 else {
+        let Event::AgentStartupError { message, cause, .. } = &frames[0].2 else {
             panic!("expected a startup error, got {:?}", frames[0].2);
         };
         assert_eq!(*message, blocked.to_string());
@@ -638,7 +738,8 @@ mod tests {
         sup.publish_user_prompt("s-1", "first prompt".into()).await;
         let resets_at = crate::time::Timestamp::now();
         assert_eq!(
-            sup.publish_rate_limit_auto_resumed("s-1", resets_at, false),
+            sup.publish_rate_limit_auto_resumed("s-1", resets_at, false)
+                .unwrap(),
             3
         );
         assert_eq!(

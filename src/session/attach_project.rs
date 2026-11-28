@@ -898,7 +898,7 @@ pub(crate) fn attach_planned(
     // commit. Flush it first so the durable recheck sees the row as it will
     // stand at the commit.
     if refreshed.moves_session {
-        match fresh.flush_published_conversation(storage) {
+        match fresh.flush_published_conversation(storage, None) {
             Some(crate::session::SidWrite::Applied) | None => {}
             // The flush read this row's own publication and the owner keeps the
             // sid, so the refusal is final: no publication of ours is waiting.
@@ -1085,7 +1085,13 @@ pub(crate) fn resume_after_conversion(
                     )
                 };
                 match outcome {
-                    Ok(_) => {
+                    Ok(outcome) => {
+                        if let super::StartOutcome::Indeterminate { cause } = outcome {
+                            warnings.push(format!(
+                                "the session's restart in its new directory is unconfirmed: {}",
+                                cause.message()
+                            ));
+                        }
                         let id = session_id.to_string();
                         // Preserve a concurrent peer edit while merging the restart result.
                         if let Err(e) = storage.update(|instances, _groups| {
@@ -1095,7 +1101,7 @@ pub(crate) fn resume_after_conversion(
                             Ok(())
                         }) {
                             warnings.push(format!(
-                                "the session restarted but its record could not be updated ({e:#})"
+                                "the session's restart state could not be recorded ({e:#})"
                             ));
                         }
                     }
@@ -1111,10 +1117,14 @@ pub(crate) fn resume_after_conversion(
     }
 
     if quiesced.worker_was_running {
-        crate::process::worker_registry::mark_restart_pending(
+        if let Err(error) = crate::process::worker_registry::mark_restart_pending(
             session_id,
             quiesced.worker_generation,
-        );
+        ) {
+            warnings.push(format!(
+                "the structured worker restart could not be scheduled ({error}); start it from the session list"
+            ));
+        }
     }
 
     warnings

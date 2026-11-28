@@ -3,14 +3,16 @@
 import { Square } from "lucide-react";
 import { useState, type ReactNode } from "react";
 
+import { getLiveAcpActions, NATIVE_INPUT_UNCONFIRMED } from "../../../hooks/acpSession/stateCache";
 import { reportError } from "../../../lib/toastBus";
 
 /** Interrupts the main agent, which stops every sub-agent with it. */
 export function StopSession({ sessionId, running }: { sessionId: string; running: number }) {
   const stop = async () => {
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/cancel`, { method: "POST" });
-      if (!res.ok) reportError("Could not interrupt the session. Try again.");
+      const actions = getLiveAcpActions(sessionId);
+      const message = actions ? await actions.cancelPrompt() : NATIVE_INPUT_UNCONFIRMED;
+      if (message) reportError(message);
     } catch {
       reportError("Could not interrupt the session. Try again.");
     }
