@@ -316,14 +316,8 @@ pub(super) async fn handle_control_connection(
             else {
                 return;
             };
-            let established = matches!(&frame, ControlBody::SessionReady { .. });
             handshake_shared
-                .enqueue_handshake(
-                    attachment_id,
-                    frame,
-                    established,
-                    dispatch_release.is_some(),
-                )
+                .enqueue_handshake(attachment_id, frame, dispatch_release.is_some())
                 .await;
             drop(dispatch_release);
         }

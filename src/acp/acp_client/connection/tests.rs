@@ -4,7 +4,8 @@ use super::*;
 use crate::acp::acp_client::commands::ClientCmd;
 use crate::acp::acp_client::commands::PromptInput;
 use crate::acp::acp_client::reset::ResetSessionOutcome;
-use crate::acp::acp_client::{SdkTaskObservation, SdkTestOptions};
+use crate::acp::acp_client::{ProxyFailurePolicy, ProxySpec, SdkTaskObservation, SdkTestOptions};
+use crate::acp::agent_compat::ProxyCompat;
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::approvals::Nonce;
 use crate::acp::event_sender::WeakEventSender;
@@ -2614,6 +2615,224 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
     })).await;
 }
 
+struct DirectConnection {
+    events: mpsc::Receiver<crate::acp::event_sender::SdkEvent>,
+    agent_write: SharedWrite,
+    connection: tokio::task::JoinHandle<()>,
+    agent: tokio::task::JoinHandle<()>,
+    shutdown: tokio_util::sync::CancellationToken,
+    _commands: mpsc::Sender<super::super::commands::QueuedClientCmd>,
+    _cwd: tempfile::TempDir,
+}
+
+impl DirectConnection {
+    async fn next_event(&mut self) -> Option<Event> {
+        use crate::acp::event_sender::SdkEvent;
+        loop {
+            match self.events.recv().await? {
+                SdkEvent::Data(data) => return Some(Arc::unwrap_or_clone(data.event)),
+                SdkEvent::ControlPlaneLoss(loss) => {
+                    return Some(Event::AcpConnectionUnavailable {
+                        source: loss.observation.source,
+                        cause: loss.observation.cause,
+                        phase: loss.observation.phase,
+                        native_subject: None,
+                    });
+                }
+                SdkEvent::EstablishmentClosed { .. } => {}
+            }
+        }
+    }
+}
+
+async fn spawn_direct_connection(
+    session_id: &'static str,
+    init_extra: &'static str,
+    proxy: Option<ProxySpec>,
+    close_after_init: bool,
+) -> (Result<(), AcpError>, DirectConnection) {
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
+    let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
+    let agent_write = Arc::new(Mutex::new(agent_write));
+    let replies = Arc::clone(&agent_write);
+    let agent = tokio::spawn(async move {
+        let mut lines = BufReader::new(agent_read).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let id = &message["id"];
+            let response = match message["method"].as_str().unwrap() {
+                "initialize" => format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}{init_extra}}}}}"#
+                ),
+                "session/new" => format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"{session_id}"}}}}"#
+                ),
+                method => panic!("unexpected direct fixture method: {method}"),
+            };
+            write_line(&replies, &response).await;
+        }
+    });
+    let cwd = tempfile::tempdir().unwrap();
+    let resources = SessionResources::new(
+        cwd.path().into(),
+        vec![],
+        session_id.into(),
+        None,
+        &SessionState::default(),
+    );
+    let connection_state = Arc::new(ConnectionState::default());
+    let close_gate = close_after_init.then(|| {
+        let (entered, initialized) = oneshot::channel();
+        let (allow, release) = oneshot::channel();
+        *connection_state
+            .test_initialize_response_application
+            .lock()
+            .unwrap() = Some((entered, release));
+        (initialized, allow)
+    });
+    let (event_tx, events) = mpsc::channel(64);
+    let (commands, cmd_rx) = mpsc::channel(1);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let params = ConnectionParams {
+        event_tx: event_tx.into(),
+        connection_state: Arc::clone(&connection_state),
+        cmd_rx,
+        child: None,
+        pending_responders: Arc::default(),
+        resources,
+        mode: ConnectMode::Fresh,
+        ready_tx,
+        profile: &crate::acp::agent_profiles::GEMINI,
+        expected_agent: ExpectedAgent::Gemini,
+        proxy,
+        source_profile: None,
+        default_effort: None,
+        default_model_config: Default::default(),
+        default_mode: None,
+        default_model: None,
+        mcp_servers: Vec::new(),
+        claude_home: None,
+        runner: None,
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        shutdown: shutdown.clone(),
+        tracking_observer: None,
+    };
+    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+    let connection = tokio::spawn(run_connection_task(transport, params));
+    if let Some((initialized, allow)) = close_gate {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            initialized.await.expect("proxy hello validated before EOF");
+            agent_write.lock().await.shutdown().await.unwrap();
+            connection_state.wait_unavailable().await;
+            let _ = allow.send(());
+        })
+        .await
+        .expect("validated proxy reaches the closed transport");
+    }
+    let ready = ready_rx.await.expect("initialize handoff resolves");
+    (
+        ready,
+        DirectConnection {
+            events,
+            agent_write,
+            connection,
+            agent,
+            shutdown,
+            _commands: commands,
+            _cwd: cwd,
+        },
+    )
+}
+
+const HELLO_WITH_INFO: &str = r#","agentInfo":{"name":"claude-x","version":"1.2.0"},"_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}"#;
+
+fn proxy_spec(compat: ProxyCompat) -> ProxySpec {
+    ProxySpec {
+        plugin_id: "p".into(),
+        command: "proxy".into(),
+        args: vec![],
+        failure_policy: ProxyFailurePolicy::Refuse,
+        display_name: "P".into(),
+        compat,
+    }
+}
+
+/// A launched proxy must send a hello naming itself, in front of an adapter
+/// its compat accepts; each breach is an `InvalidProxyHello`. Without a launched
+/// proxy a hello is accepted as announced.
+#[tokio::test]
+async fn launched_proxy_hello_is_held_to_its_spec() {
+    let other_plugin = r#","_meta":{"aoe":{"proxy":{"plugin_id":"q","protocol_version":1,"primitive_schema_version":1}}}"#;
+    let compat = |names: &[&str], req: Option<&str>| ProxyCompat {
+        agent_names: names.iter().map(|n| n.to_string()).collect(),
+        version_req: req.map(|r| r.parse().unwrap()),
+    };
+    let cases: [(&str, &str, Option<ProxySpec>, Option<&str>); 8] = [
+        (
+            "no hello",
+            "",
+            Some(proxy_spec(ProxyCompat::default())),
+            Some("sent no hello"),
+        ),
+        (
+            "other plugin",
+            other_plugin,
+            Some(proxy_spec(ProxyCompat::default())),
+            Some("names plugin `q`"),
+        ),
+        (
+            "any adapter",
+            GOOD_HELLO,
+            Some(proxy_spec(ProxyCompat::default())),
+            None,
+        ),
+        (
+            "compat met",
+            HELLO_WITH_INFO,
+            Some(proxy_spec(compat(&["claude-x"], Some(">=1.2")))),
+            None,
+        ),
+        (
+            "wrong name",
+            HELLO_WITH_INFO,
+            Some(proxy_spec(compat(&["other"], None))),
+            Some("`claude-x` is not supported"),
+        ),
+        (
+            "version too old",
+            HELLO_WITH_INFO,
+            Some(proxy_spec(compat(&[], Some(">=2")))),
+            Some("does not satisfy"),
+        ),
+        (
+            "no agent_info",
+            GOOD_HELLO,
+            Some(proxy_spec(compat(&["claude-x"], None))),
+            Some("no agent_info"),
+        ),
+        ("hello without a launched proxy", GOOD_HELLO, None, None),
+    ];
+    for (name, init_extra, proxy, refusal) in cases {
+        let (ready, fake) = spawn_direct_connection("s-v", init_extra, proxy, false).await;
+        match refusal {
+            None => assert!(ready.is_ok(), "{name}: {ready:?}"),
+            Some(needle) => assert!(
+                matches!(&ready, Err(AcpError::IncompatibleAgent(e))
+                    if matches!(&e.detail, StartupErrorDetail::InvalidProxyHello { reason } if reason.contains(needle))),
+                "{name}: {ready:?}"
+            ),
+        }
+        fake.agent.abort();
+        fake.connection.abort();
+    }
+}
+
+/// A hello core cannot accept refuses the session; a valid one makes the
+/// agent's `_meta.aoe` frames dedup, drop and reorder before the reducer, and a
+/// broken frame ends the integration.
 #[tokio::test]
 #[serial_test::serial]
 async fn proxy_hello_and_primitives_shape_the_event_stream() {
@@ -2715,4 +2934,188 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
         })
     })
     .await;
+}
+
+/// A limit that ends an agent-initiated turn must end the connection, or the
+/// drain loop never drops the worker and the reaper skips it as still running
+/// (#4373). The limit is a rejected window, or only the agent's text (#5990).
+#[tokio::test]
+async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
+    let resets_at = crate::time::Timestamp::now().as_unix_secs() + 3600;
+    let usage = |meta: &str| {
+        format!(
+            r#"{{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{{"amount":0.1,"currency":"USD"}}{meta}}}"#
+        )
+    };
+    let limit_text = r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"You've hit your 5-hour limit · resets 10pm (America/New_York)"}}"#;
+    // (name, updates, expected RateLimit resets_at and kind)
+    let cases = [
+        (
+            "rejected window",
+            vec![usage(&format!(
+                r#","_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}"#
+            ))],
+            Some(resets_at),
+            "five_hour",
+        ),
+        (
+            "limit text only",
+            vec![limit_text.to_string(), usage("")],
+            None,
+            "rate_limit",
+        ),
+    ];
+    for (name, updates, want_reset, want_kind) in cases {
+        let (ready, mut fake) = spawn_direct_connection("s-limit", "", None, false).await;
+        ready.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                fake.next_event().await.expect("connection remains open"),
+                Event::AcpSessionAssigned { .. }
+            ) {}
+        })
+        .await
+        .expect("session commits");
+
+        for update in updates {
+            write_line(
+                &fake.agent_write,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-limit","update":{update}}}}}"#
+                ),
+            )
+            .await;
+        }
+
+        // The idle grace is wall-clock, so the deadline covers it with margin.
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(event) = fake.next_event().await {
+                seen.push(event);
+            }
+        })
+        .await
+        .expect("the connection must end after parking, closing the event channel");
+        tokio::time::timeout(Duration::from_secs(10), fake.connection)
+            .await
+            .expect("connection task ends")
+            .expect("connection task does not panic");
+
+        let limit = seen.iter().position(|e| {
+            matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.as_unix_secs()) == want_reset)
+        });
+        let stopped = seen
+            .iter()
+            .position(|e| matches!(e, Event::Stopped { reason } if reason == "rate_limited"));
+        assert!(
+            limit.is_some() && limit < stopped,
+            "{name}: RateLimit then Stopped(rate_limited) expected: {seen:?}"
+        );
+        // The rejected window travels on the event, so a later report for another window of the
+        // same account cannot replace this deadline in the account table.
+        assert!(
+            matches!(&seen[limit.unwrap()], Event::RateLimit { info } if info.kind == want_kind),
+            "{name}: the event names its window: {seen:?}"
+        );
+        fake.agent.abort();
+        let _ = fake.agent.await;
+    }
+}
+
+/// A proxy that exits after a valid hello but before the connection is ready
+/// is a lost integration; reporting it as a spawn failure would make the
+/// supervisor relaunch the session without the proxy.
+#[tokio::test]
+async fn proxy_lost_between_hello_and_ready_is_integration_lost() {
+    let (ready, mut fake) = spawn_direct_connection("s-w", GOOD_HELLO, None, true).await;
+    ready.expect("a proxy that passed its hello is not a launch failure");
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = fake.next_event().await {
+            events.push(event);
+        }
+    })
+    .await
+    .expect("connection ends once the agent closes");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::IntegrationLost {
+                reason: IntegrationLostReason::ProxyExited
+            }
+        )),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::AcpConnectionUnavailable { .. } | Event::AgentStartupError { .. }
+        )),
+        "{events:?}"
+    );
+    fake.connection.await.unwrap();
+    fake.agent.abort();
+}
+
+/// Closes the agent's end and returns every event the ended connection emitted.
+/// The channel closes only when the connection task is done, so none are missed.
+async fn close_agent_and_collect(mut fake: DirectConnection) -> Vec<Event> {
+    fake.agent_write.lock().await.shutdown().await.unwrap();
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = fake.next_event().await {
+            events.push(event);
+        }
+    })
+    .await
+    .expect("connection ends once the agent closes");
+    fake.connection.await.unwrap();
+    fake.agent.abort();
+    events
+}
+
+/// A proxied agent that closes its transport after the hello loses its
+/// integration; an agent that never proved it was proxied fails as before, and
+/// a close the daemon asked for emits neither.
+#[tokio::test]
+async fn closing_the_transport_after_a_hello_loses_the_integration() {
+    // (name, hello, daemon shut the connection down first, expect proxy_exited, expect connection unavailable)
+    let cases = [
+        ("proxied", GOOD_HELLO, false, true, false),
+        ("no hello", "", false, false, true),
+        ("deliberate close", GOOD_HELLO, true, false, false),
+    ];
+    for (name, hello, deliberate, proxy_exited, unavailable) in cases {
+        let (ready, mut fake) = spawn_direct_connection("s-x", hello, None, false).await;
+        ready.expect(name);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                fake.next_event().await.expect("connection remains open"),
+                Event::AcpSessionAssigned { .. }
+            ) {}
+        })
+        .await
+        .expect("session commits before closing the transport");
+        if deliberate {
+            fake.shutdown.cancel();
+        }
+        let events = close_agent_and_collect(fake).await;
+        assert_eq!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::IntegrationLost {
+                    reason: IntegrationLostReason::ProxyExited
+                }
+            )),
+            proxy_exited,
+            "{name}: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::AcpConnectionUnavailable { .. })),
+            unavailable,
+            "{name}: {events:?}"
+        );
+    }
 }

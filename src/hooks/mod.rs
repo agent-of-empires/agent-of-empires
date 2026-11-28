@@ -43,7 +43,8 @@ pub(crate) use status_file::{
 pub(crate) const SESSION_SOURCE_ENV: &str = "AOE_SESSION_SOURCE";
 pub use hermes::{install_hermes_hooks_with_events, uninstall_hermes_hooks, HERMES_ALLOWLIST_FILE};
 pub use json_settings::{
-    install_cursor_hooks_with_events, install_hooks, uninstall_cursor_hooks, uninstall_hooks,
+    install_cursor_hooks_with_events, install_declared_hooks, install_hooks,
+    uninstall_cursor_hooks, uninstall_hooks,
 };
 pub use kimi::{install_kimi_hooks_with_events, uninstall_kimi_hooks};
 pub use kiro::KIRO_DEFAULT_AGENT_NOTE;
@@ -57,12 +58,18 @@ pub use status_file::{
     read_hook_session_path, read_hook_status, read_hook_status_age, read_hook_urgent,
     session_id_sidecar_exists,
 };
+#[cfg(test)]
+pub(crate) use targets::iter_all_hook_targets_in;
 pub(crate) use targets::{
-    has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
+    has_aoe_marker, is_other_builtin_hook_path, iter_hook_targets, iter_hook_targets_in,
+    HookTarget, HookTargetKind,
 };
+pub(crate) use trust::open_regular_for_write;
 pub use trust::{
-    disable_gemini_folder_trust, trust_claude_project, trust_codex_project, trust_gemini_project,
-    trust_host_project,
+    declared_sandbox_dir, declared_trust_applies_in_sandbox, declared_trust_path,
+    disable_gemini_folder_trust, is_other_builtin_trust_file, trust_claude_project,
+    trust_codex_project, trust_gemini_project, trust_host_project, write_declared_trust,
+    write_declared_trust_in_place,
 };
 
 /// Where the agent's settings live, which decides the base directory baked into
@@ -71,6 +78,20 @@ pub use trust::{
 pub enum HookInstallTarget {
     Host,
     Sandbox,
+}
+
+/// Installs JSON settings hooks, strictly for a plugin-declared file.
+pub(crate) fn install_json_hooks(
+    hook_cfg: &crate::agents::AgentHookConfig<'_>,
+    settings_path: &Path,
+    events: &[crate::agents::ResolvedHookEvent],
+    target: HookInstallTarget,
+) -> anyhow::Result<()> {
+    if hook_cfg.strict {
+        install_declared_hooks(settings_path, events, target)
+    } else {
+        install_hooks(settings_path, events, target)
+    }
 }
 
 /// `<CODEX_HOME>/config.toml`, else `<home>/.codex/config.toml`.
@@ -94,7 +115,7 @@ fn codex_home_in(home: &Path, host_env: &[String]) -> PathBuf {
 /// `<home>/<settings_rel_path>`.
 pub(crate) fn agent_settings_path_in(
     home: &Path,
-    hook_cfg: &crate::agents::AgentHookConfig,
+    hook_cfg: &crate::agents::AgentHookConfig<'_>,
     host_env: &[String],
 ) -> PathBuf {
     let override_dir = hook_cfg

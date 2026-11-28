@@ -500,7 +500,7 @@ test.describe("agents and presets", () => {
     const created = await startWizard(page, {
       agents: [
         { ...CLAUDE_AGENT, kind: "builtin", installed: false, install_hint: "install claude" },
-        { ...CLAUDE_AGENT, name: "remote-helper", kind: "custom", binary: hidden[0] },
+        { ...CLAUDE_AGENT, name: "remote-helper", kind: "custom", binary: hidden[0], acp_capable: false },
       ],
     });
     const w = wizard(page);

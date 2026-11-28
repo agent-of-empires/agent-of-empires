@@ -296,6 +296,12 @@ close cannot wait forever for that foreground to finish. Pending-ingress
 overflow fails closed, discards its uncommitted replay and establishes its own
 ordered protocol-failure boundary; it does not wait for the SDK close that
 depends on foreground completion.
+
+Control wire v9 preserves Native establishment receipts, result custody and replay
+ordinals independently of proxy adapter frame counts. `SessionReady.adapter_frames`
+is the baseline for frames the attachment will not replay. Queued updates and
+`AdapterFramesShed` markers advance the count in delivery order after readiness.
+
 Shared turn delivery, pending-initial-turn drains, dormant queue wakes and the
 existing rate-limit auto-resume admission consult qualified unavailability
 before resume, publication, redelivery-budget or mutation effects. Refusal
@@ -752,6 +758,12 @@ park holds ambient turn inference, pending delivery and idle reaping; observing
 the same actor through Attach or a Ready receipt is not replay consent.
 Canonical park metadata is independent of worker liveness.
 
+An agent-initiated turn can report a limit without an RPC error. For a qualified
+ambient turn that ran no tool, the idle tick may park it on a captured rejection
+or a lone usage-limit sentence. Terminal repair has only the transcript: for
+otherwise eligible agent-initiated work, it parks on that sole sentence instead
+of emitting `inferred_prompt_complete`. Neither path settles an open Native prompt.
+
 Quota windows such as `five_hour` and `seven_day` belong in `RateLimitInfo.kind`,
 not in `errorKind`. `RateLimitInfo.resets_at` uses a reset attributed to the
 rejection: the reported epoch for its window, or a reset parsed from its status
@@ -879,12 +891,9 @@ Claude-family provider changes restart the worker, preserve conversation and rea
 
 ## Agent profiles
 
-Each agent has two profile sources, kept aligned by registry key:
+`src/acp/agent_profiles.rs` is the single source: reset and compact aliases, capability gates, the card-classifier alias map, MCP prefixes, special-title patterns, the memory path regex and the daemon-side fullscreen probe. Each session row sends it to clients as the versioned `agent_profile` object (`AgentProfileWire`, `v`); the web client reads it from the row and keeps no per-agent table. Changing its shape needs a `WIRE_VERSION` bump.
 
-- **Server**, `src/acp/agent_profiles.rs`: `parent_meta_namespaces`, `clear_aliases`, and the `supports_exit_plan_mode` / `supports_wakeup_tools` gates.
-- **Frontend**, `web/src/lib/agentProfiles.ts`: the card-classifier alias map, claude-specialized capabilities (`todos`, `skills`, `wakeup`), the MCP prefix list, and special-title patterns matched only when the capability is on.
-
-Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId` on child tool calls; for a profile that supports subagents the link comes from the delegation `session_message` instead (see Subagent sessions). An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagentToolNames`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
+Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId` on child tool calls; for a profile that supports subagents the link comes from the delegation `session_message` instead (see Subagent sessions). An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagent_tool_names`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
 
 ## Security model
 

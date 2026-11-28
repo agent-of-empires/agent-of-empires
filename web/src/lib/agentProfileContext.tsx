@@ -1,50 +1,34 @@
 /* eslint-disable react-refresh/only-export-components */
-// The active session's AgentProfile for deep structured view renderers, plus the server-owned clear aliases in a sibling context. Outside a provider it defaults to the generic profile.
+// The active session's AgentProfile for deep structured view renderers. Outside a provider it defaults to the generic profile.
 
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 
-import { DEFAULT_AGENT_PROFILE, resolveAgentProfile, type AgentProfile } from "./agentProfiles";
+import { DEFAULT_AGENT_PROFILE, usableAgentProfile, type AgentProfile } from "./agentProfile";
 
 const AgentProfileContext = createContext<AgentProfile>(DEFAULT_AGENT_PROFILE);
 
-// Stable empty default so consumers never see a fresh array.
-const NO_CLEAR_ALIASES: readonly string[] = [];
-const ClearAliasesContext = createContext<readonly string[]>(NO_CLEAR_ALIASES);
-const CompactAliasesContext = createContext<readonly string[]>(NO_CLEAR_ALIASES);
+/** An unknown `v` falls back to the default; equal content keeps the previous object, as the session poll
+ *  deserializes a fresh one each time. */
+export function useStableAgentProfile(profile: AgentProfile | null | undefined): AgentProfile {
+  const usable = usableAgentProfile(profile);
+  const json = JSON.stringify(usable);
+  const [held, setHeld] = useState({ json, profile: usable });
+  if (held.json === json) return held.profile;
+  setHeld({ json, profile: usable });
+  return usable;
+}
 
 export function AgentProfileProvider({
-  toolKey,
-  clearAliases,
-  compactAliases,
+  profile,
   children,
 }: {
-  toolKey: string | null | undefined;
-  clearAliases?: readonly string[];
-  compactAliases?: readonly string[];
+  profile: AgentProfile | null | undefined;
   children: ReactNode;
 }) {
-  const profile = resolveAgentProfile(toolKey);
-  return (
-    <AgentProfileContext.Provider value={profile}>
-      <ClearAliasesContext.Provider value={clearAliases ?? NO_CLEAR_ALIASES}>
-        <CompactAliasesContext.Provider value={compactAliases ?? NO_CLEAR_ALIASES}>
-          {children}
-        </CompactAliasesContext.Provider>
-      </ClearAliasesContext.Provider>
-    </AgentProfileContext.Provider>
-  );
+  const stable = useStableAgentProfile(profile);
+  return <AgentProfileContext.Provider value={stable}>{children}</AgentProfileContext.Provider>;
 }
 
 export function useAgentProfile(): AgentProfile {
   return useContext(AgentProfileContext);
-}
-
-/** Empty without a clear alias or outside a provider. */
-export function useClearAliases(): readonly string[] {
-  return useContext(ClearAliasesContext);
-}
-
-/** Empty without a compact alias or outside a provider. */
-export function useCompactAliases(): readonly string[] {
-  return useContext(CompactAliasesContext);
 }

@@ -61,7 +61,7 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
         // the only consumer here is `has_aoe_marker` (bytes-only marker
         // scan); `uninstall_codex_hooks` reads the file separately.
         let target = HookTarget {
-            agent_name: "codex",
+            agent_name: "codex".to_string(),
             kind: HookTargetKind::CodexToml,
             path: path.clone(),
             events: Vec::new(),

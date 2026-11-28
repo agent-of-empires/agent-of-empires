@@ -30,7 +30,7 @@ use crate::acp::acp_client::lifecycle::{
     classify_lifecycle_signal, forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal,
     TerminalClaim,
 };
-use crate::acp::acp_client::rate_limit::record_rate_limit_report;
+use crate::acp::acp_client::rate_limit::{record_rate_limit_report, AgentTurnText};
 use crate::acp::acp_client::session_identity::{IngressUpdate, PendingIngress, SessionIngress};
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
@@ -97,6 +97,7 @@ pub(super) struct Shared {
     pub(super) cancel_send_gate: Arc<tokio::sync::RwLock<()>>,
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
+    pub(super) agent_turn_text: std::sync::Mutex<AgentTurnText>,
     /// Native runtime uses only current-qualified updates; original history folds separately.
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
@@ -173,6 +174,7 @@ impl Shared {
             #[cfg(test)]
             cancel_send_gate: state.cancel_send_gate.clone(),
             agent_msg_dedup: Default::default(),
+            agent_turn_text: Default::default(),
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             subagents: Default::default(),
@@ -206,6 +208,7 @@ impl Shared {
     }
 
     pub(super) async fn emit(&self, event: Event) {
+        self.observe_turn_text(&event);
         let constructor = self
             .control
             .as_ref()
@@ -296,6 +299,22 @@ impl Shared {
         }
     }
 
+    fn direct_proxy_exited(&self) -> bool {
+        self.control.is_none() && self.connection_state.sdk_is_closing() && self.aoe.is_proxied()
+    }
+
+    pub(super) fn unavailable_ready(
+        &self,
+        observation: super::AcpConnectionUnavailability,
+    ) -> Result<(), super::AcpError> {
+        if self.direct_proxy_exited() {
+            // A proved proxy exit must never trigger raw fallback.
+            Ok(())
+        } else {
+            Err(super::AcpError::ConnectionUnavailable(observation))
+        }
+    }
+
     pub(super) async fn publish_connection_unavailable(&self) {
         self.wait_local_prompt_settled().await;
         if self.connection_state.is_stopping() {
@@ -308,10 +327,19 @@ impl Shared {
                 self.adopted_turn_active.store(false, Ordering::Release);
                 self.between_prompt.deactivate();
             }
-            let _ = self
-                .event_tx
-                .send_control_plane_loss(Arc::clone(&self.connection_state), observation)
-                .await;
+            if self.direct_proxy_exited() {
+                let _ = self
+                    .event_tx
+                    .send(Event::IntegrationLost {
+                        reason: crate::acp::state::IntegrationLostReason::ProxyExited,
+                    })
+                    .await;
+            } else {
+                let _ = self
+                    .event_tx
+                    .send_control_plane_loss(Arc::clone(&self.connection_state), observation)
+                    .await;
+            }
         }
     }
 
@@ -399,6 +427,13 @@ impl Shared {
         );
     }
 
+    pub(super) fn observe_turn_text(&self, event: &Event) {
+        self.agent_turn_text
+            .lock()
+            .expect("agent turn text mutex poisoned")
+            .observe(event);
+    }
+
     /// A claimed terminal must reach the drain even if SDK teardown cancels its caller.
     pub(super) async fn publish_terminal(
         self: &Arc<Self>,
@@ -419,6 +454,7 @@ impl Shared {
                 .into_iter()
                 .chain(std::iter::once(Event::Stopped { reason }))
             {
+                shared.observe_turn_text(&event);
                 if !super::command_loop::publish_scoped(
                     &shared,
                     shared.control.is_some(),
@@ -487,6 +523,10 @@ impl Shared {
 
     async fn apply_ingress(&self, entry: PendingIngress) {
         match entry {
+            PendingIngress::AdapterFramesShed(count) => {
+                self.ingress.skip_adapter_frames(count);
+                self.settle_discarded().await;
+            }
             PendingIngress::Autonomous { first, second } => {
                 for notification in [Some(first), second].into_iter().flatten() {
                     let sender = self
@@ -1332,6 +1372,9 @@ impl Shared {
                 continue;
             }
             update_tool_context_cache(&self.tool_context_cache, &mut event, &mut tool_input);
+            if !suppressing {
+                self.observe_turn_text(&event);
+            }
             if self.event_tx.send(event).await.is_err() {
                 break;
             }

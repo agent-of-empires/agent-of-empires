@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn a_late_config_failure_stays_at_main_67_and_retries_acp_reconciliation() {
+    fn a_late_config_failure_stays_at_upstream_68_and_retries_acp_reconciliation() {
         let home = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -465,7 +465,7 @@ mod tests {
         let valid_config = fs::read(&other).unwrap();
         fs::write(&other, "[acp\n").unwrap();
         assert!(run_migrations().is_err());
-        assert_eq!(get_current_version(), 67);
+        assert_eq!(get_current_version(), 68);
         assert!(has_pending_migrations());
         assert_eq!(identity(&conn).unwrap(), old_identity);
         assert_eq!(
@@ -659,6 +659,73 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn conflicting_v068_histories_converge_without_losing_sidebar_picks() {
+        use crate::session::config::{AppStateConfig, GroupByMode, SortOrder};
+
+        for (acp_lineage, group, sort, expected_group, expected_sort) in [
+            (
+                true,
+                "manual",
+                "a_z",
+                GroupByMode::Project,
+                SortOrder::Custom,
+            ),
+            (
+                false,
+                "project",
+                "newest",
+                GroupByMode::Project,
+                SortOrder::Newest,
+            ),
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir().unwrap();
+            seed_profiles(&app);
+            let conn = seed_legacy_database(&app);
+            prepare_history(History::Main57, &conn);
+            if acp_lineage {
+                super::run().unwrap();
+            }
+            let axis = if acp_lineage { "org" } else { "group" };
+            let path = app.join("state.toml");
+            let before = format!(
+                "group_by = '{group}'\nsort_order = '{sort}'\ntips_seen = ['keep']\n\
+                 [web_ui_state]\naoe-sidebar-axis = '{axis}'\naoe-sidebar-sort-mode = 'attention'\n"
+            );
+            fs::write(&path, &before).unwrap();
+            set_version(68).unwrap();
+            let old_identity = identity(&conn).unwrap();
+            assert_eq!(super::autonomous_pending().unwrap(), !acp_lineage);
+
+            run_migrations().unwrap();
+            assert_eq!(get_current_version(), CURRENT_VERSION);
+            assert_schema_current().unwrap();
+            assert_preserved(&app, &conn);
+            assert_eq!(identity(&conn).unwrap(), old_identity);
+            let state = AppStateConfig::load().unwrap();
+            assert_eq!(state.group_by, Some(expected_group));
+            assert_eq!(state.sort_order, Some(expected_sort));
+            assert_eq!(state.web_ui_state["aoe-sidebar-axis"], axis);
+            assert_eq!(state.tips_seen, ["keep"]);
+            let migrated = fs::read_to_string(&path).unwrap();
+            let backups = crate::session::migration_backups(&path).unwrap();
+            if acp_lineage {
+                assert_eq!(backups.len(), 1);
+                assert_eq!(fs::read_to_string(&backups[0].1).unwrap(), before);
+            } else {
+                assert_eq!(migrated, before);
+                assert!(backups.is_empty());
+            }
+
+            run_migrations().unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), migrated);
+            assert_eq!(crate::session::migration_backups(&path).unwrap(), backups);
+            assert_preserved(&app, &conn);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn incompatible_legacy_scope_or_budget_preserves_data_without_stamping_reconciliation() {
         for malformed_scope in [true, false] {
             let home = tempfile::tempdir().unwrap();
@@ -678,7 +745,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            set_version(67).unwrap();
+            set_version(68).unwrap();
             let marker = fs::read(app.join(VERSION_FILE)).unwrap();
             assert!(run_migrations().is_err());
             assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
@@ -711,7 +778,7 @@ mod tests {
         prepare_history(History::Main57, &conn);
         let malformed = br#"[{"id":"5959595959595959","acp_establishment":{"version":999}}]"#;
         fs::write(app.join("sessions.json"), malformed).unwrap();
-        set_version(67).unwrap();
+        set_version(68).unwrap();
         let marker = fs::read(app.join(VERSION_FILE)).unwrap();
         assert!(run_migrations().is_err());
         assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);

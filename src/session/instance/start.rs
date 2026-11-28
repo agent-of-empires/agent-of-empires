@@ -842,7 +842,7 @@ impl Instance {
             // for either would then be watching the pane this launch is replacing.
             self.capture_poller.clear();
             if !self.is_sandboxed() {
-                self.install_agent_status_hooks(self.status_agent());
+                self.with_hook_agent(|this, agent| this.install_agent_status_hooks(agent));
             }
             self.report_store_override(prepared.execution.as_ref());
             let canonicalized = prepared.canonical_conversation.is_some();

@@ -58,6 +58,11 @@ impl AoeIngress {
         *self.order.lock().expect("aoe ordering mutex poisoned") = ArrivalOrder::default();
     }
 
+    /// Whether this connection's agent sent a valid hello.
+    pub(super) fn is_proxied(&self) -> bool {
+        self.proxied.load(Ordering::Relaxed)
+    }
+
     pub(super) fn set_loading_history(&self, loading: bool) {
         self.loading_history.store(loading, Ordering::Relaxed);
     }

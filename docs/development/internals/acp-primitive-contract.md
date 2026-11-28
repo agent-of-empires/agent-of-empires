@@ -16,7 +16,7 @@ A frame or hello naming a version core does not speak is rejected.
 
 ## Hello
 
-A proxy adds `_meta.aoe.proxy = {plugin_id, protocol_version, primitive_schema_version}` to the `initialize` response, next to the adapter's own unchanged `agent_info`. No hello means a plain ACP agent: it is not held to this contract and a malformed `_meta.aoe` from it is ignored. An invalid hello refuses the session with `StartupErrorDetail::InvalidProxyHello`.
+A proxy adds `_meta.aoe.proxy = {plugin_id, protocol_version, primitive_schema_version}` to the `initialize` response, next to the adapter's own unchanged `agent_info`. No hello means a plain ACP agent: it is not held to this contract and a malformed `_meta.aoe` from it is ignored. A launched proxy that sends no hello, a different `plugin_id`, or an `agent_info` outside its declared compat is an invalid hello. Under the `refuse` failure policy that refuses the session with `StartupErrorDetail::InvalidProxyHello`; under `neutral_boot` the supervisor relaunches once without the proxy and posts a notice.
 
 Core validates the hello and initializes its per-connection primitive state
 before reporting initialized ownership. Ownership still returns before bootstrap
@@ -32,7 +32,7 @@ session readiness.
 ```
 
 - `key` is an idempotency key. A repeat is dropped, among the last 4096 keys of a native session; a reset starts a fresh key space. A proxy must not replay a key older than that window.
-- `after_adapter_sequence: N` marks a frame the proxy emitted itself, for example from a transcript tailer. It is not an adapter frame and takes no number; core delivers it after adapter frame `N`. Adapter frames are numbered from 1 per connection and keep counting across a conversation reset. At most 1024 frames may wait; a reset drops them.
+- `after_adapter_sequence: N` marks a frame the proxy emitted itself, for example from a transcript tailer. It is not an adapter frame and takes no number; core delivers it after adapter frame `N`. Adapter frames are numbered from 1 per adapter process and keep counting across a conversation reset and a runner reattach, including frames the runner sheds from a full queue. At most 1024 frames may wait; a reset drops them.
 - `lease` is described below.
 - Primitives: `parent_tool_call`, `ephemeral` (drop before the reducer), `memory_recall`, `plan_proposal`, `tool_presentation`, `option_preview`. `parent_tool_call`, `memory_recall` and `plan_proposal` are read on `tool_call` updates only, where they produce the same events as the matching agent-specific path. `tool_presentation` and `option_preview` are validated and carried; no surface renders them yet.
 
@@ -46,7 +46,7 @@ A `session/update` with no `_meta.aoe` is an unanchored adapter frame: it is cou
 
 ## Failure
 
-For a proxied agent, a frame that breaks the contract, an overfull hold buffer or an overfull lease table emits `Event::IntegrationLost` and core ignores the agent's later frames. A process that has not announced itself is never held to this.
+For a proxied agent, a frame that breaks the contract, an overfull hold buffer or an overfull lease table emits `Event::IntegrationLost` and core ignores the agent's later frames. The same event with reason `proxy_exited` follows when the proxy, or the agent behind it, exits after its hello, unless the daemon stopped or restarted the session. Nothing then continues unproxied: a prompt queues until a respawn or reattach assigns a session. A process that has not announced itself is never held to this.
 
 ## Conformance
 

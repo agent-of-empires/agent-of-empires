@@ -8,6 +8,9 @@ mod acp_midturn_resume;
 mod acp_model_respawn;
 #[path = "../../../tests/integration/acp_provider_respawn.rs"]
 mod acp_provider_respawn;
+#[cfg(all(unix, debug_assertions))]
+#[path = "../../../tests/integration/acp_proxy_managed.rs"]
+mod acp_proxy_managed;
 #[path = "../../../tests/integration/acp_runner_managed_control.rs"]
 mod acp_runner_managed_control;
 #[path = "../../../tests/integration/acp_runner_managed_replay.rs"]
@@ -166,8 +169,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Admit a prompt without storing it, as `publish_user_prompt` does first.
-    pub(crate) fn test_note_admission(&self, session_id: &str) {
-        lock_recover(&self.lifecycle).note_admission(session_id);
+    pub(crate) fn test_note_admission(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::acp::runner_lifecycle::AdmissionGuard> {
+        lock_recover(&self.lifecycle).note_admission(session_id)
     }
 
     /// Replace a fixture's client under a fresh respawn epoch, as a respawn does.
@@ -613,6 +619,7 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
         acp_mode_id: None,
         agent_command_override: None,
         claude_store_pin: None,
+        proxy: None,
     }
 }
 
@@ -646,6 +653,8 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         seed_history_replay: false,
         prior_conversation: false,
         artifact_dir: None,
+        proxy: None,
+        degraded: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,
@@ -1216,6 +1225,8 @@ pub(crate) async fn refused_owned_constructor<S: BroadcastSink>(
             Some(lease.clone()),
             None,
             None, // Hello is refused before any native establishment/store claim.
+            None,
+            false,
         )
         .await;
         let crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal) = result

@@ -56,9 +56,11 @@ impl<T> ArrivalOrder<T> {
     /// Numbers an adapter frame core is not delivering, so the count keeps up
     /// with the proxy's. Frames its number releases are discarded.
     pub fn count_frame(&mut self) {
-        self.adapter_frames += 1;
+        self.adapter_frames = self.adapter_frames.saturating_add(1);
         let frames = self.adapter_frames;
-        let kept = self.held.split_off(&(frames + 1));
+        let kept = frames
+            .checked_add(1)
+            .map_or_else(Default::default, |next| self.held.split_off(&next));
         self.held_len = kept.values().map(Vec::len).sum();
         self.held = kept;
     }
@@ -95,7 +97,7 @@ impl<T> ArrivalOrder<T> {
             }
             Some(_) => Ok(vec![item]),
             None => {
-                self.adapter_frames += 1;
+                self.adapter_frames = self.adapter_frames.saturating_add(1);
                 let mut out = if duplicate { Vec::new() } else { vec![item] };
                 out.extend(self.release_due());
                 Ok(out)
@@ -106,7 +108,7 @@ impl<T> ArrivalOrder<T> {
     /// Numbers `n` adapter frames that core never saw, for example old-session
     /// frames dropped at a reset, and returns the held frames they release.
     pub fn skip_frames(&mut self, n: u64) -> Vec<T> {
-        self.adapter_frames += n;
+        self.adapter_frames = self.adapter_frames.saturating_add(n);
         self.release_due()
     }
 
