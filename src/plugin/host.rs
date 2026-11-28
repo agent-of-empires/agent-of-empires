@@ -3225,10 +3225,18 @@ rl.on('line', (line) => {
         let received = temp.path().join("silent-received");
         install_worker(
             "acme.silent",
-            &format!(
-                r#"["sh", "-c", "read line; touch {}; sleep 60"]"#,
-                received.display()
-            ),
+            &toml::Value::Array(
+                [
+                    "sh",
+                    "-c",
+                    "read line; touch \"$1\"; sleep 60",
+                    "sh",
+                    received.to_str().unwrap(),
+                ]
+                .map(|arg| toml::Value::String(arg.into()))
+                .into(),
+            )
+            .to_string(),
         );
         install_worker("acme.quitter", r#"["sh", "-c", "read line; exit 0"]"#);
         let registry = crate::plugin::reload_registry();
