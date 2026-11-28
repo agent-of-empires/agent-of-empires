@@ -9,8 +9,8 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use aoe_plugin_api::agent_integration::{
-    AgentIntegrationContribution, AgentKeyDeclaration, AgentResumeDeclaration, AgentTrustValue,
-    AgentYoloDeclaration,
+    AcpDeclaration, AcpFailurePolicy, AgentIntegrationContribution, AgentKeyDeclaration,
+    AgentResumeDeclaration, AgentTrustValue, AgentYoloDeclaration,
 };
 use aoe_plugin_api::agent_integration::{
     AgentIntegrationPrompt, AgentIntegrationReply, AgentIntegrationResponse,
@@ -133,6 +133,24 @@ fn launch_declaration_applies(
         return false;
     }
     true
+}
+
+/// Whether `entry`'s `acp` part of an active `plugin` may provide its tool's ACP agent.
+/// Built-in tool names stay reserved; a bundled fallback's own name is open only to a
+/// reserved-namespace plugin, as for launch declarations.
+pub(crate) fn acp_declaration_applies(
+    plugin: &super::LoadedPlugin,
+    entry: &AgentIntegrationContribution,
+) -> bool {
+    let reserved = if super::bundled_agents::contains(&entry.tool) {
+        (!plugin.manifest.id.is_reserved_namespace()).then_some(entry.tool.as_str())
+    } else {
+        reserved_builtin(&entry.tool)
+    };
+    if let Some(builtin) = reserved {
+        warn_reserved(plugin.id(), &entry.tool, builtin);
+    }
+    reserved.is_none()
 }
 
 /// An active plugin-provided agent that does not collide with a built-in or custom agent.
@@ -635,6 +653,94 @@ pub fn consent_lines(plugin_id: &str, integration: &AgentIntegrationContribution
             trust.sandbox
         ));
     }
+    if let Some(acp) = &integration.acp {
+        lines.extend(acp_consent_lines(acp));
+    }
+    lines
+}
+
+fn acp_consent_lines(acp: &AcpDeclaration) -> Vec<String> {
+    let mut lines = vec![format!(
+        "  Provides ACP agent {} ({}) through proxy {}",
+        display_command(&acp.id),
+        display_command(&acp.display_name),
+        display_command(&acp.proxy.command)
+    )];
+    if !acp.aliases.is_empty() {
+        lines.push(format!(
+            "    ACP aliases: {}",
+            acp.aliases
+                .iter()
+                .map(|alias| display_command(alias))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(adapter) = &acp.adapter {
+        lines.push(format!(
+            "    ACP adapter: {}@{}",
+            display_command(&adapter.upstream_package),
+            display_command(&adapter.upstream_pin)
+        ));
+    }
+    if !acp.env.allowlist.is_empty() {
+        let keys = acp.env.allowlist.iter().map(|key| {
+            let shown = display_command(key);
+            if acp.env.host_only.contains(key) {
+                format!("{shown} (host only)")
+            } else {
+                shown
+            }
+        });
+        lines.push(format!(
+            "    ACP env forwarded: {}",
+            keys.collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !acp.env.defaults.is_empty() {
+        lines.push(format!(
+            "    ACP env defaults: {}",
+            acp.env
+                .defaults
+                .iter()
+                .map(|(key, value)| format!("{}={}", display_command(key), display_command(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(compat) = &acp.compat {
+        let mut parts = Vec::new();
+        if let Some(name) = &compat.expected_agent_name {
+            parts.push(format!("name {}", display_command(name)));
+        }
+        if let Some(min) = &compat.min_version {
+            parts.push(format!("min version {}", display_command(min)));
+        }
+        parts.extend(
+            compat.capability_min_versions.iter().map(|(name, min)| {
+                format!("{} from {}", display_command(name), display_command(min))
+            }),
+        );
+        lines.push(format!("    ACP compat: {}", parts.join("; ")));
+    }
+    if !acp.profile.modes.is_empty() {
+        lines.push(format!(
+            "    ACP modes: {}",
+            acp.profile
+                .modes
+                .iter()
+                .map(|mode| format!("{} ({:?})", display_command(&mode.id), mode.approval_class))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines.push(format!(
+        "    ACP failure policy: {}",
+        match acp.failure_policy {
+            AcpFailurePolicy::NeutralBoot => "start on the neutral boot",
+            AcpFailurePolicy::Refuse => "refuse the session",
+        }
+    ));
     lines
 }
 
@@ -3041,6 +3147,74 @@ command = "acme-omp-shim"
         let lines = consent_lines("acme.helper", &integration).join("\n");
         assert!(!lines.contains('\u{202e}') && !lines.contains('\u{1b}'));
         assert!(lines.contains("\\u{202e}") && lines.contains("\\u{1b}"));
+    }
+
+    #[test]
+    fn consent_lines_disclose_and_escape_the_acp_declaration() {
+        use aoe_plugin_api::agent_integration::{
+            AcpAdapter, AcpCompat, AcpEnv, AcpMode, AcpProfile, AcpProxy,
+        };
+        let integration = AgentIntegrationContribution {
+            tool: "helper".into(),
+            acp: Some(AcpDeclaration {
+                id: "helper-acp".into(),
+                aliases: vec!["helper-cli".into()],
+                display_name: "Helper\u{202e}".into(),
+                proxy: AcpProxy {
+                    command: "bin/pro\u{1b}xy".into(),
+                    protocol_version: 1,
+                    primitive_schema_version: 1,
+                },
+                adapter: Some(AcpAdapter {
+                    upstream_package: "@acme/helper-acp".into(),
+                    upstream_pin: "2.1.0".into(),
+                    package_dir: "adapter".into(),
+                    binary: None,
+                }),
+                env: AcpEnv {
+                    allowlist: vec!["HELPER_KEY".into(), "HELPER_HOME".into()],
+                    host_only: vec!["HELPER_HOME".into()],
+                    defaults: [("HELPER_REGION".to_string(), "eu".to_string())].into(),
+                },
+                compat: Some(AcpCompat {
+                    expected_agent_name: Some("@acme/helper-acp".into()),
+                    min_version: Some("2.0.0".into()),
+                    capability_min_versions: [("steering".to_string(), "2.1.0".to_string())].into(),
+                }),
+                profile: AcpProfile {
+                    modes: vec![AcpMode {
+                        id: "auto".into(),
+                        approval_class: aoe_plugin_api::acp::ApprovalClass::Unattended,
+                    }],
+                },
+                failure_policy: AcpFailurePolicy::Refuse,
+            }),
+            ..Default::default()
+        };
+        let lines = consent_lines("acme.helper", &integration).join("\n");
+        for expected in [
+            "Provides ACP agent helper-acp (Helper\\u{202e}) through proxy bin/pro\\u{1b}xy",
+            "ACP aliases: helper-cli",
+            "ACP adapter: @acme/helper-acp@2.1.0",
+            "ACP env forwarded: HELPER_KEY, HELPER_HOME (host only)",
+            "ACP env defaults: HELPER_REGION=eu",
+            "ACP compat: name @acme/helper-acp; min version 2.0.0; steering from 2.1.0",
+            "ACP modes: auto (Unattended)",
+            "ACP failure policy: refuse the session",
+        ] {
+            assert!(
+                lines.contains(expected),
+                "{expected:?} missing from\n{lines}"
+            );
+        }
+        assert!(!lines.contains('\u{202e}') && !lines.contains('\u{1b}'));
+        let plain = AgentIntegrationContribution {
+            acp: None,
+            ..integration
+        };
+        assert!(!consent_lines("acme.helper", &plain)
+            .join("\n")
+            .contains("ACP"));
     }
 
     /// A delay-only declaration change re-prompts for consent, so the prompt

@@ -61,6 +61,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "session.integration",
     "mcp.rewrite",
     "mcp.serve",
+    "acp.agent.provide",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

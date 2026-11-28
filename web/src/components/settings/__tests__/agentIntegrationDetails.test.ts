@@ -60,4 +60,57 @@ describe("agentIntegrationDetails", () => {
       }),
     ).toEqual(["launch flags: yolo always", "resume: subcommand resume", "native replies: yes"]);
   });
+  it("discloses the ACP declaration with host-only keys marked and text escaped", () => {
+    expect(
+      agentIntegrationDetails({
+        tool: "agent",
+        acp: {
+          id: "agent-acp",
+          display_name: "Agent\u202e",
+          proxy: { command: "bin/proxy" },
+          adapter: { upstream_package: "@acme/agent-acp", upstream_pin: "2.1.0" },
+          env: { allowlist: ["KEY", "HOME_DIR"], host_only: ["HOME_DIR"], defaults: { REGION: "eu" } },
+          compat: {
+            expected_agent_name: "@acme/agent-acp",
+            min_version: "2.0.0",
+            capability_min_versions: { steering: "2.1.0" },
+          },
+          profile: { modes: [{ id: "auto", approval_class: "unattended" }] },
+          failure_policy: "refuse",
+        },
+      }),
+    ).toEqual([
+      "native replies: no",
+      "Provides ACP agent agent-acp (Agent\\u{202e}) through proxy bin/proxy",
+      "ACP adapter: @acme/agent-acp@2.1.0",
+      "ACP env forwarded: KEY, HOME_DIR (host only)",
+      "ACP env defaults: REGION=eu",
+      "ACP compat: name @acme/agent-acp; min version 2.0.0; steering from 2.1.0",
+      "ACP modes: auto (unattended)",
+      "ACP failure policy: refuse the session",
+    ]);
+  });
+
+  it("omits absent ACP sections and an empty launch table", () => {
+    expect(
+      agentIntegrationDetails({
+        tool: "agent",
+        launch: { container_env: {} },
+        acp: {
+          id: "min",
+          aliases: ["min-cli", "m"],
+          display_name: "Min",
+          proxy: { command: "bin/p" },
+          compat: { capability_min_versions: { steering: "1.2.0" } },
+          failure_policy: "neutral_boot",
+        },
+      }),
+    ).toEqual([
+      "native replies: no",
+      "Provides ACP agent min (Min) through proxy bin/p",
+      "ACP aliases: min-cli, m",
+      "ACP compat: steering from 1.2.0",
+      "ACP failure policy: start on the neutral boot",
+    ]);
+  });
 });

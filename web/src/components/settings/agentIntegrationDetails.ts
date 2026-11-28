@@ -66,5 +66,35 @@ export function agentIntegrationDetails(agent: PluginAgentIntegration): string[]
         .join(", ")}]${always}`,
     );
   }
+  const acp = agent.acp;
+  if (acp) {
+    details.push(`Provides ACP agent ${acp.id} (${acp.display_name}) through proxy ${acp.proxy.command}`);
+    if (acp.aliases?.length) details.push(`ACP aliases: ${acp.aliases.join(", ")}`);
+    if (acp.adapter) details.push(`ACP adapter: ${acp.adapter.upstream_package}@${acp.adapter.upstream_pin}`);
+    const hostOnly = acp.env?.host_only ?? [];
+    if (acp.env?.allowlist?.length) {
+      const keys = acp.env.allowlist.map((key) => (hostOnly.includes(key) ? `${key} (host only)` : key));
+      details.push(`ACP env forwarded: ${keys.join(", ")}`);
+    }
+    const defaults = Object.entries(acp.env?.defaults ?? {});
+    if (defaults.length > 0) {
+      details.push(`ACP env defaults: ${defaults.map(([key, value]) => `${key}=${value}`).join(", ")}`);
+    }
+    if (acp.compat) {
+      const parts: string[] = [];
+      if (acp.compat.expected_agent_name) parts.push(`name ${acp.compat.expected_agent_name}`);
+      if (acp.compat.min_version) parts.push(`min version ${acp.compat.min_version}`);
+      for (const [name, min] of Object.entries(acp.compat.capability_min_versions ?? {})) {
+        parts.push(`${name} from ${min}`);
+      }
+      details.push(`ACP compat: ${parts.join("; ")}`);
+    }
+    if (acp.profile?.modes?.length) {
+      details.push(`ACP modes: ${acp.profile.modes.map((m) => `${m.id} (${m.approval_class})`).join(", ")}`);
+    }
+    details.push(
+      `ACP failure policy: ${acp.failure_policy === "refuse" ? "refuse the session" : "start on the neutral boot"}`,
+    );
+  }
   return details.map(displayAgentText);
 }

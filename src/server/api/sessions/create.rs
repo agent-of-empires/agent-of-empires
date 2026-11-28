@@ -367,7 +367,7 @@ pub(crate) fn agent_is_acp_capable(
 ) -> bool {
     let resolved = acp_agent_key(tool, agent_name);
     if crate::acp::AgentRegistry::with_defaults()
-        .get(resolved)
+        .for_tool(resolved)
         .is_some()
     {
         return true;

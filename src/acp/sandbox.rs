@@ -262,28 +262,32 @@ fn record_built_sandbox(store: &NativeSessionStore, instance: &Instance) -> Resu
 
 /// The environment the sandboxed launch of `agent` runs with, as far as its authentication
 /// goes: `sandbox_env`, then the request's `provider_env`, then the adapter's allowlisted
-/// host variables, exactly as the launch claims them. The adapter spec is resolved as the
-/// supervisor resolves it: the registry entry, else a custom `agent_acp_cmd` (no allowlist),
-/// else the `agent_detect_as` base.
+/// host variables, exactly as the launch claims them. The adapter is the one the supervisor
+/// launches ([`crate::acp::AgentRegistry::launched_row`]); a custom `agent_acp_cmd` has none.
 pub(crate) fn effective_launch_env(
     agent: &str,
     session: &crate::session::config::SessionConfig,
     sandbox_env: &[crate::containers::EnvEntry],
     request_env: &[(String, String)],
 ) -> Vec<crate::containers::EnvEntry> {
-    let registry = crate::acp::AgentRegistry::with_defaults();
-    let spec = registry.get(agent).or_else(|| {
-        if session.agent_acp_cmd.contains_key(agent) {
-            return None;
-        }
-        let base = crate::acp::inherited_acp_base(agent, &session.agent_detect_as)?;
-        registry.get(&base)
-    });
-    crate::acp::acp_client::effective_launch_env(
+    effective_launch_env_in(
+        &crate::acp::AgentRegistry::with_defaults(),
+        agent,
+        session,
         sandbox_env,
         request_env,
-        spec.and_then(|s| s.env_allowlist.as_deref()),
     )
+}
+
+fn effective_launch_env_in(
+    registry: &crate::acp::AgentRegistry,
+    agent: &str,
+    session: &crate::session::config::SessionConfig,
+    sandbox_env: &[crate::containers::EnvEntry],
+    request_env: &[(String, String)],
+) -> Vec<crate::containers::EnvEntry> {
+    let spec = registry.launched_row(agent, session).map(|row| &row.spec);
+    crate::acp::acp_client::effective_launch_env(sandbox_env, request_env, spec)
 }
 
 /// Discard first, persist the new mount stamp second, then build. A failed
@@ -335,6 +339,50 @@ fn reconcile_provider_container_with(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn admission_env_follows_the_launched_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/proxy"), "").unwrap();
+        let manifest = "id = \"zeta-plugin\"\nname = \"Zeta\"\nversion = \"1.0.0\"\n\
+             api_version = 30\ncapabilities = [\"acp.agent.provide\"]\n\
+             [[agent_integrations]]\ntool = \"zeta\"\n\
+             [agent_integrations.acp]\nid = \"zeta\"\ndisplay_name = \"Zeta\"\n\
+             failure_policy = \"refuse\"\n\
+             [agent_integrations.acp.env.defaults]\nZZ_ZETA_KEY = \"k\"\n\
+             [agent_integrations.acp.proxy]\ncommand = \"bin/proxy\"\n\
+             protocol_version = 1\nprimitive_schema_version = 1\n";
+        let plugin = crate::plugin::LoadedPlugin {
+            manifest: toml::from_str(manifest).unwrap(),
+            enabled: true,
+            trust: aoe_plugin_api::TrustLevel::Community,
+            validation: crate::plugin::registry::ValidationState::Local,
+            source: None,
+            dir: Some(dir.path().to_path_buf()),
+            manifest_hash: String::new(),
+            granted: true,
+        };
+        let registry = crate::acp::AgentRegistry::with_snapshot(
+            &crate::plugin::PluginRegistry::from_test_plugins(vec![plugin]),
+        );
+        let keys = |session: &crate::session::config::SessionConfig| -> Vec<String> {
+            effective_launch_env_in(&registry, "zeta", session, &[], &[])
+                .iter()
+                .map(|e| e.key().to_string())
+                .collect()
+        };
+        let mut session = crate::session::config::SessionConfig::default();
+        assert_eq!(keys(&session), vec!["ZZ_ZETA_KEY"]);
+
+        session
+            .agent_acp_cmd
+            .insert("zeta".into(), "my-adapter".into());
+        assert!(
+            keys(&session).is_empty(),
+            "a user command carries no plugin defaults"
+        );
+    }
     use super::*;
     use crate::containers::Teardown;
     use crate::session::SandboxInfo;

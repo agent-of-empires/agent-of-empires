@@ -341,9 +341,13 @@ pub async fn list_agents(
             // registered even while a declaration provides the tool, so the row
             // keeps the adapter fields the builtin row would report. Selection
             // stays keyed on the bundled identity, not the plugin-chosen name.
-            let adapter = crate::plugin::bundled_agents::contains(integration.tool)
-                .then(|| acp_registry.get(integration.tool))
-                .flatten();
+            // A plugin's ACP agent reports its adapter, never its proxy.
+            let paired = acp_registry.paired_agent(integration.tool);
+            let adapter = paired.map(|agent| &agent.spec).or_else(|| {
+                crate::plugin::bundled_agents::contains(integration.tool)
+                    .then(|| acp_registry.get(integration.tool))
+                    .flatten()
+            });
             let (acp_command, acp_args) = acp_command_fields(adapter, data_dir.as_deref());
             let acp_capable = adapter.is_some();
             let launch = registry
@@ -4219,7 +4223,8 @@ mod tests {
 id = "aoe.takeover"
 name = "Takeover"
 version = "1.0.0"
-api_version = 29
+api_version = 30
+capabilities = ["acp.agent.provide"]
 
 [[agent_integrations]]
 tool = "omp"
@@ -4237,9 +4242,22 @@ command = "zzzeta"
 [[agent_integrations]]
 tool = "zzplain"
 command = "zzplain"
+
+[[agent_integrations]]
+tool = "zzacp"
+command = "zzacp"
+[agent_integrations.acp]
+id = "zzacp-agent"
+display_name = "Zacp"
+failure_policy = "refuse"
+[agent_integrations.acp.proxy]
+command = "bin/proxy"
+protocol_version = 1
+primitive_schema_version = 1
 "#;
         let dir = crate::plugin::plugins_dir().unwrap().join("aoe.takeover");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/proxy"), "").unwrap();
         std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
         crate::session::update_config(|config| {
             config.plugins.insert(
@@ -4251,7 +4269,7 @@ command = "zzplain"
                         manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
                             manifest.as_bytes(),
                         ),
-                        capabilities: Vec::new(),
+                        capabilities: vec!["acp.agent.provide".into()],
                         granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
@@ -4268,6 +4286,15 @@ command = "zzplain"
         else {
             panic!("list_agents failed");
         };
+
+        let acp_row = agents
+            .iter()
+            .find(|agent| agent.name == "zzacp")
+            .expect("the plugin row is listed");
+        assert!(acp_row.acp_capable, "a paired plugin ACP agent is capable");
+        // The adapter the proxy wraps, not the proxy itself.
+        assert_eq!(acp_row.acp_command.as_deref(), Some("zzacp"));
+        assert!(acp_row.acp_args.is_empty());
 
         let takeover = agents
             .iter()
@@ -4515,6 +4542,7 @@ command = "zzplain"
             args: vec![],
             description: "custom".into(),
             env_allowlist: None,
+            plugin_env: None,
         };
         let (cmd, _) = acp_command_fields(Some(&spec), Some(dir));
         let cmd = cmd.expect("spec has a command");

@@ -132,6 +132,7 @@ async fn cancel_under_flood() {
         profile: &crate::acp::agent_profiles::GEMINI,
         expected_agent: ExpectedAgent::Gemini,
         proxy: None,
+        adapter_compat: None,
         source_profile: None,
         default_effort: None,
         default_model_config: Default::default(),
@@ -270,6 +271,7 @@ async fn auth_events(mode: ConnectMode, reports: bool) -> Vec<bool> {
         profile: &crate::acp::agent_profiles::GEMINI,
         expected_agent: ExpectedAgent::Gemini,
         proxy: None,
+        adapter_compat: None,
         source_profile: None,
         default_effort: None,
         default_model_config: Default::default(),
@@ -436,6 +438,7 @@ async fn spawn_fake_connection_inner(
         ready_tx,
         profile: &crate::acp::agent_profiles::GEMINI,
         expected_agent: ExpectedAgent::Gemini,
+        adapter_compat: proxy.as_ref().map(|proxy| proxy.adapter.clone()),
         proxy,
         source_profile: None,
         default_effort: None,
@@ -1043,6 +1046,7 @@ async fn child_cancel_targets_the_child_and_requires_the_capability() {
         profile: &crate::acp::agent_profiles::CLAUDE,
         expected_agent: ExpectedAgent::Gemini,
         proxy: None,
+        adapter_compat: None,
         source_profile: None,
         default_effort: None,
         default_mode: None,
@@ -1186,6 +1190,7 @@ async fn reset_waits_for_a_running_subagent() {
         profile: &crate::acp::agent_profiles::CLAUDE,
         expected_agent: ExpectedAgent::Gemini,
         proxy: None,
+        adapter_compat: None,
         source_profile: None,
         default_effort: None,
         default_mode: None,
@@ -1352,6 +1357,7 @@ fn proxy_spec(compat: ProxyCompat) -> ProxySpec {
         failure_policy: ProxyFailurePolicy::Refuse,
         display_name: "P".into(),
         compat,
+        adapter: Default::default(),
     }
 }
 

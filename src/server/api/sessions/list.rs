@@ -49,6 +49,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         .collect();
     let mut resume_configs: std::collections::HashMap<String, crate::session::ResumeProfileConfig> =
         std::collections::HashMap::new();
+    let acp_registry = crate::acp::AgentRegistry::with_defaults();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
         .copied()
@@ -84,12 +85,12 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 .cloned()
                 .unwrap_or((crate::daemon::AcpWorkerState::Absent, None));
             let mut session = session_response_from_instance_with_plan(
+                &acp_registry,
                 inst,
                 &probes,
                 plan_summary,
                 acp_worker_state,
-                next_wakeup_at,
-                next_wakeup_reason,
+                (next_wakeup_at, next_wakeup_reason),
                 active_monitor,
             );
             session.acp_worker_start = acp_worker_start;
@@ -133,7 +134,6 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     let mut session_cfg_cache =
         SessionCfgCache::new(&mut session_cfg_store, &state.list_sessions_resolver_misses);
     let mut project_override_cache = ProjectRegistryCache::new();
-    let acp_registry = crate::acp::AgentRegistry::with_defaults();
     let worker_agent_keys = state
         .acp_supervisor
         .worker_agent_keys(
@@ -160,7 +160,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 .as_deref()
                 .filter(|name| !name.is_empty())
                 .unwrap_or(&inst.tool);
-            resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
+            resp.acp_capable = custom_agent_acp_capable(&acp_registry, cfg, agent_key);
             resp.acp_can_fork =
                 crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
         }

@@ -82,6 +82,7 @@ async fn list_with_spec(
         artifact_dir: None,
         proxy: None,
         degraded: None,
+        adapter_compat: None,
         claude_store_pin: None,
         base_host_environment,
     };
@@ -116,6 +117,7 @@ done
             args: vec![script.to_string_lossy().into_owned()],
             description: "list env stub".into(),
             env_allowlist: None,
+            plugin_env: None,
         };
         let cfg = crate::session::Config {
             environment: vec![

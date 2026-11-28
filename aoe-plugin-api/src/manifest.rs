@@ -1004,6 +1004,178 @@ fn validate_agent_trust(
     }
 }
 
+const ACP_ID_MAX: usize = 64;
+const ACP_NAME_LIST_MAX: usize = 64;
+
+fn acp_id_ok(id: &str) -> bool {
+    (1..=ACP_ID_MAX).contains(&id.len())
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
+}
+
+fn acp_env_name_ok(name: &str) -> bool {
+    name.len() <= 128
+        && crate::agent_integration::valid_env_key(name)
+        && !crate::agent_integration::acp_env_denied(name)
+}
+
+/// An npm package name: an optional `@scope/` then a nonblank name.
+fn acp_package_name_ok(package: &str) -> bool {
+    let name = match package.strip_prefix('@') {
+        Some(scoped) => match scoped.split_once('/') {
+            Some((scope, name)) if !scope.is_empty() => name,
+            _ => return false,
+        },
+        None => package,
+    };
+    !name.is_empty() && !name.contains('/') && !package.contains(char::is_whitespace)
+}
+
+/// A release asset or target name: one nonblank segment of printable characters.
+fn acp_asset_name_ok(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && !name.contains(['/', '\\'])
+        && name
+            .chars()
+            .all(|c| !c.is_whitespace() && declaration_character_ok(c))
+}
+
+fn validate_acp_declaration(
+    i: usize,
+    acp: &crate::agent_integration::AcpDeclaration,
+    check: &mut impl FnMut(bool, String),
+) {
+    use crate::agent_integration::{
+        ACP_PRIMITIVE_SCHEMA_VERSION, ACP_PROXY_PROTOCOL_VERSION, ACP_STEERING_CAPABILITY,
+        AGENT_DISPLAY_NAME_MAX,
+    };
+    let at = format!("agent_integrations[{i}].acp");
+    check(
+        acp_id_ok(&acp.id),
+        format!("{at}.id must be 1..={ACP_ID_MAX} lowercase letters, digits, `-` or `_`"),
+    );
+    let mut seen = std::collections::HashSet::new();
+    for alias in &acp.aliases {
+        check(
+            acp_id_ok(alias) && *alias != acp.id && seen.insert(alias.as_str()),
+            format!("{at}.aliases entry {alias:?} must be a valid id that is unique and differs from id"),
+        );
+    }
+    check(
+        acp.aliases.len() <= ACP_NAME_LIST_MAX,
+        format!("{at}.aliases must have at most {ACP_NAME_LIST_MAX} entries"),
+    );
+    let name = &acp.display_name;
+    check(
+        !name.is_empty()
+            && name.chars().count() <= AGENT_DISPLAY_NAME_MAX
+            && name.trim() == name
+            && name.chars().all(declaration_character_ok),
+        format!(
+            "{at}.display_name must be 1..={AGENT_DISPLAY_NAME_MAX} printable characters without surrounding whitespace"
+        ),
+    );
+    check(
+        declaration_rel_path_ok(&acp.proxy.command),
+        format!("{at}.proxy.command must be a plugin-relative path without `..`"),
+    );
+    check(
+        acp.proxy.protocol_version == ACP_PROXY_PROTOCOL_VERSION,
+        format!("{at}.proxy.protocol_version must be {ACP_PROXY_PROTOCOL_VERSION}"),
+    );
+    check(
+        acp.proxy.primitive_schema_version == ACP_PRIMITIVE_SCHEMA_VERSION,
+        format!("{at}.proxy.primitive_schema_version must be {ACP_PRIMITIVE_SCHEMA_VERSION}"),
+    );
+    if let Some(adapter) = &acp.adapter {
+        check(
+            acp_package_name_ok(&adapter.upstream_package)
+                && adapter.upstream_package.len() <= 214
+                && adapter
+                    .upstream_package
+                    .chars()
+                    .all(declaration_character_ok),
+            format!(
+                "{at}.adapter.upstream_package must be a package name like `name` or `@scope/name`"
+            ),
+        );
+        check(
+            semver::Version::parse(&adapter.upstream_pin).is_ok(),
+            format!("{at}.adapter.upstream_pin must be an exact semver version, not a range"),
+        );
+        check(
+            declaration_rel_path_ok(&adapter.package_dir),
+            format!("{at}.adapter.package_dir must be a plugin-relative path without `..`"),
+        );
+        if let Some(binary) = &adapter.binary {
+            check(
+                !binary.assets.is_empty()
+                    && binary.assets.iter().all(|(target, asset)| {
+                        acp_asset_name_ok(target) && acp_asset_name_ok(asset)
+                    }),
+                format!(
+                    "{at}.adapter.binary.assets must map target triples to nonblank asset names"
+                ),
+            );
+        }
+    }
+    let allowlist = &acp.env.allowlist;
+    check(
+        allowlist.len() <= ACP_NAME_LIST_MAX && allowlist.iter().all(|n| acp_env_name_ok(n)),
+        format!(
+            "{at}.env.allowlist must hold at most {ACP_NAME_LIST_MAX} exact variable names like EXAMPLE_API_KEY, none that the host reserves"
+        ),
+    );
+    check(
+        acp.env.host_only.iter().all(|n| allowlist.contains(n)),
+        format!("{at}.env.host_only must be a subset of env.allowlist"),
+    );
+    check(
+        acp.env.defaults.len() <= ACP_NAME_LIST_MAX
+            && acp
+                .env
+                .defaults
+                .iter()
+                .all(|(k, v)| acp_env_name_ok(k) && declaration_value_ok(v)),
+        format!("{at}.env.defaults must map valid variable names to printable values"),
+    );
+    if let Some(compat) = &acp.compat {
+        check(
+            compat.expected_agent_name.as_deref().is_none_or(|n| {
+                !n.trim().is_empty() && n.len() <= 128 && n.chars().all(declaration_character_ok)
+            }),
+            format!("{at}.compat.expected_agent_name must be nonblank"),
+        );
+        let versions = compat
+            .min_version
+            .iter()
+            .chain(compat.capability_min_versions.values());
+        check(
+            versions
+                .into_iter()
+                .all(|v| semver::Version::parse(v).is_ok())
+                && compat.capability_min_versions.keys().all(|k| k == ACP_STEERING_CAPABILITY),
+            format!(
+                "{at}.compat versions must be semver versions and the only capability_min_versions key is `{ACP_STEERING_CAPABILITY}`"
+            ),
+        );
+    }
+    let mut modes = std::collections::HashSet::new();
+    for mode in &acp.profile.modes {
+        check(
+            !mode.id.is_empty()
+                && mode.id.len() <= 128
+                && mode.id.chars().all(declaration_character_ok)
+                && modes.insert(mode.id.as_str()),
+            format!(
+                "{at}.profile.modes id {:?} must be nonempty and unique",
+                mode.id
+            ),
+        );
+    }
+}
+
 fn validate_agent_declaration(
     i: usize,
     integration: &crate::agent_integration::AgentIntegrationContribution,
@@ -1645,6 +1817,21 @@ impl PluginManifest {
                     self.api_version >= 29 || !declared,
                     format!("agent_integrations[{i}].{field} requires api_version >= 29"),
                 );
+            }
+            if let Some(acp) = &integration.acp {
+                check(
+                    self.api_version >= 30,
+                    format!("agent_integrations[{i}].acp requires api_version >= 30"),
+                );
+                check(
+                    self.capabilities
+                        .iter()
+                        .any(|capability| capability.as_str() == "acp.agent.provide"),
+                    format!(
+                        "agent_integrations[{i}].acp requires the acp.agent.provide capability"
+                    ),
+                );
+                validate_acp_declaration(i, acp, &mut check);
             }
             for (table, declared) in [
                 ("hooks", integration.hooks.is_some()),

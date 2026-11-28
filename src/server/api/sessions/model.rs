@@ -9,12 +9,12 @@ use crate::time::Timestamp;
 /// Convert session facts without runtime snapshots.
 pub(crate) fn session_response_from_instance(inst: &Instance) -> SessionResponse {
     let mut response = session_response_from_instance_with_plan(
+        &crate::acp::AgentRegistry::with_defaults(),
         inst,
         &crate::json_probe::Memo::default(),
         None,
         crate::daemon::AcpWorkerState::Absent,
-        None,
-        None,
+        (None, None),
         None,
     );
     response.context_resume = Some(context_resume_for(inst));
@@ -23,12 +23,12 @@ pub(crate) fn session_response_from_instance(inst: &Instance) -> SessionResponse
 
 /// Convert backend session facts with the request's plan and runtime snapshots.
 pub(super) fn session_response_from_instance_with_plan(
+    registry: &crate::acp::AgentRegistry,
     inst: &Instance,
     probes: &crate::json_probe::Memo,
     plan_summary: Option<PlanSummary>,
     acp_worker_state: crate::daemon::AcpWorkerState,
-    next_wakeup_at: Option<String>,
-    next_wakeup_reason: Option<String>,
+    (next_wakeup_at, next_wakeup_reason): (Option<String>, Option<String>),
     // `Some(description)` when the session has an armed `Monitor`, `None`
     // otherwise, mirroring `EventStore::latest_active_monitor`.
     active_monitor: Option<Option<String>>,
@@ -157,16 +157,15 @@ pub(super) fn session_response_from_instance_with_plan(
         queued_count: inst.queued_prompts.len(),
         // Overlaid in list_sessions; single-session responses omit it.
         queue_reason: None,
-        // Built-in ACP capability resolves here from a process-wide
-        // registry (no IO). Custom agents depend on profile config, which
-        // the list and create handlers overlay without a per-row read.
+        // Registry ACP capability (built-in or plugin) resolves here. Custom agents depend
+        // on profile config, which the list and create handlers overlay without a per-row read.
         acp_capable: {
             let resolved = inst
                 .agent_name
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(inst.tool.as_str());
-            builtin_acp_registry().get(resolved).is_some()
+            registry.get(resolved).is_some()
         },
         acp_session_id: inst.acp_session_id.clone(),
         import_pending: inst.import_pending == Some(true),
@@ -359,19 +358,12 @@ pub(super) fn context_resume_with<'a>(
     }
 }
 
-/// Process-wide built-in ACP registry, built once. Used to compute
-/// `SessionResponse.acp_capable` for built-in agents without allocating
-/// a registry per response row.
-fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
-    static REG: std::sync::OnceLock<crate::acp::AgentRegistry> = std::sync::OnceLock::new();
-    REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
-}
-
 /// True iff this custom agent can run in structured view: it declares a valid
 /// `agent_acp_cmd`, or it inherits a registry-backed base via
 /// `agent_detect_as`. Built-in capability is handled separately in the
 /// constructor, so this only covers the custom case.
 pub(super) fn custom_agent_acp_capable(
+    registry: &crate::acp::AgentRegistry,
     session: &crate::session::config::SessionConfig,
     tool: &str,
 ) -> bool {
@@ -379,7 +371,9 @@ pub(super) fn custom_agent_acp_capable(
         .agent_acp_cmd
         .get(tool)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
-        || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
+        || registry
+            .inherited_base(tool, &session.agent_detect_as)
+            .is_some()
 }
 
 /// Read `path` once per request, so an input many entries share costs one read.

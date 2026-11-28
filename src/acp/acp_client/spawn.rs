@@ -1,7 +1,7 @@
 //! `SpawnConfig` and agent subprocess spawning, including the environment
 //! filter that decides which host variables the agent sees.
 
-use crate::acp::agent_compat::ProxyCompat;
+use crate::acp::agent_compat::{DeclaredCompat, ProxyCompat};
 use crate::acp::agent_registry::AgentSpec;
 use crate::session::SandboxInfo;
 use agent_client_protocol::v1::schema::McpServer;
@@ -31,6 +31,10 @@ pub struct ProxySpec {
     pub failure_policy: ProxyFailurePolicy,
     pub display_name: String,
     pub compat: ProxyCompat,
+    /// Holds the adapter behind the proxy to its plugin's declared compat in place of the
+    /// `ExpectedAgent` policy.
+    #[serde(default)]
+    pub adapter: DeclaredCompat,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +112,9 @@ pub struct SpawnConfig {
     pub mcp_credentials: crate::acp::mcp_rewrite::McpCredentialEnv,
     /// Runner launches only; the in-proc stdio spawn never uses a proxy.
     pub proxy: Option<ProxySpec>,
+    /// The compat the plugin declared for the adapter. It outlives a `NeutralBoot` fallback
+    /// that drops `proxy`, so a raw relaunch is still held to the declared floors.
+    pub adapter_compat: Option<crate::acp::agent_compat::DeclaredCompat>,
     /// Display name of the proxy a `NeutralBoot` fallback dropped: the adapter
     /// runs raw under the neutral profile.
     pub degraded: Option<String>,
@@ -125,7 +132,7 @@ impl SpawnConfig {
 
 /// Request-sourced keys may not redirect infrastructure the operator env
 /// controls or hook the dynamic linker. Provider auth keys are allowed.
-pub(super) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
+pub(crate) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
     const INFRA_KEYS: &[&str] = &["PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM"];
     if key.is_empty() {
         Some("empty key")
@@ -190,18 +197,20 @@ pub(super) fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, Str
 }
 
 /// Path-valued allowlist entries: valid on the host, meaningless in a
-/// container. A path-valued key added to `env_allowlist_for` belongs here.
-pub(super) fn is_host_only_path_env(key: &str) -> bool {
-    matches!(
-        key,
-        "CLAUDE_CONFIG_DIR"
-            | "CODEX_HOME"
-            | "GOOGLE_APPLICATION_CREDENTIALS"
-            | "AWS_CONFIG_FILE"
-            | "AWS_SHARED_CREDENTIALS_FILE"
-            | "AWS_WEB_IDENTITY_TOKEN_FILE"
-            | "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
-    )
+/// container. A path-valued key added to `env_allowlist_for` belongs here, as does
+/// any key a plugin declared `host_only` (`declared`).
+pub(super) fn is_host_only_path_env(key: &str, declared: &[String]) -> bool {
+    declared.iter().any(|k| k == key)
+        || matches!(
+            key,
+            "CLAUDE_CONFIG_DIR"
+                | "CODEX_HOME"
+                | "GOOGLE_APPLICATION_CREDENTIALS"
+                | "AWS_CONFIG_FILE"
+                | "AWS_SHARED_CREDENTIALS_FILE"
+                | "AWS_WEB_IDENTITY_TOKEN_FILE"
+                | "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
+        )
 }
 
 /// The adapter's `env_allowlist` (#3238) resolved against the live env, with
@@ -228,10 +237,17 @@ pub(super) fn allowlisted_env_pairs_for(allowlist: Option<&[String]>) -> Vec<(St
     pairs
 }
 
-/// AoE's own adapter defaults, applied below every explicit env layer so a
-/// user-set value always wins.
-pub(super) fn adapter_default_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
-    crate::acp::agent_compat::ExpectedAgent::from_command(&config.spec.command)
+/// AoE's own adapter defaults, or a plugin's declared ones, applied below every explicit
+/// env layer so a user-set value always wins.
+pub(super) fn adapter_default_env_pairs(spec: &AgentSpec) -> Vec<(String, String)> {
+    if let Some(env) = &spec.plugin_env {
+        return env
+            .defaults
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+    }
+    crate::acp::agent_compat::ExpectedAgent::from_command(&spec.command)
         .default_env()
         .iter()
         .map(|&(key, value)| (key.to_string(), value.to_string()))
@@ -257,7 +273,7 @@ pub(super) fn apply_env_filter(
     extra_path_dirs: &[PathBuf],
 ) -> EnvKeys {
     let mut keys = EnvKeys::default();
-    for (key, value) in adapter_default_env_pairs(config) {
+    for (key, value) in adapter_default_env_pairs(&config.spec) {
         cmd.env(&key, value);
         keys.forwarded.push(key);
     }
@@ -973,6 +989,41 @@ mod tests {
             }
         }
     }
+    /// A plugin row takes its allowlist and defaults from its declaration: a host value
+    /// beats a default, a host-only key still applies on the host, and the built-in adapter
+    /// defaults are not guessed from the command name.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_filter_applies_a_plugin_env_declaration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("ZZ_TOKEN", "host-token"),
+            ("ZZ_HOME", "/host/zz"),
+            ("ZZ_UNLISTED", "leak"),
+        ]);
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.command = "claude-agent-acp".into();
+        config.spec.env_allowlist = Some(vec!["ZZ_TOKEN".into(), "ZZ_HOME".into()]);
+        config.spec.plugin_env = Some(aoe_plugin_api::agent_integration::AcpEnv {
+            allowlist: vec!["ZZ_TOKEN".into(), "ZZ_HOME".into()],
+            host_only: vec!["ZZ_HOME".into()],
+            defaults: [
+                ("ZZ_TOKEN".to_string(), "default-token".to_string()),
+                ("ZZ_REGION".to_string(), "eu".to_string()),
+            ]
+            .into(),
+        });
+
+        let applied = applied_env(&config);
+        let get = |key: &str| applied.get(key).map(String::as_str);
+        assert_eq!(get("ZZ_TOKEN"), Some("host-token"));
+        assert_eq!(get("ZZ_REGION"), Some("eu"));
+        assert_eq!(get("ZZ_HOME"), Some("/host/zz"));
+        assert_eq!(get("ZZ_UNLISTED"), None);
+        assert_eq!(get("CLAUDE_CODE_THINKING_DISPLAY"), None);
+    }
+
     #[test]
     #[serial_test::serial]
     fn unpinned_claude_allowlist_preserves_an_operator_store() {

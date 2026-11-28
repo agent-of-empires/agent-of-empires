@@ -161,6 +161,51 @@ impl ProxyCompat {
     }
 }
 
+/// Capability key in `acp.compat.capability_min_versions` that floors `_session/steering`.
+pub const STEERING_CAPABILITY: &str = aoe_plugin_api::agent_integration::ACP_STEERING_CAPABILITY;
+
+/// The compat a plugin declared for its adapter. It replaces the `ExpectedAgent` policy of a
+/// proxied launch, so an adapter is never judged by a guess from its command name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeclaredCompat {
+    pub expected_agent_name: Option<String>,
+    pub min_version: Option<semver::Version>,
+    pub steering_min_version: Option<semver::Version>,
+}
+
+impl DeclaredCompat {
+    pub fn from_declared(
+        compat: Option<&aoe_plugin_api::agent_integration::AcpCompat>,
+    ) -> Result<Self, String> {
+        let Some(compat) = compat else {
+            return Ok(Self::default());
+        };
+        let parse = |raw: &str| {
+            semver::Version::parse(raw).map_err(|e| format!("compat version {raw:?}: {e}"))
+        };
+        Ok(Self {
+            expected_agent_name: compat.expected_agent_name.clone(),
+            min_version: compat.min_version.as_deref().map(parse).transpose()?,
+            steering_min_version: compat
+                .capability_min_versions
+                .get(STEERING_CAPABILITY)
+                .map(|raw| parse(raw))
+                .transpose()?,
+        })
+    }
+
+    /// The hello check that holds a launched proxy to the same name and version floor.
+    pub fn proxy_compat(&self) -> ProxyCompat {
+        ProxyCompat {
+            agent_names: self.expected_agent_name.iter().cloned().collect(),
+            version_req: self.min_version.as_ref().map(|min| {
+                semver::VersionReq::parse(&format!(">={min}"))
+                    .expect("a semver version renders as a valid requirement")
+            }),
+        }
+    }
+}
+
 /// Why aoe refuses a session after a successful `initialize`; the same
 /// shape the structured view event carries.
 pub type StartupError = StartupErrorDetail;
@@ -316,17 +361,95 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
     Ok(())
 }
 
-/// Whether AoE may steer this agent's running turn via the
-/// `_session/steering` extension request.
-pub fn supports_steering(expected: ExpectedAgent, init: &InitializeResponse) -> bool {
-    let advertised = init
-        .meta
+/// [`validate`] for a plugin adapter, against the compat its plugin declared. A declared
+/// `min_version` refuses an adapter that reports no `agent_info` or an empty version.
+pub fn validate_declared(
+    compat: &DeclaredCompat,
+    init: &InitializeResponse,
+) -> Result<(), StartupError> {
+    if init.protocol_version != ProtocolVersion::V1 {
+        return Err(StartupError::UnsupportedProtocolVersion {
+            expected: format!("{:?}", ProtocolVersion::V1),
+            received: format!("{:?}", init.protocol_version),
+        });
+    }
+    let install_command = "(see the plugin's documentation)".to_string();
+    let unparseable = |package_name: String, raw_version: String, required: &semver::Version| {
+        StartupError::UnparseableAgentVersion {
+            package_name,
+            raw_version,
+            required: required.to_string(),
+            install_command: install_command.clone(),
+            auto_install: false,
+        }
+    };
+    let Some(info) = init.agent_info.as_ref() else {
+        return match compat.min_version.as_ref() {
+            Some(min) => Err(unparseable(
+                compat.expected_agent_name.clone().unwrap_or_default(),
+                String::new(),
+                min,
+            )),
+            None => Ok(()),
+        };
+    };
+    if let Some(expected) = compat.expected_agent_name.as_ref() {
+        if info.name != *expected {
+            return Err(StartupError::MismatchedAgentName {
+                expected: expected.clone(),
+                received: info.name.clone(),
+                install_command,
+                auto_install: false,
+            });
+        }
+    }
+    let Some(min) = compat.min_version.as_ref() else {
+        return Ok(());
+    };
+    let raw = info.version.trim();
+    let Ok(parsed) = semver::Version::parse(raw) else {
+        return Err(unparseable(info.name.clone(), raw.to_string(), min));
+    };
+    if parsed < *min {
+        return Err(StartupError::IncompatibleAgentVersion {
+            package_name: info.name.clone(),
+            installed: parsed.to_string(),
+            required: min.to_string(),
+            install_command,
+            auto_install: false,
+        });
+    }
+    Ok(())
+}
+
+fn steering_advertised(init: &InitializeResponse) -> bool {
+    init.meta
         .as_ref()
         .and_then(|meta| meta.get("steering"))
         .and_then(|steering| steering.get("supported"))
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if !advertised {
+        .unwrap_or(false)
+}
+
+/// [`supports_steering`] for a plugin adapter: advertised, and at or above the declared
+/// `steering` floor when there is one.
+pub fn supports_steering_declared(compat: &DeclaredCompat, init: &InitializeResponse) -> bool {
+    if !steering_advertised(init) {
+        return false;
+    }
+    let Some(floor) = compat.steering_min_version.as_ref() else {
+        return true;
+    };
+    init.agent_info
+        .as_ref()
+        .and_then(|info| semver::Version::parse(info.version.trim()).ok())
+        .is_some_and(|version| version >= *floor)
+}
+
+/// Whether AoE may steer this agent's running turn via the
+/// `_session/steering` extension request.
+pub fn supports_steering(expected: ExpectedAgent, init: &InitializeResponse) -> bool {
+    if !steering_advertised(init) {
         return false;
     }
     if expected != ExpectedAgent::ClaudeAgentAcp {
@@ -417,6 +540,138 @@ mod tests {
             .unwrap_or_else(|| panic!("no {key:?} after {anchor:?}"));
         let raw = tail.split('"').next().expect("unterminated string");
         semver::Version::parse(raw).unwrap_or_else(|e| panic!("{raw:?} is not semver: {e}"))
+    }
+
+    fn declared(name: Option<&str>, min: Option<&str>, steering: Option<&str>) -> DeclaredCompat {
+        DeclaredCompat::from_declared(Some(&aoe_plugin_api::agent_integration::AcpCompat {
+            expected_agent_name: name.map(str::to_string),
+            min_version: min.map(str::to_string),
+            capability_min_versions: steering
+                .into_iter()
+                .map(|v| (STEERING_CAPABILITY.to_string(), v.to_string()))
+                .collect(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn declared_compat_gates_a_plugin_adapter_instead_of_the_command_policy() {
+        let compat = declared(Some("acme-adapter"), Some("2.0.0"), None);
+        // (reported name and version, expected error kind or None for accepted)
+        let cases: [(Option<(&str, &str)>, Option<&str>); 7] = [
+            (Some(("acme-adapter", "2.0.0")), None),
+            (Some(("acme-adapter", "3.1.0")), None),
+            (
+                Some(("acme-adapter", "1.9.9")),
+                Some("incompatible_agent_version"),
+            ),
+            (
+                Some(("acme-adapter", "nope")),
+                Some("unparseable_agent_version"),
+            ),
+            (Some(("other", "2.0.0")), Some("mismatched_agent_name")),
+            (
+                Some(("acme-adapter", "")),
+                Some("unparseable_agent_version"),
+            ),
+            (None, Some("unparseable_agent_version")),
+        ];
+        for (info, want) in cases {
+            let got = validate_declared(&compat, &init(info)).err();
+            assert_eq!(got.as_ref().map(|e| e.kind()), want, "{info:?}");
+        }
+        // Without a declared floor, a missing or empty version passes.
+        let unfloored = declared(Some("acme-adapter"), None, None);
+        for info in [Some(("acme-adapter", "")), None] {
+            assert!(
+                validate_declared(&unfloored, &init(info)).is_ok(),
+                "{info:?}"
+            );
+        }
+        // No declared compat means no name or version requirement, whatever the command.
+        let open = DeclaredCompat::from_declared(None).unwrap();
+        assert!(validate_declared(&open, &init(Some((CLAUDE, "0.0.0")))).is_ok());
+        let mut old_protocol = init(None);
+        old_protocol.protocol_version = ProtocolVersion::V0;
+        assert_eq!(
+            validate_declared(&open, &old_protocol).unwrap_err().kind(),
+            "unsupported_protocol_version"
+        );
+        assert!(DeclaredCompat::from_declared(Some(
+            &aoe_plugin_api::agent_integration::AcpCompat {
+                expected_agent_name: None,
+                min_version: Some("^1".into()),
+                capability_min_versions: Default::default(),
+            }
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn declared_steering_floor_needs_the_advert_and_the_floor() {
+        let with_meta = |supported: bool, version: Option<&str>| {
+            let init = init(version.map(|v| ("acme-adapter", v)));
+            init.meta(
+                serde_json::json!({ "steering": { "supported": supported } })
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            )
+        };
+        let floored = declared(None, None, Some("2.1.0"));
+        let unfloored = declared(None, None, None);
+        // (compat, advertised, version, expected)
+        let cases = [
+            (&floored, true, Some("2.1.0"), true),
+            (&floored, true, Some("2.0.9"), false),
+            (&floored, true, Some("not-semver"), false),
+            (&floored, true, None, false),
+            (&floored, false, Some("9.0.0"), false),
+            (&unfloored, true, None, true),
+            (&unfloored, false, None, false),
+        ];
+        for (compat, advertised, version, want) in cases {
+            assert_eq!(
+                supports_steering_declared(compat, &with_meta(advertised, version)),
+                want,
+                "{compat:?} {advertised} {version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_compat_feeds_the_proxy_hello_check() {
+        let compat = declared(Some("acme-adapter"), Some("2.0.0"), None).proxy_compat();
+        assert_eq!(compat.agent_names, ["acme-adapter"]);
+        assert_eq!(compat.version_req.unwrap().to_string(), ">=2.0.0");
+        assert_eq!(
+            DeclaredCompat::default().proxy_compat(),
+            ProxyCompat::default()
+        );
+    }
+
+    /// The built-in floors stay the policy of an unproxied launch.
+    #[test]
+    fn builtin_version_gates_keep_their_floors() {
+        let gates: Vec<_> = version_gates()
+            .map(|g| (g.binary, g.package_name, g.min_version))
+            .collect();
+        assert_eq!(
+            gates,
+            [
+                ("claude-agent-acp", CLAUDE, "0.103.0"),
+                ("opencode", "OpenCode", "1.16.0"),
+            ]
+        );
+        assert!(supports_steering(
+            ExpectedAgent::CodexAcp,
+            &init(None).meta(
+                serde_json::json!({ "steering": { "supported": true } })
+                    .as_object()
+                    .cloned()
+                    .unwrap()
+            )
+        ));
     }
 
     #[test]

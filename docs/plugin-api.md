@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `29`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `30`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 29
+api_version = 30
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `29`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `30`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
@@ -38,7 +38,7 @@ capabilities = ["runtime.worker"]
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 23` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, the session-id capture extension requires API 22, and the `hooks` and `trust` tables require API 28, `display_name` and `icon` require API 29, each with a host implementing them. Provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, the session-id capture extension requires API 22, and the `hooks` and `trust` tables require API 28, `display_name` and `icon` require API 29, and the `acp` table requires API 30 and `acp.agent.provide`, each with a host implementing them. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
@@ -139,6 +139,59 @@ For reply-enabled integrations, the provider report's `reply_keys` must contain 
 
 `display_name` and `icon` on an `[[agent_integrations]]` entry name the agent in pickers, `/api/agents`, the no-agents hint and web push titles; both require `api_version >= 29`. `display_name` is 1 to 40 printable characters without surrounding whitespace and defaults to `tool`. `icon` is a lucide kebab-case icon name. A plugin that takes over a bundled fallback shows "Replaces bundled <name> support" in its approval and update previews.
 
+### ACP agent contribution (API 30)
+
+An `[[agent_integrations]]` entry may carry an `acp` table that supplies the agent's ACP adapter, launched behind a plugin proxy (see [ACP proxies](#acp-proxies)). It requires `api_version >= 30` and the `acp.agent.provide` capability. The host resolves the table into its ACP agent registry; the plugin supplies data and the proxy executable.
+
+```toml
+[agent_integrations.acp]
+id = "example-acp"
+aliases = ["example"]
+display_name = "Example"
+failure_policy = "neutral_boot"
+
+[agent_integrations.acp.proxy]
+command = "bin/example-proxy"
+protocol_version = 1
+primitive_schema_version = 1
+
+[agent_integrations.acp.adapter]
+upstream_package = "@example/example-acp"
+upstream_pin = "2.1.0"
+package_dir = "adapter"
+
+[agent_integrations.acp.adapter.binary]
+digests = "sha256_asset"
+assets = { "aarch64-apple-darwin" = "example-acp-darwin-arm64" }
+
+[agent_integrations.acp.env]
+allowlist = ["EXAMPLE_API_KEY", "EXAMPLE_HOME"]
+host_only = ["EXAMPLE_HOME"]
+defaults = { EXAMPLE_REGION = "eu" }
+
+[agent_integrations.acp.compat]
+expected_agent_name = "@example/example-acp"
+min_version = "2.0.0"
+capability_min_versions = { steering = "2.1.0" }
+
+[[agent_integrations.acp.profile.modes]]
+id = "auto"
+approval_class = "unattended"
+```
+
+- `id` is 1 to 64 lowercase letters, digits, `-` or `_`. `aliases` hold at most 64 further ids, unique and distinct from `id`. `display_name` is 1 to 40 printable characters without surrounding whitespace. The agent is spawned for structured sessions of the entry's `tool`.
+- `proxy.command` is a plugin-relative path without `..`; the host resolves it with symlinks followed and refuses one that leaves the install directory. `protocol_version` and `primitive_schema_version` must both be `1`, what the host speaks.
+- `adapter` is optional. `upstream_package` is a package name (`name` or `@scope/name`). The host acts only on that name today: it launches the package's unscoped binary name behind the proxy. `upstream_pin` (an exact semver version, not a range) and `package_dir` (a plugin-relative path for the lockfile and install inputs) are validated metadata the host does not act on yet; installation lands in #5320. Without `adapter`, a plugin that takes over a bundled agent keeps that agent's adapter; any other plugin launches a command named like the tool.
+- `adapter.binary` is accepted metadata the host does not act on yet (installation lands in #5320). `assets` is a nonempty map from a Rust target triple, such as `aarch64-apple-darwin`, to a release asset name; neither contains whitespace, `/` or `\`. `digests` is `sha256_asset` (a `<asset>.sha256` file in the same release) or `release_api` (the digest the release API reports).
+- `env.allowlist` holds at most 64 exact variable names the host forwards to the adapter. `env.host_only` must be a subset of the allowlist and names variables kept out of sandboxed containers. `env.defaults` (at most 64) sets a value that applies to every launch of the adapter unless a higher layer sets the same variable. On the host, the layers over a default are the host variables core inherits (a graphical login's desktop and session variables, every variable its policy permits when `session.inherit_host_environment` is on, and `XDG_CONFIG_HOME` and `SSH_AUTH_SOCK`), then the host value of a variable in `allowlist`, then the session's provider environment. Any other host variable is not forwarded and does not displace the default. In a sandboxed container the order is the session's provider environment, then the allowlisted host value, then the default. The manifest refuses a name the host denies: `AOE_*`, `PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TERM`, `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `BASH_ENV`, `ENV`, `PYTHONPATH`, `PYTHONSTARTUP`, `GIT_SSH_COMMAND`, `SHELL` and `TMPDIR`. The host also drops names its provider-environment policy denies at resolution.
+- `compat` holds `expected_agent_name` (the `agentInfo.name` the adapter must report), `min_version` (the lowest accepted semver version), and `capability_min_versions`, a map from a capability name to the lowest version that offers it. `steering` is the only accepted key: it floors the adapter's `_session/steering` support, and any other key is refused. An adapter outside the compat is an invalid hello.
+- `profile.modes` lists adapter mode ids, each unique, with an `approval_class` of `interactive`, `guarded` or `unattended`. A declared class outranks the host's name-based classification of that mode.
+- `failure_policy` is `neutral_boot` (start the session on the neutral bundled boot) or `refuse` (fail the session) for when the proxy or adapter cannot start or fails its hello.
+
+A plugin that claims the same id, alias or tool as another plugin loses both, and a built-in id or alias always wins. The exception is a takeover: an `acp` table on a bundled fallback tool, such as `claude`, replaces that tool's built-in ACP agents, and only a plugin in the reserved `aoe.*` or `agent-of-empires.*` namespace may do it. For any other built-in tool name the table is ignored with a warning.
+
+The install and update previews list the id, aliases, proxy, adapter and pin, forwarded and default env (host-only marked), compat, modes and failure policy. A change to the `acp` table needs re-approval, as any other agent declaration does.
+
 ### Hooks and folder trust (API 28)
 
 `[agent_integrations.hooks]` and `[agent_integrations.trust]` let a declared agent get the status hooks and pre-trusted folders a built-in agent has. Both require `api_version >= 28` and a nonblank `command`; a manifest below 28 that declares either is rejected. The host runs its own installer and writer, so the plugin supplies data, never code. The approval prompt shows the declared paths as `~/...` or `$VAR/...` templates, without resolving a session `agent_config_dir`. `aoe hooks status` lists the resolved hooks files, and the resolved trust files that are written only when `session.pre_trust_agent_folders` is on.
@@ -193,7 +246,7 @@ Shell-hook sidecars and native-plugin reports remain distinct transports. Native
 
 ## ACP proxies
 
-A proxy is a per-session process between the runner and an ACP adapter; the wire contract is in [the primitive contract](development/internals/acp-primitive-contract.md). The manifest field that declares one is not available yet (#5319), so the declaration source, its failure policy and its compat are not exposed to plugins. What a proxy process must do once launched:
+A proxy is a per-session process between the runner and an ACP adapter; the wire contract is in [the primitive contract](development/internals/acp-primitive-contract.md). A plugin declares one with the [`acp` table](#acp-agent-contribution-api-30), whose `failure_policy` and `compat` apply to it. What a proxy process must do once launched:
 
 - It runs in the agent's process group as the direct child of the runner. Its argv is its declared args followed by the full adapter argv, including the `docker exec` wrapper for a sandboxed session. It must start that adapter argv unchanged as a child process in the same process group (no `setsid`, no daemonizing), relay the adapter's stdin and stdout, and stay running to add the hello and translate frames. It cannot `exec` into the adapter. The runner kills the group, which is how the adapter dies with it. If the runner is killed with SIGKILL, the adapter can be orphaned.
 - `AOE_PROXY_LAUNCH_CONFIG` holds the path of an owner-only JSON file, removed when the session ends: `{"version": 1, "session_id": "...", "container_id": "..." | null, "store_root": "..."}`. It holds no secrets. Strip the variable from the adapter's environment.
@@ -238,6 +291,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | `session.integration` | Provider-native status and user-requested replies for an agent (`api_version >= 19`). Launch-only agent metadata does not require this capability. |
 | `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 24`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
 | `mcp.serve` | Serving MCP servers from the plugin's worker (`api_version >= 26`, requires a `[runtime]` worker). Gives the plugin an authenticated per-session MCP endpoint, so it can answer tool calls an agent makes in that session; the worker never sees the credentials. A distinct, high-severity grant, never implied by another. |
+| `acp.agent.provide` | Supplying an agent's ACP adapter and proxy through an `[[agent_integrations]]` `acp` table (`api_version >= 30`). The proxy runs as the user and receives the declared environment variables. See [ACP agent contribution](#acp-agent-contribution-api-30). |
 
 A capability this host version does not recognize is rejected, not granted.
 

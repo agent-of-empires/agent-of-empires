@@ -326,6 +326,7 @@ mod attach {
             failure_policy: ProxyFailurePolicy::Refuse,
             display_name: "Fake".into(),
             compat: ProxyCompat::default(),
+            adapter: Default::default(),
         }
     }
 
@@ -362,6 +363,7 @@ mod attach {
             None,
             Some(proxy_spec()),
             false,
+            Some(proxy_spec().adapter),
         )
         .await
     }
@@ -580,6 +582,7 @@ async fn killing_the_proxy_mid_turn_loses_the_integration() {
             ],
             description: "fake proxy over the test shim".into(),
             env_allowlist: None,
+            plugin_env: None,
         },
         config_path: cwd.clone(),
         cwd,
@@ -612,6 +615,7 @@ async fn killing_the_proxy_mid_turn_loses_the_integration() {
         proxy: None,
         mcp_credentials: Default::default(),
         degraded: None,
+        adapter_compat: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,

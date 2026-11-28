@@ -5297,6 +5297,60 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     );
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_resolves_builtin_plugin_and_inherited_rows_from_one_registry() {
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _reload = crate::plugin::ReloadRegistryOnDrop;
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    crate::session::test_support::install_zeta_acp_plugin("");
+    crate::session::config::update_config(|c| {
+        c.session
+            .agent_detect_as
+            .insert("zeta-wrapper".into(), "zeta".into());
+    })
+    .unwrap();
+
+    let mk = |id: &str, tool: &str| {
+        let mut inst = Instance::new(id, &format!("/tmp/{id}"));
+        inst.id = id.to_string();
+        inst.tool = tool.to_string();
+        inst.source_profile = "default".to_string();
+        inst
+    };
+    let state = crate::server::test_support::build_test_app_state(vec![
+        mk("builtin", "claude"),
+        mk("plugin", "zeta"),
+        mk("wrapper", "zeta-wrapper"),
+        mk("unknown", "plain-tool"),
+    ]);
+    let response = list_sessions(
+        axum::extract::State(state),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&body).unwrap();
+    let capable: Vec<_> = envelope
+        .sessions
+        .iter()
+        .map(|s| (s.id.as_str(), s.acp_capable))
+        .collect();
+    assert_eq!(
+        capable,
+        [
+            ("builtin", true),
+            ("plugin", true),
+            ("wrapper", true),
+            ("unknown", false),
+        ]
+    );
+}
+
 /// The list advertises the solo commands of the agent that classifies the session's prompts:
 /// its worker's agent, else the one its next spawn picks.
 #[tokio::test]

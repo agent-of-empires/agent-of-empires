@@ -59,6 +59,9 @@ pub struct WorkerRecord {
     /// Display name of the proxy a `neutral_boot` fallback dropped; the adapter runs raw.
     #[serde(default)]
     pub degraded: Option<String>,
+    /// The compat the adapter was launched under, which a reattach judges it by again.
+    #[serde(default)]
+    pub adapter_compat: Option<crate::acp::agent_compat::DeclaredCompat>,
     pub scope: ScopeOwnership,
     pub started_at: u64,
     pub last_attached_at: Option<u64>,
@@ -99,6 +102,7 @@ impl WorkerRecord {
             generation: 0,
             proxy: None,
             degraded: None,
+            adapter_compat: None,
             scope: ScopeOwnership::Unscoped,
             started_at: now_secs(),
             last_attached_at: None,
