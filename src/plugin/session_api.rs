@@ -106,11 +106,11 @@ pub(crate) async fn dispatch(
     match method {
         "acp.capabilities.get" => {
             ctx.require(CAP_ACP_CAPABILITIES_READ)?;
-            capabilities_get().await
+            capabilities_get(&deps.profile).await
         }
         "acp.capabilities.probe" => {
             ctx.require(CAP_ACP_CAPABILITIES_PROBE)?;
-            capabilities_probe(params).await
+            capabilities_probe(&deps.profile, params).await
         }
         "sessions.create" => {
             ctx.require(CAP_SESSION_CREATE)?;
@@ -132,9 +132,10 @@ pub(crate) async fn dispatch(
 
 /// Merge the static agent registry with the last advertised option catalog
 /// into the stable public DTO. Pure reads; never launches an agent.
-async fn capabilities_get() -> Result<Value, DispatchError> {
+async fn capabilities_get(profile: &str) -> Result<Value, DispatchError> {
     let catalog = load_catalog().await;
-    let mut ids: Vec<String> = crate::acp::AgentRegistry::with_defaults()
+    let (registry, session) = registry_and_session(profile).await?;
+    let mut ids: Vec<String> = registry
         .list()
         .into_iter()
         .map(|(name, _)| name.clone())
@@ -171,7 +172,13 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
                         .map(|choice| AcpModeCapability {
                             id: choice.value.clone(),
                             display_name: choice.name.clone(),
-                            approval_class: match classify_mode(&id, Some(&choice.value), entry) {
+                            approval_class: match classify_mode(
+                                &id,
+                                Some(&choice.value),
+                                entry,
+                                &registry,
+                                &session,
+                            ) {
                                 ModeDecision::Class(class) => class,
                                 // Advertised modes always classify; fail
                                 // closed if that invariant ever breaks.
@@ -217,7 +224,7 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
 /// `acp.capabilities.get`. Each probe degrades to a no-op on failure, so a
 /// missing adapter or an agent that needs credentials the daemon lacks simply
 /// stays `Undiscovered` instead of erroring the whole call.
-async fn capabilities_probe(params: &Value) -> Result<Value, DispatchError> {
+async fn capabilities_probe(profile: &str, params: &Value) -> Result<Value, DispatchError> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct ProbeParams {
@@ -251,7 +258,7 @@ async fn capabilities_probe(params: &Value) -> Result<Value, DispatchError> {
         }
     }
 
-    capabilities_get().await
+    capabilities_get(profile).await
 }
 
 fn choices(
@@ -263,6 +270,28 @@ fn choices(
         .iter()
         .filter(move |opt| opt.category == category)
         .flat_map(|opt| opt.options.iter())
+}
+
+/// A fresh registry and the serving profile's session config, which together decide the
+/// adapter an agent name launches. Reads files, so off the runtime thread.
+async fn registry_and_session(
+    profile: &str,
+) -> Result<
+    (
+        crate::acp::AgentRegistry,
+        crate::session::config::SessionConfig,
+    ),
+    DispatchError,
+> {
+    let profile = profile.to_string();
+    tokio::task::spawn_blocking(move || {
+        (
+            crate::acp::AgentRegistry::with_defaults(),
+            crate::session::config::profile_config::resolve_config_or_warn(&profile).session,
+        )
+    })
+    .await
+    .map_err(|e| DispatchError::internal(format!("resolve profile config: {e}")))
 }
 
 async fn load_catalog() -> OptionCatalog {
@@ -316,10 +345,8 @@ async fn admit_and_create(
     let entry = catalog.agents.get(&req.agent_id);
 
     // Agent must be a registry agent or one the catalog has observed.
-    let known_agent = crate::acp::AgentRegistry::with_defaults()
-        .get(&req.agent_id)
-        .is_some()
-        || entry.is_some();
+    let (registry, session) = registry_and_session(&deps.profile).await?;
+    let known_agent = registry.get(&req.agent_id).is_some() || entry.is_some();
     if !known_agent {
         return Err(DispatchError::with_kind(
             codes::INVALID_PARAMS,
@@ -329,7 +356,13 @@ async fn admit_and_create(
     }
 
     // Host-side approval classification; the plugin cannot self-label.
-    let class = match classify_mode(&req.agent_id, req.mode_id.as_deref(), entry) {
+    let class = match classify_mode(
+        &req.agent_id,
+        req.mode_id.as_deref(),
+        entry,
+        &registry,
+        &session,
+    ) {
         ModeDecision::Class(class) => class,
         ModeDecision::UnknownMode => {
             return Err(DispatchError::with_kind(

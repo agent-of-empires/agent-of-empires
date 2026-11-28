@@ -293,6 +293,25 @@ impl AgentRegistry {
         self.get(base).map(|_| base.clone())
     }
 
+    /// The registry row whose adapter a spawn of `name` runs, by the precedence of
+    /// [`Self::resolve_spec`]; `None` when the user's own command or no row serves it.
+    pub(crate) fn launched_row(
+        &self,
+        name: &str,
+        session: &crate::session::config::SessionConfig,
+    ) -> Option<&ResolvedAcpAgent> {
+        if let Some(agent) = self.builtin_row(name) {
+            return Some(agent);
+        }
+        if session.agent_acp_cmd.contains_key(name) {
+            return None;
+        }
+        if let Some(base) = self.inherited_base(name, &session.agent_detect_as) {
+            return self.resolved(&base);
+        }
+        self.resolved(name)
+    }
+
     /// What a spawn of `name` runs. A built-in row wins, then the user's `agent_acp_cmd` and
     /// `agent_detect_as` base, then a plugin row, so a plugin never shadows a name the user
     /// configured. Only a row addressed by its own name brings its proxy.

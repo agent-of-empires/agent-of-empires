@@ -39,21 +39,20 @@ pub(crate) enum ModeDecision {
     CatalogNotDiscovered,
 }
 
+/// Classify `mode_id` for the adapter `registry` launches for `agent_key` under `session`.
+/// Declared modes count only when that adapter is a plugin's; a built-in or the user's own
+/// command declares none.
 pub(crate) fn classify_mode(
     agent_key: &str,
     mode_id: Option<&str>,
     catalog: Option<&AgentOptionEntry>,
+    registry: &crate::acp::AgentRegistry,
+    session: &crate::session::config::SessionConfig,
 ) -> ModeDecision {
-    // A reviewed agent is a built-in, which declares no modes.
-    let declared = (!crate::acp::agent_profiles::is_reviewed(agent_key))
-        .then(|| {
-            crate::acp::AgentRegistry::with_defaults()
-                .resolved(agent_key)
-                .map(|agent| agent.modes.clone())
-        })
-        .flatten()
-        .unwrap_or_default();
-    classify_mode_with(&declared, agent_key, mode_id, catalog)
+    let declared = registry
+        .launched_row(agent_key, session)
+        .map_or(&[][..], |agent| agent.modes.as_slice());
+    classify_mode_with(declared, agent_key, mode_id, catalog)
 }
 
 /// [`classify_mode`] given the modes the agent's plugin declared. A declared class outranks
@@ -284,6 +283,48 @@ mod tests {
         }
     }
 
+    fn registry_of(plugins: Vec<crate::plugin::LoadedPlugin>) -> crate::acp::AgentRegistry {
+        crate::acp::AgentRegistry::with_snapshot(&crate::plugin::PluginRegistry::from_test_plugins(
+            plugins,
+        ))
+    }
+
+    /// An approved plugin declaring ACP agent `id` for `tool`, with the given modes.
+    fn acp_plugin(
+        plugin_id: &str,
+        tool: &str,
+        id: &str,
+        modes: &str,
+        dir: &Path,
+    ) -> crate::plugin::LoadedPlugin {
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/proxy"), "").unwrap();
+        let manifest = format!(
+            "id = \"{plugin_id}\"\nname = \"Acp\"\nversion = \"1.0.0\"\napi_version = 30\n\
+             capabilities = [\"acp.agent.provide\"]\n\
+             [[agent_integrations]]\ntool = \"{tool}\"\n\
+             [agent_integrations.acp]\nid = \"{id}\"\ndisplay_name = \"Acp\"\n\
+             failure_policy = \"refuse\"\n\
+             [agent_integrations.acp.proxy]\ncommand = \"bin/proxy\"\n\
+             protocol_version = 1\nprimitive_schema_version = 1\n{modes}"
+        );
+        crate::plugin::LoadedPlugin {
+            manifest: toml::from_str(&manifest).unwrap(),
+            enabled: true,
+            trust: aoe_plugin_api::TrustLevel::Community,
+            validation: crate::plugin::registry::ValidationState::Local,
+            source: None,
+            dir: Some(dir.to_path_buf()),
+            manifest_hash: String::new(),
+            granted: true,
+        }
+    }
+
+    const DEFAULT_UNATTENDED: &str = "[[agent_integrations.acp.profile.modes]]\n\
+         id = \"default\"\napproval_class = \"unattended\"\n\
+         [[agent_integrations.acp.profile.modes]]\n\
+         id = \"yolo\"\napproval_class = \"interactive\"\n";
+
     #[test]
     fn mode_classification_table() {
         use ApprovalClass::*;
@@ -313,7 +354,13 @@ mod tests {
             ("shady-agent", Some("acceptEdits"), false, Class(Unattended)),
         ];
         for (agent, mode, discovered, expected) in cases {
-            let seen = classify_mode(agent, mode, discovered.then_some(&catalog));
+            let seen = classify_mode(
+                agent,
+                mode,
+                discovered.then_some(&catalog),
+                &registry_of(Vec::new()),
+                &Default::default(),
+            );
             assert_eq!(seen, expected, "{agent} {mode:?} discovered={discovered}");
         }
     }
@@ -379,11 +426,67 @@ mod tests {
             "[[agent_integrations.acp.profile.modes]]\nid = \"review\"\n\
              approval_class = \"guarded\"\n",
         );
-        assert_eq!(classify_mode("zeta", Some("review"), None), Class(Guarded));
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let session = Default::default();
         assert_eq!(
-            classify_mode("zeta", Some("other"), None),
+            classify_mode("zeta", Some("review"), None, &registry, &session),
+            Class(Guarded)
+        );
+        assert_eq!(
+            classify_mode("zeta", Some("other"), None, &registry, &session),
             CatalogNotDiscovered
         );
+    }
+
+    #[test]
+    fn an_approved_takeover_declares_the_modes_of_the_adapter_it_launches() {
+        use ApprovalClass::*;
+        use ModeDecision::*;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_of(vec![acp_plugin(
+            "aoe.takeover",
+            "claude",
+            "claude-next",
+            DEFAULT_UNATTENDED,
+            dir.path(),
+        )]);
+        let session = crate::session::config::SessionConfig::default();
+        let class = |agent, mode| classify_mode(agent, Some(mode), None, &registry, &session);
+        // The takeover declares `default` unattended; the plugin cannot soften `yolo`.
+        assert_eq!(class("claude", "default"), Class(Unattended));
+        assert_eq!(class("claude-code", "default"), Class(Unattended));
+        assert_eq!(class("claude", "yolo"), Class(Unattended));
+        assert_eq!(class("claude", "plan"), Class(Guarded));
+    }
+
+    #[test]
+    fn declared_modes_are_ignored_when_the_effective_adapter_is_not_the_plugins() {
+        use ApprovalClass::*;
+        use ModeDecision::*;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = registry_of(vec![acp_plugin(
+            "acme.zeta",
+            "zeta",
+            "zeta-acp",
+            "[[agent_integrations.acp.profile.modes]]\n\
+             id = \"review\"\napproval_class = \"interactive\"\n",
+            dir.path(),
+        )]);
+        let class = |session: &crate::session::config::SessionConfig| {
+            classify_mode("zeta", Some("review"), None, &registry, session)
+        };
+        assert_eq!(class(&Default::default()), Class(Interactive));
+        let own_command = crate::session::config::SessionConfig {
+            agent_acp_cmd: [("zeta".to_string(), "my-zeta".to_string())].into(),
+            ..Default::default()
+        };
+        let other_base = crate::session::config::SessionConfig {
+            agent_detect_as: [("zeta".to_string(), "claude".to_string())].into(),
+            ..Default::default()
+        };
+        // No declaration describes the launched adapter, so `review` is an unknown mode.
+        assert_eq!(class(&own_command), CatalogNotDiscovered);
+        assert_eq!(class(&other_base), CatalogNotDiscovered);
     }
 
     #[test]
