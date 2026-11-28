@@ -49,7 +49,9 @@ export function workspaceId(s: { project_path: string; branch: string | null; id
 
 export interface SidebarView {
   group_by: "project" | "group";
-  sort: "custom" | "name";
+  sort: "custom" | "newest" | "name";
+  changed_by?: "tui" | "web" | "cli";
+  web_plugin_sort?: string;
 }
 
 export interface SidebarMockHandle {
@@ -61,8 +63,12 @@ export interface SidebarMockHandle {
     direction: "up" | "down";
     siblings?: string[];
   }>;
-  /** `PATCH /api/sidebar-view` bodies, in arrival order. */
-  viewPatches: Array<Partial<SidebarView>>;
+  /** `PATCH /api/sidebar-view` bodies without their `client`, in arrival order. */
+  viewPatches: Array<Partial<SidebarView> & { web_plugin_sort?: string | null }>;
+  /** The `client` each of those patches named. */
+  viewClients: unknown[];
+  /** `POST /api/groups` bodies, in arrival order. */
+  groupCreates: Array<{ profile: string; path: string; sessions?: string[] }>;
   /** One-shot override for the next PUT's response. */
   nextPutResponse: { status?: number; body?: string } | null;
   readOnly: boolean;
@@ -92,6 +98,8 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
     puts: [],
     reorders: [],
     viewPatches: [],
+    viewClients: [],
+    groupCreates: [],
     nextPutResponse: null,
     readOnly: !!opts.readOnly,
     view: opts.view ?? { group_by: "project", sort: "custom" },
@@ -151,9 +159,17 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
     return r.fulfill({ headers: runtime(true), json: { status: "moved", destination: null } });
   });
   await page.route("**/api/sidebar-view", (r: Route) => {
-    const body = (r.request().postDataJSON() ?? {}) as Partial<SidebarView>;
+    const { client, ...body } = (r.request().postDataJSON() ?? {}) as SidebarMockHandle["viewPatches"][number] & {
+      client?: unknown;
+    };
     handle.viewPatches.push(body);
-    handle.view = { ...handle.view, ...body };
+    handle.viewClients.push(client);
+    const { web_plugin_sort, ...shared } = body;
+    const view: SidebarView = { ...handle.view, ...shared };
+    if (body.sort || body.group_by) view.changed_by = client as SidebarView["changed_by"];
+    if (web_plugin_sort) view.web_plugin_sort = web_plugin_sort;
+    else if (body.sort || web_plugin_sort === null) delete view.web_plugin_sort;
+    handle.view = view;
     return r.fulfill({ headers: runtime(true), json: handle.view });
   });
   await page.route("**/api/about", (r) =>
@@ -167,9 +183,17 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
       },
     }),
   );
-  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices"]) {
+  for (const path of ["settings", "themes", "agents", "profiles", "devices"]) {
     await page.route(`**/api/${path}`, (r) => r.fulfill({ json: [] }));
   }
+  // A created Group takes its Sessions, as the Daemon's one commit does.
+  await page.route("**/api/groups", (r) => {
+    if (r.request().method() !== "POST") return r.fulfill({ json: [] });
+    const body = r.request().postDataJSON() as SidebarMockHandle["groupCreates"][number];
+    handle.groupCreates.push(body);
+    for (const s of filled) if (body.sessions?.includes(s.id)) s.group = body.path;
+    return r.fulfill({ status: 201, headers: runtime(true), json: { ok: true } });
+  });
   await page.route("**/api/docker/status", (r) => r.fulfill({ json: {} }));
 
   return handle;

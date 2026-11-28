@@ -559,7 +559,7 @@ impl serde::Serialize for SessionsView {
             sessions: ScopedSessions<'a>,
             workspace_ordering: &'a [String],
             repository_order: &'a [String],
-            sidebar_view: crate::session::config::SidebarView,
+            sidebar_view: &'a crate::session::config::SidebarView,
             group_order: GroupOrder<'a>,
             trashed_count: usize,
         }
@@ -571,7 +571,7 @@ impl serde::Serialize for SessionsView {
             },
             workspace_ordering: &self.snapshot.value.contents.workspace_ordering,
             repository_order: &self.snapshot.value.contents.repository_order,
-            sidebar_view: self.snapshot.value.contents.sidebar_view,
+            sidebar_view: &self.snapshot.value.contents.sidebar_view,
             group_order: GroupOrder(&self.snapshot.value.contents.profiles),
             trashed_count: rows.iter().filter(|row| row.trashed_at.is_some()).count(),
         }
@@ -938,6 +938,20 @@ pub async fn update_sidebar_view(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+    if let Some(Some(label)) = &patch.web_plugin_sort {
+        let invalid = if label.trim().is_empty() || label.chars().count() > 64 {
+            Some("The plugin sort label must be 1 to 64 characters.".to_owned())
+        } else {
+            crate::server::api::validate_display_label(label, "plugin sort label").err()
+        };
+        if let Some(message) = invalid {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": message })),
+            )
+                .into_response();
+        }
+    }
     // Same lock order and admission as the ordering write: namespace, then this write's lane.
     let namespace = state.profile_namespace.clone().read_owned().await;
     let lane = state.sidebar_view_lane.clone().lock_owned().await;
@@ -968,13 +982,27 @@ async fn commit_sidebar_view(
         )
             .into_response();
     }
+    let marker = match patch.web_plugin_sort.clone() {
+        Some(marker) => Some(marker),
+        None if patch.sort.is_some()
+            && patch.client == Some(crate::session::config::ClientKind::Web) =>
+        {
+            Some(None)
+        }
+        None => None,
+    };
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_app_state(|app| {
+            let before = app.sidebar_view();
             if let Some(group_by) = patch.group_by {
                 app.group_by = Some(group_by);
             }
             if let Some(sort) = patch.sort {
                 app.sort_order = Some(sort);
+            }
+            let after = app.sidebar_view();
+            if (after.group_by, after.sort) != (before.group_by, before.sort) {
+                app.sidebar_view_changed_by = patch.client;
             }
             app.sidebar_view()
         })
@@ -1004,6 +1032,13 @@ async fn commit_sidebar_view(
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let publication = state.publication.write().await;
+    // The sort is saved, so its marker change applies even if the publish below is refused.
+    if let Some(marker) = marker {
+        *state
+            .web_plugin_sort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = marker;
+    }
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -1018,7 +1053,7 @@ async fn commit_sidebar_view(
     };
     crate::server::runtime::mutation_response(
         &snapshot.value.cursor,
-        Json(snapshot.value.contents.sidebar_view),
+        Json(snapshot.value.contents.sidebar_view.clone()),
     )
 }
 
@@ -1033,49 +1068,85 @@ mod sidebar_view_tests {
     async fn a_patch_changes_only_its_own_field_and_reaches_the_snapshot() {
         let _home = crate::session::test_support::isolate_app_dir();
         let state = crate::server::test_support::build_test_app_state(Vec::new());
+        use crate::session::config::ClientKind::{Tui, Web};
+        let view = |group_by, sort, changed_by, marker: Option<&str>| SidebarView {
+            group_by,
+            sort,
+            changed_by,
+            web_plugin_sort: marker.map(str::to_owned),
+        };
         let steps = [
             (
-                SidebarViewPatch {
-                    group_by: Some(GroupByMode::Group),
-                    ..Default::default()
-                },
+                r#"{"group_by":"group","client":"tui"}"#,
                 StatusCode::OK,
-                SidebarView {
-                    group_by: GroupByMode::Group,
-                    sort: SortOrder::Custom,
-                },
+                view(GroupByMode::Group, SortOrder::Custom, Some(Tui), None),
             ),
             (
-                SidebarViewPatch {
-                    sort: Some(SortOrder::Newest),
-                    base_sort: Some(SortOrder::Custom),
-                    ..Default::default()
-                },
+                r#"{"sort":"newest","client":"web"}"#,
                 StatusCode::OK,
-                SidebarView {
-                    group_by: GroupByMode::Group,
-                    sort: SortOrder::Newest,
-                },
+                view(GroupByMode::Group, SortOrder::Newest, Some(Web), None),
+            ),
+            // The marker is not a grouping or sort change.
+            (
+                r#"{"web_plugin_sort":"Cost","client":"web"}"#,
+                StatusCode::OK,
+                view(
+                    GroupByMode::Group,
+                    SortOrder::Newest,
+                    Some(Web),
+                    Some("Cost"),
+                ),
+            ),
+            // A patch that changes nothing keeps who changed it last, and only the web's
+            // sort picks clear the marker.
+            (
+                r#"{"sort":"newest","client":"tui"}"#,
+                StatusCode::OK,
+                view(
+                    GroupByMode::Group,
+                    SortOrder::Newest,
+                    Some(Web),
+                    Some("Cost"),
+                ),
+            ),
+            (
+                r#"{"sort":"name","client":"tui"}"#,
+                StatusCode::OK,
+                view(GroupByMode::Group, SortOrder::Name, Some(Tui), Some("Cost")),
+            ),
+            (
+                r#"{"sort":"name","client":"web"}"#,
+                StatusCode::OK,
+                view(GroupByMode::Group, SortOrder::Name, Some(Tui), None),
+            ),
+            (
+                r#"{"web_plugin_sort":"Cost"}"#,
+                StatusCode::OK,
+                view(GroupByMode::Group, SortOrder::Name, Some(Tui), Some("Cost")),
+            ),
+            (
+                r#"{"web_plugin_sort":null}"#,
+                StatusCode::OK,
+                view(GroupByMode::Group, SortOrder::Name, Some(Tui), None),
             ),
             // A write built on a sort since replaced is refused.
             (
-                SidebarViewPatch {
-                    sort: Some(SortOrder::Name),
-                    base_sort: Some(SortOrder::Custom),
-                    ..Default::default()
-                },
+                r#"{"sort":"newest","base_sort":"custom"}"#,
                 StatusCode::CONFLICT,
-                SidebarView {
-                    group_by: GroupByMode::Group,
-                    sort: SortOrder::Newest,
-                },
+                view(GroupByMode::Group, SortOrder::Name, Some(Tui), None),
             ),
         ];
-        for (patch, status, expected) in steps {
+        for (body, status, expected) in steps {
+            let patch: SidebarViewPatch = serde_json::from_str(body).unwrap();
             let response = update_sidebar_view(State(state.clone()), Ok(Json(patch)))
                 .await
                 .into_response();
             assert_eq!(response.status(), status);
+            // A reload of state.toml, as the Daemon's reload installs it, keeps the marker.
+            state.canonical_metadata.write().await.sidebar_view = crate::session::Config::load()
+                .unwrap()
+                .app_state
+                .sidebar_view();
             let snapshot = state.runtime.publish(&state).await.unwrap();
             assert_eq!(snapshot.value.contents.sidebar_view, expected);
             assert_eq!(
@@ -1083,7 +1154,10 @@ mod sidebar_view_tests {
                     .unwrap()
                     .app_state
                     .sidebar_view(),
-                expected
+                SidebarView {
+                    web_plugin_sort: None,
+                    ..expected
+                }
             );
         }
     }
@@ -1118,10 +1192,23 @@ mod sidebar_view_tests {
             code: crate::daemon::ReloadFailureCode::Metadata,
             profiles: Vec::new(),
         };
-        for (name, state, status) in [
-            ("read-only", read_only, StatusCode::FORBIDDEN),
-            ("CityHall", cityhall, StatusCode::FORBIDDEN),
-            ("degraded", degraded, StatusCode::SERVICE_UNAVAILABLE),
+        let writable = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+        );
+        let sort = r#"{"sort":"name"}"#;
+        for (name, state, body, status) in [
+            ("read-only", read_only, sort, StatusCode::FORBIDDEN),
+            ("CityHall", cityhall, sort, StatusCode::FORBIDDEN),
+            ("degraded", degraded, sort, StatusCode::SERVICE_UNAVAILABLE),
+            (
+                "blank plugin sort",
+                writable,
+                r#"{"sort":"name","web_plugin_sort":" "}"#,
+                StatusCode::BAD_REQUEST,
+            ),
         ] {
             let response = test_support::build_router_for_test(state)
                 .oneshot(
@@ -1133,7 +1220,7 @@ mod sidebar_view_tests {
                         .extension(axum::extract::ConnectInfo(
                             "127.0.0.1:5555".parse::<std::net::SocketAddr>().unwrap(),
                         ))
-                        .body(axum::body::Body::from(r#"{"sort":"name"}"#))
+                        .body(axum::body::Body::from(body))
                         .unwrap(),
                 )
                 .await

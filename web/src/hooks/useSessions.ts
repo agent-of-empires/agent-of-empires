@@ -11,18 +11,21 @@ import {
   type SessionMutation,
   type SessionsEnvelope,
   type SidebarView,
+  type SidebarViewPatch,
   type WorkspaceOrderingPatch,
   type WriteResult,
 } from "../lib/api";
 import type { GroupMove, GroupOrder } from "../lib/groupOrder";
 import { noteDaemonChanged, setServerDown } from "../lib/connectionState";
 import {
+  applyViewPatch,
   DEFAULT_SIDEBAR_VIEW,
   holdSettled,
   holdStarted,
   newWriteHold,
   newWriteQueue,
   pollMayReplace,
+  sameView,
 } from "../lib/sidebarView";
 
 const POLL_INTERVAL = 3000;
@@ -83,6 +86,8 @@ export function useSessions() {
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
   const [repositoryOrder, setRepositoryOrder] = useState<string[]>([]);
   const [sidebarView, setSidebarView] = useState<SidebarView>(DEFAULT_SIDEBAR_VIEW);
+  // What the Daemon last served, apart from this browser's own picks shown ahead of it.
+  const [polledSidebarView, setPolledSidebarView] = useState<SidebarView | null>(null);
   const [groupOrder, setGroupOrder] = useState<GroupOrder>({});
   // This Client's own writes of each shared value, so a poll that predates one cannot undo it.
   const orderHold = useRef(newWriteHold());
@@ -93,7 +98,10 @@ export function useSessions() {
   const viewWrites = useRef(newWriteQueue());
   const groupWrites = useRef(newWriteQueue());
   // The newest pick of each view field, so a write that waited cannot overwrite a later pick.
-  const viewPicks = useRef<{ seq: number; latest: Partial<Record<keyof SidebarView, number>> }>({ seq: 0, latest: {} });
+  const viewPicks = useRef<{ seq: number; latest: Partial<Record<keyof SidebarViewPatch, number>> }>({
+    seq: 0,
+    latest: {},
+  });
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [trashedCount, setTrashedCount] = useState(0);
@@ -201,11 +209,11 @@ export function useSessions() {
    * with how the write ended.
    */
   const changeSidebarView = useCallback(
-    async (patch: Partial<SidebarView>, after?: Promise<WriteResult>, baseSort?: SidebarView["sort"]) => {
-      setSidebarView((prev) => ({ ...prev, ...patch }));
+    async (patch: SidebarViewPatch, after?: Promise<WriteResult>, baseSort?: SidebarView["sort"]) => {
+      setSidebarView((prev) => applyViewPatch(prev, patch));
       const picks = viewPicks.current;
       const pick = ++picks.seq;
-      const fields = Object.keys(patch) as (keyof SidebarView)[];
+      const fields = Object.keys(patch) as (keyof SidebarViewPatch)[];
       for (const field of fields) picks.latest[field] = pick;
       holdStarted(viewHold.current);
       const result = await viewWrites.current(async () => {
@@ -306,10 +314,12 @@ export function useSessions() {
           read.groups = data.group_order ?? {};
           setGroupOrder(keepIfSameOrder(read.groups));
         }
+        const polledView = data.sidebar_view ?? DEFAULT_SIDEBAR_VIEW;
+        setPolledSidebarView((prev) => (prev && sameView(prev, polledView) ? prev : polledView));
         if (pollMayReplace(viewHold.current, cursor)) {
-          const view = data.sidebar_view ?? DEFAULT_SIDEBAR_VIEW;
+          const view = polledView;
           read.sort = view.sort;
-          setSidebarView((prev) => (prev.group_by === view.group_by && prev.sort === view.sort ? prev : view));
+          setSidebarView((prev) => (sameView(prev, view) ? prev : view));
         }
         for (const listener of sharedReadListeners.current) listener(read);
       } else {
@@ -537,6 +547,7 @@ export function useSessions() {
     workspaceOrdering,
     repositoryOrder,
     sidebarView,
+    polledSidebarView,
     groupOrder,
     moveGroup,
     changeOrdering,

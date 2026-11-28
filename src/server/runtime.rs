@@ -302,7 +302,14 @@ impl NativeRuntime {
             placed_workspaces: metadata.workspace_ordering.clone(),
             repository_order: metadata.repository_order.clone(),
             global_projects: metadata.global_projects.clone(),
-            sidebar_view: metadata.sidebar_view,
+            sidebar_view: crate::session::config::SidebarView {
+                web_plugin_sort: state
+                    .web_plugin_sort
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                ..metadata.sidebar_view.clone()
+            },
         };
         if contents.health == RuntimeHealth::Healthy {
             self.owner_diagnostics.send_if_modified(|current| {

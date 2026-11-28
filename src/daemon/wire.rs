@@ -313,6 +313,16 @@ pub struct GroupLocation {
     pub path: String,
 }
 
+/// `POST /api/groups`. With `sessions`, the Group is created and those Sessions move
+/// into it in one commit, so it never exists empty.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateGroupBody {
+    #[serde(flatten)]
+    pub group: GroupLocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<Vec<String>>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct MoveGroupBody {
     pub source: GroupLocation,
@@ -365,8 +375,9 @@ pub struct WorkspaceOrderingBase {
     pub repositories: Vec<String>,
 }
 
-/// Change the shared grouping, the sort, or both; an absent field keeps its value.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+/// Change the shared grouping, the sort, the web plugin sort marker, or several; an
+/// absent field keeps its value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SidebarViewPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,6 +387,25 @@ pub struct SidebarViewPatch {
     /// The sort this write replaces, refused with 409 once it changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sort: Option<crate::session::config::SortOrder>,
+    /// The sending Client's kind, recorded as `changed_by` when the grouping or sort changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<crate::session::config::ClientKind>,
+    /// `null` clears the marker; a web patch that sets `sort` clears it too.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_nullable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub web_plugin_sort: Option<Option<String>>,
+}
+
+/// Reads a present `null` as `Some(None)`, so it differs from an absent field.
+fn deserialize_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize, Deserialize)]

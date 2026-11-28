@@ -26,6 +26,7 @@ function setup(overrides: Partial<Parameters<typeof SidebarViewMenu>[0]> = {}) {
     facetsActive: false,
     facetOpen: false,
     onToggleFacets: vi.fn(),
+    onNewGroup: vi.fn(),
     ...overrides,
   };
   render(<SidebarViewMenu {...props} />);
@@ -80,13 +81,40 @@ describe("SidebarViewMenu", () => {
     }
   });
 
-  it("lets a viewer who cannot change the view drop a plugin sort without changing the shared sort", () => {
-    const { props, open } = setup({ locked: true, pluginSortRef: { pluginId: "p", entryId: "metric" } });
+  it("keeps a locked view's choices focusable and described, picks nothing, and still drops a plugin sort", () => {
+    const { props, open } = setup({
+      lockReason: "Managed by CityHall.",
+      pluginSortRef: { pluginId: "p", entryId: "metric" },
+    });
     open();
-    expect((screen.getByTestId("sidebar-view-sort-name") as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByTestId("sidebar-view-group-group") as HTMLButtonElement).disabled).toBe(true);
+    const reason = screen.getByTestId("sidebar-view-lock-reason");
+    expect(reason.textContent).toBe("Managed by CityHall.");
+    // Focus opens on the current grouping, which a disabled item would have skipped.
+    expect(document.activeElement).toBe(screen.getByTestId("sidebar-view-group-project"));
+    for (const id of ["sidebar-view-group-project", "sidebar-view-group-group", "sidebar-view-sort-name"]) {
+      const item = screen.getByTestId(id) as HTMLButtonElement;
+      expect([item.disabled, item.getAttribute("aria-disabled"), item.getAttribute("aria-describedby")]).toEqual([
+        false,
+        "true",
+        reason.id,
+      ]);
+    }
+    fireEvent.click(screen.getByTestId("sidebar-view-group-group"));
+    fireEvent.click(screen.getByTestId("sidebar-view-sort-name"));
+    expect([props.onGroupByChange.mock.calls.length, props.onSortChange.mock.calls.length]).toEqual([0, 0]);
+    expect(screen.getByTestId("sidebar-view-menu")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-view-sort-custom").getAttribute("aria-disabled")).toBeNull();
     fireEvent.click(screen.getByTestId("sidebar-view-sort-custom"));
     expect(props.onSortChange).toHaveBeenCalledWith("custom");
+  });
+
+  it("hands focus to the trigger before a keyboard New group opens its dialog", () => {
+    const trigger = () => screen.getByTestId("sidebar-view-toggle");
+    const { props, open } = setup({ onNewGroup: vi.fn(() => expect(document.activeElement).toBe(trigger())) });
+    open();
+    // A keyboard click carries no pointer detail.
+    fireEvent.click(screen.getByTestId("sidebar-view-new-group"), { detail: 0 });
+    expect(props.onNewGroup).toHaveBeenCalledTimes(1);
   });
 
   it("moves with the arrow keys and hands focus back on Escape", () => {

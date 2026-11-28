@@ -2,7 +2,14 @@
 // order are the Daemon's, shared with every Client; a plugin sort is this browser's alone.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { RuntimeCursor, SidebarView, WorkspaceOrderingPatch, WriteResult } from "../../lib/api";
+import {
+  clearWebPluginSortOnUnload,
+  type RuntimeCursor,
+  type SidebarView,
+  type SidebarViewPatch,
+  type WorkspaceOrderingPatch,
+  type WriteResult,
+} from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
 import {
   arrangeGroups,
@@ -19,7 +26,13 @@ import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import { reportInfo, toastBus } from "../../lib/toastBus";
 import { keepUnshown, moveId, orderStartingWith } from "../../lib/sidebarReorder";
 import { workspaceComparator, type PluginSortContext } from "../../lib/sidebarSort";
-import { GROUP_BY_FEATURE, SORT_FEATURE, type SidebarGroupBy, type SidebarSort } from "../../lib/sidebarView";
+import {
+  GROUP_BY_FEATURE,
+  peerViewChangeNotice,
+  SORT_FEATURE,
+  type SidebarGroupBy,
+  type SidebarSort,
+} from "../../lib/sidebarView";
 import type { PathOrder } from "../../lib/sidebarGroups";
 import type { ProjectInfo, Workspace } from "../../lib/types";
 import type { SharedRead } from "../useSessions";
@@ -30,10 +43,33 @@ import { useSessionGroups } from "../useSessionGroups";
 
 export type PluginSortRef = { pluginId: string; entryId: string };
 
+// The plugin sort marker this tab last set on the Daemon, so a reload that lost the pick can clear it. Per tab, as
+// the pick is; another browser that set the same label is indistinguishable and is cleared too.
+const MARKER_KEY = "aoe-web-plugin-sort-marker";
+function rememberMarker(label: string | null) {
+  try {
+    if (label) sessionStorage.setItem(MARKER_KEY, label);
+    else sessionStorage.removeItem(MARKER_KEY);
+  } catch {
+    // Storage unavailable: the unload clear still runs.
+  }
+}
+function rememberedMarker(): string | null {
+  try {
+    return sessionStorage.getItem(MARKER_KEY);
+  } catch {
+    return null;
+  }
+}
+
 interface Options {
   workspaces: Workspace[];
   projects: ProjectInfo[];
   view: SidebarView;
+  /** The view the Daemon last served, without this browser's picks still in flight; null before the first read. */
+  polledView: SidebarView | null;
+  /** False on a read-only Daemon or under CityHall, which refuse view writes. */
+  viewWritable: boolean;
   workspaceOrdering: string[];
   repositoryOrder: string[];
   groupOrder: GroupOrder;
@@ -48,7 +84,7 @@ interface Options {
   changeOrdering: (patch: WorkspaceOrderingPatch) => Promise<WriteResult>;
   orderingSaving: () => boolean;
   changeSidebarView: (
-    patch: Partial<SidebarView>,
+    patch: SidebarViewPatch,
     after?: Promise<WriteResult>,
     baseSort?: SidebarSort,
   ) => Promise<WriteResult>;
@@ -143,6 +179,8 @@ export function useSidebarModel({
   workspaces,
   projects,
   view,
+  polledView,
+  viewWritable,
   workspaceOrdering,
   repositoryOrder,
   groupOrder,
@@ -206,6 +244,25 @@ export function useSidebarModel({
     [groupBy, nested.groups, session.groups],
   );
   const attentionJump = useAttentionJump(displayGroups);
+
+  // Says why the list moved when another Client kind changed the view, and only when the rows on screen moved. Only a
+  // change between two Daemon reads is named, so a refused local pick falling back is not blamed on a peer.
+  const shownOrder = useMemo(
+    () => displayGroups.map((g) => `${g.id}:${g.workspaces.map((v) => v.key).join(",")}`).join("|"),
+    [displayGroups],
+  );
+  const lastShown = useRef({ view, polled: polledView, order: shownOrder });
+  useEffect(() => {
+    const last = lastShown.current;
+    // The baseline is the last read shown on screen, so a read held behind this browser's own write is compared
+    // with what was on screen once the list adopts it.
+    const shown =
+      polledView && polledView.group_by === view.group_by && polledView.sort === view.sort ? polledView : null;
+    lastShown.current = { view, polled: shown ?? last.polled, order: shownOrder };
+    const moved = last.order !== "" && last.order !== shownOrder;
+    const notice = moved ? peerViewChangeNotice(last.view, last.polled, shown) : null;
+    if (notice) reportInfo(notice);
+  }, [view, polledView, shownOrder]);
 
   // Like the TUI, a move is refused while the last one is saving, so it never builds on a write that may fail.
   const switching = useRef(false);
@@ -302,15 +359,90 @@ export function useSidebarModel({
     },
     [groupBy, changeSidebarView],
   );
+  // The plugin sort marker the other Clients show, as this browser last set it, or undefined after a write failed.
+  // It follows the active plugin sort, so a plugin that goes away clears it, and the page clears it as it unloads.
+  const markerSent = useRef<string | null | undefined>(null);
+  const wantedRef = useRef<string | null>(null);
+  const sendMarker = useCallback(
+    (label: string | null) => {
+      if (!viewWritable || label === markerSent.current) return;
+      markerSent.current = label;
+      if (label) rememberMarker(label);
+      void changeSidebarView({ web_plugin_sort: label }).then((result) => {
+        // A newer pick owns the marker now.
+        if (markerSent.current !== label) return;
+        if (result.receipt === null) markerSent.current = undefined;
+        else if (label === null) rememberMarker(null);
+      });
+    },
+    [viewWritable, changeSidebarView],
+  );
+  const wantedMarker = useMemo(() => {
+    const label = pluginSortRef ? activePluginSort?.label : undefined;
+    return label?.trim() ? [...label].slice(0, 64).join("") : null;
+  }, [pluginSortRef, activePluginSort]);
+  useEffect(() => {
+    wantedRef.current = wantedMarker;
+    sendMarker(wantedMarker);
+  }, [wantedMarker, sendMarker]);
+  // A failed marker write is retried on the next read, with the plugin sort picked then.
+  useEffect(() => {
+    const unsubscribe = onSharedRead(() => {
+      if (markerSent.current === undefined) sendMarker(wantedRef.current);
+    });
+    return unsubscribe;
+  }, [onSharedRead, sendMarker]);
+  useEffect(() => {
+    const onHide = () => {
+      if (markerSent.current !== null) clearWebPluginSortOnUnload();
+    };
+    window.addEventListener("pagehide", onHide);
+    return () => window.removeEventListener("pagehide", onHide);
+  }, []);
+  // A reload starts with no plugin sort, so a marker this tab set before it, and that the Daemon still shows, is stale.
+  const staleChecked = useRef(false);
+  const clearStaleMarker = useCallback(
+    (loaded: boolean, daemonMarker: string | undefined) => {
+      if (!loaded || staleChecked.current) return;
+      staleChecked.current = true;
+      const stale = rememberedMarker();
+      if (!stale || markerSent.current !== null) return;
+      if (!viewWritable || daemonMarker !== stale) {
+        rememberMarker(null);
+        return;
+      }
+      // Unknown until the clear lands, so a failed one is retried and the tab's record kept until then.
+      markerSent.current = undefined;
+      sendMarker(null);
+    },
+    [viewWritable, sendMarker],
+  );
+  const loaded = polledView !== null;
+  const daemonMarker = polledView?.web_plugin_sort;
+  useEffect(() => clearStaleMarker(loaded, daemonMarker), [loaded, daemonMarker, clearStaleMarker]);
+
+  // A web patch that sets the sort also clears the plugin sort marker, on the Daemon too.
   const selectSort = useCallback(
     (next: SidebarSort) => {
       reportFeatureUse(SORT_FEATURE[next]);
       setPluginSortRef(null);
-      if (next === sort) return;
+      if (next === sort) {
+        sendMarker(null);
+        return;
+      }
       dropUndo();
-      void changeSidebarView({ sort: next });
+      const write = changeSidebarView({ sort: next });
+      // The Daemon clears the marker with a web sort; if that write fails, the next read retries the clear.
+      if (viewWritable && markerSent.current !== null) {
+        markerSent.current = null;
+        void write.then((result) => {
+          if (markerSent.current !== null) return;
+          if (result.receipt === null) markerSent.current = undefined;
+          else rememberMarker(null);
+        });
+      }
     },
-    [sort, dropUndo, changeSidebarView],
+    [sort, viewWritable, dropUndo, sendMarker, changeSidebarView],
   );
   const selectPluginSort = useCallback((ref: PluginSortRef) => {
     reportFeatureUse("sort_plugin");

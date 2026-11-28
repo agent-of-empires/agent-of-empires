@@ -39,7 +39,7 @@ import { diffSelectionStale } from "./lib/diffSelection";
 import { lazyView } from "./lib/lazyView";
 import { CloseOnEscape } from "./components/diff/comments/CloseOnEscape";
 import { useSessions } from "./hooks/useSessions";
-import { useAttentionCounts } from "./hooks/useAttentionCounts";
+import { useNeedsYouCount } from "./hooks/useNeedsYouCount";
 import { useStatusSounds } from "./hooks/useStatusSounds";
 import { onSoundBlocked } from "./lib/soundPlayer";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
@@ -73,7 +73,6 @@ import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
 import type { ResolvedTheme } from "./lib/theme";
-import { getAttentionBadgeColors } from "./lib/attentionBadgeColors";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
@@ -527,6 +526,7 @@ function AppContent({
     workspaceOrdering,
     repositoryOrder,
     sidebarView,
+    polledSidebarView,
     groupOrder,
     moveGroup,
     changeOrdering,
@@ -593,7 +593,7 @@ function AppContent({
 
   // What this window notices: a focus-mode window ignores every other session's attention and sounds.
   const windowSessions = useMemo(() => noticedSessions(sessions, focusSessionId), [sessions, focusSessionId]);
-  const { unreadCount, waitingCount } = useAttentionCounts(windowSessions, activeSessionId);
+  const needsYouCount = useNeedsYouCount(windowSessions);
   const { onSoundDue, cancelCue } = useStatusSounds(windowSessions, activeSessionId);
   const onPushedStatus = useCallback(
     (id: string, status: SessionResponse["status"], cursor: RuntimeCursor) => {
@@ -605,7 +605,6 @@ function AppContent({
   useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
   // Shown in focus mode too: the focused session's sounds are blocked like any other.
   useEffect(() => onSoundBlocked(() => toastBus.handler?.info("Click anywhere on this page to turn on sounds.")), []);
-  const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103). A focus window is not the main window.
   useLastSessionRestore({
@@ -640,10 +639,18 @@ function AppContent({
     toastBus.handler?.error("Projects are not ready. Refresh before changing the registry.");
     return undefined;
   }, [projectProfile, projectsReady]);
+  const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
+  // CityHall client mode collapses the dashboard to a locked-down end-user
+  // client; the capability flags gate the terminal/diff panes, project
+  // management, the wizard, and settings from one place. See #7.
+  const caps = useMemo(() => getClientCapabilities(serverAbout), [serverAbout]);
+
   const sidebar = useSidebarModel({
     workspaces,
     projects,
     view: sidebarView,
+    polledView: polledSidebarView,
+    viewWritable: !caps.readOnly && !caps.cityhall,
     workspaceOrdering,
     repositoryOrder,
     groupOrder,
@@ -921,12 +928,6 @@ function AppContent({
     keyboardProxyRef.current = element;
     setKeyboardProxy(element);
   }, []);
-
-  const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
-  // CityHall client mode collapses the dashboard to a locked-down end-user
-  // client; the capability flags gate the terminal/diff panes, project
-  // management, the wizard, and settings from one place. See #7.
-  const caps = useMemo(() => getClientCapabilities(serverAbout), [serverAbout]);
 
   const activeWorkspace = useMemo(() => {
     if (!activeSessionId) return undefined;
@@ -3114,9 +3115,7 @@ function AppContent({
             }
           : undefined
       }
-      unreadCount={unreadCount}
-      waitingCount={waitingCount}
-      attentionBadgeColors={attentionBadgeColors}
+      needsYouCount={needsYouCount}
       isDevBuild={isDebugBuild(serverAbout)}
       onGoDashboard={handleGoDashboard}
       onExitFocusMode={focusMode ? exitFocusMode : undefined}
@@ -3214,6 +3213,7 @@ function AppContent({
                     setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
                     setShowSessionWizard(true);
                   }}
+                  onGroupCreated={refreshSessions}
                   onCreateSession={handleCreateSession}
                   onOpenPalette={() => setShowPalette(true)}
                   onPinProject={projectsReady ? handlePinProject : undefined}

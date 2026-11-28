@@ -36,21 +36,21 @@ pub use wire::{
     AbandonPurgeBody, AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState, AttachProjectBody,
     AttachProjectOutcome, AttachedProject, AttachedWorkerOutcome, CleanupDefaults,
     CliCreationOptions, CollapseGroupBody, ContextResumeAvailability,
-    ContextResumeIndeterminateReason, ContextResumeUnavailableReason, CreateProfileBody,
-    CreateProjectBody, CreateSessionBody, CreationTrustFingerprint, CreationTrustRequest,
-    CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
-    DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
-    FrozenOrder, GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
-    ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
-    PromptAttachmentKind, PromptAttachmentRef, PromptOrigin, PurgeOutcome, QueuedPromptEntry,
-    ReclaimOwnershipBody, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
-    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
-    SessionLookupError, SessionResponse, SessionsEnvelope, SetWorktreeNameBody, SidebarViewPatch,
-    StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget, TerminalTargetStatus,
-    TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate, UpdateArchiveBody,
-    UpdateDiffBaseBody, UpdateGroupBody, UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody,
-    UpdateSnoozeBody, UpdateUnreadBody, WorkspaceOrderingBase, WorkspaceOrderingPatch,
-    WorkspaceRepoSummary, WorktreeEditOutcome,
+    ContextResumeIndeterminateReason, ContextResumeUnavailableReason, CreateGroupBody,
+    CreateProfileBody, CreateProjectBody, CreateSessionBody, CreationTrustFingerprint,
+    CreationTrustRequest, CreationTrustReview, DefaultProfileBody, DeleteGroupBody,
+    DeleteGroupMode, DeleteGroupOutcome, DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody,
+    EmptyTrashOutcome, EnsureToolBody, FrozenOrder, GroupLocation, GroupSessionFailure,
+    GroupSessionFailureCode, GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody,
+    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PromptOrigin,
+    PurgeOutcome, QueuedPromptEntry, ReclaimOwnershipBody, RenameOutcome, RenameProfileBody,
+    RenameSessionBody, ReorderBody, ReorderOutcome, RepoBaseInput, RestartOutcome,
+    RestartSessionBody, RestoreOutcome, SessionLookupError, SessionResponse, SessionsEnvelope,
+    SetWorktreeNameBody, SidebarViewPatch, StartSessionBody, StopAuxiliaryBody, TerminalSize,
+    TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody,
+    Tristate, UpdateArchiveBody, UpdateDiffBaseBody, UpdateGroupBody, UpdateIgnoredBody,
+    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    WorkspaceOrderingBase, WorkspaceOrderingPatch, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 pub use wire::{
     ApplyUpdateBody, InstallPreviewBody, PluginJob, PluginJobAccepted, PluginJobKind, PluginJobLog,
@@ -966,10 +966,11 @@ impl DaemonClient {
         self.request_mutation(request, epoch).await
     }
 
-    /// Create an explicit group, rejecting an existing path rather than merging it.
+    /// Create an explicit group, rejecting an existing path rather than merging it, and
+    /// move any `sessions` into it in the same commit.
     pub async fn create_group(
         &self,
-        group: &GroupLocation,
+        group: &CreateGroupBody,
         epoch: &str,
     ) -> Result<RuntimeCursor, DaemonClientError> {
         let url = self

@@ -5,8 +5,8 @@ use clap::{Args, Subcommand};
 
 use crate::acp::client::require_daemon;
 use crate::daemon::{
-    ApiErrorCode, DaemonClient, DaemonClientError, DeleteGroupBody, DeleteGroupMode, GroupLocation,
-    RuntimeHealth, RUNTIME_PROTOCOL_VERSION,
+    ApiErrorCode, CreateGroupBody, DaemonClient, DaemonClientError, DeleteGroupBody,
+    DeleteGroupMode, GroupLocation, RuntimeHealth, RUNTIME_PROTOCOL_VERSION,
 };
 use crate::session::config::resolve_default_profile;
 use crate::session::{GroupTree, Storage};
@@ -112,7 +112,13 @@ async fn create_group(profile: &str, args: GroupCreateArgs) -> Result<()> {
 
     let (client, epoch) = daemon_client().await?;
     client
-        .create_group(&group_location(profile, &group_path), &epoch)
+        .create_group(
+            &CreateGroupBody {
+                group: group_location(profile, &group_path),
+                sessions: None,
+            },
+            &epoch,
+        )
         .await?;
 
     println!("✓ Created group: {}", group_path);

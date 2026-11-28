@@ -86,14 +86,33 @@ describe("the sidebar view button", () => {
     expect(onGroupByChange).toHaveBeenCalledWith("group");
   });
 
-  it.each<[string, Partial<Props>]>([
-    ["read-only", { readOnly: true }],
-    ["CityHall", { canArrangeView: false }],
-  ])("leaves the shared choices to a viewer who may change them: %s", (_, over) => {
-    renderSidebar([ws("a")], over);
+  it.each<[string, Partial<Props>, string, boolean]>([
+    ["read-only", { readOnly: true }, "This Daemon is read-only.", false],
+    ["CityHall", { canArrangeView: false }, "Managed by CityHall.", true],
+  ])("shows a viewer who cannot change the view the current choice and why: %s", (_, over, reason, canCreate) => {
+    const onGroupByChange = vi.fn();
+    renderSidebar([ws("a")], { ...over, groupBy: "project", onGroupByChange });
     const menu = openMenu();
-    for (const item of within(menu).getAllByRole("menuitemradio"))
-      expect((item as HTMLButtonElement).disabled).toBe(true);
+    expect(menu.getAttribute("aria-describedby")).toBe(within(menu).getByText(reason).id);
+    const radios = within(menu).getAllByRole("menuitemradio");
+    for (const item of radios) expect(item.getAttribute("aria-disabled")).toBe("true");
+    expect(radios.find((r) => r.getAttribute("aria-checked") === "true")?.textContent).toBe("Repository");
+    fireEvent.click(within(menu).getByText("Groups"));
+    expect(onGroupByChange).not.toHaveBeenCalled();
+    const newGroup = within(menu).getByRole("menuitem", { name: "+ New group…" });
+    // A read-only Daemon keeps it reachable, described by the reason, as the choices are.
+    expect([(newGroup as HTMLButtonElement).disabled, newGroup.getAttribute("aria-disabled")]).toEqual([
+      false,
+      canCreate ? null : "true",
+    ]);
+    fireEvent.click(newGroup);
+    expect(!!screen.queryByRole("dialog", { name: "New group" })).toBe(canCreate);
+  });
+
+  it.each(["project", "group"] as const)("ends the Group by list with New group under %s", (groupBy) => {
+    renderSidebar([ws("a")], { groupBy });
+    const items = Array.from(openMenu().querySelectorAll("[role^=menuitem]"));
+    expect(items.map((i) => i.textContent)[2]).toBe("+ New group…");
   });
 });
 

@@ -77,7 +77,63 @@ impl HomeView {
 
     /// Show the group-by picker dialog seeded with the current mode.
     pub(in crate::tui) fn show_group_picker(&mut self) {
-        self.group_picker_dialog = Some(GroupPickerDialog::new(self.group_by));
+        self.group_picker_dialog = Some(GroupPickerDialog::new(
+            self.group_by,
+            self.sidebar_view_lock(),
+            !self.session_feed.daemon_read_only(),
+        ));
+    }
+
+    /// Why the Daemon refuses grouping and sort changes, as the pickers show it.
+    pub(in crate::tui) fn sidebar_view_lock(&self) -> Option<&'static str> {
+        if self.session_feed.daemon_read_only() {
+            Some("This Daemon is read-only.")
+        } else if self.session_feed.cityhall_mode() {
+            Some("Managed by CityHall.")
+        } else {
+            None
+        }
+    }
+
+    /// Ask for a new Group's name and the Sessions that move into it, offering the
+    /// selected Session's profile with that Session checked.
+    pub(in crate::tui) fn open_new_group_dialog(&mut self) {
+        let selected = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .map(|inst| (inst.id.clone(), inst.source_profile.clone()));
+        let profile = selected
+            .as_ref()
+            .map(|(_, profile)| profile.clone())
+            .or_else(|| self.selected_group_profile.clone())
+            .unwrap_or_else(|| self.config_profile());
+        let cityhall = self.session_feed.cityhall_mode();
+        let mut candidates: Vec<(String, String)> = self
+            .instances()
+            .filter(|inst| {
+                inst.source_profile == profile
+                    && !inst.is_trashed()
+                    && !matches!(
+                        inst.status,
+                        crate::session::Status::Creating | crate::session::Status::Deleting
+                    )
+                    && (!cityhall || inst.is_structured())
+            })
+            .map(|inst| (inst.id.clone(), inst.title.clone()))
+            .collect();
+        candidates.sort_by_cached_key(|(_, title)| title.to_lowercase());
+        let existing = self
+            .group_trees
+            .get(&profile)
+            .map(|tree| tree.get_all_groups().into_iter().map(|g| g.path).collect())
+            .unwrap_or_default();
+        self.new_group_dialog = Some(crate::tui::dialogs::NewGroupDialog::new(
+            profile,
+            candidates,
+            existing,
+            selected.as_ref().map(|(id, _)| id.as_str()),
+        ));
     }
 
     /// Open the saved-project picker that starts a new session pre-filled with
@@ -103,7 +159,10 @@ impl HomeView {
 
     /// Show the sort-order picker dialog seeded with the current order.
     pub(in crate::tui) fn show_sort_picker(&mut self) {
-        self.sort_picker_dialog = Some(SortPickerDialog::new(self.sort_order));
+        self.sort_picker_dialog = Some(SortPickerDialog::new(
+            self.sort_order,
+            self.sidebar_view_lock(),
+        ));
     }
 
     /// Open the attach-a-project picker for the selected session (#3103).

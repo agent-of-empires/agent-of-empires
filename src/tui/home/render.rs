@@ -34,21 +34,26 @@ fn session_offset(created_at: &Timestamp) -> usize {
 /// Build the list-pane title. `prefix` is the leading label ("aoe", "Terminals",
 /// "Tool: <name>"); `profile` is `Some(name)` only when a real filter is active, so the
 /// default all-profiles state drops the `[<profile>]` segment. Group and sort state hang
-/// off the prefix as `· groups` / `· name`, each dropped when it is the default.
+/// off the prefix as `· groups` / `· name`, each dropped when it is the default, unless a
+/// web plugin sort applies, which names the sort this view keeps.
 fn compose_list_title(
     prefix: &str,
     profile: Option<&str>,
     group_by: GroupByMode,
     sort_order: SortOrder,
+    web_plugin_sort: bool,
 ) -> String {
     let mut suffix = String::new();
     if group_by != GroupByMode::default() {
         suffix.push_str(" · ");
         suffix.push_str(&group_by.label().to_lowercase());
     }
-    if sort_order != SortOrder::default() {
+    if sort_order != SortOrder::default() || web_plugin_sort {
         suffix.push_str(" · ");
         suffix.push_str(&sort_order.label().to_lowercase());
+    }
+    if web_plugin_sort {
+        suffix.push_str(" (plugin sort on web)");
     }
     let profile_tag = match profile {
         Some(name) => format!(" [{}]", name),
@@ -1363,6 +1368,7 @@ impl HomeView {
             rename_dialog,
             worktree_name_dialog,
             sandbox_login_dialog,
+            new_group_dialog,
             restart_dialog,
             hooks_install_dialog,
             volume_ignores_glob_dialog,
@@ -1527,20 +1533,18 @@ impl HomeView {
     fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: ListLayout) {
         self.list_area = area;
         let profile = self.active_profile_display();
-        let mut title = match &self.view_mode {
-            ViewMode::Structured => {
-                compose_list_title("aoe", profile, self.group_by, self.sort_order)
-            }
-            ViewMode::Terminal => {
-                compose_list_title("Terminals", profile, self.group_by, self.sort_order)
-            }
-            ViewMode::Tool(name) => compose_list_title(
-                &format!("Tool: {}", name),
-                profile,
-                self.group_by,
-                self.sort_order,
-            ),
+        let prefix = match &self.view_mode {
+            ViewMode::Structured => "aoe".to_owned(),
+            ViewMode::Terminal => "Terminals".to_owned(),
+            ViewMode::Tool(name) => format!("Tool: {name}"),
         };
+        let mut title = compose_list_title(
+            &prefix,
+            profile,
+            self.group_by,
+            self.sort_order,
+            self.web_plugin_sort,
+        );
         if self.needs_you_only {
             title.insert_str(title.len() - 1, " · needs you");
         }
@@ -1897,6 +1901,7 @@ impl HomeView {
             || self.rename_dialog.is_some()
             || self.worktree_name_dialog.is_some()
             || self.sandbox_login_dialog.is_some()
+            || self.new_group_dialog.is_some()
             || self.repo_trust_dialog.is_some()
             || self.create_hook_failed.is_some()
             || self.hooks_install_dialog.is_some()
@@ -5366,29 +5371,48 @@ mod tests {
         // Repository and Custom are the defaults and add no suffix; the profile tag shows only
         // while a profile filter is active.
         let cases = [
-            ("aoe", None, Project, Custom, " aoe "),
+            ("aoe", None, Project, Custom, false, " aoe "),
             (
                 "aoe",
                 Some("my-profile"),
                 Project,
                 Custom,
+                false,
                 " aoe [my-profile] ",
             ),
-            ("aoe", None, Group, Custom, " aoe · groups "),
-            ("aoe", None, Project, Name, " aoe · name "),
-            ("aoe", None, Project, Newest, " aoe · newest first "),
-            ("aoe", None, Group, Name, " aoe · groups · name "),
+            ("aoe", None, Group, Custom, false, " aoe · groups "),
+            ("aoe", None, Project, Name, false, " aoe · name "),
+            ("aoe", None, Project, Newest, false, " aoe · newest first "),
+            ("aoe", None, Group, Name, false, " aoe · groups · name "),
             (
                 "Terminals",
                 Some("work"),
                 Group,
                 Name,
+                false,
                 " Terminals [work] · groups · name ",
             ),
+            // A web plugin sort names the sort this view keeps, the default included.
+            (
+                "aoe",
+                None,
+                Project,
+                Custom,
+                true,
+                " aoe · custom (plugin sort on web) ",
+            ),
+            (
+                "aoe",
+                None,
+                Group,
+                Name,
+                true,
+                " aoe · groups · name (plugin sort on web) ",
+            ),
         ];
-        for (prefix, profile, group_by, sort, expected) in cases {
+        for (prefix, profile, group_by, sort, plugin, expected) in cases {
             assert_eq!(
-                compose_list_title(prefix, profile, group_by, sort),
+                compose_list_title(prefix, profile, group_by, sort, plugin),
                 expected,
                 "{prefix} {profile:?} {group_by:?} {sort:?}"
             );

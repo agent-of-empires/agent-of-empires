@@ -95,6 +95,7 @@ pub enum ProfileMutation {
     SetDefault(super::DefaultProfileBody),
 }
 pub(crate) enum NamespaceMutation {
+    CreateGroup(super::CreateGroupBody),
     CollapseGroup(super::CollapseGroupBody),
     MoveGroup(super::MoveGroupBody),
     DeleteGroup(super::DeleteGroupBody),

@@ -11,7 +11,9 @@ use axum::{
 };
 
 use super::AppState;
-use crate::daemon::{ApiErrorCode, CollapseGroupBody, GroupLocation, MoveGroupBody, RuntimeHealth};
+use crate::daemon::{
+    ApiErrorCode, CollapseGroupBody, CreateGroupBody, GroupLocation, MoveGroupBody, RuntimeHealth,
+};
 use crate::server::session_store::NativeSessionStore;
 use crate::session::{GroupMovePlan, GroupTree, Instance, SessionStore, Status};
 
@@ -325,7 +327,8 @@ fn validate_location(location: &GroupLocation) -> Result<(), Response> {
 }
 
 enum GroupMetadataChange {
-    Create,
+    /// Create the Group and move these Sessions into it, sorted and deduplicated.
+    Create(Vec<String>),
     Collapse(bool),
 }
 
@@ -356,9 +359,27 @@ async fn commit_group_metadata(
             .into_response();
     }
     let (status, op) = match &change {
-        GroupMetadataChange::Create => (StatusCode::CREATED, "group created"),
+        GroupMetadataChange::Create(_) => (StatusCode::CREATED, "group created"),
         GroupMetadataChange::Collapse(_) => (StatusCode::OK, "group collapsed"),
     };
+    let members: &[String] = match &change {
+        GroupMetadataChange::Create(ids) => ids,
+        GroupMetadataChange::Collapse(_) => &[],
+    };
+    let mut submission_guards = Vec::with_capacity(members.len());
+    let mut instance_guards = Vec::with_capacity(members.len());
+    for id in members {
+        if let Some(guard) = state
+            .session_service
+            .prompt_submission_for_session(id)
+            .await
+        {
+            submission_guards.push(guard);
+        }
+    }
+    for id in members {
+        instance_guards.push(state.instance_lock(id).await.lock_owned().await);
+    }
     let (profile, path) = (group.profile.clone(), group.path.clone());
     let worker_state = state.clone();
     let committed = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -376,9 +397,28 @@ async fn commit_group_metadata(
             }
             let mut tree = GroupTree::new_with_groups(rows, groups);
             match change {
-                GroupMetadataChange::Create => {
+                GroupMetadataChange::Create(ids) => {
                     if tree.group_exists(&group.path) {
                         return Err(reject(StatusCode::CONFLICT, "Group already exists"));
+                    }
+                    for id in &ids {
+                        let row = rows
+                            .iter()
+                            .find(|row| &row.id == id)
+                            .ok_or_else(|| reject(StatusCode::NOT_FOUND, "Session not found"))?;
+                        if row.is_trashed() {
+                            return Err(reject_with_code(
+                                ApiErrorCode::SessionTrashed,
+                                "Session is in the Trash",
+                            ));
+                        }
+                        check_row(row, worker_state.cityhall_mode)?;
+                    }
+                    for row in rows
+                        .iter_mut()
+                        .filter(|row| ids.binary_search(&row.id).is_ok())
+                    {
+                        row.group_path.clone_from(&group.path);
                     }
                     tree.create_group(&group.path);
                 }
@@ -394,6 +434,8 @@ async fn commit_group_metadata(
         })
     })
     .await;
+    drop(instance_guards);
+    drop(submission_guards);
     drop(namespace);
     match committed {
         Ok(Ok(())) => {
@@ -413,16 +455,30 @@ async fn commit_group_metadata(
 
 pub async fn create_group(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<GroupLocation>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<CreateGroupBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if state.read_only {
         return super::read_only_response();
     }
-    let Json(group) = match body {
+    let Json(body) = match body {
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
-    commit_group_metadata(state, group, GroupMetadataChange::Create).await
+    let requested = body.sessions.is_some();
+    let mut ids = body.sessions.unwrap_or_default();
+    if requested && ids.is_empty() {
+        return failure(
+            &state,
+            reject_with_code(
+                ApiErrorCode::GroupSessionsRequired,
+                "A new group needs at least one session",
+            ),
+        )
+        .await;
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    commit_group_metadata(state, body.group, GroupMetadataChange::Create(ids)).await
 }
 
 pub async fn collapse_group(

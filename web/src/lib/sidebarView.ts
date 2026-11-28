@@ -1,4 +1,4 @@
-import type { RuntimeCursor, SidebarView } from "./api";
+import type { RuntimeCursor, SidebarView, SidebarViewPatch } from "./api";
 import type { FeatureUse } from "./featureUse";
 
 export type SidebarGroupBy = SidebarView["group_by"];
@@ -9,6 +9,45 @@ export const DEFAULT_SIDEBAR_VIEW: SidebarView = { group_by: "project", sort: "c
 
 export const GROUP_BY_LABEL: Record<SidebarGroupBy, string> = { project: "Repository", group: "Groups" };
 export const SORT_LABEL: Record<SidebarSort, string> = { custom: "Custom", newest: "Newest first", name: "Name" };
+
+/** The view as this browser's own patch leaves it: a grouping or sort pick is the web's, and a sort pick also
+ *  clears the plugin sort marker, as the Daemon does. */
+export function applyViewPatch(view: SidebarView, patch: SidebarViewPatch): SidebarView {
+  const next: SidebarView = { ...view };
+  if (patch.group_by) next.group_by = patch.group_by;
+  if (patch.sort) next.sort = patch.sort;
+  if (patch.group_by || patch.sort) next.changed_by = "web";
+  // An explicit marker wins over the clear a sort pick makes, as on the Daemon.
+  if (patch.web_plugin_sort) next.web_plugin_sort = patch.web_plugin_sort;
+  else if (patch.sort || patch.web_plugin_sort === null) delete next.web_plugin_sort;
+  return next;
+}
+
+export const sameView = (a: SidebarView, b: SidebarView) =>
+  a.group_by === b.group_by &&
+  a.sort === b.sort &&
+  a.changed_by === b.changed_by &&
+  a.web_plugin_sort === b.web_plugin_sort;
+
+const PEER_PLACE = { tui: "in the TUI" } as const;
+
+/** Why the list moved to `after`, a Daemon read, from `shown`: names each of the grouping and sort that changed both
+ *  on screen and since `lastRead`, the read last shown, when another Client kind made the change. A field that only
+ *  changed on screen, such as this browser's refused pick falling back, is not named. */
+export function peerViewChangeNotice(
+  shown: SidebarView,
+  lastRead: SidebarView | null,
+  after: SidebarView | null,
+): string | null {
+  if (!lastRead || !after) return null;
+  const by = after.changed_by;
+  if (!by || by === "web") return null;
+  const grouping = shown.group_by !== after.group_by && lastRead.group_by !== after.group_by;
+  const sort = shown.sort !== after.sort && lastRead.sort !== after.sort;
+  if (!grouping && !sort) return null;
+  const what = grouping && sort ? "Grouping and sort" : grouping ? "Grouping" : "Sort";
+  return `${what} changed ${PEER_PLACE[by]}`;
+}
 
 export const GROUP_BY_FEATURE: Record<SidebarGroupBy, FeatureUse> = {
   project: "group_by_project",

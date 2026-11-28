@@ -4,7 +4,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import type { SidebarView, WorkspaceOrderingPatch } from "../../lib/api";
+import type { PluginUiEntry, SidebarView, WorkspaceOrderingPatch } from "../../lib/api";
 import { reportFeatureUse } from "../../lib/featureUse";
 import { toastBus, type ToastApi } from "../../lib/toastBus";
 import type { SessionResponse } from "../../lib/types";
@@ -13,6 +13,12 @@ import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../useRepoGroups";
 import { useSessions } from "../useSessions";
 import { useWorkspaces } from "../useWorkspaces";
 import { session } from "./fixtures";
+
+let pluginEntries: PluginUiEntry[] = [];
+vi.mock("../../lib/pluginUiContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/pluginUiContext")>()),
+  usePluginUiEntries: () => pluginEntries,
+}));
 
 /** What the Daemon serves; each write bumps the revision like a published snapshot. */
 interface Daemon {
@@ -39,6 +45,20 @@ const sameSiblings = (stored: string[], base: string[]) => {
 
 let daemon: Daemon;
 const writes: { method: string; body: unknown }[] = [];
+/** The `client` of each view patch, which every web write names. */
+const patchClients: unknown[] = [];
+
+/** Records a view patch without its `client` and applies it as the Daemon does. */
+function patchView(body: Record<string, unknown>) {
+  const { client, ...patch } = body;
+  patchClients.push(client);
+  writes.push({ method: "PATCH", body: patch });
+  const { base_sort: _, ...change } = patch;
+  const view: SidebarView = { ...daemon.sidebar_view, ...(change as Partial<SidebarView>) };
+  if (patch.sort || patch.group_by) view.changed_by = client as SidebarView["changed_by"];
+  if (patch.sort || patch.web_plugin_sort === null) delete view.web_plugin_sort;
+  return view;
+}
 const runtime = (revision: number) => ({ "aoe-runtime-epoch": "boot", "aoe-runtime-revision": String(revision) });
 const server = setupServer(
   http.get("*/api/sessions", () =>
@@ -54,10 +74,10 @@ const server = setupServer(
     ),
   ),
   http.patch("*/api/sidebar-view", async ({ request }) => {
-    const { base_sort, ...body } = (await request.json()) as Partial<SidebarView> & { base_sort?: string };
-    writes.push({ method: "PATCH", body: base_sort ? { ...body, base_sort } : body });
-    if (base_sort && base_sort !== daemon.sidebar_view.sort) return HttpResponse.json({}, { status: 409 });
-    daemon.sidebar_view = { ...daemon.sidebar_view, ...body };
+    const body = (await request.json()) as Record<string, unknown>;
+    const view = patchView(body);
+    if (body.base_sort && body.base_sort !== daemon.sidebar_view.sort) return HttpResponse.json({}, { status: 409 });
+    daemon.sidebar_view = view;
     daemon.revision += 1;
     return HttpResponse.json(daemon.sidebar_view, { headers: runtime(daemon.revision) });
   }),
@@ -117,6 +137,8 @@ function reorder(body: ReorderBody): boolean {
 }
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => {
+  expect(patchClients.every((c) => c === "web")).toBe(true);
+  patchClients.length = 0;
   server.resetHandlers();
   toastBus.handler = null;
 });
@@ -142,9 +164,10 @@ function heldWrites(method: "patch" | "put", path: string) {
   server.use(
     http[method](path, async ({ request }) => {
       const body = (await request.json()) as Record<string, unknown>;
-      writes.push({ method: method.toUpperCase(), body });
+      const view = method === "patch" ? patchView(body) : null;
+      if (!view) writes.push({ method: method.toUpperCase(), body });
       await new Promise<void>((r) => releases.push(r));
-      if (method === "patch") daemon.sidebar_view = { ...daemon.sidebar_view, ...body };
+      if (view) daemon.sidebar_view = view;
       else {
         if (body.order) daemon.workspace_ordering = body.order as string[];
         if (body.repositories) daemon.repository_order = body.repositories as string[];
@@ -158,10 +181,12 @@ function heldWrites(method: "patch" | "put", path: string) {
 
 beforeEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
   toasts.info.mockClear();
   toasts.undo.length = 0;
   toastBus.handler = toastApi;
   writes.length = 0;
+  pluginEntries = [];
   vi.mocked(reportFeatureUse).mockClear();
   const sessions = [
     row("b2", "/r/beta", "zulu", "2025-01-02T00:00:00Z"),
@@ -178,7 +203,7 @@ beforeEach(() => {
   };
 });
 
-function mount() {
+function mount({ viewWritable = true } = {}) {
   return renderHook(() => {
     const sessions = useSessions();
     const workspaces = useWorkspaces(sessions.sessions);
@@ -186,6 +211,8 @@ function mount() {
       workspaces,
       projects: [],
       view: sessions.sidebarView,
+      polledView: sessions.polledSidebarView,
+      viewWritable,
       workspaceOrdering: sessions.workspaceOrdering,
       repositoryOrder: sessions.repositoryOrder,
       groupOrder: sessions.groupOrder,
@@ -234,7 +261,7 @@ describe("the shared sidebar view", () => {
     const held = new Promise<void>((r) => (release = r));
     server.use(
       http.patch("*/api/sidebar-view", async ({ request }) => {
-        writes.push({ method: "PATCH", body: await request.json() });
+        patchView((await request.json()) as Record<string, unknown>);
         await held;
         return HttpResponse.json({ group_by: "project", sort: "name" }, { headers: runtime(5) });
       }),
@@ -326,6 +353,193 @@ describe("the shared sidebar view", () => {
   });
 });
 
+describe("another Client's view change", () => {
+  it.each<[string, Partial<SidebarView>, string | null]>([
+    ["a TUI sort that moves the rows", { sort: "name", changed_by: "tui" }, "Sort changed in the TUI"],
+    [
+      "a TUI grouping and sort",
+      { group_by: "group", sort: "name", changed_by: "tui" },
+      "Grouping and sort changed in the TUI",
+    ],
+    ["another browser's sort", { sort: "name", changed_by: "web" }, null],
+    ["a sort that moves nothing", { sort: "newest", changed_by: "tui" }, null],
+  ])("says why the list moved only when it did: %s", async (_, change, notice) => {
+    // Custom and Newest first both put beta's header first; Name puts Alpha first.
+    daemon.sessions = [row("b1", "/r/beta", "alpha", "2025-01-02T00:00:00Z"), row("a1", "/r/Alpha", "mike")];
+    daemon.workspace_ordering = daemon.sessions.map(wsId);
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(2));
+    daemon.sidebar_view = { ...daemon.sidebar_view, ...change };
+    await pollAt(result, 2);
+    // Silence counts only once the list shows the new view.
+    await waitFor(() =>
+      expect([result.current.model.groupBy, result.current.model.sort]).toEqual([
+        change.group_by ?? "project",
+        change.sort ?? "custom",
+      ]),
+    );
+    expect(toasts.info.mock.calls).toEqual(notice ? [[notice]] : []);
+  });
+
+  it("names the TUI for a change it made while this browser's write held the list", async () => {
+    // Custom puts mike first and Name puts alpha first, under either grouping.
+    daemon.sessions = [row("b1", "/r/beta", "alpha"), row("a1", "/r/Alpha", "mike")];
+    daemon.workspace_ordering = ["/r/Alpha::a1", "/r/beta::b1"];
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(2));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    server.use(
+      http.patch("*/api/sidebar-view", async ({ request }) => {
+        daemon.sidebar_view = patchView((await request.json()) as Record<string, unknown>);
+        daemon.revision = 2;
+        await held;
+        return HttpResponse.json(daemon.sidebar_view, { headers: runtime(2) });
+      }),
+    );
+    act(() => result.current.model.selectGroupBy("group"));
+    await waitFor(() => expect(daemon.revision).toBe(2));
+    // The TUI changes the sort before this browser has its receipt, so the read is held off the list.
+    daemon.sidebar_view = { ...daemon.sidebar_view, sort: "name", changed_by: "tui" };
+    await pollAt(result, 3);
+    expect(result.current.model.sort).toBe("custom");
+    await act(async () => release());
+    await pollAt(result, 4);
+    await waitFor(() => expect(result.current.model.sort).toBe("name"));
+    expect(toasts.info.mock.calls).toEqual([["Sort changed in the TUI"]]);
+  });
+
+  it("does not blame the TUI for this browser's refused pick falling back", async () => {
+    daemon.sidebar_view = { group_by: "project", sort: "custom", changed_by: "tui" };
+    server.use(http.patch("*/api/sidebar-view", () => new HttpResponse(null, { status: 500 })));
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    const before = rows(result);
+    await act(async () => result.current.model.selectSort("name"));
+    await waitFor(() => expect(rows(result)).not.toEqual(before));
+    await pollAt(result, 2);
+    await waitFor(() => expect(rows(result)).toEqual(before));
+    expect(toasts.info.mock.calls).toEqual([]);
+  });
+});
+
+describe("plugin sorts", () => {
+  beforeEach(() => {
+    pluginEntries = [
+      { plugin_id: "p", slot: "sort-key", id: "cost", payload: { label: "Cost", column: "cost" } },
+    ] as PluginUiEntry[];
+  });
+
+  it("marks a plugin sort on the Daemon and clears it when a built-in sort is picked", async () => {
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    act(() => result.current.model.selectPluginSort({ pluginId: "p", entryId: "cost" }));
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBe("Cost"));
+    // Back to the shared sort it was layered over.
+    act(() => result.current.model.selectSort("custom"));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    act(() => result.current.model.selectPluginSort({ pluginId: "p", entryId: "cost" }));
+    act(() => result.current.model.selectSort("name"));
+    await waitFor(() => expect(writes).toHaveLength(4));
+    expect(writes.map((w) => w.body)).toEqual([
+      { web_plugin_sort: "Cost" },
+      { web_plugin_sort: null },
+      { web_plugin_sort: "Cost" },
+      { sort: "name" },
+    ]);
+    expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined();
+  });
+
+  it("clears this browser's marker when its page unloads or the plugin goes away", async () => {
+    const { result, rerender } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    act(() => result.current.model.selectPluginSort({ pluginId: "p", entryId: "cost" }));
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBe("Cost"));
+    expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBe("Cost");
+    const sent = vi.spyOn(globalThis, "fetch");
+    window.dispatchEvent(new Event("pagehide"));
+    expect(sent.mock.calls.map(([url, init]) => [url, init?.keepalive])).toEqual([["/api/sidebar-view", true]]);
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined());
+    sent.mockRestore();
+    daemon.sidebar_view.web_plugin_sort = "Cost";
+
+    pluginEntries = [];
+    rerender();
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined());
+    expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBeNull();
+  });
+
+  it.each<[string, string | undefined, boolean]>([
+    ["clears a marker this tab set before a reload", "Cost", true],
+    ["leaves another browser's marker", "Tokens", false],
+    ["writes nothing when the Daemon dropped it", undefined, false],
+  ])("on load %s", async (_, onDaemon, cleared) => {
+    sessionStorage.setItem("aoe-web-plugin-sort-marker", "Cost");
+    daemon.sidebar_view = { ...daemon.sidebar_view, web_plugin_sort: onDaemon };
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    await pollAt(result, 2);
+    expect(writes.map((w) => w.body)).toEqual(cleared ? [{ web_plugin_sort: null }] : []);
+    expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBeNull();
+  });
+
+  it("retries a marker write that failed on the next read", async () => {
+    let refused = false;
+    server.use(
+      http.patch(
+        "*/api/sidebar-view",
+        () => {
+          refused = true;
+          return new HttpResponse(null, { status: 500 });
+        },
+        { once: true },
+      ),
+    );
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    act(() => result.current.model.selectPluginSort({ pluginId: "p", entryId: "cost" }));
+    await waitFor(() => expect(refused).toBe(true));
+    await act(async () => {});
+    expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined();
+    await pollAt(result, 2);
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBe("Cost"));
+  });
+
+  it("retries a failed clear of a marker this tab set before a reload", async () => {
+    sessionStorage.setItem("aoe-web-plugin-sort-marker", "Cost");
+    daemon.sidebar_view = { ...daemon.sidebar_view, web_plugin_sort: "Cost" };
+    let refused = false;
+    server.use(
+      http.patch(
+        "*/api/sidebar-view",
+        () => {
+          refused = true;
+          return new HttpResponse(null, { status: 500 });
+        },
+        { once: true },
+      ),
+    );
+    const { result } = mount();
+    await waitFor(() => expect(refused).toBe(true));
+    await act(async () => {});
+    expect(daemon.sidebar_view.web_plugin_sort).toBe("Cost");
+    expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBe("Cost");
+    await pollAt(result, 2);
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined());
+    await waitFor(() => expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBeNull());
+  });
+
+  it("writes no marker where the Daemon refuses view changes", async () => {
+    const { result } = mount({ viewWritable: false });
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    act(() => result.current.model.selectPluginSort({ pluginId: "p", entryId: "cost" }));
+    expect(result.current.model.pluginSortRef).toEqual({ pluginId: "p", entryId: "cost" });
+    act(() => result.current.model.selectSort("custom"));
+    await pollAt(result, 2);
+    expect(writes).toEqual([]);
+  });
+});
+
 describe("sorts", () => {
   it("orders rows by title and headers by name under Name, ignoring case", async () => {
     daemon.sidebar_view = { group_by: "project", sort: "name" };
@@ -402,7 +616,7 @@ describe("the shared Custom order", () => {
     const before = [...daemon.workspace_ordering];
     server.use(
       http.patch("*/api/sidebar-view", async ({ request }) => {
-        writes.push({ method: "PATCH", body: await request.json() });
+        patchView((await request.json()) as Record<string, unknown>);
         return new HttpResponse(null, { status: 422 });
       }),
     );
@@ -526,7 +740,7 @@ describe("write order", () => {
     await act(async () => releases[2]!());
     expect(writes.map((w) => w.body)).toEqual([{ sort: "name" }, { group_by: "group" }, { sort: "custom" }]);
     await pollAt(result, 10);
-    expect(daemon.sidebar_view).toEqual({ group_by: "group", sort: "custom" });
+    expect(daemon.sidebar_view).toEqual({ group_by: "group", sort: "custom", changed_by: "web" });
     await waitFor(() => expect(result.current.model.sort).toBe("custom"));
   });
 

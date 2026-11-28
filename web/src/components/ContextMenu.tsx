@@ -191,6 +191,7 @@ export function MenuItem({
   role,
   checked,
   disabled,
+  disabledBy,
   tabIndex,
   ariaExpanded,
   ariaControls,
@@ -208,6 +209,9 @@ export function MenuItem({
   role?: "menuitem" | "menuitemradio" | "menuitemcheckbox";
   checked?: boolean;
   disabled?: boolean;
+  /** The id of a line saying why the item is unavailable. Unlike `disabled`, the item stays focusable and
+   *  announced, as aria-disabled and described by that line, and a click does nothing. */
+  disabledBy?: string;
   tabIndex?: number;
   /** For an item that discloses a group, e.g. "More". */
   ariaExpanded?: boolean;
@@ -222,19 +226,22 @@ export function MenuItem({
 }) {
   const detailId = useId();
   const base = danger ? MENU_ITEM_DANGER : MENU_ITEM;
+  const look = indent ? base.replace("px-3", "pl-6 pr-3") : base;
+  const describedBy = [disabledBy, detail ? detailId : undefined].filter(Boolean).join(" ");
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={disabledBy ? undefined : onClick}
       data-testid={testId}
       role={role}
       aria-checked={checked}
       disabled={disabled}
+      aria-disabled={disabledBy ? true : undefined}
       tabIndex={tabIndex}
       aria-expanded={ariaExpanded}
       aria-controls={ariaControls}
-      aria-describedby={detail ? detailId : undefined}
-      className={`${indent ? base.replace("px-3", "pl-6 pr-3") : base} ${className}`.trimEnd()}
+      aria-describedby={describedBy || undefined}
+      className={`${disabledBy ? `${look.replace("cursor-pointer", "cursor-not-allowed")} opacity-40` : look} ${className}`.trimEnd()}
     >
       {icon != null && (
         <span className="flex shrink-0 [&>*]:size-4 max-md:[&>*]:size-[18px]" aria-hidden="true">
@@ -289,6 +296,7 @@ export function DropdownMenu({
   id,
   label,
   labelledBy,
+  describedBy,
   testId,
   className,
   style,
@@ -301,6 +309,8 @@ export function DropdownMenu({
   id?: string;
   label?: string;
   labelledBy?: string;
+  /** A line inside the menu that says why its choices are unavailable. */
+  describedBy?: string;
   testId?: string;
   /** Position, width and height cap. */
   className: string;
@@ -334,6 +344,7 @@ export function DropdownMenu({
       role="menu"
       aria-label={label}
       aria-labelledby={labelledBy}
+      aria-describedby={describedBy}
       data-testid={testId}
       data-owns-escape="open"
       onKeyDown={onKeyDown}

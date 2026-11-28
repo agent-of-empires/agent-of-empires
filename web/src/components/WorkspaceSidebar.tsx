@@ -42,6 +42,7 @@ import { SessionRow } from "./sidebar/SessionRow";
 import { SidebarSuggestions } from "./sidebar/SidebarSuggestions";
 import { FacetPanel, SidebarToolbar } from "./sidebar/SidebarToolbar";
 import { SidebarNav } from "./sidebar/SidebarNav";
+import { NewGroupDialog } from "./sidebar/NewGroupDialog";
 import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
@@ -86,6 +87,8 @@ interface Props {
   onSelect: (workspaceId: string, sessionId: string | null) => void;
   onToggleGroup: (groupId: string) => void;
   onNew: (prefill?: { group?: string }) => void;
+  /** Reloads the list once New group has moved its Sessions. */
+  onGroupCreated?: () => void;
   /** Opens the command palette from the sidebar's Search row. */
   onOpenPalette?: () => void;
   /** Phone: the list is a drawer from the left, opened and closed through `open`. */
@@ -160,6 +163,7 @@ export function WorkspaceSidebar(props: Props) {
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
   const [facetOpen, setFacetOpen] = useState(false);
+  const [newGroupOpen, setNewGroupOpen] = useState(false);
   // A momentary triage view of this browser, so it is in memory only and clears with the filter panel.
   const [needsYou, setNeedsYou] = useState(false);
   const pluginAttention = usePluginAttention();
@@ -283,6 +287,11 @@ export function WorkspaceSidebar(props: Props) {
   // Rows reorder within their header and headers among themselves, but not while a plugin sort or facet decides
   // which rows show. A header drag also waits for any filter, which hides headers.
   const viewLocked = !!readOnly || props.canArrangeView === false;
+  const lockReason = readOnly
+    ? "This Daemon is read-only."
+    : props.canArrangeView === false
+      ? "Managed by CityHall."
+      : null;
   const pluginDecides = pluginSortActive || facets.activeFacets.length > 0;
   const rowsDisabled = viewLocked || pluginDecides;
   const drag: DragOptions = {
@@ -324,10 +333,11 @@ export function WorkspaceSidebar(props: Props) {
   };
 
   // A phone lists sessions as Muse does, in a drawer under the page, which slides aside to uncover it and hides once
-  // it has slid back. It runs the full height on a solid colour, which iOS 26 extends under its bars.
+  // it has slid back. It runs the full height on a solid colour, which iOS 26 extends under its bars. Only hiding is
+  // delayed: a visibility transition starts hidden, so an opening one would refuse focus for its first frame.
   const phoneClass = props.drawer
-    ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 max-md:transition-[visibility] ${DRAWER_MOTION} ${
-        open ? "" : "max-md:invisible"
+    ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 ${
+        open ? "" : `max-md:invisible max-md:transition-[visibility] ${DRAWER_MOTION}`
       }`
     : "max-md:hidden";
   return (
@@ -360,7 +370,11 @@ export function WorkspaceSidebar(props: Props) {
               sort={props.sort}
               onGroupByChange={props.onGroupByChange}
               onSortChange={props.onSortChange}
-              viewLocked={viewLocked}
+              lockReason={lockReason}
+              // CityHall allows creating Groups.
+              onNewGroup={() => setNewGroupOpen(true)}
+              newGroupDisabled={offline}
+              newGroupLocked={!!readOnly}
               pluginSorts={pluginSorts}
               pluginSortRef={props.pluginSortRef}
               onPluginSortChange={props.onPluginSortChange}
@@ -591,6 +605,18 @@ export function WorkspaceSidebar(props: Props) {
           )}
         </div>
       </div>
+      {newGroupOpen && (
+        <NewGroupDialog
+          sessions={[...new Map(rows.flatMap((v) => v.workspace.sessions).map((s) => [s.id, s])).values()]}
+          selectedId={activeSessionId}
+          structuredOnly={props.canArrangeView === false}
+          onCancel={() => setNewGroupOpen(false)}
+          onCreated={() => {
+            setNewGroupOpen(false);
+            props.onGroupCreated?.();
+          }}
+        />
+      )}
       {/* Hidden with the panel so no dead drag bar lingers when the sidebar is closed. On a touch screen the
          pseudo-element widens the hit area outward, clear of the rows, and touch-action lets it drag instead of scroll. */}
       <div

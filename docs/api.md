@@ -419,10 +419,65 @@ a disconnect does not cancel admitted work or authorize replay.
 ## PATCH /api/sidebar-view
 
 Change the one sidebar grouping and sort the Daemon owns. The body is
-`{"group_by": "project" | "group", "sort": "custom" | "newest" | "name"}`; an
-omitted field keeps its value. The response is the whole value, with the mutation
-receipt headers, and every Client receives it as `sidebar_view` in the runtime
-snapshot and shows it. Refused under `--read-only` and in CityHall mode.
+
+```json
+{
+  "group_by": "project" | "group",
+  "sort": "custom" | "newest" | "name",
+  "client": "tui" | "web",
+  "web_plugin_sort": "Cost" | null
+}
+```
+
+An omitted field keeps its value; unknown fields are refused with 422. The
+response is the whole value, with the mutation receipt headers, and every Client
+receives it as `sidebar_view` in the runtime snapshot and shows it. Refused under
+`--read-only` and in CityHall mode.
+
+- `client` names the sending Client's kind. When the patch changes the grouping
+  or the sort, the Daemon records it as `changed_by`; a patch that changes
+  neither keeps the previous `changed_by`. A Client uses `changed_by` to say why
+  its list moved, and stays silent when it names its own kind.
+- `web_plugin_sort` is the label (1 to 64 characters, else 400) of a plugin sort
+  a web dashboard applies in place of `sort`. Plugin sorts run only in browsers,
+  so other Clients keep `sort` and may say a plugin sort is on. `null` clears
+  it, and so does a patch with `"client": "web"` that sets `sort` without
+  `web_plugin_sort`; an explicit `web_plugin_sort` in the same patch wins. The Daemon
+  keeps it in memory only, so a restart clears it; the browser that set it
+  clears it when its page unloads, or on its next load if that clear was lost.
+  With several browsers the marker is the last one set, and any of them can clear it.
+
+The value as published:
+
+```json
+{ "group_by": "project", "sort": "custom", "changed_by": "web", "web_plugin_sort": "Cost" }
+```
+
+`changed_by` and `web_plugin_sort` are omitted while unset.
+
+## POST /api/groups
+
+Create a Group. The body is
+
+```json
+{ "profile": "default", "path": "work/api", "sessions": ["<session id>"] }
+```
+
+With `sessions`, the Group is created and those Sessions, all in `profile`, move
+into it in one commit, so it never exists empty. Duplicates are ignored. The
+response is `201 {"ok": true}` with the mutation receipt headers.
+
+| Status | `AoE-Error-Code` | Meaning |
+| --- | --- | --- |
+| `400` | `group_sessions_required` | `sessions` is present but empty. |
+| `403` | `read_only` | The Daemon runs `--read-only`. |
+| `403` | | CityHall mode and a named Session is not in Structured view. |
+| `404` | | The profile, or a named Session in it, does not exist. |
+| `409` | `session_trashed` | A named Session is in the Trash. |
+| `409` | | The Group already exists, or a named Session is being created or deleted. |
+
+Nothing is written when a request is refused. Without `sessions`, an empty Group
+is created; `aoe group create` does this.
 
 ## GET /api/sessions
 
@@ -453,8 +508,8 @@ The response is an object, not a bare array:
   workspace's position in this list.
 - `repository_order`: repository paths in the shared Custom order of the
   Repository headers; headers not listed come first, newest first.
-- `sidebar_view`: the grouping and sort every Client shows (see
-  `PATCH /api/sidebar-view`).
+- `sidebar_view`: the grouping and sort every Client shows, with who changed
+  them last and any web plugin sort (see `PATCH /api/sidebar-view`).
 - `group_order`: each profile's Group paths, nested ones included, in the
   Custom order of its Group headers (its `groups.json` order). Siblings keep
   their relative order in the list; `POST /api/reorder` moves one a slot, after

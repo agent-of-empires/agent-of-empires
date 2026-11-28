@@ -21,9 +21,9 @@ use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
     DeleteDialogConfig, DialogResult, GroupDeleteOptions, GroupDeleteOptionsDialog,
     HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction,
-    PaletteAction, PaletteCommand, PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog,
-    RenameMode, RepoTrustAction, RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome,
-    UnifiedDeleteDialog, WorktreeNameDialog,
+    PaletteAction, PaletteCommand, PaletteGroup, Pick, ProfilePickerAction, ProjectsDialog,
+    RenameDialog, RenameMode, RepoTrustAction, RestartDialog, SendMessageDialog, TipsDialog,
+    TipsOutcome, UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::dialogs::{DashboardLaunch, ServeAction, ServeView};
 use crate::tui::diff::{DiffAction, DiffView};
@@ -2039,6 +2039,11 @@ impl HomeView {
             self.press_dialog_key(key);
             return true;
         }
+        if let Some(dialog) = &mut self.new_group_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
         if let Some(dialog) = &mut self.restart_dialog {
             let _ = dialog.handle_click(col, row);
             return true;
@@ -2061,10 +2066,11 @@ impl HomeView {
         if let Some(dialog) = &mut self.sort_picker_dialog {
             match dialog.handle_click(col, row) {
                 DialogResult::Continue => {}
-                DialogResult::Cancel => {
+                // The sort picker has no action entry.
+                DialogResult::Cancel | DialogResult::Submit(Pick::Action) => {
                     self.sort_picker_dialog = None;
                 }
-                DialogResult::Submit(order) => {
+                DialogResult::Submit(Pick::Option(order)) => {
                     self.sort_picker_dialog = None;
                     self.apply_sort_order(order);
                 }
@@ -2077,11 +2083,15 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.group_picker_dialog = None;
                 }
-                DialogResult::Submit(mode) => {
+                DialogResult::Submit(Pick::Option(mode)) => {
                     self.group_picker_dialog = None;
                     if mode != self.group_by {
                         self.apply_group_by(mode);
                     }
+                }
+                DialogResult::Submit(Pick::Action) => {
+                    self.group_picker_dialog = None;
+                    self.open_new_group_dialog();
                 }
             }
             return true;
@@ -2931,6 +2941,21 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.new_group_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => self.new_group_dialog = None,
+                DialogResult::Submit(data) => match self.create_group_with_sessions(data) {
+                    Ok(()) => self.new_group_dialog = None,
+                    Err(error) => {
+                        self.info_dialog =
+                            Some(InfoDialog::new("New Group Failed", &error.to_string()))
+                    }
+                },
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.restart_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -2996,11 +3021,15 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.group_picker_dialog = None;
                 }
-                DialogResult::Submit(mode) => {
+                DialogResult::Submit(Pick::Option(mode)) => {
                     self.group_picker_dialog = None;
                     if mode != self.group_by {
                         self.apply_group_by(mode);
                     }
+                }
+                DialogResult::Submit(Pick::Action) => {
+                    self.group_picker_dialog = None;
+                    self.open_new_group_dialog();
                 }
             }
             return None;
@@ -3041,10 +3070,11 @@ impl HomeView {
         if let Some(dialog) = &mut self.sort_picker_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
-                DialogResult::Cancel => {
+                // The sort picker has no action entry.
+                DialogResult::Cancel | DialogResult::Submit(Pick::Action) => {
                     self.sort_picker_dialog = None;
                 }
-                DialogResult::Submit(order) => {
+                DialogResult::Submit(Pick::Option(order)) => {
                     self.sort_picker_dialog = None;
                     self.apply_sort_order(order);
                 }
@@ -5254,31 +5284,78 @@ impl HomeView {
         let Some(view) = self
             .session_feed
             .applied_snapshot()
-            .map(|snapshot| snapshot.contents.sidebar_view)
+            .map(|snapshot| snapshot.contents.sidebar_view.clone())
         else {
             self.observed_sidebar_view = None;
             return false;
         };
-        self.observed_sidebar_view = Some(view);
-        if (view.group_by, view.sort) == (self.group_by, self.sort_order) {
-            return false;
-        }
-        self.show_sidebar_view(view.group_by, view.sort);
-        true
+        let seen = self.observed_sidebar_view.replace(view.clone());
+        self.follow_sidebar_view(&view, seen.as_ref())
     }
 
     /// Follow the Daemon's grouping and sort when a snapshot changes it, unless this view's
     /// own change is still on its way there.
     pub(super) fn adopt_sidebar_view(&mut self, view: crate::session::config::SidebarView) {
+        self.web_plugin_sort = view.web_plugin_sort.is_some();
         // Pending first: a value seen while this view's write is in flight stays unrecorded,
         // so the next snapshot still counts as a change.
         if self.session_feed.sidebar_view_pending()
-            || self.observed_sidebar_view.replace(view) == Some(view)
-            || (view.group_by == self.group_by && view.sort == self.sort_order)
+            || self.observed_sidebar_view.as_ref() == Some(&view)
         {
             return;
         }
+        let seen = self.observed_sidebar_view.replace(view.clone());
+        self.follow_sidebar_view(&view, seen.as_ref());
+    }
+
+    /// Show the Daemon's grouping and sort, saying which Client changed them when another
+    /// kind of Client did and the list on screen moved. Only a change from `seen`, the value
+    /// last observed, is named, so a refused local pick falling back is not blamed on a peer.
+    /// Returns whether anything changed.
+    pub(super) fn follow_sidebar_view(
+        &mut self,
+        view: &crate::session::config::SidebarView,
+        seen: Option<&crate::session::config::SidebarView>,
+    ) -> bool {
+        use crate::session::config::ClientKind;
+        if (view.group_by, view.sort) == (self.group_by, self.sort_order) {
+            return false;
+        }
+        let before = self.visible_list();
+        let shown = (self.group_by, self.sort_order);
         self.show_sidebar_view(view.group_by, view.sort);
+        let place = match view.changed_by {
+            Some(ClientKind::Web) => "on the web",
+            Some(ClientKind::Tui) | None => return true,
+        };
+        let Some(seen) = seen else {
+            return true;
+        };
+        // Name only what moved on screen and since `seen`; a local pick already showing a value
+        // is not the peer's change.
+        let grouping = seen.group_by != view.group_by && shown.0 != view.group_by;
+        let sort = seen.sort != view.sort && shown.1 != view.sort;
+        if (grouping || sort) && self.visible_list() != before {
+            let what = match (grouping, sort) {
+                (true, true) => "Grouping and sort",
+                (true, false) => "Grouping",
+                _ => "Sort",
+            };
+            self.flash_status(format!("{what} changed {place}"));
+        }
+        true
+    }
+
+    /// The rows and headers on screen, in order.
+    fn visible_list(&self) -> Vec<(bool, Option<String>, String)> {
+        self.flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Group { path, profile, .. } => Some((true, profile.clone(), path.clone())),
+                Item::Session { id, .. } => Some((false, None, id.clone())),
+                Item::Suggested { .. } => None,
+            })
+            .collect()
     }
 
     /// Info-dialog copy for a rename/delete attempted on a header under the Repository grouping.
@@ -6934,6 +7011,9 @@ impl HomeView {
         if let Some(dialog) = &mut self.sandbox_login_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
+        if let Some(dialog) = &mut self.new_group_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
         if let Some(dialog) = &mut self.send_message_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
@@ -7145,6 +7225,10 @@ impl HomeView {
             return;
         }
         if let Some(ref mut dialog) = self.sandbox_login_dialog {
+            dialog.handle_paste(text);
+            return;
+        }
+        if let Some(ref mut dialog) = self.new_group_dialog {
             dialog.handle_paste(text);
             return;
         }
@@ -7969,6 +8053,10 @@ impl HomeView {
             return;
         }
         if let Some(ref mut dialog) = self.sandbox_login_dialog {
+            dialog.handle_paste(&s);
+            return;
+        }
+        if let Some(ref mut dialog) = self.new_group_dialog {
             dialog.handle_paste(&s);
             return;
         }

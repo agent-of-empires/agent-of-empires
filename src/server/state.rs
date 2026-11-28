@@ -147,6 +147,8 @@ pub struct AppState {
     pub(crate) reload_lane: tokio::sync::Mutex<()>,
     /// Orders sidebar view commits without holding `publication` across the storage write.
     pub(crate) sidebar_view_lane: Arc<tokio::sync::Mutex<()>>,
+    /// The web plugin sort marker, kept out of `state.toml` so a Daemon restart drops it.
+    pub(crate) web_plugin_sort: std::sync::Mutex<Option<String>>,
     pub(crate) canonical_metadata: RwLock<super::reload::CanonicalMetadata>,
     pub(crate) canonical_health: RwLock<crate::daemon::RuntimeHealth>,
     pub(crate) canonical_diagnostics: std::sync::RwLock<Vec<crate::daemon::OwnerLoadDiagnostic>>,
