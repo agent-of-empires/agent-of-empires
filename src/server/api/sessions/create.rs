@@ -2456,26 +2456,48 @@ fn not_running(runtime: &str) -> String {
 #[cfg(test)]
 pub(super) mod panic_hook {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::sync::Notify;
 
-    static GATE: Mutex<Option<(String, Arc<Notify>)>> = Mutex::new(None);
+    #[derive(Default)]
+    pub(in crate::server::api::sessions) struct Gate {
+        entered: Notify,
+        release: Notify,
+    }
 
-    pub(in crate::server::api::sessions) fn arm(key: &str) -> Arc<Notify> {
-        let release = Arc::new(Notify::new());
-        *GATE.lock().unwrap() = Some((key.to_owned(), Arc::clone(&release)));
-        release
+    impl Gate {
+        pub(in crate::server::api::sessions) async fn wait_until_entered(&self) {
+            tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
+                .await
+                .expect("detached create did not reach the panic gate");
+        }
+
+        pub(in crate::server::api::sessions) fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    static GATE: Mutex<Option<(String, Arc<Gate>)>> = Mutex::new(None);
+
+    pub(in crate::server::api::sessions) fn arm(key: &str) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        *GATE.lock().unwrap() = Some((key.to_owned(), Arc::clone(&gate)));
+        gate
     }
 
     pub(super) async fn fire(key: Option<&str>) {
-        let release = {
+        let armed = {
             let mut gate = GATE.lock().unwrap();
             match gate.as_ref() {
-                Some((armed, _)) if Some(armed.as_str()) == key => gate.take().map(|(_, r)| r),
+                Some((armed, _)) if Some(armed.as_str()) == key => {
+                    gate.take().map(|(_, gate)| gate)
+                }
                 _ => None,
             }
         };
-        if let Some(release) = release {
-            release.notified().await;
+        if let Some(gate) = armed {
+            gate.entered.notify_one();
+            gate.release.notified().await;
             panic!("create panic injected by test");
         }
     }
