@@ -41,7 +41,7 @@ concurrency:
 jobs:
   plan:
     name: Pick systems
-    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-plan-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-plan-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -76,7 +76,7 @@ jobs:
   cachix:
     name: Build and push (${{ matrix.system }})
     needs: plan
-    runs-on: ${{ matrix.system == 'macos' && 'macos-latest' || (vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-{1}/runner=4cpu-linux-x64/family=m8a+m8i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt)) }}
+    runs-on: ${{ matrix.system == 'macos' && 'macos-latest' || (vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-{1}/runner=4cpu-linux-x64/family=m8a+m8i+m7i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt)) }}
     permissions:
       contents: read
     strategy:
@@ -111,7 +111,7 @@ jobs:
     # or nightly run here otherwise goes unseen (#3217). A dispatch failure is
     # already in front of whoever started it.
     if: failure() && github.event_name != 'workflow_dispatch'
-    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-notify-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-notify-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
     permissions:
       actions: read
       contents: read
