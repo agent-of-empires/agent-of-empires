@@ -142,7 +142,9 @@ impl NewGroupDialog {
             self.list_focused = false;
             return None;
         }
-        if let Some(line) = super::row_index(self.list_area, col, row, LIST_ROWS as usize) {
+        if let Some(line) =
+            super::row_index(self.list_area, col, row, self.list_area.height as usize)
+        {
             let idx = self.scroll + line;
             if idx < self.candidates.len() {
                 self.list_focused = true;
@@ -196,7 +198,8 @@ impl NewGroupDialog {
             label,
         );
 
-        let rows = LIST_ROWS as usize;
+        // A short terminal shrinks the list below LIST_ROWS; scroll by what is drawn.
+        let rows = (list.height as usize).max(1);
         if self.cursor < self.scroll {
             self.scroll = self.cursor;
         } else if self.cursor >= self.scroll + rows {
@@ -310,5 +313,30 @@ mod tests {
                 (_, expected) => panic!("{keys:?}: expected {expected:?}"),
             }
         }
+    }
+
+    /// On a short terminal the list shows fewer rows, and the cursor's row stays drawn.
+    #[test]
+    fn a_short_terminal_keeps_the_cursor_row_in_view() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let candidates = (0..12)
+            .map(|i| (format!("id{i}"), format!("session-{i:02}")))
+            .collect();
+        let mut d = NewGroupDialog::new("default".into(), candidates, Vec::new(), None);
+        d.handle_key(key(Tab));
+        d.handle_key(key(KeyCode::End));
+        let mut terminal = Terminal::new(TestBackend::new(48, 12)).unwrap();
+        terminal
+            .draw(|frame| d.render(frame, frame.area(), &Theme::default()))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(d.list_area.height < LIST_ROWS, "{}", d.list_area.height);
+        assert!(screen.contains("session-11"), "{screen}");
     }
 }

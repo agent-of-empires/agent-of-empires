@@ -1668,20 +1668,35 @@ mod tests {
     }
 
     /// `POST /api/groups` with `sessions` creates the Group and moves them in one commit,
-    /// and refuses, leaving storage untouched, when none is named or policy forbids it.
+    /// and refuses, leaving storage untouched, when none is named, one is missing or in the
+    /// Trash, or policy forbids it.
     #[tokio::test]
     #[serial_test::serial]
     async fn native_group_create_moves_its_sessions_in_one_commit() -> Result<()> {
         use axum::http::StatusCode;
         use tower::ServiceExt;
-        for (name, read_only, cityhall, structured, path, sessions, expected, code) in [
+        // (case, read-only, CityHall, moving is structured, peer is trashed, path, members,
+        // status, error code)
+        type Case = (
+            &'static str,
+            bool,
+            bool,
+            bool,
+            bool,
+            &'static str,
+            &'static [&'static str],
+            StatusCode,
+            Option<&'static str>,
+        );
+        let cases: [Case; 9] = [
             (
                 "read-only",
                 true,
                 false,
                 false,
+                false,
                 "created",
-                Some(true),
+                &["moving"],
                 StatusCode::FORBIDDEN,
                 Some("read_only"),
             ),
@@ -1690,8 +1705,9 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
                 "created",
-                Some(true),
+                &["moving"],
                 StatusCode::FORBIDDEN,
                 None,
             ),
@@ -1700,8 +1716,9 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 "created",
-                Some(true),
+                &["moving"],
                 StatusCode::CREATED,
                 None,
             ),
@@ -1710,60 +1727,100 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 "created",
-                Some(false),
+                &[],
                 StatusCode::BAD_REQUEST,
                 Some("group_sessions_required"),
             ),
             (
-                "unknown session",
+                "a missing member keeps the valid one in place",
+                false,
                 false,
                 false,
                 false,
                 "created",
-                None,
+                &["moving", "missing"],
                 StatusCode::NOT_FOUND,
                 None,
+            ),
+            (
+                "a trashed member keeps the valid one in place",
+                false,
+                false,
+                false,
+                true,
+                "created",
+                &["moving", "peer"],
+                StatusCode::CONFLICT,
+                Some("session_trashed"),
             ),
             (
                 "existing group",
                 false,
                 false,
                 false,
+                false,
                 "team",
-                Some(true),
+                &["moving"],
                 StatusCode::CONFLICT,
                 None,
             ),
             (
-                "moved",
+                "distinct members move together",
+                false,
                 false,
                 false,
                 false,
                 "created",
-                Some(true),
+                &["moving", "peer"],
                 StatusCode::CREATED,
                 None,
             ),
-        ] {
+            (
+                "a repeated member moves once",
+                false,
+                false,
+                false,
+                false,
+                "created",
+                &["moving", "moving"],
+                StatusCode::CREATED,
+                None,
+            ),
+        ];
+        for (name, read_only, cityhall, structured, trashed, path, members, expected, code) in cases
+        {
             let _home = crate::session::test_support::isolate_app_dir();
             let (source, _, state, moving) = profile_move_fixture(read_only, cityhall).await?;
-            if structured {
-                source.update(|rows, _| {
-                    rows.iter_mut()
-                        .find(|row| row.id == moving.id)
-                        .unwrap()
-                        .view = crate::session::View::Structured;
-                    Ok(())
-                })?;
-            }
+            let peer = source
+                .load_with_groups()?
+                .0
+                .into_iter()
+                .find(|row| row.id != moving.id)
+                .unwrap()
+                .id;
+            source.update(|rows, _| {
+                for row in rows.iter_mut() {
+                    if structured && row.id == moving.id {
+                        row.view = crate::session::View::Structured;
+                    }
+                    if trashed && row.id == peer {
+                        row.trashed_at = Some(crate::time::Timestamp::now());
+                    }
+                }
+                Ok(())
+            })?;
             let snapshot = state.runtime.publish(&state).await?;
-            let sessions: Vec<&str> = match sessions {
-                Some(true) => vec![moving.id.as_str(), moving.id.as_str()],
-                Some(false) => Vec::new(),
-                None => vec!["missing"],
-            };
-            let body = serde_json::json!({"profile": "source", "path": path, "sessions": sessions});
+            let ids: Vec<&str> = members
+                .iter()
+                .map(|member| match *member {
+                    "moving" => moving.id.as_str(),
+                    "peer" => peer.as_str(),
+                    other => other,
+                })
+                .collect();
+            let body = serde_json::json!({"profile": "source", "path": path, "sessions": ids});
             let groups = source.sessions_path().with_file_name("groups.json");
             let before = (
                 std::fs::read(source.sessions_path())?,
@@ -1811,7 +1868,11 @@ mod tests {
             let (rows, stored) = source.load_with_groups()?;
             assert!(stored.iter().any(|group| group.path == "created"), "{name}");
             for row in rows {
-                let expected = if row.id == moving.id { "created" } else { "" };
+                let expected = if ids.contains(&row.id.as_str()) {
+                    "created"
+                } else {
+                    ""
+                };
                 assert_eq!(row.group_path, expected, "{name}");
             }
         }

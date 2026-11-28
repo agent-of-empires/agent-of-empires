@@ -441,7 +441,8 @@ receives it as `sidebar_view` in the runtime snapshot and shows it. Refused unde
 - `web_plugin_sort` is the label (1 to 64 characters, else 400) of a plugin sort
   a web dashboard applies in place of `sort`. Plugin sorts run only in browsers,
   so other Clients keep `sort` and may say a plugin sort is on. `null` clears
-  it, and so does a patch with `"client": "web"` that sets `sort`. The Daemon
+  it, and so does a patch with `"client": "web"` that sets `sort` without
+  `web_plugin_sort`; an explicit `web_plugin_sort` in the same patch wins. The Daemon
   keeps it in memory only, so a restart clears it; the browser that set it
   clears it when its page unloads, or on its next load if that clear was lost.
   With several browsers the marker is the last one set, and any of them can clear it.
@@ -472,6 +473,7 @@ response is `201 {"ok": true}` with the mutation receipt headers.
 | `403` | `read_only` | The Daemon runs `--read-only`. |
 | `403` | | CityHall mode and a named Session is not in Structured view. |
 | `404` | | The profile, or a named Session in it, does not exist. |
+| `409` | `session_trashed` | A named Session is in the Trash. |
 | `409` | | The Group already exists, or a named Session is being created or deleted. |
 
 Nothing is written when a request is refused. Without `sessions`, an empty Group

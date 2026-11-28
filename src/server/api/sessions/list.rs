@@ -1032,16 +1032,17 @@ async fn commit_sidebar_view(
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let publication = state.publication.write().await;
-    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    state.canonical_metadata.write().await.sidebar_view = view;
+    // The sort is saved, so its marker change applies even if the publish below is refused.
     if let Some(marker) = marker {
         *state
             .web_plugin_sort
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = marker;
     }
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    state.canonical_metadata.write().await.sidebar_view = view;
     state.runtime.request_publish();
     drop(publication);
     drop(lane);

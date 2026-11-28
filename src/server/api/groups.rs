@@ -406,6 +406,12 @@ async fn commit_group_metadata(
                             .iter()
                             .find(|row| &row.id == id)
                             .ok_or_else(|| reject(StatusCode::NOT_FOUND, "Session not found"))?;
+                        if row.is_trashed() {
+                            return Err(reject_with_code(
+                                ApiErrorCode::SessionTrashed,
+                                "Session is in the Trash",
+                            ));
+                        }
                         check_row(row, worker_state.cityhall_mode)?;
                     }
                     for row in rows
