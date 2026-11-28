@@ -38,7 +38,15 @@ curl -fsSL \
   | bash -s -- --version nightly-20261107
 ```
 
-A nightly build's update check and `aoe update` only offer newer nightlies; reinstall with the script's default channel to return to stable.
+On an install-script install, `aoe update` switches channels too:
+
+```bash
+aoe update --channel nightly                 # newest nightly
+aoe update --version nightly-20261107        # one exact release, e.g. to step back a day
+aoe update --channel stable                  # back to the newest stable
+```
+
+A nightly build's update check only offers newer nightlies. `aoe update` on a stable build mentions a newer nightly on stderr but never installs one without `--channel` or `--version`. Homebrew, Nix and Cargo installs refuse both flags.
 
 Moving to a nightly can be one-way until the next stable release. If a nightly includes a data migration, an older stable binary refuses to start against the migrated data and says so. Stepping back to an earlier nightly has the same limit. Back up your app directory first if you need a way back.
 

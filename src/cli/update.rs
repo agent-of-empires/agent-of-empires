@@ -5,9 +5,12 @@ use clap::Args;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
-use crate::update::check_for_update;
 use crate::update::install::{
     detect_install_method, format_prompt_block, parent_is_writable, perform_update, InstallMethod,
+};
+use crate::update::{
+    check_for_update, needs_migration_warning, newer_nightly, resolve_target, Channel, Target,
+    UpdateInfo,
 };
 
 #[derive(Args)]
@@ -23,15 +26,67 @@ pub struct UpdateArgs {
     /// Detect install method and print what would happen, no download
     #[arg(long)]
     dry_run: bool,
+
+    /// Switch to the newest release of a channel (tarball installs only)
+    #[arg(long, value_enum, conflicts_with = "version")]
+    channel: Option<Channel>,
+
+    /// Install one exact release, e.g. v1.25.0 or nightly-20261125 (tarball installs only)
+    #[arg(long, value_name = "TAG")]
+    version: Option<String>,
 }
+
+const MIGRATION_WARNING: &str = "WARNING: moving to a nightly or an older release may migrate \
+your data so that a stable build cannot read it until the next stable release.";
+
+const NOT_TARBALL: &str = "--channel and --version need an install-script (tarball) install. \
+Reinstall with scripts/install.sh --channel or --version; see docs/installation.md.";
 
 #[tracing::instrument(target = "cli.session", skip_all)]
 pub async fn run(args: UpdateArgs) -> Result<()> {
     let current_version = env!("CARGO_PKG_VERSION");
 
-    let info = check_for_update(current_version, true)
-        .await
-        .context("checking for updates")?;
+    let explicit = match (args.channel, args.version.clone()) {
+        (Some(channel), _) => Some(Target::Channel(channel)),
+        (None, Some(tag)) => Some(Target::Tag(tag)),
+        (None, None) => None,
+    };
+
+    // Refuse before any network call: a Homebrew or Nix user needs no release lookup to be told.
+    let early_method = if explicit.is_some() && !args.check {
+        let method = detect_install_method()?;
+        if !matches!(&method, InstallMethod::Tarball { .. }) {
+            bail!(NOT_TARBALL);
+        }
+        Some(method)
+    } else {
+        None
+    };
+
+    let info = match &explicit {
+        Some(target) => {
+            let latest_version = resolve_target(target)
+                .await
+                .context("resolving the requested release")?;
+            UpdateInfo {
+                available: latest_version != current_version,
+                current_version: current_version.to_string(),
+                latest_version,
+            }
+        }
+        None => {
+            let info = check_for_update(current_version, true)
+                .await
+                .context("checking for updates")?;
+            if let Some(nightly) = newer_nightly(current_version).await {
+                eprintln!(
+                    "A newer nightly is available (v{nightly}, less tested than a stable \
+                     release): aoe update --channel nightly"
+                );
+            }
+            info
+        }
+    };
 
     if args.check {
         println!("current: {}", info.current_version);
@@ -41,14 +96,15 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     }
 
     if !info.available {
-        println!(
-            "You're on v{} (latest). Nothing to do.",
-            info.current_version
-        );
+        let note = if explicit.is_some() { "" } else { " (latest)" };
+        println!("You're on v{}{note}. Nothing to do.", info.current_version);
         return Ok(());
     }
 
-    let method = detect_install_method()?;
+    let method = match early_method {
+        Some(method) => method,
+        None => detect_install_method()?,
+    };
 
     if matches!(
         &method,
@@ -67,6 +123,9 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         needs_sudo,
     );
     println!("{prompt}\n");
+    if needs_migration_warning(&info.current_version, &info.latest_version) {
+        println!("{MIGRATION_WARNING}\n");
+    }
 
     if args.dry_run {
         println!("(dry run; not downloading)");

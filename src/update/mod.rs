@@ -2,7 +2,7 @@
 
 pub mod install;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -158,11 +158,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
         }
     }
 
-    let client = crate::github::GitHubClient::unauthenticated(crate::github::GitHubClientConfig {
-        api_base: github_api_base(),
-        user_agent: crate::github::DEFAULT_USER_AGENT.to_string(),
-        timeout: std::time::Duration::from_secs(5),
-    })?;
+    let client = github_client()?;
 
     let releases = match fetch_releases(&client, current_version).await {
         Ok(r) => r,
@@ -228,21 +224,108 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
     })
 }
 
+fn github_client() -> Result<crate::github::GitHubClient> {
+    Ok(crate::github::GitHubClient::unauthenticated(
+        crate::github::GitHubClientConfig {
+            api_base: github_api_base(),
+            user_agent: crate::github::DEFAULT_USER_AGENT.to_string(),
+            timeout: std::time::Duration::from_secs(5),
+        },
+    )?)
+}
+
 #[tracing::instrument(target = "update.fetch", skip_all)]
 async fn fetch_releases(
     client: &crate::github::GitHubClient,
     current_version: &str,
 ) -> Result<Vec<ReleaseInfo>> {
     let releases = client.list_releases(GITHUB_OWNER, GITHUB_REPO, 20).await?;
-    Ok(channel_releases(releases, current_version))
+    Ok(channel_releases(releases, is_nightly(current_version)))
 }
 
-/// Stable builds only see stable releases, nightly builds only nightlies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Channel {
+    Stable,
+    Nightly,
+}
+
+/// An explicit `aoe update` destination: a channel's newest release, or one exact tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Channel(Channel),
+    Tag(String),
+}
+
+/// Version of the release `target` names, read live (never from the update cache).
+#[tracing::instrument(target = "update.fetch", skip_all)]
+pub async fn resolve_target(target: &Target) -> Result<String> {
+    let client = github_client()?;
+    let release = match target {
+        // `releases/latest` never returns a prerelease.
+        Target::Channel(Channel::Stable) => Some(release_info_from(
+            client.latest_release(GITHUB_OWNER, GITHUB_REPO).await?,
+        )),
+        Target::Channel(Channel::Nightly) => {
+            let releases = client.list_releases(GITHUB_OWNER, GITHUB_REPO, 100).await?;
+            channel_releases(releases, true).into_iter().next()
+        }
+        Target::Tag(tag) => {
+            let release = client
+                .release_by_tag(GITHUB_OWNER, GITHUB_REPO, &release_tag_for(tag))
+                .await
+                .with_context(|| format!("no release found for {tag}"))?;
+            let info = (!release.draft).then(|| release_info_from(release));
+            // A nightly tag carries only its date, so a typed full version must match the release.
+            if let Some(info) = &info {
+                let typed = tag.trim_start_matches('v');
+                if typed.contains("-nightly.") && info.version != typed {
+                    anyhow::bail!("no release found for {tag}");
+                }
+            }
+            info
+        }
+    };
+    release
+        .filter(|r| parse_version(&r.version).is_some())
+        .map(|r| r.version)
+        .with_context(|| match target {
+            Target::Channel(channel) => format!("no {channel:?} release found").to_lowercase(),
+            Target::Tag(tag) => format!("no release found for {tag}"),
+        })
+}
+
+/// The release tag a user-typed `--version` names: a `nightly-*` tag as is, otherwise a
+/// version (`1.25.0`, `v1.25.0`, `1.26.1-nightly.20261127`) mapped like `release_tag`.
+fn release_tag_for(input: &str) -> String {
+    if input.starts_with(NIGHTLY_TAG_PREFIX) {
+        input.to_string()
+    } else {
+        release_tag(input)
+    }
+}
+
+/// Newest nightly that is ahead of a stable `current_version`; `None` on any failure.
+pub async fn newer_nightly(current_version: &str) -> Option<String> {
+    if is_nightly(current_version) || !get_update_settings().update_check_mode.is_enabled() {
+        return None;
+    }
+    resolve_target(&Target::Channel(Channel::Nightly))
+        .await
+        .ok()
+        .filter(|v| is_newer_version(v, current_version))
+}
+
+/// Stable to nightly, or any downgrade, may leave data an older binary cannot read.
+pub fn needs_migration_warning(current_version: &str, target_version: &str) -> bool {
+    (is_nightly(target_version) && !is_nightly(current_version))
+        || is_newer_version(current_version, target_version)
+}
+
+/// A channel only sees its own releases: stable the non-prereleases, nightly the nightlies.
 fn channel_releases(
     releases: Vec<crate::github::GitHubRelease>,
-    current_version: &str,
+    nightly: bool,
 ) -> Vec<ReleaseInfo> {
-    let nightly = is_nightly(current_version);
     releases
         .into_iter()
         .filter(|r| {
@@ -511,11 +594,43 @@ mod tests {
                 &["1.22.2-nightly.20261109", "1.22.2-nightly.20261108"][..],
             ),
         ] {
-            let versions: Vec<String> = channel_releases(releases(), current)
+            let versions: Vec<String> = channel_releases(releases(), is_nightly(current))
                 .into_iter()
                 .map(|r| r.version)
                 .collect();
             assert_eq!(versions, expected, "{current}");
+        }
+    }
+
+    #[test]
+    fn release_tag_for_accepts_tags_and_every_printed_version_form() {
+        for (input, tag) in [
+            ("nightly-20261108", "nightly-20261108"),
+            ("1.22.2-nightly.20261108", "nightly-20261108"),
+            ("v1.22.2-nightly.20261108", "nightly-20261108"),
+            ("v1.22.0", "v1.22.0"),
+            ("1.22.0", "v1.22.0"),
+        ] {
+            assert_eq!(release_tag_for(input), tag, "{input}");
+        }
+    }
+
+    #[test]
+    fn migration_warning_covers_nightly_entry_and_downgrades_only() {
+        for (current, target, warn) in [
+            ("1.22.1", "1.22.2-nightly.20261108", true),
+            ("1.22.2-nightly.20261109", "1.22.2-nightly.20261108", true),
+            ("1.22.2-nightly.20261109", "1.22.1", true),
+            ("1.22.1", "1.22.0", true),
+            ("1.22.2-nightly.20261108", "1.22.2-nightly.20261109", false),
+            ("1.22.2-nightly.20261108", "1.22.2", false),
+            ("1.22.1", "1.23.0", false),
+        ] {
+            assert_eq!(
+                needs_migration_warning(current, target),
+                warn,
+                "{current} -> {target}"
+            );
         }
     }
 
