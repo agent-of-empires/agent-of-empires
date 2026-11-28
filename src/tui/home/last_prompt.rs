@@ -118,6 +118,10 @@ fn is_horizontal_rule(line: &str) -> bool {
             .all(|c| c == ' ' || ('\u{2500}'..='\u{257F}').contains(&c))
 }
 
+fn footer_tool(row: &crate::daemon::SessionResponse) -> String {
+    crate::tmux::status_rules::detection_tool(&row.profile, &row.tool, &row.detect_as).into_owned()
+}
+
 impl super::HomeView {
     fn last_prompt_row(&self) -> Option<&crate::daemon::SessionResponse> {
         let id = self
@@ -184,13 +188,7 @@ impl super::HomeView {
             };
             let epoch = epoch.to_owned();
             let session_id = id.to_owned();
-            let tool = self
-                .last_prompt_row()
-                .map(|row| {
-                    crate::tmux::status_rules::detection_tool(&row.profile, &row.tool, "")
-                        .into_owned()
-                })
-                .unwrap_or_default();
+            let tool = self.last_prompt_row().map(footer_tool).unwrap_or_default();
             self.last_prompt_in_flight = true;
             let slot = self.last_prompt_slot.clone();
             std::thread::spawn(move || {
@@ -235,6 +233,20 @@ mod tests {
         extract_last_prompt(pane, |line| {
             crate::tmux::detect::submitted_prompt("claude", line)
         })
+    }
+
+    #[test]
+    fn footer_follows_the_instance_alias_of_a_wrapper() {
+        let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
+            "id": "s", "tool": "wrapper-without-rules", "detect_as": "claude",
+        }))
+        .unwrap();
+        let tool = footer_tool(&row);
+        assert_eq!(tool, "claude");
+        assert_eq!(
+            crate::tmux::detect::submitted_prompt(&tool, "❯ hello").map(str::trim),
+            Some("hello")
+        );
     }
 
     #[test]
