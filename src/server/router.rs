@@ -30,7 +30,9 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // Sessions
         .route(
             "/api/sessions",
-            get(api::list_sessions).post(api::create_session),
+            get(api::list_sessions)
+                .post(api::create_session)
+                .layer(read_only.clone()),
         )
         .route(
             "/api/sessions/creation-trust",
@@ -50,7 +52,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/recent-projects", get(api::get_recent_projects))
         .route(
             "/api/workspace-ordering",
-            put(api::update_workspace_ordering),
+            put(api::update_workspace_ordering).layer(read_only.clone()),
         )
         // Atomic multi-session workspace delete.
         .route(
@@ -68,10 +70,16 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/mcp/servers/{name}/resolve",
-            post(api::resolve_mcp_conflict),
+            post(api::resolve_mcp_conflict).layer(read_only.clone()),
         )
-        .route("/api/mcp/servers/{name}/keep", post(api::keep_mcp_server))
-        .route("/api/mcp/servers/{name}/drop", post(api::drop_mcp_server))
+        .route(
+            "/api/mcp/servers/{name}/keep",
+            post(api::keep_mcp_server).layer(read_only.clone()),
+        )
+        .route(
+            "/api/mcp/servers/{name}/drop",
+            post(api::drop_mcp_server).layer(read_only.clone()),
+        )
         // Unified skills management surface (#3050).
         .route("/api/skills", get(api::list_skills).post(api::create_skill))
         // Static, so it wins over `/api/skills/{directory}` and a managed skill
@@ -96,7 +104,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
                 .delete(api::delete_session)
                 .layer(read_only.clone()),
         )
-        .route("/api/sessions/{id}/group", patch(api::update_session_group))
+        .route(
+            "/api/sessions/{id}/group",
+            patch(api::update_session_group).layer(read_only.clone()),
+        )
         .route(
             "/api/sessions/{id}/diff/files",
             get(api::session_diff_files),
@@ -110,7 +121,8 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/file",
             get(api::session_file)
                 .put(api::save_session_file)
-                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
+                .layer(read_only.clone()),
         )
         .route("/api/sessions/{id}/file/raw", get(api::session_file_raw))
         // Read-only runtime read: one Hello, one Snapshot, one clean close.
@@ -124,30 +136,38 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(api::serve_session_artifact),
         )
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
-        .route("/api/sessions/{id}/send", post(api::send_message))
+        .route(
+            "/api/sessions/{id}/send",
+            post(api::send_message).layer(read_only.clone()),
+        )
         .route(
             "/api/sessions/{id}/paste-image",
             // A base64 screenshot blows past the global 1 MiB cap.
-            post(api::paste_image).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+            post(api::paste_image)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+                .layer(read_only.clone()),
         )
         .route("/api/sessions/{id}/output", get(api::read_output))
         .route(
             "/api/sessions/{id}/notifications",
-            patch(api::update_session_notifications),
+            patch(api::update_session_notifications).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/diff-base",
-            patch(api::update_session_diff_base),
+            patch(api::update_session_diff_base).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/worktree-name",
-            patch(api::set_worktree_name),
+            patch(api::set_worktree_name).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/projects",
-            post(api::attach_session_project),
+            post(api::attach_session_project).layer(read_only.clone()),
         )
-        .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route(
+            "/api/sessions/{id}/pin",
+            patch(api::update_session_pin).layer(read_only.clone()),
+        )
         .route(
             "/api/sessions/{id}/favorite",
             patch(api::update_session_favorite).layer(read_only.clone()),
@@ -162,7 +182,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}/archive",
-            patch(api::update_session_archive),
+            patch(api::update_session_archive).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/access",
@@ -170,7 +190,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}/snooze",
-            patch(api::update_session_snooze),
+            patch(api::update_session_snooze).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/trash",
@@ -183,7 +203,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}/unread",
-            patch(api::update_session_unread),
+            patch(api::update_session_unread).layer(read_only.clone()),
         )
         .route("/api/sessions/{id}/stop", post(api::stop_session))
         .route(
@@ -199,7 +219,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/acp-default-model",
             get(api::get_session_agent_default_model),
         )
-        .route("/api/sessions/{id}/start", post(api::start_session))
+        .route(
+            "/api/sessions/{id}/start",
+            post(api::start_session).layer(read_only.clone()),
+        )
         .route(
             "/api/sessions/{id}/restart",
             post(api::restart_session).layer(read_only.clone()),
@@ -210,11 +233,13 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}/terminal",
-            post(api::ensure_terminal).delete(api::kill_terminal),
+            post(api::ensure_terminal)
+                .delete(api::kill_terminal)
+                .layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/container-terminal",
-            post(api::ensure_container_terminal),
+            post(api::ensure_container_terminal).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/tools/ensure",
@@ -229,12 +254,16 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // Profiles
         .route(
             "/api/profiles",
-            get(api::list_profiles).post(api::create_profile),
+            get(api::list_profiles)
+                .post(api::create_profile)
+                .layer(read_only.clone()),
         )
         .route("/api/profiles/{name}", delete(api::delete_profile))
         .route(
             "/api/profiles/{name}/settings",
-            get(api::get_profile_settings).patch(api::update_profile_settings),
+            get(api::get_profile_settings)
+                .patch(api::update_profile_settings)
+                .layer(read_only.clone()),
         )
         .route(
             "/api/profiles/{name}/acp-defaults/{agent}/model",
@@ -242,14 +271,23 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
                 .put(api::set_agent_default_model)
                 .layer(read_only.clone()),
         )
-        .route("/api/profiles/{name}/rename", patch(api::rename_profile))
-        .route("/api/default-profile", patch(api::default_profile))
+        .route(
+            "/api/profiles/{name}/rename",
+            patch(api::rename_profile).layer(read_only.clone()),
+        )
+        .route(
+            "/api/default-profile",
+            patch(api::default_profile).layer(read_only.clone()),
+        )
         .route("/api/filesystem/browse", get(api::browse_filesystem))
         .route("/api/filesystem/home", get(api::filesystem_home))
         .route("/api/git/branches", get(api::list_branches))
         .route("/api/git/worktrees", get(api::list_worktrees))
         .route("/api/git/is-repo", get(api::is_git_repo))
-        .route("/api/git/clone", post(api::clone_repo))
+        .route(
+            "/api/git/clone",
+            post(api::clone_repo).layer(read_only.clone()),
+        )
         .route(
             "/api/groups",
             get(api::list_groups)
@@ -265,11 +303,15 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/reorder", post(api::reorder).layer(read_only.clone()))
         .route(
             "/api/projects",
-            get(api::list_projects).post(api::create_project),
+            get(api::list_projects)
+                .post(api::create_project)
+                .layer(read_only.clone()),
         )
         .route(
             "/api/projects/{name}",
-            patch(api::update_project).delete(api::delete_project),
+            patch(api::update_project)
+                .delete(api::delete_project)
+                .layer(read_only.clone()),
         )
         .route("/api/docker/status", get(api::docker_status))
         .route("/api/sandbox/image-status", get(api::sandbox_image_status))
@@ -290,7 +332,9 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // Settings + themes
         .route(
             "/api/settings",
-            get(api::get_settings).patch(api::update_settings),
+            get(api::get_settings)
+                .patch(api::update_settings)
+                .layer(read_only.clone()),
         )
         .route("/api/settings/schema", get(api::get_settings_schema))
         .route("/api/settings/resolved", get(api::get_settings_resolved))
@@ -298,8 +342,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/cityhall/bundle", get(api::get_cityhall_bundle))
         .route("/api/cityhall/apply", post(api::apply_cityhall_bundle))
         .route("/api/tips", get(api::get_tips))
-        .route("/api/tips/show", post(api::set_show_tips))
-        .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
+        .route(
+            "/api/tips/show",
+            post(api::set_show_tips).layer(read_only.clone()),
+        )
+        .route(
+            "/api/app-state/tip-seen",
+            post(api::mark_tip_seen).layer(read_only.clone()),
+        )
         // Plugin management.
         .route("/api/plugins", get(api::list_plugins))
         // A live login session needs no device binding here; see `auth::UnboundClaim`.
@@ -313,41 +363,64 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::mint_plugin_page_ticket),
         )
         .route("/api/suggestions", get(api::get_suggestions))
-        .route("/api/suggestions/refresh", post(api::refresh_suggestions))
+        .route(
+            "/api/suggestions/refresh",
+            post(api::refresh_suggestions).layer(read_only.clone()),
+        )
         .route(
             "/api/suggestions/checks/run",
-            post(api::run_suggestion_checks),
+            post(api::run_suggestion_checks).layer(read_only.clone()),
         )
-        .route("/api/suggestions/fix", post(api::run_suggestion_fix))
-        .route("/api/suggestions/push", post(api::push_suggestion))
-        .route("/api/suggestions/dismiss", post(api::dismiss_suggestion))
+        .route(
+            "/api/suggestions/fix",
+            post(api::run_suggestion_fix).layer(read_only.clone()),
+        )
+        .route(
+            "/api/suggestions/dismiss",
+            post(api::dismiss_suggestion).layer(read_only.clone()),
+        )
+        .route(
+            "/api/suggestions/push",
+            post(api::push_suggestion).layer(read_only.clone()),
+        )
         .route(
             "/api/suggestions/undismiss",
-            post(api::undismiss_suggestion),
+            post(api::undismiss_suggestion).layer(read_only.clone()),
         )
         .route(
             "/api/suggestions/sources",
-            patch(api::update_suggestion_source),
+            patch(api::update_suggestion_source).layer(read_only.clone()),
+        )
+        .route(
+            "/api/suggestions/prefs",
+            patch(api::patch_suggestion_prefs).layer(read_only.clone()),
         )
         .route(
             "/api/suggestions/auto-start",
-            put(api::put_suggestion_auto_start),
+            put(api::put_suggestion_auto_start).layer(read_only.clone()),
         )
-        .route("/api/suggestions/prefs", patch(api::patch_suggestion_prefs))
         .route(
             "/api/suggestions/presets",
             get(api::get_suggestion_presets)
                 .put(api::put_suggestion_preset)
-                .delete(api::delete_suggestion_preset),
+                .delete(api::delete_suggestion_preset)
+                .layer(read_only.clone()),
         )
         .route("/api/suggestions/prepare", post(api::prepare_suggestion))
-        .route("/api/suggestions/start", post(api::start_suggestion))
-        .route("/api/suggestions/start-batch", post(api::start_suggestions))
+        .route(
+            "/api/suggestions/start",
+            post(api::start_suggestion).layer(read_only.clone()),
+        )
+        .route(
+            "/api/suggestions/start-batch",
+            post(api::start_suggestions).layer(read_only.clone()),
+        )
         .route(
             "/api/suggestions/mappings",
             get(api::list_suggestion_mappings)
                 .put(api::put_suggestion_mapping)
-                .delete(api::delete_suggestion_mapping),
+                .delete(api::delete_suggestion_mapping)
+                .layer(read_only.clone()),
         )
         .route(
             "/api/suggestions/projects",
@@ -370,7 +443,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/plugins/{id}/worker/restart",
             post(api::restart_plugin_worker).layer(read_only.clone()),
         )
-        .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route(
+            "/api/plugins/{id}/action",
+            post(api::invoke_plugin_action).layer(read_only.clone()),
+        )
         .route("/api/plugins/{id}/sessions", get(api::plugin_sessions))
         .route(
             "/api/plugins/{id}/settings/options/resolve",
@@ -405,12 +481,22 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
         )
-        .route("/api/setup", get(api::get_setup).patch(api::patch_setup))
+        .route(
+            "/api/setup",
+            get(api::get_setup)
+                .patch(api::patch_setup)
+                .layer(read_only.clone()),
+        )
         .route("/api/setup/runtimes", get(api::get_setup_runtimes))
-        .route("/api/app-state/dismiss-update", post(api::dismiss_update))
+        .route(
+            "/api/app-state/dismiss-update",
+            post(api::dismiss_update).layer(read_only.clone()),
+        )
         .route(
             "/api/app-state/web-ui-state",
-            get(api::get_web_ui_state).patch(api::patch_web_ui_state),
+            get(api::get_web_ui_state)
+                .patch(api::patch_web_ui_state)
+                .layer(read_only.clone()),
         )
         .route(
             "/api/app-state/volume-ignores-globs-acknowledged",
@@ -448,7 +534,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/themes/{name}", get(api::get_resolved_theme))
         .route("/api/theme/current", get(api::get_current_theme))
         // Dedicated, non-elevated global-theme write.
-        .route("/api/theme", patch(api::update_theme))
+        .route(
+            "/api/theme",
+            patch(api::update_theme).layer(read_only.clone()),
+        )
         .route("/api/sounds/{event}", get(api::serve_sound))
         // Push notifications
         .route("/api/push/status", get(push::get_status))
@@ -456,9 +545,15 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/push/vapid-public-key",
             get(push::get_vapid_public_key),
         )
-        .route("/api/push/subscribe", post(push::subscribe))
-        .route("/api/push/unsubscribe", post(push::unsubscribe))
-        .route("/api/push/test", post(push::test))
+        .route(
+            "/api/push/subscribe",
+            post(push::subscribe).layer(read_only.clone()),
+        )
+        .route(
+            "/api/push/unsubscribe",
+            post(push::unsubscribe).layer(read_only.clone()),
+        )
+        .route("/api/push/test", post(push::test).layer(read_only.clone()))
         // Login (second-factor auth)
         .route("/api/login", post(login::login_handler))
         .route("/api/login/elevate", post(login::elevate_handler))
@@ -498,22 +593,30 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/system/update-status", get(api::get_update_status))
         .route(
             "/api/log-level",
-            get(api::get_log_level).patch(api::patch_log_level),
+            get(api::get_log_level)
+                .patch(api::patch_log_level)
+                .layer(read_only.clone()),
         )
         .route("/api/client-log", post(api::post_client_log))
         // Telemetry consent (browser manages opt-in via the daemon; it never
         // posts to the telemetry backend directly).
         .route("/api/telemetry/status", get(api::get_telemetry_status))
-        .route("/api/telemetry/consent", post(api::set_telemetry_consent))
+        .route(
+            "/api/telemetry/consent",
+            post(api::set_telemetry_consent).layer(read_only.clone()),
+        )
         .route("/api/telemetry/reset-id", post(api::reset_telemetry_id))
-        .route("/api/telemetry/seen", post(api::post_telemetry_seen))
+        .route(
+            "/api/telemetry/seen",
+            post(api::post_telemetry_seen).layer(read_only.clone()),
+        )
         .route(
             "/api/telemetry/feature-use",
-            post(api::post_telemetry_feature_use),
+            post(api::post_telemetry_feature_use).layer(read_only.clone()),
         )
         .route(
             "/api/telemetry/structured-interaction",
-            post(api::post_telemetry_structured_interaction),
+            post(api::post_telemetry_structured_interaction).layer(read_only.clone()),
         )
         // Terminal WebSockets (capture-streaming live view; the agent pane and
         // the paired host/container shells). The xterm PTY relay was removed.
@@ -529,8 +632,14 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
 
     let app = app
         .route("/sessions/{id}/acp/ws", get(acp_ws::acp_ws))
-        .route("/api/sessions/{id}/acp/spawn", post(api::spawn_acp))
-        .route("/api/sessions/{id}/acp/restart", post(api::restart_acp))
+        .route(
+            "/api/sessions/{id}/acp/spawn",
+            post(api::spawn_acp).layer(read_only.clone()),
+        )
+        .route(
+            "/api/sessions/{id}/acp/restart",
+            post(api::restart_acp).layer(read_only.clone()),
+        )
         .route(
             "/api/sessions/{id}/acp/install-agent",
             post(api::install_agent),
@@ -546,13 +655,15 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}/acp/switch-provider",
-            post(api::switch_acp_provider),
+            post(api::switch_acp_provider).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/acp/prompt",
             // Prompt bodies carry inline base64 attachments, which blow past the global 1
             // MiB cap.
-            post(api::acp_prompt).layer(axum::extract::DefaultBodyLimit::max(28 * 1024 * 1024)),
+            post(api::acp_prompt)
+                .layer(axum::extract::DefaultBodyLimit::max(28 * 1024 * 1024))
+                .layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/acp/attachments/{attachment_id}",
@@ -560,7 +671,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sessions/{id}/acp/prompt/diff-comments",
-            post(api::acp_prompt_diff_comments),
+            post(api::acp_prompt_diff_comments).layer(read_only.clone()),
         )
         .route("/api/sessions/{id}/acp/cancel", post(api::acp_cancel))
         .route(
@@ -585,13 +696,19 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/acp/context-primer",
             get(api::acp_context_primer),
         )
-        .route("/api/sessions/{id}/acp/mode", post(api::acp_set_mode))
+        .route(
+            "/api/sessions/{id}/acp/mode",
+            post(api::acp_set_mode).layer(read_only.clone()),
+        )
         .route(
             "/api/sessions/{id}/acp/config-option",
-            post(api::acp_set_config_option),
+            post(api::acp_set_config_option).layer(read_only.clone()),
         )
         .route("/api/sessions/{id}/acp/enable", post(api::acp_enable))
-        .route("/api/sessions/{id}/acp/disable", post(api::acp_disable))
+        .route(
+            "/api/sessions/{id}/acp/disable",
+            post(api::acp_disable).layer(read_only.clone()),
+        )
         .route(
             "/api/sessions/{id}/acp/terminal-check",
             get(api::acp_terminal_check),
@@ -600,19 +717,22 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/queue",
             post(api::queue_enqueue)
                 .get(api::queue_list)
-                .delete(api::queue_clear),
+                .delete(api::queue_clear)
+                .layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/queue/{promptId}",
-            patch(api::queue_edit).delete(api::queue_remove),
+            patch(api::queue_edit)
+                .delete(api::queue_remove)
+                .layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/acp/approvals/{nonce}",
-            post(api::resolve_approval),
+            post(api::resolve_approval).layer(read_only.clone()),
         )
         .route(
             "/api/sessions/{id}/acp/elicitations/{nonce}",
-            post(api::resolve_elicitation),
+            post(api::resolve_elicitation).layer(read_only.clone()),
         )
         .route("/api/acp/agents", get(api::list_acp_agents))
         .route("/api/acp/option-catalog", get(api::get_option_catalog))
