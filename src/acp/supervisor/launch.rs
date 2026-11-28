@@ -690,6 +690,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 seed_history_replay,
                 prior_conversation: req.prior_conversation,
                 artifact_dir: crate::session::artifacts::session_artifact_dir(&req.session_id).ok(),
+                adapter_compat: proxy.as_ref().map(|proxy| proxy.adapter.clone()),
                 proxy,
                 degraded: None,
                 wrapper_substitution,

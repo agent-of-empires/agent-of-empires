@@ -1,7 +1,7 @@
 //! The handshake: `initialize`, then resume, fork, load, or create the
 //! session and apply configured defaults.
 
-use crate::acp::agent_compat::{self, ExpectedAgent};
+use crate::acp::agent_compat::{self, DeclaredCompat, ExpectedAgent};
 use crate::acp::aoe_meta;
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
@@ -96,6 +96,7 @@ pub(super) struct EstablishCtx {
     pub(super) mode: ConnectMode,
     pub(super) expected_agent: ExpectedAgent,
     pub(super) proxy: Option<ProxySpec>,
+    pub(super) adapter_compat: Option<DeclaredCompat>,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) default_effort: Option<String>,
     pub(super) default_model_config: BTreeMap<String, String>,
@@ -138,6 +139,7 @@ fn proxy_verdict(expected: Option<&ProxySpec>, init: &InitializeResponse) -> Res
 fn vet_initialize(
     expected_agent: ExpectedAgent,
     proxy: Option<&ProxySpec>,
+    adapter_compat: Option<&DeclaredCompat>,
     init: &InitializeResponse,
     label: &str,
 ) -> Result<bool, IncompatibleAgentError> {
@@ -152,8 +154,8 @@ fn vet_initialize(
         let message = detail.user_message();
         IncompatibleAgentError { detail, message }
     })?;
-    match proxy {
-        Some(spec) => agent_compat::validate_declared(&spec.adapter, init),
+    match adapter_compat {
+        Some(declared) => agent_compat::validate_declared(declared, init),
         None => agent_compat::validate(expected_agent, init),
     }
     .map_err(|err| {
@@ -205,7 +207,13 @@ pub(super) async fn establish(
 
     // The supervisor mirrors the typed error into events; a clean return
     // keeps the outer cleanup from adding a generic startup error.
-    let proxied = match vet_initialize(ctx.expected_agent, ctx.proxy.as_ref(), &init, &label) {
+    let proxied = match vet_initialize(
+        ctx.expected_agent,
+        ctx.proxy.as_ref(),
+        ctx.adapter_compat.as_ref(),
+        &init,
+        &label,
+    ) {
         Ok(proxied) => proxied,
         Err(error) => {
             if let Some(tx) = ctx.ready_tx.lock().await.take() {
@@ -222,8 +230,8 @@ pub(super) async fn establish(
     let load_session_capable = init.agent_capabilities.load_session;
     // Re-derived on every connect (a respawn may land on another adapter
     // build) and emitted even when false so replay cannot keep a stale true.
-    let steering_capable = match ctx.proxy.as_ref() {
-        Some(spec) => agent_compat::supports_steering_declared(&spec.adapter, &init),
+    let steering_capable = match ctx.adapter_compat.as_ref() {
+        Some(declared) => agent_compat::supports_steering_declared(declared, &init),
         None => agent_compat::supports_steering(ctx.expected_agent, &init),
     };
     let prompt_caps = &init.agent_capabilities.prompt_capabilities;
@@ -901,18 +909,40 @@ mod tests {
             },
         };
         // The Claude command policy would refuse this name and version; the declaration rules.
-        assert!(
-            vet_initialize(ExpectedAgent::ClaudeAgentAcp, Some(&spec(None)), &init, "s").is_ok()
-        );
-        let refused = vet_initialize(
-            ExpectedAgent::ClaudeAgentAcp,
-            Some(&spec(Some("1.0.0"))),
-            &init,
-            "s",
-        )
-        .unwrap_err();
+        let vet = |min| {
+            let spec = spec(min);
+            vet_initialize(
+                ExpectedAgent::ClaudeAgentAcp,
+                Some(&spec),
+                Some(&spec.adapter),
+                &init,
+                "s",
+            )
+        };
+        assert!(vet(None).is_ok());
         assert!(matches!(
-            refused.detail,
+            vet(Some("1.0.0")).unwrap_err().detail,
+            StartupErrorDetail::IncompatibleAgentVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn a_neutral_boot_relaunch_keeps_the_declared_floor_without_its_proxy() {
+        let init: InitializeResponse = serde_json::from_str(
+            r#"{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"acme","version":"0.0.1"}}"#,
+        )
+        .unwrap();
+        let declared = |min: Option<&str>| DeclaredCompat {
+            min_version: min.map(|v| v.parse().unwrap()),
+            ..Default::default()
+        };
+        let vet = |compat: Option<DeclaredCompat>| {
+            vet_initialize(ExpectedAgent::Other, None, compat.as_ref(), &init, "s")
+        };
+        assert!(vet(None).is_ok());
+        assert!(vet(Some(declared(None))).is_ok());
+        assert!(matches!(
+            vet(Some(declared(Some("1.0.0")))).unwrap_err().detail,
             StartupErrorDetail::IncompatibleAgentVersion { .. }
         ));
     }
@@ -939,6 +969,7 @@ mod tests {
         let both = vet_initialize(
             ExpectedAgent::Gemini,
             Some(&spec),
+            Some(&spec.adapter),
             &init(wrong_plugin, 0),
             "s",
         )
@@ -948,7 +979,7 @@ mod tests {
             StartupErrorDetail::InvalidProxyHello { .. }
         ));
         let adapter_only =
-            vet_initialize(ExpectedAgent::Gemini, None, &init("", 0), "s").unwrap_err();
+            vet_initialize(ExpectedAgent::Gemini, None, None, &init("", 0), "s").unwrap_err();
         assert!(!matches!(
             adapter_only.detail,
             StartupErrorDetail::InvalidProxyHello { .. }

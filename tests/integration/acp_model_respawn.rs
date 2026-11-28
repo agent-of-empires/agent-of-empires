@@ -64,6 +64,7 @@ fn spawn_config(
         artifact_dir: None,
         proxy: None,
         degraded: None,
+        adapter_compat: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,

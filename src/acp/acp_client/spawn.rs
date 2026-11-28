@@ -112,6 +112,9 @@ pub struct SpawnConfig {
     pub mcp_credentials: crate::acp::mcp_rewrite::McpCredentialEnv,
     /// Runner launches only; the in-proc stdio spawn never uses a proxy.
     pub proxy: Option<ProxySpec>,
+    /// The compat the plugin declared for the adapter. It outlives a `NeutralBoot` fallback
+    /// that drops `proxy`, so a raw relaunch is still held to the declared floors.
+    pub adapter_compat: Option<crate::acp::agent_compat::DeclaredCompat>,
     /// Display name of the proxy a `NeutralBoot` fallback dropped: the adapter
     /// runs raw under the neutral profile.
     pub degraded: Option<String>,

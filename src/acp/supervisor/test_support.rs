@@ -485,6 +485,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         artifact_dir: None,
         proxy: None,
         degraded: None,
+        adapter_compat: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,

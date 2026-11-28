@@ -268,6 +268,8 @@ struct Launch {
     install_binary: String,
     /// Set when the runner launches a proxy; the hello is held to it.
     proxy: Option<ProxySpec>,
+    /// Holds the adapter to its plugin's declared compat in place of `ExpectedAgent`.
+    adapter_compat: Option<crate::acp::agent_compat::DeclaredCompat>,
     source_profile: Option<String>,
     default_effort: Option<String>,
     default_model_config: std::collections::BTreeMap<String, String>,
@@ -317,6 +319,7 @@ impl Launch {
             profile: self.profile,
             expected_agent: ExpectedAgent::from_command(&self.install_binary),
             proxy: self.proxy,
+            adapter_compat: self.adapter_compat,
             source_profile: self.source_profile,
             default_effort: self.default_effort,
             default_model_config: self.default_model_config,
@@ -604,6 +607,7 @@ impl AcpClient {
             profile: launch_profile(&config.agent_key, config.degraded.is_some()),
             install_binary: config.spec.command.clone(),
             proxy: config.proxy.clone(),
+            adapter_compat: config.adapter_compat.clone(),
             source_profile: config.source_profile.clone(),
             default_effort: config.default_effort.clone(),
             default_model_config: config.default_model_config.clone(),
@@ -802,10 +806,19 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         // The binary name keeps the compatibility gate active on reattach; an
         // unknown agent maps to `Other` anyway.
-        let install_binary = crate::acp::AgentRegistry::with_defaults()
-            .get(&spec.agent_key)
-            .map(|agent| agent.command.clone())
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let agent = registry.resolved(&spec.agent_key);
+        let install_binary = agent
+            .map(|agent| agent.spec.command.clone())
             .unwrap_or_default();
+        // A degraded launch has no proxy on record; its adapter still answers to the declaration.
+        let adapter_compat = match &spec.proxy {
+            Some(proxy) => Some(proxy.adapter.clone()),
+            None if spec.degraded => agent
+                .and_then(|agent| agent.proxy.as_ref())
+                .map(|proxy| proxy.adapter.clone()),
+            None => None,
+        };
         let launch = Launch {
             session_id,
             mode,
@@ -814,6 +827,7 @@ impl AcpClient {
             sandbox: spec.sandbox.clone(),
             profile: launch_profile(&spec.agent_key, spec.degraded),
             install_binary,
+            adapter_compat,
             proxy: spec.proxy.clone(),
             source_profile: spec.source_profile.clone(),
             // Resume sends no session/new or load, so defaults and MCP servers

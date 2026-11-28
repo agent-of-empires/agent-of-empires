@@ -614,6 +614,7 @@ async fn killing_the_proxy_mid_turn_loses_the_integration() {
         proxy: None,
         mcp_credentials: Default::default(),
         degraded: None,
+        adapter_compat: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,
