@@ -406,7 +406,7 @@ mod attach {
                 });
                 if let Some(after) = after {
                     update["_meta"] = serde_json::json!({
-                        "aoe": {"v": 1, "key": text, "after_adapter_sequence": after}
+                        "aoe": {"v": 2, "key": text, "after_adapter_sequence": after}
                     });
                 }
                 let frame = serde_json::json!({

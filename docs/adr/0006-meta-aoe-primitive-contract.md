@@ -21,6 +21,6 @@ Core read each adapter's private `_meta` directly (`_meta.claudeCode.*`, `_claud
 
 ## Consequences
 
-- Adding a primitive is a schema version change with a documented policy; removing one is breaking.
+- Adding a primitive bumps the primitive schema version, and core speaks only the current one; removing one is breaking.
 - Agent-specific behavior can move out of core one primitive at a time.
 - Direct filesystem access by a proxy is same-user trust, the same boundary as plugin report files. A narrow core filesystem service is the upgrade path if plugin sandboxing lands.

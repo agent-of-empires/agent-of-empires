@@ -387,7 +387,7 @@ fn generate_live_wire() {
     println!("Generated live wire types at {}", path.display());
 }
 
-const META_SCHEMA_PATH: &str = "assets/aoe-meta-v1.schema.json";
+const META_SCHEMA_PATH: &str = "assets/aoe-meta-v2.schema.json";
 
 fn generate_meta_schema() {
     fs::write(

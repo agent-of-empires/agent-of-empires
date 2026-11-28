@@ -70,7 +70,7 @@ if (dir) publish("adapter_pid", String(child.pid));
 const hello = {
   plugin_id: mode === "bad-hello" ? "wrong-plugin" : "fake-proxy",
   protocol_version: 1,
-  primitive_schema_version: 1,
+  primitive_schema_version: 2,
 };
 
 process.stdin.pipe(child.stdin);

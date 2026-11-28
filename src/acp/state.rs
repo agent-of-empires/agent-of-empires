@@ -540,6 +540,46 @@ pub struct WorkflowRunRecord {
     pub ended_at: Option<Timestamp>,
 }
 
+/// Progress a `_meta.aoe` workflow run reports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+}
+
+/// An open workflow run a `_meta.aoe` primitive reported, with its latest
+/// progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleRunRecord {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<WorkflowProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
+}
+
+/// The latest `ScheduleWakeup`; a client hides it once `at` has passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingWakeup {
+    pub at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// An armed `Monitor`, until the user takes over or the work it fired ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArmedMonitor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// A tool call ran since arming, so the next `Stopped` ends the monitor.
+    #[serde(skip)]
+    worked: bool,
+}
+
 /// Finished shells kept for the Background panel's Recent group.
 pub const MAX_FINISHED_BACKGROUND_SHELLS: usize = 20;
 
@@ -745,6 +785,13 @@ pub struct AcpState {
     pub background_shells: Vec<BackgroundShellRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_runs: Vec<WorkflowRunRecord>,
+    /// Open workflow runs reported through `_meta.aoe`, not a Claude `Workflow`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lifecycle_runs: Vec<LifecycleRunRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_wakeup: Option<PendingWakeup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_monitor: Option<ArmedMonitor>,
 
     /// Whether the main turn is in flight. Dispatch (`acp::dispatch::decide`)
     /// and the queue drain gate on this directly, so it tracks only the main
@@ -994,8 +1041,10 @@ pub enum Event {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
-        /// The Bash command, or the workflow's name.
-        description: String,
+        /// The Bash command, or the workflow's name. A `_meta.aoe` task has
+        /// none and is listed as a commandless shell row labelled with its id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow: Option<WorkflowLaunch>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1149,6 +1198,20 @@ pub enum Event {
         text: String,
         summarized_until_seq: u64,
     },
+    /// A `_meta.aoe` workflow run started; a repeat for an open run is a
+    /// lease renewal.
+    WorkflowRunStarted {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<Timestamp>,
+    },
+    WorkflowRunProgress {
+        run_id: String,
+        progress: WorkflowProgress,
+    },
+    WorkflowRunFinished {
+        run_id: String,
+    },
 }
 
 impl AcpState {
@@ -1173,6 +1236,7 @@ impl AcpState {
     /// done like any other (#4001).
     pub fn has_active_background_agent(&self) -> bool {
         !self.background_tasks.is_empty()
+            || !self.lifecycle_runs.is_empty()
             || self.background_agents.iter().any(|a| a.ended_at.is_none())
             || self.subagents.iter().any(|s| s.state.is_active())
     }
@@ -1421,10 +1485,18 @@ impl AcpState {
                 self.heal_sidebar_phase();
             }
             Event::RateLimitAutoResumed { .. } => self.heal_sidebar_phase(),
-            Event::SessionContextReset { .. } => self.usage = None,
+            Event::SessionContextReset { .. } => {
+                self.lifecycle_runs.clear();
+                self.pending_wakeup = None;
+                self.armed_monitor = None;
+                self.usage = None;
+            }
             // Clears the conversation; adapter-scoped commands, modes and
             // selectors are never re-announced, so they stay.
             Event::SessionCleared => {
+                self.lifecycle_runs.clear();
+                self.pending_wakeup = None;
+                self.armed_monitor = None;
                 self.usage = None;
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
@@ -1534,7 +1606,7 @@ impl AcpState {
                 if workflow.is_none() {
                     self.background_shells.push(BackgroundShellRecord {
                         task_id: task_id.clone(),
-                        command: description,
+                        command: description.unwrap_or_default(),
                         started_at,
                         ended_at: None,
                         finished: false,
@@ -1572,16 +1644,45 @@ impl AcpState {
                     }
                 }
             }
-            // Titles live on `Instance`; wakeups and monitors are read from the log.
+            Event::WorkflowRunStarted { run_id, started_at } => {
+                if !self.lifecycle_runs.iter().any(|r| r.run_id == run_id) {
+                    self.lifecycle_runs.push(LifecycleRunRecord {
+                        run_id,
+                        progress: None,
+                        started_at,
+                    });
+                }
+            }
+            Event::WorkflowRunProgress { run_id, progress } => {
+                match self.lifecycle_runs.iter_mut().find(|r| r.run_id == run_id) {
+                    Some(run) => run.progress = Some(progress),
+                    None => self.lifecycle_runs.push(LifecycleRunRecord {
+                        run_id,
+                        progress: Some(progress),
+                        started_at: None,
+                    }),
+                }
+            }
+            Event::WorkflowRunFinished { run_id } => {
+                self.lifecycle_runs.retain(|r| r.run_id != run_id);
+            }
+            Event::WakeupScheduled { at, reason } => {
+                self.pending_wakeup = Some(PendingWakeup { at, reason });
+            }
+            Event::MonitorArmed { description } => {
+                self.armed_monitor = Some(ArmedMonitor {
+                    description,
+                    worked: false,
+                });
+            }
+            // Titles live on `Instance`.
             Event::AgentMessageChunk { .. } => self.sidebar_phase = SidebarPhase::Active,
             Event::SessionTitleSuggested { .. }
             | Event::ToolCallContent { .. }
             | Event::ModeSwitchFailed { .. }
             | Event::RawAgentUpdate { .. }
             | Event::ConversationSummary { .. }
-            | Event::ConversationCompactionSummary { .. }
-            | Event::WakeupScheduled { .. }
-            | Event::MonitorArmed { .. } => {}
+            | Event::ConversationCompactionSummary { .. } => {}
         }
         self.last_seq = seq;
         self.updated_at = Timestamp::now();
@@ -1589,6 +1690,9 @@ impl AcpState {
     }
 
     fn start_tool_call(&mut self, tool_call: ToolCall) {
+        if let Some(monitor) = self.armed_monitor.as_mut() {
+            monitor.worked = true;
+        }
         if tool_call.name == COMPACT_TOOL_NAME {
             self.compacting = true;
             self.compaction_tool_id = Some(tool_call.id.clone());
@@ -1611,6 +1715,7 @@ impl AcpState {
     fn open_turn(&mut self) {
         let steered = self.turn_active && self.steering;
         self.turn_active = true;
+        self.armed_monitor = None;
         self.sidebar_phase = SidebarPhase::Active;
         if !steered {
             self.cancelling = false;
@@ -1632,6 +1737,9 @@ impl AcpState {
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
+        if self.armed_monitor.as_ref().is_some_and(|m| m.worked) {
+            self.armed_monitor = None;
+        }
         // A lost integration is an error until a new connection restores it.
         if self.integration_lost.is_none() {
             self.sidebar_phase = SidebarPhase::Idle;
@@ -1665,6 +1773,8 @@ impl AcpState {
         self.config_options = Vec::new();
         self.config_option_switch_failed = None;
         self.subagents = Vec::new();
+        self.pending_wakeup = None;
+        self.armed_monitor = None;
         self.last_agent_switch = Some(AgentSwitchInfo {
             from,
             to,
@@ -2024,7 +2134,7 @@ mod tests {
                     Event::BackgroundTaskStarted {
                         task_id: "task-1".into(),
                         tool_call_id: None,
-                        description: "sleep".into(),
+                        description: Some("sleep".into()),
                         workflow: None,
                         started_at: None,
                     },
@@ -3002,7 +3112,7 @@ mod tests {
         let started = |id: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: None,
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -3023,11 +3133,172 @@ mod tests {
     }
 
     #[test]
+    fn a_generic_background_task_is_idempotent_and_lists_a_commandless_shell() {
+        let started = Event::BackgroundTaskStarted {
+            task_id: "g".into(),
+            tool_call_id: None,
+            description: None,
+            workflow: None,
+            started_at: None,
+        };
+        let mut s = applied([prompt("go"), started.clone(), started, stopped("end")]);
+        assert_eq!(s.background_tasks, ["g"], "a renewal adds no second entry");
+        assert_eq!(s.background_shells.len(), 1);
+        assert_eq!(s.background_shells[0].task_id, "g");
+        assert_eq!(s.background_shells[0].command, "");
+        assert!(!s.background_shells[0].finished);
+        assert!(s.workflow_runs.is_empty());
+        assert!(s.has_active_background_agent());
+        s.apply_event(
+            s.last_seq + 1,
+            Event::BackgroundTaskFinished {
+                task_id: "g".into(),
+                ended_at: None,
+            },
+        )
+        .unwrap();
+        assert!(!s.has_active_background_agent());
+        assert!(s.background_shells[0].finished);
+    }
+
+    #[test]
+    fn wakeup_and_monitor_are_reduced_and_monitor_ends_with_its_work() {
+        let at = Timestamp::now();
+        let armed = || Event::MonitorArmed {
+            description: Some("watch ci".into()),
+        };
+        let s = applied([
+            Event::WakeupScheduled {
+                at,
+                reason: Some("check".into()),
+            },
+            armed(),
+            stopped("end"),
+        ]);
+        let wakeup = s.pending_wakeup.expect("wakeup");
+        assert_eq!((wakeup.at, wakeup.reason.as_deref()), (at, Some("check")));
+        assert!(
+            s.armed_monitor.is_some(),
+            "a Stopped with no work since arming keeps it"
+        );
+
+        let worked = |tail| {
+            applied([
+                armed(),
+                Event::ToolCallStarted {
+                    tool_call: tool_call("t"),
+                },
+                tail,
+            ])
+        };
+        assert!(worked(stopped("end")).armed_monitor.is_none());
+        assert!(worked(prompt("hi")).armed_monitor.is_none());
+        assert!(applied([armed(), prompt("hi")]).armed_monitor.is_none());
+    }
+
+    #[test]
+    fn a_reset_or_clear_drops_the_pending_wakeup_and_monitor() {
+        let scheduled = || {
+            [
+                Event::WakeupScheduled {
+                    at: Timestamp::now(),
+                    reason: None,
+                },
+                Event::MonitorArmed { description: None },
+            ]
+        };
+        for end in [
+            Event::SessionContextReset {
+                reason: "reset".into(),
+            },
+            Event::SessionCleared,
+            Event::AgentSwitched {
+                from: "claude".into(),
+                to: "codex".into(),
+                reason: "user".into(),
+            },
+        ] {
+            let mut s = applied(scheduled());
+            assert!(s.pending_wakeup.is_some() && s.armed_monitor.is_some());
+            s.apply_event(s.last_seq + 1, end).unwrap();
+            assert!(s.pending_wakeup.is_none() && s.armed_monitor.is_none());
+        }
+        let mut bare = applied([]);
+        bare.apply_event(
+            bare.last_seq + 1,
+            Event::AgentSwitched {
+                from: "claude".into(),
+                to: "codex".into(),
+                reason: "user".into(),
+            },
+        )
+        .unwrap();
+        assert!(bare.pending_wakeup.is_none() && bare.armed_monitor.is_none());
+    }
+
+    #[test]
+    fn lifecycle_runs_track_progress_and_clear_on_end_and_reset() {
+        let started = |id: &str| Event::WorkflowRunStarted {
+            run_id: id.into(),
+            started_at: None,
+        };
+        let progress = |id: &str, completed| Event::WorkflowRunProgress {
+            run_id: id.into(),
+            progress: WorkflowProgress {
+                label: Some("step".into()),
+                completed: Some(completed),
+                total: Some(3),
+            },
+        };
+        let finished = |id: &str| Event::WorkflowRunFinished { run_id: id.into() };
+        let mut s = applied([prompt("go"), started("a"), progress("a", 1), stopped("end")]);
+        assert!(s.has_active_background_agent(), "an open run keeps it busy");
+
+        s.apply_event(s.last_seq + 1, started("a")).unwrap();
+        s.apply_event(s.last_seq + 1, started("b")).unwrap();
+        assert_eq!(s.lifecycle_runs.len(), 2, "a repeated start adds no run");
+        assert_eq!(
+            s.lifecycle_runs[0]
+                .progress
+                .as_ref()
+                .and_then(|p| p.completed),
+            Some(1),
+            "a renewal keeps the latest progress"
+        );
+        s.apply_event(s.last_seq + 1, progress("a", 2)).unwrap();
+        assert_eq!(
+            s.lifecycle_runs[0]
+                .progress
+                .as_ref()
+                .and_then(|p| p.completed),
+            Some(2)
+        );
+
+        s.apply_event(s.last_seq + 1, finished("a")).unwrap();
+        assert_eq!(s.lifecycle_runs.len(), 1);
+        assert!(s.has_active_background_agent());
+        s.apply_event(
+            s.last_seq + 1,
+            Event::SessionContextReset {
+                reason: "reset".into(),
+            },
+        )
+        .unwrap();
+        assert!(s.lifecycle_runs.is_empty());
+        assert!(!s.has_active_background_agent());
+
+        s.apply_event(s.last_seq + 1, started("c")).unwrap();
+        s.apply_event(s.last_seq + 1, Event::SessionCleared)
+            .unwrap();
+        assert!(s.lifecycle_runs.is_empty());
+    }
+
+    #[test]
     fn background_shells_keep_command_and_outlive_their_task() {
         let started = |id: &str, workflow: Option<WorkflowLaunch>| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: None,
-            description: format!("cmd {id}"),
+            description: Some(format!("cmd {id}")),
             workflow,
             started_at: None,
         };
@@ -3070,7 +3341,7 @@ mod tests {
         let workflow = |id: &str, call: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: Some(call.into()),
-            description: "drafts".into(),
+            description: Some("drafts".into()),
             workflow: Some(WorkflowLaunch {
                 run_id: "wf_1".into(),
                 name: "drafts".into(),
@@ -3104,7 +3375,7 @@ mod tests {
             Event::BackgroundTaskStarted {
                 task_id: "wfx".into(),
                 tool_call_id: Some("toolu_bash".into()),
-                description: "sleep".into(),
+                description: Some("sleep".into()),
                 workflow: None,
                 started_at: None,
             },

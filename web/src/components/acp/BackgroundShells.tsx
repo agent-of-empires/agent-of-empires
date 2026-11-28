@@ -28,7 +28,7 @@ export function ShellRow({ shell, onOpen }: { shell: BackgroundShell; onOpen: (t
       />
       <Terminal className="h-3.5 w-3.5 shrink-0 text-text-dim" />
       <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">
-        {shell.command || "(command unavailable)"}
+        {shell.command || shell.taskId}
       </span>
       <span className="shrink-0 text-[11px] text-text-dim">{shell.finished ? "done" : "running"}</span>
       <Maximize2 className="h-3.5 w-3.5 shrink-0 text-text-dim" />

@@ -39,6 +39,7 @@ export {
   useBackgroundShells,
   useBackgroundTasks,
   useSubagents,
+  useLifecycleRuns,
   useWorkflowRuns,
 } from "./acpSession/stateCache";
 

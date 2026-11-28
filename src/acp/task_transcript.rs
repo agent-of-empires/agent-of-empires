@@ -902,7 +902,7 @@ mod tests {
         let started = Event::BackgroundTaskStarted {
             task_id: "t-1".into(),
             tool_call_id: Some("toolu_1".into()),
-            description: String::new(),
+            description: Some(String::new()),
             workflow: None,
             started_at: None,
         };
@@ -934,7 +934,7 @@ mod tests {
             let started = Event::BackgroundTaskStarted {
                 task_id: id.into(),
                 tool_call_id: Some("toolu_1".into()),
-                description: String::new(),
+                description: Some(String::new()),
                 workflow: None,
                 started_at: None,
             };
@@ -1268,7 +1268,7 @@ mod tests {
         let started = |tool_call_id: &str| Event::BackgroundTaskStarted {
             task_id: "t-1".into(),
             tool_call_id: Some(tool_call_id.into()),
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };

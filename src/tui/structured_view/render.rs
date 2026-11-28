@@ -1776,6 +1776,57 @@ pub(super) fn wrap_line_into(mut line: Line<'static>, width: u16, out: &mut Vec<
     emit(&row, out);
 }
 
+/// One-line, clipped text for a status badge.
+fn badge_text(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(24) {
+        Some((end, _)) => format!("{}...", &flat[..end]),
+        None => flat,
+    }
+}
+
+/// Badges for open background tasks, workflow runs, a pending wakeup and an
+/// armed monitor.
+fn lifecycle_badges(t: &super::reducer::AcpTranscript, now: crate::time::Timestamp) -> Vec<String> {
+    let mut badges = Vec::new();
+    match t.background_task_count {
+        0 => {}
+        1 => badges.push("1 task".to_string()),
+        n => badges.push(format!("{n} tasks")),
+    }
+    match t.lifecycle_runs.as_slice() {
+        [] => {}
+        [run] => {
+            let mut badge = "workflow".to_string();
+            if let Some(p) = &run.progress {
+                if let Some(label) = p.label.as_deref().filter(|l| !l.is_empty()) {
+                    badge = format!("{badge} {}", badge_text(label));
+                }
+                if let (Some(done), Some(total)) = (p.completed, p.total) {
+                    badge = format!("{badge} {done}/{total}");
+                }
+            }
+            badges.push(badge);
+        }
+        runs => badges.push(format!("{} workflows", runs.len())),
+    }
+    if let Some(w) = t.pending_wakeup.as_ref().filter(|w| w.at > now) {
+        let mins = ((w.at - now).whole_seconds() + 59) / 60;
+        let mut badge = format!("wakeup in {mins}m");
+        if let Some(reason) = w.reason.as_deref().filter(|r| !r.is_empty()) {
+            badge = format!("{badge}: {}", badge_text(reason));
+        }
+        badges.push(badge);
+    }
+    if let Some(m) = &t.armed_monitor {
+        badges.push(match m.description.as_deref().filter(|d| !d.is_empty()) {
+            Some(d) => format!("monitor: {}", badge_text(d)),
+            None => "monitor".to_string(),
+        });
+    }
+    badges
+}
+
 fn render_status(
     frame: &mut Frame,
     area: Rect,
@@ -1874,6 +1925,12 @@ fn render_status(
     if state.scroll_offset.get() != u16::MAX {
         spans.push(Span::styled(
             " · G latest ",
+            Style::default().fg(theme.hint),
+        ));
+    }
+    for badge in lifecycle_badges(&state.transcript, crate::time::Timestamp::now()) {
+        spans.push(Span::styled(
+            format!("· {badge} "),
             Style::default().fg(theme.hint),
         ));
     }
@@ -4981,6 +5038,53 @@ mod tests {
         state.transcript.background_agent_active = true;
         let dump = render_dump(&state, 80, 24);
         assert!(dump.contains("working"), "{dump}");
+    }
+
+    #[test]
+    fn status_line_shows_lifecycle_badges_and_drops_ended_ones() {
+        use crate::acp::state::{
+            ArmedMonitor, LifecycleRunRecord, PendingWakeup, WorkflowProgress,
+        };
+        let mut state = test_state();
+        let t = &mut state.transcript;
+        t.background_task_count = 2;
+        t.lifecycle_runs = vec![LifecycleRunRecord {
+            run_id: "r".into(),
+            progress: Some(WorkflowProgress {
+                label: Some("build".into()),
+                completed: Some(2),
+                total: Some(5),
+            }),
+            started_at: None,
+        }];
+        t.pending_wakeup = Some(PendingWakeup {
+            at: crate::time::Timestamp::now() + crate::time::Duration::minutes(10),
+            reason: Some("check ci".into()),
+        });
+        t.armed_monitor =
+            Some(serde_json::from_str::<ArmedMonitor>(r#"{"description":"tail logs"}"#).unwrap());
+        let dump = render_dump(&state, 160, 24);
+        for want in [
+            "2 tasks",
+            "workflow build 2/5",
+            "wakeup in 10m: check ci",
+            "monitor: tail logs",
+        ] {
+            assert!(dump.contains(want), "missing {want:?}: {dump}");
+        }
+
+        let t = &mut state.transcript;
+        t.background_task_count = 0;
+        t.lifecycle_runs.clear();
+        t.pending_wakeup = Some(PendingWakeup {
+            at: crate::time::Timestamp::now() - crate::time::Duration::minutes(1),
+            reason: Some("check ci".into()),
+        });
+        t.armed_monitor = None;
+        let dump = render_dump(&state, 160, 24);
+        for gone in ["task", "workflow", "wakeup", "monitor"] {
+            assert!(!dump.contains(gone), "{gone:?} should be gone: {dump}");
+        }
     }
 
     #[test]

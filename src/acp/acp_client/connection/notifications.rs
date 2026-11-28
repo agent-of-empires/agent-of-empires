@@ -29,8 +29,8 @@ use crate::acp::acp_client::tool_context::{
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
-    map_update_to_events, qualify_compaction_id, restored_wake_tool_event, AgentMessageDedup,
-    CompactionFold, CompactionTracker,
+    lifecycle_events, map_update_to_events, qualify_compaction_id, restored_wake_tool_event,
+    AgentMessageDedup, CompactionFold, CompactionTracker,
 };
 use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
 use crate::acp::acp_client::SessionState;
@@ -304,6 +304,7 @@ impl Shared {
         // still proves the agent is alive.
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
         self.settle_discarded().await;
+        let _gate = self.aoe.lifecycle_gate.lock().await;
         let epoch = self.prompt_epoch.load(Ordering::Relaxed);
         let ingested = self
             .aoe
@@ -317,18 +318,28 @@ impl Shared {
     pub(super) async fn settle_discarded(&self) {
         let skipped = self.ingress.take_discarded_adapter_frames();
         if skipped > 0 {
+            let _gate = self.aoe.lifecycle_gate.lock().await;
             let ingested = self.aoe.skip_frames(skipped, now_ms());
             self.handle_ingested(ingested).await;
         }
     }
 
+    /// The caller holds `lifecycle_gate` from before `ingest` admitted the
+    /// leases until the last event is emitted.
     async fn handle_ingested(&self, ingested: Ingested) {
         let (frames, lost) = match ingested {
             Ingested::Deliver(frames) => (frames, None),
-            Ingested::Lost(reason) => (Vec::new(), Some(reason)),
-            Ingested::DeliverThenLost(frames, reason) => (frames, Some(reason)),
+            Ingested::Lost(reason, finished) => (Vec::new(), Some((reason, finished))),
+            Ingested::DeliverThenLost(frames, reason, finished) => {
+                (frames, Some((reason, finished)))
+            }
         };
         for frame in frames {
+            // Straight to the log: the `BackgroundTask*` interception in
+            // `handle_adapter_notification` is for Claude's tool results.
+            for event in frame.lifecycle.iter().flat_map(lifecycle_events) {
+                self.emit(event).await;
+            }
             self.handle_adapter_notification(
                 frame.notification,
                 frame.local_prompt_signals,
@@ -336,7 +347,10 @@ impl Shared {
             )
             .await;
         }
-        if let Some(reason) = lost {
+        if let Some((reason, finished)) = lost {
+            for event in finished {
+                self.emit(event).await;
+            }
             tracing::warn!(
                 target: "acp.protocol",
                 session = %self.session_label,
@@ -539,7 +553,7 @@ impl Shared {
             } = &mut event
             {
                 if let Some(command) = shell_command(&self.tool_context_cache, call) {
-                    *description = command;
+                    *description = Some(command);
                 }
             }
             if let Event::BackgroundTaskStarted {

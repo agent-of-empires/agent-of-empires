@@ -3777,7 +3777,7 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
-      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase. A Workflow call stays a workflow card when a permission start retitles it, and reads \"Preparing workflow script\" until the call returns.",
+      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase. A Workflow call stays a workflow card when a permission start retitles it, and reads \"Preparing workflow script\" until the call returns. A `_meta.aoe` workflow run lists as a progress row (label, count, bar) above shells and agents.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",

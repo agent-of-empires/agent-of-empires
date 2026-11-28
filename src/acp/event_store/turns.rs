@@ -77,6 +77,23 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
        )
      ORDER BY started.seq ASC";
 
+const UNRESOLVED_WORKFLOW_RUNS_SQL: &str =
+    "SELECT json_extract(started.event_json, '$.WorkflowRunStarted.run_id')
+     FROM acp_events AS started
+     WHERE started.session_id = ?1
+       AND started.discriminant = 'WorkflowRunStarted'
+       AND json_extract(started.event_json, '$.WorkflowRunStarted.run_id') IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM acp_events AS later
+           WHERE later.session_id = ?1
+             AND later.discriminant IN ('WorkflowRunStarted', 'WorkflowRunFinished')
+             AND later.seq > started.seq
+             AND COALESCE(json_extract(later.event_json, '$.WorkflowRunStarted.run_id'),
+                          json_extract(later.event_json, '$.WorkflowRunFinished.run_id')) =
+                 json_extract(started.event_json, '$.WorkflowRunStarted.run_id')
+       )
+     ORDER BY started.seq ASC";
+
 const LATER_PLAN_DROP_SQL: &str = "SELECT EXISTS(
      SELECT 1 FROM acp_events
      WHERE session_id = ?1
@@ -316,6 +333,17 @@ impl EventStore {
         )
     }
 
+    /// Run ids of `WorkflowRunStarted` events with no later
+    /// `WorkflowRunFinished`; a repeated start is a lease renewal, not a run.
+    pub fn unresolved_workflow_run_ids(&self, session_id: &str) -> Vec<String> {
+        query_strings(
+            &self.conn(),
+            UNRESOLVED_WORKFLOW_RUNS_SQL,
+            "unresolved_workflow_run_ids",
+            session_id,
+        )
+    }
+
     /// Subagents whose latest snapshot is still working, for the dead-worker
     /// close-out.
     pub fn open_subagents(&self, session_id: &str) -> Vec<SubagentRecord> {
@@ -358,6 +386,17 @@ impl EventStore {
                 .prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)
                 .and_then(|mut statement| statement.exists(params![session_id])),
             "has_unresolved_background_tasks",
+            session_id,
+        )
+    }
+
+    /// `None` when the query failed.
+    fn try_has_unresolved_workflow_runs(&self, session_id: &str) -> Option<bool> {
+        logged(
+            self.conn()
+                .prepare_cached(UNRESOLVED_WORKFLOW_RUNS_SQL)
+                .and_then(|mut statement| statement.exists(params![session_id])),
+            "has_unresolved_workflow_runs",
             session_id,
         )
     }
@@ -599,14 +638,16 @@ impl EventStore {
         Some(Some(terminator.is_none()))
     }
 
-    /// True while a main turn, background task, or recently reporting background agent is open.
+    /// True while a main turn, background task, workflow run, or recently reporting background agent is open.
     pub fn has_in_flight_turn(&self, session_id: &str) -> bool {
         self.try_in_flight_turn(session_id).unwrap_or(false)
     }
 
     /// [`Self::has_in_flight_turn`], or `None` when any constituent query failed.
     pub(crate) fn try_in_flight_turn(&self, session_id: &str) -> Option<bool> {
-        if self.try_has_unresolved_background_tasks(session_id)? {
+        if self.try_has_unresolved_background_tasks(session_id)?
+            || self.try_has_unresolved_workflow_runs(session_id)?
+        {
             return Some(true);
         }
         match self.latest_prompt_state(session_id)? {
@@ -764,7 +805,7 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::acp::approvals::ApprovalDecision;
-    use crate::acp::state::{BackgroundAgentStatus, WorkflowLaunch, WorkflowRef};
+    use crate::acp::state::{BackgroundAgentStatus, WorkflowLaunch, WorkflowProgress, WorkflowRef};
 
     #[test]
     fn first_prompt_and_first_turn_context() {
@@ -916,7 +957,7 @@ mod tests {
         let started = Event::BackgroundTaskStarted {
             task_id: "t".into(),
             tool_call_id: None,
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -924,9 +965,32 @@ mod tests {
             task_id: "t".into(),
             ended_at: None,
         };
+        let run_started = Event::WorkflowRunStarted {
+            run_id: "w".into(),
+            started_at: None,
+        };
+        let run_finished = Event::WorkflowRunFinished { run_id: "w".into() };
         // (events, holds live work)
         let cases = [
+            (vec![], false),
             (vec![user_prompt("go"), stopped("prompt_complete")], false),
+            (
+                vec![
+                    user_prompt("go"),
+                    run_started.clone(),
+                    stopped("prompt_complete"),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    run_started,
+                    stopped("prompt_complete"),
+                    run_finished,
+                ],
+                false,
+            ),
             (
                 vec![
                     user_prompt("go"),
@@ -1337,7 +1401,7 @@ mod tests {
         let task = |id: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: None,
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -1428,7 +1492,7 @@ mod tests {
             record(Event::BackgroundTaskStarted {
                 task_id: format!("t{i}"),
                 tool_call_id: None,
-                description: "sleep".into(),
+                description: Some("sleep".into()),
                 workflow: None,
                 started_at: None,
             });
@@ -1442,7 +1506,7 @@ mod tests {
             record(Event::BackgroundTaskStarted {
                 task_id: format!("open{i}"),
                 tool_call_id: None,
-                description: "sleep".into(),
+                description: Some("sleep".into()),
                 workflow: None,
                 started_at: None,
             });
@@ -1470,6 +1534,161 @@ mod tests {
         assert_eq!(store.unresolved_background_task_ids("s-1").len(), 3);
     }
 
+    /// An open run's start stays replayable past the retention cap, so a
+    /// reload still counts it; an ended run's pair ages out.
+    #[test]
+    fn open_workflow_runs_survive_the_retention_prune() {
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let started = |id: &str| Event::WorkflowRunStarted {
+            run_id: id.into(),
+            started_at: None,
+        };
+        record(started("done"));
+        record(Event::WorkflowRunFinished {
+            run_id: "done".into(),
+        });
+        record(started("open"));
+        record(started("reused"));
+        record(Event::WorkflowRunFinished {
+            run_id: "reused".into(),
+        });
+        record(started("reused"));
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let runs: Vec<(bool, String)> = store
+            .replay_from("s-1", 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::WorkflowRunStarted { run_id, .. } => Some((true, run_id)),
+                Event::WorkflowRunFinished { run_id } => Some((false, run_id)),
+                _ => None,
+            })
+            .collect();
+        // A reused id keeps only its open start; the closed pair ages out.
+        assert_eq!(
+            runs,
+            [(true, "open".to_string()), (true, "reused".to_string())]
+        );
+    }
+
+    /// A progress row that lands with a lower seq than the run's current one
+    /// does not leave a second pinned row.
+    #[test]
+    fn late_lower_seq_progress_leaves_one_row() {
+        let (_tmp, store) = open_store(3);
+        for seq in [20, 10] {
+            let event = Event::WorkflowRunProgress {
+                run_id: "r".into(),
+                progress: WorkflowProgress {
+                    label: None,
+                    completed: Some(seq),
+                    total: None,
+                },
+            };
+            store.record("s-1", seq, &event).unwrap();
+        }
+        let seqs: Vec<u64> = store
+            .replay_from("s-1", 0)
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(seqs, [20]);
+    }
+
+    /// A run's latest progress survives the retention cap as one row, and
+    /// goes once the run ends; a reused id keeps its open run's progress.
+    #[test]
+    fn workflow_run_progress_is_pinned_replaced_and_swept_on_finish() {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let started = |id: &str| Event::WorkflowRunStarted {
+            run_id: id.into(),
+            started_at: None,
+        };
+        let progress = |id: &str, completed| Event::WorkflowRunProgress {
+            run_id: id.into(),
+            progress: WorkflowProgress {
+                label: Some(format!("step {completed}")),
+                completed: Some(completed),
+                total: Some(9),
+            },
+        };
+        let filler = |record: &mut dyn FnMut(Event), n| {
+            for _ in 0..n {
+                record(Event::AgentMessageChunk {
+                    text: "x".into(),
+                    message_id: None,
+                });
+            }
+        };
+        record(started("open"));
+        record(progress("open", 1));
+        record(progress("open", 2));
+        record(started("done"));
+        record(progress("done", 1));
+        record(started("reused"));
+        record(progress("reused", 1));
+        record(Event::WorkflowRunFinished {
+            run_id: "reused".into(),
+        });
+        record(started("reused"));
+        record(progress("reused", 5));
+        filler(&mut record, 150);
+        record(Event::WorkflowRunFinished {
+            run_id: "done".into(),
+        });
+        filler(&mut record, 150);
+
+        let progresses: Vec<(String, Option<u64>)> = store
+            .replay_from("s-1", 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::WorkflowRunProgress { run_id, progress } => {
+                    Some((run_id, progress.completed))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            progresses,
+            [
+                ("open".to_string(), Some(2)),
+                ("reused".to_string(), Some(5))
+            ]
+        );
+
+        let mut folded =
+            AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        for (seq, event) in store.replay_from("s-1", 0) {
+            folded.apply_event(seq, event).unwrap();
+        }
+        let open = folded
+            .lifecycle_runs
+            .iter()
+            .find(|r| r.run_id == "open")
+            .unwrap();
+        let p = open.progress.as_ref().unwrap();
+        assert_eq!(
+            (p.label.as_deref(), p.completed, p.total),
+            (Some("step 2"), Some(2), Some(9))
+        );
+    }
+
     /// Workflows share the task events but must not use up the shells' kept
     /// slots, on replay or in the folded state.
     #[test]
@@ -1491,7 +1710,7 @@ mod tests {
         record(Event::BackgroundTaskStarted {
             task_id: "shell".into(),
             tool_call_id: None,
-            description: "make build".into(),
+            description: Some("make build".into()),
             workflow: None,
             started_at: None,
         });
@@ -1500,7 +1719,7 @@ mod tests {
             record(Event::BackgroundTaskStarted {
                 task_id: format!("wf{i}"),
                 tool_call_id: Some(format!("call-{i}")),
-                description: "drafts".into(),
+                description: Some("drafts".into()),
                 workflow: Some(WorkflowLaunch {
                     run_id: format!("wf_{i}"),
                     name: "drafts".into(),
@@ -1536,7 +1755,7 @@ mod tests {
         let started = |tool_call_id: &str| Event::BackgroundTaskStarted {
             task_id: "t".into(),
             tool_call_id: Some(tool_call_id.into()),
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -1574,7 +1793,7 @@ mod tests {
         let started = |id: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
             tool_call_id: None,
-            description: "sleep".into(),
+            description: Some("sleep".into()),
             workflow: None,
             started_at: None,
         };
@@ -1595,6 +1814,31 @@ mod tests {
             ["t-2".to_string()]
         );
         assert!(store.unresolved_background_task_ids("s-2").is_empty());
+    }
+
+    #[test]
+    fn unresolved_workflow_run_ids_skip_finished_runs_and_renewals() {
+        let (_tmp, store) = open_store(1000);
+        let started = |id: &str| Event::WorkflowRunStarted {
+            run_id: id.into(),
+            started_at: None,
+        };
+        store.record("s-1", 1, &started("a")).unwrap();
+        store.record("s-1", 2, &started("b")).unwrap();
+        store.record("s-1", 3, &started("a")).unwrap();
+        store
+            .record("s-1", 4, &Event::WorkflowRunFinished { run_id: "b".into() })
+            .unwrap();
+        // A reused id: the last start is open, so it is listed exactly once.
+        store.record("s-1", 5, &started("c")).unwrap();
+        store
+            .record("s-1", 6, &Event::WorkflowRunFinished { run_id: "c".into() })
+            .unwrap();
+        store.record("s-1", 7, &started("c")).unwrap();
+        let mut open = store.unresolved_workflow_run_ids("s-1");
+        open.sort();
+        assert_eq!(open, ["a".to_string(), "c".to_string()]);
+        assert!(store.unresolved_workflow_run_ids("s-2").is_empty());
     }
 
     /// A workflow run's resume carries its launch and what the log recorded
@@ -1630,7 +1874,7 @@ mod tests {
                 Event::BackgroundTaskStarted {
                     task_id: "wfx".into(),
                     tool_call_id: Some("toolu_wf".into()),
-                    description: "drafts".into(),
+                    description: Some("drafts".into()),
                     workflow: Some(launch.clone()),
                     started_at: None,
                 },

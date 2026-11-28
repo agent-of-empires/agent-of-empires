@@ -3,17 +3,17 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-const VALID: &str = r####"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"claude-agent-acp","version":"0.99.1"},"_meta":{"aoe":{"proxy":{"plugin_id":"example.plugin","protocol_version":1,"primitive_schema_version":1}}}}}
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Task","_meta":{"aoe":{"v":1,"key":"call-t1","parent_tool_call":"t0"}}}}}
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"aoe":{"v":1,"key":"busy-1","lease":{"id":"bg-1","kind":"busy","ttl_ms":30000}}}}}}
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"later"},"_meta":{"aoe":{"v":1,"key":"tail-1","after_adapter_sequence":2,"ephemeral":true}}}}}
+const VALID: &str = r####"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"claude-agent-acp","version":"0.99.1"},"_meta":{"aoe":{"proxy":{"plugin_id":"example.plugin","protocol_version":1,"primitive_schema_version":2}}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Task","_meta":{"aoe":{"v":2,"key":"call-t1","parent_tool_call":"t0"}}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"aoe":{"v":2,"key":"busy-1","lease":{"id":"bg-1","kind":"busy","ttl_ms":30000}}}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"later"},"_meta":{"aoe":{"v":2,"key":"tail-1","after_adapter_sequence":2,"ephemeral":true}}}}}
 "####;
 
-const NO_HELLO: &str = r####"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Task","_meta":{"aoe":{"v":1,"key":"call-t1"}}}}}
+const NO_HELLO: &str = r####"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Task","_meta":{"aoe":{"v":2,"key":"call-t1"}}}}}
 "####;
 
-const INVALID: &str = r####"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"_meta":{"aoe":{"proxy":{"plugin_id":"example.plugin","protocol_version":9,"primitive_schema_version":1}}}}}
-{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Task","_meta":{"aoe":{"v":1}}}}}
+const INVALID: &str = r####"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"_meta":{"aoe":{"proxy":{"plugin_id":"example.plugin","protocol_version":9,"primitive_schema_version":2}}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Task","_meta":{"aoe":{"v":2}}}}}
 "####;
 
 fn lint(stream: &str, flags: &[&str]) -> (Option<i32>, String) {

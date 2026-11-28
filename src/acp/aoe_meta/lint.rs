@@ -2,7 +2,7 @@
 //! NDJSON stream, one JSON-RPC frame per line.
 
 use super::ordering::{Arrival, ArrivalOrder};
-use super::{Envelope, EnvelopeError, LeaseVerb, ProxyHello};
+use super::{Envelope, EnvelopeError, LeaseVerb, ProxyHello, RunState};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
@@ -43,8 +43,12 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
     // The whole update, so a reused key on a different tool call is caught.
     let mut keys: HashMap<String, serde_json::Value> = HashMap::new();
     let mut leases: HashSet<String> = HashSet::new();
+    // Open background tasks and workflow runs, by primitive and id.
+    let mut runs: HashSet<(&'static str, String)> = HashSet::new();
     let mut order: ArrivalOrder<Seen> = ArrivalOrder::default();
     let mut session: Option<String> = None;
+    // Session carried by updates before the first result.
+    let mut early_session: Option<String> = None;
 
     for (index, line) in reader.lines().enumerate() {
         let n = index + 1;
@@ -64,11 +68,14 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
             }
         };
 
-        // A session/new result with a new id starts a fresh key space, as the
-        // runtime's reset commit does.
+        // A session/new result with a new id starts a fresh key space and
+        // drops open leases and runs, as the runtime's reset commit does.
         if let Some(id) = frame.pointer("/result/sessionId").and_then(|v| v.as_str()) {
-            if session.as_deref().is_some_and(|current| current != id) {
+            let previous = session.as_deref().or(early_session.as_deref());
+            if previous.is_some_and(|current| current != id) {
                 keys.clear();
+                leases.clear();
+                runs.clear();
                 order.session_reset();
             }
             session = Some(id.to_string());
@@ -101,6 +108,12 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
         if frame.get("method").and_then(|m| m.as_str()) != Some("session/update") {
             continue;
         }
+        if session.is_none() && early_session.is_none() {
+            early_session = frame
+                .pointer("/params/sessionId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+        }
         let update = frame
             .pointer("/params/update")
             .unwrap_or(&serde_json::Value::Null);
@@ -126,6 +139,11 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
                     EnvelopeError::UnsupportedVersion(_) => "unsupported_version",
                     EnvelopeError::EmptyKey => "empty_key",
                     EnvelopeError::BadLeaseTtl(_) => "bad_lease_ttl",
+                    EnvelopeError::BlankId(_) => "blank_id",
+                    EnvelopeError::BadLifecycleTtl(..) => "bad_lifecycle_ttl",
+                    EnvelopeError::BadProgress => "bad_progress",
+                    EnvelopeError::BadWakeupAt(_) => "bad_wakeup_at",
+                    EnvelopeError::EphemeralLifecycle => "ephemeral_lifecycle",
                     EnvelopeError::Malformed(_) => "bad_envelope",
                 };
                 add(n, code, e.to_string());
@@ -182,6 +200,30 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
                         .into(),
                 );
             }
+            let tracked = [
+                (
+                    "background_task",
+                    env.background_task.as_ref().map(|t| (&t.id, t.state)),
+                ),
+                (
+                    "workflow_run",
+                    env.workflow_run.as_ref().map(|r| (&r.id, r.state)),
+                ),
+            ];
+            for (primitive, run) in tracked {
+                let Some((id, state)) = run else { continue };
+                match state {
+                    RunState::Started => {
+                        runs.insert((primitive, id.clone()));
+                    }
+                    RunState::Ended if !runs.remove(&(primitive, id.clone())) => add(
+                        seen.line,
+                        "lifecycle_unknown",
+                        format!("{primitive} {id:?} ended but was never started"),
+                    ),
+                    RunState::Ended => {}
+                }
+            }
             if let Some(lease) = &env.lease {
                 match lease.op {
                     LeaseVerb::Acquire => {
@@ -225,7 +267,7 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
 mod tests {
     use super::*;
 
-    const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}}}"#;
+    const HELLO: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":2}}}}}"#;
 
     fn update_of(kind: &str, meta: &str) -> String {
         format!(
@@ -257,7 +299,7 @@ mod tests {
 
     #[test]
     fn lint_cases() {
-        let ok_lease = update(r#"{"v":1,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":100}}"#);
+        let ok_lease = update(r#"{"v":2,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":100}}"#);
         // (name, stream, require_hello, expected finding codes)
         let cases: Vec<(&str, Vec<String>, bool, Vec<&str>)> = vec![
             ("clean", vec![HELLO.into(), ok_lease.clone()], true, vec![]),
@@ -288,26 +330,26 @@ mod tests {
             ),
             (
                 "missing key",
-                vec![update(r#"{"v":1}"#)],
+                vec![update(r#"{"v":2}"#)],
                 false,
                 vec!["bad_envelope"],
             ),
             (
                 "empty key",
-                vec![update(r#"{"v":1,"key":""}"#)],
+                vec![update(r#"{"v":2,"key":""}"#)],
                 false,
                 vec!["empty_key"],
             ),
             (
                 "future version",
-                vec![update(r#"{"v":2,"key":"a"}"#)],
+                vec![update(r#"{"v":3,"key":"a"}"#)],
                 false,
                 vec!["unsupported_version"],
             ),
             (
                 "acquire without ttl",
                 vec![update(
-                    r#"{"v":1,"key":"a","lease":{"id":"l","kind":"busy"}}"#,
+                    r#"{"v":2,"key":"a","lease":{"id":"l","kind":"busy"}}"#,
                 )],
                 false,
                 vec!["bad_lease_ttl"],
@@ -315,7 +357,7 @@ mod tests {
             (
                 "renew unknown lease",
                 vec![update(
-                    r#"{"v":1,"key":"a","lease":{"id":"l","kind":"task","op":"renew","ttl_ms":5}}"#,
+                    r#"{"v":2,"key":"a","lease":{"id":"l","kind":"task","op":"renew","ttl_ms":5}}"#,
                 )],
                 false,
                 vec!["lease_unknown"],
@@ -323,8 +365,8 @@ mod tests {
             (
                 "same key same payload",
                 vec![
-                    update(r#"{"v":1,"key":"a","ephemeral":true}"#),
-                    update(r#"{"v":1,"key":"a","ephemeral":true}"#),
+                    update(r#"{"v":2,"key":"a","ephemeral":true}"#),
+                    update(r#"{"v":2,"key":"a","ephemeral":true}"#),
                 ],
                 false,
                 vec![],
@@ -332,8 +374,8 @@ mod tests {
             (
                 "same key other payload",
                 vec![
-                    update(r#"{"v":1,"key":"a","ephemeral":true}"#),
-                    update(r#"{"v":1,"key":"a","ephemeral":false}"#),
+                    update(r#"{"v":2,"key":"a","ephemeral":true}"#),
+                    update(r#"{"v":2,"key":"a","ephemeral":false}"#),
                 ],
                 false,
                 vec!["key_conflict"],
@@ -341,10 +383,10 @@ mod tests {
             (
                 "key reused for a different update after a new session",
                 vec![
-                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
+                    tool_call("t1", r#"{"v":2,"key":"k"}"#),
                     r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
                     r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
-                    in_session("s2", tool_call("t2", r#"{"v":1,"key":"k"}"#)),
+                    in_session("s2", tool_call("t2", r#"{"v":2,"key":"k"}"#)),
                 ],
                 false,
                 vec![],
@@ -353,10 +395,10 @@ mod tests {
                 "a late old-session frame is not checked in the new key space",
                 vec![
                     r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
-                    in_session("s1", tool_call("t1", r#"{"v":1,"key":"k"}"#)),
+                    in_session("s1", tool_call("t1", r#"{"v":2,"key":"k"}"#)),
                     r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
-                    in_session("s2", tool_call("t2", r#"{"v":1,"key":"k"}"#)),
-                    in_session("s1", tool_call("t3", r#"{"v":1,"key":"k"}"#)),
+                    in_session("s2", tool_call("t2", r#"{"v":2,"key":"k"}"#)),
+                    in_session("s1", tool_call("t3", r#"{"v":2,"key":"k"}"#)),
                 ],
                 false,
                 vec![],
@@ -368,9 +410,9 @@ mod tests {
                     r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
                     in_session(
                         "s2",
-                        update(r#"{"v":1,"key":"t","after_adapter_sequence":1,"ephemeral":true}"#),
+                        update(r#"{"v":2,"key":"t","after_adapter_sequence":1,"ephemeral":true}"#),
                     ),
-                    in_session("s1", update(r#"{"v":1,"key":"late"}"#)),
+                    in_session("s1", update(r#"{"v":2,"key":"late"}"#)),
                 ],
                 false,
                 vec![],
@@ -379,9 +421,9 @@ mod tests {
                 "key reused for a different update in the same session",
                 vec![
                     r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
-                    in_session("s1", tool_call("t1", r#"{"v":1,"key":"k"}"#)),
+                    in_session("s1", tool_call("t1", r#"{"v":2,"key":"k"}"#)),
                     r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s1"}}"#.into(),
-                    in_session("s1", tool_call("t2", r#"{"v":1,"key":"k"}"#)),
+                    in_session("s1", tool_call("t2", r#"{"v":2,"key":"k"}"#)),
                 ],
                 false,
                 vec!["key_conflict"],
@@ -389,8 +431,8 @@ mod tests {
             (
                 "an invalid anchored frame is not an adapter frame",
                 vec![
-                    update(r#"{"v":1,"key":"","after_adapter_sequence":1}"#),
-                    update(r#"{"v":1,"key":"t","after_adapter_sequence":1,"ephemeral":true}"#),
+                    update(r#"{"v":2,"key":"","after_adapter_sequence":1}"#),
+                    update(r#"{"v":2,"key":"t","after_adapter_sequence":1,"ephemeral":true}"#),
                 ],
                 false,
                 vec!["empty_key", "sequence_beyond_stream"],
@@ -398,8 +440,8 @@ mod tests {
             (
                 "same envelope on a different tool call",
                 vec![
-                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
-                    tool_call("t2", r#"{"v":1,"key":"k"}"#),
+                    tool_call("t1", r#"{"v":2,"key":"k"}"#),
+                    tool_call("t2", r#"{"v":2,"key":"k"}"#),
                 ],
                 false,
                 vec!["key_conflict"],
@@ -407,8 +449,8 @@ mod tests {
             (
                 "identical retransmission of a tool call",
                 vec![
-                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
-                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
+                    tool_call("t1", r#"{"v":2,"key":"k"}"#),
+                    tool_call("t1", r#"{"v":2,"key":"k"}"#),
                 ],
                 false,
                 vec![],
@@ -416,8 +458,8 @@ mod tests {
             (
                 "anchor past the end",
                 vec![
-                    update(r#"{"v":1,"key":"a","after_adapter_sequence":2,"ephemeral":true}"#),
-                    update(r#"{"v":1,"key":"b"}"#),
+                    update(r#"{"v":2,"key":"a","after_adapter_sequence":2,"ephemeral":true}"#),
+                    update(r#"{"v":2,"key":"b"}"#),
                 ],
                 false,
                 vec!["sequence_beyond_stream"],
@@ -425,9 +467,9 @@ mod tests {
             (
                 "a retransmitted adapter frame still takes its number",
                 vec![
-                    update(r#"{"v":1,"key":"k","ephemeral":true}"#),
-                    update(r#"{"v":1,"key":"k","ephemeral":true}"#),
-                    update(r#"{"v":1,"key":"t","after_adapter_sequence":2,"ephemeral":true}"#),
+                    update(r#"{"v":2,"key":"k","ephemeral":true}"#),
+                    update(r#"{"v":2,"key":"k","ephemeral":true}"#),
+                    update(r#"{"v":2,"key":"t","after_adapter_sequence":2,"ephemeral":true}"#),
                 ],
                 false,
                 vec![],
@@ -435,8 +477,8 @@ mod tests {
             (
                 "anchor reached",
                 vec![
-                    update(r#"{"v":1,"key":"a","after_adapter_sequence":1,"ephemeral":true}"#),
-                    update(r#"{"v":1,"key":"b"}"#),
+                    update(r#"{"v":2,"key":"a","after_adapter_sequence":1,"ephemeral":true}"#),
+                    update(r#"{"v":2,"key":"b"}"#),
                 ],
                 false,
                 vec![],
@@ -446,12 +488,12 @@ mod tests {
         let flood: Vec<String> = (0..=super::super::ordering::MAX_HELD)
             .map(|n| {
                 update(&format!(
-                    r#"{{"v":1,"key":"h{n}","after_adapter_sequence":2,"ephemeral":true}}"#
+                    r#"{{"v":2,"key":"h{n}","after_adapter_sequence":2,"ephemeral":true}}"#
                 ))
             })
             .chain([
-                update(r#"{"v":1,"key":"p1"}"#),
-                update(r#"{"v":1,"key":"p2"}"#),
+                update(r#"{"v":2,"key":"p1"}"#),
+                update(r#"{"v":2,"key":"p2"}"#),
             ])
             .collect();
         let mut cases = cases;
@@ -465,9 +507,9 @@ mod tests {
             (
                 "replayed release is dropped like at runtime",
                 vec![
-                    update(r#"{"v":1,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":5}}"#),
-                    update(r#"{"v":1,"key":"r","lease":{"id":"l","kind":"busy","op":"release"}}"#),
-                    update(r#"{"v":1,"key":"r","lease":{"id":"l","kind":"busy","op":"release"}}"#),
+                    update(r#"{"v":2,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":5}}"#),
+                    update(r#"{"v":2,"key":"r","lease":{"id":"l","kind":"busy","op":"release"}}"#),
+                    update(r#"{"v":2,"key":"r","lease":{"id":"l","kind":"busy","op":"release"}}"#),
                 ],
                 false,
                 vec![],
@@ -475,9 +517,9 @@ mod tests {
             (
                 "anchored renewal that precedes its acquire on the wire",
                 vec![
-                    update(r#"{"v":1,"key":"r","after_adapter_sequence":2,"lease":{"id":"l","kind":"busy","op":"renew","ttl_ms":5}}"#),
-                    update(r#"{"v":1,"key":"x"}"#),
-                    update(r#"{"v":1,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":5}}"#),
+                    update(r#"{"v":2,"key":"r","after_adapter_sequence":2,"lease":{"id":"l","kind":"busy","op":"renew","ttl_ms":5}}"#),
+                    update(r#"{"v":2,"key":"x"}"#),
+                    update(r#"{"v":2,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":5}}"#),
                 ],
                 false,
                 vec![],
@@ -485,13 +527,127 @@ mod tests {
             ("too many frames wait on an anchor", flood, false, vec!["hold_overflow"]),
             (
                 "plan proposal off a tool call",
-                vec![update(r#"{"v":1,"key":"a","plan_proposal":{"markdown":"- a"}}"#)],
+                vec![update(r#"{"v":2,"key":"a","plan_proposal":{"markdown":"- a"}}"#)],
                 false,
                 vec!["primitive_on_wrong_update"],
             ),
             (
+                "lifecycle primitives on a plain update",
+                vec![
+                    update(r#"{"v":2,"key":"a","background_task":{"id":"b","state":"started","ttl_ms":5}}"#),
+                    update(r#"{"v":2,"key":"b","workflow_run":{"id":"w","state":"started","ttl_ms":5,"progress":{"completed":1,"total":2}}}"#),
+                    update(r#"{"v":2,"key":"c","wakeup":{"at":"2026-01-01T00:00:00Z"},"monitor":{}}"#),
+                    update(r#"{"v":2,"key":"d","background_task":{"id":"b","state":"ended"}}"#),
+                    update(r#"{"v":2,"key":"e","workflow_run":{"id":"w","state":"ended"}}"#),
+                ],
+                false,
+                vec![],
+            ),
+            (
+                "ended without a start",
+                vec![update(r#"{"v":2,"key":"a","background_task":{"id":"b","state":"ended"}}"#)],
+                false,
+                vec!["lifecycle_unknown"],
+            ),
+            (
+                "a task end does not close a run of the same id",
+                vec![
+                    update(r#"{"v":2,"key":"a","workflow_run":{"id":"x","state":"started","ttl_ms":5}}"#),
+                    update(r#"{"v":2,"key":"b","background_task":{"id":"x","state":"ended"}}"#),
+                ],
+                false,
+                vec!["lifecycle_unknown"],
+            ),
+            (
+                "ended after its end",
+                vec![
+                    update(r#"{"v":2,"key":"a","background_task":{"id":"b","state":"started","ttl_ms":5}}"#),
+                    update(r#"{"v":2,"key":"b","background_task":{"id":"b","state":"ended"}}"#),
+                    update(r#"{"v":2,"key":"c","background_task":{"id":"b","state":"ended"}}"#),
+                ],
+                false,
+                vec!["lifecycle_unknown"],
+            ),
+            (
+                "invalid lifecycle envelopes",
+                vec![
+                    update(r#"{"v":2,"key":"a","background_task":{"id":" ","state":"ended"}}"#),
+                    update(r#"{"v":2,"key":"b","background_task":{"id":"b","state":"started"}}"#),
+                    update(r#"{"v":2,"key":"c","workflow_run":{"id":"w","state":"started","ttl_ms":5,"progress":{"completed":3,"total":2}}}"#),
+                    update(r#"{"v":2,"key":"d","wakeup":{"at":"soon"}}"#),
+                    update(r#"{"v":2,"key":"e","ephemeral":true,"monitor":{}}"#),
+                ],
+                false,
+                vec!["blank_id", "bad_lifecycle_ttl", "bad_progress", "bad_wakeup_at", "ephemeral_lifecycle"],
+            ),
+            (
+                "a run started in one session is not open in the next",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"a","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session("s2", update(r#"{"v":2,"key":"b","workflow_run":{"id":"w","state":"ended"}}"#)),
+                ],
+                false,
+                vec!["lifecycle_unknown"],
+            ),
+            (
+                "a lease held in one session is not held in the next",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"a","lease":{"id":"l","kind":"busy","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session("s2", update(r#"{"v":2,"key":"b","lease":{"id":"l","kind":"busy","op":"renew","ttl_ms":5}}"#)),
+                ],
+                false,
+                vec!["lease_unknown"],
+            ),
+            (
+                "the same run started in two sessions and ended in the second",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"a","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session("s2", update(r#"{"v":2,"key":"b","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    in_session("s2", update(r#"{"v":2,"key":"c","workflow_run":{"id":"w","state":"ended"}}"#)),
+                ],
+                false,
+                vec![],
+            ),
+            (
+                "start, renew and end in one session",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"a","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    in_session("s1", update(r#"{"v":2,"key":"b","workflow_run":{"id":"w","state":"started","ttl_ms":5}}"#)),
+                    in_session("s1", update(r#"{"v":2,"key":"c","workflow_run":{"id":"w","state":"ended"}}"#)),
+                ],
+                false,
+                vec![],
+            ),
+            (
+                "first result names a different session than the earlier updates",
+                vec![
+                    in_session("s1", update(r#"{"v":2,"key":"a","background_task":{"id":"x","state":"started","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session("s2", update(r#"{"v":2,"key":"b","background_task":{"id":"x","state":"ended"}}"#)),
+                ],
+                false,
+                vec!["lifecycle_unknown"],
+            ),
+            (
+                "first result matches the earlier updates",
+                vec![
+                    in_session("s1", update(r#"{"v":2,"key":"a","background_task":{"id":"x","state":"started","ttl_ms":5}}"#)),
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", update(r#"{"v":2,"key":"b","background_task":{"id":"x","state":"ended"}}"#)),
+                ],
+                false,
+                vec![],
+            ),
+            (
                 "plan proposal on a tool call",
-                vec![update_of("tool_call", r#"{"v":1,"key":"a","plan_proposal":{"markdown":"- a"}}"#)],
+                vec![update_of("tool_call", r#"{"v":2,"key":"a","plan_proposal":{"markdown":"- a"}}"#)],
                 false,
                 vec![],
             ),

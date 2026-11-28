@@ -2952,7 +2952,7 @@ mod tests {
                 crate::acp::Event::BackgroundTaskStarted {
                     task_id: "task-1".into(),
                     tool_call_id: Some("toolu_1".into()),
-                    description: "sleep".into(),
+                    description: Some("sleep".into()),
                     workflow: None,
                     started_at: None,
                 },

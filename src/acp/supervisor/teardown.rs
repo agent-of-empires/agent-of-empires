@@ -207,6 +207,18 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
                 return false;
             }
         }
+        for run_id in sink.unresolved_workflow_run_ids(id) {
+            if !super::publish_next_persisted(
+                sink,
+                seqs,
+                id,
+                &Event::WorkflowRunFinished { run_id },
+            )
+            .1
+            {
+                return false;
+            }
+        }
         for event in super::publish::cancelled_open_subagents(sink, id) {
             if !super::publish_next_persisted(sink, seqs, id, &event).1 {
                 return false;
@@ -369,6 +381,18 @@ impl<S: BroadcastSink> Supervisor<S> {
                     task_id,
                     ended_at: Some(crate::time::Timestamp::now()),
                 },
+            )
+            .1
+            {
+                return Err(SupervisorError::TeardownPending(session_id.to_owned()));
+            }
+        }
+        for run_id in self.sink.unresolved_workflow_run_ids(session_id) {
+            if !super::publish_next_persisted(
+                self.sink.as_ref(),
+                &self.next_seqs,
+                session_id,
+                &Event::WorkflowRunFinished { run_id },
             )
             .1
             {
@@ -1576,6 +1600,10 @@ mod tests {
             self.inner.unresolved_background_task_ids(id)
         }
 
+        fn unresolved_workflow_run_ids(&self, id: &str) -> Vec<String> {
+            self.inner.unresolved_workflow_run_ids(id)
+        }
+
         fn unresolved_background_agent_ids(&self, id: &str) -> Vec<String> {
             self.inner.unresolved_background_agent_ids(id)
         }
@@ -1613,7 +1641,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "original-task".into(),
                     tool_call_id: None,
-                    description: "work".into(),
+                    description: Some("work".into()),
                     workflow: None,
                     started_at: None,
                 },
@@ -1785,7 +1813,7 @@ mod tests {
             .send(Event::BackgroundTaskStarted {
                 task_id: "original-task".into(),
                 tool_call_id: None,
-                description: "work".into(),
+                description: Some("work".into()),
                 workflow: None,
                 started_at: None,
             })
@@ -1903,7 +1931,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "replacement-task".into(),
                     tool_call_id: None,
-                    description: "new work".into(),
+                    description: Some("new work".into()),
                     workflow: None,
                     started_at: None,
                 },
@@ -2388,7 +2416,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "task-1".into(),
                     tool_call_id: None,
-                    description: "sleep".into(),
+                    description: Some("sleep".into()),
                     workflow: None,
                     started_at: None,
                 },
@@ -2433,6 +2461,16 @@ mod tests {
                 },
             )
             .unwrap();
+        store
+            .record(
+                session,
+                4,
+                &Event::WorkflowRunStarted {
+                    run_id: "run-1".into(),
+                    started_at: None,
+                },
+            )
+            .unwrap();
         let dead_pid = {
             let mut child = std::process::Command::new("/bin/sh")
                 .args(["-c", "exit 0"])
@@ -2449,6 +2487,7 @@ mod tests {
         sup.shutdown(session).await.expect("unowned shutdown");
 
         assert!(store.unresolved_background_task_ids(session).is_empty());
+        assert!(store.unresolved_workflow_run_ids(session).is_empty());
         assert!(store.unresolved_background_agent_ids(session).is_empty());
         assert!(store.open_subagents(session).is_empty());
         let mut state = crate::acp::state::AcpState::new(
@@ -2521,7 +2560,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "task-1".into(),
                     tool_call_id: None,
-                    description: "sleep".into(),
+                    description: Some("sleep".into()),
                     workflow: None,
                     started_at: None,
                 },
@@ -2591,6 +2630,9 @@ mod tests {
             let ids = self.inner.unresolved_background_task_ids(session_id);
             let _ = self.swept.send(());
             ids
+        }
+        fn unresolved_workflow_run_ids(&self, session_id: &str) -> Vec<String> {
+            self.inner.unresolved_workflow_run_ids(session_id)
         }
         fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
             self.inner.unresolved_background_agent_ids(session_id)
@@ -2689,7 +2731,7 @@ mod tests {
             .send(Event::BackgroundTaskStarted {
                 task_id: "inflight".into(),
                 tool_call_id: None,
-                description: "sleep".into(),
+                description: Some("sleep".into()),
                 workflow: None,
                 started_at: None,
             })
@@ -2777,7 +2819,7 @@ mod tests {
                 &Event::BackgroundTaskStarted {
                     task_id: "open".into(),
                     tool_call_id: None,
-                    description: "sleep".into(),
+                    description: Some("sleep".into()),
                     workflow: None,
                     started_at: None,
                 },

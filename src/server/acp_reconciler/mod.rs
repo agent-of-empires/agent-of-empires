@@ -1265,7 +1265,7 @@ mod tests {
         let task = Event::BackgroundTaskStarted {
             task_id: "task".into(),
             tool_call_id: None,
-            description: "build".into(),
+            description: Some("build".into()),
             workflow: None,
             started_at: None,
         };

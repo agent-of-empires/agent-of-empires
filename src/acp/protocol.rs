@@ -461,7 +461,7 @@ mod tests {
         let workflow = frame(Event::BackgroundTaskStarted {
             task_id: "wf1".into(),
             tool_call_id: Some("tc2".into()),
-            description: "run".into(),
+            description: Some("run".into()),
             workflow: Some(crate::acp::state::WorkflowLaunch {
                 run_id: "wf_1".into(),
                 name: "run".into(),
