@@ -380,6 +380,7 @@ async fn spawn_fake_connection_with(
 
 /// `init_extra` is spliced into the `initialize` result after
 /// `agentCapabilities`, e.g. a `_meta` hello.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_fake_connection_raw(
     session_id: &'static str,
     mode: Option<ConnectMode>,
@@ -407,6 +408,7 @@ async fn spawn_fake_connection_raw(
 /// With `close_after_init`, the one-slot event channel is full when the
 /// post-hello emit runs, so it blocks, and the agent closes its end right after
 /// the initialize reply: the transport closes before the connection is ready.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_fake_connection_inner(
     session_id: &'static str,
     mode: Option<ConnectMode>,
