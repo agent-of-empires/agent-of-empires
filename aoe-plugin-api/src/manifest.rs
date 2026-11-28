@@ -1015,7 +1015,21 @@ fn acp_id_ok(id: &str) -> bool {
 }
 
 fn acp_env_name_ok(name: &str) -> bool {
-    name.len() <= 128 && crate::agent_integration::valid_env_key(name)
+    name.len() <= 128
+        && crate::agent_integration::valid_env_key(name)
+        && !crate::agent_integration::acp_env_denied(name)
+}
+
+/// An npm package name: an optional `@scope/` then a nonblank name.
+fn acp_package_name_ok(package: &str) -> bool {
+    let name = match package.strip_prefix('@') {
+        Some(scoped) => match scoped.split_once('/') {
+            Some((scope, name)) if !scope.is_empty() => name,
+            _ => return false,
+        },
+        None => package,
+    };
+    !name.is_empty() && !name.contains('/') && !package.contains(char::is_whitespace)
 }
 
 /// A release asset or target name: one nonblank segment of printable characters.
@@ -1075,13 +1089,15 @@ fn validate_acp_declaration(
     );
     if let Some(adapter) = &acp.adapter {
         check(
-            !adapter.upstream_package.trim().is_empty()
+            acp_package_name_ok(&adapter.upstream_package)
                 && adapter.upstream_package.len() <= 214
                 && adapter
                     .upstream_package
                     .chars()
                     .all(declaration_character_ok),
-            format!("{at}.adapter.upstream_package must be a nonblank package name"),
+            format!(
+                "{at}.adapter.upstream_package must be a package name like `name` or `@scope/name`"
+            ),
         );
         check(
             semver::Version::parse(&adapter.upstream_pin).is_ok(),
@@ -1107,7 +1123,7 @@ fn validate_acp_declaration(
     check(
         allowlist.len() <= ACP_NAME_LIST_MAX && allowlist.iter().all(|n| acp_env_name_ok(n)),
         format!(
-            "{at}.env.allowlist must hold at most {ACP_NAME_LIST_MAX} exact variable names like EXAMPLE_API_KEY"
+            "{at}.env.allowlist must hold at most {ACP_NAME_LIST_MAX} exact variable names like EXAMPLE_API_KEY, none that the host reserves"
         ),
     );
     check(

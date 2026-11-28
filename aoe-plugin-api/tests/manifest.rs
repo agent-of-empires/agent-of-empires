@@ -1387,7 +1387,7 @@ fn acp_declaration_is_gated_and_round_trips() {
 
 #[test]
 fn acp_declaration_rejects_bad_fields() {
-    let cases: [(&str, &str, &str); 25] = [
+    let cases: [(&str, &str, &str); 33] = [
         ("id = \"example\"", "id = \"Bad Id\"", "acp.id"),
         ("id = \"example\"", "id = \"\"", "acp.id"),
         ("[\"example-cli\"]", "[\"example\"]", "aliases"),
@@ -1406,6 +1406,14 @@ fn acp_declaration_rejects_bad_fields() {
         ("[agent_integrations.acp.adapter.binary.assets]", "[agent_integrations.acp.adapter.binary.assets]\nlinux = \"a/b\"", "binary.assets"),
         ("allowlist = [\"EXAMPLE_API_KEY\"", "allowlist = [\"EXAMPLE_*\"", "env.allowlist"),
         ("allowlist = [\"EXAMPLE_API_KEY\"", "allowlist = [\"1BAD\"", "env.allowlist"),
+        ("\"@example/acp\"", "\"@example/\"", "upstream_package"),
+        ("\"@example/acp\"", "\"@example\"", "upstream_package"),
+        ("\"@example/acp\"", "\"@/acp\"", "upstream_package"),
+        ("allowlist = [\"EXAMPLE_API_KEY\"", "allowlist = [\"NODE_OPTIONS\"", "env.allowlist"),
+        ("allowlist = [\"EXAMPLE_API_KEY\"", "allowlist = [\"AOE_TOKEN\"", "env.allowlist"),
+        ("allowlist = [\"EXAMPLE_API_KEY\"", "allowlist = [\"LD_PRELOAD\"", "env.allowlist"),
+        ("EXAMPLE_MODE = \"fast\"", "PYTHONPATH = \"/x\"", "env.defaults"),
+        ("EXAMPLE_MODE = \"fast\"", "DYLD_INSERT_LIBRARIES = \"/x\"", "env.defaults"),
         ("host_only = [\"EXAMPLE_HOME\"]", "host_only = [\"OTHER\"]", "host_only"),
         ("EXAMPLE_MODE = \"fast\"", "EXAMPLE_MODE = \"a\\u0000b\"", "env.defaults"),
         ("EXAMPLE_MODE = \"fast\"", "\"BAD-NAME\" = \"x\"", "env.defaults"),

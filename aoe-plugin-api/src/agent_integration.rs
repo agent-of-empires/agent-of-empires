@@ -721,6 +721,32 @@ fn literal_word(word: &str) -> bool {
     })
 }
 
+/// Whether a plugin's ACP `env` may not name `key`: aoe's own variables, infrastructure and
+/// dynamic-linker keys, and interpreter hooks that run code in the adapter. The host drops
+/// these at resolve time, so a manifest declaring one is refused.
+pub fn acp_env_denied(key: &str) -> bool {
+    const DENIED: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "NODE_OPTIONS",
+        "BASH_ENV",
+        "ENV",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "GIT_SSH_COMMAND",
+        "SHELL",
+        "TMPDIR",
+    ];
+    key.starts_with("AOE_")
+        || key.starts_with("LD_")
+        || key.starts_with("DYLD_")
+        || DENIED.contains(&key)
+}
+
 pub(crate) fn valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')

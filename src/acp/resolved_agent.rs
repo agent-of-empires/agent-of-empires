@@ -156,7 +156,8 @@ fn adapter_argv(
     }
 }
 
-/// `rel` under `root`, with symlinks resolved: a link or `..` leaving the root is refused.
+/// The regular file `rel` under `root`, with symlinks resolved: a link or `..` leaving the root
+/// is refused.
 fn resolve_beneath(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let root = root
         .canonicalize()
@@ -165,18 +166,20 @@ fn resolve_beneath(root: &Path, rel: &str) -> Result<PathBuf, String> {
         .join(rel)
         .canonicalize()
         .map_err(|e| format!("proxy command {rel:?} is unreadable ({e})"))?;
-    if path.starts_with(&root) {
-        Ok(path)
-    } else {
-        Err(format!(
+    if !path.starts_with(&root) {
+        return Err(format!(
             "proxy command {rel:?} escapes the install directory"
-        ))
+        ));
     }
+    if !path.is_file() {
+        return Err(format!("proxy command {rel:?} is not a regular file"));
+    }
+    Ok(path)
 }
 
 fn env_key_allowed(key: &str) -> bool {
     crate::session::environment::is_valid_env_key(key)
-        && !key.starts_with("AOE_")
+        && !aoe_plugin_api::agent_integration::acp_env_denied(key)
         && provider_env_denyreason(key).is_none()
 }
 
@@ -219,6 +222,8 @@ mod tests {
                 "LD_PRELOAD",
                 "DYLD_X",
                 "PATH",
+                "NODE_OPTIONS",
+                "TMPDIR",
                 "bad-name",
             ]
             .map(String::from)
@@ -228,6 +233,7 @@ mod tests {
                 ("EXAMPLE_REGION", "eu"),
                 ("LD_LIBRARY_PATH", "/x"),
                 ("AOE_URL", "u"),
+                ("PYTHONPATH", "/x"),
             ]
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .into(),
@@ -248,11 +254,19 @@ mod tests {
         let root = temp.path().join("plugin");
         std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::write(root.join("bin/proxy"), "").unwrap();
+        std::fs::create_dir_all(root.join("bin/dir")).unwrap();
         std::fs::write(temp.path().join("outside"), "").unwrap();
         std::os::unix::fs::symlink(temp.path().join("outside"), root.join("bin/link")).unwrap();
 
         assert!(resolve_beneath(&root, "bin/proxy").is_ok());
-        for rel in ["bin/link", "../outside", "/etc/hosts", "bin/missing"] {
+        for rel in [
+            "bin/link",
+            "../outside",
+            "/etc/hosts",
+            "bin/missing",
+            "bin/dir",
+            "bin",
+        ] {
             assert!(resolve_beneath(&root, rel).is_err(), "{rel}");
         }
     }
