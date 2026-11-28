@@ -1,9 +1,9 @@
-import type { AgentLifecycleInfo } from "./agentProfiles";
 import { notifySettingsChanged } from "./settingsEvents";
 import { clientFormFactor } from "./formFactor";
 import { reportError } from "./logger";
 import type { SchemaSettings } from "./generated/settingsKeys";
 import type {
+  AgentLifecycleInfo,
   SessionResponse,
   RichDiffFilesResponse,
   RichFileContentsResponse,
@@ -34,6 +34,7 @@ import type {
 import type { AcpAttachment, ConfigOptionDescriptor, PromptAttachmentInput } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 import { INLINE_ELEVATION_HEADER } from "./fetchInterceptor";
+import { scopeParam, type DiffScope } from "./diffScope";
 import { notifySuggestionsChanged } from "./suggestionEvents";
 
 type Payload = Record<string, unknown>;
@@ -441,8 +442,9 @@ export async function killTerminal(id: string, index: number): Promise<boolean> 
   }
 }
 
-export function getSessionDiffFiles(id: string): Promise<RichDiffFilesResponse | null> {
-  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files`);
+export function getSessionDiffFiles(id: string, scope: DiffScope = "branch"): Promise<RichDiffFilesResponse | null> {
+  const param = scopeParam(scope);
+  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files${param ? `?scope=${param}` : ""}`);
 }
 
 /**
@@ -454,9 +456,12 @@ export function getSessionFileContents(
   id: string,
   filePath: string,
   repoName?: string,
+  scope: DiffScope = "branch",
 ): Promise<RichFileContentsResponse | null> {
   const params = new URLSearchParams({ path: filePath });
   if (repoName) params.set("repo", repoName);
+  const param = scopeParam(scope);
+  if (param) params.set("scope", param);
   return fetchJson<RichFileContentsResponse>(`/api/sessions/${id}/diff/file?${params.toString()}`);
 }
 
@@ -1528,8 +1533,14 @@ export async function updateProfileSettings(name: string, updates: Record<string
 
 import type { ResolvedTheme } from "./theme";
 
-export async function fetchThemes(): Promise<string[]> {
-  return (await fetchJson<string[]>("/api/themes")) ?? [];
+/** A theme the pickers offer: its config name, and what to call it ("dark" for zinc). */
+export interface ThemeChoice {
+  name: string;
+  label: string;
+}
+
+export async function fetchThemes(): Promise<ThemeChoice[]> {
+  return (await fetchJson<ThemeChoice[]>("/api/themes")) ?? [];
 }
 
 /** Fetch the resolved theme projection (web CSS vars, terminal CSS
@@ -3632,13 +3643,25 @@ export function fetchSuggestions(): Promise<SuggestionsSnapshot | null> {
   return fetchJson<SuggestionsSnapshot>("/api/suggestions");
 }
 
-async function suggestionRequest<T>(url: string, method: string, body?: unknown): Promise<SuggestionResult<T>> {
+/** A save the server may take a while on, such as one mapping among many; past this the caller reloads to see what stuck. */
+const SUGGESTION_SAVE_TIMEOUT_MS = 15_000;
+
+async function suggestionRequest<T>(
+  url: string,
+  method: string,
+  body?: unknown,
+  timeoutMs?: number,
+): Promise<SuggestionResult<T>> {
   let res: Response;
   let text: string;
   try {
-    res = await fetch(url, jsonInit(method, body));
+    const init = jsonInit(method, body);
+    res = await fetch(url, timeoutMs ? { ...init, signal: AbortSignal.timeout(timeoutMs) } : init);
     text = await res.text();
   } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      return { ok: false, error: "Timed out. It may have saved; reload to check.", stale: false };
+    }
     return {
       ok: false,
       error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
@@ -3662,7 +3685,7 @@ async function suggestionMutation(url: string, method: string, body?: unknown): 
   return result;
 }
 
-export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refresh", "POST");
+export const refreshSuggestions = () => suggestionMutation("/api/suggestions/refresh", "POST");
 
 export const runSuggestionFix = (providerId: string) =>
   suggestionRequest("/api/suggestions/fix", "POST", { provider_id: providerId });
@@ -3678,6 +3701,10 @@ export const dismissSuggestion = (providerId: string, id: string, dismissed: boo
 
 export const updateSuggestionSource = (providerId: string, criterion: string, enabled: boolean) =>
   suggestionMutation("/api/suggestions/sources", "PATCH", { provider_id: providerId, criterion, enabled });
+
+/** Turns auto start on for a kind (at most `cap` items per refresh) or off. */
+export const putSuggestionAutoStart = (providerId: string, criterion: string, enabled: boolean, cap?: number) =>
+  suggestionMutation("/api/suggestions/auto-start", "PUT", { provider_id: providerId, criterion, enabled, cap });
 
 /** Resolves the wizard prefill. Creates nothing. */
 export const prepareSuggestion = (providerId: string, id: string) =>
@@ -3735,20 +3762,8 @@ export type StartResult =
   | { kind: "no_project" }
   | { kind: "error"; error: string };
 
-/** Starts a Session from a suggestion with its kind's preset; the server answers 201 once it exists. */
-export async function startSuggestion(
-  providerId: string,
-  id: string,
-  options: StartOptions = {},
-): Promise<StartResult> {
-  let res: Response;
-  let text: string;
-  try {
-    res = await fetch("/api/suggestions/start", jsonInit("POST", { provider_id: providerId, id, ...options }));
-    text = await res.text();
-  } catch (error) {
-    return { kind: "error", error: `Network error: ${error instanceof Error ? error.message : "connection failed"}` };
-  }
+/** What `POST /api/suggestions/start` answered (or `start-batch` for one item), as a {@link StartResult}. */
+function startResult(status: number, text: string): StartResult {
   let body: Record<string, unknown> = {};
   try {
     body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
@@ -3756,7 +3771,7 @@ export async function startSuggestion(
     // Handled below by status.
   }
   const str = (v: unknown) => (typeof v === "string" ? v : undefined);
-  if (res.ok) {
+  if (status >= 200 && status < 300) {
     const sessionId = str(body.session_id);
     if (!sessionId)
       return { kind: "error", error: "Unexpected response from the server. Reload to see the current state." };
@@ -3764,16 +3779,16 @@ export async function startSuggestion(
     return { kind: "started", sessionId, title: str(body.title) ?? "" };
   }
   const code = str(body.error);
-  if (res.status === 409 && code === "already_started") {
+  if (status === 409 && code === "already_started") {
     notifySuggestionsChanged();
     return { kind: "already_started", sessionId: str(body.session_id) ?? "" };
   }
-  if (res.status === 409 && code === "hooks_need_trust") {
+  if (status === 409 && code === "hooks_need_trust") {
     return { kind: code, review: body as unknown as StartHooksReview };
   }
-  if (res.status === 409 && code === "trust_changed") return { kind: "trust_changed" };
-  if (res.status === 409 && code === "stale_suggestion") return { kind: "stale" };
-  if (res.status === 422 && code === "start_failed") {
+  if (status === 409 && code === "trust_changed") return { kind: "trust_changed" };
+  if (status === 409 && code === "stale_suggestion") return { kind: "stale" };
+  if (status === 422 && code === "start_failed") {
     return {
       kind: "failed",
       reason: str(body.reason) ?? str(body.message) ?? "The Session could not be started.",
@@ -3781,8 +3796,55 @@ export async function startSuggestion(
       retryable: body.retryable !== false,
     };
   }
-  if (res.status === 400 && code === "no_project") return { kind: "no_project" };
-  return { kind: "error", error: parseApiErrorText(text, res.status) };
+  if (status === 400 && code === "no_project") return { kind: "no_project" };
+  return { kind: "error", error: parseApiErrorText(text, status) };
+}
+
+/** Starts a Session from a suggestion with its kind's preset; the server answers 201 once it exists. */
+export async function startSuggestion(
+  providerId: string,
+  id: string,
+  options: StartOptions = {},
+): Promise<StartResult> {
+  try {
+    const res = await fetch("/api/suggestions/start", jsonInit("POST", { provider_id: providerId, id, ...options }));
+    return startResult(res.status, await res.text());
+  } catch (error) {
+    return { kind: "error", error: `Network error: ${error instanceof Error ? error.message : "connection failed"}` };
+  }
+}
+
+/** Most items the daemon takes in one batch start. */
+export const START_BATCH_MAX = 25;
+
+/**
+ * Starts the items in one request, one after another on the daemon, never approving hooks.
+ * The results come back in the order sent, each as `startSuggestion` would have answered it.
+ */
+export async function startSuggestions(items: { provider_id: string; id: string }[]): Promise<StartResult[]> {
+  const failAll = (error: string): StartResult[] => items.map(() => ({ kind: "error", error }));
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch("/api/suggestions/start-batch", jsonInit("POST", { items }));
+    text = await res.text();
+  } catch (error) {
+    return failAll(`Network error: ${error instanceof Error ? error.message : "connection failed"}`);
+  }
+  let results: { status?: unknown; body?: unknown }[] | undefined;
+  try {
+    results = res.ok ? (JSON.parse(text) as { results: typeof results }).results : undefined;
+  } catch {
+    // Handled below.
+  }
+  if (!results || results.length !== items.length) {
+    return failAll(
+      res.ok
+        ? "Unexpected response from the server. Reload to see the current state."
+        : parseApiErrorText(text, res.status),
+    );
+  }
+  return results.map((r) => startResult(typeof r.status === "number" ? r.status : 0, JSON.stringify(r.body ?? {})));
 }
 
 export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | null> {
@@ -3791,11 +3853,16 @@ export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | n
 }
 
 export const putSuggestionMapping = (providerId: string, mappingKey: string, projects: string[]) =>
-  suggestionRequest("/api/suggestions/mappings", "PUT", {
-    provider_id: providerId,
-    mapping_key: mappingKey,
-    projects,
-  });
+  suggestionRequest(
+    "/api/suggestions/mappings",
+    "PUT",
+    {
+      provider_id: providerId,
+      mapping_key: mappingKey,
+      projects,
+    },
+    SUGGESTION_SAVE_TIMEOUT_MS,
+  );
 
 export async function fetchSuggestionProjects(): Promise<SuggestionProject[] | null> {
   const body = await fetchJson<{ projects: SuggestionProject[] }>("/api/suggestions/projects");

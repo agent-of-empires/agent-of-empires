@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import type { SystemHealth } from "../lib/api";
 import { useSystemHealth } from "../hooks/useSystemHealth";
 import { useSidebarCompact } from "../lib/sidebarCompact";
+import { useOutsideDismiss } from "./useOutsideDismiss";
 import { formatBytes, formatPercent, useSystemHealthEnabled } from "../lib/systemHealth";
 
 /** Band colors mirror the TUI strip: calm reads as running green, warn as the
@@ -38,8 +39,8 @@ export function SidebarSystemHealth() {
   return <SystemHealthStrip health={health} expanded={expanded} onToggle={() => setExpanded((v) => !v)} />;
 }
 
-/** Compact host-health readout below the session list, with the per-agent
- *  table behind a disclosure. Mirrors the TUI's strip and its drill-down. */
+/** Compact host-health readout in the sidebar's footer row, beside Settings, with the per-agent table opening above
+ *  it. Mirrors the TUI's strip and its drill-down. */
 export function SystemHealthStrip({
   health,
   expanded,
@@ -49,6 +50,9 @@ export function SystemHealthStrip({
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const ref = useRef<HTMLDivElement>(null);
+  // The drill-down floats over the list, so a click elsewhere or Escape closes it.
+  useOutsideDismiss(expanded, [ref], () => onToggle());
   if (!health) return null;
 
   const memoryKnown = health.memory_total_bytes > 0;
@@ -61,17 +65,20 @@ export function SystemHealthStrip({
       : "none";
 
   return (
-    <div className="border-t border-surface-700/20 text-[11px]" data-testid="system-health-strip">
+    // Not positioned: the drill-down opens across the whole footer row above, not just this strip's width.
+    <div ref={ref} className="flex-1 min-w-0 text-[11px]" data-testid="system-health-strip">
       <button
         onClick={() => onToggle()}
         aria-expanded={expanded}
         title="System health"
-        className="w-full flex items-center gap-1.5 px-2 py-1.5 hover:bg-surface-800/50 cursor-pointer transition-colors"
+        className="w-full h-8 flex items-center gap-1.5 px-2 rounded-md hover:bg-surface-800/50 cursor-pointer transition-colors min-w-0"
       >
-        <span className="font-medium tabular-nums">CPU {formatPercent(health.cpu_fraction)}</span>
+        <span className="shrink-0 whitespace-nowrap font-medium tabular-nums">
+          CPU {formatPercent(health.cpu_fraction)}
+        </span>
         <span className="text-text-secondary">·</span>
-        <span className={`font-medium tabular-nums ${bandColor}`}>Mem {memory}</span>
-        <span className="ml-auto text-text-secondary tabular-nums">
+        <span className={`shrink-0 whitespace-nowrap font-medium tabular-nums ${bandColor}`}>Mem {memory}</span>
+        <span className="ml-auto min-w-0 truncate whitespace-nowrap text-text-secondary tabular-nums">
           {health.agent_count} agents · {health.proc_count} procs
         </span>
         <ChevronRight
@@ -81,7 +88,10 @@ export function SystemHealthStrip({
       </button>
 
       {expanded && (
-        <div className="px-2 pb-2 space-y-2" data-testid="system-health-detail">
+        <div
+          className="absolute bottom-full left-2 right-2 z-20 mb-1 p-2 space-y-2 rounded-lg border border-surface-700/60 bg-surface-850 shadow-xl"
+          data-testid="system-health-detail"
+        >
           <div className="space-y-0.5">
             <div className="flex gap-2">
               <span className="w-14 shrink-0 text-text-secondary">Status</span>

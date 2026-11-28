@@ -46,7 +46,8 @@ test("hint sits under the cards and above the 'press n' line", async ({ page }) 
   await expect(hint).toContainText("based on your GitHub issues and PRs?");
 
   const [cards, hintBox, pressN] = await Promise.all([
-    page.locator("[data-tour=dashboard-new-session]").boundingBox(),
+    // The Dashboard's card; the phone list's New session pill shares the tour anchor.
+    page.locator("[data-tour=dashboard-new-session]").filter({ visible: true }).boundingBox(),
     hint.boundingBox(),
     page.getByText("to create a", { exact: false }).boundingBox(),
   ]);

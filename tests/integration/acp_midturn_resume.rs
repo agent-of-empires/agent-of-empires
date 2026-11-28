@@ -70,6 +70,8 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         None,
         None,
         None,
+        None,
+        false,
     )
     .await
     .expect("attach in_flight=true");
@@ -116,6 +118,8 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         None,
         None,
         None,
+        None,
+        false,
     )
     .await
     .expect("attach in_flight=false");
@@ -182,6 +186,8 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         None,
         None,
         None,
+        None,
+        false,
     )
     .await
     .expect("attach in_flight=true");
@@ -338,6 +344,8 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         None,
         None,
         None,
+        None,
+        false,
     )
     .await
     .expect("resume after detached completion");
@@ -363,6 +371,8 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         None,
         None,
         None,
+        None,
+        false,
     )
     .await
     .expect("runner accepts a new daemon after clean shutdown");

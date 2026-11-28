@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import { resolvePluginOptions } from "../../lib/api";
 import type { SettingsObjectField, SettingsOptionSource } from "../../lib/types";
+import { BUTTON_DANGER_GHOST_SM, BUTTON_GHOST_SM, FIELD_DESCRIPTION, FIELD_LABEL, INSET } from "../../lib/surfaces";
+import { PanelMessage } from "../panelParts";
+import { BUTTON_SECONDARY } from "../../lib/surfaces";
 import { validateCron } from "./cronValidation";
 import { ListField, NumberField, SelectField, TextField, ToggleField } from "./FormFields";
 import type { RowLabel } from "./rowLabel";
@@ -84,13 +87,21 @@ function PluginOptionMultiSelect({
 
   return (
     <div>
-      <div className="text-sm text-text-bright">{props.label}</div>
-      {props.description && <div className="text-xs text-text-dim">{props.description}</div>}
-      <div className="mt-1 space-y-1">
-        {shown.length === 0 && <div className="text-xs text-text-dim">No options available.</div>}
+      <div className={props.description ? FIELD_LABEL : FIELD_LABEL.replace("mb-0.5", "mb-2")}>{props.label}</div>
+      {props.description && <div className={FIELD_DESCRIPTION}>{props.description}</div>}
+      <div className="space-y-1">
+        {shown.length === 0 && <PanelMessage>No options available.</PanelMessage>}
         {shown.map((o) => (
-          <label key={o.value} className="flex items-center gap-2 text-sm text-text-primary">
-            <input type="checkbox" checked={values.includes(o.value)} onChange={() => toggle(o.value)} />
+          <label
+            key={o.value}
+            className="flex min-h-7 max-md:min-h-11 cursor-pointer items-center gap-2 text-[15px] md:text-sm text-text-primary"
+          >
+            <input
+              type="checkbox"
+              checked={values.includes(o.value)}
+              onChange={() => toggle(o.value)}
+              className="accent-brand-600 w-4 h-4 shrink-0"
+            />
             {o.label}
           </label>
         ))}
@@ -125,7 +136,7 @@ export function CronField({
         mono
         placeholder="0 9 * * 1-5"
       />
-      {error && <div className="text-xs text-status-error mt-1">{error}</div>}
+      {error && <div className="text-[13px] text-status-error-text mt-1">{error}</div>}
     </div>
   );
 }
@@ -292,12 +303,9 @@ export function ObjectListField({
   return (
     <div role="group" aria-labelledby={row.labelId} className="space-y-2">
       {working.map((item, index) => (
-        <div
-          key={String(item[idField] ?? index)}
-          className="rounded-lg border border-surface-700 bg-surface-900 p-3 space-y-2"
-        >
+        <div key={String(item[idField] ?? index)} className={`${INSET} p-3 space-y-2`}>
           <div className="flex items-center justify-between">
-            <span className="text-xs text-text-dim">Item {index + 1}</span>
+            <span className="text-[13px] text-text-dim">Item {index + 1}</span>
             <div className="flex gap-1">
               {itemButtons(index).map((b) => (
                 <button
@@ -306,7 +314,7 @@ export function ObjectListField({
                   aria-label={b.label}
                   disabled={b.disabled}
                   onClick={b.onClick}
-                  className="px-2 py-0.5 text-xs text-text-dim hover:text-text-primary disabled:opacity-40"
+                  className={BUTTON_GHOST_SM}
                 >
                   {b.text}
                 </button>
@@ -316,7 +324,7 @@ export function ObjectListField({
                 aria-label="Remove item"
                 disabled={atMin}
                 onClick={() => commit(working.filter((_, i) => i !== index))}
-                className="px-2 py-0.5 text-xs text-status-error hover:opacity-80 disabled:opacity-40"
+                className={BUTTON_DANGER_GHOST_SM}
               >
                 Remove
               </button>
@@ -329,12 +337,7 @@ export function ObjectListField({
           )}
         </div>
       ))}
-      <button
-        type="button"
-        disabled={atMax}
-        onClick={addItem}
-        className="px-3 py-1.5 text-sm rounded-md border border-surface-700 text-text-primary hover:border-brand-600 disabled:opacity-40"
-      >
+      <button type="button" disabled={atMax} onClick={addItem} className={BUTTON_SECONDARY}>
         Add item
       </button>
     </div>

@@ -10,7 +10,7 @@ import {
   type MockSessionInput,
   type SidebarMockHandle,
 } from "./helpers/sidebarMocks";
-import { dragRow, readVisibleSessionTitles } from "./helpers/sidebar";
+import { dragRow, openMobileSidebar, readVisibleSessionTitles } from "./helpers/sidebar";
 
 const WRAPPERS = "[aria-roledescription='Press and hold to reorder']";
 
@@ -105,7 +105,7 @@ test.describe("desktop rows", () => {
         ordering: order.map((title) => workspaceId(sessions.find((s) => s.title === title)!)),
       });
       // #1418: drag needs manual sort, which must stay the default.
-      await expect(page.locator("[data-testid='sidebar-sort-toggle']")).toHaveAttribute("data-sort-mode", "manual");
+      await expect(page.locator("[data-testid='sidebar-view-toggle']")).toHaveAttribute("data-sort-mode", "manual");
       await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(order);
     }
   });
@@ -231,7 +231,7 @@ test.describe("touch rows", () => {
   async function openMobile(page: Page, sessions = threeSessionsInOneRepo()) {
     const handle = await installSidebarMocks(page, { sessions });
     await page.goto("/");
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
+    await openMobileSidebar(page);
     const rows = page.getByTestId("sidebar-session-row");
     await expect(rows).toHaveCount(3);
     await page.waitForFunction(

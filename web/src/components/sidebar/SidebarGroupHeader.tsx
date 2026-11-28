@@ -56,7 +56,8 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   const compact = useSidebarCompact();
 
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
-  const rowClass = `hover:bg-surface-800/50 ${hasActiveChild ? "border-l-2 border-session-active" : ""}`;
+  // A straight edge: the header's rounding would curve the bar into a bracket.
+  const rowClass = `hover:bg-surface-800/50 ${hasActiveChild ? "border-l-2 border-session-active rounded-l-none" : ""}`;
   // Like a Session row's glyph: the header button takes focus and is described by the dot.
   const [dotTip, setDotTip] = useState<"hover" | "focus" | null>(null);
   const dotTipId = useId();
@@ -97,7 +98,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
               }
             : undefined
         }
-        className={`group flex items-center gap-2 ${compact ? "px-2" : "px-3"} py-2 transition-colors duration-75 text-text-secondary ${rowClass}`}
+        className={`group flex items-center gap-2 ${compact ? "px-2" : "px-2.5"} py-1.5 mt-1 rounded-md transition-colors duration-75 text-text-secondary ${rowClass}`}
         // The whole row activates the drag; `attributes` would add a role and a second tab stop.
         ref={(el) => {
           rowRef.current = el;
@@ -183,7 +184,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             )
           )}
           <span
-            className="text-[13px] md:text-[14px] font-medium truncate flex-1"
+            className="text-[13px] max-md:text-[15px] font-medium truncate flex-1"
             title={group.groupPath ?? group.repoPath}
           >
             {group.displayName}
@@ -200,7 +201,10 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             </Tooltip>
           )}
           {!compact && (
-            <span className="shrink-0 text-[12px] tabular-nums text-text-dim" data-testid="sidebar-group-session-count">
+            <span
+              className="shrink-0 text-[12px] max-md:text-[14px] tabular-nums text-text-dim"
+              data-testid="sidebar-group-session-count"
+            >
               ({sessionCount})
             </span>
           )}
@@ -210,7 +214,8 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             <button
               onClick={onNewSession}
               disabled={offline}
-              className={`w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer ${DISABLED_ICON_BUTTON}`}
+              // Shown on hover or focus, as Claude Code desktop and Conductor show row actions; always on touch.
+              className={`w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-[color,opacity] text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer opacity-0 group-hover:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100 ${DISABLED_ICON_BUTTON}`}
               aria-label={`New session in ${group.displayName}`}
             >
               <PlusIcon size={14} strokeWidth="2.5" round={false} />

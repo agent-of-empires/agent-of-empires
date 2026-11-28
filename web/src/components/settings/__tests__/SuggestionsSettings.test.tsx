@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsSettings } from "../SuggestionsSettings";
 import type { PresetFocus } from "../SuggestionPresetEditor";
 import { useSuggestionsSnapshot } from "../useSuggestionsSnapshot";
@@ -16,6 +16,7 @@ const api = vi.hoisted(() => ({
   updateSuggestionPrefs: vi.fn(),
   updateSuggestionSource: vi.fn(),
   putSuggestionPreset: vi.fn(),
+  putSuggestionAutoStart: vi.fn(),
   resetSuggestionPreset: vi.fn(),
   fetchSuggestionMappings: vi.fn(),
   putSuggestionMapping: vi.fn(),
@@ -121,10 +122,23 @@ function Harness({
 }
 
 function open(
-  props: { readOnly?: boolean; presetFocus?: PresetFocus; presets?: typeof PRESETS; mappings?: unknown[] } = {},
+  props: {
+    readOnly?: boolean;
+    presetFocus?: PresetFocus;
+    presets?: typeof PRESETS;
+    mappings?: unknown[];
+    asAgentProvider?: boolean;
+  } = {},
 ) {
-  api.fetchSuggestions.mockResolvedValue(snapshot());
-  api.fetchSuggestionPresets.mockResolvedValue(props.presets ?? PRESETS);
+  const snap = snapshot();
+  let presets = props.presets ?? PRESETS;
+  if (props.asAgentProvider) {
+    snap.providers[0]!.id = "builtin.agent";
+    snap.items.forEach((item) => (item.provider_id = "builtin.agent"));
+    presets = presets.map((p) => ({ ...p, provider_id: "builtin.agent" }));
+  }
+  api.fetchSuggestions.mockResolvedValue(snap);
+  api.fetchSuggestionPresets.mockResolvedValue(presets);
   api.fetchAgents.mockResolvedValue([
     { name: "claude", display_name: "Claude Code", kind: "builtin", installed: true },
     { name: "codex", display_name: "Codex", kind: "builtin", installed: true },
@@ -254,6 +268,71 @@ describe("SuggestionsSettings", () => {
     await screen.findByRole("button", { name: "Edit Review requests" });
   });
 
+  it("the preview keeps the prompt's line breaks and spacing, and a save sends them unchanged", async () => {
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    await screen.findByText(/Edit \u00b7 Review requests/);
+    const multi = "Review {repo}\n\n1. Find it.   Then run:\n2. Done";
+    fireEvent.change(screen.getByLabelText("GitHub review-requested prompt"), { target: { value: multi } });
+    const preview = screen.getByTestId("preset-preview");
+    // The text holds the breaks; white-space: pre-wrap is what keeps a browser from folding them.
+    expect(preview.textContent).toContain("\n\n1. Find it.   Then run:\n2. Done");
+    expect(preview.className).toContain("whitespace-pre-wrap");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(api.putSuggestionPreset).toHaveBeenCalledWith(
+        "gh",
+        "review-requested",
+        expect.objectContaining({ prompt: multi }),
+      ),
+    );
+  });
+
+  it("auto start is off until confirmed, says who wrote the text, and mentions yolo only when the preset has it", async () => {
+    api.putSuggestionAutoStart.mockResolvedValue(ok);
+    for (const yolo of [false, true]) {
+      cleanup();
+      api.putSuggestionAutoStart.mockClear();
+      open({ presets: [{ ...PRESETS[0]!, preset: { ...PRESET, yolo } }, PRESETS[1]!] });
+      fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+      const toggle = await screen.findByRole("switch", { name: "Auto start" });
+      expect(toggle.getAttribute("aria-checked")).toBe("false");
+      fireEvent.click(toggle);
+      // Nothing is saved before the warning is accepted.
+      const dialog = screen.getByRole("alertdialog", { name: "Turn on auto start" });
+      expect(api.putSuggestionAutoStart).not.toHaveBeenCalled();
+      expect(dialog.textContent).toContain("launches an agent on text written by others (issue and PR content)");
+      expect(dialog.textContent).toContain("no human check");
+      expect(/YOLO mode/.test(dialog.textContent ?? "")).toBe(yolo);
+      fireEvent.change(within(dialog).getByLabelText("Auto start limit per refresh"), { target: { value: "5" } });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Turn on auto start" }));
+      await waitFor(() => expect(api.putSuggestionAutoStart).toHaveBeenCalledWith("gh", "review-requested", true, 5));
+    }
+  });
+
+  it("the Agent kind has no auto start switch", async () => {
+    open({ asAgentProvider: true });
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    await screen.findByRole("switch", { name: "Yolo mode" });
+    expect(screen.queryByRole("switch", { name: "Auto start" })).toBeNull();
+  });
+
+  it("a kind with auto start on shows its limit and turns off at once", async () => {
+    api.putSuggestionAutoStart.mockResolvedValue(ok);
+    const snap = snapshot();
+    snap.providers[0]!.sources[0]!.auto_start = { cap: 3 };
+    api.fetchSuggestions.mockResolvedValue(snap);
+    api.fetchSuggestionPresets.mockResolvedValue(PRESETS);
+    api.fetchAgents.mockResolvedValue([]);
+    render(<Harness readOnly={false} onOpenSuggestions={() => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    const toggle = await screen.findByRole("switch", { name: "Auto start" });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    expect((screen.getByLabelText("Auto start limit per refresh") as HTMLSelectElement).value).toBe("3");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(api.putSuggestionAutoStart).toHaveBeenCalledWith("gh", "review-requested", false, 3));
+  });
+
   it("a preset with no prompt uses the plugin's, and typing one replaces it", async () => {
     open({ presets: [{ ...PRESETS[0]!, preset: { ...PRESET, prompt: null } }, PRESETS[1]!] });
     fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
@@ -281,6 +360,28 @@ describe("SuggestionsSettings", () => {
     const reset = await screen.findByRole("button", { name: "Reset to GitHub's settings" });
     fireEvent.click(reset);
     await waitFor(() => expect(api.resetSuggestionPreset).toHaveBeenCalledWith("gh", "ci-failed"));
+  });
+
+  it("moves focus into a sub-view and back to the control that opened it", async () => {
+    open();
+    const edit = await screen.findByRole("button", { name: "Edit CI failures" });
+    edit.focus();
+    fireEvent.click(edit);
+    const back = await screen.findByRole("button", { name: /\u2190 CI failures/ });
+    await waitFor(() => expect(document.activeElement).toBe(back));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Edit CI failures" })));
+
+    const advanced = screen.getByText("Advanced").closest("details")!;
+    fireEvent.click(screen.getByText("Advanced"));
+    await waitFor(() => expect(advanced.open).toBe(true));
+    const linked = document.querySelector<HTMLElement>('[data-focus-key="linked"]')!;
+    fireEvent.click(linked);
+    const linkedBack = await screen.findByRole("button", { name: /\u2190 Suggestions/ });
+    await waitFor(() => expect(document.activeElement).toBe(linkedBack));
+    fireEvent.click(linkedBack);
+    await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-focus-key="linked"]')));
+    expect(screen.getByText("Advanced").closest("details")!.open).toBe(true);
   });
 
   it("keeps the editor open and shows the error when saving fails", async () => {
@@ -324,6 +425,43 @@ describe("SuggestionsSettings", () => {
     // A fresh object with the same values (an App re-render) must not reopen it.
     view.rerender(<Harness readOnly={false} onOpenSuggestions={vi.fn()} presetFocus={focus()} />);
     expect(screen.queryByText(/Edit \u00b7 Review requests/)).toBeNull();
+  });
+
+  it("a new focus while the editor is open edits and saves that kind, not the last one's draft", async () => {
+    open();
+    cleanup();
+    const view = render(
+      <Harness
+        readOnly={false}
+        onOpenSuggestions={vi.fn()}
+        presetFocus={{ providerId: "gh", criterion: "review-requested" }}
+      />,
+    );
+    await screen.findByText(/Edit \u00b7 Review requests/);
+    view.rerender(
+      <Harness
+        readOnly={false}
+        onOpenSuggestions={vi.fn()}
+        presetFocus={{ providerId: "gh", criterion: "ci-failed" }}
+      />,
+    );
+    await screen.findByText(/Edit \u00b7 CI failures/);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(api.putSuggestionPreset).toHaveBeenCalledWith("gh", "ci-failed", PRESETS[1]!.preset));
+  });
+
+  it("a save that lands after leaving its editor does not close the next one", async () => {
+    open();
+    let land: (v: typeof ok) => void = () => {};
+    api.putSuggestionPreset.mockReturnValueOnce(new Promise((resolve) => (land = resolve)));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Review requests" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: /\u2190 Review requests/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit CI failures" }));
+    await screen.findByText(/Edit \u00b7 CI failures/);
+    await act(async () => land(ok));
+    await waitFor(() => expect(api.fetchSuggestions.mock.calls.length).toBeGreaterThan(1));
+    expect(screen.getByText(/Edit \u00b7 CI failures/)).toBeTruthy();
   });
 
   describe("Linked repos", () => {

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { segStyle } from "./segStyle";
 
-const FG = "var(--term-fg, #e4e4e7)";
-const BG = "var(--term-bg, #1c1c1f)";
+const FG = "var(--term-fg, #e5e5e5)";
+const BG = "var(--term-bg, #1f1f1f)";
 
 describe("segStyle", () => {
   it.each([

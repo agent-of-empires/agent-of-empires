@@ -6,18 +6,16 @@ export type DrawerSwipeAction = "open-sidebar" | "close-sidebar" | "open-panels"
 
 export interface DrawerSwipeState {
   sidebarOpen: boolean;
-  sidebarSide: "left" | "right";
   panelsOpen: boolean;
   panelsAvailable: boolean;
 }
 
-/** A drawer opens with a swipe away from its edge and closes with a swipe back
- *  toward it. The panels drawer is always on the right; one drawer at a time. */
+/** A drawer opens with a swipe away from its edge and closes with a swipe back toward it: the session drawer
+ *  is on the left, the panels on the right, and one is open at a time. */
 export function drawerSwipeAction(dir: SwipeDirection, s: DrawerSwipeState): DrawerSwipeAction | null {
   if (s.panelsOpen) return dir === "right" ? "close-panels" : null;
-  if (s.sidebarOpen) return dir === s.sidebarSide ? "close-sidebar" : null;
-  // A right-side sidebar has no open swipe: swipe-left belongs to the panels.
-  if (dir === "right") return s.sidebarSide === "left" ? "open-sidebar" : null;
+  if (s.sidebarOpen) return dir === "left" ? "close-sidebar" : null;
+  if (dir === "right") return "open-sidebar";
   return s.panelsAvailable ? "open-panels" : null;
 }
 
@@ -30,6 +28,9 @@ const MOBILE_BREAKPOINT = 768;
 // long-press), not a swipe. Matches the dnd-kit touch activation constraint.
 const HOLD_SLOP_PX = 8;
 const HOLD_MS = 150;
+// A tracked drag settles open past this share of the drawer, or on a flick this fast (px/ms) its way.
+const SETTLE_SHARE = 0.35;
+const FLICK_PX_PER_MS = 0.5;
 
 /** Which swipe directions a horizontal scroller under the touch would consume. */
 function scrollRoom(path: EventTarget[]): Record<SwipeDirection, boolean> {
@@ -45,10 +46,18 @@ function scrollRoom(path: EventTarget[]): Record<SwipeDirection, boolean> {
   return room;
 }
 
-/** Mobile horizontal swipes that open and close the side drawers. */
-export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: DrawerSwipeAction) => void) {
+/**
+ * Mobile horizontal swipes that open and close the side drawers. With `onTrack`, the sidebar drawer follows the
+ * finger: `onTrack(dx, open)` on every move and `onTrack(null, open)` on release, and the action is decided then.
+ */
+export function useDrawerSwipe(
+  state: DrawerSwipeState,
+  onAction: (action: DrawerSwipeAction) => void,
+  onTrack?: (dx: number | null, open: boolean) => void,
+) {
   const latestState = useLatestRef(state);
   const latestOnAction = useLatestRef(onAction);
+  const latestOnTrack = useLatestRef(onTrack);
 
   useEffect(() => {
     let startX = 0;
@@ -56,6 +65,8 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
     let startTime = 0;
     let moved = false;
     let tracking = false;
+    // A sidebar drag that follows the finger, once its direction is known.
+    let dragging: { open: boolean; dx: number; at: number; velocity: number } | null = null;
     let room: Record<SwipeDirection, boolean> = { left: false, right: false };
 
     const onTouchStart = (e: TouchEvent) => {
@@ -70,6 +81,7 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
       if (!t) return;
       if (t.clientX <= SYSTEM_EDGE_GUARD_PX || t.clientX >= window.innerWidth - SYSTEM_EDGE_GUARD_PX) return;
       tracking = true;
+      dragging = null;
       room = scrollRoom(e.composedPath());
       startX = t.clientX;
       startY = t.clientY;
@@ -94,6 +106,26 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
           return;
         }
       }
+      if (dragging) {
+        const now = performance.now();
+        dragging.velocity = (dx - dragging.dx) / Math.max(1, now - dragging.at);
+        dragging.dx = dx;
+        dragging.at = now;
+        latestOnTrack.current?.(dx, dragging.open);
+        return;
+      }
+      const s = latestState.current;
+      const track = latestOnTrack.current;
+      if (track && moved && Math.abs(dx) > HOLD_SLOP_PX && Math.abs(dx) > Math.abs(dy) && !s.panelsOpen) {
+        const dir = dx > 0 ? "right" : "left";
+        const action = drawerSwipeAction(dir, s);
+        if (!room[dir] && (action === "open-sidebar" || action === "close-sidebar")) {
+          if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+          dragging = { open: s.sidebarOpen, dx, at: performance.now(), velocity: 0 };
+          track(dx, dragging.open);
+          return;
+        }
+      }
       if (Math.abs(dx) > THRESHOLD_PX && Math.abs(dx) > Math.abs(dy)) {
         tracking = false;
         const dir = dx > 0 ? "right" : "left";
@@ -110,6 +142,20 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
 
     const onTouchEnd = () => {
       tracking = false;
+      if (!dragging) return;
+      const { open, dx, velocity } = dragging;
+      dragging = null;
+      latestOnTrack.current?.(null, open);
+      // The drawer's width, as --aoe-drawer-w sets it.
+      const width = Math.min(window.innerWidth * 0.85, 400);
+      // Toward the open side is positive for a left drawer.
+      const settledOpen =
+        velocity > FLICK_PX_PER_MS
+          ? true
+          : velocity < -FLICK_PX_PER_MS
+            ? false
+            : (open ? width : 0) + dx > width * SETTLE_SHARE;
+      if (settledOpen !== open) latestOnAction.current(settledOpen ? "open-sidebar" : "close-sidebar");
     };
 
     window.addEventListener("touchstart", onTouchStart, { passive: true });
@@ -122,5 +168,5 @@ export function useDrawerSwipe(state: DrawerSwipeState, onAction: (action: Drawe
       window.removeEventListener("touchend", onTouchEnd);
       window.removeEventListener("touchcancel", onTouchEnd);
     };
-  }, [latestState, latestOnAction]);
+  }, [latestState, latestOnAction, latestOnTrack]);
 }

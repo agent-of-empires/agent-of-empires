@@ -23,17 +23,12 @@ macro_rules! feature_uses {
 }
 
 feature_uses! {
+    // Names predate the Name sort and the Groups label; kept so counts stay comparable.
     SortNewest => "sort_newest",
-    SortAttention => "sort_attention",
-    SortLastActivity => "sort_last_activity",
-    SortOldest => "sort_oldest",
     SortAz => "sort_az",
-    SortZa => "sort_za",
     SortCustom => "sort_custom",
     GroupByManual => "group_by_manual",
     GroupByProject => "group_by_project",
-    GroupByOrg => "group_by_org",
-    GroupByStatus => "group_by_status",
     ArchiveToggle => "archive_toggle",
     FavoriteToggle => "favorite_toggle",
     SnoozeToggle => "snooze_toggle",
@@ -56,11 +51,37 @@ feature_uses! {
     NewFromSelection => "new_from_selection",
     TrashRestore => "trash_restore",
     TrashEmpty => "trash_empty",
+    SuggestTipShown => "suggest_tip_shown",
+    SuggestTipDismissed => "suggest_tip_dismissed",
+    SuggestTipClicked => "suggest_tip_clicked",
+    SuggestSetupOpened => "suggest_setup_opened",
+    SuggestSetupFinished => "suggest_setup_finished",
+    SuggestSetupLater => "suggest_setup_later",
+    SuggestStart => "suggest_start",
+    SuggestStartChanges => "suggest_start_changes",
+    SuggestStartIn => "suggest_start_in",
+    SuggestStartAnother => "suggest_start_another",
+    SuggestDismiss => "suggest_dismiss",
+    SuggestRestore => "suggest_restore",
+    SuggestStopKind => "suggest_stop_kind",
+    SuggestPresetEdit => "suggest_preset_edit",
+    SuggestPresetReset => "suggest_preset_reset",
+    SuggestMappingAdd => "suggest_mapping_add",
+    SuggestFromHome => "suggest_from_home",
+    SuggestFromPage => "suggest_from_page",
+    SuggestFromSidebar => "suggest_from_sidebar",
+    SuggestFromTui => "suggest_from_tui",
+    SuggestFailSandbox => "suggest_fail_sandbox",
+    SuggestFailTrust => "suggest_fail_trust",
+    SuggestFailHooks => "suggest_fail_hooks",
+    SuggestFailOther => "suggest_fail_other",
 }
 
 /// Web dashboard uses with no TUI counterpart; the shared ones go through [`FeatureUse`] names.
 const WEB_ONLY: &[&str] = &[
     "sort_manual",
+    "sort_last_activity",
+    "sort_attention",
     "sort_plugin",
     "axis_repo",
     "axis_org",
@@ -79,11 +100,7 @@ impl From<SortOrder> for FeatureUse {
     fn from(order: SortOrder) -> Self {
         match order {
             SortOrder::Newest => FeatureUse::SortNewest,
-            SortOrder::Attention => FeatureUse::SortAttention,
-            SortOrder::LastActivity => FeatureUse::SortLastActivity,
-            SortOrder::Oldest => FeatureUse::SortOldest,
-            SortOrder::AZ => FeatureUse::SortAz,
-            SortOrder::ZA => FeatureUse::SortZa,
+            SortOrder::Name => FeatureUse::SortAz,
             SortOrder::Custom => FeatureUse::SortCustom,
         }
     }
@@ -92,10 +109,8 @@ impl From<SortOrder> for FeatureUse {
 impl From<GroupByMode> for FeatureUse {
     fn from(mode: GroupByMode) -> Self {
         match mode {
-            GroupByMode::Manual => FeatureUse::GroupByManual,
+            GroupByMode::Group => FeatureUse::GroupByManual,
             GroupByMode::Project => FeatureUse::GroupByProject,
-            GroupByMode::Org => FeatureUse::GroupByOrg,
-            GroupByMode::Status => FeatureUse::GroupByStatus,
         }
     }
 }
@@ -103,6 +118,11 @@ impl From<GroupByMode> for FeatureUse {
 static COUNTS: LazyLock<UsageSeenCounters> = LazyLock::new(|| {
     UsageSeenCounters::with_names(FeatureUse::NAMES.iter().chain(WEB_ONLY).copied())
 });
+
+/// Counts one use the Daemon itself observed.
+pub fn record(feature: FeatureUse) {
+    COUNTS.record(feature.as_str());
+}
 
 /// For names a client reports to the Daemon; false when off the registry.
 pub fn record_name(name: &str) -> bool {
@@ -136,13 +156,10 @@ mod tests {
                 "{name}"
             );
         }
+        assert_eq!(FeatureUse::from(SortOrder::Name).as_str(), "sort_az");
         assert_eq!(
-            FeatureUse::from(SortOrder::Attention).as_str(),
-            "sort_attention"
-        );
-        assert_eq!(
-            FeatureUse::from(GroupByMode::Status).as_str(),
-            "group_by_status"
+            FeatureUse::from(GroupByMode::Group).as_str(),
+            "group_by_manual"
         );
     }
 }

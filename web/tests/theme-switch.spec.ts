@@ -141,3 +141,21 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     expect(bg).toMatch(/40,\s*42,\s*54/);
   });
 });
+
+test("a theme picked in one window repaints another open window without navigating", async ({ page, context }) => {
+  const zinc = { ...dracula(), name: "zinc", web: { cssVars: { "--color-surface-900": "#1c1c1f" } } };
+  await stubTheme(page, { dracula: dracula() }, zinc);
+  const other = await context.newPage();
+  await stubTheme(other, { dracula: dracula() }, zinc);
+  await page.goto("/");
+  await other.goto("/");
+  await expect.poll(() => readCssVar(other, "--color-surface-900")).toBe("#1c1c1f");
+
+  await page.evaluate(() =>
+    window.dispatchEvent(new CustomEvent("aoe:theme-picker-changed", { detail: { name: "dracula" } })),
+  );
+  await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#282a36");
+
+  await expect.poll(() => readCssVar(other, "--color-surface-900")).toBe("#282a36");
+  expect(await other.evaluate(() => getComputedStyle(document.body).backgroundColor)).toMatch(/40,\s*42,\s*54/);
+});

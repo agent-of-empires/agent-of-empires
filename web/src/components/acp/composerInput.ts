@@ -55,16 +55,19 @@ export function decideBeforeInputAction(
 /** iOS keyboard accessory bar height; on an installed PWA it floats over Send. */
 export const IOS_ACCESSORY_BAR_PX = 44;
 
+/** A sticky, solid box at the bottom edge, from which iOS 26 tints the home indicator area instead of blurring it. */
+const EDGE_BAR = "sticky bottom-0 border-t border-surface-800 bg-surface-900";
+
 export function composerWrapperLayout(opts: { keyboardOpen: boolean; accessoryBarPx?: number }): {
   className: string;
   style: React.CSSProperties | undefined;
 } {
   if (!opts.keyboardOpen) {
-    return { className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-3", style: undefined };
+    return { className: `${EDGE_BAR} px-4 pt-3 pb-3`, style: undefined };
   }
   const clearance = opts.accessoryBarPx ?? 0;
   return {
-    className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-0",
+    className: `${EDGE_BAR} px-4 pt-3 pb-0`,
     style: clearance > 0 ? { paddingBottom: clearance } : undefined,
   };
 }

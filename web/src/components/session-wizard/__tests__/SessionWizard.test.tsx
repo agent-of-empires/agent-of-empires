@@ -81,7 +81,9 @@ const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 beforeEach(() => {
   vi.clearAllMocks();
   // clearAllMocks keeps queued answers, and a test can leave some unread.
-  vi.mocked(fetchProfileAgents).mockReset().mockResolvedValue([]);
+  vi.mocked(fetchProfileAgents)
+    .mockReset()
+    .mockResolvedValue([agent("claude")]);
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
   reviewCreationTrust.mockResolvedValue({
@@ -202,6 +204,10 @@ describe("SessionWizard structured view payload", () => {
     [true, "terminal"],
   ])("opting out=%s sends view %s", async (optOut, view) => {
     renderWizard();
+    // Structured is only offered once the Daemon has reported the agent as ACP-capable.
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "Structured view" })).toHaveProperty("disabled", false),
+    );
     if (optOut) fireEvent.click(screen.getByRole("radio", { name: "Terminal view" }));
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
@@ -245,6 +251,7 @@ describe("SessionWizard structured view payload", () => {
       acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
       sandbox: {},
     } as never);
+    vi.mocked(fetchProfileAgents).mockResolvedValue([agent("opencode")]);
     renderWizard({ path: "/tmp/proj" });
     // The Agent row names opencode once the defaults have applied.
     await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("opencode"));
@@ -278,6 +285,16 @@ describe("SessionWizard structured view payload", () => {
     expect(payload().tool).toBe("claude");
     expect(payload().agent_model).toBeUndefined();
     expect(payload().agent_effort).toBeUndefined();
+  });
+});
+
+describe("SessionWizard last tool memory", () => {
+  it("falls back to claude when the stored tool is not an available agent", async () => {
+    localStorage.setItem("aoe-acp-last-tool", "ghost");
+    renderWizard({ path: "/tmp/proj" });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().tool).toBe("claude");
   });
 });
 
@@ -661,7 +678,7 @@ describe("SessionWizard rows", () => {
       const view = () => screen.getByRole("radio", { name: "Structured view" });
       await screen.findByRole("radio", { name: "Structured view" });
       await waitFor(() => expect(view().getAttribute("aria-checked")).toBe("false"));
-      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(await screen.findByText("Profile"));
       fireEvent.click(screen.getByRole("radio", { name: /work/ }));
       await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
       fireEvent.click(view());
@@ -684,7 +701,7 @@ describe("SessionWizard rows", () => {
       await waitFor(() =>
         expect(screen.getByRole("switch", { name: "Create a worktree" }).getAttribute("aria-checked")).toBe("true"),
       );
-      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(await screen.findByText("Profile"));
       fireEvent.click(screen.getByRole("radio", { name: /work/ }));
       await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
       fireEvent.click(screen.getByRole("button", { name: "Configure worktree" }));
@@ -705,7 +722,7 @@ describe("SessionWizard rows", () => {
           .mockResolvedValueOnce({ acp: { structured_view: "terminal" } } as never);
         renderWizard();
         fireEvent.click(await screen.findByRole("radio", { name: "Terminal view" }));
-        fireEvent.click(screen.getByText("Profile"));
+        fireEvent.click(await screen.findByText("Profile"));
         fireEvent.click(screen.getByRole("radio", { name: /work/ }));
         await launch();
         await waitFor(() => expect(createSession).toHaveBeenCalled());
@@ -721,7 +738,7 @@ describe("SessionWizard rows", () => {
       try {
         renderWizard();
         fireEvent.click(await screen.findByRole("switch", { name: "Yolo mode" }));
-        fireEvent.click(screen.getByText("Profile"));
+        fireEvent.click(await screen.findByText("Profile"));
         fireEvent.click(screen.getByRole("radio", { name: /work/ }));
         expect(confirmSpy).toHaveBeenCalled();
         expect(fetchSettings).not.toHaveBeenCalledWith("work");
@@ -1049,6 +1066,7 @@ describe("SessionWizard served-profile authority", () => {
   });
   const open = (label: string) => fireEvent.click(screen.getByText(label).closest("button")!);
   const chooseProfile = async (profile: string) => {
+    await screen.findByText("Profile");
     open("Profile");
     fireEvent.click(screen.getByRole("radio", { name: profile === "" ? /Server default/ : new RegExp(profile) }));
     await waitFor(() =>
@@ -1211,6 +1229,7 @@ describe("SessionWizard served-profile authority", () => {
         const structured = () => screen.getByRole("radio", { name: "Structured view" });
         await waitFor(() => expect(structured().getAttribute("aria-checked")).toBe("false"));
         fireEvent.click(structured());
+        await screen.findByText("Profile");
         open("Profile");
         fireEvent.click(screen.getByRole("radio", { name: /Server default/ }));
         await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("Alpha"));
@@ -1454,23 +1473,23 @@ describe("SessionWizard Yolo mode", () => {
       if (profile !== "beta") return Promise.resolve(wrapper(true));
       return betaCalls++ === 0 ? new Promise((resolve) => (answerBeta = resolve)) : Promise.resolve(wrapper(false));
     });
-    const pickProfile = (name: string) => {
-      fireEvent.click(screen.getByText("Profile"));
+    const pickProfile = async (name: string) => {
+      fireEvent.click(await screen.findByText("Profile"));
       fireEvent.click(screen.getByRole("radio", { name: new RegExp(name) }));
     };
     renderWizard({ path: "/tmp/proj", tool: "wrapper" }, "alpha");
     await waitFor(() => expect(yoloRow()).toContain("always on for wrapper"));
 
-    pickProfile("beta");
+    await pickProfile("beta");
     await waitFor(() => expect(yoloRow()).toContain("checking the agent…"));
     expect(launchButton().disabled).toBe(true);
-    pickProfile("alpha");
+    await pickProfile("alpha");
     await waitFor(() => expect(yoloRow()).toContain("always on for wrapper"));
     // Beta's late answer is for a profile no longer selected.
     await act(async () => answerBeta(wrapper(false)));
     expect(yoloRow()).toContain("always on for wrapper");
 
-    pickProfile("beta");
+    await pickProfile("beta");
     await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
     expect(yolo().disabled).toBe(false);
     await launch();
@@ -1529,7 +1548,7 @@ describe("SessionWizard Yolo mode", () => {
       await act(async () => vi.advanceTimersByTimeAsync(60_000));
       expect(vi.mocked(fetchProfileAgents).mock.calls.filter(([p]) => p === "gone")).toHaveLength(1);
 
-      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(await screen.findByText("Profile"));
       fireEvent.click(screen.getByRole("radio", { name: /beta/ }));
       await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
       expect(screen.queryByText(/no longer exists/)).toBeNull();
@@ -1546,8 +1565,8 @@ describe("SessionWizard Yolo mode", () => {
     );
     renderWizard({ path: "/tmp/proj", tool: "pi" }, "gone");
     await screen.findByText(/The profile "gone" no longer exists/);
-    fireEvent.click(screen.getByText("Profile"));
-    fireEvent.click(screen.getByRole("radio", { name: /^default/ }));
+    fireEvent.click(await screen.findByText("Profile"));
+    fireEvent.click(await screen.findByRole("radio", { name: /^default/ }));
     await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
     expect(screen.queryByText(/no longer exists/)).toBeNull();
     await waitFor(() => expect(launchButton().disabled).toBe(false));
@@ -1586,7 +1605,7 @@ describe("SessionWizard Yolo mode", () => {
     expect(agentButton()).not.toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Done" }));
 
-    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(await screen.findByText("Profile"));
     fireEvent.click(screen.getByRole("radio", { name: /beta/ }));
     await screen.findByText(/Couldn't load the agent list/);
     fireEvent.click(screen.getByTestId("wizard-agent-row"));
@@ -2141,7 +2160,7 @@ describe("SessionWizard create failures", () => {
         await screen.findByTestId("create-failure");
         let answer!: (v: never) => void;
         vi.mocked(fetchSettings).mockReturnValueOnce(new Promise((r) => (answer = r)));
-        fireEvent.click(screen.getByText("Profile"));
+        fireEvent.click(await screen.findByText("Profile"));
         fireEvent.click(screen.getByRole("radio", { name: /work/ }));
         await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
         release = () => answer({} as never);
@@ -2477,6 +2496,20 @@ describe("SessionWizard initial prompt", () => {
 });
 
 describe("SessionWizard suggestion link", () => {
+  it("keeps the prefill it opened with when a later one arrives", async () => {
+    const props = { servedProfile: "default", onClose: vi.fn(), onCreated: vi.fn() };
+    const { rerender } = render(<SessionWizard {...props} prefill={{ path: "/tmp/proj", tool: "claude" }} />);
+    rerender(
+      <SessionWizard
+        {...props}
+        prefill={{ path: "/tmp/other", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } }}
+      />,
+    );
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().suggestion).toBeUndefined();
+  });
+
   it("sends the suggestion reference, and nothing when the prefill has none", async () => {
     renderWizard({ path: "/tmp/proj", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } });
     await launch();
@@ -2531,6 +2564,23 @@ describe("SessionWizard suggestion source", () => {
     expect(payload()).toMatchObject({ worktree_enabled: true });
   });
 
+  it("keeps the preset's sandbox over the Project's override", async () => {
+    const prepared = { title: "t", initial_prompt: "p", project: null, sandbox: true } as unknown as SuggestionPrepared;
+    expect(toWizardPrefill(prepared, { label: "G", title: "t", url: "" }).useSandbox).toBe(true);
+    vi.mocked(fetchProjects).mockResolvedValue([
+      { name: "proj", path: "/tmp/proj", scope: "global", pinned: false, overrides: { sandbox_enabled: false } },
+    ] as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", useSandbox: true });
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalled());
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    // Both seeds have resolved; let their state updates commit before looking at the switch.
+    await act(async () => {
+      await Promise.all(vi.mocked(fetchProjects).mock.results.map((r) => r.value));
+      await Promise.all(vi.mocked(fetchSettings).mock.results.map((r) => r.value));
+    });
+    expect(screen.getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("true");
+  });
+
   it("drops the preset's worktree when the profile changes", async () => {
     vi.mocked(fetchProfiles).mockResolvedValue([
       { name: "default", is_default: true },
@@ -2539,7 +2589,7 @@ describe("SessionWizard suggestion source", () => {
     vi.mocked(fetchSettings).mockResolvedValue({ worktree: { enabled: false } } as never);
     renderWizard({ path: "/tmp/proj", tool: "claude", useWorktree: true });
     await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
-    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(await screen.findByText("Profile"));
     fireEvent.click(await screen.findByRole("radio", { name: /work/ }));
     await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
     await waitFor(() =>

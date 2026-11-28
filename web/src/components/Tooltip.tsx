@@ -118,9 +118,11 @@ export function Tooltip({
         if (e.pointerType === "mouse") touchRef.current = false;
       }}
       onMouseEnter={() => !controlled && !touchRef.current && show()}
-      onMouseLeave={() => !controlled && hide()}
+      // Leaving still clears the hover a caller's `open={false}` was masking, so it can't resurface once the
+      // caller lets go (a menu closing); a controlled tooltip keeps its position.
+      onMouseLeave={() => (controlled ? setOpen(false) : hide())}
       onFocus={() => !controlled && !touchRef.current && show()}
-      onBlur={() => !controlled && hide()}
+      onBlur={() => (controlled ? setOpen(false) : hide())}
     >
       {trigger}
       {open &&

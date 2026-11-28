@@ -7,7 +7,9 @@ import {
   type PluginListResponse,
   type PluginView,
 } from "../../lib/api";
-import { CancelButton, ConfirmButton, DANGER_BUTTON, Dialog } from "../Dialog";
+import { BACKDROP, BUTTON_DANGER, BUTTON_GHOST, BUTTON_SECONDARY, DIALOG } from "../../lib/surfaces";
+import { CancelButton, ConfirmButton, Dialog } from "../Dialog";
+import { Notice, PanelMessage } from "../panelParts";
 import { useConfirmKeys, useDialogFocus } from "../dialogHooks";
 import { PluginCard } from "./PluginCard";
 import { PluginDetailModal } from "./PluginDetailModal";
@@ -110,7 +112,7 @@ export function PluginsSettings({
   };
 
   if (!data && !error) {
-    return <p className="text-sm text-text-dim">Loading plugins…</p>;
+    return <PanelMessage className="px-1">Loading plugins…</PanelMessage>;
   }
 
   const review = updates.review;
@@ -118,7 +120,7 @@ export function PluginsSettings({
     <div className="space-y-4">
       {/* Read-only (CityHall) hides the marketplace and every lifecycle control. */}
       {!readOnly && (
-        <div role="tablist" className="flex gap-1 border-b border-surface-700">
+        <div role="tablist" className="flex gap-4 border-b border-surface-700/50 px-1">
           {(["installed", "marketplace"] as const).map((t) => (
             <button
               key={t}
@@ -127,8 +129,10 @@ export function PluginsSettings({
               aria-selected={tab === t}
               onClick={() => setTab(t)}
               data-testid={`plugins-tab-${t}`}
-              className={`px-3 py-1.5 text-xs capitalize ${
-                tab === t ? "border-b-2 border-accent-500 font-medium text-accent-500" : "text-text-dim"
+              className={`-mb-px min-h-9 max-md:min-h-11 cursor-pointer border-b-2 text-[13px] max-md:text-[15px] capitalize transition-colors ${
+                tab === t
+                  ? "border-brand-500 font-medium text-text-primary"
+                  : "border-transparent text-text-dim hover:text-text-secondary"
               }`}
             >
               {t}
@@ -147,21 +151,24 @@ export function PluginsSettings({
 
       {tab === "installed" && (
         <div className="space-y-3">
-          {error && <p className="text-sm text-status-error">{error}</p>}
+          {error && (
+            <PanelMessage tone="error" className="px-1">
+              {error}
+            </PanelMessage>
+          )}
 
           {data && data.load_errors.length > 0 && (
-            <div className="rounded border border-status-warning bg-status-warning/10 p-3 text-xs text-status-warning">
-              <p className="mb-1 font-semibold">Plugin load problems</p>
+            <Notice tone="warning" title="Plugin load problems">
               {data.load_errors.map((e) => (
                 <p key={e}>{e}</p>
               ))}
-            </div>
+            </Notice>
           )}
 
           {!readOnly && (
             <button
               type="button"
-              className="rounded border border-surface-700 px-2 py-1 text-xs hover:bg-surface-800 disabled:opacity-50"
+              className={BUTTON_SECONDARY}
               disabled={updates.checking}
               onClick={() => void updates.check()}
               data-testid="plugins-check-updates"
@@ -171,9 +178,9 @@ export function PluginsSettings({
           )}
 
           {data && data.plugins.length === 0 && (
-            <p className="text-xs text-text-dim" data-testid="plugins-empty">
+            <PanelMessage className="px-1" testId="plugins-empty">
               No plugins detected.
-            </p>
+            </PanelMessage>
           )}
           {data?.plugins.map((plugin) => (
             <PluginCard
@@ -249,26 +256,23 @@ export function PluginsSettings({
       {confirmUninstall && (
         <div
           ref={uninstallDialogRef}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          className={`fixed inset-0 z-50 flex items-center justify-center ${BACKDROP} p-4`}
           role="dialog"
           aria-modal="true"
           aria-label={`Uninstall ${confirmUninstall.name}`}
           onClick={() => setConfirmUninstall(null)}
           data-testid="plugin-uninstall-confirm"
         >
-          <div
-            className="w-full max-w-sm rounded border border-surface-700 bg-surface-900 p-4 text-sm"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h2 className="mb-2 font-semibold">Uninstall {confirmUninstall.name}?</h2>
-            <p className="mb-4 text-xs text-text-dim">
+          <div className={`w-full max-w-sm ${DIALOG} p-5 text-sm`} onClick={(e) => e.stopPropagation()}>
+            <h2 className="mb-2 text-[15px] font-semibold text-text-primary">Uninstall {confirmUninstall.name}?</h2>
+            <p className="mb-4 text-[13px] leading-normal text-text-secondary">
               This removes the plugin's files, config entry, and lockfile entry from the host. You can reinstall it
               later from the marketplace.
             </p>
             <div className="flex justify-end gap-2">
               <button
                 type="button"
-                className="rounded border border-surface-700 px-3 py-1 text-xs hover:bg-surface-800"
+                className={BUTTON_GHOST}
                 onClick={() => setConfirmUninstall(null)}
                 data-testid="plugin-uninstall-cancel"
               >
@@ -276,7 +280,7 @@ export function PluginsSettings({
               </button>
               <button
                 type="button"
-                className="rounded bg-status-error px-3 py-1 text-xs font-medium text-white hover:opacity-90"
+                className={BUTTON_DANGER}
                 onClick={() => void onConfirmUninstall()}
                 data-testid="plugin-uninstall-confirm-button"
               >
@@ -326,7 +330,7 @@ function WebDashboardOffConfirm({ onConfirm, onCancel }: { onConfirm: () => void
             buttonRef={confirmButtonRef}
             onClick={confirm}
             testId="web-dashboard-off-confirm"
-            className={DANGER_BUTTON}
+            tone="danger"
           >
             Turn off
           </ConfirmButton>
