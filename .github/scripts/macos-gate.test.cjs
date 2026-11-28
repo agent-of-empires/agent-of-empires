@@ -8,18 +8,18 @@ async function decide({ event = 'pr', files = [], labels = [], aheadBy = 1, prCh
   const notices = [];
   let output;
   const payload = event === 'pr'
-    ? { pull_request: { number: 42 } }
+    ? { pull_request: { number: 42, base: { sha: 'pb' }, head: { sha: 'ph' } } }
     : { merge_group: { base_sha: 'b', base_ref: 'refs/heads/main', head_sha: 'h' } };
   const github = {
     rest: {
       pulls: {
+        // The current head differs from the event's, as after a later push.
         get: async () => ({ data: { labels: labels.map(name => ({ name })), head: { sha: 'p'.repeat(40) } } }),
-        listFiles: 'listFiles',
       },
       repos: {
         compareCommitsWithBasehead: async ({ basehead }) => {
           if (basehead === 'refs/heads/main...h') return { data: { ahead_by: aheadBy } };
-          assert.equal(basehead, 'b...h');
+          assert.equal(basehead, event === 'pr' ? 'pb...ph' : 'b...h');
           return { data: { files, ahead_by: 1 } };
         },
       },
@@ -30,11 +30,6 @@ async function decide({ event = 'pr', files = [], labels = [], aheadBy = 1, prCh
           return { data: { check_runs: prChecks.map(conclusion => ({ conclusion, app: { slug: 'github-actions' } })) } };
         },
       },
-    },
-    paginate: async (method, args) => {
-      assert.equal(method, 'listFiles');
-      assert.equal(args.pull_number, 42);
-      return files;
     },
   };
   const core = { notice: m => notices.push(m), setOutput: (k, v) => { output = v; } };
@@ -63,11 +58,11 @@ test('the label forces macOS', async () => {
   assert.equal((await decide({ labels: ['ci-macos'] })).notice, 'macOS runs: ci-macos label');
 });
 
-test('a PR over 300 files is inspected, not run by default', async () => {
-  const files = Array.from({ length: 400 }, (_, i) => ({ filename: `web/${i}.ts`, patch: '+x' }));
+test('a PR diff the compare API truncates runs macOS', async () => {
+  const files = Array.from({ length: 299 }, (_, i) => ({ filename: `web/${i}.ts`, patch: '+x' }));
   assert.equal((await decide({ files })).run, 'false');
-  const huge = Array.from({ length: 3000 }, (_, i) => ({ filename: `web/${i}.ts`, patch: '+x' }));
-  assert.equal((await decide({ files: huge })).notice, 'macOS runs: diff too large to inspect');
+  const big = [...files, { filename: 'web/last.ts', patch: '+x' }];
+  assert.equal((await decide({ files: big })).notice, 'macOS runs: diff too large to inspect');
 });
 
 test('the queue checks the lockfile and fails closed on a large group', async () => {
