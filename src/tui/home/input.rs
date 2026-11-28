@@ -56,6 +56,27 @@ pub(super) fn web_plugin_disabled() -> bool {
         .is_some_and(|p| !p.enabled)
 }
 
+/// Whether two list rows name the same session, group or Suggested row.
+fn same_row(a: &Item, b: &Item) -> bool {
+    match (a, b) {
+        (Item::Session { id: a, .. }, Item::Session { id: b, .. }) => a == b,
+        (
+            Item::Group {
+                path: a,
+                profile: a_profile,
+                ..
+            },
+            Item::Group {
+                path: b,
+                profile: b_profile,
+                ..
+            },
+        ) => a == b && a_profile == b_profile,
+        (Item::Suggested { .. }, Item::Suggested { .. }) => true,
+        _ => false,
+    }
+}
+
 /// Persist the first-run intro picks: theme name to `config.theme.name` and attach mode to
 /// `default_attach_mode`; the telemetry answer goes to the Daemon, which owns consent.
 /// Failures are logged and swallowed so a config write hiccup cannot block startup.
@@ -3519,6 +3540,7 @@ impl HomeView {
                     | ActionId::JumpNextFinished
                     | ActionId::TogglePreviewInfo
                     | ActionId::ToggleHideStopped
+                    | ActionId::ToggleNeedsYou
                     | ActionId::ToggleDiagnostics
                     | ActionId::OpenSystemHealth
                     | ActionId::SortPicker
@@ -3712,6 +3734,7 @@ impl HomeView {
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::ToggleSplitTerminal => self.toggle_split_terminal(),
             ActionId::ToggleHideStopped => self.toggle_hide_stopped_in_groups(),
+            ActionId::ToggleNeedsYou => self.toggle_needs_you_only(),
             ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
             ActionId::OpenSystemHealth => self.open_system_health(),
             ActionId::SortPicker => self.show_sort_picker(),
@@ -4837,9 +4860,9 @@ impl HomeView {
             .collect();
         let current_session = self.selected_session.clone();
 
-        // Pass 1: forward-walk from cursor+1, wrapping, for the next Waiting session or a
-        // freshly-stopped Idle one (within `idle_decay_window`). Both need attention, so
-        // they cycle together and repeated `w` taps walk the actionable backlog.
+        // Pass 1: forward-walk from cursor+1, wrapping, for the next session that needs you
+        // or a freshly-stopped Idle one (within `idle_decay_window`), so repeated `w` taps
+        // walk the actionable backlog.
         let window = self.idle_decay_window;
         let start = (self.cursor + 1) % len;
         for i in 0..len - 1 {
@@ -4849,14 +4872,9 @@ impl HomeView {
                 _ => continue,
             };
             if let Some(inst) = self.get_instance(&id) {
-                // Trashed rows are stopped and only surface under the collapsed Trash
-                // section, so they never need attention even if a stale unread flag
-                // survived (#2489). Snoozed and archived rows are the same explicit
-                // "don't bother me" sink states.
+                // Dismissed rows never need attention, even with a stale unread flag (#2489).
                 let is_actionable = !inst.is_dismissed()
-                    && (inst.status == Status::Waiting
-                        || matches!(inst.idle_age(), Some(age) if age < window)
-                        || (crate::session::unread_enabled() && inst.is_unread()));
+                    && (inst.needs_you() || matches!(inst.idle_age(), Some(age) if age < window));
                 if is_actionable {
                     self.jump_to_session_id(&id);
                     return;
@@ -4875,9 +4893,7 @@ impl HomeView {
                 {
                     return false;
                 }
-                inst.status == Status::Waiting
-                    || matches!(inst.idle_age(), Some(age) if age < window)
-                    || (crate::session::unread_enabled() && inst.is_unread())
+                inst.needs_you() || matches!(inst.idle_age(), Some(age) if age < window)
             })
             .map(|inst| inst.id.clone());
         if let Some(id) = hidden_actionable {
@@ -4911,6 +4927,7 @@ impl HomeView {
                 || current_session.as_deref() == Some(inst.id.as_str())
                 || inst.is_dismissed()
                 || inst.status != Status::Idle
+                || self.hidden_by_filter(inst)
             {
                 continue;
             }
@@ -5130,6 +5147,7 @@ impl HomeView {
                 self.unread_dwell = None;
             }
         }
+        self.sync_needs_you_kept();
         if self.selected_is_trashed() {
             self.exit_live_send_if_active();
         }
@@ -5759,11 +5777,23 @@ impl HomeView {
         // `resolve_row_to_index` already short-circuits while any non-live-send overlay is
         // open and inside the diff takeover, so no extra gating here.
         let anchor = (col.saturating_add(1), row.saturating_add(1));
-        if let Some(idx) = self.resolve_row_to_index(col, row) {
-            if self.cursor != idx {
-                self.cursor = idx;
+        if let Some(clicked) = self.resolve_row_to_index(col, row) {
+            if self.cursor != clicked {
+                let target = self.flat_items[clicked].clone();
+                self.cursor = clicked;
                 self.update_selected();
+                // Selecting can drop the row the cursor left and shift the clicked one, or
+                // drop the clicked header itself; then no menu opens.
+                match self
+                    .flat_items
+                    .iter()
+                    .position(|item| same_row(item, &target))
+                {
+                    Some(at) if at == self.cursor => {}
+                    _ => return true,
+                }
             }
+            let idx = self.cursor;
             // Every menu entry would be refused on the creating stub, so say why
             // instead of opening a menu that can only fail.
             if self.is_creating_stub_selected() {
@@ -6624,15 +6654,20 @@ impl HomeView {
         // A click in the list gives it the keys back from the suggestions pane.
         self.suggestions_focused = false;
 
-        let is_double_click = matches!(
-            self.last_click,
-            Some((prev_time, _, prev_row))
-                if prev_row == row
-                    && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
-        );
-        self.last_click = Some((now, col, row));
-
         let item = self.flat_items[abs_idx].clone();
+        let target = match &item {
+            Item::Session { id, .. } => Some(id.clone()),
+            Item::Group { .. } | Item::Suggested { .. } => None,
+        };
+        let is_double_click = matches!(
+            &self.last_click,
+            Some((prev_time, _, prev_row, prev_target))
+                if *prev_row == row
+                    && *prev_target == target
+                    && now.duration_since(*prev_time) <= DOUBLE_CLICK_THRESHOLD
+        );
+        self.last_click = Some((now, col, row, target));
+
         if is_double_click {
             // The first click already selected the row and toggled a group, so the second
             // only activates a session; re-toggling would undo the first and flicker.
@@ -7428,7 +7463,7 @@ impl HomeView {
         }
     }
 
-    /// End live-send when a rebuild has left its target hidden by the `y` filter, whatever
+    /// End live-send when a rebuild has left its target hidden by a filter, whatever
     /// changed (its status, the sort, the grouping, its group): a stopped session's terminal
     /// can outlive its agent, and keys must not reach a pane the list no longer shows. The
     /// selection is left for the caller's rebuild to settle.
@@ -7436,13 +7471,17 @@ impl HomeView {
         let Some(state) = self.live_send.clone() else {
             return;
         };
-        let Some(by_filter) = self.get_instance(&state.session_id).and_then(|inst| {
+        let Some(message) = self.get_instance(&state.session_id).and_then(|inst| {
             if self.hidden_by_filter(inst) {
-                Some(true)
+                Some(if self.hidden_as_stopped(inst) {
+                    "Live mode ended: its session is hidden (y to show)"
+                } else {
+                    "Live mode ended: its session is hidden"
+                })
             } else {
                 self.session_row(&state.session_id)
                     .is_none()
-                    .then_some(false)
+                    .then_some("Live mode ended: its session is under a collapsed header")
             }
         }) else {
             return;
@@ -7460,11 +7499,7 @@ impl HomeView {
             self.selected_group,
             self.selected_group_profile,
         ) = selection;
-        self.flash_status(if by_filter {
-            "Live mode ended: its session is hidden (y to show)"
-        } else {
-            "Live mode ended: its session is under a collapsed header"
-        });
+        self.flash_status(message);
     }
 
     /// Tear down live-send state and restore the tmux window's automatic sizing:

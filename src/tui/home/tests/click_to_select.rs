@@ -468,10 +468,16 @@ fn double_click_tears_down_live_send_before_tmux_attach() {
     });
 
     let t0 = std::time::Instant::now();
-    // Seed last_click so the next click within the threshold is treated
-    // as the second click of a double-click on the same row.
-    env.view.last_click = Some((t0, 5, 3));
+    // Seed last_click so the next click within the threshold is treated as the second
+    // click of a double-click, but only on the same session.
+    env.view.last_click = Some((t0, 5, 3, Some("another-session".into())));
     let t1 = t0 + std::time::Duration::from_millis(100);
+    assert_ne!(
+        env.view.handle_click_at(t1, 5, 3),
+        Some(crate::tui::app::Action::AttachSession(expected_id.clone())),
+        "a row that now holds another session is not a double-click"
+    );
+    env.view.last_click = Some((t0, 5, 3, Some(expected_id.clone())));
     let action = env.view.handle_click_at(t1, 5, 3);
 
     assert_eq!(

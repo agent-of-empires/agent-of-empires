@@ -77,6 +77,7 @@ pub enum ActionId {
     /// `session.show_diagnostics_pane` so it survives restarts.
     ToggleDiagnostics,
     ToggleHideStopped,
+    ToggleNeedsYou,
     /// Open the read-only host and running-agent resource view.
     OpenSystemHealth,
     SortPicker,
@@ -1275,6 +1276,18 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::ToggleNeedsYou,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Show only sessions that need you",
+            keywords: &["needs", "attention", "waiting", "error", "filter"],
+            group: PaletteGroup::Views,
+        }),
+    },
+    Binding {
         id: ActionId::SortPicker,
         // Shift+O sorts in both modes; bare `o` only outside strict.
         non_strict: &[k('o'), k('O'), ctrl('o')],
@@ -1312,11 +1325,11 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Jump to next waiting/idle",
+            desc: "Jump to next waiting/error/idle",
         }),
         palette: Some(PaletteMeta {
-            title: "Jump to next waiting / idle session",
-            keywords: &["jump", "next", "waiting", "idle"],
+            title: "Jump to next session that needs you or just finished",
+            keywords: &["jump", "next", "waiting", "idle", "error", "needs"],
             group: PaletteGroup::Views,
         }),
     },
@@ -1530,6 +1543,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::TogglePreviewInfo => "toggle-preview-info",
         ActionId::ToggleSplitTerminal => "toggle-split-terminal",
         ActionId::ToggleHideStopped => "toggle-hide-stopped",
+        ActionId::ToggleNeedsYou => "toggle-needs-you",
         ActionId::ToggleDiagnostics => "toggle-diagnostics",
         ActionId::OpenSystemHealth => "open-system-health",
         ActionId::SortPicker => "pick-sort",

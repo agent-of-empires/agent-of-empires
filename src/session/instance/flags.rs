@@ -486,6 +486,18 @@ impl Instance {
         self.snoozed_until.filter(|t| *t > Timestamp::now())
     }
 
+    /// Waiting on a person, in Error, flagged urgent, or finished and not yet seen (with the
+    /// unread indicator on), and not put away. Differs from the web's `sessionNeedsAttention`:
+    /// unread counts here, plugin attention does not.
+    pub fn needs_you(&self) -> bool {
+        !self.is_dismissed()
+            && (matches!(
+                self.status,
+                crate::session::Status::Waiting | crate::session::Status::Error
+            ) || self.is_urgent()
+                || (crate::session::unread_enabled() && self.is_unread()))
+    }
+
     /// Combined "don't bother me" sink-state check: trashed, snoozed,
     /// archived, or ignored. Callers that walk sessions looking for something
     /// to land on (e.g. the `w`/jump-to-next-attention passes) use this

@@ -1542,6 +1542,9 @@ impl HomeView {
                 self.sort_order,
             ),
         };
+        if self.needs_you_only {
+            title.insert_str(title.len() - 1, " · needs you");
+        }
         if !self.legacy_duplicate_reports.is_empty() {
             // Fail-closed surface (#3459): ambiguous copies are hidden from
             // the list, so without this marker the loss is silent.
@@ -1675,6 +1678,7 @@ impl HomeView {
 
         let hover_idx = self.hovered_index();
         let favorite_gutter = self.favorite_gutter();
+        let needs_you = self.needs_you_counts();
 
         // --- Workspace list (every row before the shelf) ---
         let list_visible_height = if self.search_bar_visible() {
@@ -1711,13 +1715,14 @@ impl HomeView {
             let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
             let is_match =
                 !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
-            let mut line = self.render_item_line(
+            let mut line = self.render_list_line(
                 item,
                 is_selected,
                 is_match,
                 theme,
                 inner.width,
                 favorite_gutter,
+                &needs_you,
             );
             // Selection wins over hover, so the already-selected row under the
             // mouse keeps the brighter selected background.
@@ -1792,13 +1797,14 @@ impl HomeView {
                 let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
                 let is_match =
                     !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
-                let mut line = self.render_item_line(
+                let mut line = self.render_list_line(
                     item,
                     is_selected,
                     is_match,
                     theme,
                     inner.width,
                     favorite_gutter,
+                    &needs_you,
                 );
                 if is_selected || is_hovered {
                     let pad = (inner.width as usize).saturating_sub(line.width());
@@ -1927,6 +1933,7 @@ impl HomeView {
                 .any(crate::session::is_live_favorite)
     }
 
+    #[cfg(test)]
     pub(super) fn render_item_line(
         &self,
         item: &Item,
@@ -1935,6 +1942,30 @@ impl HomeView {
         theme: &Theme,
         list_width: u16,
         favorite_gutter: bool,
+    ) -> Line<'static> {
+        let needs_you = self.needs_you_counts();
+        self.render_list_line(
+            item,
+            is_selected,
+            is_match,
+            theme,
+            list_width,
+            favorite_gutter,
+            &needs_you,
+        )
+    }
+
+    /// One list row, with `attention` counted once for the frame.
+    #[allow(clippy::too_many_arguments)]
+    fn render_list_line(
+        &self,
+        item: &Item,
+        is_selected: bool,
+        is_match: bool,
+        theme: &Theme,
+        list_width: u16,
+        favorite_gutter: bool,
+        attention: &super::rows::NeedsYouCounts,
     ) -> Line<'static> {
         let indent = get_indent(item.depth());
 
@@ -1989,12 +2020,24 @@ impl HomeView {
                     })
                     .map(|p| format!("[{p}] "))
                     .unwrap_or_default();
-                let text = if let Some(glyph) = section_glyph {
-                    Cow::Owned(format!("{} {} ({})", glyph, name, session_count))
-                } else if pinned {
-                    Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
+                let needs_you = if section_glyph.is_some()
+                    || crate::session::is_within_archived_section(path)
+                {
+                    0
                 } else {
-                    Cow::Owned(format!("{}{} ({})", profile_tag, name, session_count))
+                    attention.under(path, profile.as_deref(), self.group_by)
+                };
+                let session_count = if needs_you > 0 {
+                    format!("{session_count}) \u{25cf}{needs_you}")
+                } else {
+                    format!("{session_count})")
+                };
+                let text = if let Some(glyph) = section_glyph {
+                    Cow::Owned(format!("{} {} ({}", glyph, name, session_count))
+                } else if pinned {
+                    Cow::Owned(format!("{} ({} {}", name, session_count, ICON_PINNED))
+                } else {
+                    Cow::Owned(format!("{}{} ({}", profile_tag, name, session_count))
                 };
                 let mut style = Style::default().fg(theme.group).bold();
                 // Shelf headers and their nested project sub-folders sit below the sort

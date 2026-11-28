@@ -567,7 +567,9 @@ pub struct HomeView {
     pub(super) footer_buttons: Vec<(crossterm::event::KeyEvent, Rect)>,
     pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     pub(super) mouse_pos: Option<(u16, u16)>,
-    pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
+    /// The last list click and the session it hit, so a double-click needs the same session
+    /// under the pointer, not just the same screen row.
+    pub(super) last_click: Option<(std::time::Instant, u16, u16, Option<String>)>,
 
     pub(super) last_preview_click: Option<(std::time::Instant, u16, u16)>,
 
@@ -639,6 +641,11 @@ pub struct HomeView {
     pub(super) hide_stopped_in_groups: bool,
     /// `session.hide_snoozed_with_stopped`: count snoozed Sessions as hidden too.
     pub(super) hide_snoozed_with_stopped: bool,
+    /// Show only the sessions that need you, in their usual places.
+    pub(super) needs_you_only: bool,
+    /// The selected session the needs-you filter keeps listed after it stops needing you,
+    /// until the selection leaves it.
+    pub(super) needs_you_kept: Option<String>,
     /// While stopped sessions are hidden, each group header's full count, keyed by path and
     /// profile, so the header can show `visible/total`.
     pub(super) group_totals: HashMap<(String, Option<String>), usize>,

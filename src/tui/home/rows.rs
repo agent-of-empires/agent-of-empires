@@ -38,6 +38,23 @@ pub(super) fn split_project_view_path(path: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Header path to profile to the number of its sessions that need you.
+#[derive(Default)]
+pub(super) struct NeedsYouCounts(HashMap<String, HashMap<String, usize>>);
+
+impl NeedsYouCounts {
+    /// Under Groups a profile's header counts only its own profile's sessions.
+    pub(super) fn under(&self, path: &str, profile: Option<&str>, group_by: GroupByMode) -> usize {
+        let Some(by_profile) = self.0.get(path) else {
+            return 0;
+        };
+        match (group_by, profile) {
+            (GroupByMode::Group, Some(profile)) => by_profile.get(profile).copied().unwrap_or(0),
+            _ => by_profile.values().sum(),
+        }
+    }
+}
+
 impl HomeView {
     pub fn instances(&self) -> impl ExactSizeIterator<Item = &Instance> + '_ {
         self.instances.values()
@@ -158,14 +175,14 @@ impl HomeView {
     }
 
     pub(in crate::tui) fn build_flat_items(&self) -> Vec<Item> {
-        self.build_flat_items_hiding(self.hide_stopped_in_groups)
+        self.build_flat_items_hiding(self.hide_stopped_in_groups, self.needs_you_only)
     }
 
     /// Rebuild the rows and, while stopped sessions are hidden, every group header's full count.
     pub(super) fn refresh_flat_items(&mut self) {
         self.flat_items = self.build_flat_items();
         self.group_totals = if self.hide_stopped_in_groups {
-            self.build_flat_items_hiding(false)
+            self.build_flat_items_hiding(false, self.needs_you_only)
                 .into_iter()
                 .filter_map(|item| match item {
                     Item::Group {
@@ -183,6 +200,44 @@ impl HomeView {
         self.end_live_send_if_hidden();
     }
 
+    pub(super) fn toggle_needs_you_only(&mut self) {
+        self.needs_you_only = !self.needs_you_only;
+        self.rebuild_flat_items_keeping_cursor();
+        self.update_selected();
+        self.flash_status(if self.needs_you_only {
+            "Showing only sessions that need you"
+        } else {
+            "Showing every session"
+        });
+    }
+
+    /// Sessions that need you under each header path, by profile, in one pass. Under
+    /// Repository a header holds the rows at or beneath its `repo/group` path; under Groups,
+    /// the rows at or beneath its group path.
+    pub(super) fn needs_you_counts(&self) -> NeedsYouCounts {
+        let active = self.active_profile.as_deref();
+        let mut counts = NeedsYouCounts::default();
+        for inst in self.instances.values() {
+            if !inst.needs_you() || active.is_some_and(|p| inst.source_profile != p) {
+                continue;
+            }
+            let path = match self.group_by {
+                GroupByMode::Project => project_view_path(inst),
+                GroupByMode::Group => inst.group_path.clone(),
+            };
+            let ends = path.match_indices('/').map(|(at, _)| at);
+            for end in ends.chain([path.len()]) {
+                *counts
+                    .0
+                    .entry(path[..end].to_owned())
+                    .or_default()
+                    .entry(inst.source_profile.clone())
+                    .or_default() += 1;
+            }
+        }
+        counts
+    }
+
     pub(super) fn toggle_hide_stopped_in_groups(&mut self) {
         self.hide_stopped_in_groups = !self.hide_stopped_in_groups;
         self.rebuild_flat_items_keeping_cursor();
@@ -197,8 +252,45 @@ impl HomeView {
         });
     }
 
-    /// Whether the `y` filter is keeping `inst` out of the list.
+    /// Whether the `y` filter or the needs-you filter is keeping `inst` out of the list.
     pub(super) fn hidden_by_filter(&self, inst: &Instance) -> bool {
+        (self.needs_you_only && !self.listed_by_needs_you(inst)) || self.hidden_as_stopped(inst)
+    }
+
+    /// Whether the needs-you filter lists `inst`: it needs you, or it is the selection kept.
+    pub(super) fn listed_by_needs_you(&self, inst: &Instance) -> bool {
+        inst.needs_you()
+            || (self.needs_you_kept.as_deref() == Some(inst.id.as_str()) && !inst.is_dismissed())
+    }
+
+    /// Keep the selected session listed under the needs-you filter until the selection leaves
+    /// it, as a mail client keeps a message just read; the row left behind drops out at once.
+    pub(super) fn sync_needs_you_kept(&mut self) {
+        let kept = self
+            .selected_session
+            .clone()
+            .filter(|_| self.needs_you_only)
+            .filter(|id| {
+                self.get_instance(id)
+                    .is_some_and(|inst| self.listed_by_needs_you(inst))
+            });
+        let released = std::mem::replace(&mut self.needs_you_kept, kept);
+        if released.is_some()
+            && released != self.needs_you_kept
+            && self.needs_you_only
+            && released
+                .as_deref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| !inst.needs_you())
+        {
+            self.rebuild_flat_items_keeping_cursor();
+            // The rebuild can drop the header under the cursor, leaving the selection on a row
+            // no longer listed.
+            self.update_selected();
+        }
+    }
+
+    pub(super) fn hidden_as_stopped(&self, inst: &Instance) -> bool {
         self.hide_stopped_in_groups
             && stopped_row_hidden_in_groups(inst, self.hide_snoozed_with_stopped)
             && self.could_hide(inst)
@@ -213,10 +305,11 @@ impl HomeView {
         grouped && !inst.is_archived() && !inst.is_trashed()
     }
 
-    /// The row of the group header session `id` sits under while the `y` filter hides it, so a
+    /// The row of the group header session `id` sits under while a filter hides it, so a
     /// selection that drops out moves to its own group rather than to whichever row now has its
     /// index. Read from the unfiltered rows of the current grouping, where a session follows its
-    /// own group's header.
+    /// own group's header. When the filter drops that header too, the nearest listed header
+    /// before the session, or else after it.
     pub(super) fn header_row_for_hidden_session(&self, id: &str) -> Option<usize> {
         if !self
             .get_instance(id)
@@ -224,16 +317,18 @@ impl HomeView {
         {
             return None;
         }
-        let unfiltered = self.build_flat_items_hiding(false);
+        let unfiltered = self.build_flat_items_hiding(false, false);
         let at = unfiltered
             .iter()
             .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))?;
-        let (path, profile) = unfiltered[..at].iter().rev().find_map(|item| match item {
-            Item::Group { path, profile, .. } => Some((path, profile)),
-            Item::Session { .. } | Item::Suggested { .. } => None,
-        })?;
-        self.flat_items.iter().position(|item| {
-            matches!(item, Item::Group { path: p, profile: pr, .. } if p == path && pr == profile)
+        let (before, after) = unfiltered.split_at(at);
+        before.iter().rev().chain(after).find_map(|item| {
+            let Item::Group { path, profile, .. } = item else {
+                return None;
+            };
+            self.flat_items.iter().position(|row| {
+                matches!(row, Item::Group { path: p, profile: pr, .. } if p == path && pr == profile)
+            })
         })
     }
 
@@ -255,23 +350,28 @@ impl HomeView {
             .collect()
     }
 
-    fn build_flat_items_hiding(&self, hide_stopped: bool) -> Vec<Item> {
+    fn build_flat_items_hiding(&self, hide_stopped: bool, needs_you_only: bool) -> Vec<Item> {
         if self.group_by == GroupByMode::Project {
-            return self.build_flat_items_by_project(hide_stopped);
+            return self.build_flat_items_by_project(hide_stopped, needs_you_only);
         }
 
-        let pool = self.shown_in_groups(self.cloned_instances_in_active_view(), hide_stopped);
+        let mut pool = self.shown_in_groups(self.cloned_instances_in_active_view(), hide_stopped);
+        // Headers rank by every member, so the rows the filter hides do not move them.
+        let ranked = needs_you_only.then(|| pool.clone());
+        if needs_you_only {
+            pool.retain(|inst| self.listed_by_needs_you(inst));
+        }
+        let ranked = ranked.as_deref().unwrap_or(&pool);
+        let flatten = |tree| flatten_tree(tree, &pool, ranked, self.sort_order);
         let mut items = if let Some(profile) = &self.active_profile {
-            self.group_trees
-                .get(profile)
-                .map_or_else(Vec::new, |tree| flatten_tree(tree, &pool, self.sort_order))
+            self.group_trees.get(profile).map_or_else(Vec::new, flatten)
         } else if self.storages.len() <= 1 {
             self.group_trees
                 .values()
                 .next()
-                .map_or_else(Vec::new, |tree| flatten_tree(tree, &pool, self.sort_order))
+                .map_or_else(Vec::new, flatten)
         } else {
-            flatten_tree_all_profiles(&pool, &self.group_trees, self.sort_order)
+            flatten_tree_all_profiles(&pool, ranked, &self.group_trees, self.sort_order)
         };
         self.append_suggested(&mut items);
         append_archived_section(&mut items, &pool, self.archived_section_collapsed);
@@ -281,7 +381,7 @@ impl HomeView {
 
     /// Repository mode: one header per repository with the session's Groups nested inside.
     /// Archived rows keep only their repository, which buckets the Archived section.
-    fn build_flat_items_by_project(&self, hide_stopped: bool) -> Vec<Item> {
+    fn build_flat_items_by_project(&self, hide_stopped: bool, needs_you_only: bool) -> Vec<Item> {
         let mut grouped: Vec<Instance> = self
             .cloned_instances_in_active_view()
             .into_iter()
@@ -334,10 +434,15 @@ impl HomeView {
                 headers.push((rank(inst.repo_path()), Group::new(label, label)));
             }
         }
-        for project in crate::session::projects::unpopulated_projects(
-            &populated_labels,
-            &self.registered_projects,
-        ) {
+        let unpopulated = if needs_you_only {
+            Vec::new()
+        } else {
+            crate::session::projects::unpopulated_projects(
+                &populated_labels,
+                &self.registered_projects,
+            )
+        };
+        for project in unpopulated {
             headers.push((
                 rank(&project.path),
                 Group::new(&project.label, &project.label),
@@ -365,9 +470,38 @@ impl HomeView {
         for (path, _) in self.project_group_collapsed.iter().filter(|(_, &c)| c) {
             tree.set_collapsed(path, true);
         }
-        // Seeded before hiding, so a header whose sessions are all hidden keeps its place.
+        // Seeded and ranked before filtering, so a header keeps its place while its sessions
+        // are hidden.
+        let ranked = needs_you_only.then(|| self.shown_in_groups(grouped.clone(), hide_stopped));
+        let listed_paths = needs_you_only.then(|| {
+            grouped.retain(|inst| self.listed_by_needs_you(inst));
+            let mut paths = HashSet::new();
+            for inst in grouped
+                .iter()
+                .filter(|i| !i.is_archived() && !i.is_trashed())
+            {
+                let path = inst.group_path.as_str();
+                paths.extend(
+                    path.match_indices('/')
+                        .map(|(at, _)| path[..at].to_string()),
+                );
+                paths.insert(path.to_string());
+            }
+            paths
+        });
         let grouped = self.shown_in_groups(grouped, hide_stopped);
-        let mut items = flatten_tree(&tree, &grouped, self.sort_order);
+        let mut items = flatten_tree(
+            &tree,
+            &grouped,
+            ranked.as_deref().unwrap_or(&grouped),
+            self.sort_order,
+        );
+        if let Some(paths) = listed_paths {
+            items.retain(|item| match item {
+                Item::Group { path, .. } => paths.contains(path),
+                Item::Session { .. } | Item::Suggested { .. } => true,
+            });
+        }
         self.append_suggested(&mut items);
         append_archived_section_by_project(
             &mut items,
