@@ -364,10 +364,10 @@ jobs:
               BASE="$EVENT_BEFORE"
             fi
           fi
-          # A git failure leaves the pipeline non-zero and reports false, so
-          # keep the diff simple enough that it cannot fail.
+          # A git failure fails this job, which makes the builds run.
+          files=$(git diff --name-only "$BASE"...HEAD)
           changed() {
-            if git diff --name-only "$BASE"...HEAD | grep -E "$1" >/dev/null; then
+            if grep -qE "$1" <<<"$files"; then
               echo true
             else
               echo false
