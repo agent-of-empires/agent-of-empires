@@ -63,6 +63,7 @@ export function visibleOrgRepos(groups: OrgNestedGroup[], expandAll: boolean): S
 function sinkTimeMs(ws: Workspace): number {
   let best = Number.NEGATIVE_INFINITY;
   for (const s of ws.sessions) {
+    if (s.trashed_at != null) continue;
     const ts = s.archived_at ?? s.snoozed_until ?? s.last_accessed_at;
     const ms = ts ? Date.parse(ts) : Number.NaN;
     if (ms > best) best = ms;
