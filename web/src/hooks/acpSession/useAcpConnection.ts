@@ -83,7 +83,6 @@ export function useAcpConnection(
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [reconnecting, setReconnecting] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
-  const [retryCountdown, setRetryCountdown] = useState(0);
   const [hasMoreOlder, setHasMoreOlder] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasEverOpened, setHasEverOpened] = useState(false);
@@ -97,7 +96,6 @@ export function useAcpConnection(
   const wsRef = useRef<WebSocket | null>(null);
   const retryCountRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const connectRef = useRef<(() => void) | null>(null);
   // Bumped per dial; handlers of a superseded dial must not touch the current socket.
   const dialGenRef = useRef(0);
@@ -111,7 +109,6 @@ export function useAcpConnection(
     setStatus,
     setReconnecting,
     setRetryCount,
-    setRetryCountdown,
     setHasEverOpened,
     setReplayedWhileDown,
   });
@@ -121,17 +118,12 @@ export function useAcpConnection(
       clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
     }
-    if (countdownTimerRef.current) {
-      clearInterval(countdownTimerRef.current);
-      countdownTimerRef.current = null;
-    }
   }, []);
 
   const redial = useCallback(() => {
     retryCountRef.current = 0;
     setReconnecting(false);
     setRetryCount(0);
-    setRetryCountdown(0);
     clearRetryTimers();
     connectRef.current?.();
   }, [clearRetryTimers]);
@@ -209,7 +201,6 @@ export function useAcpConnection(
     setStatus(sessionId ? "connecting" : "closed");
     setReconnecting(false);
     setRetryCount(0);
-    setRetryCountdown(0);
     setHasMoreOlder(false);
     setLoadingOlder(false);
     setHasEverOpened(false);
@@ -225,35 +216,20 @@ export function useAcpConnection(
     dispatch({ kind: "hydrate", state: cached ?? emptyAcpState() });
     retryCountRef.current = 0;
     let cancelled = false;
-    const { setStatus, setReconnecting, setRetryCount, setRetryCountdown, setHasEverOpened, setReplayedWhileDown } =
-      settersRef.current;
+    const { setStatus, setReconnecting, setRetryCount, setHasEverOpened, setReplayedWhileDown } = settersRef.current;
 
     const scheduleReconnect = () => {
       if (cancelled) return;
       if (retryCountRef.current >= ACP_MAX_RETRIES) {
         setReconnecting(false);
         setRetryCount(retryCountRef.current);
-        setRetryCountdown(0);
         return;
       }
       const attempt = ++retryCountRef.current;
-      const delayMs = acpRetryDelayMs(attempt);
-      let countdown = Math.ceil(delayMs / 1000);
       setReconnecting(true);
       setRetryCount(attempt);
-      setRetryCountdown(countdown);
       clearRetryTimers();
-      countdownTimerRef.current = setInterval(() => {
-        countdown -= 1;
-        if (countdown > 0) setRetryCountdown(countdown);
-      }, 1000);
-      retryTimerRef.current = setTimeout(() => {
-        if (countdownTimerRef.current) {
-          clearInterval(countdownTimerRef.current);
-          countdownTimerRef.current = null;
-        }
-        connectRef.current?.();
-      }, delayMs);
+      retryTimerRef.current = setTimeout(() => connectRef.current?.(), acpRetryDelayMs(attempt));
     };
 
     const startReplay = (): {
@@ -385,7 +361,6 @@ export function useAcpConnection(
           retryCountRef.current = 0;
           setReconnecting(false);
           setRetryCount(0);
-          setRetryCountdown(0);
         };
         ws.onerror = () => {
           if (isCurrentDial()) setStatus("error");
@@ -432,7 +407,6 @@ export function useAcpConnection(
     status,
     reconnecting,
     retryCount,
-    retryCountdown,
     manualReconnect,
     hasEverOpened,
     replayedWhileDown,

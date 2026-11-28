@@ -164,6 +164,9 @@ pub struct SessionNotice {
     pub description: Option<String>,
 }
 
+/// Key of the notice a `neutral_boot` fallback posts; it lasts as long as the degraded session.
+pub const PROXY_DEGRADED_NOTICE_KEY: &str = "proxy-degraded";
+
 /// A keyed notice keeps one id across updates; others are minted from the seq.
 pub fn notice_id(key: Option<&str>, seq: u64) -> String {
     match key {
@@ -325,11 +328,22 @@ pub struct ConfigOptionSwitchFailure {
 }
 
 /// A startup failure aoe has diagnosed; clients branch on it instead of the message.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StartupCause {
     /// The sandboxed Session's container no longer exists, so a respawn can't reach it.
     ContainerMissing,
+    /// The launch waits for the sandbox login. `command` and `profile` are what its
+    /// `aoe sandbox login` needs, as the 409 body carries them: the session's profile and, only
+    /// when it matters, its command.
+    SandboxLoginRequired {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<String>,
+    },
+    /// The container runtime cannot run the sandbox login; the setting or the runtime has to change.
+    SandboxLoginUnsupported,
 }
 
 impl Event {
@@ -396,6 +410,8 @@ pub enum IntegrationLostReason {
     HoldOverflow,
     /// The proxy held more leases than any real agent does.
     LeaseOverflow,
+    /// The proxy, or the agent behind it, exited after its hello.
+    ProxyExited,
 }
 
 /// Lifecycle status of an async background sub-agent.
@@ -549,6 +565,13 @@ pub struct SubagentRecord {
     /// Launched in the background: its card stays open until it goes idle.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub background: bool,
+    /// Number of runs: 1 is the first, each later idle -> active transition adds one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub runs: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// One tool call a background sub-agent made, parsed from its transcript.
@@ -1267,11 +1290,15 @@ impl AcpState {
                     Some(existing) => *existing = notice,
                     None => self.session_notices.push(notice),
                 }
-                let excess = self
-                    .session_notices
-                    .len()
-                    .saturating_sub(Self::MAX_SESSION_NOTICES);
-                self.session_notices.drain(..excess);
+                // The degraded-proxy banner outlives the cap: it stays true
+                // until the proxy is back.
+                let degraded = notice_id(Some(PROXY_DEGRADED_NOTICE_KEY), 0);
+                while self.session_notices.len() > Self::MAX_SESSION_NOTICES {
+                    match self.session_notices.iter().position(|n| n.id != degraded) {
+                        Some(oldest) => self.session_notices.remove(oldest),
+                        None => break,
+                    };
+                }
             }
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
@@ -1338,6 +1365,9 @@ impl AcpState {
                 self.startup_error = None;
                 self.integration_lost = None;
                 self.rate_limit = None;
+                // A degraded worker re-asserts the notice after assignment.
+                let degraded = notice_id(Some(PROXY_DEGRADED_NOTICE_KEY), 0);
+                self.session_notices.retain(|n| n.id != degraded);
                 self.heal_sidebar_phase();
             }
             Event::RateLimitAutoResumed { .. } => self.heal_sidebar_phase(),
@@ -1537,8 +1567,9 @@ impl AcpState {
         }
         self.rate_limit = None;
         // Advisories describe the turn they arrived in, so a new prompt retires
-        // them. Their transcript rows keep the history.
-        self.session_notices.clear();
+        // them, except the degraded-proxy banner. Their transcript rows keep the history.
+        let degraded = notice_id(Some(PROXY_DEGRADED_NOTICE_KEY), 0);
+        self.session_notices.retain(|n| n.id == degraded);
     }
 
     /// A fresh worker attached: a startup error no longer holds the row.
@@ -1603,7 +1634,7 @@ impl AcpState {
     /// The RFD snapshot is authoritative for the async agent that child
     /// belongs to, so it replaces the transcript tailer's heuristics and,
     /// unlike them, may reopen an idle agent that was messaged again.
-    fn apply_subagent(&mut self, subagent: SubagentRecord, at: Timestamp) {
+    fn apply_subagent(&mut self, mut subagent: SubagentRecord, at: Timestamp) {
         if let Some(tool_call_id) = subagent.parent_tool_call_id.as_deref() {
             if let Some(agent) = self
                 .background_agents
@@ -1618,8 +1649,15 @@ impl AcpState {
             .iter_mut()
             .find(|s| s.session_id == subagent.session_id)
         {
-            Some(existing) => *existing = subagent,
-            None => self.subagents.push(subagent),
+            Some(existing) => {
+                let resumed = existing.state == SubagentState::Idle && subagent.state.is_active();
+                subagent.runs = existing.runs + u32::from(resumed);
+                *existing = subagent;
+            }
+            None => {
+                subagent.runs = subagent.runs.max(1);
+                self.subagents.push(subagent);
+            }
         }
     }
 
@@ -2006,6 +2044,46 @@ mod tests {
             titles(&applied([notice("stale"), prompt("next")])).is_empty(),
             "a new turn retires the previous turn's advisories"
         );
+        let degraded = Event::SessionNotice {
+            severity: "warning".into(),
+            title: "Fake features unavailable".into(),
+            description: None,
+            key: Some(PROXY_DEGRADED_NOTICE_KEY.into()),
+        };
+        assert_eq!(
+            titles(&applied([degraded, notice("stale"), prompt("next")])),
+            ["Fake features unavailable"],
+            "a degraded proxy's banner outlives the turn"
+        );
+        let degraded = || Event::SessionNotice {
+            severity: "warning".into(),
+            title: "Fake features unavailable".into(),
+            description: None,
+            key: Some(PROXY_DEGRADED_NOTICE_KEY.into()),
+        };
+        let assigned = Event::AcpSessionAssigned {
+            acp_session_id: "acp-2".into(),
+        };
+        assert_eq!(
+            titles(&applied([degraded(), assigned.clone(), degraded()])),
+            ["Fake features unavailable"],
+            "a degraded worker re-asserts the notice after assignment"
+        );
+        let flood = (0..AcpState::MAX_SESSION_NOTICES + 2).map(|i| notice(&format!("n{i}")));
+        let flooded = applied(
+            std::iter::once(degraded())
+                .chain(flood)
+                .chain([prompt("next")]),
+        );
+        assert_eq!(
+            titles(&flooded),
+            ["Fake features unavailable"],
+            "later notices do not evict the banner, and a turn keeps it"
+        );
+        assert!(
+            titles(&applied([degraded(), assigned])).is_empty(),
+            "a healthy worker's assignment retires the degraded notice"
+        );
         assert!(
             titles(&applied([
                 notice("stale"),
@@ -2184,6 +2262,40 @@ mod tests {
                 },
                 serde_json::json!({ "AgentStartupError": {
                     "message": "x", "cause": { "kind": "container_missing" }
+                } }),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "x".into(),
+                    cause: Some(StartupCause::SandboxLoginRequired {
+                        command: Some("my claude".into()),
+                        profile: Some("work".into()),
+                    }),
+                },
+                serde_json::json!({ "AgentStartupError": {
+                    "message": "x",
+                    "cause": { "kind": "sandbox_login_required", "command": "my claude", "profile": "work" }
+                } }),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "x".into(),
+                    cause: Some(StartupCause::SandboxLoginRequired {
+                        command: None,
+                        profile: None,
+                    }),
+                },
+                serde_json::json!({ "AgentStartupError": {
+                    "message": "x", "cause": { "kind": "sandbox_login_required" }
+                } }),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "x".into(),
+                    cause: Some(StartupCause::SandboxLoginUnsupported),
+                },
+                serde_json::json!({ "AgentStartupError": {
+                    "message": "x", "cause": { "kind": "sandbox_login_unsupported" }
                 } }),
             ),
         ] {
@@ -2607,9 +2719,32 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: false,
+                runs: 0,
             },
             at: Timestamp::now(),
         }
+    }
+
+    #[test]
+    fn subagent_runs_count_each_resume_and_replay_the_same() {
+        let run = |events: Vec<Event>| applied(events).subagents[0].runs;
+        use SubagentState::{Idle, Running, Unknown};
+        let idle = || subagent(Idle, Some("end_turn"));
+        assert_eq!(run(vec![subagent(Running, None)]), 1);
+        assert_eq!(run(vec![idle()]), 1);
+        let twice = vec![
+            subagent(Running, None),
+            idle(),
+            subagent(Running, None),
+            idle(),
+        ];
+        assert_eq!(run(twice.clone()), 2);
+        assert_eq!(applied(twice.clone()).subagents, applied(twice).subagents);
+        assert_eq!(
+            run(vec![subagent(Unknown, None), subagent(Running, None)]),
+            1
+        );
+        assert_eq!(run(vec![idle(), idle()]), 1);
     }
 
     #[test]

@@ -5,7 +5,6 @@
 //! A `status` frame goes out only after a snapshot publication that began after the move, and
 //! carries that snapshot's cursor, so a `GET /api/sessions` after the frame is never staler than it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,12 +15,11 @@ use serde_json::json;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::time::Instant;
 
-use crate::session::Status;
-
 use crate::daemon::RuntimeCursor;
 
 use super::push::{NotificationEvent, StatusChange};
 use super::runtime::PublishedSnapshot;
+use super::sound_cues::Dwells;
 use super::AppState;
 
 const PING_INTERVAL: Duration = Duration::from_secs(25);
@@ -38,57 +36,6 @@ pub async fn session_status_ws(
     ws.protocols(["aoe-auth"])
         .on_upgrade(move |socket| serve(socket, state))
         .into_response()
-}
-
-/// Pending dwell per session; a later move replaces the entry, so a flap never cues.
-#[derive(Default)]
-struct Dwells(HashMap<String, (Instant, NotificationEvent)>);
-
-impl Dwells {
-    fn track(&mut self, id: &str, status: Status, now: Instant) {
-        match NotificationEvent::for_status(status) {
-            Some(event) => {
-                let due = now + Duration::from_millis(event.dwell_ms());
-                self.0.insert(id.to_string(), (due, event));
-            }
-            None => {
-                self.0.remove(id);
-            }
-        }
-    }
-
-    fn on_change(&mut self, change: &StatusChange, now: Instant) {
-        if !(change.new == Status::Error && change.rearms_error()) {
-            self.track(&change.instance_id, change.new, now);
-        }
-    }
-
-    /// A dwell for every session already in a cueing status, so a new connection still cues a
-    /// status that started before it; the client drops a cue it already sounded.
-    async fn seeded(state: &AppState) -> Self {
-        let now = Instant::now();
-        let mut dwells = Self::default();
-        for inst in state.instances.read().await.iter() {
-            dwells.track(&inst.id, inst.status, now);
-        }
-        dwells
-    }
-
-    fn next_due(&self) -> Option<Instant> {
-        self.0.values().map(|(due, _)| *due).min()
-    }
-
-    fn take_due(&mut self, now: Instant) -> Vec<(String, NotificationEvent)> {
-        let ids: Vec<String> = self
-            .0
-            .iter()
-            .filter(|(_, (due, _))| *due <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
-        ids.into_iter()
-            .filter_map(|id| self.0.remove(&id).map(|(_, event)| (id, event)))
-            .collect()
-    }
 }
 
 fn status_frame(id: &str, status: &str, cursor: &RuntimeCursor) -> String {
@@ -236,6 +183,7 @@ async fn serve(mut socket: WebSocket, state: Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Status;
     use crate::time::Timestamp;
 
     fn change(id: &str, new: Status) -> StatusChange {
@@ -248,59 +196,6 @@ mod tests {
             at: Timestamp::now(),
             restores_prior: false,
         }
-    }
-
-    #[test]
-    fn dwell_cues_after_the_status_holds_and_a_later_move_cancels_it() {
-        let t0 = Instant::now();
-        let mut dwells = Dwells::default();
-        dwells.on_change(&change("a", Status::Waiting), t0);
-        dwells.on_change(&change("b", Status::Idle), t0);
-        dwells.on_change(&change("c", Status::Running), t0);
-        assert_eq!(dwells.next_due(), Some(t0 + Duration::from_millis(2_000)));
-
-        let mut due = dwells.take_due(t0 + Duration::from_millis(2_000));
-        due.sort_by(|x, y| x.0.cmp(&y.0));
-        assert_eq!(due, vec![("b".to_string(), NotificationEvent::Idle)]);
-
-        dwells.on_change(
-            &change("a", Status::Running),
-            t0 + Duration::from_millis(3_000),
-        );
-        assert!(dwells.take_due(t0 + Duration::from_secs(60)).is_empty());
-        assert_eq!(dwells.next_due(), None);
-    }
-
-    /// #5921: push's Error to Error re-arm moves nothing, so the sound dwell keeps its time and
-    /// a cued Error doesn't replay. A Retry's rollback, Error to Starting to Error, does move the
-    /// status, and cues once.
-    #[test]
-    fn a_rollback_cues_once_and_a_push_only_rearm_replays_nothing() {
-        use Status::{Error, Starting};
-        let step = |old, new, restores_prior| StatusChange {
-            old,
-            restores_prior,
-            ..change("a", new)
-        };
-        let t0 = Instant::now();
-        let later = |secs| t0 + Duration::from_secs(secs);
-        let mut dwells = Dwells::default();
-        dwells.on_change(&change("a", Error), t0);
-        let pending = dwells.next_due();
-        assert!(pending.is_some(), "an Error cues");
-        dwells.on_change(&step(Error, Error, false), later(1));
-        assert_eq!(
-            dwells.next_due(),
-            pending,
-            "a re-arm keeps a pending cue's time"
-        );
-        let mut cues = vec![dwells.take_due(later(60)).len()];
-        dwells.on_change(&step(Error, Starting, false), later(61));
-        dwells.on_change(&step(Starting, Error, true), later(62));
-        cues.push(dwells.take_due(later(120)).len());
-        dwells.on_change(&step(Error, Error, false), later(121));
-        cues.push(dwells.take_due(later(180)).len());
-        assert_eq!(cues, [1, 1, 0], "the first Error, the rollback, the re-arm");
     }
 
     fn cursor(revision: u64) -> RuntimeCursor {

@@ -101,6 +101,8 @@ pub(super) struct Shared {
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
     pub(super) aoe: AoeIngress,
+    /// The agent closed the transport, as opposed to any other connection error.
+    pub(super) transport_closed: AtomicBool,
     claude_home: Option<std::path::PathBuf>,
 }
 
@@ -158,6 +160,7 @@ impl Shared {
             bg_transcript_source,
             bg_tasks: Arc::default(),
             aoe: AoeIngress::default(),
+            transport_closed: AtomicBool::new(false),
             claude_home,
         }
     }

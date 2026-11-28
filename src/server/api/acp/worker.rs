@@ -1049,6 +1049,7 @@ pub async fn switch_acp_agent(
         prior_conversation: false,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
         claude_store_pin: None,
+        proxy: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };
     if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {
@@ -3600,6 +3601,8 @@ mod tests {
         let park = |info, cap_reached| RateLimitPark {
             info,
             recorded_at_ms: 0,
+            observed_at_ms: 0,
+            inherited_window: None,
             cap_reached,
             last_resume_attempt_ms: None,
         };
@@ -3728,6 +3731,7 @@ mod tests {
                 "error": "sandbox_login_required",
                 "message": "sandbox login required for claude: run `aoe sandbox login --tool claude`",
                 "tool": "claude",
+                "profile": crate::session::config::effective_profile(""),
             })
         );
         assert!(!state.acp_supervisor.is_running(&id).await);

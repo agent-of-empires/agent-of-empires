@@ -35,6 +35,7 @@ use crate::session::capture::{
     OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
+pub(crate) use accessors::generate_id;
 mod capture_slot;
 mod container;
 #[cfg(test)]
@@ -162,8 +163,8 @@ pub(crate) enum TerminalContextResume {
 pub use types::{
     AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity,
     LegacyToolObservation, PaneObservation, PanePresence, PluginCreateIdempotency, SandboxInfo,
-    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    MAX_INITIAL_PROMPT_BYTES,
+    SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo,
+    WorktreeInfo, MAX_INITIAL_PROMPT_BYTES,
 };
 pub(crate) use types::{
     PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxPin, SandboxStoreTransitionPath,
@@ -251,7 +252,7 @@ pub struct PendingInitialTurn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Stable machine-readable form of `error`, for the causes a client can act
-    /// on (`agent_folder_not_trusted`, `agent_bypass_not_accepted`).
+    /// on (`agent_folder_not_trusted`, `agent_bypass_not_accepted`, `input_line_busy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     /// Identifies this turn across reloads, so state kept for one turn never
@@ -572,17 +573,10 @@ pub struct Instance {
     /// different concept with a different type and lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_entered_at: Option<Timestamp>,
-    /// Wall-clock launch of the current agent process; `None` until the first launch after upgrade.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<Timestamp>,
     /// The absolute agent program the last host launch ran, when native launch resolved it. It is
     /// a path only; hook output is never recorded here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_executable: Option<std::path::PathBuf>,
-    /// `launch_executable` with symlinks resolved at launch, to tell a switched link from a
-    /// re-created one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_resolved_executable: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<Timestamp>,
 
@@ -727,6 +721,12 @@ pub struct Instance {
     /// releases the key. Additive: absent in older rows, no migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
+
+    /// Suggestion this session was started from. Additive: absent in older
+    /// rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<SuggestionOrigin>,
+
     /// Set by a plugin's `sessions.turn.send` right before waking a resting session, under the
     /// same `instances` write lock that decides to revive it, so the plugin active-session cap
     /// treats it as occupying a slot immediately rather than waiting for a status to land.

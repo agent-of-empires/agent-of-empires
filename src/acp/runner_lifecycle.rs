@@ -411,6 +411,20 @@ impl Lease {
         });
     }
 
+    /// Forget a runner this construction already tore down, so it can launch another.
+    pub(crate) fn release_torn_down_runner(&self) {
+        *self
+            .construction
+            .runner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        *self
+            .construction
+            .spawn_attestor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
     pub(crate) async fn attest_runner(&self) -> bool {
         let Some(current) = self.spawned_runner() else {
             return true;

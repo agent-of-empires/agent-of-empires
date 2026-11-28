@@ -49,6 +49,7 @@ impl Gate {
         self.seen = Some(id);
         self.epoch += 1;
         super::feature_use::zero();
+        super::suggestions::zero();
         self.resets.retain(|reset| reset());
     }
 }

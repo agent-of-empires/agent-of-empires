@@ -1,5 +1,6 @@
 import type { ElicitationAnswer } from "../../lib/acpTypes";
-import { CopyMarkdownButton } from "./CopyMarkdownButton";
+import { CAPTION_INLINE } from "../../lib/surfaces";
+import { USER_REPLY_ITEM, UserReplyCard } from "./UserReplyCard";
 
 interface Props {
   answers: ElicitationAnswer[];
@@ -12,34 +13,21 @@ interface Props {
  *  structured pick reads as a tidy card, not a flat "Q: A" line. See #2209. */
 export function ElicitationAnswerCard({ answers }: Props) {
   return (
-    <div
-      data-testid="elicitation-answer-card"
-      className="w-full max-w-3xl rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-4 py-3 text-sm"
+    <UserReplyCard
+      testId="elicitation-answer-card"
+      tag="answer"
+      summary={`${answers.length} answer${answers.length === 1 ? "" : "s"}`}
+      copySource={answers.map((a) => `**${a.question}**\n${a.answer}`).join("\n\n")}
+      copyLabel="Copy answers"
     >
-      <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-wider text-text-dim">
-        <span className="rounded bg-brand-600/15 px-1.5 py-0.5 font-mono text-brand-300">answer</span>
-        <span>
-          {answers.length} answer{answers.length === 1 ? "" : "s"}
-        </span>
-        <span className="ml-auto">
-          <CopyMarkdownButton
-            compact
-            source={answers.map((a) => `**${a.question}**\n${a.answer}`).join("\n\n")}
-            label="Copy answers"
-          />
-        </span>
-      </div>
       <ul className="flex flex-col gap-2">
         {answers.map((a, i) => (
-          <li
-            key={`${i}-${a.question}`}
-            className="rounded-lg border border-surface-700/60 bg-surface-900/60 px-3 py-2"
-          >
-            <div className="mb-0.5 text-[11px] uppercase tracking-wider text-text-dim">{a.question}</div>
+          <li key={`${i}-${a.question}`} className={`${USER_REPLY_ITEM} px-3 py-2`}>
+            <div className={`mb-0.5 ${CAPTION_INLINE}`}>{a.question}</div>
             <div className="whitespace-pre-wrap text-text-primary">{a.answer}</div>
           </li>
         ))}
       </ul>
-    </div>
+    </UserReplyCard>
   );
 }

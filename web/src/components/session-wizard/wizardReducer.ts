@@ -43,6 +43,7 @@ export interface WizardData {
   /** Per extra repo base branch, keyed by path; outranks `baseBranch`. */
   repoBases: Record<string, string>;
   customInstruction: string;
+  initialPrompt: string;
   extraArgs: string;
   commandOverride: string;
   /** Set when the user edits an agent-step field after defaults were applied. */
@@ -151,6 +152,7 @@ export const initialData: WizardData = {
   repoBases: {},
   profileDirty: false,
   customInstruction: "",
+  initialPrompt: "",
   extraArgs: "",
   commandOverride: "",
   scratch: false,
@@ -350,6 +352,8 @@ function reduce(state: WizardState, action: Action): WizardState {
         state.data.importAcpSessionId || state.data.scratch || state.data.pathIsGitRepo === false
           ? false
           : (state.data.projectWorktreeOverride ?? action.worktreeEnabled);
+      const keepWorktree = !!action.skipIfDirty && state.data.worktreeDirty;
+      const keepSandbox = !!action.skipIfDirty && state.data.sandboxDirty;
       const structuredViewOffered = action.structuredViewOffered ?? state.data.structuredViewOffered;
       const useStructuredView = seededStructuredView(state.data, action, structuredViewOffered);
       const resolvedSandbox = state.data.importAcpSessionId
@@ -377,9 +381,10 @@ function reduce(state: WizardState, action: Action): WizardState {
         data: {
           ...state.data,
           yoloMode: action.yoloMode,
-          sandboxEnabled: resolvedSandbox,
+          sandboxEnabled: keepSandbox ? state.data.sandboxEnabled : resolvedSandbox,
           profileSandboxDefault: action.sandboxEnabled,
-          useWorktree: resolvedUseWorktree(),
+          // A prefilled or typed choice survives the first load; a profile reset drops it.
+          useWorktree: keepWorktree ? state.data.useWorktree : resolvedUseWorktree(),
           profileWorktreeDefault: action.worktreeEnabled,
           useWorkspace: action.workspaceByDefault,
           workspaceDirty: false,
@@ -390,8 +395,8 @@ function reduce(state: WizardState, action: Action): WizardState {
           useStructuredView,
           structuredViewOffered,
           profileDirty: false,
-          worktreeDirty: false,
-          sandboxDirty: false,
+          worktreeDirty: keepWorktree,
+          sandboxDirty: keepSandbox,
         },
       };
     }

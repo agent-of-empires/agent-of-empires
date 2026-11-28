@@ -643,12 +643,14 @@ pub(crate) async fn get_runtime_info(
     local: Option<Extension<Principal>>,
 ) -> Response {
     match state.runtime.publish(&state).await {
-        Ok(snapshot) => Json(
-            state
-                .runtime
-                .info(&state, local.as_deref(), &snapshot.value),
-        )
-        .into_response(),
+        Ok(snapshot) => mutation_response(
+            &snapshot.value.cursor,
+            Json(
+                state
+                    .runtime
+                    .info(&state, local.as_deref(), &snapshot.value),
+            ),
+        ),
         Err(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }

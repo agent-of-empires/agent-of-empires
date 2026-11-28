@@ -20,15 +20,7 @@ function session(over: Partial<SessionResponse>): SessionResponse {
 }
 
 function renderDashboard(sessions: SessionResponse[]) {
-  return render(
-    <Dashboard
-      sessions={sessions}
-      onSelectSession={vi.fn()}
-      onNewSession={vi.fn()}
-      onCloneFromUrl={vi.fn()}
-      onToggleSidebar={vi.fn()}
-    />,
-  );
+  return render(<Dashboard sessions={sessions} onNewSession={vi.fn()} onCloneFromUrl={vi.fn()} />);
 }
 
 describe("Dashboard summary excludes trashed sessions (#2489)", () => {

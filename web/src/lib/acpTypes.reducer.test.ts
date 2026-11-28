@@ -17,8 +17,10 @@ import {
   type Elicitation,
   type ReducedState,
   type TranscriptRow,
+  type ActivityRow,
   type ToolCall,
 } from "./acpTypes";
+import { fromInline } from "../components/acp/subagents/model";
 import { workflowRunning } from "../components/acp/backgroundAgentsContext";
 
 const ev = (state: AcpState, seq: number, event: AcpEvent) => applyEvent(state, { session_id: "s-1", seq, event });
@@ -370,6 +372,134 @@ describe("applyEvent / subagent roster", () => {
       ["child-1", "idle"],
       ["c2", "running"],
     ]);
+  });
+
+  it("counts a run per idle to active transition and stamps when the child last went idle", () => {
+    const states = (...events: AcpEvent[]) => {
+      let s = emptyAcpState();
+      return events.map((e, i) => {
+        s = ev(s, i + 1, e);
+        return s.subagents[0]!;
+      });
+    };
+    const rs = states(
+      update("running", "t1"),
+      update("requires_action", "t2"),
+      update("idle", "t3"),
+      update("running", "t4"),
+      update("idle", "t5"),
+      update("idle", "t6", { title: "renamed" }),
+    );
+    expect(rs.map((r) => [r.runs, r.idle_since])).toEqual([
+      [1, undefined],
+      [1, undefined],
+      [1, "t3"],
+      [2, undefined],
+      [2, "t5"],
+      [2, "t5"],
+    ]);
+  });
+
+  it("settles a text-only resume at its last update through the real reducer", () => {
+    const launch: ToolCall = { id: "task-1", name: "Explore", kind: "think", args_preview: "{}", started_at: "t0" };
+    const first: ActivityRow = { id: "r", kind: "tool_complete", text: "first report", at: "2026-01-01T00:02:00Z" };
+    const roster = (...events: AcpEvent[]) => run(...events).subagents[0]!;
+    const idle = { stop_reason: "end_turn", background: true };
+    const t = (m: number) => `2026-01-01T00:0${m}:00Z`;
+
+    const resumed = fromInline(
+      launch,
+      first,
+      [],
+      roster(
+        update("running", t(1), { background: true }),
+        update("idle", t(2), idle),
+        update("running", t(4), { background: true }),
+        update("idle", t(5), idle),
+      ),
+    );
+    expect(resumed).toMatchObject({ status: "done", report: "", earlierReport: "first report", endedAt: t(5) });
+    expect(
+      roster(update("running", t(1)), update("idle", t(2), idle), update("running", t(4)), update("idle", t(5), idle))
+        .runs,
+    ).toBe(2);
+
+    const once = fromInline(
+      launch,
+      first,
+      [],
+      roster(update("running", t(1), { background: true }), update("idle", t(2), idle)),
+    );
+    expect(once).toMatchObject({ status: "done", report: "first report", endedAt: t(2) });
+    expect(once.earlierReport).toBeUndefined();
+  });
+
+  it("keeps a seen text-only resume across a reconnect that adopts a newer idle snapshot", () => {
+    const launch: ToolCall = { id: "task-1", name: "Explore", kind: "think", args_preview: "{}", started_at: "t0" };
+    const first: ActivityRow = { id: "r", kind: "tool_complete", text: "first report", at: "2026-01-01T00:02:00Z" };
+    const t = (m: number) => `2026-01-01T00:0${m}:00Z`;
+    const held = run(
+      update("running", t(1), { background: true }),
+      update("idle", t(2), { stop_reason: "end_turn", background: true }),
+      update("running", t(4), { background: true }),
+    );
+    const { idle_since: _i, updated_at: _u, ...bare } = held.subagents[0] as Record<string, unknown>;
+    const reduced = reducedState({
+      subagents: [{ ...bare, runs: 1, state: "idle", stop_reason: "end_turn" }] as never,
+    });
+    const merged = applyReducedState(held, reduced, [], held.lastSeq).subagents[0]!;
+    const card = fromInline(launch, first, [], merged);
+    expect(card).toMatchObject({ status: "done", report: "", earlierReport: "first report" });
+  });
+
+  it("does not count a first run again when replay frames the snapshot already covers arrive after it", () => {
+    const idle = { stop_reason: "end_turn", background: true };
+    const t = (m: number) => `2026-01-01T00:0${m}:00Z`;
+    const settled = run(update("running", t(1), { background: true }), update("idle", t(2), idle)).subagents[0]!;
+    const { idle_since: _i, ...bare } = settled as Record<string, unknown>;
+    const snapshot = reducedState({ subagents: [{ ...bare, runs: 1 }] as never });
+    // Snapshot at seq 2 lands first; the replay of seq 1 and 2 follows.
+    let state = applyReducedState(emptyAcpState(), snapshot, [], 2);
+    state = ev(state, 1, update("running", t(1), { background: true }));
+    state = ev(state, 2, update("idle", t(2), idle));
+    expect(state.subagents[0]!.runs).toBe(1);
+    // A real resume after the snapshot still counts.
+    state = ev(state, 3, update("running", t(4), { background: true }));
+    expect(state.subagents[0]!.runs).toBe(2);
+  });
+
+  it("reads a resume from the snapshot's run count on a cold load, with no event times", () => {
+    const launch: ToolCall = { id: "task-1", name: "Explore", kind: "think", args_preview: "{}", started_at: "t0" };
+    const first: ActivityRow = {
+      id: "done-task-1",
+      kind: "tool_complete",
+      toolCallId: "task-1",
+      text: "first report",
+      at: "2026-01-01T00:02:00Z",
+    };
+    const child = {
+      session_id: "child-1",
+      parent_session_id: "root",
+      parent_tool_call_id: "task-1",
+      state: "idle",
+      stop_reason: "end_turn",
+      cancel_capable: true,
+      background: true,
+    };
+    const cold = (runs: number) =>
+      applyReducedState(
+        { ...emptyAcpState(), activity: [first] },
+        reducedState({ subagents: [{ ...child, runs }] as ReducedState["subagents"] }),
+      ).subagents[0]!;
+
+    expect(fromInline(launch, first, [], cold(2))).toMatchObject({
+      status: "done",
+      report: "",
+      earlierReport: "first report",
+    });
+    const once = fromInline(launch, first, [], cold(1));
+    expect(once).toMatchObject({ status: "done", report: "first report" });
+    expect(once.earlierReport).toBeUndefined();
   });
 
   it("maps the state onto the matching background agent, including idle then running again", () => {

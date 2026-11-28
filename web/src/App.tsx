@@ -1,4 +1,5 @@
 import {
+  type CSSProperties,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -8,7 +9,22 @@ import {
   type ComponentProps,
   type ReactNode,
 } from "react";
-import { Puzzle } from "lucide-react";
+import {
+  AlarmClock,
+  AlarmClockOff,
+  Archive,
+  ArchiveRestore,
+  Copy,
+  FileDiff,
+  FolderTree,
+  Pin,
+  PinOff,
+  Puzzle,
+  Sparkles,
+  Square,
+  SquareTerminal,
+  Trash2,
+} from "lucide-react";
 import {
   confirmFileEditNavigation,
   confirmFileEditPanes,
@@ -25,6 +41,7 @@ import { CloseOnEscape } from "./components/diff/comments/CloseOnEscape";
 import { useSessions } from "./hooks/useSessions";
 import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
+import { onSoundBlocked } from "./lib/soundPlayer";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { useWizardReopen } from "./hooks/app/useWizardReopen";
@@ -37,7 +54,11 @@ import { clearDraft } from "./lib/acpDrafts";
 import { useOrphanSweep } from "./hooks/useOrphanSweep";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
 import { SessionActionProvider } from "./components/sidebar/SessionActionProvider";
-import { recreateContainerBlock, recreateContainerTitle } from "./components/sidebar/sessionActionTargets";
+import {
+  recreateContainerBlock,
+  recreateContainerTitle,
+  sessionActionEligible,
+} from "./components/sidebar/sessionActionTargets";
 import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
@@ -73,12 +94,23 @@ import { useDrawerSwipe, type DrawerSwipeAction } from "./hooks/useDrawerSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
+import { useMediaQuery } from "./hooks/useMediaQuery";
+import { SHEET_MEDIA_QUERY } from "./lib/rightDockMode";
 import type { RightPanelView } from "./lib/rightPanelView";
-import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed, renderedGroups } from "./lib/paneLayout";
+import {
+  usePaneLayout,
+  dockGroups,
+  dockOf,
+  isDockCollapsed,
+  renderedGroups,
+  sessionTerminals,
+  terminalPlacements,
+} from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
-import { PluginSessionMenu } from "./components/plugin/PluginSessionMenu";
+import { SuggestionsView } from "./components/SuggestionsView";
+import { PluginSessionMenu, type SessionMenuRequest } from "./components/plugin/PluginSessionMenu";
 import {
   deleteWorkspaceSessions,
   restoreSessions,
@@ -132,11 +164,17 @@ import { PanelDefaultsContext, parsePanelDefaults, usePanelDefaults, type PanelD
 import { settleSettingsIntrosReadOnly } from "./lib/settingsIntros";
 import { onSettingsChanged } from "./lib/settingsEvents";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
-import { toastBus, reportError } from "./lib/toastBus";
-import { restartForUpdate } from "./lib/restartForUpdate";
+import { toastBus, reportError, reportInfo } from "./lib/toastBus";
+import { writeClipboard } from "./lib/clipboard";
 import { startPendingCreates } from "./lib/pendingCreates";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
-import { NAVIGATE_EVENT, OPEN_SESSION_EVENT, openFocusWindow, replaceDocument } from "./lib/sessionRoute";
+import {
+  NAVIGATE_EVENT,
+  OPEN_SESSION_EVENT,
+  openFocusWindow,
+  replaceDocument,
+  requestNavigate,
+} from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
   bindHiddenInput,
@@ -149,7 +187,6 @@ import { SnoozeModal } from "./components/sidebar/SnoozeModal";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
-import { TopBar } from "./components/TopBar";
 import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
 import { TrashReadFailed } from "./components/TrashReadFailed";
 import { ContentSplit } from "./components/ContentSplit";
@@ -187,7 +224,7 @@ const LazyCommandPalette = lazyView(() => loadCommandPalette().then((m) => m.Com
 function CommandPalette(props: ComponentProps<typeof LazyCommandPalette>) {
   return props.open ? <LazyCommandPalette {...props} /> : null;
 }
-import { type PaneDisplay } from "./components/Dock";
+import { type DockControls, type PaneDisplay } from "./components/Dock";
 import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
@@ -197,13 +234,36 @@ import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
 import { FileContentViewer } from "./components/diff/FileContentViewer";
-import { PairedShellPane } from "./components/PairedTerminal";
+import { MainViewTabs } from "./components/MainViewTabs";
+import { OPEN_HEADER_MENU_EVENT, type OverflowItem } from "./components/OverflowMenu";
+import { TopBar, type PhoneViewChoice } from "./components/TopBar";
+import { appMenuItems } from "./lib/appMenu";
+import { PHONE_BANNER_CARD } from "./lib/surfaces";
+import { TOUR_ANCHORS, findTourAnchor } from "./lib/tourSteps";
+import { SidebarLegend } from "./components/sidebar/SidebarLegend";
+import { MAIN_VIEW_IDS } from "./lib/mainViewIds";
+import { DiffScopeContext, loadDiffScope, saveDiffScope, type DiffScope, type DiffScopeState } from "./lib/diffScope";
+import { PairedShellPane, ShellModeToggle } from "./components/PairedTerminal";
+import { TerminalSwitcherButton, TerminalSwitcherOverlay } from "./components/TerminalSwitcher";
+import {
+  effectiveShellMode,
+  liveShellIndices,
+  pairedShellGroups,
+  shellLabel,
+  type PairedShell,
+} from "./lib/pairedShells";
 import { usePairedShellModes } from "./hooks/usePairedShellModes";
 import { useOpenPairedTerminal, usePairedTerminalReveal } from "./hooks/usePairedTerminalReveal";
-import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
+import {
+  BUILTIN_PANES,
+  emptyPanelPane,
+  parseTerminalTabId,
+  TERMINAL_DOCK,
+  type DockLocation,
+  type TerminalRef,
+} from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
-import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
 import { ProjectFormModal } from "./components/ProjectFormModal";
 import { ScratchOverridesModal } from "./components/ScratchOverridesModal";
 import { HelpOverlay } from "./components/HelpOverlay";
@@ -224,6 +284,7 @@ import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./
 import { AboutModal } from "./components/AboutModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
+import type { CommandAction } from "./components/command-palette/types";
 import { useConversationSearch } from "./hooks/useConversationSearch";
 import { BannerStack } from "./components/BannerStack";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -390,6 +451,10 @@ const SESSION_STATE_FEATURE: Partial<Record<SessionStateAction, FeatureUse>> = {
 };
 
 /** Composes the authenticated dashboard and synchronizes its user-scoped UI state. */
+/** The phone drawer pushes the Session aside on the iOS sheet curve; reduced motion skips it. */
+const PUSH_MOTION =
+  "max-md:transition-[translate,border-radius,box-shadow] max-md:duration-[400ms] max-md:ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
+
 function AppContent({
   loginRequired,
   onLogout,
@@ -434,6 +499,7 @@ function AppContent({
   const { focusSessionId, enterFocusMode, exitFocusMode } = useFocusMode(sessionMatch?.params.sessionId ?? null);
   const focusMode = focusSessionId !== null;
   useDashboardPresence(focusSessionId);
+  const suggestionsMatch = useMatch("/suggestions");
   // A plugin page's split pane shows `?session=` as the routed session, docks and all.
   const activeSessionId = sessionMatch?.params.sessionId ?? (pluginPageMatch ? searchParams.get("session") : null);
   const selectPluginPageSession = useCallback(
@@ -461,7 +527,7 @@ function AppContent({
   }, [focusMode, onPluginPage, selectPluginPageSession, navigate]);
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   // Settings and plugin pages take the full width, sidebar and session panels hidden.
-  const fullPageView = showSettings || pluginPageMatch !== null;
+  const fullPageView = showSettings || pluginPageMatch !== null || suggestionsMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -539,6 +605,8 @@ function AppContent({
     [cancelCue, applyPushedStatus],
   );
   useSessionStatusStream({ onStatus: onPushedStatus, onSoundDue, onResync: refreshSessions });
+  // Shown in focus mode too: the focused session's sounds are blocked like any other.
+  useEffect(() => onSoundBlocked(() => toastBus.handler?.info("Click anywhere on this page to turn on sounds.")), []);
   const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103). A focus window is not the main window.
@@ -565,6 +633,17 @@ function AppContent({
   const pluginUiEntries = usePluginUiEntries();
   const pluginPages = usePluginPages();
   const pluginPageActions = useMemo(() => buildPluginPageActions(pluginPages ?? []), [pluginPages]);
+  const suggestionsAction = useMemo<CommandAction>(
+    () => ({
+      id: "page:suggestions",
+      title: "Suggested sessions",
+      group: "Pages",
+      keywords: ["page", "suggestions", "suggested", "start"],
+      icon: <Sparkles className="h-4 w-4" />,
+      perform: () => requestNavigate("/suggestions"),
+    }),
+    [],
+  );
   const pluginAttention = usePluginAttention();
   const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
   const activePluginSort = useMemo(() => {
@@ -702,6 +781,9 @@ function AppContent({
     external?: boolean;
   } | null>(null);
   const selectedFilePath = selectedFile?.path ?? null;
+  // The open file the user stepped back from to the Agent tab; picking another file shows that one.
+  const [agentTabFor, setAgentTabFor] = useState<typeof selectedFile>(null);
+  const fileShown = selectedFile !== null && agentTabFor !== selectedFile;
   const selectedFileExternal = selectedFile?.external ?? false;
   const selectedRepoName = selectedFile?.repoName;
   const selectedFileLine = selectedFile?.line;
@@ -723,11 +805,18 @@ function AppContent({
     () => (panelDefaults.plugins ? pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })) : []),
     [panelDefaults.plugins, pluginPanes],
   );
+  // Host or Container per shell, so choosing one never switches another shell.
+  const { modeFor: shellModeFor, setMode: setShellMode } = usePairedShellModes();
+  const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
   // A persisted tab is visible only if its backing pane currently exists: diff
-  // and terminals always do; a plugin tab does only while its plugin is loaded.
+  // always does; a terminal while its Session is listed; a plugin tab while its plugin is loaded.
   const tabAvailable = useCallback(
-    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
-    [pluginPaneById],
+    (id: string) => {
+      if (id.startsWith("plugin:")) return pluginPaneById.has(id);
+      const shell = parseTerminalTabId(id);
+      return !shell || sessionById.has(shell.sessionId);
+    },
+    [pluginPaneById, sessionById],
   );
   const {
     layout: paneLayout,
@@ -773,15 +862,24 @@ function AppContent({
         // per-pane runtime icon a worker chose before icon_asset existed.
         return { title: plugin.title, icon, iconAssetUrl: identity?.iconAssetUrl };
       }
-      if (isTerminalTabId(id)) {
-        const idx = terminalIndexOf(id);
+      const shell = parseTerminalTabId(id);
+      if (shell) {
         const term = BUILTIN_PANES.find((p) => p.id === "terminal")!;
-        return { title: idx === 0 ? term.title : `${term.title} ${idx + 1}`, icon: term.icon };
+        const session = sessionById.get(shell.sessionId);
+        return {
+          title: `${session?.title ?? term.title} · ${shell.index + 1}`,
+          icon: term.icon,
+          badge: session?.is_sandboxed
+            ? shellModeFor(shell.sessionId, shell.index) === "container"
+              ? "ctr"
+              : "host"
+            : undefined,
+        };
       }
       const d = BUILTIN_PANES.find((p) => p.id === id)!;
       return { title: d.title, icon: d.icon };
     },
-    [pluginPaneById, pluginIdentityById],
+    [pluginPaneById, pluginIdentityById, sessionById, shellModeFor],
   );
 
   const renderGroups = useCallback(
@@ -804,17 +902,12 @@ function AppContent({
     }),
     [rightGroups, bottomGroups],
   );
-  const terminalOpen = (["right", "bottom"] as DockLocation[]).some(
-    (d) => !isDockCollapsed(paneLayout, d) && dockTabs(paneLayout, d).some(isTerminalTabId),
-  );
+  const terminalOpen =
+    !!activeSessionId &&
+    sessionTerminals(paneLayout, activeSessionId).some(({ dock }) => !isDockCollapsed(paneLayout, dock));
 
-  // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
-  // individual tabs; the strip's +/x manage terminal instances.
-  const isPaneOpen = (kind: string): boolean => {
-    if (kind === "terminal") return terminalOpen;
-    const dock = dockOf(paneLayout, kind);
-    return dock !== null && !isDockCollapsed(paneLayout, dock);
-  };
+  // Header toggles act on pane KINDS (diff, terminal, each plugin), not individual tabs; the strip's +/x
+  // manage terminal instances.
   const togglePaneAny = useCallback(
     (kind: string) => {
       if (kind === "files") reportFeatureUse("files_pane");
@@ -846,19 +939,17 @@ function AppContent({
       // Closing an extra terminal tab kills its tmux shell so it does not leak;
       // terminal 0 (shared with the native TUI) only hides. Diff/plugin tabs
       // have no backend shell to reap.
-      if (isTerminalTabId(id)) {
-        const idx = terminalIndexOf(id);
-        if (idx >= 1) {
-          // Remove the tab only once the shell is actually killed; if the
-          // DELETE fails, keep the tab so the user can retry instead of
-          // silently leaking the shell with no way to close it.
-          if (activeSessionId) closeTab(id, () => killTerminal(activeSessionId, idx));
-          return;
-        }
+      const shell = parseTerminalTabId(id);
+      if (shell && shell.index >= 1) {
+        // Remove the tab only once the shell is actually killed; if the
+        // DELETE fails, keep the tab so the user can retry instead of
+        // silently leaking the shell with no way to close it.
+        closeTab(id, () => killTerminal(shell.sessionId, shell.index));
+        return;
       }
       closeTab(id);
     },
-    [closeTab, activeSessionId],
+    [closeTab],
   );
   const movePaneAny = useCallback((id: string, dock: DockLocation) => moveTab(id, dock), [moveTab]);
   // The dnd controller works in visible-tab space; map a drop index back to the
@@ -883,22 +974,21 @@ function AppContent({
   // pane shows one of agent / diff / paired, chosen via the picker (#1452).
   const isMdUp = useIsWideViewport();
   const singlePane = !isMdUp;
+  // Between md and the inline threshold the right dock overlays the main area as a sheet.
+  const rightDockSheet = useMediaQuery(SHEET_MEDIA_QUERY, true);
+  const rightSheetOpen = rightDockSheet && !rightDockCollapsed;
+  // Not persisted: a reload shows the agent again.
+  const [rightMaximized, setRightMaximized] = useState(false);
   const [rightPanelView, setRightPanelView] = useState<RightPanelView>("agent");
   const [pickerOpen, setPickerOpen] = useState(false);
-  // Reading mode for the phone conversation view: the top bar folds away so the
-  // transcript gets its 48px back (the composer has its own, independent
-  // handle inside StructuredView). Kept here rather than in the structured view
-  // because the top bar is the App shell's own child. State is App-level, so it
-  // survives switching sessions; the collapse only *applies* on the mobile
-  // conversation view, so leaving it on and navigating to settings or the
-  // dashboard shows the bar again.
-  const [headerCollapsed, setHeaderCollapsed] = useState(false);
   // The paired shell mounts lazily on first activation, then stays mounted
   // (kept alive but hidden) so its PTY, scrollback, and focus survive view
   // switches. Mounting it eagerly would spawn a shell for every mobile
   // session the user never opens the shell on.
   const [pairedMounted, setPairedMounted] = useState(false);
-  const { modeFor: shellModeFor, setMode: setShellMode } = usePairedShellModes();
+  // The shell the mobile paired view shows; null is the active Session's primary shell.
+  const [mobileShell, setMobileShell] = useState<TerminalRef | null>(null);
+  const [terminalSwitcherOpen, setTerminalSwitcherOpen] = useState(false);
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const tipsAutoPoppedRef = useRef(false);
@@ -947,27 +1037,51 @@ function AppContent({
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
   const focusSession = useFocusSession(focusSessionId, activeSession, openedSessionSettled);
-  const allPaneIds: string[] = [
-    // CityHall client mode hides the code-inspection panes (diff, files) and
-    // the terminal (plus plugin panes below) so only the composer + structured
-    // view remain. See #7.
-    ...(caps.canUseDiff ? ["diff", "files"] : []),
-    ...(caps.canUseTerminal ? ["terminal"] : []),
-    // The background-agents panel only applies to structured-view (ACP)
-    // sessions; a plain terminal session never launches sub-agents.
-    ...(activeSession?.view === "structured" ? ["agents"] : []),
-    ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
-  ];
-  // The mobile picker/single-pane view reuses this exact list (minus
-  // "terminal", desktop's multi-instance extra-terminal dock, which has no
-  // single-pane mobile equivalent) so its available views can't drift from
-  // desktop's capability/session gating the way the sub-agents and Files
-  // panes previously did.
-  const mobilePaneIds = allPaneIds.filter((id) => id !== "terminal");
+  const view = activeSession?.view;
+  // The panes beside the agent: the right dock's review panes in its tab order, then plugin panes. The mobile
+  // picker lists the same ones, so its views can't drift from desktop's capability and session gating.
+  const dockPaneIds = useMemo(
+    () => [
+      // CityHall client mode hides the code-inspection panes (diff, files), the terminal and plugin panes, so
+      // only the composer and structured view remain. See #7.
+      ...(caps.canUseDiff ? ["diff", "files"] : []),
+      // Only structured-view (ACP) sessions launch sub-agents.
+      ...(view === "structured" ? ["agents"] : []),
+      ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
+    ],
+    [caps.canUseDiff, caps.cityhall, view, pluginPanes],
+  );
+  // On desktop the header toggles the terminal and the review panel; the panel's menu opens each of its panes,
+  // so plugin panes add a menu entry rather than header width.
+  const paneMenu = useMemo(
+    () => ({
+      paneIds: dockPaneIds,
+      descriptorFor: paneDescriptor,
+      openIds: dockPaneIds.filter((id) => {
+        const dock = dockOf(paneLayout, id);
+        return dock !== null && !isDockCollapsed(paneLayout, dock);
+      }),
+      onTogglePane: togglePaneAny,
+    }),
+    [dockPaneIds, paneDescriptor, paneLayout, togglePaneAny],
+  );
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
   const diffPanelActive = isMdUp ? dockOf(paneLayout, "diff") !== null : rightPanelView === "diff";
+  // The comparison picked for each Session in this browser.
+  const [pickedDiffScopes, setPickedDiffScopes] = useState<Record<string, DiffScope>>({});
+  const requestedDiffScope: DiffScope = activeSessionId
+    ? (pickedDiffScopes[activeSessionId] ?? loadDiffScope(activeSessionId))
+    : "branch";
+  const pickDiffScope = useCallback(
+    (scope: DiffScope) => {
+      if (!activeSessionId) return;
+      saveDiffScope(activeSessionId, scope);
+      setPickedDiffScopes((m) => ({ ...m, [activeSessionId]: scope }));
+    },
+    [activeSessionId],
+  );
   const {
     files: diffFiles,
     perRepoBases,
@@ -975,9 +1089,20 @@ function AppContent({
     loading: diffFilesLoading,
     revision,
     refresh: refreshDiffFiles,
-  } = useDiffFiles(activeSessionId, diffPanelActive);
-  // Fetched once per Session even while Diff is closed, so the count is as of opening it.
-  const diffBadge = useCallback((id: string) => (id === "diff" ? diffFiles.length : 0), [diffFiles]);
+    scope: diffScope,
+  } = useDiffFiles(activeSessionId, diffPanelActive, requestedDiffScope);
+  const diffScopeState = useMemo<DiffScopeState>(
+    () => ({ scope: diffScope, onChange: pickDiffScope }),
+    [diffScope, pickDiffScope],
+  );
+  // Dock tabs name a count beside the label, as Conductor's `Changes 74` does.
+  const dockDescriptor = useCallback(
+    (id: string): PaneDisplay => {
+      const desc = paneDescriptor(id);
+      return id === "diff" && diffFiles.length > 0 ? { ...desc, badge: String(diffFiles.length) } : desc;
+    },
+    [paneDescriptor, diffFiles.length],
+  );
 
   // Diff-viewer comments (#928). Session-scoped. The
   // banner lives in the diff pane while the inline UI lives inside
@@ -1039,6 +1164,8 @@ function AppContent({
     setRightPanelView("agent");
     setPickerOpen(false);
     setPairedMounted(false);
+    setMobileShell(null);
+    setRightMaximized(false);
     setSelectedFile(null);
   }
 
@@ -1061,7 +1188,7 @@ function AppContent({
   // Mirrors the paired guard above; render-phase derivation per the block at
   // the top.
   const isGatedBuiltinView = rightPanelView === "diff" || rightPanelView === "files" || rightPanelView === "agents";
-  if ((isGatedBuiltinView || isPluginPaneId(rightPanelView)) && !mobilePaneIds.includes(rightPanelView)) {
+  if ((isGatedBuiltinView || isPluginPaneId(rightPanelView)) && !dockPaneIds.includes(rightPanelView)) {
     setRightPanelView("agent");
   }
 
@@ -1718,13 +1845,6 @@ function AppContent({
 
   // The right-panel control toggles the desktop split, but on mobile there
   // is no split to collapse: it opens the view picker instead (#1452).
-  const toggleDiff = useCallback(() => {
-    if (isMdUp) {
-      toggleKind("diff", "right");
-    } else {
-      setPickerOpen((o) => !o);
-    }
-  }, [isMdUp, toggleKind]);
 
   // Collapse or restore the whole right dock (the "toggle right panel"
   // shortcut). Collapse hides the dock without removing its tabs so expanding
@@ -1736,14 +1856,12 @@ function AppContent({
     }
     if (rightDockCollapsed) {
       setDockCollapsed("right", false);
-      if (availableRightGroups.length === 0) {
-        openTab("diff", "right");
-        openTab(terminalTabId(0), "right");
-      }
+      const first = emptyPanelPane(dockPaneIds);
+      if (availableRightGroups.length === 0 && first) openTab(first, "right");
     } else {
       setDockCollapsed("right", true);
     }
-  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab]);
+  }, [isMdUp, rightDockCollapsed, setDockCollapsed, availableRightGroups.length, openTab, dockPaneIds]);
 
   const handlePickView = useCallback(
     (view: RightPanelView) => {
@@ -1751,16 +1869,30 @@ function AppContent({
       if (view === "files") reportFeatureUse("files_pane");
       if (view === "agents") reportFeatureUse("agents_pane");
       transitionKeyboardProxy(activeSessionId, view);
+      // The picker's Paired terminal entry is the active Session's primary shell.
+      if (view === "paired") setMobileShell(null);
       setRightPanelView(view);
       setPickerOpen(false);
     },
     [activeSessionId, rightPanelView, transitionKeyboardProxy],
   );
 
-  const handleSelectFile = useCallback((path: string, repoName?: string, line?: number) => {
-    if (!confirmFileEditPanes([null])) return;
-    setSelectedFile({ path, repoName, line });
-  }, []);
+  // On a phone the Diff tab toggles with the Agent.
+  const toggleDiff = useCallback(() => {
+    if (isMdUp) toggleKind("diff", "right");
+    else handlePickView(rightPanelView === "diff" ? "agent" : "diff");
+  }, [isMdUp, toggleKind, handlePickView, rightPanelView]);
+
+  const handleSelectFile = useCallback(
+    (path: string, repoName?: string, line?: number) => {
+      if (!confirmFileEditPanes([null])) return;
+      setSelectedFile({ path, repoName, line });
+      // The file opens in the main area: a sheet over it closes and a maximized dock makes room.
+      setRightMaximized(false);
+      if (rightDockSheet) setDockCollapsed("right", true);
+    },
+    [rightDockSheet, setDockCollapsed],
+  );
 
   // Open a local file reference cited in an acp transcript (Codex
   // `path:line` markdown links). Resolve the absolute path back to a
@@ -1857,20 +1989,77 @@ function AppContent({
   const closePicker = useCallback(() => setPickerOpen(false), []);
   const handleDrawerSwipe = useCallback(
     (action: DrawerSwipeAction) => {
+      // On a phone page a right swipe opens the session drawer and a left swipe the header's ⋯.
+      const phonePage = !focusMode && !fullPageView;
       if (action === "open-sidebar" || action === "close-sidebar") {
-        if (!focusMode) setSidebarOpen(action === "open-sidebar");
-      } else setPickerOpen(action === "open-panels");
+        if (phonePage) setSidebarOpen(action === "open-sidebar");
+      } else if (action === "open-panels") {
+        if (phonePage) window.dispatchEvent(new Event(OPEN_HEADER_MENU_EVENT));
+      } else setPickerOpen(false);
     },
-    [focusMode],
+    [focusMode, fullPageView],
   );
+  // The Session card a phone's drawer pushes aside, and the dim over it.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const scrimRef = useRef<HTMLButtonElement>(null);
+  // Follows a drawer swipe with the finger: inline styles, so a frame costs no render. `null` hands back to the
+  // classes, which then animate from wherever the finger let go.
+  const trackDrawerDrag = useCallback((dx: number | null, open: boolean) => {
+    const card = cardRef.current;
+    const scrim = scrimRef.current;
+    const drawer = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
+    if (!card) return;
+    const styled = [card.style, scrim?.style, drawer?.style];
+    if (dx === null) {
+      for (const st of styled) st?.removeProperty("transition");
+      card.style.removeProperty("translate");
+      card.style.removeProperty("border-radius");
+      card.style.removeProperty("box-shadow");
+      scrim?.style.removeProperty("opacity");
+      scrim?.style.removeProperty("visibility");
+      drawer?.style.removeProperty("visibility");
+      return;
+    }
+    const width = drawer?.getBoundingClientRect().width || window.innerWidth * 0.85;
+    const offset = Math.min(width, Math.max(0, (open ? width : 0) + dx));
+    for (const st of styled) st?.setProperty("transition", "none");
+    card.style.translate = `${offset}px 0`;
+    card.style.borderRadius = "28px";
+    card.style.boxShadow = "var(--drawer-card-shadow)";
+    drawer?.style.setProperty("visibility", "visible");
+    if (scrim) {
+      scrim.style.visibility = "visible";
+      scrim.style.opacity = String(offset / width);
+    }
+  }, []);
+  // iOS pans the page when the keyboard opens, carrying fixed chrome off the top; the phone header and the strip
+  // under the clock follow the visible viewport instead.
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const root = document.documentElement;
+    const sync = () => root.style.setProperty("--vv-offset-top", `${Math.max(0, vv.offsetTop)}px`);
+    sync();
+    vv.addEventListener("resize", sync);
+    vv.addEventListener("scroll", sync);
+    return () => {
+      vv.removeEventListener("resize", sync);
+      vv.removeEventListener("scroll", sync);
+      root.style.removeProperty("--vv-offset-top");
+    };
+  }, []);
+
+  const phoneDrawerTracking = singlePane && !fullPageView && !focusMode;
   useDrawerSwipe(
     {
       sidebarOpen,
-      sidebarSide: webSettings.sidebarSide,
       panelsOpen: pickerOpen,
-      panelsAvailable: !!activeWorkspace && !!activeSession,
+      // A left swipe opens the header's ⋯, which holds More panes and the rest.
+      panelsAvailable: phoneDrawerTracking,
     },
     handleDrawerSwipe,
+    // Only a phone's session drawer, which the page card covers, follows the finger.
+    phoneDrawerTracking ? trackDrawerDrag : undefined,
   );
 
   // Read-only mode hides mutation UI. Guard creation at the handler so every
@@ -1893,20 +2082,69 @@ function AppContent({
     setShowSessionWizard(true);
   }, []);
 
-  const showPairedTerminal = usePairedTerminalReveal({
+  const showMobileShell = useCallback((shell: TerminalRef) => {
+    setMobileShell(shell);
+    setRightPanelView("paired");
+  }, []);
+  const { revealActive: showPairedTerminal, revealShell } = usePairedTerminalReveal({
     singlePane,
+    activeSessionId,
     layout: paneLayout,
     openTab,
     activateTab,
-    setRightPanelView,
+    showMobileShell,
   });
 
   // PairedTerminal shows Host whatever the stored mode while the Session isn't sandboxed.
   const shownShellMode = useCallback(
     (sessionId: string, terminalIndex: number) =>
-      activeSession?.is_sandboxed ? shellModeFor(sessionId, terminalIndex) : "host",
-    [activeSession?.is_sandboxed, shellModeFor],
+      effectiveShellMode(sessionById.get(sessionId), shellModeFor(sessionId, terminalIndex)),
+    [sessionById, shellModeFor],
   );
+  const mobileShellShown = useMemo<TerminalRef | null>(
+    () => mobileShell ?? (activeSessionId ? { sessionId: activeSessionId, index: 0 } : null),
+    [mobileShell, activeSessionId],
+  );
+  const shownShells = useMemo(() => {
+    if (singlePane) return rightPanelView === "paired" && mobileShellShown ? [mobileShellShown] : [];
+    return terminalPlacements(paneLayout).flatMap((t) => {
+      const shell = parseTerminalTabId(t.id);
+      return shell && tabAvailable(t.id) ? [shell] : [];
+    });
+  }, [singlePane, rightPanelView, mobileShellShown, paneLayout, tabAvailable]);
+  const shellGroups = useMemo(
+    () =>
+      pairedShellGroups(
+        sessions,
+        shownShells,
+        (session, index) => effectiveShellMode(session, shellModeFor(session.id, index)),
+        activeSessionId,
+      ),
+    [sessions, shownShells, shellModeFor, activeSessionId],
+  );
+  const pickShell = useCallback(
+    (shell: PairedShell) =>
+      revealShell(shell, () => {
+        const remounts = shownShellMode(shell.sessionId, shell.index) !== shell.mode;
+        setShellMode(shell.sessionId, shell.index, shell.mode);
+        return remounts;
+      }),
+    [revealShell, shownShellMode, setShellMode],
+  );
+  // A new shell skips the indices the Daemon sees alive, which another browser may have opened.
+  const newTerminal = useCallback(
+    (dock?: DockLocation) =>
+      addTerminal(
+        dock ?? terminalPlacements(paneLayout)[0]?.dock ?? TERMINAL_DOCK,
+        Math.max(0, ...liveShellIndices(activeSession)) + 1,
+      ),
+    [addTerminal, paneLayout, activeSession],
+  );
+  const canOpenTerminals = caps.canUseTerminal && !!activeSession;
+  const newTerminalFor = caps.readOnly || !activeSession ? undefined : activeSession.title;
+  const toggleTerminalSwitcher = useCallback(() => {
+    if (canOpenTerminals) setTerminalSwitcherOpen((o) => !o);
+  }, [canOpenTerminals]);
   const handleOpenPairedTerminal = useOpenPairedTerminal(
     activeSessionId,
     showPairedTerminal,
@@ -1946,17 +2184,15 @@ function AppContent({
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
     }
-    if (target === "agent" && selectedFilePath) {
-      // Agent terminal is hidden under the diff viewer; close the diff first
-      // so the wrapper un-hides, then dispatch on the next frame because
-      // focus() on a display:none element is a no-op.
-      if (!confirmFileEditPanes([null])) return;
-      setSelectedFile(null);
+    if (target === "agent" && fileShown) {
+      // The agent is hidden behind the file tab; switch to the Agent tab, keeping the file open,
+      // then dispatch on the next frame because focus() on a display:none element is a no-op.
+      setAgentTabFor(selectedFile);
       requestAnimationFrame(() => dispatchFocusTerminal("agent"));
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, selectedFilePath, showPairedTerminal]);
+  }, [activeSessionId, singlePane, fileShown, selectedFile, showPairedTerminal]);
 
   // Flattened, display-ordered session ids plus the subset needing attention,
   // sourced from the same sidebar model the user sees so jump-to-next follows
@@ -1971,12 +2207,15 @@ function AppContent({
 
   const handleFocusSidebar = useCallback(() => {
     setSidebarOpen(true);
-    requestAnimationFrame(() => {
-      const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
-      const activeRow = sidebar?.querySelector<HTMLElement>("[data-active-session-row]");
-      const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
-      target?.focus();
-    });
+    // Two frames: a phone's drawer is hidden, and so unfocusable, until the opening render commits.
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        const sidebar = document.querySelector<HTMLElement>('[role="navigation"][aria-label="Sessions sidebar"]');
+        const activeRow = sidebar?.querySelector<HTMLElement>("[data-active-session-row]");
+        const target = activeRow && activeRow.getClientRects().length > 0 ? activeRow : sidebar;
+        target?.focus();
+      }),
+    );
   }, []);
 
   useKeyboardShortcuts(
@@ -2008,6 +2247,11 @@ function AppContent({
             setPaletteQuery("");
             return;
           }
+          // Only when the sheet is on top: Escape over Help, Settings or another dialog closes that first.
+          if (rightSheetOpen && !showHelp && !showSessionWizard && !showSettings && !showAbout) {
+            setDockCollapsed("right", true);
+            return;
+          }
           setShowSessionWizard(false);
           setShowHelp(false);
           // Settings dialogs handle Escape after this capture-phase shortcut.
@@ -2024,17 +2268,24 @@ function AppContent({
         onToggleSidebar: focusMode ? noop : () => setSidebarOpen((o) => !o),
         onToggleRightPanel: () => toggleRightDock(),
         onToggleTerminalFocus: handleToggleTerminalFocus,
+        onSwitchTerminal: toggleTerminalSwitcher,
       }),
       [
         toggleDiff,
         toggleRightDock,
         showPalette,
+        rightSheetOpen,
+        showHelp,
+        showSessionWizard,
+        showAbout,
+        setDockCollapsed,
         deletingSessions,
         stoppingSessionId,
         showSettings,
         handleCloseSettings,
         handleOpenSettings,
         handleToggleTerminalFocus,
+        toggleTerminalSwitcher,
         handleNewSession,
         handleNewScratch,
         handleJumpToAttention,
@@ -2073,6 +2324,82 @@ function AppContent({
     },
     [applySession, handleRestoreSession],
   );
+
+  // A phone keeps the Session's other views in the header's ⋯, as Claude's app does: the agent fills the screen,
+  // and the views it is reviewed with are a tap away. TopBar builds the items, since a pick switches views.
+  const phoneViews = useMemo(() => {
+    if (!singlePane || !activeSession) return undefined;
+    const choices: PhoneViewChoice[] = [{ id: "agent", label: "Agent", icon: Sparkles }];
+    if (caps.canUseTerminal) choices.push({ id: "paired", label: "Terminal", icon: SquareTerminal });
+    if (dockPaneIds.includes("diff")) choices.push({ id: "diff", label: "Diff", icon: FileDiff });
+    if (dockPaneIds.includes("files")) choices.push({ id: "files", label: "Files", icon: FolderTree });
+    const hasMore =
+      dockPaneIds.some((id) => id !== "diff" && id !== "files") || (caps.canUseTerminal && shellGroups.length > 0);
+    const current = choices.find((c) => c.id === rightPanelView);
+    return {
+      choices,
+      current: rightPanelView,
+      // The pill names any view but the agent; More's entry names one picked from it.
+      label: rightPanelView === "agent" ? undefined : (current?.label ?? paneDescriptor(rightPanelView).title),
+      moreDetail: hasMore && !current ? paneDescriptor(rightPanelView).title : undefined,
+      hasMore,
+    };
+  }, [singlePane, activeSession, caps.canUseTerminal, dockPaneIds, shellGroups.length, rightPanelView, paneDescriptor]);
+  // The open Session's actions, a phone's only way to them; desktop keeps the sidebar row's menu.
+  // The open Session's full menu, the one a long press on its row opens, from a phone's title pill. Kept mounted after
+  // it closes so a picker it opened, such as Rename, can finish.
+  const [titleMenu, setTitleMenu] = useState<SessionMenuRequest | null>(null);
+  const renderSessionMenu = (request: SessionMenuRequest) => (
+    <PluginSessionMenu
+      request={request}
+      workspaces={workspaces}
+      readOnly={caps.readOnly}
+      observedById={observedById}
+      runtimeEpoch={runtimeEpoch}
+      handlers={{
+        onSessionMutation: applySessionMutation,
+        onDelete: handleDeleteSession,
+        onStop: handleStopSession,
+        onStart: handleStartSession,
+        onSwitchView: handleSwitchView,
+        onCreateSession: handleCreateSession,
+      }}
+    />
+  );
+  const phoneSessionItems = useMemo<OverflowItem[] | undefined>(() => {
+    if (!singlePane || !activeSession) return undefined;
+    const s = activeSession;
+    const items: OverflowItem[] = [];
+    if (caps.readOnly) return undefined;
+    if (s.branch) {
+      const branch = s.branch;
+      items.push({
+        label: "Copy branch",
+        detail: branch,
+        icon: Copy,
+        onClick: () =>
+          void writeClipboard(branch).then((ok) => (ok ? reportInfo("Branch copied") : reportError("Couldn't copy"))),
+      });
+    }
+    items.push(
+      s.pinned_at != null
+        ? { label: "Unpin", icon: PinOff, onClick: () => void handleSessionStateAction(s.id, "unpin") }
+        : { label: "Pin", icon: Pin, onClick: () => void handleSessionStateAction(s.id, "pin") },
+      s.snoozed_until != null
+        ? { label: "Unsnooze", icon: AlarmClockOff, onClick: () => void handleSessionStateAction(s.id, "unsnooze") }
+        : { label: "Snooze…", icon: AlarmClock, onClick: () => void handleSessionStateAction(s.id, "snooze") },
+      s.archived_at != null
+        ? { label: "Unarchive", icon: ArchiveRestore, onClick: () => void handleSessionStateAction(s.id, "unarchive") }
+        : { label: "Archive", icon: Archive, onClick: () => void handleSessionStateAction(s.id, "archive") },
+    );
+    if (sessionActionEligible("stop", s)) {
+      items.push({ label: "Stop", icon: Square, onClick: () => handleStopSession(s.id) });
+    }
+    if (!s.trashed_at) {
+      items.push({ label: "Move to Trash", icon: Trash2, onClick: () => void handleSessionStateAction(s.id, "trash") });
+    }
+    return items;
+  }, [singlePane, activeSession, caps.readOnly, handleSessionStateAction, handleStopSession]);
 
   const commandActions = useCommandActions({
     sessions,
@@ -2136,6 +2463,19 @@ function AppContent({
     // Render a pane body by id. Passed to the docks as a callback (rather than
     // building an array of {icon, body} objects here) so the per-session JSX is
     // constructed inside the dock, not threaded through a prop object.
+    // A sandboxed Session's shell switches Host or Container from its dock's strip.
+    const shellModeActions = (id: string): ReactNode => {
+      const shell = parseTerminalTabId(id);
+      const session = shell && sessionById.get(shell.sessionId);
+      if (!shell || !session?.is_sandboxed) return null;
+      return (
+        <ShellModeToggle
+          mode={shellModeFor(shell.sessionId, shell.index)}
+          onModeChange={(mode) => setShellMode(shell.sessionId, shell.index, mode)}
+          label={`${session.title} ${shellLabel(shell.index).toLowerCase()}`}
+        />
+      );
+    };
     const renderPaneBody = (id: string): ReactNode => {
       const plugin = pluginPaneById.get(id);
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
@@ -2182,30 +2522,57 @@ function AppContent({
           />
         );
       }
-      const terminalIndex = isTerminalTabId(id) ? terminalIndexOf(id) : 0;
+      const shell = parseTerminalTabId(id);
       return (
         <PairedShellPane
           readOnly={caps.readOnly}
-          session={activeSession ?? null}
-          sessionId={activeSessionId}
-          terminalIndex={terminalIndex}
-          mode={shellModeFor(activeSessionId, terminalIndex)}
-          onModeChange={(mode) => activeSessionId && setShellMode(activeSessionId, terminalIndex, mode)}
+          session={(shell && sessionById.get(shell.sessionId)) ?? null}
+          terminalIndex={shell?.index ?? 0}
+          mode={shell ? shellModeFor(shell.sessionId, shell.index) : "host"}
         />
       );
     };
+    const dockControls = (dock: DockLocation): DockControls => ({
+      onNewTerminal: newTerminalFor === undefined ? undefined : () => newTerminal(dock),
+      newTerminalLabel: newTerminalFor === undefined ? undefined : `New terminal for ${newTerminalFor}`,
+      tabActions: shellModeActions,
+      terminalSwitcher: canOpenTerminals ? (
+        <TerminalSwitcherButton
+          groups={shellGroups}
+          newTerminalFor={newTerminalFor}
+          onPick={pickShell}
+          onNew={() => newTerminal(dock)}
+        />
+      ) : undefined,
+    });
     return (
       <div className="flex-1 flex flex-col min-h-0">
-        <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
+        <PaneDndController groupsByDock={groupsByDock} descriptorFor={dockDescriptor} onPlaceTab={placeVisibleTab}>
           <ContentSplit
             collapsed={rightDockCollapsed}
             onToggleCollapse={toggleRightDock}
+            sheet={rightDockSheet}
+            maximized={rightMaximized}
             left={
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
-                <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
+                {selectedFilePath && (
+                  <MainViewTabs
+                    filePath={selectedFilePath}
+                    fileShown={fileShown}
+                    onShowAgent={() => setAgentTabFor(selectedFile)}
+                    onShowFile={() => setAgentTabFor(null)}
+                    onCloseFile={handleCloseFile}
+                  />
+                )}
+                <div
+                  className={fileShown ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}
+                  {...(selectedFilePath
+                    ? { id: MAIN_VIEW_IDS.agentPanel, role: "tabpanel", "aria-labelledby": MAIN_VIEW_IDS.agentTab }
+                    : {})}
+                >
                   {activeSession?.view === "structured" ? (
                     <StructuredSessionStack
-                      active={!selectedFilePath}
+                      active={!fileShown}
                       activeSessionId={activeSessionId!}
                       sessions={sessions.filter((session) => session.view === "structured")}
                       persistent={webSettings.persistentStructuredViews}
@@ -2266,27 +2633,35 @@ function AppContent({
                   )}
                 </div>
 
-                {selectedFilePath &&
-                  activeSessionId &&
-                  (selectedFileExternal ? (
-                    <FileContentViewer
-                      structured={activeSession?.view === "structured"}
-                      sessionId={activeSessionId}
-                      filePath={selectedFilePath}
-                      onBack={handleCloseFile}
-                    />
-                  ) : (
-                    <DiffFileViewer
-                      sessionId={activeSessionId}
-                      filePath={selectedFilePath}
-                      repoName={selectedRepoName}
-                      targetLine={selectedFileLine}
-                      revision={revision}
-                      onClose={handleCloseFile}
-                      commentsEnabled={commentsEnabled}
-                      commentsStore={diffComments}
-                    />
-                  ))}
+                {selectedFilePath && activeSessionId && (
+                  // Kept mounted behind the Agent tab, so the file keeps its scroll, comments and draft.
+                  <div
+                    id={MAIN_VIEW_IDS.filePanel}
+                    role="tabpanel"
+                    aria-labelledby={MAIN_VIEW_IDS.fileTab}
+                    className={fileShown ? "flex-1 flex flex-col min-h-0 overflow-hidden" : "hidden"}
+                  >
+                    {selectedFileExternal ? (
+                      <FileContentViewer
+                        structured={activeSession?.view === "structured"}
+                        sessionId={activeSessionId}
+                        filePath={selectedFilePath}
+                        onBack={handleCloseFile}
+                      />
+                    ) : (
+                      <DiffFileViewer
+                        sessionId={activeSessionId}
+                        filePath={selectedFilePath}
+                        repoName={selectedRepoName}
+                        targetLine={selectedFileLine}
+                        revision={revision}
+                        onClose={handleCloseFile}
+                        commentsEnabled={commentsEnabled}
+                        commentsStore={diffComments}
+                      />
+                    )}
+                  </div>
+                )}
               </div>
             }
             right={
@@ -2294,12 +2669,17 @@ function AppContent({
                 <DockGroups
                   location="right"
                   groups={rightGroups}
-                  descriptorFor={paneDescriptor}
+                  descriptorFor={dockDescriptor}
                   renderBody={renderPaneBody}
                   onActivate={(id) => activateTab("right", id)}
                   onMove={movePaneAny}
                   onClose={closePaneAny}
-                  onNewTerminal={caps.readOnly ? undefined : () => addTerminal("right")}
+                  {...dockControls("right")}
+                  maximize={
+                    rightDockSheet
+                      ? undefined
+                      : { maximized: rightMaximized, onToggle: () => setRightMaximized((m) => !m) }
+                  }
                 />
               </div>
             }
@@ -2307,12 +2687,12 @@ function AppContent({
           {bottomGroups.length > 0 && (
             <BottomDock
               groups={bottomGroups}
-              descriptorFor={paneDescriptor}
+              descriptorFor={dockDescriptor}
               renderBody={renderPaneBody}
               onActivate={(id) => activateTab("bottom", id)}
               onMove={movePaneAny}
               onClose={closePaneAny}
-              onNewTerminal={caps.readOnly ? undefined : () => addTerminal("bottom")}
+              {...dockControls("bottom")}
             />
           )}
         </PaneDndController>
@@ -2368,30 +2748,46 @@ function AppContent({
             if (openedSessionUnread) return { title: "", view: <TrashReadFailed onRetry={loadTrash} /> };
             return activeSession ? { title: activeSession.title, view: renderSessionLayout() } : null;
           }}
-          renderSessionMenu={(request) => (
-            <PluginSessionMenu
-              request={request}
-              workspaces={workspaces}
-              readOnly={caps.readOnly}
-              observedById={observedById}
-              runtimeEpoch={runtimeEpoch}
-              handlers={{
-                onSessionMutation: applySessionMutation,
-                onDelete: handleDeleteSession,
-                onStop: handleStopSession,
-                onStart: handleStartSession,
-                onRestartForUpdate: restartForUpdate,
-                onSwitchView: handleSwitchView,
-                onCreateSession: handleCreateSession,
-              }}
-            />
-          )}
+          renderSessionMenu={renderSessionMenu}
         />
+      );
+    }
+    if (suggestionsMatch) {
+      return (
+        <div className="flex-1 min-h-0 flex flex-col">
+          <div className="px-4 pt-3 md:px-8">
+            <button onClick={handleClosePluginPage} className="text-brand-500 cursor-pointer text-sm">
+              &larr; Back
+            </button>
+          </div>
+          <SuggestionsView
+            readOnly={caps.readOnly || !caps.canManageSuggestions}
+            cityhall={caps.cityhall}
+            onOpenMarketplace={
+              caps.canManageProjects ? () => requestNavigate("/settings/plugins?marketplace=suggestions") : undefined
+            }
+            initialDismissed={searchParams.get("dismissed") === "1"}
+            onPrepare={(prefill) => {
+              setWizardPrefill(prefill);
+              setShowSessionWizard(true);
+            }}
+            onOpenSession={(id) => requestNavigate(`/session/${encodeURIComponent(id)}`)}
+            onOpenSettings={caps.canManageSuggestions ? () => requestNavigate("/settings/suggestions") : undefined}
+            sessions={sessions}
+            canLink={!caps.nameOnlyWizard}
+            onEditPreset={(providerId, criterion) =>
+              requestNavigate(
+                `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
+              )
+            }
+          />
+        </div>
       );
     }
     if (showSettings) {
       return (
         <SettingsView
+          banner={singlePane ? bannerStack : undefined}
           tab={settingsTab}
           onClose={handleCloseSettings}
           onSelectTab={(t) => {
@@ -2414,6 +2810,16 @@ function AppContent({
             await refreshProjects();
           }}
           profile={searchParams.get("profile")}
+          onOpenSuggestions={(dismissed) => navigate(dismissed ? "/suggestions?dismissed=1" : "/suggestions")}
+          presetFocus={
+            searchParams.get("preset_provider") && searchParams.get("preset_criterion")
+              ? {
+                  providerId: searchParams.get("preset_provider")!,
+                  criterion: searchParams.get("preset_criterion")!,
+                  returnToSuggestions: searchParams.get("from") === "suggestions",
+                }
+              : undefined
+          }
           field={searchParams.get("field")}
           onSelectProfile={(p) => {
             const next = new URLSearchParams(searchParams);
@@ -2459,19 +2865,26 @@ function AppContent({
           onSelectSession={handleSelectSession}
           onNewSession={handleNewSession}
           onCloneFromUrl={handleCloneFromUrl}
-          onToggleSidebar={handleToggleSidebar}
           readOnly={caps.readOnly}
           canManageProjects={caps.canManageProjects}
-          banner={
-            setupBannerSteps.length > 0 &&
-            setup.status && (
-              <SetupBanner
-                steps={setup.status.steps}
-                open={setupBannerSteps}
-                onDismiss={() => void setup.update({ banner_dismissed: true })}
-              />
-            )
+          banner={setupBanner}
+          canLinkSuggestions={!caps.nameOnlyWizard}
+          canManageSuggestions={caps.canManageSuggestions}
+          onEditSuggestionPreset={
+            caps.canManageSuggestions
+              ? (providerId, criterion) =>
+                  requestNavigate(
+                    `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion, from: "suggestions" })}`,
+                  )
+              : undefined
           }
+          onPrepareSuggestion={(prefill) => {
+            setWizardPrefill(prefill);
+            setShowSessionWizard(true);
+          }}
+          onViewAllSuggestions={() => requestNavigate("/suggestions")}
+          onOpenSuggestionsMarketplace={() => requestNavigate("/settings/plugins?marketplace=suggestions")}
+          tourActive={tour.isTourActive}
         />
       );
     }
@@ -2501,8 +2914,14 @@ function AppContent({
           onOpenTerminal={canSwitchToTerminal ? handleOpenPairedTerminal : undefined}
           canRestartAgent={canRestartAgent}
           newSessionLike={newSessionLike}
-          shellMode={shellModeFor(activeSessionId, 0)}
-          onShellModeChange={(mode) => activeSessionId && setShellMode(activeSessionId, 0, mode)}
+          pairedShell={{
+            session: (mobileShellShown && sessionById.get(mobileShellShown.sessionId)) ?? null,
+            index: mobileShellShown?.index ?? 0,
+          }}
+          shellMode={mobileShellShown ? shellModeFor(mobileShellShown.sessionId, mobileShellShown.index) : "host"}
+          onShellModeChange={(mode) =>
+            mobileShellShown && setShellMode(mobileShellShown.sessionId, mobileShellShown.index, mode)
+          }
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
@@ -2646,6 +3065,28 @@ function AppContent({
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
   });
+  // The symbol legend opens from the app's ⋯, beside whichever ⋯ opened it.
+  const [legend, setLegend] = useState<{ anchor: { x: number; y: number }; opener: HTMLElement | null } | null>(null);
+  const openLegend = useCallback(() => {
+    const opener = findTourAnchor(TOUR_ANCHORS.topbarMore);
+    const r = opener?.getBoundingClientRect();
+    setLegend({ anchor: { x: r ? r.right - 340 : 8, y: r ? r.bottom + 6 : 56 }, opener });
+  }, []);
+  const closeLegend = useCallback(() => setLegend(null), []);
+  const startTour = tour.startTour;
+  const appMenu = useMemo(
+    () =>
+      appMenuItems({
+        onOpenHelp: handleOpenHelp,
+        onOpenLegend: openLegend,
+        onStartTutorial: startTour,
+        onOpenTips: tips.open,
+        onOpenAbout: handleOpenAbout,
+        onLogout,
+        loginRequired,
+      }),
+    [handleOpenHelp, openLegend, startTour, tips.open, handleOpenAbout, onLogout, loginRequired],
+  );
 
   // Auto-pop the tip-of-the-day once per load, after onboarding settles, like
   // GIMP/DBeaver. Gated like the tour: only on a settled dashboard, only when a
@@ -2701,6 +3142,15 @@ function AppContent({
     automated: isAutomatedSession(),
   };
   const setupBannerSteps = bannerSteps(setupViewer);
+  const setupBanner =
+    setupBannerSteps.length > 0 && setup.status ? (
+      <SetupBanner
+        steps={setup.status.steps}
+        open={setupBannerSteps}
+        onDismiss={() => void setup.update({ banner_dismissed: true })}
+      />
+    ) : null;
+
   // On / and /setup, also hold it until setup status answers, so a fresh install never sees the dashboard
   // flash before /setup. Deep links render without it, so a stalled /api/setup can't blank them.
   if (!serverAboutLoaded || (setup.status === undefined && (location.pathname === "/" || setupMatch))) {
@@ -2722,324 +3172,462 @@ function AppContent({
     return <Navigate to="/setup" replace />;
   }
 
-  // The header collapse is a phone affordance for the conversation view only:
-  // at md and up there is room for both the bar and the transcript, and on the
-  // dashboard / settings / diff panes the bar is the only navigation there is.
-  const headerCollapsible =
-    singlePane &&
-    !fullPageView &&
-    !!activeWorkspace &&
-    activeSession?.view === "structured" &&
-    rightPanelView === "agent";
+  // A phone shows one page at a time, the landing page or a Session, with the session list in a drawer that pushes
+  // the page aside as a card, as Muse and Claude's app do.
+  const phoneDrawer = singlePane && !fullPageView && !focusMode;
+  const phoneHome = phoneDrawer && !activeSession;
+  const drawerPushed = phoneDrawer && sidebarOpen;
+  const phonePagesHostBanners = phoneDrawer || (singlePane && showSettings);
+
+  const bannerStack = (
+    <BannerStack
+      onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
+      tourActive={tour.isTourActive}
+    />
+  );
+  const topBar = (
+    <TopBar
+      activeWorkspace={activeWorkspace}
+      activeSession={activeSession ?? null}
+      onToggleSidebar={handleToggleSidebar}
+      onOpenPalette={() => setShowPalette(true)}
+      terminal={caps.canUseTerminal ? { open: terminalOpen, onToggle: () => togglePaneAny("terminal") } : undefined}
+      phoneFloating={singlePane && !fullPageView && !focusMode}
+      page={showSettings && isMdUp ? { title: "Settings", onBack: handleCloseSettings } : undefined}
+      sessionItems={phoneSessionItems}
+      onOpenSessionMenu={
+        singlePane && activeSession
+          ? (x, y) =>
+              setTitleMenu({
+                key: Date.now(),
+                sessionId: activeSession.id,
+                x,
+                y,
+                items: [],
+                source: "",
+                onClose: () => {},
+              })
+          : undefined
+      }
+      appMenu={appMenu}
+      phoneViews={phoneViews && { ...phoneViews, onPick: handlePickView, onMore: () => setPickerOpen(true) }}
+      panels={
+        dockPaneIds.length > 0
+          ? {
+              ...paneMenu,
+              open: !rightDockCollapsed,
+              onToggle: toggleRightDock,
+              badge: caps.canUseDiff ? diffFiles.length : 0,
+            }
+          : undefined
+      }
+      unreadCount={unreadCount}
+      waitingCount={waitingCount}
+      attentionBadgeColors={attentionBadgeColors}
+      isDevBuild={isDebugBuild(serverAbout)}
+      onGoDashboard={handleGoDashboard}
+      onExitFocusMode={focusMode ? exitFocusMode : undefined}
+      sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
+      rightColumnVisible={
+        isMdUp &&
+        !rightDockSheet &&
+        !rightMaximized &&
+        !fullPageView &&
+        !!activeWorkspace &&
+        !!activeSession &&
+        !rightDockCollapsed
+      }
+    />
+  );
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
-      <SessionActionProvider
-        sessions={sessions}
-        runtimeEpoch={runtimeEpoch}
-        observedById={observedById}
-        onSessionMutation={applySessionMutation}
-        readOnly={caps.readOnly}
-        available={!error}
-      >
-        <div className="h-(--app-height) flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-          {/* Wrapped unconditionally, not behind the `headerCollapsible`
-            ternary: swapping the element type at this position would remount
-            `TopBar` (and reset its overflow menu) every time the boundary
-            flips, e.g. opening settings on a phone. An expanded region is a
-            `1fr` grid row around a fixed-height bar, so the wrapper is inert
-            for every view that cannot collapse. */}
-          <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
-            <TopBar
-              activeWorkspace={activeWorkspace}
-              activeSession={activeSession ?? null}
-              onToggleSidebar={handleToggleSidebar}
-              onOpenPalette={() => setShowPalette(true)}
-              onToggleDiff={toggleDiff}
-              paneIds={allPaneIds}
-              paneDescriptor={paneDescriptor}
-              isPaneOpen={isPaneOpen}
-              onTogglePane={togglePaneAny}
-              closedPaneBadge={diffBadge}
-              onOpenHelp={handleOpenHelp}
-              onOpenAbout={handleOpenAbout}
-              onStartTutorial={tour.startTour}
-              unreadCount={unreadCount}
-              waitingCount={waitingCount}
-              attentionBadgeColors={attentionBadgeColors}
-              onLogout={onLogout}
-              loginRequired={loginRequired}
-              isOffline={!!error}
-              isDevBuild={isDebugBuild(serverAbout)}
-              onOpenTips={tips.open}
-              onGoDashboard={handleGoDashboard}
-              onExitFocusMode={focusMode ? exitFocusMode : undefined}
-              sidebarColumnVisible={!focusMode && !fullPageView && sidebarOpen}
-              rightColumnVisible={
-                isMdUp && !fullPageView && !!activeWorkspace && !!activeSession && !rightDockCollapsed
-              }
-            />
-          </CollapsibleRegion>
+      <DiffScopeContext.Provider value={diffScopeState}>
+        <SessionActionProvider
+          sessions={sessions}
+          runtimeEpoch={runtimeEpoch}
+          observedById={observedById}
+          onSessionMutation={applySessionMutation}
+          readOnly={caps.readOnly}
+          available={!error}
+        >
+          <div
+            // The session drawer's colour on a phone: its home, and behind a Session card the drawer pushes aside, so
+            // nothing lighter shows past the card's rounded edge.
+            className={`h-(--app-height) flex flex-col ${phoneDrawer ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
+            // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
+            style={
+              phoneDrawer ? ({ "--phone-header-h": "76px", "--phone-overlay-top": "76px" } as CSSProperties) : undefined
+            }
+          >
+            {phoneDrawer && (
+              // Under the clock, which an installed app draws beneath: the page colour, never content. Fixed and opaque,
+              // so iOS 26 tints the status bar from it rather than blurring; under sheets and dialogs, and following the
+              // visible viewport while the keyboard pans the page.
+              <div
+                className={`md:hidden fixed inset-x-0 top-[var(--vv-offset-top,0px)] z-30 h-[env(safe-area-inset-top)] transition-colors duration-[400ms] [mask-image:linear-gradient(to_bottom,#000_calc(100%-0.375rem),transparent)] ${
+                  drawerPushed || phoneHome ? "bg-surface-950" : "bg-surface-900"
+                }`}
+              />
+            )}
+            {!phoneDrawer && (
+              // A phone's Settings heads its own page; a wide one puts Back and its search in this header.
+              <div className={showSettings ? "max-md:hidden" : undefined}>{topBar}</div>
+            )}
+            {/* A phone's pages host the banners under their own top controls. */}
+            {!phonePagesHostBanners && bannerStack}
+            {focusMode && focusSession.title !== null && !focusSession.gone && (
+              <FocusModeNote title={focusSession.title} />
+            )}
 
-          <BannerStack
-            onRetryServerSettings={serverAbout ? undefined : () => void recoverServerAbout()}
-            tourActive={tour.isTourActive}
-          />
-          {focusMode && focusSession.title !== null && !focusSession.gone && (
-            <FocusModeNote title={focusSession.title} />
-          )}
+            <div className="flex flex-1 min-h-0">
+              {!fullPageView && !focusMode && (
+                <WorkspaceSidebar
+                  drawer={phoneDrawer}
+                  onHome={
+                    phoneDrawer
+                      ? () => {
+                          setSidebarOpen(false);
+                          handleGoDashboard();
+                        }
+                      : undefined
+                  }
+                  menuItems={appMenu}
+                  observedById={observedById}
+                  runtimeEpoch={runtimeEpoch}
+                  onSessionMutation={applySessionMutation}
+                  groups={sidebarGroups}
+                  nestedGroups={nestedGroups}
+                  orgGroups={orgGroups}
+                  trashedWorkspaces={trashedWorkspaces}
+                  trashedCount={trashedCount}
+                  trashLoaded={trashLoaded}
+                  onLoadTrash={loadTrash}
+                  onToggleSubgroup={toggleSubgroupCollapsed}
+                  onToggleOrg={toggleOrgCollapsed}
+                  onToggleOrgRepo={toggleOrgRepoCollapsed}
+                  onReorderWorkspaces={handleReorderWorkspaces}
+                  onReorderGroups={reorderRepoGroups}
+                  activeId={activeWorkspace?.id ?? null}
+                  activeSessionId={activeSessionId}
+                  open={sidebarOpen}
+                  onOpenChange={setSidebarOpen}
+                  onSelect={handleSelectWorkspace}
+                  onToggleGroup={toggleSidebarGroup}
+                  onNew={(prefill) => {
+                    setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
+                    setShowSessionWizard(true);
+                  }}
+                  onCreateSession={handleCreateSession}
+                  onOpenPalette={() => setShowPalette(true)}
+                  onPinProject={projectsReady ? handlePinProject : undefined}
+                  onUnpinProject={projectsReady ? handleUnpinProject : undefined}
+                  onEditProjectSettings={handleEditProjectSettings}
+                  savedProjects={savedProjects}
+                  onAddProject={handleAddProject}
+                  onEditProject={handleEditProject}
+                  onRemoveProject={handleRemoveProject}
+                  onSettings={handleOpenSettings}
+                  onDeleteSession={handleDeleteSession}
+                  onRestoreSession={handleRestoreSession}
+                  onEmptyTrash={handleEmptyTrash}
+                  onRetryTrash={handleRetryTrash}
+                  onStopSession={handleStopSession}
+                  onStartSession={handleStartSession}
+                  onSwitchView={handleSwitchView}
+                  readOnly={caps.readOnly}
+                  canManageProjects={caps.canManageProjects}
+                  sortMode={sidebarSortMode}
+                  onSortModeChange={selectSidebarSortMode}
+                  pluginSortRef={pluginSortRef}
+                  onPluginSortChange={selectPluginSort}
+                  axis={sidebarAxis}
+                  onAxisChange={setSidebarAxis}
+                  suggestions={{
+                    readOnly: caps.readOnly || !caps.canManageSuggestions,
+                    cityhall: caps.cityhall,
+                    onEditPreset: caps.canManageSuggestions
+                      ? (providerId, criterion) =>
+                          requestNavigate(
+                            `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion })}`,
+                          )
+                      : undefined,
+                    onPrepare: (prefill) => {
+                      setWizardPrefill(prefill);
+                      setShowSessionWizard(true);
+                    },
+                    onOpenSession: (id) => requestNavigate(`/session/${encodeURIComponent(id)}`),
+                    onViewAll: () => requestNavigate("/suggestions"),
+                  }}
+                />
+              )}
 
-          {/* Below the banners, not directly under the bar: the handle is
-            absolutely positioned at the top-right, and hanging it off the bar
-            puts it on top of the update banner's dismiss button (same corner),
-            which then cannot be tapped at all. */}
-          {headerCollapsible && (
-            <ChromeCollapseHandle
-              edge="top"
-              collapsed={headerCollapsed}
-              onToggle={() => setHeaderCollapsed((v) => !v)}
-              collapseLabel="Collapse conversation header"
-              expandLabel="Expand conversation header"
-              controlsId="conversation-header"
-              testId="header-collapse-toggle"
-            />
-          )}
+              <div
+                ref={cardRef}
+                // With a Session open on a phone this is a card over the session drawer: the drawer pushes it aside
+                // whole, header and all, as clawbolt's and Claude's apps do.
+                className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${phoneHome ? "max-md:pt-[var(--phone-header-h)]" : ""} ${
+                  phoneDrawer
+                    ? `max-md:relative max-md:z-10 ${phoneHome ? "max-md:bg-surface-950" : "max-md:bg-surface-900"} max-md:has-[>[data-phone-banner]:not(:empty)]:[--phone-overlay-top:0px]`
+                    : ""
+                } ${
+                  drawerPushed
+                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-[28px] max-md:overflow-hidden max-md:drawer-card-shadow"
+                    : ""
+                }`}
+              >
+                {phoneDrawer && (
+                  // Floats over the Session, which scrolls beneath it; only its controls take taps. Placed by `top`, not a
+                  // transform, which would bound the ⋯ backdrop's `fixed` box to this strip.
+                  <div className="md:hidden absolute inset-x-0 top-[var(--vv-offset-top,0px)] z-30 pointer-events-none [&_button]:pointer-events-auto [&_[role=menu]]:pointer-events-auto [&_[data-testid=session-title-pill]]:pointer-events-auto">
+                    {topBar}
+                  </div>
+                )}
+                {phoneDrawer && (
+                  // In the card's flow under the floating header, whose menus open over it. While it shows, the
+                  // views below it start right under it instead of clearing the header themselves.
+                  <div
+                    data-phone-banner
+                    className={`md:hidden shrink-0 mx-3 mb-2 ${phoneHome ? "" : "mt-[var(--phone-header-h)]"} ${PHONE_BANNER_CARD}`}
+                  >
+                    {bannerStack}
+                  </div>
+                )}
+                {renderContent()}
+                {phoneDrawer && (
+                  // Dims the pushed-aside Session; a tap on it closes the drawer.
+                  <button
+                    ref={scrimRef}
+                    type="button"
+                    tabIndex={-1}
+                    aria-label="Close sessions"
+                    data-testid="sidebar-drawer-scrim"
+                    onClick={() => setSidebarOpen(false)}
+                    className={`md:hidden absolute inset-0 z-40 bg-black/15 cursor-pointer transition-[opacity,visibility] duration-[400ms] motion-reduce:transition-none ${
+                      drawerPushed ? "opacity-100" : "opacity-0 invisible"
+                    }`}
+                  />
+                )}
+              </div>
+            </div>
 
-          <div className="flex flex-1 min-h-0">
-            {!fullPageView && !focusMode && (
-              <WorkspaceSidebar
-                observedById={observedById}
-                runtimeEpoch={runtimeEpoch}
-                onSessionMutation={applySessionMutation}
-                groups={sidebarGroups}
-                nestedGroups={nestedGroups}
-                orgGroups={orgGroups}
-                trashedWorkspaces={trashedWorkspaces}
-                trashedCount={trashedCount}
-                trashLoaded={trashLoaded}
-                onLoadTrash={loadTrash}
-                onToggleSubgroup={toggleSubgroupCollapsed}
-                onToggleOrg={toggleOrgCollapsed}
-                onToggleOrgRepo={toggleOrgRepoCollapsed}
-                onReorderWorkspaces={handleReorderWorkspaces}
-                onReorderGroups={reorderRepoGroups}
-                activeId={activeWorkspace?.id ?? null}
-                activeSessionId={activeSessionId}
-                open={sidebarOpen}
-                onOpenChange={setSidebarOpen}
-                onSelect={handleSelectWorkspace}
-                onToggleGroup={toggleSidebarGroup}
-                onNew={(prefill) => {
-                  setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
-                  setShowSessionWizard(true);
+            {titleMenu && renderSessionMenu(titleMenu)}
+            {legend && <SidebarLegend anchor={legend.anchor} onClose={closeLegend} opener={legend.opener} />}
+
+            {showSessionWizard && (
+              <SessionWizard
+                restore={wizardRestore ?? undefined}
+                onReopenFailure={reopenFailure}
+                servedProfile={servedProfileReady ? serverAbout?.profile : undefined}
+                onRetryServedProfile={refreshServerAbout}
+                onClose={() => {
+                  setShowSessionWizard(false);
+                  setWizardPrefill(undefined);
+                  clearRestore();
                 }}
-                onCreateSession={handleCreateSession}
-                onPinProject={projectsReady ? handlePinProject : undefined}
-                onUnpinProject={projectsReady ? handleUnpinProject : undefined}
-                onEditProjectSettings={handleEditProjectSettings}
-                savedProjects={savedProjects}
-                onAddProject={handleAddProject}
-                onEditProject={handleEditProject}
-                onRemoveProject={handleRemoveProject}
-                onSettings={handleOpenSettings}
-                onDeleteSession={handleDeleteSession}
-                onRestoreSession={handleRestoreSession}
-                onEmptyTrash={handleEmptyTrash}
-                onRetryTrash={handleRetryTrash}
-                onStopSession={handleStopSession}
-                onStartSession={handleStartSession}
-                onRestartForUpdate={restartForUpdate}
-                onSwitchView={handleSwitchView}
-                readOnly={caps.readOnly}
-                canManageProjects={caps.canManageProjects}
-                sortMode={sidebarSortMode}
-                onSortModeChange={selectSidebarSortMode}
-                pluginSortRef={pluginSortRef}
-                onPluginSortChange={selectPluginSort}
-                axis={sidebarAxis}
-                onAxisChange={setSidebarAxis}
+                onOpenSettingsTab={openSettingsTab}
+                onCreated={(session?: SessionResponse) => {
+                  if (session) {
+                    injectSession(session);
+                    navigate(`/session/${encodeURIComponent(session.id)}`);
+                    if (window.innerWidth < 768) setSidebarOpen(false);
+                  }
+                  setShowSessionWizard(false);
+                  setWizardPrefill(undefined);
+                  clearRestore();
+                }}
+                onCreatedInBackground={(session?: SessionResponse) => {
+                  if (!session) return;
+                  injectSession(session);
+                  toastBus.handler?.info(`"${session.title}" is ready`);
+                }}
+                prefill={wizardPrefill}
+                nameOnly={caps.nameOnlyWizard}
+                onEditPreset={
+                  caps.canManageSuggestions
+                    ? ({ providerId, criterion }) => {
+                        setShowSessionWizard(false);
+                        setWizardPrefill(undefined);
+                        const q = new URLSearchParams({
+                          preset_provider: providerId,
+                          preset_criterion: criterion,
+                          from: "suggestions",
+                        });
+                        navigate(`/settings/suggestions?${q}`);
+                      }
+                    : undefined
+                }
               />
             )}
 
-            <div className="flex-1 flex flex-col min-h-0 min-w-0">{renderContent()}</div>
-          </div>
+            {projectForm && (
+              <ProjectFormModal
+                initial={projectForm.editProject}
+                profile={projectForm.profile}
+                onClose={() => setProjectForm(null)}
+                onSaved={() => refreshProjects()}
+              />
+            )}
 
-          {showSessionWizard && (
-            <SessionWizard
-              restore={wizardRestore ?? undefined}
-              onReopenFailure={reopenFailure}
-              servedProfile={servedProfileReady ? serverAbout?.profile : undefined}
-              onRetryServedProfile={refreshServerAbout}
+            {scratchSettingsOpen && (
+              <ScratchOverridesModal
+                profile={serverAbout?.profile ?? ""}
+                onClose={() => setScratchSettingsOpen(false)}
+              />
+            )}
+
+            {tour.tourElement}
+
+            {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
+            {terminalSwitcherOpen && canOpenTerminals && (
+              <TerminalSwitcherOverlay
+                groups={shellGroups}
+                newTerminalFor={isMdUp ? newTerminalFor : undefined}
+                onPick={pickShell}
+                onNew={() => newTerminal()}
+                onClose={() => setTerminalSwitcherOpen(false)}
+              />
+            )}
+
+            {tips.isOpen && (
+              <TipsModal
+                tips={tips.tips}
+                startIndex={tips.startIndex}
+                enabled={tips.enabled}
+                onMarkSeen={tips.markSeen}
+                onSetEnabled={tips.setEnabled}
+                onClose={tips.close}
+              />
+            )}
+
+            {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
+
+            {deletingSession && deletingCleanupDefaults && (
+              <DeleteSessionDialog
+                sessionTitle={deletingSession.title}
+                branchName={deletingBranchName}
+                hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
+                isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
+                isScratch={deletingSessions.some((session) => session.scratch)}
+                cleanupDefaults={deletingCleanupDefaults}
+                defaultToTrash={deletingDefaultToTrash}
+                affectedSessions={deletingSessions.map((session) => ({
+                  id: session.id,
+                  title: session.title,
+                  isSandboxed: session.is_sandboxed,
+                }))}
+                worktreeSharedWith={deletingWorktreeSharedWith}
+                onConfirm={handleConfirmDelete}
+                onTrash={handleConfirmTrash}
+                onCancel={() => setDeletingSessions([])}
+              />
+            )}
+
+            {stoppingSession && (
+              <StopSessionDialog
+                sessionTitle={stoppingSession.title}
+                onConfirm={handleConfirmStop}
+                onCancel={() => setStoppingSessionId(null)}
+              />
+            )}
+
+            {switchViewTarget && switchViewSession && (
+              <SwitchViewDialog
+                sessionTitle={switchViewSession.title}
+                toStructured={switchViewTarget.toStructured}
+                keepsContext={switchViewSession.keeps_context ?? false}
+                onConfirm={handleConfirmSwitchView}
+                onCancel={() => setSwitchViewTarget(null)}
+              />
+            )}
+
+            <CommandPalette
+              open={showPalette}
               onClose={() => {
-                setShowSessionWizard(false);
-                setWizardPrefill(undefined);
-                clearRestore();
+                setShowPalette(false);
+                setPaletteQuery("");
               }}
-              onOpenSettingsTab={openSettingsTab}
-              onCreated={(session?: SessionResponse) => {
-                if (session) {
-                  injectSession(session);
-                  navigate(`/session/${encodeURIComponent(session.id)}`);
-                  if (window.innerWidth < 768) setSidebarOpen(false);
+              actions={[
+                ...commandActions,
+                ...conversationActions,
+                ...pluginPageActions,
+                suggestionsAction,
+                ...settingsCommands,
+                ...pluginCommandActions,
+              ]}
+              onSearchChange={setPaletteQuery}
+              searching={conversationSearching}
+            />
+
+            {pluginLinkPicker}
+
+            {snoozeTargetId && (
+              <SnoozeModal
+                title="Snooze session"
+                onCancel={() => setSnoozeTargetId(null)}
+                onPick={(minutes) => {
+                  reportFeatureUse("snooze_toggle");
+                  const id = snoozeTargetId;
+                  setSnoozeTargetId(null);
+                  void setSessionSnooze(id, minutes).then((result) => {
+                    if (result) applySession(result);
+                    else reportError("Failed to snooze session");
+                  });
+                }}
+              />
+            )}
+
+            {singlePane && activeWorkspace && activeSession && (
+              <MobileRightPanelPicker
+                open={pickerOpen}
+                active={rightPanelView}
+                sessionTitle={activeSession.title}
+                availablePanes={dockPaneIds}
+                describePane={paneDescriptor}
+                shellGroups={caps.canUseTerminal ? shellGroups : []}
+                onPickShell={(shell) => {
+                  setPickerOpen(false);
+                  pickShell(shell);
+                }}
+                shownShell={
+                  rightPanelView === "paired" && mobileShellShown
+                    ? { ...mobileShellShown, mode: shownShellMode(mobileShellShown.sessionId, mobileShellShown.index) }
+                    : null
                 }
-                setShowSessionWizard(false);
-                setWizardPrefill(undefined);
-                clearRestore();
-              }}
-              onCreatedInBackground={(session?: SessionResponse) => {
-                if (!session) return;
-                injectSession(session);
-                toastBus.handler?.info(`"${session.title}" is ready`);
-              }}
-              prefill={wizardPrefill}
-              nameOnly={caps.nameOnlyWizard}
+                onSelect={handlePickView}
+                onClose={closePicker}
+              />
+            )}
+
+            <textarea
+              ref={setKeyboardProxyRef}
+              data-keyboard-proxy
+              data-session-input={
+                activeSession &&
+                !fullPageView &&
+                (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
+                  ? ""
+                  : undefined
+              }
+              aria-hidden="true"
+              tabIndex={-1}
+              // Keep the element in the visual viewport. Focusing a zero-size
+              // textarea thousands of pixels above an iOS PWA can leave WebKit's
+              // focus scroll in a broken state until the keyboard is toggled.
+              // This matches the live terminal's hidden input geometry.
+              className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
+              style={{ caretColor: "transparent", color: "transparent" }}
+              // Typed text stays in this textarea as IME context (see
+              // bindHiddenInput), so keep the OS from rewriting it the way the
+              // live terminal's own hidden input already does.
+              autoCapitalize="off"
+              autoCorrect="off"
+              autoComplete="off"
+              spellCheck={false}
             />
-          )}
-
-          {projectForm && (
-            <ProjectFormModal
-              initial={projectForm.editProject}
-              profile={projectForm.profile}
-              onClose={() => setProjectForm(null)}
-              onSaved={() => refreshProjects()}
-            />
-          )}
-
-          {scratchSettingsOpen && (
-            <ScratchOverridesModal profile={serverAbout?.profile ?? ""} onClose={() => setScratchSettingsOpen(false)} />
-          )}
-
-          {tour.tourElement}
-
-          {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
-
-          {tips.isOpen && (
-            <TipsModal
-              tips={tips.tips}
-              startIndex={tips.startIndex}
-              enabled={tips.enabled}
-              onMarkSeen={tips.markSeen}
-              onSetEnabled={tips.setEnabled}
-              onClose={tips.close}
-            />
-          )}
-
-          {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
-
-          {deletingSession && deletingCleanupDefaults && (
-            <DeleteSessionDialog
-              sessionTitle={deletingSession.title}
-              branchName={deletingBranchName}
-              hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
-              isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
-              isScratch={deletingSessions.some((session) => session.scratch)}
-              cleanupDefaults={deletingCleanupDefaults}
-              defaultToTrash={deletingDefaultToTrash}
-              affectedSessions={deletingSessions.map((session) => ({
-                id: session.id,
-                title: session.title,
-                isSandboxed: session.is_sandboxed,
-              }))}
-              worktreeSharedWith={deletingWorktreeSharedWith}
-              onConfirm={handleConfirmDelete}
-              onTrash={handleConfirmTrash}
-              onCancel={() => setDeletingSessions([])}
-            />
-          )}
-
-          {stoppingSession && (
-            <StopSessionDialog
-              sessionTitle={stoppingSession.title}
-              onConfirm={handleConfirmStop}
-              onCancel={() => setStoppingSessionId(null)}
-            />
-          )}
-
-          {switchViewTarget && switchViewSession && (
-            <SwitchViewDialog
-              sessionTitle={switchViewSession.title}
-              toStructured={switchViewTarget.toStructured}
-              keepsContext={switchViewSession.keeps_context ?? false}
-              onConfirm={handleConfirmSwitchView}
-              onCancel={() => setSwitchViewTarget(null)}
-            />
-          )}
-
-          <CommandPalette
-            open={showPalette}
-            onClose={() => {
-              setShowPalette(false);
-              setPaletteQuery("");
-            }}
-            actions={[
-              ...commandActions,
-              ...conversationActions,
-              ...pluginPageActions,
-              ...settingsCommands,
-              ...pluginCommandActions,
-            ]}
-            onSearchChange={setPaletteQuery}
-            searching={conversationSearching}
-          />
-
-          {pluginLinkPicker}
-
-          {snoozeTargetId && (
-            <SnoozeModal
-              title="Snooze session"
-              onCancel={() => setSnoozeTargetId(null)}
-              onPick={(minutes) => {
-                reportFeatureUse("snooze_toggle");
-                const id = snoozeTargetId;
-                setSnoozeTargetId(null);
-                void setSessionSnooze(id, minutes).then((result) => {
-                  if (result) applySession(result);
-                  else reportError("Failed to snooze session");
-                });
-              }}
-            />
-          )}
-
-          {singlePane && activeWorkspace && activeSession && (
-            <MobileRightPanelPicker
-              open={pickerOpen}
-              active={rightPanelView}
-              sessionTitle={activeSession.title}
-              availablePanes={mobilePaneIds}
-              describePane={paneDescriptor}
-              onSelect={handlePickView}
-              onClose={closePicker}
-            />
-          )}
-
-          <textarea
-            ref={setKeyboardProxyRef}
-            data-keyboard-proxy
-            data-session-input={
-              activeSession &&
-              !fullPageView &&
-              (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
-                ? ""
-                : undefined
-            }
-            aria-hidden="true"
-            tabIndex={-1}
-            // Keep the element in the visual viewport. Focusing a zero-size
-            // textarea thousands of pixels above an iOS PWA can leave WebKit's
-            // focus scroll in a broken state until the keyboard is toggled.
-            // This matches the live terminal's hidden input geometry.
-            className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
-            style={{ caretColor: "transparent", color: "transparent" }}
-            // Typed text stays in this textarea as IME context (see
-            // bindHiddenInput), so keep the OS from rewriting it the way the
-            // live terminal's own hidden input already does.
-            autoCapitalize="off"
-            autoCorrect="off"
-            autoComplete="off"
-            spellCheck={false}
-          />
-        </div>
-      </SessionActionProvider>
+          </div>
+        </SessionActionProvider>
+      </DiffScopeContext.Provider>
     </AcpPrefsProvider>
   );
 }

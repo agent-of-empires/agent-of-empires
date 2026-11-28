@@ -79,12 +79,7 @@ export function SessionGroupModal({ sessionTitle, currentGroup, profile, onSave,
             </button>
           )}
           <CancelButton onClick={onClose} disabled={saving} />
-          <ConfirmButton
-            onClick={handleSave}
-            busy={saving}
-            testId="session-group-modal-save"
-            className="text-white bg-brand-600/90 hover:bg-brand-600"
-          >
+          <ConfirmButton onClick={handleSave} busy={saving} testId="session-group-modal-save">
             {saving ? "Saving..." : "Save"}
           </ConfirmButton>
         </div>

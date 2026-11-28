@@ -1,4 +1,6 @@
 import { MAX_FONT_SIZE, MIN_FONT_SIZE } from "../../lib/fontSizeRange";
+import { INPUT } from "../../lib/surfaces";
+import { FIELD_DESCRIPTION, FIELD_LABEL } from "../../lib/surfaces";
 
 interface FontSizeControlProps {
   label: string;
@@ -14,7 +16,8 @@ const OPTIONS = Array.from({ length: MAX_FONT_SIZE - MIN_FONT_SIZE + 1 }, (_, i)
 export function FontSizeControl({ label, value, onChange, description, testIdPrefix }: FontSizeControlProps) {
   return (
     <div>
-      <label className="block text-[13px] text-text-secondary mb-2">{label}</label>
+      <label className={description ? FIELD_LABEL : FIELD_LABEL.replace("mb-0.5", "mb-2")}>{label}</label>
+      {description && <p className={FIELD_DESCRIPTION}>{description}</p>}
       <div className="flex items-center gap-3">
         <input
           type="range"
@@ -32,7 +35,7 @@ export function FontSizeControl({ label, value, onChange, description, testIdPre
           data-testid={`${testIdPrefix}-select`}
           value={value}
           onChange={(e) => onChange(Number(e.target.value))}
-          className="bg-surface-800 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary font-mono w-16 text-center"
+          className={`${INPUT} !w-20 !px-2 font-mono text-center`}
         >
           {OPTIONS.map((s) => (
             <option key={s} value={s}>
@@ -41,7 +44,6 @@ export function FontSizeControl({ label, value, onChange, description, testIdPre
           ))}
         </select>
       </div>
-      {description && <p className="text-[11px] text-text-muted mt-1">{description}</p>}
     </div>
   );
 }

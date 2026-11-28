@@ -1,17 +1,22 @@
 //! The capability-gated host API a plugin worker calls over the worker
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use aoe_plugin_api::UiSlot;
+use aoe_plugin_api::{SuggestionsSpec, UiSlot};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::events::{self, Order, Schema, SeqBound};
 use crate::plugin::protocol::codes;
+use crate::plugin::suggestions;
 use crate::plugin::ui_state::{NotifyTarget, Tone, UiError, UiSnapshot, UiStore};
 use crate::session::Storage;
+
+/// File name of the plugin database under the app directory.
+pub(crate) const EVENTS_DB: &str = "plugin_events.db";
 
 const CAP_WORKER: &str = "runtime.worker";
 pub(crate) const CAP_SESSION_READ: &str = "session.read";
@@ -31,7 +36,17 @@ pub struct HostApiState {
     profile: String,
     ui: UiStore,
     settings_revision: std::sync::atomic::AtomicU64,
+    /// Providers asked to refresh: when, and the provider's publish count at that moment.
+    refreshing: Mutex<HashMap<String, (Instant, u64)>>,
+    /// Publishes seen per provider. Counted, not timestamped: a publish in the same second
+    /// as a refresh request must still end it.
+    publishes: Mutex<HashMap<String, u64>>,
+    /// Wakes the auto start sweep; a permit is kept when nothing waits, so publishes coalesce.
+    published: tokio::sync::Notify,
 }
+
+/// A worker that never answers stops counting as refreshing after this long.
+const REFRESH_TTL: Duration = Duration::from_secs(120);
 
 impl HostApiState {
     pub fn open(
@@ -51,6 +66,7 @@ impl HostApiState {
              );",
         )
         .context("create plugin_storage table")?;
+        suggestions::init(&conn).context("create suggestion tables")?;
         Ok(Self {
             events: Mutex::new(conn),
             schema,
@@ -58,7 +74,59 @@ impl HostApiState {
             profile: profile.to_string(),
             ui: UiStore::new(),
             settings_revision: std::sync::atomic::AtomicU64::new(0),
+            refreshing: Mutex::new(HashMap::new()),
+            publishes: Mutex::new(HashMap::new()),
+            published: tokio::sync::Notify::new(),
         })
+    }
+
+    pub(crate) fn mark_refreshing(&self, provider_id: &str) {
+        let seen = self.publish_count(provider_id);
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(provider_id.to_string(), (Instant::now(), seen));
+    }
+
+    pub(crate) fn clear_refreshing(&self, provider_id: &str) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+    }
+
+    fn publish_count(&self, provider_id: &str) -> u64 {
+        let publishes = self.publishes.lock().unwrap_or_else(|p| p.into_inner());
+        publishes.get(provider_id).copied().unwrap_or(0)
+    }
+
+    fn record_publish(&self, provider_id: &str) {
+        let mut publishes = self.publishes.lock().unwrap_or_else(|p| p.into_inner());
+        *publishes.entry(provider_id.to_string()).or_insert(0) += 1;
+        self.published.notify_one();
+    }
+
+    pub(crate) fn notify_published(&self) {
+        self.published.notify_one();
+    }
+
+    pub(crate) async fn wait_published(&self) {
+        self.published.notified().await;
+    }
+
+    /// Providers asked to refresh, within [`REFRESH_TTL`], that have not published since.
+    pub(crate) fn refreshing_providers(&self) -> HashSet<String> {
+        self.refreshing_providers_at(Instant::now())
+    }
+
+    fn refreshing_providers_at(&self, now: Instant) -> HashSet<String> {
+        let mut pending = self.refreshing.lock().unwrap_or_else(|p| p.into_inner());
+        pending.retain(|_, (at, _)| now.saturating_duration_since(*at) < REFRESH_TTL);
+        pending
+            .iter()
+            .filter(|(id, (_, seen))| self.publish_count(id) == *seen)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     fn storage(&self) -> anyhow::Result<Storage> {
@@ -67,6 +135,41 @@ impl HostApiState {
 
     pub(crate) fn profile(&self) -> &str {
         &self.profile
+    }
+
+    /// The profile key suggestions are stored and read under.
+    pub(crate) fn suggestions_profile(&self) -> String {
+        crate::session::config::effective_profile(&self.profile)
+    }
+
+    /// Run `f` on the plugin database with the profile key suggestions are
+    /// stored and read under. The key is resolved before the shared lock is
+    /// taken, and `f` must stay a short query: every worker RPC waits behind it.
+    pub(crate) fn with_suggestions_db<T>(&self, f: impl FnOnce(&Connection, &str) -> T) -> T {
+        let profile = self.suggestions_profile();
+        let conn = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        f(&conn, &profile)
+    }
+
+    /// `with_suggestions_db` for a worker's write: refused, under the same lock
+    /// `forget_publication` takes, once the worker's generation is retired, so
+    /// an RPC admitted before a restart or uninstall cannot recreate or replace
+    /// what the host cleared or the new worker published.
+    fn with_suggestions_db_as<T>(
+        &self,
+        ctx: &PluginRpcContext,
+        f: impl FnOnce(&Connection, &str) -> Result<T, DispatchError>,
+    ) -> Result<T, DispatchError> {
+        self.with_suggestions_db(|conn, profile| {
+            if !self.ui.is_current(&ctx.plugin_id, ctx.ui_generation) {
+                return Err(DispatchError {
+                    code: codes::FAILED_PRECONDITION,
+                    message: "plugin worker was replaced or stopped".into(),
+                    data: None,
+                });
+            }
+            f(conn, profile)
+        })
     }
 
     pub fn bump_settings_revision(&self) -> u64 {
@@ -116,6 +219,8 @@ pub struct PluginRpcContext {
     /// Ids of the plugin's pages that declare `deep_link`.
     pub deep_link_pages: HashSet<String>,
     pub ui_generation: u64,
+    /// The `[suggestions]` spec of the manifest this worker was launched from.
+    pub suggestions_spec: Option<SuggestionsSpec>,
 }
 
 impl PluginRpcContext {
@@ -184,6 +289,47 @@ pub fn dispatch(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     match method {
+        "suggestions.set" => {
+            ctx.require(CAP_WORKER)?;
+            let spec = suggestions_spec(ctx)?;
+            let stored = state.with_suggestions_db_as(ctx, |conn, profile| {
+                suggestions::set(conn, profile, &ctx.plugin_id, &spec, params)
+            });
+            if stored.is_ok() {
+                state.record_publish(&ctx.plugin_id);
+            }
+            stored
+        }
+        "suggestions.error" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_spec(ctx)?;
+            let stored = state.with_suggestions_db_as(ctx, |conn, profile| {
+                suggestions::error(conn, profile, &ctx.plugin_id, params)
+            });
+            if stored.is_ok() {
+                state.record_publish(&ctx.plugin_id);
+            }
+            stored
+        }
+        "suggestions.checks.set" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_spec(ctx)?;
+            let stored = state.with_suggestions_db_as(ctx, |conn, profile| {
+                suggestions::set_checks(conn, profile, &ctx.plugin_id, params)
+            });
+            // A worker may answer a refresh with checks alone, which leaves `updated_at` as it was.
+            if stored.is_ok() {
+                state.clear_refreshing(&ctx.plugin_id);
+            }
+            stored
+        }
+        "suggestions.sources" => {
+            ctx.require(CAP_WORKER)?;
+            let spec = suggestions_spec(ctx)?;
+            state.with_suggestions_db_as(ctx, |conn, profile| {
+                suggestions::sources(conn, profile, &ctx.plugin_id, &spec)
+            })
+        }
         "projects.list" => {
             ctx.require(CAP_SESSION_READ)?;
             projects_list(state)
@@ -254,6 +400,29 @@ pub fn dispatch(
         }
         other => Err(DispatchError::method_not_found(other)),
     }
+}
+
+/// The spec the worker launched with, refused once the installed manifest has moved on.
+fn suggestions_spec(ctx: &PluginRpcContext) -> Result<SuggestionsSpec, DispatchError> {
+    let forbidden = || DispatchError {
+        code: codes::FORBIDDEN,
+        message: "plugin did not declare suggestions".into(),
+        data: None,
+    };
+    let launched = ctx.suggestions_spec.clone().ok_or_else(forbidden)?;
+    let current = crate::plugin::registry()
+        .get(&ctx.plugin_id)
+        .filter(|p| p.active())
+        .and_then(|p| p.manifest.suggestions.clone())
+        .ok_or_else(forbidden)?;
+    if suggestions::spec_hash(&current) != suggestions::spec_hash(&launched) {
+        return Err(DispatchError {
+            code: codes::FAILED_PRECONDITION,
+            message: "plugin manifest changed since this worker launched".into(),
+            data: None,
+        });
+    }
+    Ok(launched)
 }
 
 fn projects_list(state: &HostApiState) -> Result<Value, DispatchError> {
@@ -997,6 +1166,7 @@ mod tests {
             ui_contributions: HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         }
     }
 
@@ -1079,6 +1249,123 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_counts_until_reported_or_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        state.mark_refreshing("a");
+        state.mark_refreshing("b");
+        state.clear_refreshing("a");
+        assert_eq!(
+            state.refreshing_providers(),
+            HashSet::from(["b".to_string()])
+        );
+        let later = Instant::now() + REFRESH_TTL + Duration::from_secs(1);
+        assert!(
+            state.refreshing_providers_at(later).is_empty(),
+            "a silent worker expires"
+        );
+    }
+
+    #[test]
+    fn a_publish_ends_a_refresh_even_in_the_same_second() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        state.record_publish("a");
+        state.mark_refreshing("a");
+        assert!(
+            state.refreshing_providers().contains("a"),
+            "earlier publish"
+        );
+        state.record_publish("a");
+        assert!(state.refreshing_providers().is_empty(), "next publish");
+    }
+
+    fn provider_ctx(generation: u64) -> PluginRpcContext {
+        PluginRpcContext {
+            ui_generation: generation,
+            suggestions_spec: crate::plugin::registry()
+                .get("acme.gh")
+                .and_then(|p| p.manifest.suggestions.clone()),
+            ..ctx_for("acme.gh", &[CAP_WORKER])
+        }
+    }
+
+    fn assigned_item() -> Value {
+        json!({ "items": [{
+            "id": "a", "title": "Fix it", "reason": "assigned",
+            "source_url": "https://example.com/1", "source_ref": "acme/web#1",
+            "preview": "body", "criterion": "assigned",
+            "variables": { "number": "1" },
+            "draft": { "title": "Fix", "prompt": "Fix #{number}" },
+        }]})
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_worker_launched_under_an_older_spec_cannot_publish_or_report() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _reload = crate::server::api::suggestions_tests::register_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let generation = state.begin_ui_generation("acme.gh");
+        let worker = provider_ctx(generation);
+        let accepted = dispatch(&state, &worker, "suggestions.set", &assigned_item()).unwrap();
+        assert_eq!(accepted["accepted"], 1);
+
+        // The installed manifest gains a source while the old worker keeps running.
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.gh");
+        let manifest = std::fs::read_to_string(dir.join("aoe-plugin.toml")).unwrap();
+        let changed = format!(
+            "{manifest}\n[[suggestions.sources]]\ncriterion = \"mentioned\"\nlabel = \"Mentioned\"\n"
+        );
+        std::fs::write(dir.join("aoe-plugin.toml"), &changed).unwrap();
+        crate::session::update_config(|config| {
+            let plugin = config.plugins.get_mut("acme.gh").unwrap();
+            plugin.grant.as_mut().unwrap().manifest_hash =
+                aoe_plugin_api::PluginManifest::hash_bytes(changed.as_bytes());
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+
+        for (method, params) in [
+            ("suggestions.set", assigned_item()),
+            ("suggestions.error", json!({ "message": "late" })),
+            ("suggestions.checks.set", json!({ "checks": [] })),
+            ("suggestions.sources", json!({})),
+        ] {
+            let err = dispatch(&state, &worker, method, &params).unwrap_err();
+            assert_eq!(err.code, codes::FAILED_PRECONDITION, "{method}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_error_report_ends_the_refresh() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _reload = crate::server::api::suggestions_tests::register_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let worker = provider_ctx(state.begin_ui_generation("acme.gh"));
+        state.mark_refreshing("acme.gh");
+        assert!(state.refreshing_providers().contains("acme.gh"));
+        dispatch(
+            &state,
+            &worker,
+            "suggestions.error",
+            &json!({ "message": "rate limited" }),
+        )
+        .unwrap();
+        assert!(state.refreshing_providers().is_empty());
+        let providers = crate::plugin::suggestions::providers();
+        let snapshot = state
+            .with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::snapshot(conn, profile, &providers)
+            })
+            .unwrap();
+        assert_eq!(snapshot["providers"][0]["error"], "rate limited");
+    }
+
+    #[test]
     fn ungranted_capability_is_forbidden() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state(tmp.path());
@@ -1101,6 +1388,84 @@ mod tests {
         assert_eq!(err.code, codes::FORBIDDEN);
     }
 
+    #[test]
+    fn suggestions_and_projects_rpcs_are_capability_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        for (method, caps) in [
+            ("suggestions.set", &[][..]),
+            ("suggestions.error", &[][..]),
+            ("suggestions.checks.set", &[][..]),
+            ("suggestions.sources", &[CAP_SESSION_READ][..]),
+            ("projects.list", &[CAP_WORKER][..]),
+        ] {
+            let err = dispatch(&state, &ctx(caps), method, &json!({"items": []})).unwrap_err();
+            assert_eq!(err.code, codes::FORBIDDEN, "{method}");
+        }
+        // A worker whose manifest declares no [suggestions] is refused too.
+        for method in ["suggestions.sources", "suggestions.checks.set"] {
+            let err = dispatch(&state, &ctx(&[CAP_WORKER]), method, &json!({})).unwrap_err();
+            assert!(
+                err.message.contains("did not declare suggestions"),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retired_worker_generation_cannot_write_suggestions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let worker = |generation| PluginRpcContext {
+            ui_generation: generation,
+            suggestions_spec: None,
+            ..ctx_for("acme.worker", &[CAP_WORKER])
+        };
+        let write = |ctx: &PluginRpcContext| {
+            state.with_suggestions_db_as(ctx, |conn, profile| {
+                conn.execute(
+                    "INSERT INTO suggestion_providers (profile, provider_id, updated_at)
+                     VALUES (?1, 'acme.worker', 1)
+                     ON CONFLICT (profile, provider_id) DO NOTHING",
+                    [profile],
+                )
+                .map(|_| ())
+                .map_err(|e| DispatchError::internal(e.to_string()))
+            })
+        };
+        let published = || {
+            state.with_suggestions_db(|conn, _| {
+                conn.query_row("SELECT COUNT(*) FROM suggestion_providers", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+        };
+
+        // Restart: the old worker's RPC runs after the new generation began.
+        let old = state.begin_ui_generation("acme.worker");
+        let new = state.begin_ui_generation("acme.worker");
+        let err = write(&worker(old)).unwrap_err();
+        assert_eq!(err.code, codes::FAILED_PRECONDITION);
+        assert_eq!(published(), 0, "a stale write must not touch the store");
+        write(&worker(new)).unwrap();
+        assert_eq!(published(), 1);
+
+        // Uninstall, then reinstall with the same spec: the stopped worker's
+        // late RPC cannot recreate what the host cleared, and the reinstalled
+        // worker owns a fresh generation.
+        state.clear_ui("acme.worker", new);
+        state.with_suggestions_db(|conn, _| {
+            crate::plugin::suggestions::forget_publication(conn, "acme.worker").unwrap()
+        });
+        assert!(write(&worker(new)).is_err());
+        assert_eq!(published(), 0);
+        let reinstalled = state.begin_ui_generation("acme.worker");
+        assert!(write(&worker(new)).is_err(), "the retired id stays retired");
+        write(&worker(reinstalled)).unwrap();
+        assert_eq!(published(), 1);
+    }
+
     fn ctx_for(plugin_id: &str, caps: &[&str]) -> PluginRpcContext {
         PluginRpcContext {
             plugin_id: plugin_id.to_string(),
@@ -1108,6 +1473,7 @@ mod tests {
             ui_contributions: HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         }
     }
 
@@ -1500,6 +1866,7 @@ mod tests {
             ui_contributions: HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 0,
+            suggestions_spec: None,
         };
         assert_eq!(
             get(&other, "poll_interval_ms").unwrap()["value"],
@@ -1520,6 +1887,7 @@ mod tests {
             ui_contributions: contributions,
             deep_link_pages: Default::default(),
             ui_generation: state.begin_ui_generation("acme.worker"),
+            suggestions_spec: None,
         }
     }
 

@@ -80,7 +80,13 @@ async function installSetupMocks(page: Page, opts: { finished?: boolean; readOnl
   );
   await page.route(
     (url) => url.pathname === "/api/themes",
-    (r) => r.fulfill({ json: ["empire", "dracula"] }),
+    (r) =>
+      r.fulfill({
+        json: [
+          { name: "empire", label: "empire" },
+          { name: "dracula", label: "dracula" },
+        ],
+      }),
   );
   await page.route(
     (url) => url.pathname === "/api/theme",

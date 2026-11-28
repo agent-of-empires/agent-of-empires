@@ -45,6 +45,7 @@ export const HOST_STATE_VARS = new Set([
   // Private fixture files and subprocess controls cannot come from the host.
   "AOE_E2E_INPUT_BARRIER",
   "AOE_E2E_RUNTIME_STATE",
+  "AOE_E2E_ADAPTER_FRAMES_FILE",
   "AOE_E2E_PARTIAL_FRAME_FILE",
   "AOE_E2E_PROMPT_COMPLETED_FILE",
   "AOE_E2E_STORAGE_LOCK_CONTENDED",
@@ -58,6 +59,11 @@ export const HOST_STATE_VARS = new Set([
   "AOE_UDS_UMASK_TEST_CHILD",
   "AOE_UDS_UMASK_TEST_ENTERED",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
+  // Set by aoe for the sandbox MCP forwarder it spawns (a credential
+  // reference plus the session it belongs to); a host value could only
+  // smuggle a credential or session into a spec.
+  "AOE_PLUGIN_MCP_SESSION",
+  "AOE_PLUGIN_MCP_TOKEN",
   "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
   "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one
   "AOE_SERVE_PASSPHRASE", // host credential for the daemon's own auth
@@ -79,6 +85,7 @@ export const HOST_STATE_VARS = new Set([
   "AOE_OMP_CAPTURE_META",
   "AOE_OMP_CAPTURE_READY",
   "AOE_OMP_LAUNCH_ID",
+  "AOE_PROXY_LAUNCH_CONFIG", // names a host proxy launch config the runner would hand its agent
   "TMUX",
   "TMUX_PANE",
   "DBUS_SESSION_BUS_ADDRESS",
