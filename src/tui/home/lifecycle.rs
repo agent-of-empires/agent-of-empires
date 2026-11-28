@@ -474,7 +474,7 @@ impl HomeView {
             .iter()
             .flat_map(|(_, _, rows)| rows)
             .filter(|row| reports.iter().all(|report| report.id != row.id))
-            .map(|row| crate::server::api::sessions::session_response_from_instance(row, false))
+            .map(crate::server::api::sessions::session_response_from_instance)
             .collect();
         let default_profile = view
             .active_profile

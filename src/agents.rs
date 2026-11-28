@@ -230,7 +230,7 @@ impl ForkStrategy {
 }
 
 /// Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`
-/// and in the TS mirrors (`web/src/lib/types.ts`, `web/src/lib/agentProfiles.ts`).
+/// and in the TS mirror (`web/src/lib/types.ts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AgentLifecycle {
@@ -2601,34 +2601,6 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
                 r#""replacement":"antigravity"}"#
             )
         );
-    }
-
-    #[test]
-    fn lifecycle_facts_stay_synced_with_ts_mirror() {
-        let mirror_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/agentProfiles.ts");
-        let Ok(mirror) = std::fs::read_to_string(&mirror_path) else {
-            // Nix-filtered sources omit web/.
-            eprintln!(
-                "skipping TS lifecycle mirror check: {} is absent",
-                mirror_path.display()
-            );
-            return;
-        };
-        let AgentLifecycle::Deprecated {
-            since,
-            note,
-            replacement: Some(replacement),
-        } = get_agent("gemini").unwrap().lifecycle
-        else {
-            panic!("gemini must stay Deprecated with a replacement");
-        };
-        for fact in [since, note, replacement] {
-            assert!(
-                mirror.contains(fact),
-                "web/src/lib/agentProfiles.ts is missing {fact:?}"
-            );
-        }
     }
 
     fn config_with_status(

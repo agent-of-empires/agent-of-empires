@@ -157,6 +157,7 @@ import { onServerDownChange } from "./lib/connectionState";
 import { createAboutRequests } from "./lib/aboutRequests";
 import { ABOUT_RETRY_DELAYS_MS, fetchAboutOnce, fetchAboutRetrying } from "./lib/serverAbout";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
+import { usableAgentProfile } from "./lib/agentProfile";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
@@ -1271,7 +1272,7 @@ function AppContent({
           // input on iOS (#3285). Start it as a monitoring view until that
           // separate transport race is fixed; other terminal agents remain
           // safe to auto-open.
-          if (picked?.tool === "claude" && picked.view !== "structured") {
+          if (picked && usableAgentProfile(picked.agent_profile).mobile_monitor_only && picked.view !== "structured") {
             closeKeyboardProxy();
           } else if (webSettings.autoOpenKeyboard) {
             focusKeyboardProxy();
@@ -1314,7 +1315,7 @@ function AppContent({
         // See handleSelectSession: keep focus on the persistent keyboard input
         // until the selected surface can receive it.
         if (isCoarse) {
-          if (picked.tool === "claude" && picked.view !== "structured") {
+          if (usableAgentProfile(picked.agent_profile).mobile_monitor_only && picked.view !== "structured") {
             closeKeyboardProxy();
           } else if (webSettings.autoOpenKeyboard) {
             focusKeyboardProxy();
@@ -2592,8 +2593,7 @@ function AppContent({
                           acpAgent={session.acp_agent ?? null}
                           startedBefore={hasStartedBefore(session)}
                           acpProvider={session.acp_provider ?? null}
-                          clearAliases={session.clear_aliases}
-                          compactAliases={session.compact_aliases}
+                          agentProfile={session.agent_profile}
                           onStartSession={() => void handleStartSession(session.id)}
                           archivedAt={session.archived_at ?? null}
                           snoozedUntil={session.snoozed_until ?? null}
