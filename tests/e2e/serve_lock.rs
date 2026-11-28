@@ -383,8 +383,8 @@ fn managed_core_promotion_migrates_historical_launch_before_replay() {
 #[test]
 #[parallel]
 fn tui_restart_failure_retains_predecessor_credential_for_rotation_and_removal() {
-    use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
-    use std::net::TcpListener;
+    use crate::harness::{app_dir_in, bind_saved_port, require_tmux, TuiTestHarness};
+    use std::net::Ipv4Addr;
     use std::time::Duration;
     for rotate in [false, true] {
         require_tmux!();
@@ -404,9 +404,7 @@ fn tui_restart_failure_retains_predecessor_credential_for_rotation_and_removal()
         let app = app_dir_in(h.home_path());
         let predecessor: serde_json::Value =
             serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
-        let blocker = (49152..65535)
-            .find_map(|candidate| TcpListener::bind(("0.0.0.0", candidate)).ok())
-            .expect("fixture high port");
+        let blocker = bind_saved_port(Ipv4Addr::UNSPECIFIED);
         let blocked_port = blocker.local_addr().unwrap().port();
         std::fs::write(app.join("serve.last_port"), blocked_port.to_string()).unwrap();
         if rotate {

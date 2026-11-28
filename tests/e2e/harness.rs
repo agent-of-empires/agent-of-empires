@@ -11,10 +11,12 @@
 //! convert it to a GIF via `agg`. Recordings are saved to
 //! `target/e2e-media/`. Both `asciinema` and `agg` must be on `$PATH`.
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -176,11 +178,7 @@ pub(crate) use require_python3;
 /// Ephemeral port not yet issued to another test in this process. The
 /// bind-then-drop TOCTOU window remains for unrelated processes.
 pub fn pick_free_port() -> u16 {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-
-    static ISSUED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
-    let issued = ISSUED.get_or_init(|| Mutex::new(HashSet::new()));
+    let issued = issued_ports();
 
     for _ in 0..64 {
         let port = {
@@ -192,6 +190,28 @@ pub fn pick_free_port() -> u16 {
         }
     }
     panic!("could not find an unissued ephemeral port after 64 attempts");
+}
+
+/// Binds a port accepted by `serve.last_port` and keeps it reserved in this process.
+pub fn bind_saved_port(host: Ipv4Addr) -> TcpListener {
+    const MIN_PORT: u16 = 49152;
+    let mut issued = issued_ports().lock().expect("issued ports mutex");
+
+    for port in MIN_PORT..=u16::MAX {
+        if issued.contains(&port) {
+            continue;
+        }
+        if let Ok(listener) = TcpListener::bind((host, port)) {
+            issued.insert(port);
+            return listener;
+        }
+    }
+    panic!("could not bind an unissued saved port on {host}");
+}
+
+fn issued_ports() -> &'static Mutex<HashSet<u16>> {
+    static ISSUED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    ISSUED.get_or_init(Mutex::default)
 }
 
 /// True while `pid` runs. An exited process waiting to be reaped counts as gone, since a

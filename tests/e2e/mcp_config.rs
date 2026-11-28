@@ -3,8 +3,9 @@
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use serial_test::parallel;
+use std::net::Ipv4Addr;
 
-use crate::harness::{app_dir_in, TuiTestHarness};
+use crate::harness::{app_dir_in, bind_saved_port, TuiTestHarness};
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Runtime::new()
@@ -434,9 +435,10 @@ fn cli_and_tui_autostart_reuse_the_saved_port() {
     h.append_config("[web]\nmcp_enabled = true");
     h.append_config("[serve]\nfunnel_port = \"8443\"");
     h.stop_daemon_on_drop();
-    let saved_port = (49152..=u16::MAX)
-        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
-        .expect("available port in the saved-port range");
+    let saved_port = bind_saved_port(Ipv4Addr::LOCALHOST)
+        .local_addr()
+        .unwrap()
+        .port();
     let app = app_dir_in(h.home_path());
     std::fs::write(app.join("serve.last_port"), saved_port.to_string()).unwrap();
 
