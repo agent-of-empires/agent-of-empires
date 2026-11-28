@@ -90,7 +90,7 @@ The **View options** button (sliders icon) beside the **Sessions** label holds t
 
 - **Manual** (default): keeps your drag-ordered list, drag enabled.
 - **Recent activity**: orders by the most recent of `last_accessed_at`, `idle_entered_at`, and `created_at` across each workspace's sessions, descending.
-- **Attention**: floats sessions needing a human to the top, mirroring the TUI's Attention sort. Ranks by status (Waiting, Error, Idle, Unknown, Running, Stopped, transient states last); session and plugin attention requests rise within their tier, favorited rows come first within a status rank, and ties break by most-recent activity.
+- **Attention**: floats sessions needing a human to the top. Ranks by status (Waiting, Error, Idle, Unknown, Running, Stopped, transient states last); session and plugin attention requests rise within their tier, favorited rows come first within a status rank, and ties break by most-recent activity.
 
 Drag-to-reorder is disabled in the computed modes. The sort is per-browser (localStorage), not synced and not tied to your profile. The Multi-repo and Scratch groups default to the bottom; in manual mode you can drag them anywhere, in computed modes they stay at the bottom.
 
@@ -104,7 +104,7 @@ Drag-to-reorder is disabled in the computed modes. The sort is per-browser (loca
 - **By organization**: groups repositories by the owner in their git remote (any hosted remote, not only GitHub), with each repository's header inside its owner. Repos with no resolvable owner fall into a **No organization** bucket pinned to the bottom.
 - **By group** (**Group** in the menu): groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
 - **By repo and group**: repository headers with user groups nested inside each. A session split across groups appears once per subgroup.
-- **By status**: groups by each session's actual execution status, in the same attention order the Attention sort and the Board's cards use: Waiting, Error, Idle, Unknown, Running, Stopped, then the transient Creating, Deleting and Starting. A workspace whose sessions differ in status appears once per status. This mirrors the TUI's Status grouping (`g` then Status).
+- **By status**: groups by each session's actual execution status, in the same attention order the Attention sort and the Board's cards use: Waiting, Error, Idle, Unknown, Running, Stopped, then the transient Creating, Deleting and Starting. A workspace whose sessions differ in status appears once per status.
 
 The choice is per-browser (localStorage). Collapse state is tracked separately per axis. You can move a session between groups from the web context menu, but drag-reorder lives on the repo axis only.
 

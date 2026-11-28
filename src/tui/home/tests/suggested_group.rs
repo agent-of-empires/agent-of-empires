@@ -109,11 +109,7 @@ fn the_row_sits_directly_above_archived_and_trash() {
         (true, false, true),
         (true, true, true),
     ];
-    for group_by in [
-        GroupByMode::Manual,
-        GroupByMode::Project,
-        GroupByMode::Status,
-    ] {
+    for group_by in [GroupByMode::Group, GroupByMode::Project] {
         for (archived, collapsed, trashed) in cases {
             let case =
                 format!("{group_by:?} archived={archived} collapsed={collapsed} trashed={trashed}");
@@ -1078,19 +1074,6 @@ fn z_in_the_pane_dismisses_then_restores_within_the_undo_window() {
         view.handle_key(key(KeyCode::Char('z')), None);
     });
     assert_eq!(next_request(&requests), "dismiss gh/i0 false");
-}
-
-#[test]
-#[serial]
-fn status_grouping_keeps_the_suggested_row() {
-    use crate::session::config::GroupByMode;
-    let mut env = create_test_env_with_sessions(1);
-    env.view
-        .suggestions_feed
-        .set_snapshot_for_test(snapshot(2, &[]));
-    env.view.group_by = GroupByMode::Status;
-    env.view.rebuild_flat_items();
-    assert_eq!(suggested_rows(&env).len(), 1);
 }
 
 #[test]

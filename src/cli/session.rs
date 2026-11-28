@@ -81,22 +81,20 @@ pub enum SessionCommands {
     Unsnooze(SessionIdArgs),
 
     /// Mark a session as a favorite. With `session.favorites_first` on (the
-    /// default), favorited rows pin to the top of their sibling scope in every
-    /// sort order; with it off, they pin within their status tier in the
-    /// Attention sort only. Either way the row shows a `✦` in the session list
-    /// gutter wherever the pin applies. Snoozing a favorite suspends the pin
-    /// until it wakes.
+    /// default), favorited rows pin to the top of their sibling scope under the
+    /// Name and Newest first sorts and show a `✦` in the session list gutter;
+    /// Custom keeps the order you arranged. A snoozed favorite keeps its place.
     Favorite(SessionIdArgs),
 
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
-    /// Archive a session: sink it in the Attention sort and tear down its
+    /// Archive a session: move it to the Archived section and tear down its
     /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
     /// skips tmux teardown. See #1868.
     Archive(ArchiveArgs),
 
-    /// Unarchive a session (restores it to its tier in the Attention sort)
+    /// Unarchive a session, returning it to its place in the list
     Unarchive(SessionIdArgs),
 
     /// Restore a trashed session, returning it to its prior bucket with its

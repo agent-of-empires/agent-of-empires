@@ -918,7 +918,7 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch_override: Option<String>,
 
-    /// Position within its group under `SortOrder::Custom`. `None` sorts last.
+    /// Position within its group under `SortOrder::Custom`. `None` sorts first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_index: Option<u32>,
     /// How this session is rendered: `Structured` (ACP native rendering) or

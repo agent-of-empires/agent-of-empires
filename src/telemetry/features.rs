@@ -39,22 +39,12 @@ pub fn active_features(config: &Config) -> BTreeMap<String, bool> {
     .collect()
 }
 
-const WEB_SORT_KEY: &str = "aoe-sidebar-sort-mode";
-const WEB_SORTS: &[&str] = &["manual", "lastActivity", "attention"];
-const WEB_AXIS_KEY: &str = "aoe-sidebar-axis";
-const WEB_AXES: &[&str] = &["repo", "org", "group", "repo+group", "status"];
-
 /// Closed-vocabulary values of layout and ordering preferences. `unset` means never chosen.
 pub fn active_prefs(config: &Config) -> BTreeMap<String, String> {
     let app = &config.app_state;
-    let web = |key: &str, allowed: &[&str]| match app.web_ui_state.get(key) {
-        None => "unset".to_string(),
-        Some(v) if allowed.contains(&v.as_str()) => v.clone(),
-        Some(_) => "other".to_string(),
-    };
     [
-        ("tui_sort_order", app.sort_order.map(serde_name)),
-        ("tui_group_by", app.group_by.map(serde_name)),
+        ("sidebar_sort", app.sort_order.map(serde_name)),
+        ("sidebar_group_by", app.group_by.map(serde_name)),
         ("row_tag", Some(serde_name(config.session.row_tag))),
         (
             "sidebar_position",
@@ -64,8 +54,6 @@ pub fn active_prefs(config: &Config) -> BTreeMap<String, String> {
             "narrow_layout",
             Some(serde_name(config.session.narrow_layout)),
         ),
-        ("web_sidebar_sort", Some(web(WEB_SORT_KEY, WEB_SORTS))),
-        ("web_sidebar_axis", Some(web(WEB_AXIS_KEY, WEB_AXES))),
     ]
     .into_iter()
     .map(|(name, value)| (name.to_string(), value.unwrap_or_else(|| "unset".into())))
@@ -102,19 +90,13 @@ mod tests {
     }
 
     #[test]
-    fn prefs_report_closed_values_and_never_raw_strings() {
+    fn prefs_report_closed_values() {
         let mut config = Config::default();
-        assert_eq!(active_prefs(&config)["tui_sort_order"], "unset");
-        assert_eq!(active_prefs(&config)["web_sidebar_sort"], "unset");
+        assert_eq!(active_prefs(&config)["sidebar_sort"], "unset");
 
-        config.app_state.sort_order = Some(SortOrder::Attention);
-        let ui = &mut config.app_state.web_ui_state;
-        ui.insert(WEB_SORT_KEY.into(), "attention".into());
-        ui.insert(WEB_AXIS_KEY.into(), "/home/me/secret".into());
+        config.app_state.sort_order = Some(SortOrder::Name);
         let prefs = active_prefs(&config);
-        assert_eq!(prefs["tui_sort_order"], "attention");
-        assert_eq!(prefs["web_sidebar_sort"], "attention");
-        assert_eq!(prefs["web_sidebar_axis"], "other");
+        assert_eq!(prefs["sidebar_sort"], "name");
         assert_eq!(prefs["row_tag"], serde_name(config.session.row_tag));
     }
 }

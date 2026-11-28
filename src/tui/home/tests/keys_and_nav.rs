@@ -500,19 +500,12 @@ fn unread_dot_suppressed_on_archived_snoozed_and_ignored() {
         "an idle unread row should paint the unread dot"
     );
 
-    env.view.sort_order = SortOrder::Newest;
+    env.view.sort_order = SortOrder::Custom;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     env.view.flat_items = env.view.build_flat_items();
     assert!(
         !render(&mut env).contains('●'),
-        "a snoozed unread row must not paint the unread dot outside Attention sort"
-    );
-
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-    assert!(
-        !render(&mut env).contains('●'),
-        "a snoozed unread row must not paint the unread dot in Attention sort"
+        "a snoozed unread row must not paint the unread dot"
     );
 
     env.view.mutate_instance(&id, |inst| {
@@ -1274,15 +1267,15 @@ fn test_g_key_opens_group_picker() {
     use crate::session::config::GroupByMode;
 
     let mut env = create_test_env_with_sessions(3);
-    env.view.group_by = GroupByMode::Manual;
+    env.view.group_by = GroupByMode::Group;
 
     // 'g' opens the picker without changing the current mode.
     env.view.handle_key(key(KeyCode::Char('g')), None);
     assert!(env.view.group_picker_dialog.is_some());
-    assert_eq!(env.view.group_by, GroupByMode::Manual);
+    assert_eq!(env.view.group_by, GroupByMode::Group);
 
-    // Down + Enter selects the next option (Project).
-    env.view.handle_key(key(KeyCode::Down), None);
+    // Up + Enter selects the other option (Repository).
+    env.view.handle_key(key(KeyCode::Up), None);
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Project);
@@ -1294,19 +1287,12 @@ fn test_g_key_opens_group_picker() {
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Project);
 
-    // 'g' again, Down + Enter advances Project -> Org.
+    // 'g' again, Down + Enter goes back to Groups.
     env.view.handle_key(key(KeyCode::Char('g')), None);
     env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(env.view.group_picker_dialog.is_none());
-    assert_eq!(env.view.group_by, GroupByMode::Org);
-
-    // 'g' again, Down + Enter advances Org -> Status (#4867).
-    env.view.handle_key(key(KeyCode::Char('g')), None);
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(env.view.group_picker_dialog.is_none());
-    assert_eq!(env.view.group_by, GroupByMode::Status);
+    assert_eq!(env.view.group_by, GroupByMode::Group);
 }
 
 #[test]

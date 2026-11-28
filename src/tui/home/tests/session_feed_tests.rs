@@ -960,8 +960,10 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
 #[test]
 #[serial]
 fn canonical_favorite_reorder_keeps_cursor_on_selected_session() {
+    let original = crate::session::favorites_first();
+    crate::session::set_favorites_first(true);
     let mut env = create_test_env_with_sessions(2);
-    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    env.view.sort_order = crate::session::config::SortOrder::Name;
     for instance in env.view.instances.values_mut() {
         instance.status = Status::Stopped;
     }
@@ -1015,6 +1017,7 @@ fn canonical_favorite_reorder_keeps_cursor_on_selected_session() {
         env.view.selected_session.as_deref(),
         Some(selected.as_str())
     );
+    crate::session::set_favorites_first(original);
 }
 
 /// A published result is applied exactly once: a tick with no new publication

@@ -175,10 +175,6 @@ impl HomeView {
             return;
         }
         self.stamp_last_accessed(session_id);
-        if self.sort_order == crate::session::config::SortOrder::Attention {
-            self.select_top_attention(None);
-            self.selected_session = None;
-        }
     }
 
     /// Send the tmux keystrokes for a permission-prompt decision straight
