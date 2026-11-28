@@ -1361,9 +1361,8 @@ async fn terminal_sessions_send_and_read_through_their_pane() {
     pane_shows("from-the-child").await;
 }
 
-/// MCP `send` types into the pane its dialog check read, or refuses, even when the live target
-/// moves to another pane after the check, or the checked pane leaves the session. A draft typed
-/// after the check refuses at once rather than being waited out.
+/// MCP send stays on the pane it checked after the live target changes, refuses a moved or
+/// replaced pane, and refuses a draft typed after the check without waiting it out.
 #[tokio::test]
 #[serial_test::serial]
 async fn an_mcp_send_types_into_the_pane_it_checked() {
@@ -1397,6 +1396,7 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
         Unpin,
         Kill,
         Move,
+        Respawn,
         Draft,
     }
     // (case, what happens to the checked pane after the check besides losing its pin, the code)
@@ -1404,6 +1404,7 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
         ("unpinned", Then::Unpin, None),
         ("killed", Then::Kill, Some("not_running")),
         ("moved", Then::Move, Some("send_failed")),
+        ("same-pane-new-process", Then::Respawn, Some("send_failed")),
         ("drafted-after-check", Then::Draft, Some("input_line_busy")),
     ] {
         let mut live = Instance::new("mcp-checked", "/tmp/aoe-mcp-checked");
@@ -1454,6 +1455,7 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
             let action = match then {
                 Then::Kill => vec!["kill-pane", "-t", &target],
                 Then::Move => vec!["join-pane", "-d", "-s", &target, "-t", &to],
+                Then::Respawn => vec!["respawn-pane", "-k", "-t", &target, "exec cat"],
                 Then::Draft => vec!["send-keys", "-t", &target, "-l", "half typed"],
                 Then::Unpin => {
                     let _ = mutated.send(true);
@@ -1501,7 +1503,7 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
         match then {
             Then::Kill => assert_eq!(checked_session, None, "{case}: still there"),
             Then::Move => assert_eq!(checked_session.as_deref(), Some(other.name()), "{case}"),
-            Then::Unpin | Then::Draft => {}
+            Then::Unpin | Then::Draft | Then::Respawn => {}
         }
 
         if then == Then::Unpin {

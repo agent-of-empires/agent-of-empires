@@ -565,15 +565,37 @@ pub(crate) fn observe_pane(
     let pane = panes
         .first()
         .ok_or_else(|| anyhow::anyhow!("pane identity unavailable"))?;
-    observe_pane_at(pane, deadline)
+    inspect_physical_pane(pane, None, deadline).map(Some)
 }
 
-/// Capture the physical identity of an exact pane, including the owning tmux server.
-pub(crate) fn observe_pane_at(
+/// Attest the selected pane against the original session and server evidence.
+pub(crate) fn observe_selected_pane(
+    session_name: &str,
+    first: &crate::session::LegacyToolObservation,
     pane: &str,
     deadline: &crate::tmux::TmuxCommandDeadline,
-) -> Result<Option<(crate::session::LegacyToolObservation, PaneProbe, bool)>> {
-    let mut command = crate::tmux::tmux_query_command();
+) -> Result<Option<crate::session::LegacyToolObservation>> {
+    let (checked, state, _) = inspect_physical_pane(pane, Some(&first.server.socket), deadline)?;
+    let server_pid = first.server.pid.to_string();
+    if checked.server != first.server
+        || checked.identity.session_id != first.identity.session_id
+        || state != PaneProbe::Alive
+        || !session_holds_pane(session_name, Some(&server_pid), pane, deadline)
+    {
+        return Ok(None);
+    }
+    Ok(Some(checked))
+}
+
+fn inspect_physical_pane(
+    pane: &str,
+    socket: Option<&str>,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Result<(crate::session::LegacyToolObservation, PaneProbe, bool)> {
+    let mut command = socket.map_or_else(
+        crate::tmux::tmux_query_command,
+        crate::tmux::tmux_query_command_for_socket,
+    );
     command.args([
         "display-message", "-p", "-t", pane,
         "#{n:socket_path}|#{socket_path}|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
@@ -645,7 +667,7 @@ pub(crate) fn observe_pane_at(
         current_command,
         start_command.contains(PANE_ENV_FILE_PREFIX),
     );
-    Ok(Some((observation, state, shell)))
+    Ok((observation, state, shell))
 }
 
 fn probe_owned_pane_with<T>(

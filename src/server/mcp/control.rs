@@ -659,6 +659,9 @@ impl McpServer {
                 ),
                 None,
             ),
+            PaneReadiness::AtPrompt if checked_pane.is_none() => {
+                (false, PromptDelivery::NotRunning, None, None)
+            }
             PaneReadiness::Gone => (false, PromptDelivery::NotRunning, None, None),
             // A session that just failed to start is not restarted behind the caller's back.
             PaneReadiness::AtPrompt => match send_terminal_message(
@@ -869,40 +872,32 @@ fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<CheckedSendPane
     let Ok(pane) = session.live_pane_target_with_deadline(&deadline) else {
         return (PaneReadiness::Unreadable, None);
     };
-    let Ok(Some((physical, state, _))) = crate::tmux::utils::observe_pane_at(&pane, &deadline)
-    else {
-        return (PaneReadiness::Unreadable, None);
-    };
-    if state != crate::tmux::utils::PaneProbe::Alive {
-        return (PaneReadiness::Gone, None);
+    match CheckedSendPane::capture(instance, session.name(), &pane, &deadline) {
+        Ok(Some(checked)) => {
+            let (readiness, _) =
+                readiness_in(instance, &checked.session(), Some(checked.pane_id()));
+            (readiness, Some(checked))
+        }
+        Ok(None) => (PaneReadiness::Gone, None),
+        Err(_) => (PaneReadiness::Unreadable, None),
     }
-    let physical = std::sync::Arc::new(physical);
-    let session = crate::tmux::Session::from_observation(session.name(), physical.clone());
-    let (readiness, checked) = readiness_in(instance, &session, Some(pane));
-    let receipt = checked.map(|_| CheckedSendPane {
-        created_at: instance.created_at,
-        lifecycle_generation: instance.lifecycle_generation,
-        profile: instance.source_profile.clone(),
-        physical,
-    });
-    (readiness, receipt)
 }
 
 /// [`pane_readiness`] of the pane its lookup found. Without one nothing is captured: the
 /// session's default target may be another pane than the one a send would type into.
-fn readiness_in(
+fn readiness_in<'pane>(
     instance: &Instance,
     session: &crate::tmux::Session,
-    pane: Option<String>,
-) -> (PaneReadiness, Option<String>) {
+    pane: Option<&'pane str>,
+) -> (PaneReadiness, Option<&'pane str>) {
     let Some(pane) = pane else {
         return (PaneReadiness::Unreadable, None);
     };
     let (detected, input_line) =
-        instance.detect_pane_and_input_line_now(&instance.source_profile, session, &pane);
+        instance.detect_pane_and_input_line_now(&instance.source_profile, session, pane);
     let readiness = readiness_of(detected, input_line);
     #[cfg(test)]
-    crate::tmux::test_helpers::after_input_check(&pane);
+    crate::tmux::test_helpers::after_input_check(pane);
     (readiness, Some(pane))
 }
 
@@ -1278,7 +1273,7 @@ mod tests {
             let checked = pane_readiness(&instance)
                 .1
                 .expect("the draft pane is observed");
-            assert_eq!(checked.physical.identity.pane_id, pane);
+            assert_eq!(checked.pane_id(), pane);
 
             let (sent, _, _, code) = McpServer::new(state)
                 .deliver_terminal_prompt(
@@ -1338,10 +1333,10 @@ mod tests {
 
         // (case, the lookup's pane, readiness; the send gets the looked-up pane back)
         for (case, looked_up, want) in [
-            ("looked-up", Some(pane.clone()), PaneReadiness::AtPrompt),
+            ("looked-up", Some(pane.as_str()), PaneReadiness::AtPrompt),
             ("lookup-failed", None, PaneReadiness::Unreadable),
         ] {
-            let (readiness, checked) = readiness_in(&instance, &session, looked_up.clone());
+            let (readiness, checked) = readiness_in(&instance, &session, looked_up);
             assert_eq!(readiness, want, "{case}");
             assert_eq!(checked, looked_up, "{case}");
         }
@@ -1457,9 +1452,9 @@ mod tests {
                     }
                 });
             }
-            let (readiness, checked) = readiness_in(&instance, &session, Some(pane.clone()));
+            let (readiness, checked) = readiness_in(&instance, &session, Some(&pane));
             assert_eq!(readiness, want, "{case}");
-            assert_eq!(checked, Some(pane), "{case}");
+            assert_eq!(checked, Some(pane.as_str()), "{case}");
         }
     }
 
