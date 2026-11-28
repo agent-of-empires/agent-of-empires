@@ -181,12 +181,15 @@ function Image({ name }: { name: string }) {
   return <span className="text-text-subtle break-all">· {name}</span>;
 }
 
-/** A toggle with its panel below the banner; Escape closes it. */
+/**
+ * A toggle with its panel below the banner; Escape closes it. Below md the panel is a full-width row of the banner
+ * instead, since a phone's banner card clips anything drawn outside it.
+ */
 function Disclosure({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const panelId = useId();
   return (
-    <span onKeyDown={(e) => e.key === "Escape" && setOpen(false)}>
+    <span className="max-md:contents" onKeyDown={(e) => e.key === "Escape" && setOpen(false)}>
       <button
         type="button"
         aria-expanded={open}
@@ -199,7 +202,7 @@ function Disclosure({ label, children }: { label: string; children: ReactNode })
       <span
         id={panelId}
         hidden={!open}
-        className="absolute left-1/2 top-full z-30 mt-1 w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 rounded-md border border-surface-700 bg-surface-850 p-3 text-left font-sans text-xs leading-relaxed text-text-primary shadow-lg"
+        className="absolute left-1/2 top-full z-30 mt-1 w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 rounded-md border border-surface-700 bg-surface-850 p-3 text-left font-sans text-xs leading-relaxed text-text-primary shadow-lg max-md:static max-md:basis-full max-md:w-full max-md:translate-x-0 max-md:shadow-none"
       >
         {children}
       </span>

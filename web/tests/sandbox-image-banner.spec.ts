@@ -5,7 +5,11 @@ import type { Page } from "@playwright/test";
 const IMAGE = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
 
 /** A Daemon whose pull state the test moves; every status poll reads it. */
-async function mockDaemon(page: Page, pull: { current: Record<string, unknown> }) {
+async function mockDaemon(
+  page: Page,
+  pull: { current: Record<string, unknown> },
+  status: Record<string, unknown> = {},
+) {
   await mockStaticApis(page);
   await page.route(/\/api\/sessions(\?.*)?$/, (r) =>
     r.fulfill({
@@ -25,6 +29,7 @@ async function mockDaemon(page: Page, pull: { current: Record<string, unknown> }
         pull_blocked: null,
         pull_command: `docker pull ${IMAGE}`,
         runtime: "Docker",
+        ...status,
       },
     }),
   );
@@ -110,6 +115,20 @@ test("at 375px a refused Cancel says so, and its Details fit on screen (#5751)",
   await banner.getByRole("button", { name: "Details" }).click();
   await expect(page.getByText("Pulling sandbox images from the web is off.")).toBeInViewport();
   for (const name of ["Cancel", "Details", "Hide sandbox image notice"]) {
+    await expect(banner.getByRole("button", { name })).toBeInViewport();
+  }
+  expect(await noSideScroll(page)).toBeLessThanOrEqual(0);
+});
+
+test("at 375px the update offer's Why? fits on screen", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 800 });
+  await mockDaemon(page, { current: { state: "idle" } }, { state: "available", remote_digest: "sha256:b" });
+  await page.goto("/");
+  const banner = page.getByTestId("sandbox-image-banner");
+  await expect(banner.getByRole("status")).toHaveText("Sandbox image update available");
+  await banner.getByRole("button", { name: "Why?" }).click();
+  await expect(page.getByText("Sandboxed Sessions run in the current image.", { exact: false })).toBeInViewport();
+  for (const name of ["Update now", "Why?", "Dismiss sandbox image notice"]) {
     await expect(banner.getByRole("button", { name })).toBeInViewport();
   }
   expect(await noSideScroll(page)).toBeLessThanOrEqual(0);
