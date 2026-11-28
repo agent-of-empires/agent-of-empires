@@ -194,18 +194,20 @@ pub(super) fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, Str
 }
 
 /// Path-valued allowlist entries: valid on the host, meaningless in a
-/// container. A path-valued key added to `env_allowlist_for` belongs here.
-pub(super) fn is_host_only_path_env(key: &str) -> bool {
-    matches!(
-        key,
-        "CLAUDE_CONFIG_DIR"
-            | "CODEX_HOME"
-            | "GOOGLE_APPLICATION_CREDENTIALS"
-            | "AWS_CONFIG_FILE"
-            | "AWS_SHARED_CREDENTIALS_FILE"
-            | "AWS_WEB_IDENTITY_TOKEN_FILE"
-            | "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
-    )
+/// container. A path-valued key added to `env_allowlist_for` belongs here, as does
+/// any key a plugin declared `host_only` (`declared`).
+pub(super) fn is_host_only_path_env(key: &str, declared: &[String]) -> bool {
+    declared.iter().any(|k| k == key)
+        || matches!(
+            key,
+            "CLAUDE_CONFIG_DIR"
+                | "CODEX_HOME"
+                | "GOOGLE_APPLICATION_CREDENTIALS"
+                | "AWS_CONFIG_FILE"
+                | "AWS_SHARED_CREDENTIALS_FILE"
+                | "AWS_WEB_IDENTITY_TOKEN_FILE"
+                | "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
+        )
 }
 
 /// The adapter's `env_allowlist` (#3238) resolved against the live env, with
@@ -232,9 +234,16 @@ pub(super) fn allowlisted_env_pairs_for(allowlist: Option<&[String]>) -> Vec<(St
     pairs
 }
 
-/// AoE's own adapter defaults, applied below every explicit env layer so a
-/// user-set value always wins.
+/// AoE's own adapter defaults, or a plugin's declared ones, applied below every explicit
+/// env layer so a user-set value always wins.
 pub(super) fn adapter_default_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
+    if let Some(env) = &config.spec.plugin_env {
+        return env
+            .defaults
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+    }
     crate::acp::agent_compat::ExpectedAgent::from_command(&config.spec.command)
         .default_env()
         .iter()
@@ -977,6 +986,41 @@ mod tests {
             }
         }
     }
+    /// A plugin row takes its allowlist and defaults from its declaration: a host value
+    /// beats a default, a host-only key still applies on the host, and the built-in adapter
+    /// defaults are not guessed from the command name.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_filter_applies_a_plugin_env_declaration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("ZZ_TOKEN", "host-token"),
+            ("ZZ_HOME", "/host/zz"),
+            ("ZZ_UNLISTED", "leak"),
+        ]);
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.command = "claude-agent-acp".into();
+        config.spec.env_allowlist = Some(vec!["ZZ_TOKEN".into(), "ZZ_HOME".into()]);
+        config.spec.plugin_env = Some(aoe_plugin_api::agent_integration::AcpEnv {
+            allowlist: vec!["ZZ_TOKEN".into(), "ZZ_HOME".into()],
+            host_only: vec!["ZZ_HOME".into()],
+            defaults: [
+                ("ZZ_TOKEN".to_string(), "default-token".to_string()),
+                ("ZZ_REGION".to_string(), "eu".to_string()),
+            ]
+            .into(),
+        });
+
+        let applied = applied_env(&config);
+        let get = |key: &str| applied.get(key).map(String::as_str);
+        assert_eq!(get("ZZ_TOKEN"), Some("host-token"));
+        assert_eq!(get("ZZ_REGION"), Some("eu"));
+        assert_eq!(get("ZZ_HOME"), Some("/host/zz"));
+        assert_eq!(get("ZZ_UNLISTED"), None);
+        assert_eq!(get("CLAUDE_CODE_THINKING_DISPLAY"), None);
+    }
+
     #[test]
     #[serial_test::serial]
     fn unpinned_claude_allowlist_preserves_an_operator_store() {

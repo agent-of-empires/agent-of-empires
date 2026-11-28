@@ -13,9 +13,20 @@ pub struct AgentSpec {
     pub description: String,
     /// Provider env vars forwarded on top of `ALWAYS_FORWARD_ENV` in `acp_client/spawn.rs`.
     pub env_allowlist: Option<Vec<String>>,
+    /// The env a plugin declared for its adapter: its `defaults` replace the built-in adapter
+    /// defaults and its `host_only` keys stay out of a sandbox. `None` for a built-in or custom agent.
+    #[serde(default)]
+    pub plugin_env: Option<aoe_plugin_api::agent_integration::AcpEnv>,
 }
 
 impl AgentSpec {
+    /// Allowlisted keys a plugin declared meaningless in a container.
+    pub(crate) fn host_only_env(&self) -> &[String] {
+        self.plugin_env
+            .as_ref()
+            .map_or(&[], |env| env.host_only.as_slice())
+    }
+
     /// Build a spec from a custom agent's `agent_acp_cmd` string.
     pub fn from_acp_cmd(name: &str, cmd: &str) -> Result<AgentSpec, String> {
         let argv = shell_words::split(cmd).map_err(|e| {
@@ -31,6 +42,7 @@ impl AgentSpec {
             args: argv.collect(),
             description: format!("Custom ACP agent `{name}`"),
             env_allowlist: None,
+            plugin_env: None,
         })
     }
 }

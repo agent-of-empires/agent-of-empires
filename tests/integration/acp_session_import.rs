@@ -25,6 +25,7 @@ fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
             args: vec![shim_path().to_string_lossy().into_owned()],
             description: "import shim".into(),
             env_allowlist: None,
+            plugin_env: None,
         },
         cwd: std::env::temp_dir(),
         config_path: std::env::temp_dir(),

@@ -37,6 +37,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
             args: vec![shim.to_string_lossy().to_string()],
             description: "session/delete shim".into(),
             env_allowlist: None,
+            plugin_env: None,
         },
         cwd: std::env::temp_dir(),
         config_path: std::env::temp_dir(),

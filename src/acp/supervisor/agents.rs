@@ -359,6 +359,7 @@ mod tests {
             args: args.iter().map(|s| s.to_string()).collect(),
             description: "test".into(),
             env_allowlist: None,
+            plugin_env: None,
         }
     }
 

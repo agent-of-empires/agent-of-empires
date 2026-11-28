@@ -4542,6 +4542,7 @@ primitive_schema_version = 1
             args: vec![],
             description: "custom".into(),
             env_allowlist: None,
+            plugin_env: None,
         };
         let (cmd, _) = acp_command_fields(Some(&spec), Some(dir));
         let cmd = cmd.expect("spec has a command");

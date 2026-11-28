@@ -279,11 +279,7 @@ pub(crate) fn effective_launch_env(
         let base = crate::acp::inherited_acp_base(agent, &session.agent_detect_as)?;
         registry.get(&base)
     });
-    crate::acp::acp_client::effective_launch_env(
-        sandbox_env,
-        request_env,
-        spec.and_then(|s| s.env_allowlist.as_deref()),
-    )
+    crate::acp::acp_client::effective_launch_env(sandbox_env, request_env, spec)
 }
 
 /// Discard first, persist the new mount stamp second, then build. A failed

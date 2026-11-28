@@ -116,6 +116,7 @@ done
             args: vec![script.to_string_lossy().into_owned()],
             description: "list env stub".into(),
             env_allowlist: None,
+            plugin_env: None,
         };
         let cfg = crate::session::Config {
             environment: vec![

@@ -37,6 +37,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
             args: vec![shim.to_string_lossy().to_string()],
             description: "test shim".into(),
             env_allowlist: None,
+            plugin_env: None,
         },
         config_path: cwd.clone(),
         cwd,

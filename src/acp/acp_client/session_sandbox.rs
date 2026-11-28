@@ -199,6 +199,7 @@ pub(super) fn build_sandbox_docker_argv(
         &config.provider_env,
         allowlisted_env_pairs(config),
         adapter_default_env_pairs(config),
+        config.spec.host_only_env(),
     ) {
         if forwards {
             docker_args.push("-e".into());
@@ -259,12 +260,14 @@ pub(super) struct ClaimedEnv {
 /// holds the keys already taken, the sandbox environment's among them; the first claim of a
 /// key wins even when its value is empty, so a later source never fills it in. `defaults` are
 /// AoE's own adapter defaults, claimed last so any explicit value wins. The one resolution
-/// shared by the launch's argv and the launch-authentication admission.
+/// shared by the launch's argv and the launch-authentication admission. `host_only` are the
+/// keys a plugin declared meaningless in a container.
 pub(super) fn claim_launch_env(
     claimed: &mut std::collections::HashSet<String>,
     request: &[(String, String)],
     allowlist: Vec<(String, String)>,
     defaults: Vec<(String, String)>,
+    host_only: &[String],
 ) -> Vec<ClaimedEnv> {
     let request = request
         .iter()
@@ -275,29 +278,30 @@ pub(super) fn claim_launch_env(
         .chain(defaults)
         .filter(|(key, _)| claimed.insert(key.clone()))
         .map(|(key, value)| ClaimedEnv {
-            forwards: forwards_into_container(&key),
+            forwards: forwards_into_container(&key, host_only),
             key,
             value,
         })
         .collect()
 }
 
-/// The environment a sandboxed launch of an adapter with `allowlist` runs with, as far as its
+/// The environment a sandboxed launch of the adapter `spec` runs with, as far as its
 /// authentication is concerned: `sandbox_env` first, then what `claim_launch_env` forwards
 /// of the request's `provider_env` and the allowlisted host variables the daemon has set.
 /// Resolved in memory for the admission check; the request's values are never stored.
 pub fn effective_launch_env(
     sandbox_env: &[crate::containers::EnvEntry],
     request: &[(String, String)],
-    allowlist: Option<&[String]>,
+    spec: Option<&crate::acp::AgentSpec>,
 ) -> Vec<crate::containers::EnvEntry> {
     let mut claimed = sandbox_env.iter().map(|e| e.key().to_string()).collect();
     // AoE's adapter defaults carry no authentication, so they take no part in the admission.
     let forwarded = claim_launch_env(
         &mut claimed,
         request,
-        allowlisted_env_pairs_for(allowlist),
+        allowlisted_env_pairs_for(spec.and_then(|s| s.env_allowlist.as_deref())),
         Vec::new(),
+        spec.map_or(&[], |s| s.host_only_env()),
     )
     .into_iter()
     .filter(|c| c.forwards)
@@ -311,8 +315,8 @@ pub fn effective_launch_env(
 /// A path-valued key names nothing inside the container, so a sandboxed launch
 /// drops it. `docs/structured-view.md` documents the drop; the caller names the
 /// key and the reason in the log, at the point the value is actually lost.
-fn forwards_into_container(key: &str) -> bool {
-    !is_host_only_path_env(key)
+fn forwards_into_container(key: &str, host_only: &[String]) -> bool {
+    !is_host_only_path_env(key, host_only)
 }
 
 /// The `cwd` for `session/new` / `session/load` / `session/fork`. A sandboxed
@@ -620,6 +624,41 @@ mod tests {
         }
         assert_absent(&argv, "LD_PRELOAD");
         assert_absent(&argv, "ANTHROPIC_API_KEY");
+    }
+
+    /// A plugin's env declaration governs its adapter: `host_only` keys stay out of the
+    /// container like the built-in path keys, its defaults cross, and the built-in adapter
+    /// defaults are not guessed from the command name.
+    #[test]
+    #[serial_test::serial]
+    fn build_sandbox_docker_argv_applies_a_plugin_env_declaration() {
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("ZZ_TOKEN", "tok"),
+            ("ZZ_HOME", "/host/zz"),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let info = sandbox("aoe-sandbox-plugin-env", None);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.spec.command = "claude-agent-acp".into();
+        config.spec.env_allowlist = Some(vec!["ZZ_TOKEN".into(), "ZZ_HOME".into()]);
+        config.spec.plugin_env = Some(aoe_plugin_api::agent_integration::AcpEnv {
+            allowlist: vec!["ZZ_TOKEN".into(), "ZZ_HOME".into()],
+            host_only: vec!["ZZ_HOME".into()],
+            defaults: [("ZZ_REGION".to_string(), "eu".to_string())].into(),
+        });
+
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+
+        assert_named_without_value(&argv, "ZZ_TOKEN", "tok");
+        assert_named_without_value(&argv, "ZZ_REGION", "eu");
+        assert_absent(&argv, "ZZ_HOME");
+        assert_absent(&argv, "CLAUDE_CODE_THINKING_DISPLAY");
+        assert!(
+            effective_launch_env(&[], &[], Some(&config.spec))
+                .iter()
+                .all(|entry| entry.key() != "ZZ_HOME"),
+            "the admission drops a host-only key too"
+        );
     }
 
     /// The request's `provider_env` must win a shared key over the adapter's

@@ -43,6 +43,7 @@ fn spawn_config(
             args: vec![shim.to_string_lossy().to_string()],
             description: "model-option shim".into(),
             env_allowlist: None,
+            plugin_env: None,
         },
         cwd: std::env::temp_dir(),
         config_path: std::env::temp_dir(),

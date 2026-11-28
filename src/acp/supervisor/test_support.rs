@@ -465,6 +465,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
             args: vec![],
             description: "test fixture".into(),
             env_allowlist: None,
+            plugin_env: None,
         },
         cwd: std::env::temp_dir(),
         config_path: std::env::temp_dir(),

@@ -581,6 +581,7 @@ async fn killing_the_proxy_mid_turn_loses_the_integration() {
             ],
             description: "fake proxy over the test shim".into(),
             env_allowlist: None,
+            plugin_env: None,
         },
         config_path: cwd.clone(),
         cwd,

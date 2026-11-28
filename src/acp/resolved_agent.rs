@@ -65,6 +65,7 @@ impl ResolvedAcpAgent {
                 args: args.iter().map(|a| a.to_string()).collect(),
                 description: description.into(),
                 env_allowlist: (!allowlist.is_empty()).then(|| allowlist.clone()),
+                plugin_env: None,
             },
             env: AcpEnv {
                 allowlist,
@@ -110,6 +111,7 @@ impl ResolvedAcpAgent {
                 args,
                 description: format!("{} (plugin {plugin_id})", acp.display_name),
                 env_allowlist: (!env.allowlist.is_empty()).then(|| env.allowlist.clone()),
+                plugin_env: Some(env.clone()),
             },
             env,
             compat: acp.compat.clone(),

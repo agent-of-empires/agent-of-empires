@@ -61,6 +61,7 @@ fn spawn_config(
             args: vec![shim_path().to_string_lossy().to_string()],
             description: "provider-routing shim".into(),
             env_allowlist: None,
+            plugin_env: None,
         },
         cwd: std::env::temp_dir(),
         config_path: std::env::temp_dir(),
