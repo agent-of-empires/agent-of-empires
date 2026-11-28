@@ -264,6 +264,12 @@ mod tests {
     }
 
     #[test]
+    fn a_glyph_without_a_following_space_is_not_a_prompt() {
+        let pane = "❯ first\n● reply\n❯pasted\n● reply";
+        assert_eq!(claude(pane).as_deref(), Some("first"));
+    }
+
+    #[test]
     fn none_when_no_prompt_present() {
         assert_eq!(claude("just some output\nno markers here"), None);
         assert_eq!(claude(""), None);

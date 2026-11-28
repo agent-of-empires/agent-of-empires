@@ -772,47 +772,36 @@ not = [{ region = "evidence(secondary)", contains = ["cancel"] }]
         }
     }
 
-    /// The previous hand-written chrome checks, kept as the oracle.
-    fn old_chrome(trimmed: &str) -> bool {
-        let lower = trimmed.to_lowercase();
-        (trimmed.starts_with('⎿') && trimmed.contains("Tip:"))
-            || trimmed.starts_with("new task?")
-            || ((trimmed.starts_with('⏵') || trimmed.starts_with('⏸'))
-                && (lower.contains(" on") || lower.contains("shift+tab")))
-            || ((trimmed.starts_with('✔') || trimmed.starts_with('✓'))
-                && lower.contains("update")
-                && (lower.contains("restart") || lower.contains("installed")))
-    }
-
     #[test]
-    fn claude_chrome_regexes_agree_with_the_old_helpers() {
+    fn claude_chrome_regexes_classify_lines() {
         let manifest =
             Manifest::parse(include_str!("manifests/claude.toml"), &[]).expect("claude manifest");
         let input_box = manifest.input_box.as_ref().expect("claude input_box");
-        for line in [
-            "⎿ Tip: use /compact",
-            "⎿ no hint here",
-            "Tip: not under a result",
-            "new task? /clear to save 40k tokens",
-            "not a new task? line",
-            "⏵⏵ bypass permissions on (shift+tab to cycle)",
-            "⏸ plan mode on",
-            "⏵⏵ accept edits",
-            "⏵ SHIFT+TAB to cycle",
-            "⏵ auto mode ON",
-            "⏵ done",
-            "✓ Update installed · Restart to apply",
-            "✔ Restart to finish the UPDATE",
-            "✓ installed update",
-            "✔ Update available",
-            "✓ Restart now",
-            "✓ updated",
-            "update installed, restart",
-            "● Done",
-            "",
+        for (line, expected) in [
+            ("⎿ Tip: use /compact", true),
+            ("⎿ no hint here", false),
+            ("Tip: not under a result", false),
+            ("new task? /clear to save 40k tokens", true),
+            ("not a new task? line", false),
+            ("⏵⏵ bypass permissions on (shift+tab to cycle)", true),
+            ("⏸ plan mode on", true),
+            ("⏵⏵ accept edits", false),
+            ("⏵ SHIFT+TAB to cycle", true),
+            ("⏸ shift+tab to cycle", true),
+            ("⏵ auto mode ON", true),
+            ("⏵ done", false),
+            ("✓ Update installed · Restart to apply", true),
+            ("✔ Restart to finish the UPDATE", true),
+            ("✓ installed update", true),
+            ("✔ Update available", false),
+            ("✓ Restart now", false),
+            ("✓ updated", false),
+            ("update installed, restart", false),
+            ("● Done", false),
+            ("", false),
         ] {
             let got = input_box.chrome.iter().any(|re| re.is_match(line));
-            assert_eq!(got, old_chrome(line), "{line:?}");
+            assert_eq!(got, expected, "{line:?}");
         }
     }
 }

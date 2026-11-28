@@ -124,6 +124,7 @@ pub fn run() -> Result<()> {
 }
 
 /// Exits 0 when a rule matched, 1 when none did, 2 when an input could not be used.
+#[tracing::instrument(target = "cli.agents", skip_all)]
 pub fn run_detect(args: DetectArgs) -> Result<()> {
     match detect(&args) {
         Ok(true) => Ok(()),
