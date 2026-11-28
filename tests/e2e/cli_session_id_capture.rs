@@ -249,11 +249,15 @@ fn install_reconstructing_fake_omp(
     let script = format!(
         "#!/bin/sh\n\
          control={control}\n\
-         if [ -f \"$control/launched\" ]; then\n\
+         if [ ! -f \"$control/launched-metadata\" ]; then\n\
+           : > \"$control/launched-metadata\"\n\
+           slot=metadata; sid={first}; stale={metadata_stale}; store={metadata_store}\n\
+         elif [ ! -f \"$control/launched-legacy\" ]; then\n\
+           : > \"$control/launched-legacy\"\n\
            slot=legacy; sid={second}; stale={legacy_stale}; store={legacy_store}\n\
          else\n\
-           : > \"$control/launched\"\n\
-           slot=metadata; sid={first}; stale={metadata_stale}; store={metadata_store}\n\
+           : > \"$control/launched-resident\"\n\
+           slot=resident; sid={third}; stale={metadata_stale}; store={metadata_store}\n\
          fi\n\
          sessions_dir=\"$store/sessions/home-project\"\n\
          terminal_dir=\"$store/terminal-sessions\"\n\
@@ -284,6 +288,7 @@ fn install_reconstructing_fake_omp(
         legacy_store = sh_quote(legacy_store),
         first = OMP_SID_FIRST,
         second = OMP_SID_SECOND,
+        third = OMP_SID_THIRD,
         old_cwd = sh_quote(old_project),
         cwd = sh_quote(project),
     );
@@ -311,6 +316,9 @@ fn omp_reconstruction_rejects_cross_project_and_unqualified_legacy_publications(
     for (slot, store, title) in [
         ("metadata", &metadata_store, "OmpCrossProject"),
         ("legacy", &legacy_store, "OmpUnqualifiedLegacy"),
+        // Same project, post-launch, current generation: what the removed
+        // built-in capture would have adopted.
+        ("resident", &metadata_store, "OmpResidentPublication"),
     ] {
         write_project_omp_dotenv(&project, store);
         h.run_cli_ok(&["add", project.to_str().unwrap(), "-c", "omp", "-t", title]);
