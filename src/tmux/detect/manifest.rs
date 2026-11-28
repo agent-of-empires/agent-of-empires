@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use super::region::{Marker, Region, Screen};
+use super::region::{InputBox, Marker, Region, Screen};
 use crate::session::Status;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +122,9 @@ struct RawManifest {
     /// The agent's input box, for [`super::input_line`].
     #[serde(default)]
     input_line: Option<RawInputLine>,
+    /// The agent's input box geometry, for `Region::AboveInputBox` and `Region::PromptBoxBody`.
+    #[serde(default)]
+    input_box: Option<RawInputBox>,
     rules: Vec<RawRule>,
 }
 
@@ -132,10 +135,21 @@ struct RawInputLine {
     prompt: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInputBox {
+    /// Matches the prompt glyph at the start of a line; the rest of the line is the typed text.
+    prompt: String,
+    /// Matched against the trimmed line; matching lines are skipped above the box.
+    #[serde(default)]
+    chrome: Vec<String>,
+}
+
 /// A compiled matcher: regexes compiled once, substrings pre-lowered.
 pub(super) struct MatchContext<'a> {
     pub(super) screen: &'a Screen<'a>,
     pub(super) prompt_marker: &'a [regex::Regex],
+    pub(super) input_box: Option<&'a InputBox>,
     pub(super) markers: &'a std::collections::HashMap<String, Marker>,
 }
 
@@ -175,6 +189,7 @@ pub(super) struct Manifest {
     /// Sorted by descending priority, so evaluation stops at the first match.
     pub(super) rules: Vec<Rule>,
     pub(super) input_line: Option<regex::Regex>,
+    pub(super) input_box: Option<InputBox>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,12 +263,22 @@ impl Matcher {
         })
     }
 
+    fn uses_input_box(&self) -> bool {
+        self.region.is_some_and(Region::needs_input_box)
+            || self
+                .any
+                .iter()
+                .chain(&self.all)
+                .chain(&self.not)
+                .any(Matcher::uses_input_box)
+    }
+
     fn matches(&self, text: &str, lower: &str, ctx: &MatchContext) -> bool {
         match self.region {
             Some(region) => {
-                let sliced = ctx
-                    .screen
-                    .region_text(region, ctx.prompt_marker, ctx.markers);
+                let sliced =
+                    ctx.screen
+                        .region_text(region, ctx.prompt_marker, ctx.input_box, ctx.markers);
                 let lowered = sliced.to_lowercase();
                 self.matches_in(&sliced, &lowered, ctx)
             }
@@ -322,16 +347,22 @@ impl Rule {
         })
     }
 
+    fn uses_input_box(&self) -> bool {
+        self.region.needs_input_box() || self.matcher.uses_input_box()
+    }
+
     fn matches(
         &self,
         screen: &Screen,
         hook: Option<HookObservation>,
         prompt_marker: &[regex::Regex],
+        input_box: Option<&InputBox>,
         markers: &std::collections::HashMap<String, Marker>,
     ) -> bool {
         let ctx = MatchContext {
             screen,
             prompt_marker,
+            input_box,
             markers,
         };
         if self.is_hook {
@@ -350,7 +381,7 @@ impl Rule {
             };
             return fresh && self.matcher.matches("", "", &ctx);
         }
-        let text = screen.region_text(self.region, prompt_marker, markers);
+        let text = screen.region_text(self.region, prompt_marker, input_box, markers);
         if text.is_empty() {
             return false;
         }
@@ -466,13 +497,15 @@ impl Rule {
         &self,
         screen: &Screen,
         prompt_marker: &[regex::Regex],
+        input_box: Option<&InputBox>,
         markers: &std::collections::HashMap<String, Marker>,
     ) -> Option<usize> {
-        let text = screen.region_text(self.region, prompt_marker, markers);
+        let text = screen.region_text(self.region, prompt_marker, input_box, markers);
         let lines: Vec<&str> = text.lines().collect();
         let ctx = MatchContext {
             screen,
             prompt_marker,
+            input_box,
             markers,
         };
         (0..lines.len()).rev().find_map(|idx| {
@@ -561,12 +594,39 @@ impl Manifest {
                 })
             })
             .transpose()?;
+        let input_box = raw
+            .input_box
+            .map(|geometry| {
+                let compile = |what: &str, p: &str| {
+                    regex::Regex::new(p).map_err(|e| {
+                        anyhow::anyhow!("input_box {what} {p:?} is not a valid regex: {e}")
+                    })
+                };
+                Ok::<_, anyhow::Error>(InputBox {
+                    prompt: compile("prompt", &geometry.prompt)?,
+                    chrome: geometry
+                        .chrome
+                        .iter()
+                        .map(|p| compile("chrome", p))
+                        .collect::<anyhow::Result<_>>()?,
+                })
+            })
+            .transpose()?;
+        if input_box.is_none() {
+            if let Some(rule) = rules.iter().find(|rule| rule.uses_input_box()) {
+                anyhow::bail!(
+                    "rule {}: uses an input box region, but the manifest has no [input_box]",
+                    rule.id
+                );
+            }
+        }
         Ok(Self {
             id: raw.id,
             prompt_marker,
             markers,
             rules,
             input_line,
+            input_box,
         })
     }
 
@@ -582,8 +642,15 @@ impl Manifest {
         screen: &Screen,
         hook: Option<HookObservation>,
     ) -> bool {
-        self.rule(id)
-            .is_some_and(|r| r.matches(screen, hook, &self.prompt_marker, &self.markers))
+        self.rule(id).is_some_and(|r| {
+            r.matches(
+                screen,
+                hook,
+                &self.prompt_marker,
+                self.input_box.as_ref(),
+                &self.markers,
+            )
+        })
     }
 
     /// The deciding rule: descending priority; positional peers of equal priority
@@ -593,7 +660,13 @@ impl Manifest {
         while i < self.rules.len() {
             let rule = &self.rules[i];
             if !rule.positional {
-                if rule.matches(screen, hook, &self.prompt_marker, &self.markers) {
+                if rule.matches(
+                    screen,
+                    hook,
+                    &self.prompt_marker,
+                    self.input_box.as_ref(),
+                    &self.markers,
+                ) {
                     return Some(rule);
                 }
                 i += 1;
@@ -606,8 +679,13 @@ impl Manifest {
             let winner = self.rules[i..group_end]
                 .iter()
                 .filter_map(|r| {
-                    r.match_position(screen, &self.prompt_marker, &self.markers)
-                        .map(|pos| (pos, r))
+                    r.match_position(
+                        screen,
+                        &self.prompt_marker,
+                        self.input_box.as_ref(),
+                        &self.markers,
+                    )
+                    .map(|pos| (pos, r))
                 })
                 .min_by_key(|(pos, _)| *pos)
                 .map(|(_, r)| r);
@@ -667,6 +745,74 @@ not = [{ region = "evidence(secondary)", contains = ["cancel"] }]
 
         for names in [&[][..], &["primary"][..], &["secondary"][..]] {
             assert!(Manifest::parse(source, names).is_err(), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn input_box_regions_require_an_input_box_table() {
+        for region in ["last_non_empty_above_prompt_box", "prompt_box_body"] {
+            let direct = format!(
+                "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"idle\"\npriority = 1\nregion = \"{region}\"\ncontains = [\"x\"]\n"
+            );
+            let nested = format!(
+                "id = \"t\"\n[[rules]]\nid = \"r\"\nstate = \"idle\"\npriority = 1\nregion = \"whole_recent\"\nall = [{{ region = \"{region}\", contains = [\"x\"] }}]\n"
+            );
+            for source in [direct, nested] {
+                let err = Manifest::parse(&source, &[])
+                    .err()
+                    .expect("must not compile");
+                assert!(err.to_string().contains("[input_box]"), "{region}: {err}");
+                let boxed = source.replacen(
+                    "id = \"t\"\n",
+                    "id = \"t\"\n[input_box]\nprompt = '^>'\n",
+                    1,
+                );
+                Manifest::parse(&boxed, &[]).expect("compiles with [input_box]");
+            }
+        }
+    }
+
+    /// The previous hand-written chrome checks, kept as the oracle.
+    fn old_chrome(trimmed: &str) -> bool {
+        let lower = trimmed.to_lowercase();
+        (trimmed.starts_with('⎿') && trimmed.contains("Tip:"))
+            || trimmed.starts_with("new task?")
+            || ((trimmed.starts_with('⏵') || trimmed.starts_with('⏸'))
+                && (lower.contains(" on") || lower.contains("shift+tab")))
+            || ((trimmed.starts_with('✔') || trimmed.starts_with('✓'))
+                && lower.contains("update")
+                && (lower.contains("restart") || lower.contains("installed")))
+    }
+
+    #[test]
+    fn claude_chrome_regexes_agree_with_the_old_helpers() {
+        let manifest =
+            Manifest::parse(include_str!("manifests/claude.toml"), &[]).expect("claude manifest");
+        let input_box = manifest.input_box.as_ref().expect("claude input_box");
+        for line in [
+            "⎿ Tip: use /compact",
+            "⎿ no hint here",
+            "Tip: not under a result",
+            "new task? /clear to save 40k tokens",
+            "not a new task? line",
+            "⏵⏵ bypass permissions on (shift+tab to cycle)",
+            "⏸ plan mode on",
+            "⏵⏵ accept edits",
+            "⏵ SHIFT+TAB to cycle",
+            "⏵ auto mode ON",
+            "⏵ done",
+            "✓ Update installed · Restart to apply",
+            "✔ Restart to finish the UPDATE",
+            "✓ installed update",
+            "✔ Update available",
+            "✓ Restart now",
+            "✓ updated",
+            "update installed, restart",
+            "● Done",
+            "",
+        ] {
+            let got = input_box.chrome.iter().any(|re| re.is_match(line));
+            assert_eq!(got, old_chrome(line), "{line:?}");
         }
     }
 }

@@ -59,6 +59,12 @@ pub(super) struct Screen<'a> {
 
 const RECENT_LINES: usize = 30;
 
+/// An agent's input box geometry from its manifest's `[input_box]` table.
+pub(super) struct InputBox {
+    pub(super) prompt: regex::Regex,
+    pub(super) chrome: Vec<regex::Regex>,
+}
+
 /// A landmark line (a turn divider, an input box rule, a banner) that regions
 /// like `after(<name>)` and `above(<name>, n)` resolve through.
 pub(super) struct Marker {
@@ -154,6 +160,10 @@ pub(super) enum Region {
 }
 
 impl Region {
+    pub(super) fn needs_input_box(self) -> bool {
+        matches!(self, Region::AboveInputBox | Region::PromptBoxBody)
+    }
+
     /// Marker region names are leaked once at compile time (process lifetime).
     pub(super) fn parse(raw: &str, evidence_names: &[&str]) -> Option<Self> {
         if let Some(name) = raw
@@ -239,6 +249,7 @@ impl<'a> Screen<'a> {
         &self,
         region: Region,
         prompt_marker: &[regex::Regex],
+        input_box: Option<&InputBox>,
         markers: &std::collections::HashMap<String, Marker>,
     ) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(match region {
@@ -259,12 +270,12 @@ impl<'a> Screen<'a> {
             }
             Region::AboveInputBox => self
                 .above_input_box
-                .get_or_init(|| self.compute_above_input_box())
+                .get_or_init(|| self.compute_above_input_box(input_box?))
                 .as_deref()
                 .unwrap_or(""),
             Region::PromptBoxBody => self
                 .prompt_box_body
-                .get_or_init(|| self.compute_prompt_box_body())
+                .get_or_init(|| self.compute_prompt_box_body(input_box?))
                 .as_deref()
                 .unwrap_or(""),
             Region::AfterLastRule => self
@@ -335,23 +346,23 @@ impl<'a> Screen<'a> {
         self.joined.get_or_init(|| self.recent.join("\n"))
     }
 
-    fn compute_above_input_box(&self) -> Option<String> {
-        let box_top = self
-            .recent
+    fn prompt_line(&self, input_box: &InputBox) -> Option<usize> {
+        self.recent
             .iter()
-            .rposition(|l| l.trim_start().starts_with('❯'))
-            .unwrap_or(self.recent.len());
+            .rposition(|l| input_box.prompt.is_match(l))
+    }
+
+    fn compute_above_input_box(&self, input_box: &InputBox) -> Option<String> {
+        let box_top = self.prompt_line(input_box).unwrap_or(self.recent.len());
         self.recent[..box_top]
             .iter()
             .rev()
-            .find(|l| !line_is_input_box_chrome(l))
+            .find(|l| !line_is_input_box_chrome(l, input_box))
             .map(|l| (*l).to_string())
     }
 
-    fn compute_prompt_box_body(&self) -> Option<String> {
-        self.recent
-            .iter()
-            .rposition(|l| l.trim_start().starts_with('❯'))
+    fn compute_prompt_box_body(&self, input_box: &InputBox) -> Option<String> {
+        self.prompt_line(input_box)
             .map(|idx| self.recent[idx].to_string())
     }
 
@@ -374,27 +385,9 @@ pub(super) fn line_is_horizontal_rule(trimmed: &str) -> bool {
 
 /// Input-box furniture that [`Region::AboveInputBox`] skips; unlisted furniture
 /// hides the status slot.
-fn line_is_input_box_chrome(line: &str) -> bool {
+fn line_is_input_box_chrome(line: &str, input_box: &InputBox) -> bool {
     let trimmed = line.trim();
-    line_is_horizontal_rule(trimmed)
-        || (trimmed.starts_with('⎿') && trimmed.contains("Tip:"))
-        || trimmed.starts_with("new task?")
-        || line_is_mode_footer(trimmed)
-        || line_is_update_banner(trimmed)
-}
-
-fn line_is_mode_footer(trimmed: &str) -> bool {
-    let lower = trimmed.to_lowercase();
-    (trimmed.starts_with('⏵') || trimmed.starts_with('⏸'))
-        && (lower.contains(" on") || lower.contains("shift+tab"))
-}
-
-/// Claude's self-update notice, which otherwise hides the completion line.
-fn line_is_update_banner(trimmed: &str) -> bool {
-    let lower = trimmed.to_lowercase();
-    (trimmed.starts_with('✔') || trimmed.starts_with('✓'))
-        && lower.contains("update")
-        && (lower.contains("restart") || lower.contains("installed"))
+    line_is_horizontal_rule(trimmed) || input_box.chrome.iter().any(|re| re.is_match(trimmed))
 }
 
 /// Glue runs of single-character lines (a narrow Textual pane stacking a word);

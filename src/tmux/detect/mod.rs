@@ -201,6 +201,23 @@ pub fn input_line(agent: &str, capture: &str) -> InputLine {
     }
 }
 
+/// The text after the `[input_box]` prompt glyph on `line`; `None` when the agent's manifest
+/// declares no input box or the line does not start with the prompt.
+pub fn submitted_prompt<'a>(agent: &str, line: &'a str) -> Option<&'a str> {
+    strip_prompt(&detector(agent)?.manifest, line)
+}
+
+fn strip_prompt<'a>(manifest: &Manifest, line: &'a str) -> Option<&'a str> {
+    let prompt = &manifest.input_box.as_ref()?.prompt;
+    Some(&line[prompt.find(line)?.end()..])
+}
+
+#[cfg(test)]
+pub(crate) fn submitted_prompt_from_source<'a>(source: &str, line: &'a str) -> Option<&'a str> {
+    let manifest = Manifest::parse(source, adapter::PLAIN.evidence_names).expect("manifest");
+    strip_prompt(&manifest, line)
+}
+
 /// Evaluate an agent manifest over an ANSI-stripped capture.
 pub fn detect<'a>(
     agent: &str,
