@@ -1005,6 +1005,142 @@ fn agent_display_name_and_icon_are_validated() {
     }
 }
 
+const PROFILE: &str = r#"
+[[agent_integrations]]
+tool = "example"
+command = "example"
+[agent_integrations.profile]
+parent_meta_namespaces = ["example"]
+clear_aliases = ["/clear"]
+compact_aliases = ["/compact"]
+supports_subagents = true
+todos = true
+yolo_mode_id = "bypass"
+subagent_tool_names = ["Task"]
+mcp_prefixes = ["mcp__"]
+memory_path_regex = "(^|/)\\.example/memory/[^/]+\\.md$"
+[agent_integrations.profile.card_aliases]
+execute = ["Bash"]
+[agent_integrations.profile.special_titles]
+skill_names = ["Skill"]
+"#;
+
+#[test]
+fn agent_profile_round_trips_and_rejects_unknown_fields() {
+    let m = parse(30, PROFILE);
+    let profile = m.agent_integrations[0].profile.as_ref().unwrap();
+    assert_eq!(profile.clear_aliases, ["/clear"]);
+    assert_eq!(profile.card_aliases.execute, ["Bash"]);
+    assert_eq!(profile.special_titles.skill_names, ["Skill"]);
+    assert_eq!(profile.yolo_mode_id.as_deref(), Some("bypass"));
+    assert!(profile.supports_subagents && !profile.skills);
+    let reparsed = PluginManifest::from_toml_str(&toml::to_string(&m).unwrap()).unwrap();
+    assert_eq!(reparsed.agent_integrations[0], m.agent_integrations[0]);
+
+    for extra in [
+        "key = \"x\"\n",
+        "oneshot_gate = \"x\"\n",
+        "fullscreen_probe = \"x\"\n",
+    ] {
+        let body = PROFILE.replace("todos = true\n", &format!("todos = true\n{extra}"));
+        let err = PluginManifest::from_toml_str(&manifest(30, &body)).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{extra}: {err}");
+    }
+}
+
+#[test]
+fn agent_profile_requires_api_30() {
+    let errors = invalid(29, PROFILE);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("agent_integrations[0].profile requires api_version >= 30")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn agent_profile_is_validated() {
+    let with = |extra: &str| PROFILE.replace("todos = true\n", &format!("todos = true\n{extra}\n"));
+    let long = "x".repeat(129);
+    let many = (0..33)
+        .map(|n| format!("\"a{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cases = [
+        (with("skills = true"), None),
+        ("".to_string(), None),
+        (
+            PROFILE.replace("[\"/clear\"]", "[\"clear\"]"),
+            Some("clear_aliases"),
+        ),
+        (
+            PROFILE.replace("[\"/clear\"]", "[\"/clear all\"]"),
+            Some("clear_aliases"),
+        ),
+        (
+            PROFILE.replace("[\"/compact\"]", "[\"/compact\", \"/compact\"]"),
+            Some("compact_aliases"),
+        ),
+        (
+            PROFILE.replace("[\"mcp__\"]", "[\"\"]"),
+            Some("mcp_prefixes"),
+        ),
+        (
+            PROFILE.replace("[\"mcp__\"]", "[\"a\\u001b\"]"),
+            Some("mcp_prefixes"),
+        ),
+        (
+            PROFILE.replace("[\"mcp__\"]", &format!("[\"{long}\"]")),
+            Some("mcp_prefixes"),
+        ),
+        (
+            PROFILE.replace("[\"mcp__\"]", &format!("[{many}]")),
+            Some("mcp_prefixes"),
+        ),
+        (
+            PROFILE.replace("[\"Bash\"]", "[\"Bash\", \"Bash\"]"),
+            Some("card_aliases.execute"),
+        ),
+        (PROFILE.replace("\"bypass\"", "\"\""), Some("yolo_mode_id")),
+        (
+            PROFILE.replace("\"(^|/)", "\"(unclosed"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"(a+)+"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"((a|b*)c){2,}"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", &format!("\"{}", "a".repeat(257))),
+            Some("memory_path_regex"),
+        ),
+    ];
+    for (body, want) in cases {
+        let body = if body.is_empty() {
+            PROFILE.to_string()
+        } else {
+            body
+        };
+        match want {
+            None => {
+                parse(30, &body);
+            }
+            Some(want) => {
+                let errors = invalid(30, &body);
+                assert!(
+                    errors.iter().any(|e| e.contains(want)),
+                    "{want}: {errors:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn hooks_declarations_are_validated() {
     let with = |from: &str, to: &str| agent(&HOOKS.replace(from, to));

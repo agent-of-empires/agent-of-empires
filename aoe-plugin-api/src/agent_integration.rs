@@ -39,6 +39,9 @@ pub struct AgentIntegrationContribution {
     /// Requires API 28: the folder-trust record the host writes before launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<AgentTrustDeclaration>,
+    /// Requires API 30: how clients render and drive the agent's structured view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<AgentProfileDeclaration>,
 }
 
 /// Hook events the host knows how to install into a JSON settings file.
@@ -62,6 +65,54 @@ pub const AGENT_HOOK_PATH_MAX: usize = 256;
 pub const AGENT_HOOK_STRING_MAX: usize = 256;
 pub const AGENT_TRUST_POINTER_SEGMENTS_MAX: usize = 8;
 pub const AGENT_DISPLAY_NAME_MAX: usize = 40;
+pub const AGENT_PROFILE_LIST_MAX: usize = 32;
+pub const AGENT_PROFILE_STRING_MAX: usize = 128;
+pub const AGENT_PROFILE_REGEX_MAX: usize = 256;
+
+/// Structured-view behavior of an agent; field names mirror the host's agent profile.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentProfileDeclaration {
+    pub parent_meta_namespaces: Vec<String>,
+    pub clear_aliases: Vec<String>,
+    pub compact_aliases: Vec<String>,
+    pub clear_requires_driven_reset: bool,
+    pub supports_exit_plan_mode: bool,
+    pub supports_wakeup_tools: bool,
+    pub emits_heartbeat_keepalives: bool,
+    pub supports_subagents: bool,
+    pub todos: bool,
+    pub skills: bool,
+    pub yolo_mode_id: Option<String>,
+    pub subagent_tool_names: Vec<String>,
+    pub mcp_prefixes: Vec<String>,
+    pub card_aliases: AgentCardAliasesDeclaration,
+    pub special_titles: AgentSpecialTitlesDeclaration,
+    /// Matched in the browser, so it must also avoid nested quantifiers.
+    pub memory_path_regex: Option<String>,
+    pub mobile_monitor_only: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentCardAliasesDeclaration {
+    pub execute: Vec<String>,
+    pub read: Vec<String>,
+    pub edit: Vec<String>,
+    pub delete: Vec<String>,
+    pub search: Vec<String>,
+    pub fetch: Vec<String>,
+    pub think: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentSpecialTitlesDeclaration {
+    pub skill_names: Vec<String>,
+    pub schedule_names: Vec<String>,
+    pub harness_names: Vec<String>,
+    pub workflow_names: Vec<String>,
+}
 
 /// Status hooks installed into the agent's JSON settings file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
