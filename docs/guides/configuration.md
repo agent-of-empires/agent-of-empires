@@ -12,7 +12,7 @@ Over the web API, `GET /api/settings` returns the settings as they apply to the 
 
 Global-only settings use the global config. On upgrade, values from the default profile move there and copies in other profiles are removed. The profile settings API rejects global-only fields; use `PATCH /api/settings` instead.
 
-A project registry entry can override `worktree.enabled`, `session.smart_rename` and `sandbox.enabled_by_default` for that project from the web Projects view or the TUI add-project form. Project overrides win over all three configuration layers. They live in the user's `projects.json`, not the repository, so they do not weaken these fields' `repo = "deny"` policy.
+A project registry entry can override `worktree.enabled`, `session.smart_rename` and `sandbox.enabled_by_default` for that project from the web Projects view or the TUI add-project form, and `session.default_tool` through `PATCH /api/projects` or `projects.json`. Project overrides win over all three configuration layers. They live in the user's `projects.json`, not the repository, so they do not weaken these fields' `repo = "deny"` policy. A project's `default_tool` is the agent new sessions started in it begin on, wherever they are created: `aoe add`, the New session dialog (TUI or web) and [suggested sessions](suggested-sessions.md#presets). An explicit tool choice wins, and a project that sets none inherits the profile's `session.default_tool`.
 
 ## File locations
 

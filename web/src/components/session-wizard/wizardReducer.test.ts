@@ -320,6 +320,53 @@ describe("SEED_PROJECT_OVERRIDES", () => {
   });
 });
 
+describe("tool ownership across profile loads", () => {
+  it("keeps a prefilled agent when the project's own arrives after it", () => {
+    // `initialWizardData` marks a prefilled agent as a direct choice.
+    const prefilled = makeState({ tool: "opencode", baseTool: "opencode", toolDirty: true });
+    const seeded = reducer(prefilled, {
+      type: "SEED_PROJECT_OVERRIDES",
+      overrides: { default_tool: "codex" },
+    });
+    expect(seeded.data).toMatchObject({ tool: "opencode", projectToolOverride: "codex" });
+    expect(reducer(seeded, defaults({ tool: "claude" })).data.tool).toBe("opencode");
+  });
+
+  it("replaces a vanished fallback even while a project's agent is showing", () => {
+    const state = makeState({ tool: "codex", baseTool: "ghost", projectToolOverride: "codex" });
+    const claude = { name: "claude" } as WizardState["agents"][number];
+    const loaded = reducer(state, { type: "SET_AGENTS", agents: [claude], agentsFor: "", agentsProject: "" });
+    expect(loaded.data).toMatchObject({ tool: "codex", baseTool: "claude" });
+    expect(reducer(loaded, { type: "SEED_PROJECT_OVERRIDES", overrides: undefined }).data.tool).toBe("claude");
+  });
+
+  it("keeps the fallback in step with a late profile default under a dirty profile", () => {
+    const state = run(
+      makeState({ path: "/repo" }),
+      defaults({ tool: "opencode" }),
+      { type: "SEED_PROJECT_OVERRIDES", overrides: { default_tool: "codex" } },
+      set("yoloMode", true),
+    );
+    expect(state.data).toMatchObject({ tool: "codex", baseTool: "opencode", profileDirty: true });
+    const late = reducer(state, defaults({ tool: "claude" }));
+    expect(late.data).toMatchObject({ tool: "codex", baseTool: "claude", profileDirty: true });
+    // Scratch restores the profile's agent, not the one the project left behind.
+    expect(reducer(late, set("scratch", true)).data.tool).toBe("claude");
+  });
+
+  it("drops the manual choice with the profile reset that replaces it", () => {
+    const picked = run(makeState({ tool: "opencode", baseTool: "opencode" }), set("tool", "opencode"));
+    expect(picked.data.toolDirty).toBe(true);
+    // A confirmed profile switch discards the manual pick, so its flag must go too.
+    const reset = reducer(picked, defaults({ tool: "claude", skipIfDirty: undefined }));
+    expect(reset.data).toMatchObject({ tool: "claude", toolDirty: false, baseTool: "claude" });
+    // A project seed applies again now that nothing claims the choice.
+    expect(reducer(reset, { type: "SEED_PROJECT_OVERRIDES", overrides: { default_tool: "codex" } }).data.tool).toBe(
+      "codex",
+    );
+  });
+});
+
 describe("native import defaults", () => {
   it.each([true, false])("clears host-incompatible state and ignores late defaults (skipIfDirty %s)", (skipIfDirty) => {
     const imported = run(
@@ -423,6 +470,86 @@ describe("SEED_PROJECT_OVERRIDES sandbox", () => {
     expect(withB.data).toMatchObject({ sandboxEnabled: false, projectSandboxOverride: false });
     const switched = reducer(withB, defaults({ sandboxEnabled: true, skipIfDirty: false }));
     expect(switched.data).toMatchObject({ sandboxEnabled: false, sandboxDirty: false });
+  });
+});
+
+describe("SEED_PROJECT_OVERRIDES agent", () => {
+  const seed = (tool: string | undefined): Action => ({
+    type: "SEED_PROJECT_OVERRIDES",
+    overrides: tool === undefined ? undefined : { default_tool: tool },
+  });
+
+  it("applies the project's agent and reverts to the profile default without one", () => {
+    const overridden = run(makeState(), defaults({ tool: "claude" }), seed("codex"));
+    expect(overridden.data).toMatchObject({ tool: "codex", projectToolOverride: "codex" });
+    expect(reducer(overridden, seed(undefined)).data.tool).toBe("claude");
+  });
+
+  it("reverts to the non-project fallback when the profile names none", () => {
+    const project = run(makeState({ baseTool: "opencode" }), seed("codex"));
+    expect(project.data).toMatchObject({ tool: "codex", profileToolDefault: "" });
+    // Leaving the project must not keep its agent as the fallback.
+    expect(reducer(project, seed(undefined)).data).toMatchObject({ tool: "opencode", baseTool: "opencode" });
+  });
+
+  it("clears another agent's model and effort when it changes the agent", () => {
+    const seeded = reducer(
+      makeState({ agentModel: "opus", agentEffort: "high" }),
+      defaults({ tool: "claude", agentModel: "opus", agentEffort: "high" }),
+    );
+    expect(seeded.data).toMatchObject({ tool: "claude", agentModel: "opus", agentEffort: "high" });
+    expect(reducer(seeded, seed("codex")).data).toMatchObject({ agentModel: "", agentEffort: "" });
+  });
+
+  it("keeps the seeded model and effort when the agent is unchanged", () => {
+    const seeded = reducer(makeState(), defaults({ tool: "claude", agentModel: "opus", agentEffort: "high" }));
+    expect(reducer(seeded, seed("claude")).data).toMatchObject({ agentModel: "opus", agentEffort: "high" });
+  });
+
+  it("outranks a profile-defaults response in either order", () => {
+    expect(run(makeState(), seed("codex"), defaults({ tool: "claude" })).data.tool).toBe("codex");
+    expect(run(makeState(), defaults({ tool: "claude" }), seed("codex")).data.tool).toBe("codex");
+  });
+
+  it("keeps a hand-picked tool, but still applies after an unrelated edit", () => {
+    const picked = run(makeState(), defaults({ tool: "claude" }), set("tool", "opencode"));
+    expect(reducer(picked, seed("codex")).data.tool).toBe("opencode");
+    const unrelated = run(makeState(), defaults({ tool: "claude" }), set("title", "Fix"));
+    expect(reducer(unrelated, seed("codex")).data.tool).toBe("codex");
+  });
+
+  it("drops the project's agent when leaving it for scratch", () => {
+    const project = run(makeState({ path: "/repo" }), defaults({ tool: "claude" }), seed("codex"));
+    expect(project.data.tool).toBe("codex");
+    expect(reducer(project, set("scratch", true)).data).toMatchObject({
+      projectToolOverride: undefined,
+      tool: "claude",
+    });
+    // A hand-picked agent is not the project's to drop.
+    const picked = reducer(project, set("tool", "opencode"));
+    expect(reducer(picked, set("scratch", true)).data.tool).toBe("opencode");
+  });
+
+  it("clears the leaving agent's model and effort when scratch restores the fallback", () => {
+    const project = run(
+      makeState({ path: "/repo" }),
+      defaults({ tool: "claude" }),
+      seed("codex"),
+      set("agentModel", "codex-max"),
+      set("agentEffort", "high"),
+    );
+    expect(reducer(project, set("scratch", true)).data).toMatchObject({
+      tool: "claude",
+      agentModel: "",
+      agentEffort: "",
+    });
+    // The agent stays for a hand-picked one, so its model and effort do too.
+    const picked = run(project, set("tool", "opencode"), set("agentModel", "oc-model"), set("agentEffort", "low"));
+    expect(reducer(picked, set("scratch", true)).data).toMatchObject({
+      tool: "opencode",
+      agentModel: "oc-model",
+      agentEffort: "low",
+    });
   });
 });
 

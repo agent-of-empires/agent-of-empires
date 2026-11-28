@@ -17,6 +17,15 @@ export interface WizardData {
   profileSandboxDefault: boolean;
   /** The selected saved project's sandbox override; outranks `profileSandboxDefault`. */
   projectSandboxOverride: boolean | undefined;
+  /** Profile-resolved tool default, independent of any project override. */
+  profileToolDefault: string;
+  /** The selected saved project's agent; outranks `profileToolDefault`. */
+  projectToolOverride: string | undefined;
+  /** The agent this session would run without a project: the manual pick, else the profile
+   *  default, else the remembered one. A departed project's agent must not outlive it. */
+  baseTool: string;
+  /** Set only by a direct tool choice, so a project seed does not clobber it. */
+  toolDirty: boolean;
   /** Set only by a direct `sandboxEnabled` edit, so a project override seed does not clobber it. */
   sandboxDirty: boolean;
   /** Set only by a direct `useWorktree` edit, so an unrelated profile-field edit does not block
@@ -134,6 +143,10 @@ export const initialData: WizardData = {
   projectWorktreeOverride: undefined,
   profileSandboxDefault: false,
   projectSandboxOverride: undefined,
+  profileToolDefault: "",
+  projectToolOverride: undefined,
+  baseTool: "",
+  toolDirty: false,
   sandboxDirty: false,
   worktreeDirty: false,
   useWorkspace: false,
@@ -187,6 +200,8 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   if (field === "worktreeBranch") next.worktreeBranchDirty = true;
   // The seeded model and effort belong to the previous agent; unset, the server uses the new agent's defaults.
   if (field === "tool" && value !== data.tool) Object.assign(next, { agentModel: "", agentEffort: "" });
+  // A direct choice is what the session falls back to once no project applies.
+  if (field === "tool") next.baseTool = String(value);
   if (field === "scratch" && value === true) {
     Object.assign(next, {
       path: "",
@@ -198,8 +213,14 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
       // The project's overrides leave with it; only a manual sandbox choice outlives it.
       projectWorktreeOverride: undefined,
       projectSandboxOverride: undefined,
+      projectToolOverride: undefined,
     });
     if (!data.sandboxDirty) next.sandboxEnabled = data.profileSandboxDefault;
+    // The project's agent leaves with it; a hand-picked one stays.
+    const scratchTool = data.baseTool || data.tool;
+    if (!data.toolDirty && scratchTool !== data.tool) {
+      Object.assign(next, { tool: scratchTool, agentModel: "", agentEffort: "" });
+    }
   }
   if (
     (field === "path" && typeof value === "string" && value.length > 0) ||
@@ -227,6 +248,7 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
       baseBranch: "",
       projectWorktreeOverride: undefined,
       projectSandboxOverride: undefined,
+      projectToolOverride: undefined,
       worktreeDirty: false,
       sandboxDirty: false,
     });
@@ -234,6 +256,7 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   if (field === "path") next.pathIsGitRepo = true;
   if (field === "pathIsGitRepo" && value === false) next.useWorktree = false;
   if (PROFILE_FIELDS.includes(field)) next.profileDirty = true;
+  if (field === "tool") next.toolDirty = true;
   if (field === "useWorktree") next.worktreeDirty = true;
   if (field === "useWorkspace") next.workspaceDirty = true;
   if (field === "sandboxEnabled") next.sandboxDirty = true;
@@ -293,7 +316,13 @@ function reduce(state: WizardState, action: Action): WizardState {
         return state;
       const projectWorktreeOverride = action.overrides?.worktree_enabled;
       const projectSandboxOverride = action.overrides?.sandbox_enabled;
+      const projectToolOverride = action.overrides?.default_tool;
       const { data } = state;
+      // A project with no agent inherits the profile's, which may still be loading. With neither,
+      // fall back to what the session would run outside a project, not to the one being left.
+      const fallback = data.profileToolDefault || data.baseTool || data.tool;
+      const baseTool = data.toolDirty ? data.tool : fallback;
+      const tool = data.toolDirty ? data.tool : (projectToolOverride ?? fallback);
       const useWorktree = data.worktreeDirty
         ? data.useWorktree
         : data.scratch || data.pathIsGitRepo === false
@@ -304,7 +333,18 @@ function reduce(state: WizardState, action: Action): WizardState {
         : (projectSandboxOverride ?? data.profileSandboxDefault);
       return {
         ...state,
-        data: { ...data, projectWorktreeOverride, projectSandboxOverride, useWorktree, sandboxEnabled },
+        data: {
+          ...data,
+          projectWorktreeOverride,
+          projectSandboxOverride,
+          projectToolOverride,
+          useWorktree,
+          sandboxEnabled,
+          tool,
+          baseTool,
+          // Whoever the new agent is, another agent's model and effort are not its defaults.
+          ...(tool !== data.tool && { agentModel: "", agentEffort: "" }),
+        },
       };
     }
     case "SUBMIT_START":
@@ -317,17 +357,27 @@ function reduce(state: WizardState, action: Action): WizardState {
       return { ...state, isSubmitting: false };
     case "SUBMIT_CANCEL":
       return { ...state, isSubmitting: false, error: null, failure: null };
-    case "SET_AGENTS":
+    case "SET_AGENTS": {
+      // A remembered agent the list drops must not survive as the fallback a departed project
+      // restores, whether or not a project's agent is the one showing.
+      const baseTool =
+        state.data.baseTool && !action.agents.some((a) => a.name === state.data.baseTool)
+          ? (action.resetTool ?? "claude")
+          : state.data.baseTool;
+      const data = action.resetTool
+        ? { ...state.data, tool: action.resetTool, baseTool, agentModel: "", agentEffort: "" }
+        : baseTool === state.data.baseTool
+          ? state.data
+          : { ...state.data, baseTool };
       return {
         ...state,
-        data: action.resetTool
-          ? { ...state.data, tool: action.resetTool, agentModel: "", agentEffort: "" }
-          : state.data,
+        data,
         agents: action.agents,
         agentsStatus: "ready",
         agentsFor: action.agentsFor,
         agentsProject: action.agentsProject,
       };
+    }
     case "AGENTS_FAILED":
       // Another project's list for this Profile stays usable; only its readiness is dropped.
       if (action.agentsFor === state.agentsFor && state.agentsStatus === "ready" && !action.missing) return state;
@@ -363,6 +413,16 @@ function reduce(state: WizardState, action: Action): WizardState {
       const resolvedSandbox = state.data.importAcpSessionId
         ? false
         : (state.data.projectSandboxOverride ?? action.sandboxEnabled);
+      // A prefilled or typed agent survives the initial load; a confirmed profile reset discards
+      // it, so its ownership flag goes with the choice it described.
+      const keepTool = !!action.skipIfDirty && state.data.toolDirty;
+      const baseTool = keepTool ? state.data.tool : action.tool || state.data.baseTool || state.data.tool;
+      const resolvedTool = keepTool ? state.data.tool : (state.data.projectToolOverride ?? baseTool);
+      // The seeded model and effort describe `action.tool`; another agent's are not its defaults.
+      const agentDefaults =
+        resolvedTool === action.tool
+          ? { agentModel: action.agentModel ?? "", agentEffort: action.agentEffort ?? "" }
+          : { agentModel: "", agentEffort: "" };
       if (action.skipIfDirty && state.data.profileDirty) {
         // Still record the real default, or a later project with no override falls back to `false`.
         // The view is not a profile-tracked field, so it seeds past other edits.
@@ -374,6 +434,9 @@ function reduce(state: WizardState, action: Action): WizardState {
             structuredViewOffered,
             profileWorktreeDefault: action.worktreeEnabled,
             profileSandboxDefault: action.sandboxEnabled,
+            profileToolDefault: action.tool,
+            // The fallback scratch restores follows the new default unless the user chose.
+            baseTool: state.data.toolDirty ? state.data.tool : action.tool || state.data.baseTool,
             useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
             useWorkspace: state.data.workspaceDirty ? state.data.useWorkspace : action.workspaceByDefault,
             sandboxEnabled: state.data.sandboxDirty ? state.data.sandboxEnabled : resolvedSandbox,
@@ -390,12 +453,15 @@ function reduce(state: WizardState, action: Action): WizardState {
           // A prefilled or typed choice survives the first load; a profile reset drops it.
           useWorktree: keepWorktree ? state.data.useWorktree : resolvedUseWorktree(),
           profileWorktreeDefault: action.worktreeEnabled,
+          profileToolDefault: action.tool,
           useWorkspace: action.workspaceByDefault,
           workspaceDirty: false,
-          tool: action.tool || state.data.tool,
+          // The project's agent outranks the profile's, whichever resolved first.
+          tool: resolvedTool,
+          baseTool,
+          toolDirty: keepTool,
           extraEnv: action.extraEnv,
-          agentModel: action.agentModel ?? "",
-          agentEffort: action.agentEffort ?? "",
+          ...agentDefaults,
           useStructuredView,
           structuredViewOffered,
           profileDirty: false,

@@ -1881,6 +1881,20 @@
       ]
     },
     {
+      "id": "wizard.project-agent-override",
+      "notes": "A Project's default_tool is the agent the wizard starts on: it outranks the Profile's session.default_tool and a remembered last-used tool, a hand-picked or prefilled agent outranks it, a Project that sets none inherits the Profile's, and leaving for scratch drops it.",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/session-wizard/wizardReducer.test.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.projectWorktreeOverride.test.tsx"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/wizardReducer.ts"
+      ]
+    },
+    {
       "id": "wizard.sandbox-image-status",
       "kind": "mocked-playwright",
       "risk": "medium",

@@ -1817,7 +1817,8 @@ fn test_reload_config_defaults_uses_project_worktree_override() {
 
     // Browsing to the project applies its override without resetting other edits.
     let mut dialog = multi_tool_dialog();
-    dialog.tool_index = 1;
+    // A hand-picked tool owns the choice; only an automatic one follows the path.
+    dialog.pick_tool(1);
     dialog.yolo_mode = true;
     dialog.focused_field = 0;
     dialog.path = Input::new(repo.path().to_string_lossy().to_string());
@@ -1837,7 +1838,7 @@ fn test_reload_config_defaults_uses_project_worktree_override() {
     let unregistered = tempfile::tempdir().expect("unregistered dir");
     pick(&mut dialog, unregistered.path());
     assert!(!dialog.worktree_enabled);
-    dialog.focused_field = 4;
+    dialog.focused_field = dialog.field_indices().worktree;
     dialog.handle_key(key(KeyCode::Char(' ')));
     assert!(dialog.worktree_enabled);
     pick(&mut dialog, unregistered.path());
@@ -1985,6 +1986,120 @@ fn test_scratch_ignores_the_retained_projects_sandbox_override() {
     dialog.sandbox_dirty = true;
     dialog.handle_key(ctrl_key(KeyCode::Char('t')));
     assert!(!dialog.sandbox_enabled, "manual choice survives scratch");
+}
+
+#[test]
+#[serial_test::serial]
+fn test_the_projects_agent_outranks_the_profile_default_and_leaves_with_the_project() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        "default_profile = \"default\"\n\n[session]\ndefault_tool = \"codex\"\n",
+    )
+    .expect("global config");
+
+    let repo = tempfile::tempdir().expect("temp repo");
+    let repo_path = repo.path().to_string_lossy().to_string();
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new("demo", &repo_path, crate::session::ProjectScope::Global)
+            .with_overrides(crate::session::ProjectOverrides {
+                default_tool: Some("opencode".into()),
+                ..Default::default()
+            }),
+        false,
+    )
+    .expect("register project");
+    let tools = vec!["claude", "codex", "opencode"];
+    let open_in = |dialog: &mut NewSessionDialog, path: &str| {
+        dialog.path = Input::default();
+        dialog.focused_field = dialog.field_indices().path;
+        type_str(dialog, path);
+        dialog.handle_key(key(KeyCode::Tab));
+    };
+
+    // A typed project path seeds its agent over the profile's default.
+    let mut dialog = NewSessionDialog::new_with_tools(tools.clone(), String::new());
+    open_in(&mut dialog, &repo_path);
+    assert_eq!(dialog.selected_tool(), "opencode");
+
+    // A path outside the registry takes the profile default.
+    let plain = tempfile::tempdir().expect("temp plain");
+    open_in(&mut dialog, &plain.path().to_string_lossy());
+    assert_eq!(dialog.selected_tool(), "codex");
+
+    // A hand-picked tool survives later path picks.
+    dialog.set_tool("claude");
+    open_in(&mut dialog, &repo_path);
+    assert_eq!(dialog.selected_tool(), "claude");
+
+    // Scratch owns no project, so the project's agent leaves with it.
+    let mut dialog = NewSessionDialog::new_with_tools(tools, repo_path);
+    dialog.reload_config_defaults();
+    assert_eq!(dialog.selected_tool(), "opencode");
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert_eq!(
+        dialog.selected_tool(),
+        "codex",
+        "profile default in scratch"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_a_departed_project_falls_back_to_the_first_agent_without_a_profile_default() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
+    // No `session.default_tool`: nothing names an agent once the project goes.
+    fs::write(
+        app_dir.join("config.toml"),
+        "default_profile = \"default\"\n",
+    )
+    .expect("global config");
+
+    let repo = tempfile::tempdir().expect("temp repo");
+    let repo_path = repo.path().to_string_lossy().to_string();
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new("demo", &repo_path, crate::session::ProjectScope::Global)
+            .with_overrides(crate::session::ProjectOverrides {
+                default_tool: Some("opencode".into()),
+                ..Default::default()
+            }),
+        false,
+    )
+    .expect("register project");
+    let tools = vec!["claude", "codex", "opencode"];
+
+    let mut dialog = NewSessionDialog::new_with_tools(tools.clone(), repo_path.clone());
+    dialog.reload_config_defaults();
+    assert_eq!(dialog.selected_tool(), "opencode", "the project's agent");
+
+    // A path outside the registry has no project and no profile default to fall back to.
+    let plain = tempfile::tempdir().expect("temp plain");
+    dialog.path = Input::default();
+    dialog.focused_field = dialog.field_indices().path;
+    type_str(&mut dialog, &plain.path().to_string_lossy());
+    dialog.handle_key(key(KeyCode::Tab));
+    assert_eq!(
+        dialog.selected_tool(),
+        "claude",
+        "the ordinary fallback, not the departed project's agent"
+    );
+
+    // Scratch leaves the project too.
+    let mut dialog = NewSessionDialog::new_with_tools(tools, repo_path);
+    dialog.reload_config_defaults();
+    assert_eq!(dialog.selected_tool(), "opencode");
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert_eq!(dialog.selected_tool(), "claude", "scratch fallback");
 }
 
 /// Registers a repo whose project asks for the sandbox, with the global default off, and returns the

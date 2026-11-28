@@ -397,6 +397,8 @@ export interface ProjectOverrides {
   worktree_enabled?: boolean;
   smart_rename?: boolean;
   sandbox_enabled?: boolean;
+  /** The agent new sessions in this project start on, over `session.default_tool`. */
+  default_tool?: string;
   /** Values of plugin settings declared `per_project`, by plugin id then setting key. */
   plugin_settings?: Record<string, Record<string, unknown>>;
 }

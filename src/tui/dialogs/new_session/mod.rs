@@ -205,6 +205,8 @@ pub struct NewSessionDialog {
     pub(super) tool_index: usize,
     pub(super) focused_field: usize,
     pub(super) available_tools: Vec<String>,
+    /// Set by a direct tool choice, so a later path pick keeps the user's choice.
+    pub(super) tool_dirty: bool,
     pub(super) worktree_enabled: bool,
     /// Set by a direct worktree toggle, so a later path pick keeps the user's choice.
     pub(super) worktree_dirty: bool,
@@ -541,19 +543,6 @@ impl NewSessionDialog {
             std::path::Path::new(&current_dir),
         );
 
-        let tool_index = if let Some(ref default_tool) = config.session.default_tool {
-            available_tools
-                .iter()
-                .position(|t| t == default_tool)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        let is_default_tool_host_only = available_tools
-            .get(tool_index)
-            .and_then(|t| crate::agents::get_agent(t))
-            .is_some_and(|a| a.host_only);
         let (initial_overrides, overrides_unresolved, overrides_resolved_for) =
             match project_overrides(profile, &current_dir) {
                 Ok(overrides) => (overrides, false, Some(path_key(&current_dir))),
@@ -562,6 +551,18 @@ impl NewSessionDialog {
                     (None, true, None)
                 }
             };
+        let default_tool = initial_overrides
+            .as_ref()
+            .and_then(|o| o.default_tool.as_deref())
+            .or(config.session.default_tool.as_deref());
+        let tool_index = default_tool
+            .and_then(|tool| available_tools.iter().position(|t| t == tool))
+            .unwrap_or(0);
+
+        let is_default_tool_host_only = available_tools
+            .get(tool_index)
+            .and_then(|t| crate::agents::get_agent(t))
+            .is_some_and(|a| a.host_only);
         let sandbox_enabled = docker_available
             && initial_overrides
                 .as_ref()
@@ -631,6 +632,7 @@ impl NewSessionDialog {
             dir_picker: DirPicker::new(),
             worktree_enabled,
             workspace: config.worktree.workspace_by_default,
+            tool_dirty: false,
             worktree_dirty: false,
             sandbox_dirty: false,
             overrides_unresolved,
@@ -787,8 +789,14 @@ impl NewSessionDialog {
     /// Preselect a tool by name. No-op when the tool is not available.
     pub fn set_tool(&mut self, tool: &str) {
         if let Some(index) = self.available_tools.iter().position(|t| t == tool) {
-            self.select_tool_index(index);
+            self.pick_tool(index);
         }
+    }
+
+    /// Choose a tool the caller owns, so later path picks leave it alone.
+    fn pick_tool(&mut self, index: usize) {
+        self.tool_dirty = true;
+        self.select_tool_index(index);
     }
 
     /// Switch tools and reset the per-tool YOLO, sandbox and Ctrl+P fields.
@@ -975,8 +983,8 @@ impl NewSessionDialog {
         self.available_profiles.len() > 1
     }
 
-    /// Only the worktree and sandbox toggles follow a picked or typed path, so other edits survive.
-    /// A direct toggle or scratch mode keeps the current value.
+    /// Only the tool, worktree and sandbox defaults follow a picked or typed path, so other edits
+    /// survive. A direct choice keeps its value.
     fn seed_defaults_for_path(&mut self) {
         if self.scratch {
             return;
@@ -984,10 +992,23 @@ impl NewSessionDialog {
         let profile = self.selected_profile().to_string();
         let config = self.resolve_config_for_path(&profile);
         self.refresh_path_agent_config(&config);
-        // Unknown overrides leave the toggles alone: a guess could disable a sandbox the project asks for.
+        // Unknown overrides leave the tool and toggles alone: a guess could pick the wrong agent
+        // or disable a sandbox the project asks for.
         let ProjectOverridesLookup::Known(overrides) = self.resolve_overrides(&profile) else {
             return;
         };
+        if !self.tool_dirty {
+            let tool = overrides
+                .as_ref()
+                .and_then(|o| o.default_tool.as_deref())
+                .or(config.session.default_tool.as_deref());
+            // No resolvable default falls back the way construction does, rather than keeping the
+            // agent of the project this path replaced.
+            let index = tool
+                .and_then(|tool| self.available_tools.iter().position(|t| t == tool))
+                .unwrap_or(0);
+            self.select_tool_index(index);
+        }
         let host_only = self.selected_tool_host_only();
         if !self.worktree_dirty {
             let on = overrides
@@ -1211,18 +1232,6 @@ impl NewSessionDialog {
         self.profile = profile.clone();
         let config = self.resolve_config_for_path(&profile);
 
-        self.tool_index = if let Some(ref default_tool) = config.session.default_tool {
-            self.available_tools
-                .iter()
-                .position(|t| t == default_tool)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
-        self.yolo_mode_default = config.session.yolo_mode_default;
-        self.yolo_mode = self.yolo_mode_default;
-        self.structured_default = config.acp.structured_view.starts_structured();
         // Each profile has its own registry, so an earlier resolution says nothing about this one. A
         // scratch session belongs to no project, so a retained path's overrides do not apply.
         self.overrides_resolved_for = None;
@@ -1230,6 +1239,17 @@ impl NewSessionDialog {
             ProjectOverridesLookup::Known(overrides) => overrides,
             ProjectOverridesLookup::Unknown => None,
         };
+        let default_tool = overrides
+            .as_ref()
+            .and_then(|o| o.default_tool.as_deref())
+            .or(config.session.default_tool.as_deref());
+        self.tool_index = default_tool
+            .and_then(|tool| self.available_tools.iter().position(|t| t == tool))
+            .unwrap_or(0);
+
+        self.yolo_mode_default = config.session.yolo_mode_default;
+        self.yolo_mode = self.yolo_mode_default;
+        self.structured_default = config.acp.structured_view.starts_structured();
         self.sandbox_enabled = self.docker_available
             && overrides
                 .as_ref()
@@ -1241,6 +1261,7 @@ impl NewSessionDialog {
             .unwrap_or(config.worktree.enabled)
             && !self.selected_tool_host_only();
         self.workspace = config.worktree.workspace_by_default;
+        self.tool_dirty = false;
         self.worktree_dirty = false;
         self.sandbox_dirty = false;
 
@@ -1317,6 +1338,7 @@ impl NewSessionDialog {
             dir_picker: DirPicker::new(),
             worktree_enabled: config.worktree.enabled,
             workspace: config.worktree.workspace_by_default,
+            tool_dirty: false,
             worktree_dirty: false,
             sandbox_dirty: false,
             overrides_unresolved: false,
@@ -1405,6 +1427,7 @@ impl NewSessionDialog {
             dir_picker: DirPicker::new(),
             worktree_enabled: false,
             workspace: false,
+            tool_dirty: false,
             worktree_dirty: false,
             sandbox_dirty: false,
             overrides_unresolved: false,
@@ -1644,7 +1667,7 @@ impl NewSessionDialog {
                 self.reload_config_defaults();
             }
         } else if self.focused_field == fields.tool {
-            self.select_tool_index((self.tool_index + 1) % self.available_tools.len());
+            self.pick_tool((self.tool_index + 1) % self.available_tools.len());
         } else if self.focused_field == fields.structured {
             self.set_structured(!self.structured_enabled);
         } else if self.focused_field == fields.yolo {
@@ -1747,6 +1770,16 @@ impl NewSessionDialog {
                 let profile = self.selected_profile().to_string();
                 let config = self.resolve_config_for_path(&profile);
                 self.refresh_path_agent_config(&config);
+                // The project's agent leaves with the project; a hand-picked one stays.
+                if !self.tool_dirty {
+                    let index = config
+                        .session
+                        .default_tool
+                        .as_deref()
+                        .and_then(|tool| self.available_tools.iter().position(|t| t == tool))
+                        .unwrap_or(0);
+                    self.select_tool_index(index);
+                }
                 self.seed_sandbox(&config, None);
             } else {
                 self.seed_defaults_for_path();
@@ -1903,7 +1936,7 @@ impl NewSessionDialog {
                 } else {
                     (self.tool_index + 1) % len
                 };
-                self.select_tool_index(index);
+                self.pick_tool(index);
                 DialogResult::Continue
             }
             KeyCode::Char(c @ '1'..='9')
@@ -1911,7 +1944,7 @@ impl NewSessionDialog {
             {
                 let index = c as usize - '1' as usize;
                 if index < self.available_tools.len() {
-                    self.select_tool_index(index);
+                    self.pick_tool(index);
                 }
                 DialogResult::Continue
             }
