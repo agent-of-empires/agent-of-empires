@@ -18,6 +18,7 @@ use super::{
 };
 use crate::acp::acp_client::{AcpClient, AcpError, ProxyFailurePolicy, SpawnConfig};
 use crate::acp::agent_policy::AgentPolicy;
+use crate::acp::agent_registry::SpawnSpec;
 use crate::acp::mcp_config::PluginCredentials;
 use crate::acp::runner_lifecycle::{
     AdmitError, InstallError, Lease, LifecycleTable, ProcessControl, RunnerIdentity,
@@ -500,19 +501,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         .map_err(|e| {
             SupervisorError::InvalidAgentCommand(format!("config load task failed: {e}"))
         })?;
-        let (mut spec, spec_from_registry) = self
-            .resolve_agent_spec(&req.agent, &resolved_cfg.session, &policy)
-            .await?;
+        let registry = self.registry_snapshot().await;
+        let SpawnSpec {
+            mut spec,
+            from_registry: spec_from_registry,
+            proxy: registry_proxy,
+        } = self.resolve_agent_spec(&registry, &req.agent, &resolved_cfg.session, &policy)?;
         if let Some(ovr) = &req.agent_command_override {
             apply_agent_command_override(&req.agent, spec_from_registry, ovr, &mut spec)?;
         }
-        let proxy = match req.proxy.clone() {
-            Some(proxy) => Some(proxy),
-            None if spec_from_registry => self.registry_proxy(&req.agent).await,
-            None => None,
-        };
+        let proxy = req.proxy.clone().or(registry_proxy);
         let wrapper_substitution = wrapper_substitution_for(
-            &*self.registry.lock().await,
+            &registry,
             &req.tool,
             &req.agent,
             spec_from_registry,
@@ -2519,24 +2519,17 @@ time.sleep(60)
     #[tokio::test]
     #[serial_test::serial]
     async fn a_registry_plugin_agent_launches_its_adapter_behind_its_proxy() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
         let (_home, _temp) = isolate_home();
+        crate::session::test_support::install_zeta_acp_plugin("");
         let supervisor = Supervisor::new(VecSink::new());
-        let mut zeta =
-            crate::acp::resolved_agent::ResolvedAcpAgent::builtin("zeta", "zeta-adapter", &[], "d");
-        zeta.proxy = Some(proxy_spec(ProxyFailurePolicy::NeutralBoot));
-        supervisor
-            .registry
-            .lock()
-            .await
-            .agents
-            .insert("zeta".into(), zeta);
 
         let mut request = spawn_request("plugin-proxy");
         request.agent = "zeta".into();
         let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
-        assert_eq!(config.spec.command, "zeta-adapter");
+        assert_eq!(config.spec.command, "zeta");
         let proxy = config.proxy.expect("the registry proxy is launched");
-        assert_eq!(proxy.command, "/bin/proxy");
+        assert!(proxy.command.ends_with("aoe.zeta/bin/proxy"));
         assert_eq!(proxy.failure_policy, ProxyFailurePolicy::NeutralBoot);
 
         // A request's own proxy wins, and a built-in agent has none.
@@ -2551,6 +2544,36 @@ time.sleep(60)
             .await
             .unwrap();
         assert!(config.proxy.is_none());
+    }
+
+    /// A supervisor built before a plugin changes still launches against the plugin as it is
+    /// now: an install is picked up and a revoked grant stops the agent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_supervisor_resolves_plugin_agents_as_of_each_launch() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let (_home, _temp) = isolate_home();
+        let supervisor = Supervisor::new(VecSink::new());
+        let mut request = spawn_request("plugin-fresh");
+        request.agent = "zeta".into();
+        assert!(matches!(
+            supervisor.spawn_config(&request, 1).await,
+            Err(SupervisorError::UnknownAgent(_))
+        ));
+
+        crate::session::test_support::install_zeta_acp_plugin("");
+        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+        assert!(config.proxy.is_some());
+
+        crate::session::update_config(|config| {
+            config.plugins.remove("aoe.zeta");
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+        assert!(matches!(
+            supervisor.spawn_config(&request, 1).await,
+            Err(SupervisorError::UnknownAgent(_))
+        ));
     }
 
     #[tokio::test]

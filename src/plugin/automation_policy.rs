@@ -367,6 +367,26 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn classify_mode_reads_the_modes_a_plugin_agent_declared() {
+        use ApprovalClass::*;
+        use ModeDecision::*;
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_zeta_acp_plugin(
+            "[[agent_integrations.acp.profile.modes]]\nid = \"review\"\n\
+             approval_class = \"guarded\"\n",
+        );
+        assert_eq!(classify_mode("zeta", Some("review"), None), Class(Guarded));
+        assert_eq!(
+            classify_mode("zeta", Some("other"), None),
+            CatalogNotDiscovered
+        );
+    }
+
+    #[test]
     fn limits_and_reservations() {
         let dir = tempfile::tempdir().expect("tempdir");
         let policy = std::sync::Arc::new(

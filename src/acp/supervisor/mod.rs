@@ -25,7 +25,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use super::acp_client::{AcpClient, AcpError, SpawnConfig};
-use super::agent_registry::AgentRegistry;
 pub use super::runner_lifecycle::ResumeKind;
 use super::runner_lifecycle::{
     Lease, LifecycleTable, ProcessControl, RunnerIdentity, SystemProcessControl, WorkerPhase,
@@ -228,7 +227,6 @@ pub(crate) enum ResumeReservationOutcome {
 
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
-    registry: Arc<Mutex<AgentRegistry>>,
     workers: Workers,
     next_seqs: Arc<SeqMap>,
     /// Owner of every runner epoch. Lock order: `workers` before `lifecycle`.
@@ -525,7 +523,6 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub fn with_capacity(sink: Arc<S>, max_concurrent_workers: u32) -> Self {
         Self {
             sink,
-            registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::default(),
             next_seqs: Arc::default(),
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(

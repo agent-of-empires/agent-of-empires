@@ -1452,30 +1452,15 @@ pub mod structured {
         if choice.sandboxed {
             return Ok(());
         }
-        let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
-        let (mut spec, spec_from_registry) = match registry.for_tool(agent) {
-            Some(resolved) => (resolved.spec.clone(), true),
-            None => match config.session.agent_acp_cmd.get(agent) {
-                Some(cmd) => (
-                    crate::acp::AgentSpec::from_acp_cmd(agent, cmd).map_err(|e| {
-                        StructuredChoiceError::NotCapable(format!(
-                            "invalid [session.agent_acp_cmd] for `{agent}`: {e}"
-                        ))
-                    })?,
-                    false,
-                ),
-                // A custom agent that inherits a registry-backed base runs the
-                // base agent's adapter, so the check targets that.
-                None => {
-                    match crate::acp::inherited_acp_base(agent, &config.session.agent_detect_as)
-                        .and_then(|base| registry.get(&base).cloned())
-                    {
-                        Some(spec) => (spec, true),
-                        None => unreachable!("tool_acp_capable implies a resolvable spec"),
-                    }
-                }
-            },
-        };
+        let resolved = crate::acp::agent_registry::AgentRegistry::with_defaults()
+            .resolve_spec(agent, &config.session)
+            .map_err(|e| {
+                StructuredChoiceError::NotCapable(format!(
+                    "invalid [session.agent_acp_cmd] for `{agent}`: {e}"
+                ))
+            })?
+            .unwrap_or_else(|| unreachable!("tool_acp_capable implies a resolvable spec"));
+        let (mut spec, spec_from_registry) = (resolved.spec, resolved.from_registry);
         // The spawn runs the session's command in place of an adapter that is the
         // agent's own CLI, so check what it will launch.
         let command = match choice.command_override.trim() {

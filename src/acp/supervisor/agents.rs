@@ -7,57 +7,34 @@ use tracing::warn;
 
 use super::{AgentCommandOverride, BroadcastSink, Supervisor, SupervisorError};
 use crate::acp::agent_policy::AgentPolicy;
-use crate::acp::agent_registry::{AgentRegistry, AgentSpec};
+use crate::acp::agent_registry::{AgentRegistry, AgentSpec, SpawnSpec};
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
 
 impl<S: BroadcastSink> Supervisor<S> {
     pub async fn resolve_agent(&self, name: &str) -> Result<AgentSpec, SupervisorError> {
-        self.registry
-            .lock()
+        self.registry_snapshot()
             .await
             .get(name)
             .cloned()
             .ok_or_else(|| SupervisorError::UnknownAgent(name.into()))
     }
 
-    /// Resolve `name` against the registry, then the session's custom
-    /// `agent_acp_cmd`, then an `agent_detect_as` base. The bool is true for a
-    /// registry spec.
-    pub async fn resolve_agent_spec(
+    /// Resolve `name` against `registry` and the session's config, see
+    /// [`AgentRegistry::resolve_spec`].
+    pub fn resolve_agent_spec(
         &self,
+        registry: &AgentRegistry,
         name: &str,
         config: &crate::session::config::SessionConfig,
         policy: &AgentPolicy,
-    ) -> Result<(AgentSpec, bool), SupervisorError> {
+    ) -> Result<SpawnSpec, SupervisorError> {
         if !policy.allows(name) {
             return Err(SupervisorError::AgentNotAllowed(name.into()));
         }
-        if let Some(spec) = self.registry.lock().await.get(name).cloned() {
-            return Ok((spec, true));
-        }
-        if let Some(cmd) = config.agent_acp_cmd.get(name) {
-            let spec =
-                AgentSpec::from_acp_cmd(name, cmd).map_err(SupervisorError::InvalidAgentCommand)?;
-            return Ok((spec, false));
-        }
-        if let Some(base) = crate::acp::inherited_acp_base(name, &config.agent_detect_as) {
-            if let Some(spec) = self.registry.lock().await.get(&base).cloned() {
-                return Ok((spec, true));
-            }
-        }
-        Err(SupervisorError::UnknownAgent(name.into()))
-    }
-
-    /// The plugin proxy to launch ahead of registry agent `name`'s adapter.
-    pub(super) async fn registry_proxy(
-        &self,
-        name: &str,
-    ) -> Option<crate::acp::acp_client::ProxySpec> {
-        self.registry
-            .lock()
-            .await
-            .resolved(name)
-            .and_then(|agent| agent.proxy.clone())
+        registry
+            .resolve_spec(name, config)
+            .map_err(SupervisorError::InvalidAgentCommand)?
+            .ok_or_else(|| SupervisorError::UnknownAgent(name.into()))
     }
 
     /// Pick the agent name to spawn for an instance's tool.
@@ -71,24 +48,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(name) = explicit_override.filter(|name| !name.is_empty()) {
             return name.to_string();
         }
-        if let Some(agent) = self.registry.lock().await.paired_agent(tool) {
-            return agent.id.clone();
-        }
-        if self.registry_has_agent(tool).await
-            || self
-                .custom_agent_has_acp_cmd(tool, profile, project_path)
-                .await
-        {
-            return tool.to_string();
-        }
-        if let Some(base) = self
-            .custom_agent_inherited_base(tool, profile, project_path)
-            .await
-        {
-            return base;
-        }
-        with_resolved_config(profile, project_path, |cfg| {
-            cfg.acp.resolved_default_agent().to_string()
+        let registry = self.registry_snapshot().await;
+        let tool = tool.to_string();
+        with_resolved_config(profile, project_path, move |cfg| {
+            crate::acp::pick_acp_agent_name(&registry, &cfg.session, &cfg.acp, &tool, None)
         })
         .await
         .unwrap_or_else(|| crate::session::config::DEFAULT_ACP_AGENT.to_string())
@@ -127,12 +90,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         .unwrap_or(false)
     }
 
+    /// The registry as of now: plugin agents follow installs, updates, grants and disables.
     pub async fn registry_snapshot(&self) -> AgentRegistry {
-        self.registry.lock().await.clone()
+        AgentRegistry::with_defaults()
     }
 
     pub async fn registry_has_agent(&self, name: &str) -> bool {
-        self.registry.lock().await.get(name).is_some()
+        self.registry_snapshot().await.get(name).is_some()
     }
 
     /// True iff `name` is a valid structured-view switch target for this profile and project.
@@ -557,17 +521,17 @@ mod tests {
         ];
         for (restrict, allowed, name, want) in cases {
             let policy = AgentPolicy::for_test(restrict, allowed);
-            let got = sup.resolve_agent_spec(name, &cfg, &policy).await;
+            let got = sup.resolve_agent_spec(&AgentRegistry::with_defaults(), name, &cfg, &policy);
             let label = format!("restrict={restrict} allowed={allowed:?} name={name:?}");
             match want {
                 Want::Registry => {
-                    let (_, from_registry) = got.unwrap_or_else(|e| panic!("{label}: {e}"));
-                    assert!(from_registry, "{label}: expected a registry spec");
+                    let got = got.unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert!(got.from_registry, "{label}: expected a registry spec");
                 }
                 Want::Custom(command) => {
-                    let (spec, from_registry) = got.unwrap_or_else(|e| panic!("{label}: {e}"));
-                    assert!(!from_registry, "{label}: expected a custom spec");
-                    assert_eq!(spec.command, command, "{label}");
+                    let got = got.unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert!(!got.from_registry, "{label}: expected a custom spec");
+                    assert_eq!(got.spec.command, command, "{label}");
                 }
                 Want::NotAllowed => assert!(
                     matches!(got, Err(SupervisorError::AgentNotAllowed(ref n)) if n == name),

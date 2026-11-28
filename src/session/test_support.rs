@@ -554,13 +554,22 @@ sandbox = "pane_scoped"
     install_agent_plugin("aoe.omp-cutover", &manifest);
 }
 
-/// Installs an approved plugin from `manifest`; a reserved-namespace id installs as a
-/// local dev plugin, the only unverified way to load one. Bind an isolated app
+/// Installs an approved plugin from `manifest`, granting the capabilities it declares; a
+/// reserved-namespace id installs as a local dev plugin, the only unverified way to load one. Bind an isolated app
 /// directory and `crate::plugin::ReloadRegistryOnDrop` around the caller.
 pub(crate) fn install_agent_plugin(id: &str, manifest: &str) {
     let dir = crate::plugin::plugins_dir().unwrap().join(id);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+    let capabilities: Vec<String> = aoe_plugin_api::PluginManifest::from_toml_str(manifest)
+        .map(|parsed| {
+            parsed
+                .capabilities
+                .iter()
+                .map(|c| c.as_str().to_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     let reserved = aoe_plugin_api::PluginId::new(id.to_owned())
         .unwrap()
         .is_reserved_namespace();
@@ -572,7 +581,7 @@ pub(crate) fn install_agent_plugin(id: &str, manifest: &str) {
                 source: reserved.then(|| "local".to_owned()),
                 grant: Some(crate::session::CapabilityGrant {
                     manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
-                    capabilities: Vec::new(),
+                    capabilities,
                     granted_at: crate::time::Timestamp::now(),
                 }),
                 ..crate::session::PluginConfig::default()
@@ -581,6 +590,27 @@ pub(crate) fn install_agent_plugin(id: &str, manifest: &str) {
     })
     .unwrap();
     crate::plugin::reload_registry();
+}
+
+/// Installs the approved plugin `aoe.zeta`, providing ACP agent `zeta` for tool `zeta`, with
+/// `extra` TOML appended to its manifest. Bind an isolated app directory and
+/// `crate::plugin::ReloadRegistryOnDrop` around the caller.
+pub(crate) fn install_zeta_acp_plugin(extra: &str) {
+    let dir = crate::plugin::plugins_dir().unwrap().join("aoe.zeta");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::write(dir.join("bin/proxy"), "").unwrap();
+    install_agent_plugin(
+        "aoe.zeta",
+        &format!(
+            "id = \"aoe.zeta\"\nname = \"Zeta\"\nversion = \"1.0.0\"\napi_version = 30\n\
+             capabilities = [\"acp.agent.provide\"]\n\
+             [[agent_integrations]]\ntool = \"zeta\"\n\
+             [agent_integrations.acp]\nid = \"zeta\"\ndisplay_name = \"Zeta\"\n\
+             failure_policy = \"neutral_boot\"\n\
+             [agent_integrations.acp.proxy]\ncommand = \"bin/proxy\"\n\
+             protocol_version = 1\nprimitive_schema_version = 1\n{extra}"
+        ),
+    );
 }
 
 /// The error a launch of `tool` refused for the sandbox login carries.

@@ -1,7 +1,8 @@
 //! Named agent registry: maps an agent name (e.g. `claude`, `aoe-agent`) to a spawn command.
 
+use super::acp_client::ProxySpec;
 use super::install_hints::{install_hint_for, AOE_AGENT_BINARY};
-use super::resolved_agent::ResolvedAcpAgent;
+use super::resolved_agent::{AcpAgentSource, ResolvedAcpAgent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -45,6 +46,27 @@ impl AgentSpec {
             plugin_env: None,
         })
     }
+}
+
+/// True the first time a `(plugin, agent, reason)` is seen, so a registry rebuilt per
+/// resolution does not repeat the warning.
+fn first_warning(plugin: &str, agent: &str, reason: &str) -> bool {
+    static WARNED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashSet<(String, String, String)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    WARNED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert((plugin.to_owned(), agent.to_owned(), reason.to_owned()))
+}
+
+/// The outcome of [`AgentRegistry::resolve_spec`].
+#[derive(Debug)]
+pub struct SpawnSpec {
+    pub spec: AgentSpec,
+    /// False for the user's own `agent_acp_cmd`.
+    pub from_registry: bool,
+    pub proxy: Option<ProxySpec>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -182,8 +204,10 @@ impl AgentRegistry {
                     .count()
                     > 1;
             if ambiguous {
-                tracing::warn!(target: "plugin.agents", plugin = plugin.id(), %tool, agent = %acp.id,
-                    "ACP agent id, alias or tool is claimed by more than one plugin; ignoring it");
+                if first_warning(plugin.id(), &acp.id, "ambiguous") {
+                    tracing::warn!(target: "plugin.agents", plugin = plugin.id(), %tool, agent = %acp.id,
+                        "ACP agent id, alias or tool is claimed by more than one plugin; ignoring it");
+                }
                 continue;
             }
             let replaced: Vec<String> = if crate::plugin::bundled_agents::contains(tool) {
@@ -209,8 +233,10 @@ impl AgentRegistry {
             ) {
                 Ok(agent) => agent,
                 Err(error) => {
-                    tracing::warn!(target: "plugin.agents", plugin = plugin.id(), %tool, agent = %acp.id, %error,
-                        "plugin ACP agent cannot be resolved; ignoring it");
+                    if first_warning(plugin.id(), &acp.id, &error) {
+                        tracing::warn!(target: "plugin.agents", plugin = plugin.id(), %tool, agent = %acp.id, %error,
+                            "plugin ACP agent cannot be resolved; ignoring it");
+                    }
                     continue;
                 }
             };
@@ -221,8 +247,10 @@ impl AgentRegistry {
                         .any(|name| existing.answers_to(name))
             });
             if let Some(existing) = taken {
-                tracing::warn!(target: "plugin.agents", plugin = plugin.id(), agent = %agent.id, existing = %existing.id,
-                    "plugin ACP agent collides with an existing agent; preserving it");
+                if first_warning(plugin.id(), &agent.id, &format!("collides:{}", existing.id)) {
+                    tracing::warn!(target: "plugin.agents", plugin = plugin.id(), agent = %agent.id, existing = %existing.id,
+                        "plugin ACP agent collides with an existing agent; preserving it");
+                }
                 continue;
             }
             for id in replaced {
@@ -232,10 +260,73 @@ impl AgentRegistry {
         }
     }
 
+    /// The agent `name` addresses: by id, by alias, else the agent paired to the tool `name`
+    /// (`claude-code` is the legacy name of tool `claude`), so a takeover that removed the
+    /// built-in rows still answers to their persisted names.
     pub fn resolved(&self, name: &str) -> Option<&ResolvedAcpAgent> {
         self.agents
             .get(name)
             .or_else(|| self.agents.values().find(|agent| agent.answers_to(name)))
+            .or_else(|| {
+                self.paired_agent(if name == "claude-code" {
+                    "claude"
+                } else {
+                    name
+                })
+            })
+    }
+
+    /// A built-in row named `name`, which no plugin or user config can shadow.
+    fn builtin_row(&self, name: &str) -> Option<&ResolvedAcpAgent> {
+        self.agents
+            .get(name)
+            .filter(|agent| agent.source == AcpAgentSource::Builtin)
+    }
+
+    /// The built-in or plugin base `tool` inherits via `agent_detect_as`.
+    pub fn inherited_base(
+        &self,
+        tool: &str,
+        agent_detect_as: &HashMap<String, String>,
+    ) -> Option<String> {
+        let base = agent_detect_as.get(tool)?;
+        self.get(base).map(|_| base.clone())
+    }
+
+    /// What a spawn of `name` runs. A built-in row wins, then the user's `agent_acp_cmd` and
+    /// `agent_detect_as` base, then a plugin row, so a plugin never shadows a name the user
+    /// configured. Only a row addressed by its own name brings its proxy.
+    pub fn resolve_spec(
+        &self,
+        name: &str,
+        session: &crate::session::config::SessionConfig,
+    ) -> Result<Option<SpawnSpec>, String> {
+        let from_registry = |spec: &AgentSpec, proxy: Option<&ProxySpec>| SpawnSpec {
+            spec: spec.clone(),
+            from_registry: true,
+            proxy: proxy.cloned(),
+        };
+        if let Some(agent) = self.builtin_row(name) {
+            return Ok(Some(from_registry(&agent.spec, None)));
+        }
+        if let Some(cmd) = session.agent_acp_cmd.get(name) {
+            return AgentSpec::from_acp_cmd(name, cmd).map(|spec| {
+                Some(SpawnSpec {
+                    spec,
+                    from_registry: false,
+                    proxy: None,
+                })
+            });
+        }
+        if let Some(spec) = self
+            .inherited_base(name, &session.agent_detect_as)
+            .and_then(|base| self.get(&base))
+        {
+            return Ok(Some(from_registry(spec, None)));
+        }
+        Ok(self
+            .resolved(name)
+            .map(|agent| from_registry(&agent.spec, agent.proxy.as_ref())))
     }
 
     pub fn get(&self, name: &str) -> Option<&AgentSpec> {
@@ -265,10 +356,7 @@ impl AgentRegistry {
 
 /// The built-in base `tool` inherits via `agent_detect_as`, when that base has an ACP adapter.
 pub fn inherited_acp_base(tool: &str, agent_detect_as: &HashMap<String, String>) -> Option<String> {
-    let base = agent_detect_as.get(tool)?;
-    AgentRegistry::with_defaults()
-        .get(base)
-        .map(|_| base.clone())
+    AgentRegistry::with_defaults().inherited_base(tool, agent_detect_as)
 }
 
 /// Whether `agent` always runs in Yolo mode in `view`: a built-in that does, or a custom agent
@@ -309,9 +397,9 @@ pub fn display_name_for(agent: &str) -> Option<&'static str> {
     .map(|def| def.display_name)
 }
 
-/// The agent a structured-view session of `tool` spawns as: an explicit
-/// override, the agent paired to the tool, the tool's own registry entry or
-/// custom command, an inherited base, then the configured default agent.
+/// The agent a structured-view session of `tool` spawns as: an explicit override, the tool's
+/// built-in row, the user's custom command or inherited base, the plugin agent for the tool,
+/// then the configured default agent.
 pub fn pick_acp_agent_name(
     registry: &AgentRegistry,
     session: &crate::session::config::SessionConfig,
@@ -338,18 +426,21 @@ pub(crate) fn pick_acp_agent_name_with_default(
     if let Some(name) = explicit_override.filter(|name| !name.is_empty()) {
         return name.to_string();
     }
+    if let Some(agent) = registry.builtin_row(tool) {
+        return agent.id.clone();
+    }
     let custom_cmd = session
         .agent_acp_cmd
         .get(tool)
         .is_some_and(|cmd| AgentSpec::from_acp_cmd(tool, cmd).is_ok());
-    if let Some(agent) = registry.paired_agent(tool) {
-        return agent.id.clone();
-    }
-    if registry.get(tool).is_some() || custom_cmd {
+    if custom_cmd {
         return tool.to_string();
     }
-    if let Some(base) = inherited_acp_base(tool, &session.agent_detect_as) {
+    if let Some(base) = registry.inherited_base(tool, &session.agent_detect_as) {
         return base;
+    }
+    if let Some(agent) = registry.for_tool(tool) {
+        return agent.id.clone();
     }
     default_agent.to_string()
 }
@@ -433,7 +524,11 @@ mod tests {
         assert_eq!(paired("codex").as_deref(), Some("codex"));
         assert_eq!(paired("aoe-agent"), None);
         assert_eq!(registry.paired_agent("claude").unwrap().id, "claude");
-        assert_eq!(registry.agents.len(), 11);
+        assert!(registry.paired_agent("aoe-agent").is_none());
+        assert!(registry
+            .agents
+            .values()
+            .all(|a| a.source == AcpAgentSource::Builtin));
     }
 
     #[test]
@@ -458,7 +553,8 @@ mod tests {
         );
         assert_eq!(registry.resolved("zeta-cli").unwrap().id, "zeta-acp");
         assert_eq!(agent.env.allowlist, ["ZZ_KEY"]);
-        assert_eq!(registry.agents.len(), 12);
+        // The tool name addresses its paired agent too.
+        assert_eq!(registry.get("zzzeta").unwrap().command, "zzzeta");
     }
 
     #[test]
@@ -537,7 +633,10 @@ mod tests {
             acp_plugin("acme.four", "zzfour", "codex", &[], &dir),
             acp_plugin("acme.five", "zzfive", "five", &["claude-code"], &dir),
         ]);
-        assert_eq!(registry.agents.len(), 11);
+        assert!(registry
+            .agents
+            .values()
+            .all(|a| a.source == AcpAgentSource::Builtin));
         assert_eq!(registry.paired_agent("claude").unwrap().id, "claude");
         assert_eq!(registry.paired_agent("opencode").unwrap().id, "opencode");
         assert!(registry.paired_agent("zzfive").is_none());
@@ -553,7 +652,7 @@ mod tests {
         assert_eq!(registry.paired_agent("claude").unwrap().id, "claude-next");
         assert_eq!(registry.resolved("claude-code").unwrap().id, "claude-next");
         assert!(!registry.agents.contains_key("claude"));
-        assert_eq!(registry.agents.len(), 10);
+        assert!(!registry.agents.contains_key("claude-code"));
     }
 
     #[test]
@@ -573,8 +672,13 @@ mod tests {
                 acp_plugin("acme.b", b.0, b.1, b.2, &dir),
                 acp_plugin("acme.c", "zzc", "ok", &[], &dir),
             ]);
-            assert_eq!(registry.agents.len(), 12, "{a:?} {b:?}");
-            assert!(registry.get("ok").is_some());
+            let plugin_ids: Vec<_> = registry
+                .agents
+                .values()
+                .filter(|agent| agent.source != AcpAgentSource::Builtin)
+                .map(|agent| agent.id.as_str())
+                .collect();
+            assert_eq!(plugin_ids, ["ok"], "{a:?} {b:?}");
         }
     }
 
@@ -591,7 +695,10 @@ mod tests {
         let mut missing = acp_plugin("acme.missing", "zzms", "missing", &[], &dir);
         missing.dir = Some(temp.path().join("nowhere"));
         let registry = registry_of(vec![disabled, ungranted, no_dir, missing]);
-        assert_eq!(registry.agents.len(), 11);
+        assert!(registry
+            .agents
+            .values()
+            .all(|a| a.source == AcpAgentSource::Builtin));
 
         #[cfg(unix)]
         {
@@ -631,6 +738,100 @@ mod tests {
                 "{tool} / {explicit:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_plugin_never_shadows_a_name_the_user_configured() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(temp.path(), "acme");
+        let registry = registry_of(vec![
+            acp_plugin("acme.zeta", "zzzeta", "zeta-acp", &["zeta-cli"], &dir),
+            acp_plugin("acme.mine", "zzmine", "mine", &[], &dir),
+        ]);
+        let session = crate::session::config::SessionConfig {
+            agent_acp_cmd: [
+                ("zeta-cli".to_string(), "my-zeta acp".to_string()),
+                ("zzzeta".to_string(), "my-zzzeta".to_string()),
+            ]
+            .into(),
+            agent_detect_as: [("mine".to_string(), "claude".to_string())].into(),
+            ..Default::default()
+        };
+        let acp = crate::session::config::AcpConfig::default();
+
+        for (tool, want) in [
+            // The user's command for the tool outranks the plugin paired to it.
+            ("zzzeta", "zzzeta"),
+            ("mine", "claude"),
+            ("zzmine", "mine"),
+            ("claude", "claude"),
+        ] {
+            assert_eq!(
+                pick_acp_agent_name(&registry, &session, &acp, tool, None),
+                want,
+                "{tool}"
+            );
+        }
+        // Without the user's config the plugin answers.
+        let bare = crate::session::config::SessionConfig::default();
+        assert_eq!(
+            pick_acp_agent_name(&registry, &bare, &acp, "zzzeta", None),
+            "zeta-acp"
+        );
+
+        // (name, command, from the registry, carries the plugin proxy)
+        for (name, command, from_registry, proxied) in [
+            ("zeta-cli", "my-zeta", false, false),
+            ("mine", "claude-agent-acp", true, false),
+            ("zeta-acp", "zzzeta", true, true),
+            ("zzmine", "zzmine", true, true),
+            ("claude", "claude-agent-acp", true, false),
+        ] {
+            let got = registry.resolve_spec(name, &session).unwrap().unwrap();
+            assert_eq!(got.spec.command, command, "{name}");
+            assert_eq!(got.from_registry, from_registry, "{name}");
+            assert_eq!(got.proxy.is_some(), proxied, "{name}");
+        }
+        assert!(registry.resolve_spec("nope", &session).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_takeover_keeps_answering_to_the_persisted_builtin_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(temp.path(), "acme");
+        let session = crate::session::config::SessionConfig::default();
+        for (aliases, expected_alias) in [(&[][..], false), (&["claude-code"][..], true)] {
+            let registry = registry_of(vec![acp_plugin(
+                "aoe.claude",
+                "claude",
+                "claude-next",
+                aliases,
+                &dir,
+            )]);
+            // Only a declared alias is the plugin's; otherwise the legacy name follows the tool.
+            let declared = registry
+                .agents
+                .values()
+                .any(|agent| agent.aliases.iter().any(|a| a == "claude-code"));
+            assert_eq!(declared, expected_alias);
+            for name in ["claude", "claude-code"] {
+                assert_eq!(
+                    registry.get(name).unwrap().command,
+                    "claude-agent-acp",
+                    "{name}"
+                );
+                assert_eq!(registry.for_tool(name).unwrap().id, "claude-next", "{name}");
+                let got = registry.resolve_spec(name, &session).unwrap().unwrap();
+                assert!(got.from_registry && got.proxy.is_some(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_warnings_are_reported_once_per_reason() {
+        assert!(first_warning("acme.once", "agent", "reason"));
+        assert!(!first_warning("acme.once", "agent", "reason"));
+        assert!(first_warning("acme.once", "agent", "another reason"));
     }
 
     #[test]

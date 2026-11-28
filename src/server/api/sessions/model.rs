@@ -157,16 +157,17 @@ pub(super) fn session_response_from_instance_with_plan(
         queued_count: inst.queued_prompts.len(),
         // Overlaid in list_sessions; single-session responses omit it.
         queue_reason: None,
-        // Built-in ACP capability resolves here from a process-wide
-        // registry (no IO). Custom agents depend on profile config, which
-        // the list and create handlers overlay without a per-row read.
+        // Registry ACP capability (built-in or plugin) resolves here. Custom agents depend
+        // on profile config, which the list and create handlers overlay without a per-row read.
         acp_capable: {
             let resolved = inst
                 .agent_name
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(inst.tool.as_str());
-            builtin_acp_registry().get(resolved).is_some()
+            crate::acp::AgentRegistry::with_defaults()
+                .get(resolved)
+                .is_some()
         },
         acp_session_id: inst.acp_session_id.clone(),
         import_pending: inst.import_pending == Some(true),
@@ -357,14 +358,6 @@ pub(super) fn context_resume_with<'a>(
             reason: ContextResumeUnavailableReason::PreviousFailure,
         },
     }
-}
-
-/// Process-wide built-in ACP registry, built once. Used to compute
-/// `SessionResponse.acp_capable` for built-in agents without allocating
-/// a registry per response row.
-fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
-    static REG: std::sync::OnceLock<crate::acp::AgentRegistry> = std::sync::OnceLock::new();
-    REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
 }
 
 /// True iff this custom agent can run in structured view: it declares a valid
