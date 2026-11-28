@@ -74,7 +74,7 @@ async fn exercise(kind: Kind, stale: Stale) {
     .unwrap();
     if kind == Kind::Group {
         crate::session::config::update_app_state(|state| {
-            state.group_by = Some(crate::session::config::GroupByMode::Manual);
+            state.group_by = Some(crate::session::config::GroupByMode::Group);
             state.sort_order = Some(crate::session::config::SortOrder::Newest);
         })
         .unwrap();
@@ -428,7 +428,7 @@ async fn home_pending_frame_cannot_route_mouse_to_reordered_sessions() {
     })
     .unwrap();
     crate::session::config::update_app_state(|state| {
-        state.group_by = Some(GroupByMode::Manual);
+        state.group_by = Some(GroupByMode::Group);
         state.sort_order = Some(SortOrder::Custom);
     })
     .unwrap();
