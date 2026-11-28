@@ -5344,7 +5344,13 @@ async fn list_sessions_advertises_the_running_agents_reset_command() {
     let advertised: Vec<_> = project_sessions(&state)
         .await
         .into_iter()
-        .map(|s| (s.id, s.clear_aliases, s.compact_aliases))
+        .map(|s| {
+            (
+                s.id,
+                s.agent_profile.clear_aliases,
+                s.agent_profile.compact_aliases,
+            )
+        })
         .collect();
     let row = |id: &str, clear: &[&str], compact: &[&str]| {
         (
@@ -5669,7 +5675,7 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
             let mut inst = make_test_instance();
             inst.tool = tool.to_string();
             assert_eq!(
-                session_response_from_instance(&inst, false).acp_can_fork,
+                session_response_from_instance(&inst).acp_can_fork,
                 crate::session::fork::structured_fork_capable(tool, None),
                 "acp_can_fork and the create guard disagree for '{tool}'"
             );
@@ -5686,9 +5692,12 @@ fn session_response_carries_the_agents_solo_commands() {
     for (tool, clear, compact) in cases {
         let mut inst = make_test_instance();
         inst.tool = tool.to_string();
-        let response = session_response_from_instance(&inst, false);
+        let response = session_response_from_instance(&inst);
         assert_eq!(
-            (response.clear_aliases, response.compact_aliases),
+            (
+                response.agent_profile.clear_aliases,
+                response.agent_profile.compact_aliases
+            ),
             (
                 clear.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 compact.iter().map(|s| s.to_string()).collect::<Vec<_>>()
@@ -6146,7 +6155,7 @@ fn session_response_from_instance_reports_managed_worktree_for_workspace_session
         cleanup_on_delete: true,
     });
 
-    let resp = session_response_from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst);
     assert!(
         resp.has_cleanable_worktree,
         "workspace session must report a cleanable worktree so the delete checkbox shows"
@@ -6173,11 +6182,11 @@ fn session_response_from_instance_surfaces_hook_urgent_flag() {
     )
     .unwrap();
 
-    let urgent_resp = session_response_from_instance(&inst, false);
+    let urgent_resp = session_response_from_instance(&inst);
     assert!(urgent_resp.urgent, "hook-flagged session must be urgent");
 
     crate::hooks::cleanup_hook_status_dir(&inst.id);
-    let plain_resp = session_response_from_instance(&inst, false);
+    let plain_resp = session_response_from_instance(&inst);
     assert!(
         !plain_resp.urgent,
         "session with no hook file must not be urgent"
@@ -6523,15 +6532,15 @@ fn session_response_dormant_reflects_shown_dormant() {
 
     // Live idle: not dormant.
     inst.status = Status::Idle;
-    assert!(!session_response_from_instance(&inst, false).dormant);
+    assert!(!session_response_from_instance(&inst).dormant);
 
     // Idle-reaped (marker set, status left Idle): dormant.
     inst.mark_idle_dormant();
-    assert!(session_response_from_instance(&inst, false).dormant);
+    assert!(session_response_from_instance(&inst).dormant);
 
     // A deliberate stop keeps the neutral Stopped dot rather than dormant (#2250).
     inst.status = Status::Stopped;
-    assert!(!session_response_from_instance(&inst, false).dormant);
+    assert!(!session_response_from_instance(&inst).dormant);
 }
 
 #[test]
@@ -6686,9 +6695,13 @@ async fn session_diff_files_flags_a_working_directory_outside_any_repository() {
     let state = crate::server::test_support::build_test_app_state(instances.clone());
 
     for ((label, path, outside), inst) in cases.iter().zip(&instances) {
-        let resp = session_diff_files(State(state.clone()), AxumPath(inst.id.clone()))
-            .await
-            .into_response();
+        let resp = session_diff_files(
+            State(state.clone()),
+            AxumPath(inst.id.clone()),
+            axum::extract::Query(DiffFilesQuery::default()),
+        )
+        .await
+        .into_response();
         let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let base = &body["per_repo_bases"][0];
@@ -6747,7 +6760,7 @@ fn session_response_flags_a_working_directory_outside_any_repository() {
     ];
     for (label, inst, outside) in cases {
         assert_eq!(
-            session_response_from_instance(&inst, false).outside_repository,
+            session_response_from_instance(&inst).outside_repository,
             outside,
             "{label}"
         );
@@ -6854,12 +6867,12 @@ fn session_response_gates_snoozed_until_on_active_snooze() {
     let mut inst = make_test_instance();
 
     // Not snoozed -> field omitted.
-    let resp = session_response_from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst);
     assert!(resp.snoozed_until.is_none());
 
     // Active snooze -> field surfaced.
     inst.snooze(30);
-    let resp = session_response_from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst);
     assert!(resp.snoozed_until.is_some());
 
     // Expired snooze -> stays on disk for the next mutation to rewrite,
@@ -6867,7 +6880,7 @@ fn session_response_gates_snoozed_until_on_active_snooze() {
     // This prevents the web from rendering "snoozed 0m" on rows that
     // have already woken on the server.
     inst.snoozed_until = Some(crate::time::Timestamp::now() - crate::time::Duration::seconds(1));
-    let resp = session_response_from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst);
     assert!(
         resp.snoozed_until.is_none(),
         "expired snooze must be filtered out on the wire even though the persisted field stays set"
@@ -7999,6 +8012,81 @@ async fn handlers_take_instance_lock_before_snapshot() {
     }
 }
 
+/// `?scope=` picks what the working tree is compared against.
+#[tokio::test]
+#[serial_test::serial]
+async fn diff_scopes_compare_against_the_branch_or_head() {
+    use axum::body::to_bytes;
+    use axum::extract::Query;
+
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (dir, repo) = crate::git::test_support::init_repo();
+    let root = repo.head().unwrap().peel_to_commit().unwrap().id();
+    repo.branch("base", &repo.find_commit(root).unwrap(), false)
+        .unwrap();
+    crate::git::test_support::commit(
+        &repo,
+        Some("HEAD"),
+        &[("branch.txt", b"b\n")],
+        &[root],
+        None,
+    );
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    repo.checkout_head(Some(checkout.force())).unwrap();
+    std::fs::write(dir.path().join("before.txt"), "before\n").unwrap();
+    let mut inst = Instance::new("scopes", dir.path().to_str().unwrap());
+    inst.base_branch_override = Some("base".into());
+    let id = inst.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+    let files = |scope| {
+        let state = state.clone();
+        let id = id.clone();
+        async move {
+            let resp = session_diff_files(State(state), Path(id), Query(DiffFilesQuery { scope }))
+                .await
+                .into_response();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let paths: Vec<String> = body["files"]
+                .as_array()
+                .map(|files| {
+                    files
+                        .iter()
+                        .map(|f| f["path"].as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (status, paths)
+        }
+    };
+    assert_eq!(
+        files(DiffScope::Branch).await,
+        (
+            StatusCode::OK,
+            vec!["before.txt".into(), "branch.txt".into()]
+        )
+    );
+    assert_eq!(
+        files(DiffScope::Uncommitted).await,
+        (StatusCode::OK, vec!["before.txt".into()])
+    );
+}
+
+/// An unknown scope is a client error, not a silent Branch diff.
+#[test]
+fn an_unknown_diff_scope_is_rejected() {
+    let parse = |q: &str| {
+        let uri: axum::http::Uri = format!("http://aoe/diff/files?{q}").parse().unwrap();
+        axum::extract::Query::<DiffFilesQuery>::try_from_uri(&uri).map(|q| q.0.scope)
+    };
+    assert_eq!(parse("").unwrap(), DiffScope::Branch);
+    assert_eq!(parse("scope=uncommitted").unwrap(), DiffScope::Uncommitted);
+    assert!(parse("scope=last_turn").is_err());
+    assert!(parse("scope=yesterday").is_err());
+}
+
 /// A workspace row can persist with `repos: []`; a file-diff request that
 /// omits `?repo=` must get a 400 for it, not a panic on the empty repo list.
 #[tokio::test]
@@ -8022,6 +8110,7 @@ async fn diff_file_rejects_workspace_with_no_repos() {
         Query(FileDiffQuery {
             path: "Cargo.toml".to_string(),
             repo: None,
+            scope: DiffScope::Branch,
         }),
     )
     .await
@@ -8098,6 +8187,7 @@ mod open_file {
             Query(FileDiffQuery {
                 path: path.to_string(),
                 repo: repo.map(str::to_string),
+                scope: DiffScope::Branch,
             }),
         )
         .await
@@ -9371,7 +9461,12 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         state.acp_supervisor.test_insert_worker(id).await;
 
-        assert_eq!(project_sessions(&state).await[0].clear_aliases, ["/clear"]);
+        assert_eq!(
+            project_sessions(&state).await[0]
+                .agent_profile
+                .clear_aliases,
+            ["/clear"]
+        );
         let response = rename_session(
             State(state.clone()),
             Path(id.to_string()),
@@ -9396,7 +9491,12 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
                 .test_insert_worker_cmd_recording(id)
                 .await;
             let _live = crate::acp::supervisor::test_support::save_agent_record(id, "bridge", true);
-            assert_eq!(project_sessions(&state).await[0].clear_aliases, ["/new"]);
+            assert_eq!(
+                project_sessions(&state).await[0]
+                    .agent_profile
+                    .clear_aliases,
+                ["/new"]
+            );
             state
                 .session_service
                 .send_turn(
@@ -10664,7 +10764,7 @@ fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
                 native_interaction: true,
             },
             default_profile: "default".into(),
-            sessions: vec![session_response_from_instance(&instance, false)],
+            sessions: vec![session_response_from_instance(&instance)],
             profiles: Vec::new(),
             workspace_ordering: Vec::new(),
             global_projects: Vec::new(),
@@ -11274,13 +11374,17 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         axum::http::HeaderName::from_static("x-aoe-prompt-origin"),
         axum::http::HeaderValue::from_static("tui"),
     );
+    // A multi-line preset prompt, as the dashboard and the TUI send it.
+    const MULTI_LINE: &str = "Review it\n\n1. Find it.   Then run:\r\n2. Done\n";
     for (title, headers) in [
         ("with-prompt", axum::http::HeaderMap::new()),
         ("with-prompt-tui", tui),
+        ("multi-line", axum::http::HeaderMap::new()),
     ] {
         let mut body = serde_json::json!({
             "title": title, "path": "", "tool": "claude",
-            "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
+            "scratch": true, "view": "structured",
+            "initial_prompt": if title == "multi-line" { MULTI_LINE } else { "fix the bug" },
         });
         if title == "with-prompt" {
             body["suggestion"] = serde_json::json!({ "provider_id": "acme.gh", "id": "42" });
@@ -11292,7 +11396,14 @@ async fn create_persists_initial_prompt_as_pending_turn() {
     let origin_of = |title: &str| {
         let row = instances.iter().find(|i| i.title == title).expect("row");
         let turn = row.pending_initial_turn.as_ref().expect("queued");
-        assert_eq!(turn.text, "fix the bug");
+        assert_eq!(
+            turn.text,
+            if title == "multi-line" {
+                MULTI_LINE
+            } else {
+                "fix the bug"
+            }
+        );
         assert!(!turn.synthesized);
         turn.origin
     };
@@ -11304,6 +11415,7 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         origin_of("with-prompt-tui"),
         crate::daemon::PromptOrigin::Tui
     );
+    origin_of("multi-line");
     let linked = instances.iter().find(|i| i.title == "with-prompt").unwrap();
     let origin = linked.suggestion.as_ref().expect("linked");
     assert_eq!(

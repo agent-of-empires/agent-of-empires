@@ -235,7 +235,7 @@ impl ForkStrategy {
 }
 
 /// Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`
-/// and in the TS mirrors (`web/src/lib/types.ts`, `web/src/lib/agentProfiles.ts`).
+/// and in the TS mirror (`web/src/lib/types.ts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AgentLifecycle {
@@ -291,14 +291,34 @@ pub enum HookIdentityField {
     HermesForegroundSessionId,
 }
 
+/// Tool names borrowed from a built-in table or from a plugin declaration.
+#[derive(Debug, Clone, Copy)]
+pub enum ToolNames<'a> {
+    Static(&'a [&'a str]),
+    Declared(&'a [String]),
+}
+
+impl<'a> ToolNames<'a> {
+    pub fn iter(&self) -> impl Iterator<Item = &'a str> {
+        let (builtin, declared): (&'a [&'a str], &'a [String]) = match *self {
+            ToolNames::Static(names) => (names, &[]),
+            ToolNames::Declared(names) => (&[], names),
+        };
+        builtin
+            .iter()
+            .copied()
+            .chain(declared.iter().map(String::as_str))
+    }
+}
+
 #[derive(Debug)]
-pub struct HookEvent {
-    pub name: &'static str,
-    pub matcher: Option<&'static str>,
+pub struct HookEvent<'a> {
+    pub name: &'a str,
+    pub matcher: Option<&'a str>,
     pub status: Option<HookStatus>,
     pub identity_field: Option<HookIdentityField>,
     /// Tools that block on the user for their whole run; the hook writes `waiting` for them.
-    pub waiting_tools: &'static [&'static str],
+    pub waiting_tools: ToolNames<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,7 +331,7 @@ pub struct ResolvedHookEvent {
     /// Binary of the agent whose config declares this event. The identity publisher carries it
     /// so a nested agent of another kind cannot publish into the pane's sidecar, and Claude's
     /// status writers use it to bind to the pane's `session_id`.
-    pub publisher: Option<&'static str>,
+    pub publisher: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,11 +348,14 @@ pub enum HookFormat {
 }
 
 #[derive(Debug)]
-pub struct AgentHookConfig {
-    pub settings_rel_path: &'static str,
-    pub config_dir_env_var: Option<&'static str>,
-    pub events: &'static [HookEvent],
+pub struct AgentHookConfig<'a> {
+    pub settings_rel_path: &'a str,
+    pub config_dir_env_var: Option<&'a str>,
+    pub events: &'a [HookEvent<'a>],
     pub format: HookFormat,
+    /// Plugin-declared: the installer refuses a settings file that is not a JSON object
+    /// instead of replacing it.
+    pub strict: bool,
 }
 
 /// An agent has at most one of `hook_config` or `sidecar_hooks`.
@@ -401,7 +424,9 @@ pub struct AgentDef<'a> {
     pub set_default_command: bool,
     pub detect_status: fn(&str) -> Status,
     pub container_env: &'a [(&'a str, &'a str)],
-    pub hook_config: Option<AgentHookConfig>,
+    pub hook_config: Option<AgentHookConfig<'a>>,
+    /// Plugin-declared folder trust; built-in agents write theirs through `trust_host_project`.
+    pub trust: Option<&'a aoe_plugin_api::agent_integration::AgentTrustDeclaration>,
     pub sidecar_hooks: Option<SidecarHooks>,
     pub session_support: Option<SessionSupport<'a>>,
     pub fork_strategy: ForkStrategy,
@@ -431,17 +456,21 @@ pub struct PermissionResponse<'a> {
     pub deny: &'a [KeyToken<'a>],
 }
 
-const fn hook(name: &'static str, status: HookStatus) -> HookEvent {
+const fn hook(name: &'static str, status: HookStatus) -> HookEvent<'static> {
     HookEvent {
         name,
         matcher: None,
         status: Some(status),
         identity_field: None,
-        waiting_tools: &[],
+        waiting_tools: ToolNames::Static(&[]),
     }
 }
 
-const fn matched_hook(name: &'static str, matcher: &'static str, status: HookStatus) -> HookEvent {
+const fn matched_hook(
+    name: &'static str,
+    matcher: &'static str,
+    status: HookStatus,
+) -> HookEvent<'static> {
     HookEvent {
         matcher: Some(matcher),
         ..hook(name, status)
@@ -458,14 +487,14 @@ const fn sidecar(name: &'static str, status: HookStatus) -> SidecarHookEvent {
 
 /// `Notification`/`idle_prompt` and `StopFailure` backstop `Stop`, which misses API-error and
 /// interrupted turn ends. `waiting_tools` marks `AskUserQuestion` as waiting until `PostToolUse`.
-const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
+const CLAUDE_HOOK_EVENTS: &[HookEvent<'static>] = &[
     HookEvent {
         status: None,
         identity_field: Some(HookIdentityField::SessionId),
         ..hook("SessionStart", HookStatus::Idle)
     },
     HookEvent {
-        waiting_tools: &["AskUserQuestion"],
+        waiting_tools: ToolNames::Static(&["AskUserQuestion"]),
         ..hook("PreToolUse", HookStatus::Running)
     },
     matched_hook("PostToolUse", "AskUserQuestion", HookStatus::Running),
@@ -497,7 +526,7 @@ const CURSOR_HOOK_EVENTS: &[SidecarHookEvent] = &[
     sidecar("stop", HookStatus::Idle),
 ];
 
-const QWEN_HOOK_EVENTS: &[HookEvent] = &[
+const QWEN_HOOK_EVENTS: &[HookEvent<'static>] = &[
     hook("PreToolUse", HookStatus::Running),
     hook("UserPromptSubmit", HookStatus::Running),
     hook("PostToolUse", HookStatus::Running),
@@ -509,7 +538,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
     ),
 ];
 
-const CODEX_HOOK_EVENTS: &[HookEvent] = &[
+const CODEX_HOOK_EVENTS: &[HookEvent<'static>] = &[
     // Codex's SessionStart payload carries a top-level string `session_id`
     // (alongside `transcript_path`, `cwd`, `hook_event_name`), so the pane can
     // publish its own conversation the way Claude's does instead of leaving
@@ -528,7 +557,7 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
     hook("Stop", HookStatus::Idle),
 ];
 
-const GEMINI_HOOK_EVENTS: &[HookEvent] = &[
+const GEMINI_HOOK_EVENTS: &[HookEvent<'static>] = &[
     hook("BeforeTool", HookStatus::Running),
     hook("BeforeAgent", HookStatus::Running),
     hook("AfterAgent", HookStatus::Idle),
@@ -595,14 +624,15 @@ const fn resume_only(resume: ResumeStrategy<'static>) -> Option<SessionSupport<'
 
 const fn json_hooks(
     settings_rel_path: &'static str,
-    events: &'static [HookEvent],
+    events: &'static [HookEvent<'static>],
     format: HookFormat,
-) -> Option<AgentHookConfig> {
+) -> Option<AgentHookConfig<'static>> {
     Some(AgentHookConfig {
         settings_rel_path,
         config_dir_env_var: None,
         events,
         format,
+        strict: false,
     })
 }
 
@@ -627,6 +657,7 @@ const fn agent(
         detect_status: status_detection::detect_hook_only_status,
         container_env: &[],
         hook_config: None,
+        trust: None,
         sidecar_hooks: None,
         session_support: None,
         fork_strategy: ForkStrategy::Unsupported,
@@ -652,6 +683,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
             events: CLAUDE_HOOK_EVENTS,
             format: HookFormat::JsonSettings,
+            strict: false,
         }),
         session_support: session_support(
             ResumeStrategy::FlagPair {
@@ -1634,7 +1666,7 @@ pub fn effective_status_map(
 fn append_configured_status_events(
     events: &mut Vec<ResolvedHookEvent>,
     overrides: Option<&BTreeMap<String, HookStatus>>,
-    publisher: &'static str,
+    publisher: &str,
 ) {
     let Some(overrides) = overrides else {
         return;
@@ -1648,7 +1680,7 @@ fn append_configured_status_events(
                 status: Some(*status),
                 identity_field: None,
                 waiting_tools: Vec::new(),
-                publisher: Some(publisher),
+                publisher: Some(publisher.to_string()),
             });
         }
     }
@@ -1671,7 +1703,7 @@ pub(crate) fn hook_install_required(agent: &AgentDef, status_hooks_enabled: bool
 }
 
 pub fn resolved_hook_events(
-    agent: &AgentDef<'static>,
+    agent: &AgentDef,
     config: &crate::session::config::Config,
 ) -> anyhow::Result<Vec<ResolvedHookEvent>> {
     let Some(hook_cfg) = &agent.hook_config else {
@@ -1688,8 +1720,8 @@ pub fn resolved_hook_events(
                 .and_then(|map| map.get(event.name).copied())
                 .or(event.status),
             identity_field: event.identity_field,
-            waiting_tools: event.waiting_tools.iter().map(|t| t.to_string()).collect(),
-            publisher: Some(agent.binary),
+            waiting_tools: event.waiting_tools.iter().map(str::to_string).collect(),
+            publisher: Some(agent.binary.to_string()),
         })
         .collect();
     append_configured_status_events(&mut events, overrides, agent.binary);
@@ -1697,7 +1729,7 @@ pub fn resolved_hook_events(
 }
 
 pub fn resolved_sidecar_hook_events(
-    agent: &AgentDef<'static>,
+    agent: &AgentDef,
     config: &crate::session::config::Config,
 ) -> anyhow::Result<Vec<ResolvedHookEvent>> {
     let Some(sidecar) = &agent.sidecar_hooks else {
@@ -1717,7 +1749,7 @@ pub fn resolved_sidecar_hook_events(
             ),
             identity_field: event.identity_field,
             waiting_tools: Vec::new(),
-            publisher: Some(agent.binary),
+            publisher: Some(agent.binary.to_string()),
         })
         .collect();
     append_configured_status_events(&mut events, overrides, agent.binary);
@@ -2576,34 +2608,6 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
         );
     }
 
-    #[test]
-    fn lifecycle_facts_stay_synced_with_ts_mirror() {
-        let mirror_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/agentProfiles.ts");
-        let Ok(mirror) = std::fs::read_to_string(&mirror_path) else {
-            // Nix-filtered sources omit web/.
-            eprintln!(
-                "skipping TS lifecycle mirror check: {} is absent",
-                mirror_path.display()
-            );
-            return;
-        };
-        let AgentLifecycle::Deprecated {
-            since,
-            note,
-            replacement: Some(replacement),
-        } = get_agent("gemini").unwrap().lifecycle
-        else {
-            panic!("gemini must stay Deprecated with a replacement");
-        };
-        for fact in [since, note, replacement] {
-            assert!(
-                mirror.contains(fact),
-                "web/src/lib/agentProfiles.ts is missing {fact:?}"
-            );
-        }
-    }
-
     fn config_with_status(
         agent: &str,
         event: &str,
@@ -2647,7 +2651,7 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
             .unwrap();
         assert_eq!(custom.status, Some(HookStatus::Running));
         assert!(custom.matcher.is_none() && custom.identity_field.is_none());
-        assert_eq!(custom.publisher, Some("claude"));
+        assert_eq!(custom.publisher.as_deref(), Some("claude"));
 
         let config = config_with_status("vertex", "session.idle", HookStatus::Idle);
         let map = effective_status_map(&config, "vertex").unwrap();

@@ -40,7 +40,8 @@ export function isLoginAttemptPath(path: string): boolean {
 }
 
 /** GETs whose failure Home, /suggestions and the plugin views show inline; the sidebar group just hides. */
-const SELF_REPORTED = new Set(["/api/suggestions", "/api/plugins/discover"]);
+// `/api/sessions` is the poll that raises the Daemon unreachable banner, so its own failure is that banner.
+const SELF_REPORTED = new Set(["/api/sessions", "/api/suggestions", "/api/plugins/discover"]);
 
 const ACP_PROMPT_PATH = /^\/api\/sessions\/[^/]+\/acp\/prompt$/;
 
@@ -131,8 +132,8 @@ export function installFetchErrorToasts(): void {
       if (err instanceof DOMException && (err.name === "AbortError" || err.name === "TimeoutError")) {
         throw err;
       }
-      // The DisconnectBanner covers a known-down server.
-      if (toastFailures && !isServerDown() && !isPageLifecycleNetworkGlitch()) {
+      // The DisconnectBanner covers a known-down server and a device with no network.
+      if (toastFailures && !isServerDown() && navigator.onLine !== false && !isPageLifecycleNetworkGlitch()) {
         reportError(`Network error contacting ${path}. Check your connection.`);
       }
       throw err;

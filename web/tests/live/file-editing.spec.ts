@@ -1,10 +1,12 @@
 import { chmodSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { pickPhoneView } from "../helpers/phoneViews";
 import { join } from "node:path";
 import type { Dialog, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { enableStructuredViewAndWait, composer } from "../helpers/acp";
 import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { openDeleteDialogFromRow } from "../helpers/trashMocks";
+import { openReviewPane } from "../helpers/panes";
 
 async function openFile(page: Page, serve: ServeHandle, title?: string) {
   const sessions = await listSessions(serve.baseUrl);
@@ -19,12 +21,9 @@ async function openFile(page: Page, serve: ServeHandle, title?: string) {
 
 async function showNotes(page: Page) {
   if (page.viewportSize()!.width < 768) {
-    await page.getByRole("button", { name: "Toggle panels" }).click();
-    await page.getByTestId("mobile-right-panel-picker").getByRole("button", { name: "Files", exact: true }).click();
+    await pickPhoneView(page, "Files");
   } else {
-    const toggle = page.getByRole("button", { name: "Toggle Files pane" }).first();
-    await expect(toggle).toBeVisible();
-    if ((await toggle.getAttribute("aria-pressed")) !== "true") await toggle.click();
+    await openReviewPane(page, "files");
   }
   await page.getByRole("button", { name: "notes.txt", exact: true }).first().click();
 }
@@ -39,7 +38,7 @@ async function enableEditing(page: Page, serve: ServeHandle) {
   );
   await page.getByRole("checkbox", { name: "Edit project text files" }).check();
   await persisted;
-  await page.getByTestId("settings-header").getByRole("button", { name: /Back/ }).click();
+  await page.getByRole("banner").getByRole("button", { name: /Back/ }).click();
   await expect(page).toHaveURL(`${serve.baseUrl}/`);
 }
 
@@ -92,8 +91,9 @@ test("file editing is opt-in, persists exact bytes and mode, and guards dirty pa
   page.off("dialog", recordDialog);
   expect(unexpectedDialogs).toEqual([]);
   await expect(editor).toHaveValue("changed\nsecond\n");
+  // Opening Diff in the edited pane's group would hide it; declining keeps the draft.
   page.once("dialog", (dialog) => dialog.dismiss());
-  await page.getByRole("button", { name: "New terminal", exact: true }).first().click();
+  await openReviewPane(page, "diff");
   await expect(editor).toHaveValue("changed\nsecond\n");
   const currentUrl = page.url();
   const leaving = page.waitForEvent("dialog");
@@ -256,7 +256,7 @@ test("mobile editing keeps controls usable and confirms leaving the Files pane",
   await editor.fill("phone edit");
   await page.screenshot({ path: testInfo.outputPath("mobile-editor.png") });
   page.once("dialog", (dialog) => dialog.dismiss());
-  await page.getByTestId("mobile-back-to-agent").click();
+  await pickPhoneView(page, "Agent");
   await expect(editor).toHaveValue("phone edit");
   page.once("dialog", (dialog) => dialog.accept());
   await editor.press("Escape");
@@ -273,12 +273,13 @@ test("changing the other dock keeps a visible draft without asking", async ({ pa
     const group = (tab: string) => [{ tabs: [tab], active: tab }];
     const layout = {
       right: group("files"),
-      bottom: group("terminal:0"),
+      bottom: group(`terminal:${id}:0`),
       nextTerminalIndex: 1,
       closedPlugins: [],
       collapsed: { right: false, bottom: false },
     };
-    localStorage.setItem("aoe-pane-layout-v3", JSON.stringify({ version: 3, sessions: { [id]: layout } }));
+    const terminals = [{ id: `terminal:${id}:0`, dock: "bottom" }];
+    localStorage.setItem("aoe-pane-layout-v4", JSON.stringify({ version: 4, sessions: { [id]: layout }, terminals }));
   }, session!.id);
   await openFile(page, serve);
   await page.getByRole("button", { name: "Edit", exact: true }).click();
@@ -289,13 +290,13 @@ test("changing the other dock keeps a visible draft without asking", async ({ pa
     dialogs.push(dialog.message());
     void dialog.dismiss();
   });
-  const newTerminal = page.getByRole("button", { name: "New terminal", exact: true });
+  const newTerminal = page.getByRole("button", { name: "New terminal for file-docks" });
   await newTerminal.last().click();
-  await expect(page.getByRole("tab", { name: "Terminal 2" })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "file-docks · 2" })).toBeVisible();
   expect(dialogs).toEqual([]);
   await expect(editor).toHaveValue("draft");
   // Hiding the edited tab still asks; declining keeps it.
-  await newTerminal.first().click();
+  await openReviewPane(page, "diff");
   await expect.poll(() => dialogs.length).toBe(1);
   await expect(editor).toHaveValue("draft");
 });
@@ -312,11 +313,8 @@ test("an unsaved draft survives crossing the mobile breakpoint in both direction
   const editor = page.getByRole("textbox", { name: "Edit notes.txt" });
   await editor.fill("desktop draft");
   await page.setViewportSize({ width: 390, height: 844 });
-  // The desktop sidebar stays open as an overlay after the resize.
-  await page
-    .getByRole("navigation", { name: "Sessions sidebar" })
-    .getByRole("button", { name: "Close sidebar" })
-    .click();
+  // The open desktop sidebar becomes the phone's drawer, the Session pushed aside; a tap on the Session closes it.
+  await page.getByTestId("sidebar-drawer-scrim").click();
   // The Files pane keeps its selection locally; reopening the file restores the draft.
   await showNotes(page);
   await expect(editor).toHaveValue("desktop draft");

@@ -3,6 +3,8 @@
 
 import { expect, type Page, type WebSocketRoute } from "@playwright/test";
 
+import { CLAUDE_PROFILE } from "../../src/lib/__tests__/agentProfileFixtures";
+
 /** `prompt_id` is the client-minted id echoed on `UserPromptSent`. */
 export interface AcpPromptBody {
   text: string;
@@ -35,7 +37,7 @@ export interface AcpSessionMockOptions {
   rateLimitAutoResume?: boolean;
   /** Daemon control state sent on connect, over idle defaults; the only way a rate limit reaches the client. */
   reducedState?: Record<string, unknown>;
-  /** Extra `SessionResponse` fields, such as the agent's `clear_aliases` and `compact_aliases`. */
+  /** Extra `SessionResponse` fields, such as `agent_profile` (Claude's by default). */
   sessionFields?: Record<string, unknown>;
 }
 
@@ -237,6 +239,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             ...(opts.acpSessionId ? { acp_session_id: opts.acpSessionId } : {}),
             ...(opts.importPending ? { import_pending: true } : {}),
             ...(opts.rateLimitAutoResume === undefined ? {} : { rate_limit_auto_resume: opts.rateLimitAutoResume }),
+            agent_profile: CLAUDE_PROFILE,
             ...opts.sessionFields,
             claude_fullscreen: false,
           },

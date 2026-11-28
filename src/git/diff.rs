@@ -81,19 +81,50 @@ pub struct FileDiff {
     pub is_binary: bool,
 }
 
+/// What a diff compares the working tree against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffBase<'a> {
+    /// The merge-base of HEAD and this branch, so only the branch's changes show.
+    Branch(&'a str),
+    /// HEAD, so only uncommitted changes show.
+    Head,
+}
+
+fn base_tree<'r>(repo: &'r git2::Repository, base: DiffBase<'_>) -> Result<git2::Tree<'r>> {
+    match base {
+        DiffBase::Branch(branch) => get_merge_base_tree(repo, branch),
+        DiffBase::Head => match repo.head() {
+            Ok(head) => Ok(head.peel_to_tree()?),
+            // An unborn branch has nothing committed: everything is uncommitted.
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => {
+                Ok(repo.find_tree(repo.treebuilder(None)?.write()?)?)
+            }
+            Err(e) => Err(e.into()),
+        },
+    }
+}
+
 /// Changed files between a base branch and the working directory, from the
 /// merge-base of HEAD and the base, so only this branch's changes show.
 pub fn compute_changed_files(repo_path: &Path, base_branch: &str) -> Result<Vec<DiffFile>> {
+    compute_changed_files_against(repo_path, DiffBase::Branch(base_branch))
+}
+
+/// Changed files between `base` and the working directory.
+pub fn compute_changed_files_against(
+    repo_path: &Path,
+    base: DiffBase<'_>,
+) -> Result<Vec<DiffFile>> {
     let repo = super::open_repo_at(repo_path)?;
 
-    let base_tree = get_merge_base_tree(&repo, base_branch)?;
+    let base_tree = base_tree(&repo, base)?;
 
     // Create diff options
     let mut opts = git2::DiffOptions::new();
     opts.include_untracked(true);
     opts.recurse_untracked_dirs(true);
 
-    // Get diff from base tree to working directory (includes index)
+    // Base tree to working directory through the index, as `git diff <base>` does.
     let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))?;
 
     // Find renames/copies
@@ -319,7 +350,7 @@ pub fn compute_file_diff(
         new_content,
         is_binary,
         status,
-    } = read_file_state(&repo, &workdir, file_path, base_branch)?;
+    } = read_file_state(&repo, &workdir, file_path, DiffBase::Branch(base_branch))?;
 
     if is_binary {
         return Ok(FileDiff {
@@ -435,9 +466,18 @@ pub fn compute_file_contents(
     file_path: &Path,
     base_branch: &str,
 ) -> Result<FileContents> {
+    compute_file_contents_against(repo_path, file_path, DiffBase::Branch(base_branch))
+}
+
+/// [`compute_file_contents`] against any [`DiffBase`].
+pub fn compute_file_contents_against(
+    repo_path: &Path,
+    file_path: &Path,
+    base: DiffBase<'_>,
+) -> Result<FileContents> {
     let repo = super::open_repo_at(repo_path)?;
     let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?.to_path_buf();
-    let state = read_file_state(&repo, &workdir, file_path, base_branch)?;
+    let state = read_file_state(&repo, &workdir, file_path, base)?;
     // libgit2's xdiff, not the `similar` crate: xdiff is C compiled optimized
     // regardless of cargo profile and carries git's pathological-input
     // heuristics. `similar`'s Myers took ~20s on a +10k/-13k lockfile churn
@@ -481,9 +521,9 @@ fn read_file_state(
     repo: &git2::Repository,
     workdir: &Path,
     file_path: &Path,
-    base_branch: &str,
+    base: DiffBase<'_>,
 ) -> Result<FileState> {
-    let base_tree = get_merge_base_tree(repo, base_branch)?;
+    let base_tree = base_tree(repo, base)?;
 
     // Get old content from base tree (as bytes first to check for binary)
     let old_bytes = get_blob_bytes(repo, &base_tree, file_path);
@@ -796,6 +836,68 @@ mod tests {
         let parents: Vec<&git2::Commit> = parent.iter().collect();
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
             .unwrap();
+    }
+
+    #[test]
+    fn each_diff_base_compares_the_working_tree_against_its_own_tree() {
+        let (dir, repo) = setup_test_repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("base", &head, false).unwrap();
+        commit_file(&repo, "committed.txt", "on the branch\n", "branch work");
+        fs::write(dir.path().join("test.txt"), "line 1\nchanged\nline 3\n").unwrap();
+        fs::write(dir.path().join("untracked.txt"), "new\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(dir.path().join("ignored.txt"), "never\n").unwrap();
+
+        fs::write(dir.path().join("turn.txt"), "made this turn\n").unwrap();
+        fs::remove_file(dir.path().join("test.txt")).unwrap();
+
+        let paths = |base| {
+            compute_changed_files_against(dir.path(), base)
+                .unwrap()
+                .into_iter()
+                .map(|f| (f.path.to_string_lossy().into_owned(), f.status))
+                .collect::<Vec<_>>()
+        };
+        use FileStatus::*;
+        assert_eq!(
+            paths(DiffBase::Branch("base")),
+            [
+                (".gitignore".into(), Untracked),
+                ("committed.txt".into(), Added),
+                ("test.txt".into(), Deleted),
+                ("turn.txt".into(), Untracked),
+                ("untracked.txt".into(), Untracked),
+            ]
+        );
+        assert_eq!(
+            paths(DiffBase::Head),
+            [
+                (".gitignore".into(), Untracked),
+                ("test.txt".into(), Deleted),
+                ("turn.txt".into(), Untracked),
+                ("untracked.txt".into(), Untracked),
+            ]
+        );
+    }
+
+    #[test]
+    fn uncommitted_changes_on_an_unborn_branch_are_the_whole_tree() {
+        let dir = TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("first.txt"), "hello\n").unwrap();
+        let files = compute_changed_files_against(dir.path(), DiffBase::Head).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, Path::new("first.txt"));
+
+        // A HEAD that names a commit the store lacks is an error, not an empty repository.
+        let (dir, _repo) = setup_test_repo();
+        fs::write(
+            dir.path().join(".git/HEAD"),
+            format!("{}\n", "1".repeat(40)),
+        )
+        .unwrap();
+        assert!(compute_changed_files_against(dir.path(), DiffBase::Head).is_err());
     }
 
     /// Only tracked blobs are served: an untracked secret (#1810) and `.git`

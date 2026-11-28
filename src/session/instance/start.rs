@@ -719,7 +719,7 @@ impl Instance {
         // for either would then be watching the pane this launch is replacing.
         self.capture_poller.clear();
         if !self.is_sandboxed() {
-            self.install_agent_status_hooks(self.status_agent());
+            self.with_hook_agent(|this, agent| this.install_agent_status_hooks(agent));
             // A plugin-declared tool's extension ships with the plugin, so core
             // installs no hook file that would mark it launched.
             if self.resolved_capture_backend()

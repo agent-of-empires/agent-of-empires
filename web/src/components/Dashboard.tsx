@@ -1,26 +1,25 @@
 import { useMemo, useState, type ReactNode } from "react";
 import type { SessionResponse } from "../lib/types";
-import { getStatusTextClass, isSessionActive } from "../lib/session";
+import { isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
-import { useIsWideViewport } from "../hooks/useIsWideViewport";
 import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandMark";
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
 import { DashboardSuggestions } from "./DashboardSuggestions";
 import { SuggestionsSetupHint } from "./SuggestionsSetupHint";
 import type { WizardPrefill } from "./session-wizard/SessionWizard";
 import { PluginCards, PluginHomePanes } from "./plugin/PluginSlots";
-import { StatusGlyph } from "./StatusGlyph";
 import { StrokeIcon } from "./icons";
+import { CARD } from "../lib/surfaces";
 
 interface Props {
   sessions: SessionResponse[];
+  /** Opens a Session a suggestion already started. */
   onSelectSession: (sessionId: string) => void;
   onNewSession: () => void;
   onCloneFromUrl: () => void;
   /** When false (CityHall client mode), the "Clone URL" action is hidden;
    *  cloning a repo is a project-management action. Defaults to true. See #7. */
   canManageProjects?: boolean;
-  onToggleSidebar: () => void;
   readOnly?: boolean;
   /** Shown above the action panes, e.g. the setup checklist. */
   banner?: ReactNode;
@@ -42,7 +41,6 @@ export function Dashboard({
   onSelectSession,
   onNewSession,
   onCloneFromUrl,
-  onToggleSidebar,
   readOnly,
   canManageProjects = true,
   banner,
@@ -57,7 +55,6 @@ export function Dashboard({
   // Bumped when the setup sheet finishes so the Suggested section refetches.
   const [suggestionsEpoch, setSuggestionsEpoch] = useState(0);
   const idleDecayWindowMs = useIdleDecayWindowMs();
-  const isWideViewport = useIsWideViewport();
   const stats = useMemo(() => {
     const projects = new Set<string>();
     let total = 0;
@@ -77,15 +74,6 @@ export function Dashboard({
     }
     return { total, active, waiting, errors, projects: projects.size };
   }, [idleDecayWindowMs, sessions]);
-  const recentSessions = useMemo(
-    () =>
-      sessions
-        .filter((session) => !session.trashed_at)
-        .sort((a, b) => recentSessionTimestamp(b) - recentSessionTimestamp(a) || b.id.localeCompare(a.id))
-        .slice(0, 5),
-    [sessions],
-  );
-
   return (
     <div
       className="flex-1 flex flex-col items-center justify-start overflow-y-auto bg-surface-950 px-4 py-6 md:justify-center md:py-0"
@@ -169,6 +157,7 @@ export function Dashboard({
       {onPrepareSuggestion && onViewAllSuggestions && (
         <DashboardSuggestions
           key={suggestionsEpoch}
+          focusHeading={suggestionsEpoch > 0}
           readOnly={readOnly || !canManageSuggestions}
           cityhall={!canManageSuggestions}
           onPrepare={onPrepareSuggestion}
@@ -180,69 +169,12 @@ export function Dashboard({
         />
       )}
 
-      {/* The desktop sidebar is always available, but mobile starts at this dashboard. */}
-      {!isWideViewport && recentSessions.length > 0 && (
-        <section className="md:hidden mb-4 w-full max-w-md" aria-labelledby="recent-sessions-heading">
-          <h2
-            id="recent-sessions-heading"
-            className="mb-2 px-1 text-[11px] font-mono uppercase tracking-[0.16em] text-text-muted"
-          >
-            Recent sessions
-          </h2>
-          <div className="overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900">
-            {recentSessions.map((session) => (
-              <button
-                key={session.id}
-                type="button"
-                onClick={() => onSelectSession(session.id)}
-                className="flex w-full cursor-pointer items-center gap-3 border-b border-surface-700/40 px-3 py-2.5 text-left last:border-b-0 hover:bg-surface-850 active:bg-surface-800 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-brand-600"
-              >
-                <span
-                  aria-hidden="true"
-                  className={`shrink-0 font-mono text-sm leading-none ${getStatusTextClass(session, idleDecayWindowMs)}`}
-                >
-                  <StatusGlyph
-                    status={session.status}
-                    createdAt={session.created_at ?? null}
-                    idleEnteredAt={session.idle_entered_at}
-                    dormant={session.dormant}
-                  />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate font-mono text-sm font-medium text-text-primary">
-                    {session.title}
-                  </span>
-                  <span className="block truncate text-xs text-text-muted">
-                    {session.main_repo_path || session.project_path}
-                  </span>
-                </span>
-                <span aria-hidden="true" className="text-text-dim">
-                  ›
-                </span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* Mobile sidebar toggle */}
-      <button
-        onClick={onToggleSidebar}
-        className="md:hidden mb-4 w-full max-w-md px-4 py-2.5 rounded-lg bg-surface-900 border border-surface-700/40 text-text-secondary text-sm flex items-center justify-center gap-2 cursor-pointer hover:bg-surface-850 active:bg-surface-800 transition-colors"
-      >
-        <StrokeIcon size={16} strokeWidth="2" hidden>
-          <rect x="3" y="3" width="18" height="18" rx="2" />
-          <line x1="9" y1="3" x2="9" y2="21" />
-        </StrokeIcon>
-        Show sessions
-      </button>
-
       {banner}
 
       {/* Action panes */}
       {readOnly ? (
         <div className="max-w-sm w-full">
-          <p className="text-xs text-text-dim text-center mb-3">This dashboard is in read-only mode.</p>
+          <p className="text-[13px] text-text-dim text-center mb-3">This dashboard is in read-only mode.</p>
           <ActionPane
             title="Docs"
             subtitle="Guides and reference"
@@ -298,11 +230,6 @@ export function Dashboard({
   );
 }
 
-function recentSessionTimestamp(session: SessionResponse): number {
-  const timestamp = Date.parse(session.last_accessed_at ?? session.created_at);
-  return Number.isNaN(timestamp) ? 0 : timestamp;
-}
-
 function ActionPane({
   title,
   subtitle,
@@ -343,29 +270,31 @@ function ActionPane({
     ),
   };
 
-  const classes = `flex flex-col items-start gap-2 px-4 rounded-lg bg-surface-900 border border-surface-700/40 transition-colors cursor-pointer hover:border-brand-600/40 hover:bg-surface-850 active:bg-surface-800 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
+  const classes = `${CARD} flex flex-col items-start gap-2 transition-colors cursor-pointer hover:border-brand-600/40 hover:bg-surface-800 active:bg-surface-700/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
     featured ? "md:col-span-2 md:row-span-2 py-6" : "py-4"
   }`;
+
+  const content = (
+    <>
+      {iconSvg[icon]}
+      <div>
+        <p className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}>{title}</p>
+        <p className="text-[13px] text-text-secondary mt-0.5">{subtitle}</p>
+      </div>
+    </>
+  );
 
   if (href) {
     return (
       <a href={href} target="_blank" rel="noopener noreferrer" data-tour={dataTour} className={classes}>
-        {iconSvg[icon]}
-        <div>
-          <p className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}>{title}</p>
-          <p className="text-xs text-text-muted mt-0.5">{subtitle}</p>
-        </div>
+        {content}
       </a>
     );
   }
 
   return (
     <button onClick={onClick} data-tour={dataTour} className={`text-left ${classes}`}>
-      {iconSvg[icon]}
-      <div>
-        <p className={`font-medium text-text-primary ${featured ? "text-base" : "text-sm"}`}>{title}</p>
-        <p className="text-xs text-text-muted mt-0.5">{subtitle}</p>
-      </div>
+      {content}
     </button>
   );
 }

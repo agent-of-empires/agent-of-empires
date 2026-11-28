@@ -20,46 +20,70 @@ use tracing::{debug, warn};
 /// Adding a builtin is `themes/builtin/X.toml` plus one entry here.
 pub struct BuiltinTheme {
     pub name: &'static str,
+    /// The picker's plain name for the default dark and light themes; the rest show their name.
+    pub label: Option<&'static str>,
     pub source: &'static str,
 }
 
 pub const BUILTIN_THEMES: &[BuiltinTheme] = &[
     BuiltinTheme {
         name: "zinc",
+        label: Some("dark"),
         source: include_str!("../../../themes/builtin/zinc.toml"),
     },
     BuiltinTheme {
+        name: "light",
+        label: Some("light"),
+        source: include_str!("../../../themes/builtin/light.toml"),
+    },
+    BuiltinTheme {
         name: "empire",
+        label: None,
         source: include_str!("../../../themes/builtin/empire.toml"),
     },
     BuiltinTheme {
         name: "phosphor",
+        label: None,
         source: include_str!("../../../themes/builtin/phosphor.toml"),
     },
     BuiltinTheme {
         name: "tokyo-night-storm",
+        label: None,
         source: include_str!("../../../themes/builtin/tokyo-night-storm.toml"),
     },
     BuiltinTheme {
         name: "catppuccin-latte",
+        label: None,
         source: include_str!("../../../themes/builtin/catppuccin-latte.toml"),
     },
     BuiltinTheme {
         name: "dracula",
+        label: None,
         source: include_str!("../../../themes/builtin/dracula.toml"),
     },
     BuiltinTheme {
         name: "rose-pine",
+        label: None,
         source: include_str!("../../../themes/builtin/rose-pine.toml"),
     },
     BuiltinTheme {
         name: "deep-ocean",
+        label: None,
         source: include_str!("../../../themes/builtin/deep-ocean.toml"),
     },
 ];
 
 pub fn builtin_theme_names() -> impl Iterator<Item = &'static str> {
     BUILTIN_THEMES.iter().map(|b| b.name)
+}
+
+/// What a picker shows for a theme: a builtin's label, else its name.
+pub fn theme_label(name: &str) -> &str {
+    BUILTIN_THEMES
+        .iter()
+        .find(|b| b.name == name)
+        .and_then(|b| b.label)
+        .unwrap_or(name)
 }
 
 pub fn is_builtin_theme(name: &str) -> bool {
@@ -281,8 +305,13 @@ mod tests {
     const BUILTIN_COLOR_ANCHORS: &[(&str, Color, Color)] = &[
         (
             "zinc",
-            Color::Rgb(0x1c, 0x1c, 0x1f),
+            Color::Rgb(0x1f, 0x1f, 0x1f),
             Color::Rgb(0xfb, 0xbf, 0x24),
+        ),
+        (
+            "light",
+            Color::Rgb(0xfa, 0xf9, 0xf5),
+            Color::Rgb(0x14, 0x14, 0x13),
         ),
         (
             "empire",
@@ -384,7 +413,7 @@ mod tests {
     fn all_builtins_parse_with_expected_anchors_and_roundtrip() {
         // Every entry in BUILTIN_THEMES must deserialize cleanly and match the
         // expected anchors; otherwise a typo surfaces only at the first runtime
-        // load. Catppuccin Latte is the lone light builtin.
+        // load. Light and Catppuccin Latte are the light builtins.
         let table_names: Vec<&str> = BUILTIN_COLOR_ANCHORS.iter().map(|(n, _, _)| *n).collect();
         for name in builtin_theme_names() {
             assert!(
@@ -396,7 +425,7 @@ mod tests {
             let theme = load_theme(name);
             assert_eq!(theme.background, *expected_bg, "{name} background");
             assert_eq!(theme.title, *expected_title, "{name} title");
-            let expected_appearance = if *name == "catppuccin-latte" {
+            let expected_appearance = if matches!(*name, "catppuccin-latte" | "light") {
                 ThemeAppearance::Light
             } else {
                 ThemeAppearance::Dark

@@ -134,7 +134,8 @@ pub(crate) fn run_in(home: &Path, app_dir: &Path) -> Result<()> {
 
 fn rewrite_one(target: &HookTarget) -> Result<()> {
     #[cfg(test)]
-    if FORCE_REWRITE_FAILURE_FOR.with(|c| c.borrow().as_deref() == Some(target.agent_name)) {
+    if FORCE_REWRITE_FAILURE_FOR.with(|c| c.borrow().as_deref() == Some(target.agent_name.as_str()))
+    {
         anyhow::bail!("test-injected rewrite failure for {}", target.agent_name);
     }
     match target.kind {

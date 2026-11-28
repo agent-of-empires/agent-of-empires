@@ -6,6 +6,7 @@ import { X } from "lucide-react";
 import { createPortal } from "react-dom";
 
 import { useArtifactObjectUrl } from "../../hooks/useArtifactObjectUrl";
+import { LIGHTBOX } from "../../lib/surfaces";
 
 /** Thumbnail that opens full size in an in-page overlay; Esc or a click closes it.
  *  Focus moves to the close button while open (Tab stays put, nothing else is focusable),
@@ -62,14 +63,14 @@ export function ExpandableImage({
             aria-modal="true"
             aria-label={alt || "Image"}
             data-testid="image-lightbox"
-            className="fixed inset-0 z-50 flex cursor-zoom-out items-center justify-center bg-black/80 p-4 animate-fade-in"
+            className={`${LIGHTBOX} z-50 cursor-zoom-out`}
             onClick={() => setOpen(false)}
           >
             <button
               ref={closeRef}
               type="button"
               aria-label="Close image"
-              className="absolute right-3 top-3 cursor-pointer rounded-md bg-black/50 p-2 text-white hover:bg-black/70"
+              className="absolute right-3 top-[max(12px,env(safe-area-inset-top))] inline-flex h-11 w-11 items-center justify-center cursor-pointer rounded-full bg-black/50 text-white hover:bg-black/70 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
               onClick={() => setOpen(false)}
             >
               <X className="h-5 w-5" />

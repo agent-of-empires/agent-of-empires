@@ -252,7 +252,7 @@ test.describe("mobile", () => {
   test("opening starts focus inside the wizard, on Close, without a field", async ({ page }) => {
     await mockWizardApis(page);
     await page.goto("/");
-    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeAttached();
     await openWizard(page);
     await expect(wizard(page).getByRole("button", { name: "Close" })).toBeFocused();
   });
@@ -261,7 +261,7 @@ test.describe("mobile", () => {
     await mockWizardApis(page);
     await page.goto("/");
     // The `n` shortcut is live once the dashboard has loaded its sessions.
-    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeAttached();
     await openWizard(page);
     await selectProject(page, "/tmp/example");
     const w = wizard(page);
@@ -283,7 +283,7 @@ test.describe("mobile", () => {
       projects: Array.from({ length: 30 }, (_, i) => ({ name: `proj-${i}`, path: `/tmp/proj-${i}`, scope: "global" })),
     });
     await page.goto("/");
-    await expect(page.getByTestId("sidebar-session-row").first()).toBeVisible();
+    await expect(page.getByTestId("sidebar-session-row").first()).toBeAttached();
     await openWizard(page);
     const box = (await wizard(page).boundingBox())!;
     expect(box.y).toBeGreaterThanOrEqual(0);
@@ -500,7 +500,7 @@ test.describe("agents and presets", () => {
     const created = await startWizard(page, {
       agents: [
         { ...CLAUDE_AGENT, kind: "builtin", installed: false, install_hint: "install claude" },
-        { ...CLAUDE_AGENT, name: "remote-helper", kind: "custom", binary: hidden[0] },
+        { ...CLAUDE_AGENT, name: "remote-helper", kind: "custom", binary: hidden[0], acp_capable: false },
       ],
     });
     const w = wizard(page);
@@ -926,7 +926,8 @@ test.describe("Sandbox row", () => {
       await expect(cue).toBeVisible();
       const status = row.getByTestId("sandbox-image-status");
       await expect(status).toContainText("Couldn't check for updates");
-      expect((await cue.boundingBox())!.y).toBe((await status.boundingBox())!.y);
+      // On one line: the inline cue's box may sit a pixel off its block parent's.
+      expect(Math.abs((await cue.boundingBox())!.y - (await status.boundingBox())!.y)).toBeLessThanOrEqual(1);
       const fit = await status.evaluate((el) => {
         let clip = el.parentElement;
         while (clip && getComputedStyle(clip).overflowX === "visible") clip = clip.parentElement;

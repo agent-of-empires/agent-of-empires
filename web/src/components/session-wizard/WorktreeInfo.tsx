@@ -1,5 +1,6 @@
 import type { MouseEvent } from "react";
 import { InfoPopover } from "./InfoPopover";
+import { BUTTON_INLINE } from "../../lib/surfaces";
 
 /** What the Worktree row turns on, with a link to its settings. */
 export function WorktreeInfo({ onOpenSettings }: { onOpenSettings: () => void }) {
@@ -15,11 +16,7 @@ export function WorktreeInfo({ onOpenSettings }: { onOpenSettings: () => void })
         A separate copy of the repo on its own branch, so this Session&apos;s changes don&apos;t touch your main
         checkout. Moving the Session to Trash keeps it. Deleting it for good may remove it.
       </p>
-      <a
-        href="/settings/worktree"
-        onClick={open}
-        className="mt-2 inline-flex min-h-8 items-center text-brand-400 underline hover:opacity-80"
-      >
+      <a href="/settings/worktree" onClick={open} className={`${BUTTON_INLINE} mt-2`}>
         Worktree settings ›
       </a>
     </InfoPopover>

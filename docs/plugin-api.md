@@ -38,7 +38,7 @@ capabilities = ["runtime.worker"]
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 23` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, and the session-id capture extension requires API 22, each with a host implementing them. Provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, the session-id capture extension requires API 22, and the `hooks` and `trust` tables require API 28, each with a host implementing them. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
@@ -135,6 +135,48 @@ A report is not tied to a launch. The host mints no launch token and the call ca
 
 For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
 
+### Hooks and folder trust (API 28)
+
+`[agent_integrations.hooks]` and `[agent_integrations.trust]` let a declared agent get the status hooks and pre-trusted folders a built-in agent has. Both require `api_version >= 28` and a nonblank `command`; a manifest below 28 that declares either is rejected. The host runs its own installer and writer, so the plugin supplies data, never code. The approval prompt shows the declared paths as `~/...` or `$VAR/...` templates, without resolving a session `agent_config_dir`. `aoe hooks status` lists the resolved hooks files, and the resolved trust files that are written only when `session.pre_trust_agent_folders` is on.
+
+```toml
+[agent_integrations.launch.container_env]
+EXAMPLE_CONFIG_DIR = "/opt/example"
+
+[agent_integrations.hooks]
+settings_rel_path = ".example/settings.json"
+config_dir_env_var = "EXAMPLE_CONFIG_DIR"
+format = "json_settings"
+
+[[agent_integrations.hooks.events]]
+event = "PreToolUse"
+status = "running"
+waiting_tools = ["AskUserQuestion"]
+
+[[agent_integrations.hooks.events]]
+event = "Notification"
+matcher = "permission_prompt"
+status = "waiting"
+
+[agent_integrations.trust]
+file = ".example.json"
+location = "config_dir_or_home"
+config_dir_env_var = "EXAMPLE_CONFIG_DIR"
+pointer = "/projects/{path}/hasTrustDialogAccepted"
+value = true
+sandbox = "yolo_only"
+```
+
+- `hooks.settings_rel_path` is a `.json` file inside a directory, relative to the home directory. When `config_dir_env_var` is set, the file's name is placed in that directory instead. Paths hold only plain components: no absolute paths, `.`, `..`, `:`, `,` or `\`, and at most 256 bytes. The host refuses to write a file that is another agent's settings file.
+- `config_dir_env_var` (hooks and trust) is an ordinary launch variable name: not `HOME`, `PATH`, `AOE_*`, `LD_*`, `DYLD_*` or `XDG_*`, and not credential-shaped (containing `TOKEN`, `SECRET`, `KEY`, `PASSWORD`, `CREDENTIAL` or `AUTH`). It must also be a `launch.container_env` key. That value is the directory the sandbox mounts read-write, so it must be absolute and normalized, with no `..`, `:` or `,`, at most 256 bytes, and not `/`, `/root`, `/workspace*`, `/aoe*`, `/proc*`, `/sys*`, `/dev*` or `/tmp/aoe-hooks*`. The host checks it again at launch, and a directory that overlaps a mount it already binds is skipped with a warning rather than failing the sandbox.
+- `hooks.format` is `json_settings`, the `hooks.<event>[].hooks[].command` layout. `events` holds 1 to 32 entries; each `event` is one of `SessionStart`, `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `StopFailure`, `Notification`, `ElicitationResult`, `PermissionRequest`, `BeforeTool`, `BeforeAgent`, `AfterAgent`. An event may repeat only with different `matcher` values. `status` is `running`, `waiting`, `idle` or `error`; `identity_field` is `session_id` or `conversation_id_or_session_id`; `waiting_tools` lists tools that block on the user. Each event needs a `status` or an `identity_field`. With any `identity_field`, the `command` must name a bare executable matching `[A-Za-z0-9._-]+`.
+- `trust.file` is one `.json` file name, without `:`, `,` or `\`. The host refuses to write the default trust file of another built-in agent (`~/.claude.json`, Codex's `config.toml`, Gemini's `trustedFolders.json`). `location = "config_dir_or_home"` resolves to the session's `agent_config_dir`, else the `config_dir_env_var` directory, else the home directory. `pointer` is absolute, has exactly one `{path}` segment, and at most 8 segments. `{path}` receives the project path as a single object key, with no escaping. The value is written at the last segment. `value` is a boolean or a string.
+- The hooks writer is strict too: a settings file that is not a JSON object is an error and is left untouched, never replaced. Built-in agents keep their lenient writer.
+- The trust writer is strict. It creates missing objects but fails, without writing, when the file is not valid JSON or a segment on the pointer exists and is not an object. The host chooses whether to follow symlinks; a plugin cannot.
+- `trust.file` must not be, or contain, the sandbox path of `hooks.settings_rel_path` (the same file, or a file named like the hooks directory), because the single-file trust mount would hide the staged hooks. Other files in that directory are fine.
+- `trust.sandbox` is `always` or `yolo_only`; `yolo_only` writes the record only for a sandbox launched in Yolo mode. In a sandbox the host stages a per-session copy of the declared hooks file and trust file, so a declared agent needs no config mount of its own. A directory named by a `launch.container_env` entry for `config_dir_env_var` is where the container sees them, else the home directory. The staged files hold the AoE hooks and the trust record only; the host files are not copied. A sandbox write never follows a symlink. The staged directory lives as long as the session, so the agent's own files in it persist across relaunches. The staged trust file is reset when the declaration changes, so an entry written by an earlier declaration does not outlive it. The trust file is bind-mounted as one file, so an agent that replaces it by rename inside the container fails with `EBUSY`. On the host the trust record is written only when `session.pre_trust_agent_folders` is on, as for built-in agents.
+- Uninstalling AoE removes the hooks from the declared settings file, including one relocated by `session.agent_config_dir`, while the plugin is active. Hooks left behind by a plugin that was removed or disabled before the uninstall stay in place. Trust entries stay, as built-in ones do. Host trust entries written by an earlier declaration are not retired when the declaration changes.
+
 ### Report and reply files
 
 The provider writes `integration-<plugin id>.json` in the session's private hook directory, `/tmp/aoe-hooks-<effective uid>/<instance id>/`. A sandboxed session has only that one directory bind-mounted, at `/tmp/aoe-hooks/<instance id>`, and the launch sets `AOE_INTEGRATION_DIR` to that path so a provider inside the container writes where the host reads. AoE reads that report and writes `integration-<plugin id>.reply.json` in the same directory after the user responds.
@@ -148,6 +190,19 @@ AoE owns report validation and reply creation. The provider owns reading and rem
 The snapshot's `revision` changes only when the prompt changes, not when runtime status changes. Single-choice questions require exactly one selected option or a nonblank custom answer. Enter selects the highlighted option for an unanswered single-choice question before advancing or submitting; custom answers and multi-choice selections are preserved. The response dialog stays open for incomplete answers. While editing a custom answer, the viewport follows the input cursor.
 
 Shell-hook sidecars and native-plugin reports remain distinct transports. Native reports retain their heartbeat and live-writer checks; shell hooks keep their existing freshness and publisher rules. Both reuse hardened host I/O and the established guarded session-identity persistence path where applicable. Declaring launch or reply metadata does not install hooks or companion extensions.
+
+## ACP proxies
+
+A proxy is a per-session process between the runner and an ACP adapter; the wire contract is in [the primitive contract](development/internals/acp-primitive-contract.md). The manifest field that declares one is not available yet (#5319), so the declaration source, its failure policy and its compat are not exposed to plugins. What a proxy process must do once launched:
+
+- It runs in the agent's process group as the direct child of the runner. Its argv is its declared args followed by the full adapter argv, including the `docker exec` wrapper for a sandboxed session. It must start that adapter argv unchanged as a child process in the same process group (no `setsid`, no daemonizing), relay the adapter's stdin and stdout, and stay running to add the hello and translate frames. It cannot `exec` into the adapter. The runner kills the group, which is how the adapter dies with it. If the runner is killed with SIGKILL, the adapter can be orphaned.
+- `AOE_PROXY_LAUNCH_CONFIG` holds the path of an owner-only JSON file, removed when the session ends: `{"version": 1, "session_id": "...", "container_id": "..." | null, "store_root": "..."}`. It holds no secrets. Strip the variable from the adapter's environment.
+- For a sandboxed session the container environment travels on file descriptor 9, which the runner passes to the proxy and the adapter argv names as `--env-file /dev/fd/9`. The proxy must pass descriptor 9 to the adapter's `docker exec` as descriptor 9 (not remapped to another number) and must not close or read it.
+- The `initialize` response must carry the hello with the declared `plugin_id`, and forward the adapter's own `agent_info` unchanged so it can be checked against the declared compat. A missing or invalid hello, a different `plugin_id`, or an `agent_info` outside the compat counts as a hello failure.
+
+A hello failure, a proxy that cannot start or one that exits before its hello follows the declared failure policy. `refuse` fails the session start. `neutral_boot` launches the adapter once without the proxy (on the first launch and on a respawn), posts a "features unavailable" notice, and keeps that state across a reattach. Failures after a valid hello never fall back; see [Failure](development/internals/acp-primitive-contract.md#failure).
+
+A proxy is trusted as the user: it can run anything the user's `docker` can, not only the adapter it was handed, and reads the filesystem with the user's rights ([ADR 0006](adr/0006-meta-aoe-primitive-contract.md)).
 
 ## Plugin id
 
@@ -441,6 +496,7 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 | `resume_failed` | A terminal session's agent could not resume. `data.resume_session_id` holds the preserved session id. |
 | `session_not_running` | A terminal pane vanished between the revive and the send. |
 | `session_transient` | A terminal session is mid-start or mid-stop; retry when it settles. |
+| `input_line_busy` | A terminal session's input box held text a person had not sent for the whole 3 s wait; nothing was typed. Retry once they send or clear it. |
 | `worker_not_ready` | A structured session's worker did not come up, or could not be resumed. Retryable. |
 | `sandbox_login_required` | Resuming a sandbox needs the sandbox login of its agent (`aoe sandbox login --tool <tool>`, with `-p <profile>` when the session runs under a non-default profile and `--command <command>` when it runs its own command, as the message says). A structured session keeps the message in its queue (`data.queued_id`) and gets it after the login: do not retry. A terminal session has no queue: send again after the login. `sessions.turn.send` keeps a refused turn the same way. |
 | `before_start_hook_failed` | The `host_hooks.before_start` hook of a sandbox session failed, timed out, could not be started or is still running for that session while its launch was being admitted. The message is kept (`data.queued_id`) and goes out with the next revival; no hold is registered, so nothing revives the session when the hook is fixed, and no plugin session cap reservation is left behind. The error text is fixed (it never carries the hook's command or output). |
@@ -621,13 +677,14 @@ Each call replaces the provider's whole list. It fails with invalid-params, and 
 
 ### Suggestions API
 
-Suggestions are stored per profile. The routes below list and act on them; only `POST /api/suggestions/start` creates a session. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode; the `GET` routes below stay readable in both, and so does `POST /api/suggestions/prepare`, which mutates nothing (CityHall's "Start with changes" needs it, and `POST /api/sessions` is allowed there). `start` is refused. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
+Suggestions are stored per profile. The routes below list and act on them; only `POST /api/suggestions/start` and `start-batch` create sessions. Mutations return 403 `read_only` in read-only mode and are refused in CityHall mode; the `GET` routes below stay readable in both, and so does `POST /api/suggestions/prepare`, which mutates nothing (CityHall's "Start with changes" needs it, and `POST /api/sessions` is allowed there). `start` is refused. Item bodies name an item by `{ "provider_id", "id" }`, since an `id` is only unique within a provider.
 
 | Route | Body | Result |
 |---|---|---|
-| `GET /api/suggestions` | none | `{ profile?, providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled, preset, customized }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, show_source_ref, provider_order } }` |
+| `GET /api/suggestions` | none | `{ profile?, providers: [{ id, name, enabled, status, error?, updated_at?, refreshing, sources: [{ criterion, label, description, variables, enabled, preset, customized }], checks: [{ id, label, status, detail, fix }] }], items, prefs: { homepage, sidebar, refresh_minutes, show_source_ref, provider_order }, setup_offered }`; `setup_offered` says whether the host may offer suggested-session setup |
 | `POST /api/suggestions/refresh` | none | `{ ok, notified }` |
 | `POST /api/suggestions/checks/run` | none | `{ ok, notified }` |
+| `POST /api/suggestions/push` | `{ title, prompt, reason?, project?, id?, pushed_by? }` | `{ ok, id }`; adds or replaces a built-in `builtin.agent` item. Used by `aoe suggest` and the `suggest_session` MCP tool |
 | `POST /api/suggestions/dismiss` | `{ provider_id, id }` | `{ ok }` |
 | `POST /api/suggestions/undismiss` | `{ provider_id, id }` | `{ ok }` |
 | `PATCH /api/suggestions/sources` | `{ provider_id, criterion, enabled }` | `{ provider_id, criterion, enabled }` |
@@ -635,7 +692,9 @@ Suggestions are stored per profile. The routes below list and act on them; only 
 | `GET /api/suggestions/presets` | none | `{ presets: [{ provider_id, criterion, customized, preset, defaults }] }`, one per declared source |
 | `PUT /api/suggestions/presets` | `{ provider_id, criterion, preset }` | `{ provider_id, criterion, customized: true, preset, defaults }` |
 | `DELETE /api/suggestions/presets?provider_id=&criterion=` | none | 204 |
+| `PUT /api/suggestions/auto-start` | `{ provider_id, criterion, enabled, cap? }` | `{ provider_id, criterion, auto_start: { cap } \| null }`; `cap` is 1 to 10, default 3; `builtin.agent` is refused with 400 |
 | `POST /api/suggestions/start` | `{ provider_id, id, project?: { path }, approve_hooks?, review_fingerprint? }` | 201 `{ session_id, title }` |
+| `POST /api/suggestions/start-batch` | `{ items: [{ provider_id, id }] }` (1 to 25) | 200 `{ results: [{ provider_id, id, status, body }] }`; each `status` and `body` is what `start` answers for that item |
 | `POST /api/suggestions/fix` | `{ provider_id }` | `{ ok, notified }` |
 | `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, customized, source_ref, project, extra_projects, tool, view, yolo, sandbox, worktree }`; `view` is `structured` or `terminal` |
 | `GET /api/suggestions/mappings` | none | `{ mappings: [{ provider_id, mapping_key, projects }] }` |
@@ -659,7 +718,7 @@ A provider's `status` is `pending` before its first publish, `ok`, or `error`. U
 
 A preset is stored per profile and criterion: `{ agent, view: "structured" | "terminal", worktree, sandbox, yolo, prompt }`. Without a stored one (`customized: false`) a kind follows `defaults`: the profile's new-session settings, with the plugin's own prompt (`prompt: null`). `prepare` and `start` take `agent`, `view`, `worktree`, `sandbox` and `yolo` from the preset, and `customized` says whether one is stored. A non-null `prompt` is a template that replaces the provider's `draft.prompt` in `initial_prompt`, nowhere else. `{name}` expands to the item's variable of that name, scanning left to right (`{a{pr_number}}` becomes `{a42}`); unknown names and stray braces stay as typed, and expanded values are never scanned again. An empty or blank prompt gives an empty `initial_prompt`, so a client must then omit it when creating the session, which rejects a blank one. A prompt and its expansion are each limited to 64 KiB; `prepare` and `start` fail with 400 `validation_failed` when the expansion is longer. `PUT` replaces the whole preset and checks that the agent exists. `DELETE` resets the kind and checks neither provider nor criterion, so a preset of a disabled plugin can still be reset, and resetting an absent one succeeds. `GET` and `PUT /presets` list `project_overrides`: the preset fields (`agent`, `view`, `worktree`, `sandbox`, `yolo`) whose default differs in at least one registered Project, because Start resolves defaults per Project (repo config and the Project's worktree and sandbox overrides). `defaults` is the profile's; an editor should mark those fields rather than claim one value.
 
-`POST /api/suggestions/start` creates the Session from the item's kind preset and Project, in the profile the daemon serves. CityHall mode refuses the route. `project` first links the item's repo (its `mapping_key`) to that registered Project: it becomes the primary, the repo's other mapped Projects stay behind it, up to the 16-Project mapping cap (any no longer registered are dropped), and the link stays if the start then fails. Repository hooks are a security gate: when the Project's hooks or MCP servers are not yet approved, nothing is created and the answer is 409 `hooks_need_trust` with `{ commands: { on_create, on_launch, on_destroy }, needs_mcp_trust, mcp_summaries, review_fingerprint }`; `mcp_summaries` are the redacted one-line summaries of the repo's MCP servers. Repeat the call with `approve_hooks: true` and that `review_fingerprint` to approve and start in one step; a configuration that changed since the review is refused with 409 `trust_changed`, and `approve_hooks` without a fingerprint is 400 `validation_failed`. The answer is 201 once the Session exists, like `POST /api/sessions`. A failure answers 422 `start_failed` with `{ reason, hint, retryable }`, and 400 `no_project` (`hint: "link_project"`) when the repo is not linked to a Project.
+`POST /api/suggestions/start` creates the Session from the item's kind preset and Project, in the profile the daemon serves. CityHall mode refuses the route. `project` first links the item's repo (its `mapping_key`) to that registered Project: it becomes the primary, the repo's other mapped Projects stay behind it, up to the 16-Project mapping cap (any no longer registered are dropped), and the link stays if the start then fails. Repository hooks are a security gate: when the Project's hooks or MCP servers are not yet approved, nothing is created and the answer is 409 `hooks_need_trust` with `{ commands: { on_create, on_launch, on_destroy }, needs_mcp_trust, mcp_summaries, review_fingerprint }`; `mcp_summaries` are the redacted one-line summaries of the repo's MCP servers. Repeat the call with `approve_hooks: true` and that `review_fingerprint` to approve and start in one step; a configuration that changed since the review is refused with 409 `trust_changed`, and `approve_hooks` without a fingerprint is 400 `validation_failed`. The answer is 201 once the Session exists, like `POST /api/sessions`. A failure answers 422 `start_failed` with `{ reason, hint, retryable }`, and 400 `no_project` (`hint: "link_project"`) when the repo is not linked to a Project. `POST /api/suggestions/start-batch` runs that start for each listed item in order, never approving a hooks review, so one item's refusal (a hooks review, no Project, a failure) never stops the rest; CityHall mode refuses it too.
 
 An item has one primary Session. The first create that carries `suggestion` (`start`, or `POST /api/sessions` from "Start with changes") claims it under the new Session's id, allocated before the create; a second gets 409 `already_started` with `{ session_id }`, the winner's id, which may still be provisioning. `session_id` is omitted when the caller cannot see that Session (CityHall does not see terminal Sessions or one still being created). A claim holds while its start is in flight, however long the create runs. One left by a crash is settled by the next start if its Session was persisted, and taken over if not. A failed create, even one whose client disconnected, frees the claim, so Try again works. Trashing the Session frees it; archiving keeps it. A create without `suggestion` ("Start another") takes no link.
 
@@ -842,7 +901,7 @@ A `pane` entry renders a dockable tool-window, pushed with `ui.state.set`:
 | `body` | string | The simple form: plain text, used only when `blocks` is absent. |
 | `blocks` | array | The block list (below). Takes precedence over `body`. |
 | `default_location` | string | `right` or `bottom`. The dock it first opens in; the user can move it after. |
-| `icon` | string | Lucide name for the activity-bar / dock-tab icon. A manifest `icon_asset` outranks it. |
+| `icon` | string | Lucide name for the pane-menu and dock-tab icon. A manifest `icon_asset` outranks it. |
 | `footer` | table | A status line pinned below the scrolling block list: `text` left, tone-colored `value` right, plus an optional `icon`. Requires `api_version >= 12`. |
 
 The payload is capped at 64 KiB. Everything but `blocks` is validated strictly; `blocks` is opaque JSON, and **each surface renders the kinds it knows and drops the rest.** That forward-compatibility contract cuts both ways: a new kind needs no host change, but an older host renders nothing for it, so a pane that depends on a newer kind should say so with `api_version` and `aoe_version`.

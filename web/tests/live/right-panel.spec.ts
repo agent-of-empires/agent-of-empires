@@ -8,6 +8,7 @@ import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import { commitAll, generateLargeFileContent, pngStubBytes, writeBinaryFile } from "../helpers/gitFixture";
 import { enableStructuredViewAndWait } from "../helpers/acp";
+import { openReviewPane } from "../helpers/panes";
 
 const decodablePng = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR4AWLSSN30H4SZGKAAAAAA//977exuAAAABklEQVQDADoABIHXJwUZAAAAAElFTkSuQmCC",
@@ -20,9 +21,9 @@ async function openSession(page: Page, serve: ServeHandle, title: string) {
   const row = page.getByRole("link").filter({ hasText: title }).first();
   await expect(row).toBeVisible({ timeout: 10_000 });
   await row.click();
-  const diffToggle = page.getByTestId("pane-toggle-diff").first();
-  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
-  await diffToggle.click();
+  const panelToggle = page.getByTestId("right-dock-toggle").first();
+  await expect(panelToggle).toHaveAttribute("aria-pressed", "false");
+  await panelToggle.click();
 }
 
 // The dashboard mounts a desktop and a hidden mobile right panel, so visible-anywhere checks use first().
@@ -39,7 +40,7 @@ test("files pane renders a Markdown file in a scratch session", async ({ page, s
     }),
   });
   await openSession(page, serve, "rp-files-md");
-  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+  await openReviewPane(page, "files");
   const planRow = page.getByRole("button", { name: "plan.md" }).first();
   await expect(planRow).toBeVisible({ timeout: 10_000 });
   await planRow.click();
@@ -66,7 +67,7 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
   expect(session!.outside_repository).toBe(true);
   const storedTabs = () =>
     page.evaluate((id) => {
-      const store = JSON.parse(localStorage.getItem("aoe-pane-layout-v3") ?? "{}");
+      const store = JSON.parse(localStorage.getItem("aoe-pane-layout-v4") ?? "{}");
       const layout = store.sessions?.[id];
       return layout ? [...layout.right, ...layout.bottom].flatMap((g: { tabs: string[] }) => g.tabs) : null;
     }, session!.id);
@@ -84,7 +85,7 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
     await route.continue();
   });
   const diffFilesRequested = page.waitForRequest((r) => r.url().includes(`/sessions/${session!.id}/diff/files`));
-  const diffToggle = page.getByTestId("pane-toggle-diff").first();
+  const panelToggle = page.getByTestId("right-dock-toggle").first();
   try {
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(session!.id)}`);
     // The diff-files effect establishes the unknown-session layout window.
@@ -92,15 +93,15 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
     expect(heldGets).toBeGreaterThan(0);
     expect(await storedTabs()).toBeNull();
     // The toggle renders only once the Session is known, so it must not be awaited before release.
-    await expect(diffToggle).toHaveCount(0);
+    await expect(panelToggle).toHaveCount(0);
   } finally {
     release();
   }
-  await expect(diffToggle).toBeVisible({ timeout: 10_000 });
-  await expect(diffToggle).toHaveAttribute("aria-pressed", "false");
+  await expect(panelToggle).toBeVisible({ timeout: 10_000 });
+  await expect(panelToggle).toHaveAttribute("aria-pressed", "false");
   expect(await storedTabs()).toBeNull();
 
-  await diffToggle.click();
+  await panelToggle.click();
   await expect.poll(storedTabs).toEqual(["diff"]);
   const neutral = `The working directory (${String(session!.project_path)}) isn't a git repository, so there's nothing to compare.`;
   await expect(page.getByText(neutral, { exact: true }).first()).toBeVisible({ timeout: 10_000 });
@@ -118,7 +119,7 @@ test("files pane numbers the lines of a source file", async ({ page, spawnServe 
     }),
   });
   await openSession(page, serve, "rp-files-gutter");
-  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+  await openReviewPane(page, "files");
   const notesRow = page.getByRole("button", { name: "notes.ts" }).first();
   await expect(notesRow).toBeVisible({ timeout: 10_000 });
   await notesRow.click();
@@ -219,7 +220,7 @@ test("files pane: Open file shows an unchanged file in a new tab", async ({ page
     }),
   });
   await openSession(page, serve, "rp-files-open");
-  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+  await openReviewPane(page, "files");
 
   const openFileFor = async (name: string) => {
     await page.getByRole("button", { name }).first().click({ button: "right" });
@@ -252,7 +253,7 @@ test("files pane: a binary file renders an image inline and downloads anything e
     }),
   });
   await openSession(page, serve, "rp-files-binary");
-  await page.getByRole("button", { name: "Toggle Files pane" }).first().click();
+  await openReviewPane(page, "files");
 
   await page.getByRole("button", { name: "logo.png" }).first().click();
   const image = page.getByRole("img", { name: "logo.png" });

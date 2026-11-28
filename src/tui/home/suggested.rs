@@ -39,11 +39,7 @@ impl HomeView {
     pub(super) fn ensure_suggestions_view(&mut self) {
         if self.suggestions_view.is_none() {
             let mut view = SuggestionsView::new(&self.suggestions_feed);
-            // The local config stands in until a load reads the daemon's setting.
-            view.pretrusted = self.suggestions_feed.daemon_pre_trust().unwrap_or_else(|| {
-                crate::session::config::Config::load()
-                    .is_ok_and(|c| c.session.pre_trust_agent_folders)
-            });
+            view.pretrusted = self.suggestions_feed.daemon_pre_trust().unwrap_or(false);
             self.suggestions_view = Some(view);
         }
         if let Some(view) = &mut self.suggestions_view {
@@ -75,6 +71,11 @@ impl HomeView {
         self.system_health_open = false;
         // A Trash transcript reader would otherwise take the keys first.
         self.retained_focus = None;
+        if !self.suggestions_focused {
+            crate::tui::telemetry::report_feature_use(
+                crate::telemetry::feature_use::FeatureUse::SuggestFromTui,
+            );
+        }
         self.suggestions_focused = true;
     }
 
@@ -102,7 +103,7 @@ impl HomeView {
     }
 
     /// Selects the Session a suggestion was started as, expanding the Archived
-    /// or Trash section and the project or org subgroup it sits in. The reason
+    /// or Trash section and the repository subgroup it sits in. The reason
     /// when it cannot be shown (including another profile's).
     pub(super) fn try_open_linked_session(&mut self, id: &str) -> Result<(), String> {
         let Some(row) = self.session_feed.applied_session(id) else {
@@ -122,10 +123,7 @@ impl HomeView {
             self.trashed_section_collapsed,
             self.archived_section_collapsed,
         );
-        let subgroups = (
-            self.project_group_collapsed.clone(),
-            self.org_group_collapsed.clone(),
-        );
+        let subgroups = self.project_group_collapsed.clone();
         if trashed {
             self.trashed_section_collapsed = false;
         } else if archived {
@@ -141,27 +139,19 @@ impl HomeView {
             self.trashed_section_collapsed,
             self.archived_section_collapsed,
         ) = sections;
-        (self.project_group_collapsed, self.org_group_collapsed) = subgroups;
+        self.project_group_collapsed = subgroups;
         self.rebuild_flat_items();
         Err("That session could not be shown".into())
     }
 
-    /// Expands the archived Project or Org subgroup holding session `id`.
+    /// Expands the archived Repository subgroup holding session `id`.
     fn expand_archived_subgroup(&mut self, id: &str) {
         let Some(inst) = self.get_instance(id) else {
             return;
         };
-        match self.group_by {
-            GroupByMode::Project => {
-                let path =
-                    crate::session::archived_project_sub_path(&super::project_group_key(inst));
-                self.project_group_collapsed.insert(path, false);
-            }
-            GroupByMode::Org => {
-                let path = crate::session::archived_project_sub_path(&self.org_group_key(inst));
-                self.org_group_collapsed.insert(path, false);
-            }
-            _ => {}
+        if self.group_by == GroupByMode::Project {
+            let path = crate::session::archived_project_sub_path(&super::project_group_key(inst));
+            self.project_group_collapsed.insert(path, false);
         }
     }
 

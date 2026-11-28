@@ -47,7 +47,7 @@ runs:
     # Only the toolchain dir is cached; rustup and its proxies come from the runner
     # image. A two-part MSRV like 1.95 keeps the first patch it cached, fine for a check.
     - id: cache
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      uses: actions/cache@v6.1.0
       with:
         path: ~/.rustup/toolchains/${{ steps.pin.outputs.channel }}-*
         key: rustup-${{ runner.os }}-${{ runner.arch }}-${{ steps.pin.outputs.channel }}-${{ inputs.components }}-${{ inputs.targets }}
@@ -66,7 +66,7 @@ runs:
     - id: try1
       if: steps.restored.outcome != 'success'
       continue-on-error: true
-      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ steps.pin.outputs.channel }}
         components: ${{ inputs.components }}
@@ -77,7 +77,7 @@ runs:
     - id: try2
       if: steps.try1.outcome == 'failure'
       continue-on-error: true
-      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ steps.pin.outputs.channel }}
         components: ${{ inputs.components }}
@@ -86,7 +86,7 @@ runs:
       shell: bash
       run: sleep 60
     - if: steps.try2.outcome == 'failure'
-      uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ steps.pin.outputs.channel }}
         components: ${{ inputs.components }}

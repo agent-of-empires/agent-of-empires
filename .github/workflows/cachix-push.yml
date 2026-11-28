@@ -2,7 +2,8 @@ name: Push to Cachix
 
 # Builds aoe-with-web (default features, web UI embedded) for Linux and macOS
 # and pushes the results to the Cachix binary cache so users can install
-# without compiling. Runs a matrix so both systems build in parallel.
+# without compiling. macOS runners are scarce, so a push builds macOS only when
+# flake.nix, flake.lock or Cargo.lock change; a nightly run covers the rest.
 #
 # Requires two repository secrets:
 #   CACHIX_AUTH_TOKEN  - from cachix.org (Settings > Auth Tokens)
@@ -28,30 +29,71 @@ on:
       - 'plugins/**'
       # web/** is excluded: lockfile bumps land on main via the
       # nix-npm-hash bot's PR which bumps flake.nix in the same commit.
+  schedule:
+    - cron: '13 3 * * *'
   workflow_dispatch:
 
+# The event keeps a push from cancelling the nightly macOS build.
+concurrency:
+  group: cachix-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  plan:
+    name: Pick systems
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-plan-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      systems: ${{ steps.pick.outputs.systems }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        if: github.event_name == 'push'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: pick
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            schedule) systems='["macos"]' ;;
+            push)
+              systems='["linux"]'
+              # A base git cannot diff (first or force push) counts as a change.
+              if ! changed="$(git diff --name-only "$BEFORE" "$GITHUB_SHA")" \
+                || grep -qE '^(flake\.nix|flake\.lock|Cargo\.lock)$' <<<"$changed"; then
+                systems='["linux","macos"]'
+              fi
+              ;;
+            *) systems='["linux","macos"]' ;;
+          esac
+          echo "systems=$systems" >> "$GITHUB_OUTPUT"
+
   cachix:
-    name: Build and push (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    # Job level: the matrix context is not available at workflow level.
-    concurrency:
-      group: cachix-push-${{ matrix.os }}-${{ github.event_name }}-${{ github.ref }}
-      cancel-in-progress: true
+    name: Build and push (${{ matrix.system }})
+    needs: plan
+    runs-on: ${{ matrix.system == 'macos' && 'macos-latest' || (vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-{1}/runner=4cpu-linux-x64/family=m8a+m8i+m7i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt)) }}
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        system: ${{ fromJSON(needs.plan.outputs.systems) }}
 
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache).
+      - if: matrix.system == 'linux'
+        uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
 
-      - uses: ./.github/actions/install-nix
+      - uses: $/.github/actions/install-nix
 
       - name: Set up Cachix
-        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        uses: cachix/cachix-action@v17
         with:
           name: ${{ secrets.CACHIX_CACHE_NAME }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -64,18 +106,18 @@ jobs:
 
   notify-on-failure:
     name: Report a failed build on main
-    needs: cachix
-    # This is the only CI that compiles the Nix package on main, so a red run
-    # here otherwise goes unseen (#3217). A dispatch failure is already in
-    # front of whoever started it.
-    if: failure() && github.event_name == 'push'
-    runs-on: ubuntu-latest
+    needs: [plan, cachix]
+    # This is the only CI that compiles the Nix package on main, so a red push
+    # or nightly run here otherwise goes unseen (#3217). A dispatch failure is
+    # already in front of whoever started it.
+    if: failure() && github.event_name != 'workflow_dispatch'
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-cachix-notify-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
     permissions:
       actions: read
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
@@ -86,10 +128,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          # No earlier non-cancelled push run in the window is inconclusive: alert.
-          PREVIOUS=$(gh run list --repo "$REPO" --workflow cachix-push.yml --branch main --event push \
+          # Compare with the previous run of the same event, since push and
+          # nightly runs build different systems. None in the window: alert.
+          PREVIOUS=$(gh run list --repo "$REPO" --workflow cachix-push.yml --branch main --event "$EVENT" \
             --status completed --limit 100 --json databaseId,conclusion \
             --jq "[.[] | select(.databaseId < $RUN_ID and .conclusion != \"cancelled\")][0].conclusion // \"failure\"")
           # --build-step must match the build step's `name:` above.
@@ -105,7 +149,7 @@ jobs:
       - name: Open or update the tracking issue
         # Also runs when classification itself failed, so an API error still alerts.
         if: ${{ !cancelled() && steps.classify.outputs.alert != 'false' }}
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: actions/github-script@v9.0.0
         env:
           KIND: ${{ steps.classify.outputs.kind || 'unknown' }}
         with:

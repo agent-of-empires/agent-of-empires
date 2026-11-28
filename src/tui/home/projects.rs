@@ -77,7 +77,7 @@ impl HomeView {
         }
         match self.flat_items.get(self.cursor) {
             Some(Item::Group { path, name, .. })
-                if !crate::session::is_synthetic_project_header(path) =>
+                if !path.contains('/') && !crate::session::is_synthetic_project_header(path) =>
             {
                 Some(name.clone())
             }

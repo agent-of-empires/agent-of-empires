@@ -319,6 +319,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::run_suggestion_checks),
         )
         .route("/api/suggestions/fix", post(api::run_suggestion_fix))
+        .route("/api/suggestions/push", post(api::push_suggestion))
         .route("/api/suggestions/dismiss", post(api::dismiss_suggestion))
         .route(
             "/api/suggestions/undismiss",
@@ -327,6 +328,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/suggestions/sources",
             patch(api::update_suggestion_source),
+        )
+        .route(
+            "/api/suggestions/auto-start",
+            put(api::put_suggestion_auto_start),
         )
         .route("/api/suggestions/prefs", patch(api::patch_suggestion_prefs))
         .route(
@@ -337,6 +342,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/suggestions/prepare", post(api::prepare_suggestion))
         .route("/api/suggestions/start", post(api::start_suggestion))
+        .route("/api/suggestions/start-batch", post(api::start_suggestions))
         .route(
             "/api/suggestions/mappings",
             get(api::list_suggestion_mappings)

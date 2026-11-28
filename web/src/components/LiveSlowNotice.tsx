@@ -1,4 +1,8 @@
 import { useLivePanes } from "../lib/liveControl";
+import { BUTTON_INLINE } from "../lib/surfaces";
+
+// The top bar's controls stay 32px on a phone too.
+const TOP_BAR_BUTTON = `${BUTTON_INLINE.replace("max-md:h-11", "max-md:h-8")} shrink-0`;
 
 /** In the Session's top bar, outside the terminal, so showing or dismissing it never resizes a pane this tab sizes. */
 export function LiveSlowNotice({ sessionId }: { sessionId: string | null }) {
@@ -10,11 +14,7 @@ export function LiveSlowNotice({ sessionId }: { sessionId: string | null }) {
       <span role="status" className="whitespace-nowrap max-sm:sr-only">
         Updates are slower.
       </span>
-      <button
-        type="button"
-        onClick={slow.reconnect}
-        className="h-8 shrink-0 px-1 sm:px-2 rounded-md text-brand-400 hover:text-brand-300 cursor-pointer underline"
-      >
+      <button type="button" onClick={slow.reconnect} className={TOP_BAR_BUTTON}>
         Reconnect
       </button>
       <button

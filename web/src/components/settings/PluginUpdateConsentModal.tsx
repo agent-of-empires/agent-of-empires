@@ -44,9 +44,20 @@ export function PluginUpdateConsentModal({
       closeTestId="plugin-update-consent-close"
       busy={busy}
       onClose={onClose}
+      actions={
+        <ModalActions
+          busy={busy}
+          cancelLabel={needsConsent ? "Decline" : "Cancel"}
+          cancelTestId="plugin-update-decline"
+          onCancel={() => (needsConsent ? onDecline?.() : closeIfIdle())}
+          confirmLabel={busy ? "Updating…" : needsConsent ? "Approve and update" : "Update"}
+          confirmTestId="plugin-update-approve"
+          onConfirm={onApprove}
+        />
+      }
       header={
         <div>
-          <h2 className="font-semibold">Update {name}?</h2>
+          <h2 className="text-[16px] md:text-[15px] font-semibold text-text-primary">Update {name}?</h2>
           <p className="text-xs text-text-dim">
             v{fromVersion} → v{toVersion}
           </p>
@@ -119,16 +130,6 @@ export function PluginUpdateConsentModal({
           {error}
         </p>
       )}
-
-      <ModalActions
-        busy={busy}
-        cancelLabel={needsConsent ? "Decline" : "Cancel"}
-        cancelTestId="plugin-update-decline"
-        onCancel={() => (needsConsent ? onDecline?.() : closeIfIdle())}
-        confirmLabel={busy ? "Updating…" : needsConsent ? "Approve and update" : "Update"}
-        confirmTestId="plugin-update-approve"
-        onConfirm={onApprove}
-      />
     </PluginModal>
   );
 }

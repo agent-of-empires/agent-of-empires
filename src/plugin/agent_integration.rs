@@ -9,7 +9,8 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use aoe_plugin_api::agent_integration::{
-    AgentIntegrationContribution, AgentKeyDeclaration, AgentResumeDeclaration, AgentYoloDeclaration,
+    AgentIntegrationContribution, AgentKeyDeclaration, AgentResumeDeclaration, AgentTrustValue,
+    AgentYoloDeclaration,
 };
 use aoe_plugin_api::agent_integration::{
     AgentIntegrationPrompt, AgentIntegrationReply, AgentIntegrationResponse,
@@ -539,8 +540,86 @@ pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> 
             labels(&reply.deny)
         ));
     }
+    if let Some(hooks) = &integration.hooks {
+        let relocated = hooks.config_dir_env_var.as_ref().and_then(|var| {
+            let file = std::path::Path::new(&hooks.settings_rel_path).file_name()?;
+            Some(format!(
+                " or ${}/{}",
+                display_command(var),
+                display_command(&file.to_string_lossy())
+            ))
+        });
+        lines.push(format!(
+            "  hooks: writes AoE status hooks into ~/{}{}",
+            display_command(&hooks.settings_rel_path),
+            relocated.unwrap_or_default()
+        ));
+        for event in &hooks.events {
+            let mut parts = Vec::new();
+            if let Some(matcher) = &event.matcher {
+                parts.push(format!("matcher {}", display_command(matcher)));
+            }
+            if let Some(status) = event.status {
+                parts.push(format!("writes {status:?}"));
+            }
+            if let Some(field) = event.identity_field {
+                parts.push(format!("publishes {field:?}"));
+            }
+            if !event.waiting_tools.is_empty() {
+                parts.push(format!(
+                    "waiting on {}",
+                    event
+                        .waiting_tools
+                        .iter()
+                        .map(|tool| display_command(tool))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            lines.push(format!(
+                "    {}: {}",
+                display_command(&event.event),
+                parts.join("; ")
+            ));
+        }
+    }
+    if let Some(trust) = &integration.trust {
+        let relocated = trust
+            .config_dir_env_var
+            .as_ref()
+            .map(|var| {
+                format!(
+                    " or ${}/{}",
+                    display_command(var),
+                    display_command(&trust.file)
+                )
+            })
+            .unwrap_or_default();
+        lines.push(format!(
+            "  trust: writes {} = {} into ~/{}{} (sandbox: {:?}); kept on uninstall",
+            display_command(&trust.pointer),
+            match &trust.value {
+                AgentTrustValue::Bool(value) => value.to_string(),
+                AgentTrustValue::String(value) => format!("{:?}", display_command(value)),
+            },
+            display_command(&trust.file),
+            relocated,
+            trust.sandbox
+        ));
+    }
     lines
 }
+
+/// Tools of active declarations that carry hooks or trust, in plugin order.
+pub(crate) fn hook_declaring_tools(registry: &super::PluginRegistry) -> Vec<String> {
+    registry
+        .active()
+        .flat_map(|plugin| &plugin.manifest.agent_integrations)
+        .filter(|entry| entry.command.is_some() && (entry.hooks.is_some() || entry.trust.is_some()))
+        .map(|entry| entry.tool.clone())
+        .collect()
+}
+
 /// Resolve a unique plugin-provided agent launch command.
 pub fn agent_command<'a>(
     tool: &str,

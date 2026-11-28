@@ -1,6 +1,6 @@
 import { useRef } from "react";
 import { switchViewCopy } from "../lib/acpKeepContext";
-import { BRAND_BUTTON, CancelButton, ConfirmButton, Dialog } from "./Dialog";
+import { CancelButton, ConfirmButton, Dialog } from "./Dialog";
 import { useBusyAction, useConfirmKeys, useDialogFocus } from "./dialogHooks";
 
 interface Props {
@@ -33,7 +33,6 @@ export function SwitchViewDialog({ sessionTitle, toStructured, keepsContext, onC
             onClick={handleConfirm}
             busy={switching}
             testId="switch-view-confirm"
-            className={BRAND_BUTTON}
           >
             {switching ? "Switching..." : copy.confirmLabel}
           </ConfirmButton>
