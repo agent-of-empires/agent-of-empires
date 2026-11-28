@@ -86,6 +86,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 &req.session_id,
                 kind,
                 authority,
+                None,
                 restart,
                 cancellation,
                 None,
@@ -99,16 +100,34 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
-    /// Admit a resume and reserve its capacity slot; only spawns count, since
-    /// an attach takes over a runner the registry already counts.
     pub(crate) async fn begin_resume(
         &self,
         session_id: &str,
         kind: ResumeKind,
-        authority: crate::process::worker_registry::ResumeAuthority,
+        authority: worker_registry::ResumeAuthority,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
         self.begin_resume_observing(session_id, kind, authority, None)
             .await
+    }
+
+    /// Existing build/version replacement policy may reserve a spawn only for
+    /// its frozen predecessor, after the same strict control-capability gate.
+    pub(crate) async fn begin_governed_replacement(
+        &self,
+        session_id: &str,
+        kind: ResumeKind,
+        predecessor: RunnerIdentity,
+    ) -> Result<ResumeReservationOutcome, SupervisorError> {
+        self.begin_resume_with_restart_claim(
+            session_id,
+            kind,
+            worker_registry::ResumeAuthority::Automatic,
+            Some(predecessor),
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// [`Self::begin_resume`] admitting against `observed_stop` (`Some`: the stop intent the
@@ -120,15 +139,25 @@ impl<S: BroadcastSink> Supervisor<S> {
         authority: crate::process::worker_registry::ResumeAuthority,
         observed_stop: Option<Option<worker_registry::StopIntent>>,
     ) -> Result<ResumeReservationOutcome, SupervisorError> {
-        self.begin_resume_with_restart_claim(session_id, kind, authority, None, None, observed_stop)
-            .await
+        self.begin_resume_with_restart_claim(
+            session_id,
+            kind,
+            authority,
+            None,
+            None,
+            None,
+            observed_stop,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn begin_resume_with_restart_claim(
         &self,
         session_id: &str,
         kind: ResumeKind,
         authority: crate::process::worker_registry::ResumeAuthority,
+        predecessor: Option<RunnerIdentity>,
         restart: Option<&RestartRequestGuard>,
         cancellation: Option<CancellationToken>,
         observed_stop: Option<Option<worker_registry::StopIntent>>,
@@ -170,6 +199,36 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::RestartInProgress(session_id.to_string()));
         }
         drop(restart_requests);
+        let retained = if _workers.contains_key(session_id) {
+            None
+        } else {
+            worker_registry::control_admission(session_id)
+                .map_err(|refusal| AcpError::RetainedRuntimeUnavailable(Box::new(refusal)))?
+        };
+        if predecessor.is_some_and(|expected| {
+            retained
+                .as_ref()
+                .is_none_or(|record| !expected.owns_record(record))
+        }) {
+            return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
+                worker_registry::ControlAdmissionRefusal::unconfirmed(predecessor),
+            ))
+            .into());
+        }
+        if kind != ResumeKind::Attach && predecessor.is_none() {
+            if let Some(record) = retained
+                .as_ref()
+                .filter(|record| worker_registry::retained_process_may_be_alive(record))
+            {
+                return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
+                    worker_registry::ControlAdmissionRefusal::from_record(
+                        record,
+                        worker_registry::ControlRefusalReason::OwnershipUnconfirmed,
+                    ),
+                ))
+                .into());
+            }
+        }
         worker_registry::admit_resume(session_id, authority, &observed_stop).map_err(|error| {
             if error.is::<worker_registry::StopSuperseded>() {
                 SupervisorError::StopSuperseded(session_id.to_string())
@@ -180,9 +239,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Freeze the observed runner under the same gate as stop and installation.
         // Later registry contents may describe a replacement, not this attach.
         let attach_record = if kind == ResumeKind::Attach {
-            worker_registry::load_strict(session_id)
-                .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
-                .map(Box::new)
+            retained.map(Box::new)
         } else {
             None
         };
@@ -250,6 +307,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             lease,
             expected_lifecycle_generation: None,
             attach_record,
+            preserve_owner: false,
             lifecycle: Arc::clone(&self.lifecycle),
             notify: Arc::clone(&self.worker_notify),
         }))
@@ -259,7 +317,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub(crate) async fn spawn_inner(
         &self,
         mut req: SpawnRequest,
-        reservation: ResumeReservation,
+        mut reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
         if self.native_admission_required
             && req.source_profile.is_none()
@@ -285,6 +343,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                 Err(()) => return Err(self.cancelled_spawn(&lease).await),
             }
         }
+        if let Some(admission) = req.launch_admission.as_mut() {
+            capture_admission_scope(admission, &req.session_id).await?;
+        }
         lease.set_admission(req.launch_admission.clone());
         match await_resume_to_completion(
             reservation.cancellation(),
@@ -296,6 +357,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             Ok(Err(error)) => return Err(error),
             Err(()) => return Err(self.cancelled_spawn(&lease).await),
         }
+        super::fork_rejection::prepare_fork_seed(&lease, req.fork_from.as_deref()).await?;
         let session_id = req.session_id.as_str();
         let warmup_guard =
             match await_resume(reservation.cancellation(), self.warmup_guard(&req.agent)).await {
@@ -376,6 +438,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if cancelled {
                     drop(warmup_guard);
                     return Err(self.cancelled_spawn(&lease).await);
+                }
+                if matches!(&err, AcpError::RetainedRuntimeUnavailable(_)) {
+                    reservation.preserve_refused_owner();
+                    return Err(SupervisorError::Acp(err));
                 }
                 if blames_adapter_binary(&err) {
                     self.mark_incompatible_binary(session_id, &config.spec.command);
@@ -938,9 +1004,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         mut reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
         let record = match reservation.attach_record.take() {
-            Some(record) if worker_registry::is_record_live(&record) => record,
+            Some(record) => record,
             _ => return Err(SupervisorError::UnknownSession(session_id)),
         };
+        worker_registry::revalidate_control_record(&record)
+            .map_err(|refusal| AcpError::RetainedRuntimeUnavailable(Box::new(refusal)))?;
         let (admission, claude_home) = capture_durable_launch(
             record.source_profile.as_deref(),
             &session_id,
@@ -949,6 +1017,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         )
         .await?;
         admit_durable_launch(admission.as_ref(), &session_id).await?;
+        reservation.lease().set_admission(admission.clone());
         let identity = RunnerIdentity::from_record(&record);
 
         let agent_key = if record.agent_key.is_empty() {
@@ -962,6 +1031,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             .map_err(|e| {
                 SupervisorError::InvalidAgentCommand(format!("agent policy load task failed: {e}"))
             })?;
+        worker_registry::revalidate_control_record(&record)
+            .map_err(|refusal| AcpError::RetainedRuntimeUnavailable(Box::new(refusal)))?;
         if !agent_allowed {
             warn!(
                 target: "acp.supervisor",
@@ -975,11 +1046,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::AgentNotAllowed(agent_key));
         }
 
-        let Some(stored_acp_session_id) = record.stored_acp_session_id.clone() else {
-            return Err(SupervisorError::Acp(AcpError::Spawn(
-                "runner registry has no stored_acp_session_id; need fresh spawn".into(),
-            )));
-        };
+        // A cached registry ID is routing metadata, not an establishment receipt.
+        // The runner supplies its genuine current session (or native loss).
+        let stored_acp_session_id = record.stored_acp_session_id.clone().unwrap_or_default();
         let sandbox_resources = match sandbox.as_ref() {
             Some((info, config_path)) => {
                 let (info, config_path) = (info.clone(), config_path.clone());
@@ -1040,7 +1109,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         } else {
             None
         };
+        worker_registry::revalidate_control_record(&record)
+            .map_err(|refusal| AcpError::RetainedRuntimeUnavailable(Box::new(refusal)))?;
 
+        let sink = Arc::clone(&self.sink);
+        let outcome_id = session_id.clone();
+        let unsuccessful_main =
+            tokio::task::spawn_blocking(move || sink.unsuccessful_main(&outcome_id))
+                .await
+                .map_err(|_| SupervisorError::NativeStoreUnavailable)?;
         let client = await_resume(
             reservation.cancellation(),
             AcpClient::attach(
@@ -1049,6 +1126,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 additional_dirs,
                 stored_acp_session_id,
                 in_flight_turn,
+                unsuccessful_main,
                 AcpSessionId(session_id.clone()),
                 sandbox_resources,
                 agent_key,
@@ -1069,6 +1147,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             Err(()) => return Err(self.cancelled_spawn(reservation.lease()).await),
         };
+
+        // Install unavailable clients only while their retained owner can still
+        // recover. A dead runner must reach the caller's settlement path.
+        if client.control_loss().is_some()
+            && !worker_registry::retained_process_may_be_alive(&record)
+        {
+            return Err(AcpError::NotRunning.into());
+        }
 
         let inbound = client
             .take_inbound()
@@ -1263,7 +1349,7 @@ async fn capture_durable_launch(
             .acquire_instance_lifecycle_lock(&id)
             .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
         let row = storage
-            .load()
+            .load_instances_complete()
             .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?
             .into_iter()
             .find(|row| row.id == id)
@@ -1275,11 +1361,14 @@ async fn capture_durable_launch(
         } else {
             None
         };
+        let native_scope = crate::acp::state::NativeObservationScope::capture(&row, &storage)
+            .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))?;
         Ok((
             Some(super::LaunchAdmission {
                 store: std::sync::Arc::new(storage),
                 generation: expected.unwrap_or(row.lifecycle_generation),
                 namespace: None,
+                native_scope: Some(native_scope),
             }),
             claude_home,
         ))
@@ -1328,6 +1417,45 @@ pub(super) async fn admit_stored_row(
 ) -> Result<(), SupervisorError> {
     let (admission, _) = capture_durable_launch(profile, session_id, None, false).await?;
     admit_durable_launch(admission.as_ref(), session_id).await
+}
+
+async fn capture_admission_scope(
+    admission: &mut super::LaunchAdmission,
+    session_id: &str,
+) -> Result<(), SupervisorError> {
+    if admission.native_scope.is_some() {
+        return Ok(());
+    }
+    let store = admission.store.clone();
+    let generation = admission.generation;
+    let id = session_id.to_owned();
+    let namespace = match admission.namespace.as_ref() {
+        Some(namespace) => Some(namespace.clone().read_owned().await),
+        None => None,
+    };
+    let scope = tokio::task::spawn_blocking(move || {
+        let _namespace = namespace;
+        let _lifecycle = store
+            .storage()
+            .acquire_instance_lifecycle_lock(&id)
+            .map_err(|error| admission_error(error, &id))?;
+        let row = store
+            .storage()
+            .load_instances_complete()
+            .map_err(|error| admission_error(error, &id))?
+            .into_iter()
+            .find(|row| row.id == id)
+            .ok_or_else(|| SupervisorError::SessionGone(id.clone()))?;
+        if row.lifecycle_generation != generation {
+            return Err(SupervisorError::SpawnCancelled(id));
+        }
+        crate::acp::state::NativeObservationScope::capture(&row, store.storage())
+            .map_err(|error| admission_error(error, &id))
+    })
+    .await
+    .map_err(|error| SupervisorError::Acp(AcpError::Spawn(error.to_string())))??;
+    admission.native_scope = Some(scope);
+    Ok(())
 }
 
 /// Check the same authority and generation before hooks, after hooks and after handshake.
@@ -2117,6 +2245,7 @@ time.sleep(60)
                     id,
                     ResumeKind::SpawnFirst,
                     crate::process::worker_registry::ResumeAuthority::Explicit,
+                    None,
                     Some(&restart),
                     None,
                     None,
@@ -4819,78 +4948,23 @@ time.sleep(60)
         store: Arc<crate::acp::event_store::EventStore>,
         rx: tokio::sync::broadcast::Receiver<crate::server::AcpBroadcastFrame>,
         supervisor: Supervisor<super::super::ChannelSink>,
-        runner_handshake: tokio::task::JoinHandle<()>,
-        fake_runner: std::process::Child,
+        _runner: HeldAttachRunner,
         _tmp: tempfile::TempDir,
         _store_tmp: tempfile::TempDir,
         _home: crate::session::test_support::AppDirGuard,
     }
 
-    impl Drop for AttachBackgroundAgentFixture {
-        fn drop(&mut self) {
-            self.runner_handshake.abort();
-            let _ = self.fake_runner.kill();
-            let _ = self.fake_runner.wait();
-        }
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn cancelled_attach_retires_only_its_recorded_scope() {
-        use crate::acp::control_protocol::{self, ControlBody};
         let (_home, tmp) = isolate_home();
-        let child = tokio::process::Command::new("sleep")
-            .arg("60")
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let pid = child.id().unwrap();
         let id = "cancelled-scope-attach";
-        let socket = tmp.path().join("attach.sock");
-        let listener =
-            tokio::net::UnixListener::bind(crate::process::worker::control_socket_sibling(&socket))
-                .unwrap();
-        let (entered, observed) = tokio::sync::oneshot::channel();
-        let peer = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            control_protocol::write_frame(
-                &mut stream,
-                &ControlBody::Hello {
-                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                    session_id: id.into(),
-                },
-            )
-            .await
-            .unwrap();
-            loop {
-                if matches!(
-                    control_protocol::read_frame(&mut stream).await.unwrap(),
-                    Some(ControlBody::Initialize { .. })
-                ) {
-                    entered.send(()).unwrap();
-                    break;
-                }
-            }
-            let _ = control_protocol::read_frame(&mut stream).await;
-        });
-        let mut record = worker_registry::WorkerRecord::new(
-            id.into(),
-            pid,
-            socket,
-            "test-agent-acp".into(),
-            "test-agent".into(),
-            tmp.path().to_path_buf(),
-            None,
-            vec![],
-            vec![],
-            Some("original-native-id".into()),
-            None,
-        );
-        record.runner_identity = crate::process::process_birth_identity(pid).unwrap();
+        let mut runner = HeldAttachRunner::new(id, tmp.path(), 17, None).await;
+        let pid = runner.record.pid;
         let unit = "aoe-original-attach.scope";
-        record.scope = crate::process::worker_registry::ScopeOwnership::Owned { unit: unit.into() };
-        worker_registry::save(&record).unwrap();
+        runner.record.scope =
+            crate::process::worker_registry::ScopeOwnership::Owned { unit: unit.into() };
+        worker_registry::save(&runner.record).unwrap();
         let control = Arc::new(FakeProcessControl::default());
         control.alive(pid);
         control.fail_scope(unit);
@@ -4900,7 +4974,7 @@ time.sleep(60)
             let cwd = tmp.path().to_path_buf();
             async move { sup.attach(id.into(), cwd, vec![], false, None).await }
         });
-        observed.await.unwrap();
+        runner.entered().await;
         sup.shutdown(id).await.unwrap();
         assert!(attaching.await.unwrap().is_err());
         assert!(control.scope_units().iter().any(|scope| scope == unit));
@@ -4911,8 +4985,6 @@ time.sleep(60)
         control.exit_scope(unit);
         sup.retry_pending_teardowns().await;
         assert!(!sup.is_owned(id).await);
-        peer.abort();
-        drop(child);
     }
 
     /// One `attach` fixture for the survivor and untrackable cases below: a
@@ -4925,10 +4997,9 @@ time.sleep(60)
         session_id: &str,
         output_file: &str,
         open_task: Option<&str>,
+        failed_main: bool,
     ) -> AttachBackgroundAgentFixture {
-        use crate::acp::control_protocol::{self, ControlBody};
         use crate::acp::state::BackgroundAgentStatus;
-        use std::os::unix::process::CommandExt as _;
 
         let (_home, tmp) = isolate_home();
         let (sink, store, rx, _store_tmp) = channel_sink();
@@ -5008,71 +5079,43 @@ time.sleep(60)
                 },
             );
         }
-
-        // `is_record_live` requires a live pid; `sleep 60` as its own process
-        // group leader keeps the cleanup kill off the test process.
-        let fake_runner = std::process::Command::new("sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .expect("spawn stand-in runner");
-
-        let socket = tmp.path().join(format!("{session_id}.sock"));
-        let control_socket = crate::process::worker::control_socket_sibling(&socket);
-        let listener = tokio::net::UnixListener::bind(&control_socket).unwrap();
-        let session_id_owned = session_id.to_string();
-        let runner_handshake = tokio::spawn(async move {
-            let (mut peer, _) = listener.accept().await.unwrap();
-            control_protocol::write_frame(
-                &mut peer,
-                &ControlBody::Hello {
-                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                    session_id: session_id_owned,
+        if failed_main {
+            for event in [
+                crate::acp::state::test_support::prompt("original failed main"),
+                Event::PromptRuntimeError {
+                    message: "original failed main".into(),
+                    evidence: None,
+                    native_subject: None,
                 },
+                Event::Stopped {
+                    reason: "prompt_failed".into(),
+                },
+            ] {
+                sink.publish(session_id, store.highest_seq(session_id) + 1, &event);
+            }
+        }
+
+        let mut runner = if failed_main {
+            HeldAttachRunner::failed_main_replay(
+                session_id,
+                tmp.path(),
+                17,
+                Some("default"),
+                "acp-sid",
             )
             .await
-            .unwrap();
-            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
-                let reply = match frame {
-                    ControlBody::Attach { .. } => continue,
-                    ControlBody::Initialize { .. } => ControlBody::Initialized {
-                        result: serde_json::json!({
-                            "protocolVersion": 1, "agentCapabilities": {}
-                        }),
-                    },
-                    ControlBody::ResumeSession => ControlBody::SessionReady {
-                        acp_session_id: "acp-sid".into(),
-                        result: serde_json::json!({}),
-                        adapter_frames: 0,
-                    },
-                    frame => panic!("unexpected attach handshake frame: {frame:?}"),
-                };
-                control_protocol::write_frame(&mut peer, &reply)
-                    .await
-                    .unwrap();
-            }
-        });
-
-        // An agent key absent from the registry resolves to
-        // `ExpectedAgent::Other`, skipping the per-adapter compat gate: this
-        // fixture tests attach wiring, not agent compatibility.
-        let mut record = worker_registry::WorkerRecord::new(
-            session_id.to_string(),
-            fake_runner.id(),
-            socket,
-            "test-agent-acp".into(),
-            "test-agent".into(),
-            tmp.path().to_path_buf(),
-            None,
-            vec![],
-            vec![],
-            Some("acp-sid".into()),
-            None,
-        );
-        if open_task.is_some() {
-            record.source_profile = Some("default".into());
-        }
-        worker_registry::save(&record).unwrap();
+        } else {
+            HeldAttachRunner::ready(
+                session_id,
+                tmp.path(),
+                17,
+                open_task.map(|_| "default"),
+                Some("acp-sid"),
+            )
+            .await
+        };
+        runner.record.scope = worker_registry::ScopeOwnership::Unscoped;
+        worker_registry::save(&runner.record).unwrap();
 
         let sup = Supervisor::new(sink);
         sup.hydrate_seqs(store.all_session_seqs());
@@ -5080,8 +5123,7 @@ time.sleep(60)
             store,
             rx,
             supervisor: sup,
-            runner_handshake,
-            fake_runner,
+            _runner: runner,
             _tmp: tmp,
             _store_tmp,
             _home,
@@ -5100,6 +5142,105 @@ time.sleep(60)
         .expect("attach must not hang")
         .expect("attach must succeed against the fake runner");
         fixture
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reattached_failed_main_keeps_its_terminal_through_ambient_accounting_and_background_work(
+    ) {
+        let transcript = tempfile::NamedTempFile::new().unwrap();
+        let id = "retained-failed-background";
+        let mut fixture = attach_with_orphaned_background_agent(
+            id,
+            &transcript.path().to_string_lossy(),
+            Some("surviving-task"),
+            true,
+        )
+        .await;
+        let original_owner = fixture._runner.identity;
+        let original_lease = fixture.supervisor.running_lease(id).unwrap();
+        assert_eq!(fixture._runner.resumed_session().await, "acp-sid");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = fixture.rx.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::AgentStartupError { .. }) {
+                    panic!(
+                        "the retained observer must remain usable: {:?}",
+                        frame.event
+                    );
+                }
+                if matches!(frame.event.as_ref(), Event::UsageUpdated { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("actual ambient accounting reaches the SDK callback");
+        let extra_terminal = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = fixture.rx.recv().await.unwrap();
+                if let Event::Stopped { reason } = frame.event.as_ref() {
+                    return reason.clone();
+                }
+                assert!(!matches!(
+                    frame.event.as_ref(),
+                    Event::AgentStartupError { .. }
+                ));
+            }
+        })
+        .await;
+        assert!(
+            extra_terminal.is_err(),
+            "ambient activity must not manufacture another main terminal: {extra_terminal:?}"
+        );
+        let mut folded = crate::acp::state::AcpState::new(
+            crate::acp::state::AcpSessionId(id.into()),
+            crate::acp::state::AgentName("claude".into()),
+            None,
+        );
+        for (seq, event) in fixture.store.replay_from(id, 0) {
+            folded.apply_event(seq, event).unwrap();
+        }
+        assert_eq!(
+            folded.sidebar_phase,
+            crate::acp::state::SidebarPhase::PromptFailed
+        );
+        assert!(!folded.turn_active && folded.has_active_background_agent());
+        assert_eq!(
+            fixture
+                .store
+                .replay_from(id, 0)
+                .iter()
+                .filter(|(_, event)| matches!(event, Event::Stopped { .. }))
+                .count(),
+            1
+        );
+        fixture
+            .supervisor
+            .publish_user_prompt(id, "next explicit input".into())
+            .await;
+        fixture
+            .supervisor
+            .send_prompt(id, "next explicit input", &[])
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let frame = fixture.rx.recv().await.unwrap();
+                if matches!(frame.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete") { break; }
+                assert!(!matches!(frame.event.as_ref(), Event::AgentStartupError { .. }));
+            }
+        }).await.expect("the next explicit prompt completes through the same attached actor");
+        assert!(fixture.supervisor.running_lease(id) == Some(original_lease));
+        assert_eq!(
+            RunnerIdentity::from_record(&worker_registry::load(id).unwrap().unwrap()),
+            original_owner
+        );
+        assert!(worker_registry::is_record_live(&fixture._runner.record));
+        let handle = fixture.supervisor.workers.lock().await.remove(id).unwrap();
+        handle.drain_task.abort();
+        handle.client.shutdown().await.unwrap();
+        lock_recover(&fixture.supervisor.lifecycle).release_running(&handle.lease);
     }
 
     async fn await_background_agent_resolved(
@@ -5160,6 +5301,7 @@ time.sleep(60)
             "s-attach-survivor",
             &transcript.path().to_string_lossy(),
             None,
+            false,
         )
         .await;
         let state = await_background_agent_resolved(
@@ -5190,7 +5332,7 @@ time.sleep(60)
         use crate::acp::state::BackgroundAgentStatus;
 
         let mut fixture =
-            attach_with_orphaned_background_agent("s-attach-untrackable", "", None).await;
+            attach_with_orphaned_background_agent("s-attach-untrackable", "", None, false).await;
         let state = await_background_agent_resolved(
             &mut fixture,
             "s-attach-untrackable",
@@ -5213,7 +5355,7 @@ time.sleep(60)
     async fn attach_resumes_tailing_a_background_task_that_ended_during_the_restart() {
         let session_id = "s-attach-task";
         let mut fixture =
-            attach_with_orphaned_background_agent(session_id, "", Some("task-1")).await;
+            attach_with_orphaned_background_agent(session_id, "", Some("task-1"), false).await;
         assert_eq!(
             fixture.store.unresolved_background_task_ids(session_id),
             ["task-1".to_string()],
@@ -5278,6 +5420,8 @@ time.sleep(60)
             None,
             None,
         );
+        record.control_protocol_version =
+            Some(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION);
         record.detached_at = Some(1);
         let attach = || {
             sup.attach(
@@ -5336,7 +5480,7 @@ time.sleep(60)
         for drop_waiter in [false, true] {
             let (_home, tmp) = isolate_home();
             let id = "borrowed-attach-retry";
-            let mut runner = HeldAttachRunner::new(id, tmp.path(), 17, None);
+            let mut runner = HeldAttachRunner::new(id, tmp.path(), 17, None).await;
             let bytes = std::fs::read(worker_registry::record_path(id).unwrap()).unwrap();
             let (sink, store, mut rx, _store_tmp) = channel_sink();
             sink.publish(
@@ -5415,7 +5559,7 @@ time.sleep(60)
             let events = store.replay_from(id, 0);
             assert!(events.iter().any(|(_, event)| matches!(
                 event,
-                Event::AcpSessionAssigned { acp_session_id }
+                Event::AcpSessionAssigned { acp_session_id, .. }
                     if Some(acp_session_id) == runner.record.stored_acp_session_id.as_ref()
             )));
             assert!(events.iter().any(|(_, event)| matches!(
@@ -5449,7 +5593,7 @@ time.sleep(60)
         for stop_before_deadline in [true, false] {
             let (_home, tmp) = isolate_home();
             let id = "borrowed-attach-stop-race";
-            let mut original = HeldAttachRunner::new(id, tmp.path(), 17, None);
+            let mut original = HeldAttachRunner::new(id, tmp.path(), 17, None).await;
             let control = Arc::new(ObservedProcessControl::default());
             let sup =
                 Arc::new(Supervisor::new(VecSink::new()).with_process_control(control.clone()));
@@ -5460,7 +5604,7 @@ time.sleep(60)
             });
             original.entered().await;
             let target = sup.capture_retirement(id).unwrap();
-            let replacement = HeldAttachRunner::new(id, tmp.path(), 18, None);
+            let replacement = HeldAttachRunner::new(id, tmp.path(), 18, None).await;
             let replacement_bytes =
                 std::fs::read(worker_registry::record_path(id).unwrap()).unwrap();
             let mut replacement_observer = None;

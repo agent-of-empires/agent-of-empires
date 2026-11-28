@@ -1,4 +1,4 @@
-import type { AcpState } from "../../lib/acpTypes";
+import { nativeInputAvailable, type AcpState } from "../../lib/acpTypes";
 import type { SessionResponse } from "../../lib/types";
 import type { AcpContext } from "./AcpRuntime";
 
@@ -20,9 +20,18 @@ export function isRetryingStart(state: Pick<AcpState, "restartInFlight" | "retri
 
 /** The empty state while the Agent can't start, or until a Retry has started it. */
 export function notRunningCopy(
-  state: Pick<AcpState, "restartInFlight" | "retriedError" | "startupError">,
+  state: Pick<
+    AcpState,
+    | "restartInFlight"
+    | "retriedError"
+    | "startupError"
+    | "connectionReady"
+    | "nativeSnapshotSeq"
+    | "connectionUnavailable"
+  >,
   name: string,
 ): string | null {
+  if (nativeInputAvailable(state) || state.connectionUnavailable !== null) return null;
   const subject = name.charAt(0).toUpperCase() + name.slice(1);
   if (isRetryingStart(state)) return `${subject} isn't running yet.`;
   return state.startupError ? `${subject} isn't running.` : null;
@@ -34,10 +43,7 @@ export function hasStartedBefore(session: Pick<SessionResponse, "acp_session_id"
   return !!session.acp_session_id && !session.import_pending;
 }
 
-/** A new Session whose Agent session doesn't exist yet: its Worker, first connection, or
- *  `session/new` is still coming up. Events persisted before `session/new` answers
- *  (prompt capabilities, commands) don't end it; `AcpSessionAssigned` does.
- *  A Retry of a startup error counts too, for any Session. */
+/** Wait for current input authority, including a Retry on a previously started session. */
 export function isNewSessionStarting(
   state: AcpState,
   connection: ConnectionRetryState & Pick<AcpContext, "hasEverOpened">,
@@ -47,8 +53,9 @@ export function isNewSessionStarting(
   if (isRetryingStart(state)) return !connectionRetriesExhausted(connection);
   if (
     startedBefore ||
-    state.sessionAssigned ||
+    nativeInputAvailable(state) ||
     state.startupError ||
+    state.integrationLost ||
     state.workerStopped ||
     state.workerRestarting ||
     connectionRetriesExhausted(connection)
@@ -56,7 +63,7 @@ export function isNewSessionStarting(
     return false;
   const { status, hasEverOpened, reconnecting } = connection;
   if (acpWorkerState === "resuming") return true;
-  // A running Worker's replay says whether its session was assigned, so wait for the connection.
+  // Wait for its current receipt after the connection opens.
   if (acpWorkerState === "running") return hasEverOpened;
   return !hasEverOpened && (reconnecting || status === "connecting" || status === "error");
 }

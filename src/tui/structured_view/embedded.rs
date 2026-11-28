@@ -421,6 +421,10 @@ impl EmbeddedView {
         Ok(view)
     }
 
+    pub(crate) fn can_submit_prompt_intent(&self) -> bool {
+        self.state.can_submit_prompt_intent()
+    }
+
     /// Test constructor: a mounted, non-activated view over a state that
     /// never talks to a daemon. Lets App-level tests drive the paste-drain
     /// handoff without a live connection.
@@ -433,13 +437,15 @@ impl EmbeddedView {
         );
         let http =
             crate::acp::client::HttpClient::new(endpoint.clone()).expect("fake endpoint client");
+        let mut state = crate::tui::structured_view::StructuredViewState::new(
+            session_id.into(),
+            endpoint,
+            http,
+            None,
+        );
+        state.prompt_intent_available_for_test = true;
         Self {
-            state: crate::tui::structured_view::StructuredViewState::new(
-                session_id.into(),
-                endpoint,
-                http,
-                None,
-            ),
+            state,
             toast_deadline: None,
             plugin_rx: tokio::sync::mpsc::channel(1).1,
             session_info_rx: tokio::sync::mpsc::channel(1).1,
@@ -611,8 +617,7 @@ impl EmbeddedView {
             EmbeddedEvent::Ws(None) => {
                 // Channel closed without an error frame: treat as a disconnect so
                 // `next_event` stops polling the dead handle.
-                self.state.ws = None;
-                self.state.in_flight = false;
+                self.state.disconnect_management();
                 set_toast(
                     &mut self.state,
                     &mut self.toast_deadline,

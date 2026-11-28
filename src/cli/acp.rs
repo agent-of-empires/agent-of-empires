@@ -1643,6 +1643,7 @@ mod tests {
                     store: std::sync::Arc::new(Storage::open_unwatched("default").unwrap()),
                     generation: stored.lifecycle_generation,
                     namespace: None,
+                    native_scope: None,
                 };
                 let mut admitted = crate::acp::supervisor::with_durable_launch(
                     Some(admission),

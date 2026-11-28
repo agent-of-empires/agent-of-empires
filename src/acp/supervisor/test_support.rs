@@ -49,7 +49,8 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// What the drain task records for a worker that failed before establishing a session.
     pub(crate) fn note_startup_failure(&self, session_id: &str) {
-        lock_recover(&self.startup_failures).insert(session_id.to_string());
+        lock_recover(&self.startup_failures)
+            .insert(session_id.to_string(), super::StartupFailure::Retry);
     }
 
     /// Leave the session mid-teardown, where an unproven settlement parks it.
@@ -124,6 +125,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.test_install_handle(session_id, client, WorkerKind::Stdio, None)
             .await
             .epoch()
+    }
+
+    pub(crate) async fn test_observe_native_ready(&self, session_id: &str) {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .expect("installed test worker")
+            .client
+            .test_observe_native_ready();
     }
 
     /// Admit a prompt without storing it, as `publish_user_prompt` does first.
@@ -211,12 +222,43 @@ impl<S: BroadcastSink> Supervisor<S> {
         cmds
     }
 
+    pub(crate) async fn test_insert_classified_worker(
+        &self,
+        session_id: &str,
+        agent: &str,
+    ) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let (client, _tx, cmds) =
+            AcpClient::fake_for_test_cmd_recording(AcpSessionId(format!("acp-{session_id}")));
+        let mut config = runner_config(std::path::PathBuf::new());
+        config.agent_key = agent.into();
+        self.test_install_handle(
+            session_id,
+            client,
+            WorkerKind::Runner {
+                spawn_config: Box::new(config),
+            },
+            None,
+        )
+        .await;
+        cmds
+    }
+
     /// The event a fresh worker publishes once attached; it clears a startup error.
-    pub(crate) fn test_publish_worker_attached(&self, session_id: &str) {
+    pub(crate) fn test_publish_worker_attached_in(
+        &self,
+        session_id: &str,
+        context: Option<crate::acp::state::NativeEventContext>,
+    ) {
         self.publish_next(
             session_id,
             &Event::AcpSessionAssigned {
                 acp_session_id: format!("acp-{session_id}"),
+                connection_ready: true,
+                native_subject: context.map(|context| crate::acp::state::NativeEventSubject {
+                    context,
+                    owner: None,
+                    kind: crate::acp::state::NativeSubjectEvent::ChannelReady,
+                }),
             },
         );
     }
@@ -354,20 +396,27 @@ pub(super) fn channel_sink() -> (
     broadcast::Receiver<crate::server::AcpBroadcastFrame>,
     tempfile::TempDir,
 ) {
+    channel_sink_with_cache(Arc::new(crate::acp::control_cache::ControlStateCache::new()))
+}
+
+pub(super) fn channel_sink_with_cache(
+    cache: Arc<crate::acp::control_cache::ControlStateCache>,
+) -> (
+    Arc<ChannelSink>,
+    Arc<EventStore>,
+    broadcast::Receiver<crate::server::AcpBroadcastFrame>,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::TempDir::new().unwrap();
     let event_store = Arc::new(EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap());
     let (tx, rx) = broadcast::channel(16);
-    let sink = Arc::new(ChannelSink::new(
-        tx,
-        event_store.clone(),
-        Arc::new(crate::acp::control_cache::ControlStateCache::new()),
-    ));
+    let sink = Arc::new(ChannelSink::new(tx, event_store.clone(), cache));
     (sink, event_store, rx, tmp)
 }
 
 /// Isolate HOME under a short `/tmp` path so runner socket paths stay valid.
 pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, tempfile::TempDir) {
-    let tmp = tempfile::TempDir::with_prefix_in("aoe-lease-", "/tmp").unwrap();
+    let tmp = tempfile::TempDir::with_prefix_in("aoe-", "/tmp").unwrap();
     let home = crate::session::test_support::isolate_app_dir_at(tmp.path());
     (home, tmp)
 }
@@ -712,44 +761,423 @@ impl ProcessControl for ObservedProcessControl {
     }
 }
 
-/// A real child identity and compatible control socket. The first initialize stays
-/// unanswered until its exact connection closes. The second resumes the same turn.
+enum AttachPeerMode {
+    Normal,
+    FailedMain,
+    IncompatibleHello(Lease),
+    RecordPrompt,
+}
+
+enum HeldChild {
+    Retained(std::process::Child),
+    Constructor(Option<tokio::process::Child>),
+}
+
+impl Drop for HeldChild {
+    fn drop(&mut self) {
+        match self {
+            Self::Retained(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Self::Constructor(Some(child)) => {
+                let _ = child.start_kill();
+            }
+            Self::Constructor(None) => {}
+        }
+    }
+}
+
+/// Retains the child-owned control endpoint while Rust scripts its frames.
+pub(crate) struct RetainedControlPeer {
+    pub(crate) record: WorkerRecord,
+    pub(crate) identity: RunnerIdentity,
+    child: HeldChild,
+    _socket_dir: tempfile::TempDir,
+}
+
+impl RetainedControlPeer {
+    pub(crate) async fn new(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        native_id: &str,
+        scripted_control: std::path::PathBuf,
+    ) -> Self {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
+
+        let socket_dir = tempfile::TempDir::with_prefix_in("aoe-drain-", "/tmp").unwrap();
+        let socket = socket_dir.path().join("runner.sock");
+        let script = r#"
+import select, socket, sys, threading
+frontend, backend = sys.argv[1:]
+def forward(client):
+    with client, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        try:
+            peer.connect(backend)
+            while True:
+                ready, _, _ = select.select([client, peer], [], [])
+                for source in ready:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    (peer if source is client else client).sendall(data)
+        except OSError:
+            return
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(frontend)
+listener.listen(8)
+print("ready", flush=True)
+while True:
+    client, _ = listener.accept()
+    threading.Thread(target=forward, args=(client,), daemon=True).start()
+"#;
+        let mut child = std::process::Command::new("python3")
+            .args(["-u", "-c", script])
+            .arg(crate::process::worker::control_socket_sibling(&socket))
+            .arg(scripted_control)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stdout = tokio::process::ChildStdout::from_std(child.stdout.take().unwrap()).unwrap();
+        let child = HeldChild::Retained(child);
+        let mut lines = BufReader::new(stdout).lines();
+        let ready =
+            tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line()).await;
+        assert!(
+            matches!(&ready, Ok(Ok(Some(line))) if line == "ready"),
+            "fixture child did not bind its control socket: {ready:?}"
+        );
+        let mut record = WorkerRecord::new(
+            session_id.into(),
+            pid,
+            socket,
+            "test-agent-acp".into(),
+            "test-agent".into(),
+            cwd.into(),
+            None,
+            vec![],
+            vec![],
+            Some(native_id.into()),
+            None,
+        )
+        .with_generation(generation);
+        record.control_protocol_version =
+            Some(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION);
+        let identity = RunnerIdentity::from_record(&record);
+        assert!(identity.birth_fingerprint.is_some());
+        worker_registry::save(&record).unwrap();
+        Self {
+            record,
+            identity,
+            child,
+            _socket_dir: socket_dir,
+        }
+    }
+
+    pub(crate) fn exit_peer(&mut self) {
+        let HeldChild::Retained(child) = &mut self.child else {
+            unreachable!("the fixture retains its original child")
+        };
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// A real child-owned control peer with causal handshake, replay and prompt gates.
 pub(crate) struct HeldAttachRunner {
     pub(crate) record: WorkerRecord,
     pub(crate) identity: RunnerIdentity,
     entered: Option<tokio::sync::oneshot::Receiver<()>>,
     disconnected: Option<tokio::sync::oneshot::Receiver<()>>,
-    completion: Option<tokio::sync::oneshot::Sender<()>>,
-    trailer: Arc<std::sync::atomic::AtomicBool>,
+    completion: Option<std::process::ChildStdin>,
+    resumed: mpsc::Receiver<String>,
+    prompts: mpsc::Receiver<serde_json::Value>,
+    trailer: bool,
     peer: tokio::task::JoinHandle<()>,
-    child: std::process::Child,
+    child: HeldChild,
     _socket_dir: tempfile::TempDir,
 }
 
 impl HeldAttachRunner {
-    pub(crate) fn new(
+    pub(crate) async fn new(
         session_id: &str,
         cwd: &std::path::Path,
         generation: u64,
         profile: Option<&str>,
     ) -> Self {
-        use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
-        use std::os::unix::process::CommandExt as _;
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            generation,
+            profile,
+            true,
+            None,
+            AttachPeerMode::Normal,
+        )
+        .await
+    }
 
+    /// Complete both real attach handshakes without an outstanding native prompt.
+    pub(crate) async fn ready(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+        native_id: Option<&str>,
+    ) -> Self {
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            generation,
+            profile,
+            false,
+            native_id,
+            AttachPeerMode::Normal,
+        )
+        .await
+    }
+
+    pub(crate) async fn failed_main_replay(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+        native_id: &str,
+    ) -> Self {
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            generation,
+            profile,
+            false,
+            Some(native_id),
+            AttachPeerMode::FailedMain,
+        )
+        .await
+    }
+
+    pub(crate) async fn incompatible_hello(
+        session_id: &str,
+        cwd: &std::path::Path,
+        lease: &Lease,
+        profile: Option<&str>,
+    ) -> Self {
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            lease.epoch(),
+            profile,
+            false,
+            None,
+            AttachPeerMode::IncompatibleHello(lease.clone()),
+        )
+        .await
+    }
+
+    pub(crate) async fn recording_prompt(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+        native_id: &str,
+    ) -> Self {
+        Self::with_initialize_hold(
+            session_id,
+            cwd,
+            generation,
+            profile,
+            false,
+            Some(native_id),
+            AttachPeerMode::RecordPrompt,
+        )
+        .await
+    }
+
+    async fn with_initialize_hold(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+        hold_first_initialize: bool,
+        native_id: Option<&str>,
+        mode: AttachPeerMode,
+    ) -> Self {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt as _, BufReader};
         let socket_dir = tempfile::TempDir::with_prefix_in("aoe-attach-", "/tmp").unwrap();
         let socket = socket_dir.path().join("runner.sock");
-        let listener =
-            tokio::net::UnixListener::bind(crate::process::worker::control_socket_sibling(&socket))
-                .unwrap();
-        let child = std::process::Command::new("sleep")
-            .arg("60")
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let native_id = format!("native-{session_id}-{generation}");
+        let native_id = native_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("native-{session_id}-{generation}"));
+        // The child binds and serves the socket: its actual peer credentials,
+        // not an unrelated sleeper, must match the retained registry owner.
+        let script = r#"
+import json, signal, socket, struct, sys
+path, sid, native, version, hold, mode = sys.argv[1:]
+version, hold, failed = int(version), hold == "true", mode == "failed"
+holding_observer = False
+termination_requested = False
+def terminate(signum, frame):
+    global termination_requested
+    if holding_observer:
+        termination_requested = True
+    else:
+        raise SystemExit(0)
+signal.signal(signal.SIGTERM, terminate)
+if mode == "incompatible":
+    version -= 1
+def read_exact(s, count):
+    data = b""
+    while len(data) < count:
+        part = s.recv(count - len(data))
+        if not part:
+            assert not data, "partial fixture frame"
+            return None
+        data += part
+    return data
+def receive(s):
+    size = read_exact(s, 4)
+    if size is None:
+        return None
+    count = struct.unpack(">I", size)[0]
+    assert count <= 64 * 1024 * 1024
+    return json.loads(read_exact(s, count))
+def send(s, body):
+    data = json.dumps(body).encode()
+    s.sendall(struct.pack(">I", len(data)) + data)
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(path)
+listener.listen(2)
+print("ready", flush=True)
+for attempt in range(2):
+    s, _ = listener.accept()
+    with s:
+        send(s, {"kind": "hello", "control_protocol_version": version, "session_id": sid})
+        while True:
+            frame = receive(s)
+            if frame is None:
+                if mode == "incompatible":
+                    print("disconnected", flush=True)
+                break
+            kind = frame["kind"]
+            if kind == "attach":
+                assert frame["control_protocol_version"] == version
+            elif kind == "initialize" and attempt == 0 and hold:
+                holding_observer = True
+                print("entered", flush=True)
+                assert receive(s) is None, "observer retirement sent native management input"
+                print("disconnected", flush=True)
+                holding_observer = False
+                if termination_requested:
+                    raise SystemExit(0)
+                break
+            elif kind == "initialize":
+                caps = {"promptCapabilities": {"image": True}} if mode == "record" else {}
+                send(s, {"kind": "initialized", "result": {"protocolVersion": 1, "agentCapabilities": caps}})
+            elif kind == "resume_session":
+                send(s, {"kind": "session_ready", "acp_session_id": native,
+                         "result": {}, "native_channel": {"state": "available"}, "adapter_frames": 0})
+                send(s, {"kind": "notify", "method": "_aoe/session_replayed", "params": {}})
+                print("resumed", flush=True)
+                if failed:
+                    send(s, {"kind": "prompt_completed", "prompt_req_id": 77,
+                             "outcome": {"status": "error", "code": -32603,
+                                         "message": "original failed main", "data": None}})
+                    send(s, {"kind": "notify", "method": "session/update", "params": {
+                        "sessionId": native, "update": {"sessionUpdate": "usage_update",
+                        "used": 10, "size": 100, "cost": {"amount": 0.1, "currency": "USD"}}}})
+                if hold:
+                    completion = sys.stdin.readline()
+                    assert completion in ("complete\n", "complete-trailer\n")
+                    send(s, {"kind": "notify", "method": "session/update", "params": {
+                        "sessionId": native, "update": {"sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "original producer completed"}}}})
+                    send(s, {"kind": "prompt_completed", "prompt_req_id": 77,
+                             "outcome": {"status": "completed", "stop_reason": "end_turn"}})
+                    if completion == "complete-trailer\n":
+                        send(s, {"kind": "notify", "method": "session/update", "params": {
+                            "sessionId": native, "update": {"sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "after the retained completion"}}}})
+            elif mode == "record" and kind == "prompt":
+                print("prompt:" + json.dumps(frame["request"]), flush=True)
+                send(s, {"kind": "prompt_started", "prompt_req_id": 78})
+                assert sys.stdin.readline() == "complete\n"
+                send(s, {"kind": "prompt_completed", "prompt_req_id": 78,
+                         "outcome": {"status": "completed", "stop_reason": "end_turn"}})
+            elif failed and kind == "prompt":
+                send(s, {"kind": "prompt_started", "prompt_req_id": 78})
+                send(s, {"kind": "prompt_completed", "prompt_req_id": 78,
+                         "outcome": {"status": "completed", "stop_reason": "end_turn"}})
+            else:
+                raise AssertionError("unexpected attach request: " + kind)
+"#;
+        let mut command = std::process::Command::new("python3");
+        command
+            .args(["-u", "-c", script])
+            .arg(crate::process::worker::control_socket_sibling(&socket))
+            .args([session_id, &native_id])
+            .arg(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION.to_string())
+            .arg(hold_first_initialize.to_string())
+            .arg(match &mode {
+                AttachPeerMode::Normal => "normal",
+                AttachPeerMode::FailedMain => "failed",
+                AttachPeerMode::IncompatibleHello(_) => "incompatible",
+                AttachPeerMode::RecordPrompt => "record",
+            })
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let (mut child, pid, completion, stdout) =
+            if matches!(&mode, AttachPeerMode::IncompatibleHello(_)) {
+                let mut child = tokio::process::Command::from(command)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let pid = child.id().unwrap();
+                let stdout = child.stdout.take().unwrap();
+                (HeldChild::Constructor(Some(child)), pid, None, stdout)
+            } else {
+                let mut child = command.spawn().unwrap();
+                let pid = child.id();
+                let completion = child.stdin.take();
+                let stdout =
+                    tokio::process::ChildStdout::from_std(child.stdout.take().unwrap()).unwrap();
+                (HeldChild::Retained(child), pid, completion, stdout)
+            };
+        let mut lines = BufReader::new(stdout).lines();
+        let ready =
+            tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line()).await;
+        if !matches!(&ready, Ok(Ok(Some(line))) if line == "ready") {
+            match &mut child {
+                HeldChild::Retained(child) => {
+                    let _ = child.kill();
+                    child
+                        .wait()
+                        .expect("reap original child before publication");
+                }
+                HeldChild::Constructor(Some(child)) => {
+                    let _ = child.kill().await;
+                    child
+                        .wait()
+                        .await
+                        .expect("reap original constructor before publication");
+                }
+                HeldChild::Constructor(None) => unreachable!("original child has not transferred"),
+            }
+            panic!("fixture did not bind its actual child-owned socket: {ready:?}");
+        }
+        // Read kernel identity only after final startup, while retaining the original Child.
+        // Ready is a scheduling barrier, not an ownership attestation.
         let mut record = WorkerRecord::new(
             session_id.into(),
-            child.id(),
+            pid,
             socket,
             "test-agent-acp".into(),
             "test-agent".into(),
@@ -761,152 +1189,79 @@ impl HeldAttachRunner {
             profile.map(str::to_owned),
         )
         .with_generation(generation);
+        record.control_protocol_version =
+            Some(crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION);
         record.scope = worker_registry::ScopeOwnership::Owned {
             unit: format!("aoe-attach-{session_id}-{generation}.scope"),
         };
         let identity = RunnerIdentity::from_record(&record);
-        assert!(identity.birth_fingerprint.is_some());
-        worker_registry::save(&record).unwrap();
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (disconnected_tx, disconnected) = tokio::sync::oneshot::channel();
-        let (completion, completion_rx) = tokio::sync::oneshot::channel();
-        let trailer = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let peer_trailer = trailer.clone();
-        let id = session_id.to_owned();
+        let (resumed_tx, resumed) = mpsc::channel(2);
+        let (prompt_tx, prompts) = mpsc::channel(2);
         let peer = tokio::spawn(async move {
             let mut entered_tx = Some(entered_tx);
             let mut disconnected_tx = Some(disconnected_tx);
-            let mut completion_rx = Some(completion_rx);
-            for attempt in 0..2 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                control_protocol::write_frame(
-                    &mut stream,
-                    &ControlBody::Hello {
-                        control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                        session_id: id.clone(),
-                    },
-                )
-                .await
-                .unwrap();
-                while let Some(frame) = control_protocol::read_frame(&mut stream).await.unwrap() {
-                    match frame {
-                        ControlBody::Attach {
-                            control_protocol_version,
-                        } => {
-                            assert_eq!(
-                                control_protocol_version,
-                                control_protocol::CONTROL_PROTOCOL_VERSION
-                            );
-                        }
-                        ControlBody::Initialize { .. } if attempt == 0 => {
-                            entered_tx.take().unwrap().send(()).unwrap();
-                            // A failed observation may close only this connection.
-                            assert_eq!(
-                                control_protocol::read_frame(&mut stream).await.unwrap(),
-                                None,
-                                "timeout/drop must not cancel, close, or delete the producer turn"
-                            );
-                            disconnected_tx.take().unwrap().send(()).unwrap();
-                            break;
-                        }
-                        ControlBody::Initialize { .. } => {
-                            control_protocol::write_frame(
-                                &mut stream,
-                                &ControlBody::Initialized {
-                                    result: serde_json::json!({
-                                        "protocolVersion": 1,
-                                        "agentCapabilities": {}
-                                    }),
-                                },
-                            )
-                            .await
-                            .unwrap();
-                        }
-                        ControlBody::ResumeSession => {
-                            control_protocol::write_frame(
-                                &mut stream,
-                                &ControlBody::SessionReady {
-                                    acp_session_id: native_id.clone(),
-                                    result: serde_json::json!({}),
-                                    adapter_frames: 0,
-                                },
-                            )
-                            .await
-                            .unwrap();
-                            completion_rx.take().unwrap().await.unwrap();
-                            control_protocol::write_frame(
-                                &mut stream,
-                                &ControlBody::Notify {
-                                    method: "session/update".into(),
-                                    params: serde_json::json!({
-                                        "sessionId": native_id,
-                                        "update": {
-                                            "sessionUpdate": "agent_message_chunk",
-                                            "content": {
-                                                "type": "text",
-                                                "text": "original producer completed"
-                                            }
-                                        }
-                                    }),
-                                },
-                            )
-                            .await
-                            .unwrap();
-                            control_protocol::write_frame(
-                                &mut stream,
-                                &ControlBody::PromptCompleted {
-                                    prompt_req_id: 77,
-                                    outcome: PromptOutcome::Completed {
-                                        stop_reason: Some("end_turn".into()),
-                                    },
-                                },
-                            )
-                            .await
-                            .unwrap();
-                            if peer_trailer.load(std::sync::atomic::Ordering::SeqCst) {
-                                control_protocol::write_frame(
-                                    &mut stream,
-                                    &ControlBody::Notify {
-                                        method: "session/update".into(),
-                                        params: serde_json::json!({
-                                            "sessionId": native_id,
-                                            "update": {
-                                                "sessionUpdate": "agent_message_chunk",
-                                                "content": {
-                                                    "type": "text",
-                                                    "text": "after the retained completion"
-                                                }
-                                            }
-                                        }),
-                                    },
-                                )
-                                .await
-                                .unwrap();
-                            }
-                        }
-                        frame => panic!("unexpected attach request: {frame:?}"),
+            while let Some(line) = lines.next_line().await.unwrap() {
+                match line.as_str() {
+                    "entered" => {
+                        entered_tx.take().unwrap().send(()).unwrap();
                     }
+                    "disconnected" => {
+                        disconnected_tx.take().unwrap().send(()).unwrap();
+                    }
+                    "resumed" => {
+                        resumed_tx.send(native_id.clone()).await.unwrap();
+                    }
+                    value if value.starts_with("prompt:") => {
+                        prompt_tx
+                            .send(serde_json::from_str(&value["prompt:".len()..]).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    _ => panic!("unexpected fixture observation: {line}"),
                 }
             }
         });
-        Self {
+        let mut runner = Self {
             record,
             identity,
             entered: Some(entered),
             disconnected: Some(disconnected),
-            completion: Some(completion),
-            trailer,
+            completion,
+            resumed,
+            prompts,
+            trailer: false,
             peer,
             child,
             _socket_dir: socket_dir,
+        };
+        use futures_util::FutureExt as _;
+        let prepared = std::panic::AssertUnwindSafe(async {
+            assert!(identity.birth_fingerprint.is_some());
+            if let AttachPeerMode::IncompatibleHello(lease) = &mode {
+                let HeldChild::Constructor(child) = &mut runner.child else {
+                    unreachable!()
+                };
+                lease.record_spawned_child(child.take().unwrap(), identity);
+            }
+            worker_registry::save(&runner.record).unwrap();
+        })
+        .catch_unwind()
+        .await;
+        if let Err(panic) = prepared {
+            if let AttachPeerMode::IncompatibleHello(lease) = &mode {
+                runner.cleanup_constructor(lease).await;
+            }
+            std::panic::resume_unwind(panic);
         }
+        runner
     }
 
     /// Sends one more chunk after the completion, so a test can wait on the frames
     /// being processed in order before asserting that the completion did nothing.
-    pub(crate) fn with_trailing_chunk(self) -> Self {
-        self.trailer
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    pub(crate) fn with_trailing_chunk(mut self) -> Self {
+        self.trailer = true;
         self
     }
 
@@ -918,16 +1273,156 @@ impl HeldAttachRunner {
         self.disconnected.take().unwrap().await.unwrap();
     }
 
-    pub(crate) fn complete_turn(&mut self) {
-        self.completion.take().unwrap().send(()).unwrap();
+    /// Observe an actual ResumeSession request after its SessionReady was written.
+    pub(crate) async fn resumed_session(&mut self) -> String {
+        self.resumed.recv().await.unwrap()
     }
+
+    pub(crate) async fn next_prompt(&mut self) -> serde_json::Value {
+        self.prompts.recv().await.unwrap()
+    }
+
+    pub(crate) fn complete_turn(&mut self) {
+        use std::io::Write as _;
+        self.completion
+            .take()
+            .unwrap()
+            .write_all(if self.trailer {
+                b"complete-trailer\n"
+            } else {
+                b"complete\n"
+            })
+            .unwrap();
+    }
+
+    pub(crate) async fn wait_for_constructor(&self, lease: &Lease) {
+        let mut waited = lease.test_child_wait_completed();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            waited.wait_for(|outcome| outcome.is_some()),
+        )
+        .await
+        .expect("the original production child waiter completes")
+        .unwrap();
+        assert_eq!(*outcome, Some(true), "the original child wait succeeds");
+    }
+
+    pub(crate) async fn cleanup_constructor(&mut self, lease: &Lease) {
+        match &mut self.child {
+            HeldChild::Constructor(Some(child)) => {
+                let _ = child.kill().await;
+                child
+                    .wait()
+                    .await
+                    .expect("reap the untransferred original child");
+            }
+            HeldChild::Constructor(None) => {
+                assert_eq!(lease.spawned_runner(), Some(self.identity));
+                crate::acp::runner_lifecycle::SystemProcessControl::default()
+                    .kill_group(self.identity);
+                self.wait_for_constructor(lease).await;
+            }
+            HeldChild::Retained(_) => panic!("cleanup requires original constructor custody"),
+        }
+    }
+
+    pub(crate) fn exit_peer(&mut self) {
+        let HeldChild::Retained(child) = &mut self.child else {
+            panic!("constructor has transferred its original child");
+        };
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}
+
+/// Reproduce an owned constructor's genuine control refusal, retaining its
+/// reservation at the exact boundary before Drop records producer completion.
+pub(crate) async fn refused_owned_constructor<S: BroadcastSink>(
+    supervisor: &Supervisor<S>,
+    row: &crate::session::Instance,
+) -> (ResumeReservation, HeldAttachRunner) {
+    let mut reservation = supervisor
+        .reserve_spawn(
+            &row.id,
+            ResumeKind::SpawnFirst,
+            worker_registry::ResumeAuthority::Explicit,
+        )
+        .await
+        .unwrap();
+    let lease = reservation.lease().clone();
+    let mut runner = HeldAttachRunner::incompatible_hello(
+        &row.id,
+        std::path::Path::new(&row.project_path),
+        &lease,
+        Some(&row.source_profile),
+    )
+    .await;
+    use futures_util::FutureExt as _;
+    let refused = std::panic::AssertUnwindSafe(async {
+        runner.record.stored_acp_session_id = None;
+        runner.record.scope = worker_registry::ScopeOwnership::Unscoped;
+        worker_registry::save(&runner.record).unwrap();
+        lease.record_scope(runner.record.scope.clone());
+        lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
+        assert_eq!(lease.spawned_runner(), Some(runner.identity));
+        let storage =
+            Arc::new(crate::session::Storage::open_reference(&row.source_profile).unwrap());
+        let scope = crate::acp::state::NativeObservationScope::capture(row, &storage).unwrap();
+        lease.set_admission(Some(super::LaunchAdmission {
+            store: storage,
+            generation: row.lifecycle_generation,
+            namespace: None,
+            native_scope: Some(scope),
+        }));
+        let result = AcpClient::attach(
+            runner.record.socket_path.clone(),
+            PathBuf::from(&row.project_path),
+            Vec::new(),
+            String::new(),
+            false,
+            false,
+            AcpSessionId(row.id.clone()),
+            None,
+            runner.record.agent_key.clone(),
+            Some(row.source_profile.clone()),
+            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3)),
+            Some(lease.clone()),
+            None,
+            None,
+            false,
+        )
+        .await;
+        let crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(refusal) = result
+            .err()
+            .expect("the actual child greets with the prior private protocol")
+        else {
+            panic!("expected a typed retained control refusal");
+        };
+        assert_eq!(
+            refusal.reason,
+            worker_registry::ControlRefusalReason::ProtocolIncompatible
+        );
+        assert_eq!(refusal.owner, Some(runner.identity));
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.disconnected())
+            .await
+            .expect("the refused observer closes without native initialization");
+        reservation.preserve_refused_owner();
+    })
+    .catch_unwind()
+    .await;
+    if let Err(panic) = refused {
+        runner.cleanup_constructor(&lease).await;
+        std::panic::resume_unwind(panic);
+    }
+    (reservation, runner)
 }
 
 impl Drop for HeldAttachRunner {
     fn drop(&mut self) {
         self.peer.abort();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let HeldChild::Constructor(None) = &self.child {
+            crate::acp::runner_lifecycle::SystemProcessControl::default().kill_group(self.identity);
+        }
     }
 }
 

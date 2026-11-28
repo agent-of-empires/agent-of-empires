@@ -154,6 +154,8 @@ pub struct StructuredViewState {
     /// held as a real `Sent` response would until the turn-start echo clears it.
     #[cfg(test)]
     pub accept_submits_for_test: usize,
+    #[cfg(test)]
+    pub prompt_intent_available_for_test: bool,
     /// Every prompt the composer submitted, in order. Test-only, so the paste
     /// handoff can assert what each Enter actually sent.
     #[cfg(test)]
@@ -465,6 +467,8 @@ impl StructuredViewState {
             #[cfg(test)]
             accept_submits_for_test: 0,
             #[cfg(test)]
+            prompt_intent_available_for_test: false,
+            #[cfg(test)]
             submitted_prompts: Vec::new(),
             show_full_thinking: false,
             transcript_cache: RefCell::new(None),
@@ -517,6 +521,36 @@ impl StructuredViewState {
     /// (#4001).
     pub fn is_busy(&self) -> bool {
         self.transcript.turn_active || self.in_flight || self.ws.is_none()
+    }
+
+    pub fn native_input_available(&self) -> bool {
+        self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && self.transcript.connection_ready
+            && self.transcript.connection_unavailable.is_none()
+    }
+
+    pub fn can_submit_prompt_intent(&self) -> bool {
+        #[cfg(test)]
+        if self.prompt_intent_available_for_test {
+            return true;
+        }
+        self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && self.transcript.connection_unavailable.is_none()
+            && (self.transcript.connection_ready || self.transcript.prompt_wake_eligible)
+    }
+
+    pub fn can_accept_choice(&self) -> bool {
+        self.choice.as_ref().is_none_or(|choice| {
+            matches!(&choice.purpose, ChoicePurpose::OpenLink) || self.native_input_available()
+        })
+    }
+
+    pub fn disconnect_management(&mut self) {
+        self.ws = None;
+        self.in_flight = false;
+        self.transcript.revoke_native_authority();
     }
 
     /// Drain the composer's current text and clear it so the user can

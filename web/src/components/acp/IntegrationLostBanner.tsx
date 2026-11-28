@@ -16,6 +16,7 @@ function integrationLostLine(reason: IntegrationLostReason): string {
 
 /** The Agent's plugin integration failed mid-session. The session itself keeps running. */
 export function IntegrationLostBanner({ reason }: { reason: IntegrationLostReason }) {
+  const detail = reason.kind === "contract_violation" ? reason.detail : reason.kind.replaceAll("_", " ");
   return (
     <section
       aria-label="Agent integration lost"
@@ -23,7 +24,7 @@ export function IntegrationLostBanner({ reason }: { reason: IntegrationLostReaso
       className="border-b border-status-error/40 bg-status-error/10 px-4 py-3 text-text-primary"
     >
       <div role="alert">
-        <h2 className="text-sm font-semibold">Agent integration lost</h2>
+        <h2 className="text-sm font-semibold">Agent integration lost: {detail}</h2>
         <p data-testid="integration-lost-line" className="mt-1 text-xs text-text-subtle">
           {integrationLostLine(reason)} Messages you send stay queued.
         </p>

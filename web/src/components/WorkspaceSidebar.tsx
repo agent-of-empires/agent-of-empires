@@ -342,11 +342,11 @@ export function WorkspaceSidebar(props: Props) {
     props.onOpenPalette?.();
   };
 
-  // A phone lists sessions as Muse does, in a drawer under the page, which slides aside to uncover it and hides once
-  // it has slid back. It runs the full height on a solid colour, which iOS 26 extends under its bars.
+  // The drawer becomes focusable as soon as it opens, but stays visible until the page slides back over it.
+  // It runs the full height on a solid colour, which iOS 26 extends under its bars.
   const phoneClass = props.drawer
-    ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 max-md:transition-[visibility] ${DRAWER_MOTION} ${
-        open ? "" : "max-md:invisible"
+    ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 ${
+        open ? "" : `max-md:invisible max-md:transition-[visibility] ${DRAWER_MOTION}`
       }`
     : "max-md:hidden";
   return (

@@ -2,14 +2,12 @@
 //! lifecycle signals, the silent-orphan and cancel-escalation watchdogs, and
 //! mid-turn steering.
 
-use crate::acp::control_protocol::PromptOutcome;
-use crate::acp::state::{Event, RateLimitInfo};
+use crate::acp::state::{AcpConnectionSource, Event, RateLimitInfo};
 use agent_client_protocol::v1::schema::{ContentBlock, PromptRequest, PromptResponse, StopReason};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, Sleep};
 use tracing::{debug, info, trace, warn};
@@ -18,17 +16,17 @@ use super::command_loop::Session;
 use super::notifications::now_ms;
 use super::CANCEL_ESCALATION_GRACE;
 use crate::acp::acp_client::commands::{ClientCmd, PromptInput};
-use crate::acp::acp_client::control::prompt_outcome_to_response;
+use crate::acp::acp_client::control::{prompt_outcome_to_response, ControlPromptResult};
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
-use crate::acp::acp_client::errors::{acp_internal_error, is_authentication_failure};
+use crate::acp::acp_client::errors::{acp_internal_error, prompt_runtime_error, AcpError};
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_reset, classify_rate_limit_error, classify_rate_limit_from_message,
-    clear_captured_rejections, is_unsupported_session_error,
+    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
     take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
+use crate::acp::acp_client::session_identity::{ordered_native_request, OrderedRequestResult};
 use crate::acp::acp_client::steer::{first_text_block, SteerOutcome, SteerRequest};
 use crate::acp::acp_client::watchdog::{
     silent_orphan_check_interval, silent_orphan_fast_grace, silent_orphan_grace,
@@ -38,8 +36,19 @@ use crate::acp::acp_client::watchdog::{
 use crate::daemon::PromptAttachmentRef;
 
 type AcpResult<T> = Result<T, agent_client_protocol::Error>;
-type PromptFut = Pin<Box<dyn Future<Output = PromptReply> + Send>>;
-type SteerFut = Pin<Box<dyn Future<Output = (PromptInput, AcpResult<serde_json::Value>)> + Send>>;
+type PromptFut = Pin<Box<dyn Future<Output = PromptResult> + Send>>;
+type SteerFut =
+    Pin<Box<dyn Future<Output = (PromptInput, OrderedRequestResult<serde_json::Value>)> + Send>>;
+type PromptResult = OrderedRequestResult<PromptResponse>;
+
+struct LocalPromptScope(std::sync::Arc<super::notifications::Shared>);
+
+impl Drop for LocalPromptScope {
+    fn drop(&mut self) {
+        self.0.prompt_in_flight.store(false, Ordering::Release);
+        self.0.local_prompt_settled.notify_waiters();
+    }
+}
 
 #[cfg(test)]
 pub(super) struct SelectProbe {
@@ -69,13 +78,6 @@ fn observe_select_win(command: bool) {
     });
 }
 
-/// `session/prompt`'s result. `rejected` marks an error the agent answered
-/// with, as opposed to a lost transport or runner.
-struct PromptReply {
-    result: AcpResult<PromptResponse>,
-    rejected: bool,
-}
-
 enum Flow {
     Continue,
     Break,
@@ -91,12 +93,15 @@ struct TurnFlags {
     agent_unresponsive: bool,
     /// The adapter resolved with `StopReason::Cancelled`.
     prompt_cancelled: bool,
+    prompt_failed: bool,
     orphan_cancel_sent: bool,
     cancelling: bool,
+    connection_lost: bool,
+    result_observed: bool,
     /// What the adapter reported; `None` when no `PromptResponse` arrived.
     agent_stop_reason: Option<StopReason>,
     /// The error the agent answered `session/prompt` with.
-    rejection: Option<String>,
+    rejection: Option<agent_client_protocol::Error>,
 }
 
 struct Turn {
@@ -105,6 +110,7 @@ struct Turn {
     prompt_text: String,
     prompt_attachments: Vec<PromptAttachmentRef>,
     flags: TurnFlags,
+    preceding: Vec<Event>,
     watchdog: SilentOrphanWatchdog,
     cfg: SilentOrphanWatchdogConfig,
     orphan_check_enabled: bool,
@@ -133,12 +139,6 @@ impl Turn {
     }
 }
 
-/// The SDK's own error for a connection that ended before the response.
-fn is_lost_response(error: &agent_client_protocol::Error) -> bool {
-    agent_client_protocol::is_connection_terminated(error)
-        || agent_client_protocol::is_incoming_transport_closed(error)
-}
-
 /// Debug-only fault injection: suppress the prompt response once so the
 /// silent-orphan watchdog must break the loop (#1240).
 fn simulate_orphan(session_label: &str) -> bool {
@@ -160,71 +160,85 @@ fn simulate_orphan(session_label: &str) -> bool {
 }
 
 impl Session {
-    /// Runs one turn and always emits its terminal `Stopped`. Returns whether
-    /// the connection should shut down.
+    /// Runs one operation. A connection-loss event is itself terminal; it does
+    /// not manufacture a second `Stopped` or a peer prompt failure.
     pub(super) async fn run_prompt(&mut self, prompt: PromptInput) -> AcpResult<bool> {
         let PromptInput {
             blocks,
             attachments,
         } = prompt;
         let shared = self.shared.clone();
-        if let Some(control) = self.control.as_ref() {
-            control.supersede_adopted_turn();
-        }
-        shared.reset_message_dedup();
-        shared.seed_user_replay.store(false, Ordering::Relaxed);
-        if shared
-            .suppress_history_replay
-            .swap(false, Ordering::Relaxed)
-        {
-            info!(
-                target: "acp.protocol",
-                session = %shared.session_label,
-                "first user prompt after session/load; resuming notification pump"
+        let publication = shared.state.publication.lock().await;
+        let epoch = {
+            let _admission = shared
+                .connection_state
+                .admission
+                .lock()
+                .expect("connection admission lock");
+            if shared.connection_state.loss().is_some() || shared.connection_state.is_stopping() {
+                return Ok(false);
+            }
+            if let Some(control) = self.control.as_ref() {
+                control.supersede_adopted_turn();
+            }
+            shared.reset_message_dedup();
+            shared.seed_user_replay.store(false, Ordering::Relaxed);
+            if shared
+                .suppress_history_replay
+                .swap(false, Ordering::Relaxed)
+            {
+                info!(
+                    target: "acp.protocol",
+                    session = %shared.session_label,
+                    "first user prompt after session/load; resuming notification pump"
+                );
+            }
+            // This prompt owns the next terminal; every idle-completion path for
+            // an adopted or agent-initiated turn stands down.
+            shared
+                .prompt_sent_since_attach
+                .store(true, Ordering::Relaxed);
+            shared.adopted_turn_active.store(false, Ordering::Relaxed);
+            *shared
+                .last_prompt
+                .lock()
+                .expect("last prompt mutex poisoned") = (
+                blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_owned(),
+                0,
             );
-        }
-        // This prompt owns the next terminal; every idle-completion path for
-        // an adopted or agent-initiated turn stands down.
-        shared
-            .prompt_sent_since_attach
-            .store(true, Ordering::Relaxed);
-        shared.adopted_turn_active.store(false, Ordering::Relaxed);
-        *shared
-            .last_prompt
-            .lock()
-            .expect("last prompt mutex poisoned") = (
-            blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-                .trim()
-                .to_owned(),
-            0,
-        );
-        shared.prompt_in_flight.store(true, Ordering::Relaxed);
-        shared.terminal_claim.begin_turn();
-        shared.between_prompt.reset_for_prompt();
-        clear_captured_rejections(&shared.rate_limit_rejections);
-        shared
-            .agent_turn_text
-            .lock()
-            .expect("agent turn text mutex poisoned")
-            .disqualify();
-        *shared.cancel_deadline.lock().unwrap() = None;
-        info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
-        // Bump the epoch before sending so envelopes from a handler parked on
-        // the previous prompt are discarded.
-        let epoch = shared.prompt_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+            shared.prompt_in_flight.store(true, Ordering::Relaxed);
+            shared.terminal_claim.begin_turn();
+            shared.between_prompt.reset_for_prompt();
+            clear_captured_rejections(&shared.rate_limit_rejections);
+            shared
+                .agent_turn_text
+                .lock()
+                .expect("agent turn text mutex poisoned")
+                .disqualify();
+            *shared.cancel_deadline.lock().unwrap() = None;
+            info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
+            // Bump the epoch before sending so envelopes from a handler parked on
+            // the previous prompt are discarded.
+            shared.prompt_epoch.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        drop(publication);
+        let _scope = LocalPromptScope(shared.clone());
         while self.lifecycle_rx.try_recv().is_ok() {}
 
         let base_grace = silent_orphan_grace(self.source_profile.as_deref());
         let orphan_check_period = silent_orphan_check_interval();
         let mut turn = Turn {
             epoch,
+            preceding: Vec::new(),
             prompt_text: first_text_block(&blocks),
             prompt_attachments: attachments,
             flags: TurnFlags::default(),
@@ -255,12 +269,16 @@ impl Session {
                 res = &mut prompt_fut, if !simulate_orphan => {
                     self.on_prompt_result(&mut turn, res).await?
                 }
+                observation = shared.connection_state.wait_ordered_unavailable() => {
+                    self.on_prompt_result(&mut turn, PromptResult::Unavailable(observation)).await?
+                }
                 cmd = self.cmd_rx.recv() => {
                     #[cfg(test)]
                     observe_select_win(true);
                     self.on_command(&mut turn, cmd).await?
                 }
-                _ = turn.cancel_grace.as_mut(), if turn.flags.cancelling => {
+                _ = turn.cancel_grace.as_mut(),
+                    if turn.flags.cancelling && shared.connection_state.loss().is_none() => {
                     warn!(
                         target: "acp.protocol",
                         session = %shared.session_label,
@@ -276,7 +294,7 @@ impl Session {
                     observe_select_win(false);
                     // None: the handler dropped; another arm ends the loop.
                     match env {
-                        Some(env) if env.epoch == turn.epoch => turn.apply(env.signal),
+                        Some(env) if env.epoch == turn.epoch && shared.connection_state.loss().is_none() => turn.apply(env.signal),
                         Some(env) => trace!(
                             target: "acp.protocol",
                             session = %shared.session_label,
@@ -289,7 +307,8 @@ impl Session {
                     Flow::Continue
                 }
                 _ = turn.orphan_check.as_mut(),
-                    if turn.orphan_check_enabled && !turn.flags.orphan_cancel_sent =>
+                    if turn.orphan_check_enabled && !turn.flags.orphan_cancel_sent
+                        && shared.connection_state.loss().is_none() =>
                 {
                     self.on_orphan_check(&mut turn).await
                 }
@@ -304,53 +323,60 @@ impl Session {
                 break;
             }
         }
-        let shutdown = turn.flags.shutdown;
-        self.finish_turn(turn, prompt_started_at_ms).await;
-        Ok(shutdown)
+        if turn.flags.connection_lost {
+            return Ok(false);
+        }
+        Ok(self.finish_turn(turn, prompt_started_at_ms).await)
     }
 
     async fn send_prompt(&self, blocks: Vec<ContentBlock>) -> PromptFut {
         let request = PromptRequest::new(self.acp_session_id.clone(), blocks);
-        let lost = |result| PromptReply {
-            result,
-            rejected: false,
-        };
         let Some(control) = self.control.as_ref() else {
-            let sent = self.connection.send_request(request).block_task();
+            let request =
+                ordered_native_request(&self.connection, &self.shared.connection_state, request);
             return Box::pin(async move {
-                let result = sent.await;
-                let rejected = result.as_ref().is_err_and(|e| !is_lost_response(e));
-                PromptReply { result, rejected }
+                match request {
+                    Ok(request) => request.wait().await,
+                    Err(AcpError::ConnectionUnavailable(observation)) => {
+                        PromptResult::Unavailable(observation)
+                    }
+                    Err(error) => PromptResult::Refused(acp_internal_error(error.to_string())),
+                }
             });
         };
-        match serde_json::to_value(request) {
-            Ok(params) => {
-                let rx = match control.prompt(params).await {
-                    Ok(rx) => rx,
-                    Err(e) => return Box::pin(async move { lost(Err(e)) }),
-                };
-                let control = Arc::clone(control);
-                Box::pin(async move {
-                    match rx.await {
-                        Ok(outcome) => PromptReply {
-                            rejected: matches!(outcome, PromptOutcome::Error { .. }),
-                            result: prompt_outcome_to_response(outcome),
-                        },
-                        // The runner may still own the turn, so it stays open
-                        // for a reattach instead of ending here.
-                        Err(_) if control.lost() => lost(Err(acp_internal_error(
-                            "runner control channel lost".into(),
-                        ))),
-                        // The dying connection surfaces the underlying failure.
-                        Err(_) => lost(prompt_outcome_to_response(PromptOutcome::Aborted)),
+        let params = match serde_json::to_value(request) {
+            Ok(params) => params,
+            Err(error) => {
+                return Box::pin(std::future::ready(PromptResult::Refused(
+                    acp_internal_error(format!("serialize prompt params: {error}")),
+                )));
+            }
+        };
+        let state = self.shared.connection_state.clone();
+        let receiver = control.prompt(params).await;
+        Box::pin(async move {
+            match receiver {
+                Ok(rx) => match rx.await {
+                    Ok(ControlPromptResult::Outcome(
+                        crate::acp::control_protocol::PromptOutcome::Aborted,
+                    )) => PromptResult::Abandoned,
+                    Ok(ControlPromptResult::Outcome(outcome)) => {
+                        PromptResult::Correlated(prompt_outcome_to_response(outcome))
                     }
-                })
+                    Ok(ControlPromptResult::NativeLost) => PromptResult::Unavailable(
+                        state.loss().expect("ordered native loss observed"),
+                    ),
+                    Err(_) if state.loss().is_some() => {
+                        PromptResult::Unavailable(state.loss().expect("control loss observed"))
+                    }
+                    Err(_) => PromptResult::Abandoned,
+                },
+                Err(AcpError::ConnectionUnavailable(observation)) => {
+                    PromptResult::Unavailable(observation)
+                }
+                Err(error) => PromptResult::Refused(acp_internal_error(error.to_string())),
             }
-            Err(e) => {
-                let result = Err(acp_internal_error(format!("serialize prompt params: {e}")));
-                Box::pin(async move { lost(result) })
-            }
-        }
+        })
     }
 
     #[cfg(test)]
@@ -371,69 +397,72 @@ impl Session {
         }
     }
 
-    async fn on_prompt_result(&mut self, turn: &mut Turn, reply: PromptReply) -> AcpResult<Flow> {
-        let PromptReply {
-            result: res,
-            rejected,
-        } = reply;
-        if let Ok(response) = &res {
+    async fn on_prompt_result(&mut self, turn: &mut Turn, result: PromptResult) -> AcpResult<Flow> {
+        turn.flags.result_observed = !matches!(&result, PromptResult::Unavailable(_));
+        let (result, correlated) = match result {
+            PromptResult::Correlated(result) => (result, true),
+            PromptResult::Refused(error) => (Err(error), false),
+            PromptResult::Unavailable(observation) => {
+                if observation.source == AcpConnectionSource::Native {
+                    turn.flags.connection_lost = true;
+                    return Ok(Flow::Break);
+                }
+                return Err(acp_internal_error("ACP connection unavailable".into()));
+            }
+            PromptResult::Abandoned => {
+                turn.preceding.push(Event::PromptRuntimeError {
+                    message: "Prompt completion was not observed".into(),
+                    evidence: Some(crate::session::OperationErrorEvidence::new(
+                        crate::session::ErrorEvidenceSource::LocalPromptResult,
+                        crate::session::ErrorOperation::Prompt,
+                    )),
+                    native_subject: None,
+                });
+                turn.flags.prompt_failed = true;
+                return Ok(Flow::Break);
+            }
+        };
+        if let Ok(response) = &result {
             turn.flags.prompt_cancelled = matches!(response.stop_reason, StopReason::Cancelled);
             turn.flags.agent_stop_reason = Some(response.stop_reason);
         }
-        if let Some(info) = self.completion_rate_limit(&res) {
-            turn.flags.rate_limit = Some(info);
-            turn.flags.shutdown = true;
-            return Ok(Flow::Break);
+        if correlated {
+            turn.flags.rate_limit = self.completion_rate_limit(&result);
+            if turn.flags.rate_limit.is_some() {
+                return Ok(Flow::Break);
+            }
         }
-        let e = match res {
+        let error = match result {
             Ok(_) => return Ok(Flow::Break),
-            Err(e) => e,
+            Err(error) => error,
         };
-        let label = &self.shared.session_label;
-        // A dropped session only recovers through a respawn. A resumed id
-        // also resets context so the respawn opens a fresh session (#3560).
-        let dropped_session = is_unsupported_session_error(&e);
-        if self.session_from_storage && dropped_session {
-            warn!(
-                target: "acp.protocol",
-                session = %label,
-                acp_session_id = %self.acp_session_id.0,
-                "resumed ACP session rejected as unsupported; resetting context so the respawn starts fresh: {e}"
-            );
-            self.shared
-                .emit(Event::SessionContextReset {
-                    reason: format!("resumed session no longer available: {e}"),
-                })
-                .await;
-            self.shared
-                .context_reset_emitted
-                .store(true, Ordering::Relaxed);
-        }
-        // A login needs a fresh adapter, which the startup error's sign-in
-        // steps and its Retry respawn provide.
-        let auth_required = e.code == agent_client_protocol::ErrorCode::AUTH_REQUIRED
-            && is_authentication_failure(&e.message);
-        if dropped_session || auth_required || !rejected {
-            return Err(e);
-        }
-        // The agent is still answering, so only this turn ends (#5662).
-        warn!(
-            target: "acp.protocol",
-            session = %label,
-            error = %e,
-            "agent rejected session/prompt; ending the turn and keeping the connection"
-        );
-        // An error answering our cancel ends the turn as cancelled.
-        if turn.flags.cancelling || turn.flags.orphan_cancel_sent {
-            turn.flags.prompt_cancelled = true;
+        if correlated {
+            if turn.flags.cancelling || turn.flags.orphan_cancel_sent {
+                turn.flags.prompt_cancelled = true;
+            } else {
+                turn.flags.rejection = Some(error);
+                if let Err(error) = self.send_cancel().await {
+                    debug!(target: "acp.protocol", %error, "cancel after a rejected prompt failed");
+                }
+            }
             return Ok(Flow::Break);
         }
-        turn.flags.rejection = Some(e.message);
-        // A turn the agent still runs from before a restart is the usual
-        // cause, and aoe already treats it as ended, so the retry needs it gone.
-        if let Err(error) = self.send_cancel().await {
-            debug!(target: "acp.protocol", %error, "cancel after a rejected prompt failed");
+        warn!(target: "acp.protocol", session = %self.shared.session_label, ?error, "prompt operation failed; preserving connection and conversation");
+        let mut diagnostic = prompt_runtime_error(
+            &error,
+            crate::session::ErrorEvidenceSource::LocalPromptResult,
+        );
+        if !correlated {
+            if let Event::PromptRuntimeError {
+                evidence: Some(evidence),
+                ..
+            } = &mut diagnostic
+            {
+                evidence.reported_code = None;
+            }
         }
+        turn.preceding.push(diagnostic);
+        turn.flags.prompt_failed = true;
         Ok(Flow::Break)
     }
 
@@ -448,11 +477,7 @@ impl Session {
             Err(error) => {
                 let now = crate::time::Timestamp::now();
                 let captured = captured_rate_limit_reset(&shared.rate_limit_rejections, now);
-                // A marker only in the text used to park through the
-                // connection error path, which a rejection no longer takes.
-                return classify_rate_limit_error(error, captured.clone(), now).or_else(|| {
-                    classify_rate_limit_from_message(&error.to_string(), captured, now)
-                });
+                return classify_rate_limit_error(error, captured.as_ref(), now);
             }
             Ok(response) if matches!(response.stop_reason, StopReason::Cancelled) => return None,
             Ok(_) => {}
@@ -500,6 +525,10 @@ impl Session {
     }
 
     async fn on_command(&mut self, turn: &mut Turn, cmd: Option<ClientCmd>) -> AcpResult<Flow> {
+        let mut cmd = cmd;
+        if self.refuse_unavailable_command(&mut cmd) {
+            return Ok(Flow::Continue);
+        }
         match cmd {
             Some(ClientCmd::CancelChild {
                 session_id,
@@ -537,7 +566,12 @@ impl Session {
             Some(ClientCmd::DeleteSession {
                 acp_session_id,
                 respond_to,
-            }) => handle_delete_session_cmd(&self.connection, acp_session_id, respond_to),
+            }) => handle_delete_session_cmd(
+                &self.connection,
+                &self.shared.connection_state,
+                acp_session_id,
+                respond_to,
+            ),
             Some(ClientCmd::ResumeBackgroundTailing(launches)) => {
                 self.shared.resume_background_tailing(launches)
             }
@@ -567,6 +601,7 @@ impl Session {
             Some(ClientCmd::CloseSession(respond_to)) => {
                 crate::acp::acp_client::close::dispatch_close(
                     &self.connection,
+                    &self.shared.connection_state,
                     self.acp_session_id.clone(),
                     self.close_capable,
                     respond_to,
@@ -627,11 +662,21 @@ impl Session {
             "sending _session/steering during in-flight prompt ({} content blocks)",
             prompt.blocks.len()
         );
-        let sent = self.connection.send_request(SteerRequest::new(
-            self.acp_session_id.clone(),
-            prompt.blocks.clone(),
-        ));
-        turn.steer_fut = Some(Box::pin(async move { (prompt, sent.block_task().await) }));
+        let request = ordered_native_request(
+            &self.connection,
+            &self.shared.connection_state,
+            SteerRequest::new(self.acp_session_id.clone(), prompt.blocks.clone()),
+        );
+        turn.steer_fut = Some(Box::pin(async move {
+            let result = match request {
+                Ok(request) => request.wait().await,
+                Err(AcpError::ConnectionUnavailable(observation)) => {
+                    OrderedRequestResult::Unavailable(observation)
+                }
+                Err(error) => OrderedRequestResult::Refused(acp_internal_error(error.to_string())),
+            };
+            (prompt, result)
+        }));
     }
 
     async fn on_orphan_check(&mut self, turn: &mut Turn) -> Flow {
@@ -700,9 +745,20 @@ impl Session {
         &mut self,
         turn: &mut Turn,
         prompt: PromptInput,
-        res: AcpResult<serde_json::Value>,
+        res: OrderedRequestResult<serde_json::Value>,
     ) {
         turn.steer_fut = None;
+        let res = match res {
+            OrderedRequestResult::Correlated(result) => result,
+            OrderedRequestResult::Refused(error) => Err(error),
+            OrderedRequestResult::Unavailable(_) => {
+                turn.steer_backlog.clear();
+                return;
+            }
+            OrderedRequestResult::Abandoned => Err(acp_internal_error(
+                "Steering response was not observed".into(),
+            )),
+        };
         let label = self.shared.session_label.clone();
         match res.as_ref().map(SteerOutcome::from_response) {
             Ok(SteerOutcome::Injected) => {
@@ -747,9 +803,12 @@ impl Session {
         }
     }
 
-    async fn finish_turn(&mut self, mut turn: Turn, prompt_started_at_ms: i64) {
+    async fn finish_turn(&mut self, mut turn: Turn, prompt_started_at_ms: i64) -> bool {
         let shared = self.shared.clone();
-        let mut preceding = Vec::new();
+        if !turn.flags.result_observed && shared.connection_state.loss().is_some() {
+            return false;
+        }
+        let mut preceding = std::mem::take(&mut turn.preceding);
         // A cost marker can land in the same tick the prompt resolves (#2370).
         while let Ok(env) = self.lifecycle_rx.try_recv() {
             if env.epoch == turn.epoch {
@@ -758,18 +817,32 @@ impl Session {
         }
         let w = &turn.watchdog;
         let finished = w.cost_seen() && w.off_protocol_work_seen().is_none();
-        if shared.profile.key == "opencode" && finished && !w.saw_progress() {
+        if !turn.flags.prompt_failed
+            && turn.flags.rejection.is_none()
+            && shared.profile.key == "opencode"
+            && finished
+            && !w.saw_progress()
+        {
             if let Some(message) =
                 recover_opencode_prompt_error(&self.acp_session_id.0, prompt_started_at_ms)
             {
-                preceding.push(Event::PromptRuntimeError { message });
+                preceding.push(Event::PromptRuntimeError {
+                    message,
+                    evidence: Some(crate::session::OperationErrorEvidence::new(
+                        crate::session::ErrorEvidenceSource::TranscriptRecovery,
+                        crate::session::ErrorOperation::Prompt,
+                    )),
+                    native_subject: None,
+                });
+                turn.flags.prompt_failed = true;
             }
         }
         let rejected = turn.flags.rejection.is_some();
         if let Some(error) = turn.flags.rejection.take() {
-            preceding.push(Event::PromptRuntimeError {
-                message: format!("the agent rejected the prompt: {error}"),
-            });
+            preceding.push(prompt_runtime_error(
+                &error,
+                crate::session::ErrorEvidenceSource::LocalPromptResult,
+            ));
             preceding.push(Event::PromptRejected {
                 reason: "prompt_failed".into(),
                 text: std::mem::take(&mut turn.prompt_text),
@@ -777,9 +850,10 @@ impl Session {
             });
         }
         let f = &mut turn.flags;
-        // Not `prompt_complete`, which consumers read as a finished reply.
         let reason = if rejected {
             "prompt_rejected"
+        } else if f.rate_limit.is_none() && f.prompt_failed {
+            "prompt_failed"
         } else {
             terminal_stop_reason(
                 f.rate_limit.is_some(),
@@ -795,23 +869,39 @@ impl Session {
             preceding.push(Event::RateLimit { info });
         }
         let terminal_at = now_ms();
-        // A completion the runner reports after this is dropped.
-        shared.terminal_claim.claim();
-        shared.publish_terminal(reason.into(), preceding).await;
+        let failed = matches!(reason, "prompt_failed" | "prompt_rejected" | "rate_limited");
+        let claimed = if failed {
+            shared.terminal_claim.claim_failed()
+        } else {
+            shared.terminal_claim.claim()
+        };
+        if claimed {
+            if failed {
+                shared.between_prompt.deactivate();
+            }
+            if f.result_observed {
+                shared.publish_terminal(reason.into(), preceding).await;
+            } else {
+                preceding.push(Event::Stopped {
+                    reason: reason.into(),
+                });
+                if !shared.emit_while_available(preceding).await {
+                    return false;
+                }
+            }
+        }
         shared.reset_message_dedup();
         shared
             .last_prompt
             .lock()
             .expect("last prompt mutex poisoned")
             .1 = now_ms();
-        shared.prompt_in_flight.store(false, Ordering::Relaxed);
         *shared.cancel_deadline.lock().unwrap() = None;
-        // Child traffic that raced the terminal, or a child still running,
-        // continues as an agent-initiated turn.
+        shared.prompt_in_flight.store(false, Ordering::Release);
         if shared.subagent_activity_at.load(Ordering::Relaxed) >= terminal_at
             || shared.subagent_working(now_ms())
         {
-            shared.arm_for_subagent_activity();
+            shared.arm_for_subagent_activity().await;
         }
         // Missing after a Stopped, this line signals a stranded prompt (#3190).
         info!(
@@ -822,5 +912,6 @@ impl Session {
             duration_ms = now_ms() - prompt_started_at_ms,
             "turn finished; between-prompt idle ownership restored"
         );
+        turn.flags.shutdown
     }
 }

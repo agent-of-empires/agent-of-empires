@@ -2,7 +2,6 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { getSessionDiffFiles, reportTelemetrySeen } from "../lib/api";
 import type { DiffScope } from "../lib/diffScope";
 import type { RepoBase, RichDiffFile } from "../lib/types";
-import { useLatestRef } from "./useLatestRef";
 
 const POLL_INTERVAL = 10_000;
 const DEFAULT_BASES: RepoBase[] = [{ base_branch: "main", repo_path: "" }];
@@ -33,7 +32,6 @@ export function useDiffFiles(
   const requestIdRef = useRef(0);
   const currentSessionIdRef = useRef(sessionId);
   const diffPanelSeenForRef = useRef<string | null>(null);
-  const enabledRef = useLatestRef(enabled);
 
   const fetchFiles = useCallback(async () => {
     if (!sessionId) return;
@@ -59,13 +57,9 @@ export function useDiffFiles(
         setWarning(resp.warning ?? null);
         setRevision((r) => r + 1);
       }
-      if (enabledRef.current && diffPanelSeenForRef.current !== capturedSessionId) {
-        diffPanelSeenForRef.current = capturedSessionId;
-        reportTelemetrySeen("diff_panel");
-      }
     }
     setLoading(false);
-  }, [sessionId, enabledRef, requestedScope]);
+  }, [sessionId, requestedScope]);
 
   const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
   if (sessionId !== trackedSessionId) {
@@ -95,6 +89,13 @@ export function useDiffFiles(
     }, 0);
     return () => clearTimeout(timer);
   }, [sessionId, fetchFiles]);
+
+  useEffect(() => {
+    // The badge may have loaded the diff before the panel opened. Don't wait for another poll.
+    if (!enabled || !sessionId || lastFingerprintRef.current === "" || diffPanelSeenForRef.current === sessionId) return;
+    diffPanelSeenForRef.current = sessionId;
+    reportTelemetrySeen("diff_panel");
+  }, [enabled, sessionId, revision]);
 
   useEffect(() => {
     if (!enabled || !sessionId) return;

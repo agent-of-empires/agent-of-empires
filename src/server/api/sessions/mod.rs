@@ -82,3 +82,6 @@ pub(super) fn validate_shell_fields(checks: &[(&str, &str)]) -> Result<(), Strin
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(in crate::server) use tests::terminal_custody;

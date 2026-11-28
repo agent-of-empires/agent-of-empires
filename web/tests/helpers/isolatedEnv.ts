@@ -58,6 +58,7 @@ export const HOST_STATE_VARS = new Set([
   "AOE_TUI_TEST_ENTERED",
   "AOE_UDS_UMASK_TEST_CHILD",
   "AOE_UDS_UMASK_TEST_ENTERED",
+  "AOE_VT_BRIDGE_TEST_SOCKET",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
   // Set by aoe for the sandbox MCP forwarder it spawns (a credential
   // reference plus the session it belongs to); a host value could only

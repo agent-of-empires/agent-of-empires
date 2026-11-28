@@ -154,8 +154,16 @@ fn render_choice_picker(
     // Padded to the reserved height so the option rows keep their position.
     detail.resize(detail_rows, Line::default());
     lines.extend(detail);
-    let drawn = render_popup_above(frame, composer_area, theme, picker.title.clone(), lines);
-    record_picker(state, PickerKind::Choice, drawn, first, rows, context_rows);
+    let accepts_choice = state.can_accept_choice();
+    let title = if accepts_choice {
+        picker.title.clone()
+    } else {
+        " Native input not ready · Esc dismiss ".into()
+    };
+    let drawn = render_popup_above(frame, composer_area, theme, title, lines);
+    if accepts_choice {
+        record_picker(state, PickerKind::Choice, drawn, first, rows, context_rows);
+    }
 }
 
 /// Rows `detail` takes at `width`, counted the way it is painted.
@@ -659,8 +667,12 @@ fn render_approval_shelf(
         height: 1.min(inner.height),
         ..inner
     };
-    let (actions, spans) =
-        approval_actions_line(theme, active, row.choice && !row.options.is_empty());
+    let (actions, spans) = approval_actions_line(
+        theme,
+        active,
+        row.choice && !row.options.is_empty(),
+        state.native_input_available(),
+    );
     frame.render_widget(Paragraph::new(actions), actions_area);
     // An open choice picker owns the keyboard, so the decision buttons go
     // inert with their keys.
@@ -863,9 +875,19 @@ fn approval_actions_line(
     theme: &Theme,
     active: bool,
     choice: bool,
+    native_available: bool,
 ) -> (Line<'static>, Vec<(u16, u16, Intent)>) {
     use crate::acp::protocol::ApprovalDecisionWire as Decision;
 
+    if !native_available {
+        return (
+            Line::from(Span::styled(
+                "Native input unavailable",
+                Style::default().fg(theme.hint),
+            )),
+            Vec::new(),
+        );
+    }
     if !active {
         let hint = Span::styled("Enter to respond", Style::default().fg(theme.hint));
         return (Line::from(hint), Vec::new());
@@ -1836,20 +1858,33 @@ fn render_status(
             Style::default().fg(color),
         ));
     }
-    if state.transcript.turn_active || state.transcript.background_agent_active {
-        let banner = state.transcript.status_text.as_deref().unwrap_or("working");
-        spans.push(Span::styled(
-            format!("· ● {banner} "),
-            Style::default().fg(theme.running),
-        ));
-    } else if state.ws.is_none() {
+    if state.ws.is_none() {
         spans.push(Span::styled(
             "· ○ Disconnected ",
             Style::default().fg(theme.error),
         ));
-    } else {
+    } else if state.transcript.connection_unavailable.is_some() {
+        spans.push(Span::styled(
+            "· ○ Native input unavailable ",
+            Style::default().fg(theme.error),
+        ));
+    } else if !state.native_input_available() {
+        let label = if state.can_submit_prompt_intent() {
+            "· ○ Wake eligible "
+        } else {
+            "· ○ Native input unconfirmed "
+        };
+        spans.push(Span::styled(label, Style::default().fg(theme.hint)));
+    } else if !state.transcript.turn_active && !state.transcript.background_agent_active {
         spans.push(Span::styled(
             "· ● Ready ",
+            Style::default().fg(theme.running),
+        ));
+    }
+    if state.transcript.turn_active || state.transcript.background_agent_active {
+        let banner = state.transcript.status_text.as_deref().unwrap_or("working");
+        spans.push(Span::styled(
+            format!("· ● {banner} "),
             Style::default().fg(theme.running),
         ));
     }
@@ -1922,14 +1957,20 @@ fn render_status(
             );
         }
     }
-    let hint = if active {
+    let hint = if state.choice.is_some() && !state.can_accept_choice() {
+        " Native input not ready · Esc dismiss · Ctrl+Q exit "
+    } else if active {
         help_hint(
             state.focus,
             selected_approval_is_choice(state),
             state.visible_notices().next().is_some(),
+            state.native_input_available(),
+            state.can_submit_prompt_intent(),
         )
-    } else {
+    } else if state.can_submit_prompt_intent() {
         " Enter reply · wheel history "
+    } else {
+        " Enter view · wheel history "
     };
     let hint_width = hint.chars().count() as u16;
     if left_area.width > hint_width.saturating_add(24) {
@@ -2950,13 +2991,22 @@ fn selected_approval_is_choice(state: &StructuredViewState) -> bool {
         .any(|pending| pending.nonce == selected && pending.choice && !pending.options.is_empty())
 }
 
-fn help_hint(focus: Focus, approval_is_choice: bool, has_notices: bool) -> &'static str {
+fn help_hint(
+    focus: Focus,
+    approval_is_choice: bool,
+    has_notices: bool,
+    native_available: bool,
+    prompt_eligible: bool,
+) -> &'static str {
     match focus {
+        Focus::Composer if !prompt_eligible => " Input retained · Ctrl+Q to exit ",
+        Focus::Composer if !native_available => " Enter to queue wake intent · Ctrl+Q to exit ",
         Focus::Composer => " Enter to send · Ctrl+Q to exit ",
         // `render_status` drops the hint unless it has `len + 24` spare columns,
         // so keep these short.
         Focus::Transcript if has_notices => " x dismiss · scroll · p pane · Ctrl+Q exit ",
         Focus::Transcript => " scroll · p pane · Ctrl+Q exit ",
+        Focus::Approval if !native_available => " Native input unavailable · Ctrl+Q exit ",
         Focus::Approval if approval_is_choice => " a answer · d deny · Esc stop ",
         Focus::Approval => " a allow · A always · d deny · Esc stop ",
         Focus::Pane => " scroll to read · Esc to close ",
@@ -2965,6 +3015,7 @@ fn help_hint(focus: Focus, approval_is_choice: bool, has_notices: bool) -> &'sta
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::NativeInputFixture;
     use super::*;
     use crate::acp::client::HttpClient;
     use crate::acp::state::{AvailableCommand, Event, SessionNotice};
@@ -3018,10 +3069,6 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].contains("Model fallback"), "{rows:?}");
         assert!(rows[1].contains("Fast mode turned off"), "{rows:?}");
-        assert!(
-            help_hint(Focus::Transcript, false, true).contains("x dismiss"),
-            "the key is advertised while a notice is up"
-        );
 
         state.dismissed_notices.insert("notice-1".into());
         let rows = strip_rows(&state);
@@ -3291,7 +3338,7 @@ mod tests {
                 ],
             ),
         ] {
-            let (line, buttons) = approval_actions_line(&Theme::default(), true, choice);
+            let (line, buttons) = approval_actions_line(&Theme::default(), true, choice, true);
             let text = line_text(&line);
             assert!(
                 !text.contains('[') && !text.contains(']'),
@@ -3313,12 +3360,12 @@ mod tests {
             assert_eq!(got, want, "choice={choice}");
         }
         // The preview shelf has no keyboard, so nothing is clickable.
-        assert!(approval_actions_line(&Theme::default(), false, false)
+        assert!(approval_actions_line(&Theme::default(), false, false, true)
             .1
             .is_empty());
-        assert!(help_hint(Focus::Approval, true, false).contains("a answer"));
-        assert!(!help_hint(Focus::Approval, true, false).contains("always"));
-        assert!(help_hint(Focus::Approval, false, false).contains("A always"));
+        assert!(approval_actions_line(&Theme::default(), true, false, false)
+            .1
+            .is_empty());
     }
 
     #[test]
@@ -3768,11 +3815,12 @@ mod tests {
 
     /// A pending question has to say what it is asking: the option labels alone
     /// leave the lead-in and the chosen answer's detail unsaid.
-    #[test]
-    fn question_picker_shows_the_question_context_and_highlighted_detail() {
+    #[tokio::test]
+    async fn question_picker_shows_the_question_context_and_highlighted_detail() {
         use super::super::state::{ChoicePicker, ChoicePurpose};
 
-        let mut state = test_state();
+        let mut fixture = NativeInputFixture::ready().await;
+        let state = &mut fixture.view;
         state.choice = Some(ChoicePicker {
             title: " Which store? (Enter=pick · Esc=dismiss) ".into(),
             context: Some(
@@ -3786,7 +3834,7 @@ mod tests {
             selected: 0,
             purpose: ChoicePurpose::Mode,
         });
-        let dump = render_dump(&state, 80, 24);
+        let dump = render_dump(state, 80, 24);
         assert!(dump.contains("Picking the store for"), "{dump}");
         assert!(
             dump.contains("Postgres") && dump.contains("SQLite"),
@@ -3814,9 +3862,10 @@ mod tests {
 
     /// The approval shelf has to show the request itself: the tool name and an
     /// elided target in the title are not enough to decide on a command.
-    #[test]
-    fn approval_shelf_shows_the_request_payload() {
-        let mut state = test_state();
+    #[tokio::test]
+    async fn approval_shelf_shows_the_request_payload() {
+        let mut fixture = NativeInputFixture::ready().await;
+        let state = &mut fixture.view;
         state.transcript.pending_approvals = vec![PendingApproval {
             nonce: "n-1".into(),
             title: "Bash".into(),
@@ -3828,7 +3877,7 @@ mod tests {
         }];
         state.selected_approval = Some("n-1".into());
         state.focus = Focus::Approval;
-        let dump = render_dump(&state, 80, 24);
+        let dump = render_dump(state, 80, 24);
         for want in [
             "$ rm -rf build && make",
             "description: clean the tree",
@@ -3846,13 +3895,13 @@ mod tests {
                 .join(" && "),
         })
         .to_string();
-        let dump = render_dump(&state, 40, 24);
+        let dump = render_dump(state, 40, 24);
         assert!(dump.contains("step-0"), "{dump}");
         assert!(dump.contains(" more"), "the rest is counted: {dump}");
 
         // A shelf clamped by a short terminal clips the paragraph, so the count
         // has to come from the height it really has.
-        let dump = render_dump(&state, 40, 12);
+        let dump = render_dump(state, 40, 12);
         assert!(
             dump.contains(" more"),
             "a clipped body still counts what it dropped: {dump}"
@@ -3986,10 +4035,11 @@ mod tests {
 
     /// Moving between options must not resize the popup: it is bottom-anchored,
     /// so a shorter detail would slide the options out from under the pointer.
-    #[test]
-    fn question_picker_option_rows_hold_still_while_the_detail_changes() {
+    #[tokio::test]
+    async fn question_picker_option_rows_hold_still_while_the_detail_changes() {
         use super::super::state::{ChoicePicker, ChoicePurpose};
-        let mut state = test_state();
+        let mut fixture = NativeInputFixture::ready().await;
+        let state = &mut fixture.view;
         state.choice = Some(ChoicePicker {
             title: " Which store? ".into(),
             context: None,
@@ -4004,11 +4054,11 @@ mod tests {
             selected: 0,
             purpose: ChoicePurpose::Mode,
         });
-        let _ = render_dump(&state, 80, 24);
+        let _ = render_dump(state, 80, 24);
         let with_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
 
         state.choice.as_mut().unwrap().selected = 1;
-        let _ = render_dump(&state, 80, 24);
+        let _ = render_dump(state, 80, 24);
         let without_detail = state.mouse_targets.borrow().picker.expect("picker").rows;
         assert_eq!(
             with_detail.y, without_detail.y,

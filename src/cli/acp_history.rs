@@ -337,6 +337,7 @@ mod tests {
             Event::ConversationCompacted,
             Event::SessionContextReset {
                 reason: "model switch".into(),
+                fork_rejection: None,
             },
         ]);
         assert_eq!(got.len(), 4, "{got:?}");
@@ -452,6 +453,7 @@ mod tests {
                 "context reset",
                 Event::SessionContextReset {
                     reason: "model switch".into(),
+                    fork_rejection: None,
                 },
             ),
             ("new message id", chunk("b", Some("m2"))),

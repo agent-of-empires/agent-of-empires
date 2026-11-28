@@ -7,8 +7,65 @@ import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from 
 const nativeId = "11111111-2222-4333-8444-555555555555";
 interface AgentEvent {
   event: string;
-  text?: string;
+  pid: number;
   argv?: string[];
+  pending_hex?: string;
+}
+
+function readAgentEvents(log: string, offset = 0): AgentEvent[] {
+  if (!existsSync(log)) return [];
+  const text = readFileSync(log, "utf8");
+  const end = text.lastIndexOf("\n");
+  if (end < 0) return [];
+  return text
+    .slice(0, end)
+    .split("\n")
+    .map((line) => JSON.parse(line) as AgentEvent)
+    .slice(offset);
+}
+
+interface NativeReady {
+  event: AgentEvent;
+  index: number;
+}
+
+async function waitForReady(events: () => AgentEvent[]): Promise<NativeReady> {
+  let ready: NativeReady | undefined;
+  await expect
+    .poll(
+      () => {
+        const snapshot = events();
+        const index = snapshot.findIndex((event) => event.event === "ready");
+        if (index < 0) return false;
+        ready = { event: snapshot[index]!, index };
+        return true;
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(true);
+  return ready!;
+}
+
+async function expectNoInput(events: () => AgentEvent[], ready: NativeReady): Promise<void> {
+  let snapshot: AgentEvent[] = [];
+  let closed: AgentEvent | undefined;
+  await expect
+    .poll(
+      () => {
+        const current = events();
+        closed = current.find(
+          (event, index) => index > ready.index && event.pid === ready.event.pid && event.event === "window_closed",
+        );
+        if (!closed) return false;
+        snapshot = current;
+        return true;
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(true);
+  expect(snapshot[ready.index]).toEqual(ready.event);
+  expect(snapshot.filter((event) => event.event === "prompt")).toEqual([]);
+  expect(closed?.pending_hex).toBe("");
 }
 
 for (const scenario of [
@@ -31,10 +88,10 @@ for (const scenario of [
 import json, os, select, sys, time
 log = open(${JSON.stringify(log)}, "a", buffering=1)
 def record(event, **data):
-    log.write(json.dumps(dict(event=event, **data)) + "\\n")
+    log.write(json.dumps(dict(event=event, pid=os.getpid(), **data)) + "\\n")
 record("ready", argv=sys.argv[1:])
 print("FAKE_AGENT_READY", flush=True)
-deadline = time.monotonic() + 6
+deadline = time.monotonic() + 12
 if ${scenario.fail ? "True" : "False"}:
     sys.exit(42)
 pending = b""
@@ -42,13 +99,14 @@ while True:
     timeout = max(0, deadline - time.monotonic()) if deadline else None
     readable, _, _ = select.select([sys.stdin], [], [], timeout)
     if not readable:
-        record("window_closed")
+        record("window_closed", pending_hex=pending.hex())
         deadline = None
         continue
     chunk = os.read(sys.stdin.fileno(), 4096)
     if not chunk:
         break
     pending += chunk
+    deadline = time.monotonic() + 1
     while b"\\n" in pending:
         line, pending = pending.split(b"\\n", 1)
         record("prompt", text=line.decode().rstrip("\\r"))
@@ -101,15 +159,8 @@ while True:
       },
     });
     const log = join(serve.home, "agent-input.jsonl");
-    const events = (): AgentEvent[] => {
-      if (!existsSync(log)) return [];
-      return readFileSync(log, "utf8")
-        .trim()
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as AgentEvent);
-    };
-    await expect.poll(() => events().some((event) => event.event === "ready"), { timeout: 20_000 }).toBe(true);
+    const events = () => readAgentEvents(log);
+    const ready = await waitForReady(events);
     const [session] = await listSessions(serve.baseUrl);
     expect(session?.title).toBe(title);
     expect(session?.lifecycle_generation).toBeGreaterThan(0);
@@ -133,15 +184,9 @@ while True:
       return;
     }
     expect(spawnSync("tmux", ["-S", serve.tmuxSocket, "has-session", "-t", name]).status).toBe(0);
-    expect(events().find((event) => event.event === "ready")?.argv).toContain(nativeId);
-    expect(events().find((event) => event.event === "ready")?.argv).toContain("--resume");
-    // Observe the full input window to catch late extra prompts.
-    await expect.poll(() => events().some((event) => event.event === "window_closed"), { timeout: 15_000 }).toBe(true);
-    expect(
-      events()
-        .filter((event) => event.event === "prompt")
-        .map((event) => event.text),
-    ).toEqual([]);
+    expect(ready.event.argv).toContain(nativeId);
+    expect(ready.event.argv).toContain("--resume");
+    await expectNoInput(events, ready);
 
     if (scenario.name === "idle") {
       // Neither restart path types anything into the relaunched agent.
@@ -162,28 +207,9 @@ while True:
           });
           expect(response.status, await response.text()).toBe(200);
         }
-        await expect
-          .poll(() =>
-            events()
-              .slice(offset)
-              .some((event) => event.event === "ready"),
-          )
-          .toBe(true);
-        await expect
-          .poll(
-            () =>
-              events()
-                .slice(offset)
-                .some((event) => event.event === "window_closed"),
-            { timeout: 15_000 },
-          )
-          .toBe(true);
-        expect(
-          events()
-            .slice(offset)
-            .filter((event) => event.event === "prompt")
-            .map((event) => event.text),
-        ).toEqual([]);
+        const phaseEvents = () => readAgentEvents(log, offset);
+        const phaseReady = await waitForReady(phaseEvents);
+        await expectNoInput(phaseEvents, phaseReady);
       }
     }
   });

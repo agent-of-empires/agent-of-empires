@@ -48,29 +48,40 @@ fn flattened_error(message: &str) -> Option<(&str, String)> {
 /// the reset and window come from the status text (`refine_from_status`).
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
     now: crate::time::Timestamp,
 ) -> Option<RateLimitInfo> {
-    let kind = err.data.as_ref()?.get("errorKind")?.as_str()?;
+    // Present data is authoritative, even when it has no recognized error kind. Only an
+    // error whose data was flattened into the message takes the fallback.
+    let Some(data) = &err.data else {
+        return classify_rate_limit_from_message(&err.message, captured, now);
+    };
+    let kind = data.get("errorKind")?.as_str()?;
     let kind = *ACCOUNT_LIMIT_KINDS.iter().find(|k| **k == kind)?;
-    Some(limit_info(err.message.clone(), kind, captured, now))
+    Some(limit_info(
+        super::errors::public_error_message(err),
+        kind,
+        captured,
+        now,
+    ))
 }
 
 /// Fallback for an outer error that kept only the serialized `errorKind`.
-pub(crate) fn classify_rate_limit_from_message(
+fn classify_rate_limit_from_message(
     message: &str,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
     now: crate::time::Timestamp,
 ) -> Option<RateLimitInfo> {
     let (prose, kind) = flattened_error(message)?;
     let kind = *ACCOUNT_LIMIT_KINDS.iter().find(|k| **k == kind)?;
-    Some(limit_info(prose.to_string(), kind, captured, now))
+    let status = super::errors::public_error_text(prose, None);
+    Some(limit_info(status, kind, captured, now))
 }
 
 fn limit_info(
     status: String,
     kind: &str,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
     now: crate::time::Timestamp,
 ) -> RateLimitInfo {
     // A captured window is a quota window's: a billing error keeps its own kind and takes no reset.
@@ -78,10 +89,8 @@ fn limit_info(
     refine_from_status(
         RateLimitInfo {
             status,
-            resets_at: captured.as_ref().map(|c| c.resets_at),
-            kind: captured
-                .as_ref()
-                .map_or_else(|| kind.to_string(), |c| c.kind()),
+            resets_at: captured.map(|c| c.resets_at),
+            kind: captured.map_or_else(|| kind.to_string(), CapturedReset::kind),
         },
         now,
         Observation::Live,
@@ -253,29 +262,6 @@ fn parse_month_day(date: &str) -> Option<(i8, i8)> {
     let month = month.get(..3)?.to_ascii_lowercase();
     let month = MONTHS.iter().position(|m| *m == month)? as i8 + 1;
     Some((month, day.trim().parse().ok()?))
-}
-
-/// A stored session ID the agent no longer knows, as opposed to an
-/// unsupported session feature.
-pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
-    const PHRASES: &[&str] = &[
-        "unsupported acp session",
-        "unknown session",
-        "session not found",
-        "no such session",
-        "session does not exist",
-    ];
-    // 0.99.0+ answers an unknown id with `-32002` and `data.sessionId`.
-    if err.code == agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND
-        && err
-            .data
-            .as_ref()
-            .is_some_and(|d| d.get("sessionId").is_some())
-    {
-        return true;
-    }
-    let msg = err.message.to_ascii_lowercase();
-    PHRASES.iter().any(|phrase| msg.contains(phrase))
 }
 
 /// A rejected window from a `usage_update`'s `_meta["_claude/rateLimit"]`.
@@ -571,7 +557,7 @@ mod tests {
             resets_at: utc("2026-11-20T00:00:00Z").unwrap(),
         };
         let info =
-            classify_rate_limit_error(&err(weekly, Some(limit)), Some(captured), now()).unwrap();
+            classify_rate_limit_error(&err(weekly, Some(limit)), Some(&captured), now()).unwrap();
         assert_eq!(info.resets_at, utc("2026-11-20T00:00:00Z"));
         assert_eq!(info.kind, "seven_day_opus");
 
@@ -741,7 +727,7 @@ mod tests {
                 "You've hit your 5-hour limit · resets 6pm (UTC)",
                 Some(json!({ "errorKind": "rate_limit" })),
             ),
-            Some(far),
+            Some(&far),
             now(),
         )
         .unwrap();
@@ -766,7 +752,7 @@ mod tests {
         };
         let billing = classify_rate_limit_error(
             &err("low", Some(json!({ "errorKind": "billing_error" }))),
-            Some(quota),
+            Some(&quota),
             now(),
         )
         .unwrap();
@@ -774,6 +760,16 @@ mod tests {
             (billing.kind.as_str(), billing.resets_at),
             ("billing_error", None)
         );
+    }
+
+    #[test]
+    fn only_absent_error_data_allows_the_redacted_flattened_fallback() {
+        let message = "limit for ghp_0123456789abcdef: {\"errorKind\":\"rate_limit\",\"private\":\"hidden data\"}";
+        let structured = err(message, Some(json!({ "errorKind": "overloaded" })));
+        assert!(classify_rate_limit_error(&structured, None, now()).is_none());
+
+        let flattened = classify_rate_limit_error(&err(message, None), None, now()).unwrap();
+        assert_eq!(flattened.status, "limit for <redacted-secret>");
     }
 
     /// Account-level limits park; capacity trouble another account would meet too does not.
@@ -916,7 +912,7 @@ mod tests {
         assert_eq!(info.resets_at, None);
 
         let info =
-            classify_rate_limit_error(&err("limit", Some(limit)), Some(captured), now()).unwrap();
+            classify_rate_limit_error(&err("limit", Some(limit)), Some(&captured), now()).unwrap();
         assert_eq!(info.resets_at, Some(resets_at));
         assert_eq!(info.kind, "seven_day", "the window names the limit");
 
@@ -940,7 +936,7 @@ mod tests {
                     window: window.into(),
                     resets_at,
                 };
-                let info = classify_rate_limit_from_message(msg, Some(captured), now()).unwrap();
+                let info = classify_rate_limit_from_message(msg, Some(&captured), now()).unwrap();
                 assert_eq!(info.kind, kind);
                 assert_eq!(info.resets_at, Some(resets_at));
             }
@@ -1108,45 +1104,5 @@ mod tests {
                 assert!(take_rate_limit_from_captured_rejection(&captures, now).is_none());
             }
         }
-    }
-
-    #[test]
-    fn is_unsupported_session_error_matches_only_stale_session_rejections() {
-        let cases = [
-            ("Unsupported ACP session", true),
-            ("Unknown session 01a040bb-...", true),
-            ("session not found", true),
-            ("no such session: abc", true),
-            ("Session does not exist", true),
-            ("You've hit your limit", false),
-            ("transport closed", false),
-            ("unsupported model", false),
-            ("unknown tool", false),
-            ("Unsupported content block in session/prompt", false),
-            ("Method not found: session/prompt", false),
-            ("Unsupported session mode", false),
-            ("Unsupported session capability: fork", false),
-        ];
-        for (msg, expected) in cases {
-            assert_eq!(
-                is_unsupported_session_error(&err(msg, None)),
-                expected,
-                "{msg:?}"
-            );
-        }
-
-        // 0.99.0+ rejects an unknown id with a bare `-32002` and no phrase.
-        let not_found = |data| {
-            let mut e = err("Resource not found", data);
-            e.code = agent_client_protocol::ErrorCode::RESOURCE_NOT_FOUND;
-            e
-        };
-        assert!(is_unsupported_session_error(&not_found(Some(
-            json!({ "sessionId": "abc" })
-        ))));
-        assert!(!is_unsupported_session_error(&not_found(None)));
-        assert!(!is_unsupported_session_error(&not_found(Some(
-            json!({ "uri": "file:///x" })
-        ))));
     }
 }

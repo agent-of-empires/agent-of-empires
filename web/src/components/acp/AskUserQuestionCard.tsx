@@ -247,7 +247,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
       </div>
 
       {error && <p className={`${PROMPT_ERROR} pb-1`}>{error}</p>}
-      {phase === "rolled-back" && <p className={`${PROMPT_ERROR} pb-1`}>Could not reach the server. Try again.</p>}
+      {phase === "rolled-back" && <p className={`${PROMPT_ERROR} pb-1`}>Could not submit response. Try again.</p>}
       {offline && <p className={`${PROMPT_ERROR} pb-1`}>{OFFLINE_TITLE}</p>}
 
       <div className="flex items-stretch gap-1.5 border-t border-surface-700/40 p-2">

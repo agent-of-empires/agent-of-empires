@@ -215,6 +215,9 @@ pub async fn spawn_runner(
     let xdg = temp.path().join("xdg");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
+    let mut roots = EnvGuard::new(&["HOME", "XDG_CONFIG_HOME"]);
+    roots.set("HOME", &home);
+    roots.set("XDG_CONFIG_HOME", &xdg);
 
     // The daemon verifies the id the runner announces, so `session_id` must
     // match what the caller later attaches with.
@@ -278,6 +281,7 @@ pub async fn spawn_runner(
         socket_path,
         RunnerGuard {
             _child: child,
+            _env: roots,
             _temp: temp,
         },
     )
@@ -420,9 +424,10 @@ async fn expect_frame(
 }
 
 #[cfg(debug_assertions)]
-/// Dropping this kills the runner, which takes the shim with it.
+/// Dropping this kills the runner, which takes its agent with it.
 pub struct RunnerGuard {
     _child: tokio::process::Child,
+    _env: EnvGuard,
     _temp: tempfile::TempDir,
 }
 
@@ -493,6 +498,7 @@ mod tests {
                     ControlBody::SessionReady {
                         acp_session_id: "acp".into(),
                         result: serde_json::json!({}),
+                        native_channel: control_protocol::NativeChannelAvailability::Available,
                         adapter_frames: 0,
                     },
                 ),

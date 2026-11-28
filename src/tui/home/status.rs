@@ -609,6 +609,7 @@ impl HomeView {
                 Some(error) => instance.last_error.set(error),
                 None => instance.last_error.clear(),
             }
+            instance.last_error_evidence = row.last_error_evidence;
             instance.pane_dead_observed = row.pane_dead_observed;
             if let Some(status) = Status::from_api_str(&row.status) {
                 instance.status = status;
@@ -951,12 +952,14 @@ impl HomeView {
         };
         let mut changed = instance.status != status
             || instance.last_error.as_deref() != row.last_error.as_deref()
+            || instance.last_error_evidence != row.last_error_evidence
             || instance.pane_dead_observed != row.pane_dead_observed;
         instance.status = status;
         match row.last_error.as_deref() {
             Some(error) => instance.last_error.set(error),
             None => instance.last_error.clear(),
         }
+        instance.last_error_evidence = row.last_error_evidence;
         instance.pane_dead_observed = row.pane_dead_observed;
         if row.view != crate::session::View::Structured
             || row.archived_at.is_some()

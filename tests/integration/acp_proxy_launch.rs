@@ -353,6 +353,7 @@ mod attach {
             vec![],
             acp_session_id.into(),
             false,
+            false,
             AcpSessionId(session_id.into()),
             None,
             "shim".into(),
@@ -454,7 +455,7 @@ mod attach {
     async fn assigned_id(client: &mut AcpClient) -> String {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let Event::AcpSessionAssigned { acp_session_id } =
+                if let Event::AcpSessionAssigned { acp_session_id, .. } =
                     client.next_event().await.expect("event stream open")
                 {
                     return acp_session_id;
