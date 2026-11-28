@@ -116,6 +116,8 @@ interface Props {
 }
 
 /** Which Project each repo starts in; the same links "Start in…" makes. */
+const focusOnMount = (el: HTMLElement | null) => el?.focus();
+
 export function SuggestionLinkedRepos({ snapshot, disabled, onBack }: Props) {
   const [mappings, setMappings] = useState<SuggestionMapping[]>([]);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
@@ -161,7 +163,7 @@ export function SuggestionLinkedRepos({ snapshot, disabled, onBack }: Props) {
   const linked = mappings.filter((m) => m.projects.length > 0).length;
   return (
     <div className="space-y-4">
-      <button type="button" onClick={onBack} className="cursor-pointer text-sm text-brand-500">
+      <button ref={focusOnMount} type="button" onClick={onBack} className="cursor-pointer text-sm text-brand-500">
         &larr; Suggestions
       </button>
       <div>

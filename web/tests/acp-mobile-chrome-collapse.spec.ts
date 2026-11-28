@@ -2,11 +2,11 @@ import { test, expect } from "./helpers/mockedTest";
 import { devices } from "@playwright/test";
 import { agentMessageChunk, mockAcpSession, openStructuredSession, waitForComposerConnected } from "./helpers/acpMock";
 
-// On phones the top bar and composer each fold away behind a handle that stays tappable in both states.
+// On phones the composer folds away behind a handle that stays tappable in both states; the header floats instead.
 test.use({ ...devices["iPhone 13"] });
 
 test.describe("mobile conversation chrome collapse", () => {
-  test("header and composer collapse independently and hand their height to the transcript", async ({ page }) => {
+  test("the composer collapses and hands its height to the transcript", async ({ page }) => {
     const mock = await mockAcpSession(page, {
       title: "story-collapse",
       initialEvents: [agentMessageChunk("hello from the agent")],
@@ -14,8 +14,8 @@ test.describe("mobile conversation chrome collapse", () => {
     await openStructuredSession(page, mock);
     await waitForComposerConnected(page);
 
-    const headerToggle = page.getByTestId("header-collapse-toggle");
     const composerToggle = page.getByTestId("composer-collapse-toggle");
+    await expect(page.getByTestId("header-collapse-toggle")).toHaveCount(0);
 
     // Measure heights: a clipped child still reports visible, but the row must release its height.
     const heightOf = async (testId: string) =>
@@ -30,16 +30,13 @@ test.describe("mobile conversation chrome collapse", () => {
     const draft = page.getByRole("textbox").first();
     await draft.fill("half-written prompt");
 
-    const headerHeight = await heightOf("conversation-header");
     const composerHeight = await heightOf("conversation-composer");
-    expect(headerHeight).toBeGreaterThan(0);
     expect(composerHeight).toBeGreaterThan(0);
     const bothExpanded = await viewportHeight();
 
     await expect(composerToggle).toHaveAttribute("aria-label", "Collapse message composer");
     await composerToggle.click();
     await expect.poll(() => heightOf("conversation-composer")).toBe(0);
-    expect(await heightOf("conversation-header")).toBe(headerHeight);
     await expect(composerToggle).toHaveAttribute("aria-label", "Expand message composer");
     // A collapsed composer is inert: taps and focus() miss it. It is off the accessibility tree, so query the DOM.
     await page.mouse.click(150, 250);
@@ -48,23 +45,10 @@ test.describe("mobile conversation chrome collapse", () => {
       return document.activeElement?.tagName ?? null;
     });
     expect(focusedAfter).not.toBe("TEXTAREA");
-    const composerOnly = await viewportHeight();
-    expect(composerOnly).toBeCloseTo(bothExpanded + composerHeight, 0);
-
-    await headerToggle.click();
-    await expect.poll(() => heightOf("conversation-header")).toBe(0);
-    await expect(headerToggle).toBeVisible();
-    await expect(composerToggle).toBeVisible();
-    const bothCollapsed = await viewportHeight();
-    expect(bothCollapsed).toBeCloseTo(composerOnly + headerHeight, 0);
+    expect(await viewportHeight()).toBeCloseTo(bothExpanded + composerHeight, 0);
 
     await composerToggle.click();
     await expect.poll(() => heightOf("conversation-composer")).toBe(composerHeight);
-    expect(await heightOf("conversation-header")).toBe(0);
-    expect(await viewportHeight()).toBeLessThan(bothCollapsed);
-
-    await headerToggle.click();
-    await expect.poll(() => heightOf("conversation-header")).toBe(headerHeight);
     expect(await viewportHeight()).toBeCloseTo(bothExpanded, 0);
 
     await expect(draft).toHaveValue("half-written prompt");
@@ -74,7 +58,7 @@ test.describe("mobile conversation chrome collapse", () => {
   });
 
   // The handles overlay content, so their hit area must equal the painted tab; a larger wrapper once ate the update banner's dismiss taps.
-  test("each handle's clickable area is the tab you can see, so it intercepts nothing around it", async ({ page }) => {
+  test("the handle's clickable area is the tab you can see, so it intercepts nothing around it", async ({ page }) => {
     const mock = await mockAcpSession(page, {
       title: "story-collapse-hit",
       initialEvents: [agentMessageChunk("hello from the agent")],
@@ -104,7 +88,7 @@ test.describe("mobile conversation chrome collapse", () => {
         [x, y],
       );
 
-    for (const testId of ["header-collapse-toggle", "composer-collapse-toggle"]) {
+    for (const testId of ["composer-collapse-toggle"]) {
       const box = (await page.getByTestId(testId).boundingBox())!;
       expect({ width: box.width, height: box.height }).toEqual({ width: 28, height: 16 });
       // The painted element is the clickable one, so a transparent wrapper cannot pass.
@@ -124,13 +108,13 @@ test.describe("mobile conversation chrome collapse", () => {
       }
     }
 
-    // A real click proves nothing covers the banner's dismiss control in the same corner.
+    // A real click proves the floating header leaves the banner's dismiss control reachable.
     const dismiss = page.getByRole("button", { name: "Dismiss update notice" });
     await dismiss.click({ timeout: 5_000 });
     await expect(page.getByRole("status", { name: /Update available/i })).toHaveCount(0);
   });
 
-  // Phone-only: crossing to desktop restores both regions without losing the draft.
+  // Phone-only: crossing to desktop restores the composer without losing the draft.
   test("desktop renders no handles, and crossing the breakpoint restores the chrome", async ({ page }) => {
     const mock = await mockAcpSession(page, {
       title: "story-collapse-desktop",
@@ -139,32 +123,23 @@ test.describe("mobile conversation chrome collapse", () => {
     await openStructuredSession(page, mock);
     await waitForComposerConnected(page);
 
-    const headerToggle = page.getByTestId("header-collapse-toggle");
     const composerToggle = page.getByTestId("composer-collapse-toggle");
     const heightOf = async (testId: string) =>
-      (await (
-        testId === "conversation-composer" ? page.locator(`[data-testid^="${testId}-"]`) : page.getByTestId(testId)
-      ).boundingBox())!.height;
+      (await page.locator(`[data-testid^="${testId}-"]`).boundingBox())!.height;
 
     await page.getByRole("textbox").first().fill("typed on the phone");
     const draftValue = () => page.evaluate(() => document.querySelector("textarea")?.value ?? null);
-    await headerToggle.click();
     await composerToggle.click();
-    await expect.poll(() => heightOf("conversation-header")).toBe(0);
     await expect.poll(() => heightOf("conversation-composer")).toBe(0);
 
     await page.setViewportSize({ width: 1280, height: 800 });
-    await expect(headerToggle).toHaveCount(0);
     await expect(composerToggle).toHaveCount(0);
-    await expect.poll(() => heightOf("conversation-header")).toBeGreaterThan(0);
     await expect.poll(() => heightOf("conversation-composer")).toBeGreaterThan(0);
     await expect(page.getByRole("textbox").first()).toHaveValue("typed on the phone");
 
-    // Back on a phone: header collapse lives in App and persists, but the structured view remounts, so the composer returns expanded.
+    // Back on a phone the structured view remounts, so the composer returns expanded.
     await page.setViewportSize({ width: 390, height: 664 });
-    await expect(headerToggle).toBeVisible();
     await expect(composerToggle).toBeVisible();
-    await expect.poll(() => heightOf("conversation-header")).toBe(0);
     await expect.poll(() => heightOf("conversation-composer")).toBeGreaterThan(0);
     expect(await draftValue()).toBe("typed on the phone");
   });

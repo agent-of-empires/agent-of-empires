@@ -34,7 +34,14 @@ pub(super) fn provider_prefs(
     .collect()
 }
 
-/// Ids of the providers switched on. A provider with no stored switch is off.
+/// Whether a provider with no stored switch is on: plugins start off, the
+/// built-in agent provider starts on.
+pub(super) fn default_enabled(provider_id: &str) -> bool {
+    provider_id == super::AGENT_PROVIDER_ID
+}
+
+/// Ids of the plugin providers switched on, the ones with a worker to notify.
+/// A provider with no stored switch is off.
 pub(crate) fn enabled_providers(
     conn: &Connection,
     profile: &str,
@@ -160,9 +167,9 @@ pub(crate) fn apply_prefs(
     }
     for (position, id) in patch.provider_order.iter().flatten().enumerate() {
         tx.execute(
-            "INSERT INTO suggestion_provider_prefs (profile, provider_id, enabled, sort_order) VALUES (?1, ?2, 0, ?3)
+            "INSERT INTO suggestion_provider_prefs (profile, provider_id, enabled, sort_order) VALUES (?1, ?2, ?4, ?3)
              ON CONFLICT (profile, provider_id) DO UPDATE SET sort_order = ?3",
-            params![profile, id, position as i64],
+            params![profile, id, position as i64, default_enabled(id)],
         )?;
     }
     for (id, enabled) in patch.provider_enabled.iter().flatten() {

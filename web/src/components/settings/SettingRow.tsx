@@ -39,10 +39,10 @@ export function SettingRow({
   const [copied, copy] = useCopy();
 
   return (
-    <div className="group grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-0.5 py-2.5 sm:pointer-fine:-mx-2 sm:pointer-fine:rounded-md sm:pointer-fine:px-2 sm:pointer-fine:hover:bg-surface-850">
+    <div className="group grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-0.5 py-3 sm:pointer-fine:-mx-2 sm:pointer-fine:rounded-md sm:pointer-fine:px-2 sm:pointer-fine:hover:bg-surface-700/30">
       <label htmlFor={row.controlId} className="col-start-1 block min-w-0">
         <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
-          <span id={row.labelId} className="text-sm text-text-primary">
+          <span id={row.labelId} className="text-[15px] md:text-sm text-text-primary">
             {d.label}
           </span>
           {settingTags(d).map((tag) => (

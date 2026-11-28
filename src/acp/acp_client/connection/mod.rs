@@ -16,7 +16,7 @@ mod tests;
 
 use crate::acp::agent_compat::ExpectedAgent;
 use crate::acp::agent_profiles::AgentProfile;
-use crate::acp::state::Event;
+use crate::acp::state::{Event, IntegrationLostReason};
 use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationAction, ElicitationScope, KillTerminalRequest,
@@ -45,6 +45,7 @@ use super::rate_limit::{
     captured_rate_limit_reset, classify_rate_limit_error, classify_rate_limit_from_message,
 };
 use super::session_identity::{RequestPolicy, SessionIngress, SessionIngressNotification};
+use super::spawn::ProxySpec;
 use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
     handle_wait_for_terminal_exit,
@@ -79,6 +80,7 @@ pub(super) struct ConnectionParams {
     pub(super) ready_tx: oneshot::Sender<Result<(), AcpError>>,
     pub(super) profile: &'static AgentProfile,
     pub(super) expected_agent: ExpectedAgent,
+    pub(super) proxy: Option<ProxySpec>,
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
     pub(super) default_model_config: std::collections::BTreeMap<String, String>,
@@ -149,6 +151,7 @@ pub(super) async fn run_connection_task<W, R>(
         ready_tx,
         profile,
         expected_agent,
+        proxy,
         source_profile,
         default_effort,
         default_model_config,
@@ -201,8 +204,9 @@ pub(super) async fn run_connection_task<W, R>(
         .v1()
         .name("aoe-acp")
         .on_close({
-            let control = control.clone();
+            let (control, shared) = (control.clone(), shared.clone());
             move |_connection| async move {
+                shared.transport_closed.store(true, Ordering::Relaxed);
                 if let Some(control) = control {
                     control.shutdown();
                 }
@@ -242,6 +246,11 @@ pub(super) async fn run_connection_task<W, R>(
                                         status: Some(status),
                                     })
                                     .await;
+                                return Ok(());
+                            }
+                            SessionIngressNotification::AdapterFramesShed(count) => {
+                                shared.ingress.skip_adapter_frames(count);
+                                shared.settle_discarded().await;
                                 return Ok(());
                             }
                             SessionIngressNotification::Update(params) => params,
@@ -414,6 +423,7 @@ pub(super) async fn run_connection_task<W, R>(
         ready_tx: ready_tx.clone(),
         mode,
         expected_agent,
+        proxy,
         mcp_servers,
         default_effort,
         default_model_config,
@@ -499,7 +509,15 @@ async fn report_connection_error(
         Some(_) => classify_rate_limit_error(e, captured, now),
         None => classify_rate_limit_from_message(&message, captured, now),
     };
-    if let Some(tx) = ready_tx.lock().await.take() {
+    let mut pending_ready = ready_tx.lock().await.take();
+    // The hello already proved the proxy; losing it before ready is a lost
+    // integration, not a launch failure the supervisor would relaunch raw.
+    if shared.transport_closed.load(Ordering::Relaxed) && shared.aoe.is_proxied() {
+        if let Some(tx) = pending_ready.take() {
+            let _ = tx.send(Ok(()));
+        }
+    }
+    if let Some(tx) = pending_ready {
         // A handshake-time limit fails the spawn as rate-limited so the
         // supervisor parks instead of burning respawn budget (#3514).
         let err = match rate_limit {
@@ -535,6 +553,13 @@ async fn report_connection_error(
         let _ = event_tx
             .send(Event::Stopped {
                 reason: "stored_session_rejected".into(),
+            })
+            .await;
+    } else if shared.transport_closed.load(Ordering::Relaxed) && shared.aoe.is_proxied() {
+        // A deliberate close ends the connection cleanly and never reaches here.
+        let _ = event_tx
+            .send(Event::IntegrationLost {
+                reason: IntegrationLostReason::ProxyExited,
             })
             .await;
     } else {
