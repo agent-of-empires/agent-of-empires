@@ -135,6 +135,7 @@ struct AutonomousControl {
     ordinal: u64,
     source: crate::acp::control_protocol::NativeAutonomousSource,
     active: bool,
+    parked: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -165,6 +166,7 @@ impl OperationEffects {
             ordinal: identity.ordinal,
             source: identity.source,
             active,
+            parked: false,
         });
     }
 
@@ -209,6 +211,21 @@ impl OperationEffects {
             self.restore_autonomous(identity, true);
             return ControlEffect::AutonomousStarted;
         }
+        if let Some(identity) = metadata.autonomous_rate_limit.as_deref() {
+            if self.active.is_none() {
+                if let Some(active) = self.autonomous.as_mut().filter(|active| {
+                    active.active
+                        && active.origin == identity.origin
+                        && active.run_id == identity.run_id
+                        && active.ordinal == identity.ordinal
+                        && active.source == identity.source
+                }) {
+                    active.parked = true;
+                    return ControlEffect::Current;
+                }
+            }
+            return ControlEffect::Historical;
+        }
         if (kind.changes_conversation()
             && (metadata.host_action
                 || matches!(
@@ -216,6 +233,10 @@ impl OperationEffects {
                     EventScope::SessionCurrent | EventScope::OperationCurrent
                 )))
             || (metadata.host_action && matches!(kind, ControlKind::Stopped("orphaned_at_restart")))
+            || (metadata.host_action
+                && matches!(kind, ControlKind::Stopped("rate_limited"))
+                && self.active.is_none()
+                && self.autonomous.is_some_and(|run| run.parked))
         {
             if let Some(autonomous) = self.autonomous.as_mut() {
                 autonomous.active = false;

@@ -28,7 +28,54 @@ use crate::process::runner::test_support::managed_runner::{
 };
 use crate::server::{AcpBroadcastFrame, AppState};
 
-pub use node::{shim_node, shim_path, shim_ready};
+/// Node shim used by the managed consumer suites.
+pub fn shim_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("acp-worker")
+        .join("test-shim")
+        .join("shim.mjs")
+}
+
+/// Reports missing Node/shim dependencies before isolated setup.
+pub fn shim_ready() -> Result<(), String> {
+    shim_node()?;
+    let shim = shim_path();
+    if !shim.exists() {
+        return Err(format!("shim missing at {}", shim.display()));
+    }
+    let node_modules = shim.parent().unwrap().join("node_modules");
+    if !node_modules.exists() {
+        return Err(
+            "shim deps not installed; run `cd acp-worker/test-shim && npm ci` first".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the runtime behind version-manager launchers before tests isolate
+/// HOME: probe and spawn must use the same executable.
+pub fn shim_node() -> Result<&'static Path, String> {
+    static NODE: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
+    NODE.get_or_init(|| {
+        let output = std::process::Command::new("node")
+            .args(["--print", "process.execPath"])
+            .output()
+            .map_err(|error| format!("cannot resolve Node runtime: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot resolve Node runtime: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let path = String::from_utf8(output.stdout)
+            .map_err(|error| format!("invalid Node runtime path: {error}"))?;
+        std::fs::canonicalize(path.trim())
+            .map_err(|error| format!("cannot resolve Node executable: {error}"))
+    })
+    .as_ref()
+    .map(PathBuf::as_path)
+    .map_err(Clone::clone)
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

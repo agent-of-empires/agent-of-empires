@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{is_resumable, query_store, resolve_per_profile, AppState};
+use super::{is_resumable, query_control, query_store, resolve_per_profile, AppState};
 use crate::acp::event_store::ControlKnowledge::Known;
 
 /// The idle threshold is hours; probe it coarsely.
@@ -106,20 +106,25 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
         {
             continue;
         }
-        let sole_text = query_store(
+        let Some(_submission) = state.session_service.try_prompt_submission(&id).await else {
+            continue;
+        };
+        // The journal sequence fences the probe against any newer Native run.
+        let limit = query_control(
             &state.acp_event_store,
             &id,
-            "terminal-repair text",
-            |s, id| s.agent_turn_sole_text(id),
+            "terminal-repair quota",
+            move |s, id| s.autonomous_turn_limit(id, latest.latest_seq),
         )
-        .await
-        .flatten();
-        if let Some(info) = sole_text
-            .as_deref()
-            .and_then(crate::acp::state::RateLimitInfo::from_agent_text)
-        {
-            park_limited_agent_turn(state, &id, info, latest.latest_seq, observed).await;
-            continue;
+        .await;
+        match limit {
+            Ok(Some((info, identity))) => {
+                park_limited_agent_turn(state, &id, info, identity, latest.latest_seq, observed)
+                    .await;
+                continue;
+            }
+            Ok(None) => {}
+            Err(_) => continue,
         }
         // Conditional on `latest_seq` (not the substantive seq, which ambient
         // events outrun) so anything published since the probe wins.
@@ -139,20 +144,24 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
     }
 }
 
-/// Ends a turn whose only output was the agent's usage-limit text the way the
-/// connection does (#4373): `RateLimit`, a `rate_limited` stop, and no worker,
-/// so the rate-limit reaper owns the session (#5990).
+/// Persists the park for the observed autonomous run, then retires the worker
+/// only if the same lease, admission count and publication sequence still own it.
 async fn park_limited_agent_turn(
     state: &Arc<AppState>,
     id: &str,
     info: crate::acp::state::RateLimitInfo,
+    identity: Arc<crate::acp::event_sender::NativeAutonomousIdentity>,
     latest_seq: u64,
     observed: Option<(u64, crate::acp::runner_lifecycle::Lease)>,
 ) {
     let supervisor = &state.acp_supervisor;
     let status = info.status.clone();
-    // Only a stored park lets the reaper resume what the stop interrupts.
-    if !supervisor.publish_if_seq(id, &crate::acp::Event::RateLimit { info }, latest_seq) {
+    if observed.as_ref().is_some_and(|(admissions, lease)| {
+        lease.has_unsettled_admission()
+            || lease.admissions() != *admissions
+            || supervisor.running_lease(id).as_ref() != Some(lease)
+    }) || !supervisor.publish_autonomous_rate_limit_if_seq(id, info, identity, latest_seq)
+    {
         return;
     }
     use crate::acp::supervisor::SupervisorError;
@@ -160,7 +169,7 @@ async fn park_limited_agent_turn(
     let stop = match &observed {
         Some((admissions, lease)) => {
             supervisor
-                .shutdown_rate_limited(id, (lease, *admissions))
+                .shutdown_rate_limited(id, (lease, *admissions), latest_seq + 1)
                 .await
         }
         None => Err(SupervisorError::UnknownSession(id.to_string())),
@@ -337,9 +346,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::state::{SessionUsage, UsageCost};
     use crate::acp::Event;
-    use crate::time::Timestamp;
 
     #[test]
     fn should_auto_stop_policy() {
@@ -904,75 +911,96 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn terminal_repair_stops_the_worker_of_a_limited_agent_turn() {
-        for admitted_unstored in [false, true] {
-            let id = "acp-limited-live";
-            let (_home, state, _project) = super::super::test_fixtures::test_state(id);
-            state.instances.write().await[0].status = crate::session::Status::Running;
-            let sup = &state.acp_supervisor;
-            sup.test_insert_worker(id).await;
-            let lease = sup.running_lease(id).unwrap();
-            // Backdated after the admission, so only its unsettled publication protects the worker.
-            let _admission = admitted_unstored.then(|| sup.test_note_admission(id));
-            lease.test_backdate_idle_baseline(Timestamp::now().as_millis() - 3_600_000);
-            let at_ms = Timestamp::now().as_millis() - 120_000;
-            let events = [
-                Event::Stopped {
-                    reason: "prompt_complete".to_string(),
-                },
-                Event::AgentMessageChunk {
-                    text: "You've hit your 5-hour limit · resets 10pm (America/New_York)"
-                        .to_string(),
-                    message_id: None,
-                },
-                Event::UsageUpdated {
-                    usage: SessionUsage {
-                        used: 1,
-                        size: 10,
-                        cost: Some(UsageCost {
-                            amount: 0.1,
-                            currency: "USD".to_string(),
-                        }),
-                    },
-                },
-            ];
-            for (idx, event) in events.iter().enumerate() {
-                state
-                    .acp_event_store
-                    .record_at(id, idx as u64 + 1, event, at_ms)
-                    .unwrap();
-            }
-            let last_seq = events.len() as u64;
-            sup.hydrate_seqs([(id.to_string(), last_seq)]);
+        use crate::acp::supervisor::test_support::managed::with_managed;
 
-            repair_missing_terminal(&state).await;
+        with_managed(|scope| {
+            Box::pin(async move {
+                for (label, autonomous, admitted_unstored) in [
+                    ("qualified-quota", true, false),
+                    ("unsettled-admission", true, true),
+                    ("ambient-quota", false, false),
+                ] {
+                    let mut live = managed_idle_session(scope, label).await;
+                    let id = live.id().to_owned();
+                    if autonomous {
+                        live.native.send(serde_json::json!({
+                            "jsonrpc":"2.0","method":"_omp/autonomous_turn/start",
+                            "params":{"version":1,"sessionId":live.sid,
+                                "runId":uuid::Uuid::new_v4(),"source":"irc"}
+                        })).await;
+                    }
+                    for update in [
+                        serde_json::json!({"sessionUpdate":"agent_message_chunk",
+                            "content":{"type":"text","text":"You've hit your 5-hour limit · resets 10pm (America/New_York)"}}),
+                        serde_json::json!({"sessionUpdate":"usage_update","used":1,"size":10,
+                            "cost":{"amount":0.1,"currency":"USD"}}),
+                    ] {
+                        live.native.send(serde_json::json!({
+                            "jsonrpc":"2.0","method":"session/update",
+                            "params":{"sessionId":live.sid,"update":update}
+                        })).await;
+                    }
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if matches!(
+                                live.client.next_event().await.expect("Native publication"),
+                                Event::UsageUpdated { usage } if usage.used == 1
+                            ) {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .expect("usage reaches the durable log");
 
-            let store = &state.acp_event_store;
-            let tail = store.replay_from(id, last_seq).unwrap().len();
-            if admitted_unstored {
-                assert!(sup.is_running(id).await);
-                assert_eq!(tail, 0);
-                continue;
-            }
-            assert!(!sup.is_running(id).await);
-            // A test worker's stop publishes nothing, so the reason it asked for
-            // is read from the lease and the closing event recorded here.
-            assert_eq!(lease.test_stop_reason().as_deref(), Some("rate_limited"));
-            assert_eq!(tail, 1, "RateLimit");
-            store
-                .record_at(
-                    id,
-                    last_seq + 2,
-                    &Event::Stopped {
-                        reason: "rate_limited".to_string(),
-                    },
-                    Timestamp::now().as_millis(),
-                )
-                .unwrap();
-            assert!(matches!(store.rate_limit_park(id).unwrap(), Known(Some(_))));
-            assert!(matches!(
-                store.rate_limit_interrupted_agent_turn(id).unwrap(),
-                Known(true)
-            ));
-        }
+                    let state = &live.state;
+                    let sup = &state.acp_supervisor;
+                    let store = &state.acp_event_store;
+                    assert_eq!(store.has_open_agent_turn(&id).unwrap(), Known(autonomous));
+                    let admission = admitted_unstored.then(|| {
+                        sup.test_note_admission(&id).expect("same worker owns admission")
+                    });
+                    live.client.lease.test_backdate_idle_baseline(
+                        (crate::time::Timestamp::now() - crate::time::Duration::hours(1))
+                            .as_millis(),
+                    );
+                    live.make_quota_due();
+                    state.instances.write().await.iter_mut().find(|row| row.id == id)
+                        .unwrap().status = crate::session::Status::Running;
+                    let before = store.highest_seq(&id).unwrap();
+                    repair_missing_terminal(state).await;
+                    drop(admission);
+
+                    let tail = store.replay_from(&id, before).unwrap();
+                    if admitted_unstored || !autonomous {
+                        assert!(sup.is_running(&id).await, "{label}");
+                        assert!(matches!(store.rate_limit_park(&id).unwrap(), Known(None)));
+                        assert!(!tail.iter().any(|row| matches!(
+                            row.event.as_ref(), Event::RateLimit { .. }
+                        )));
+                        if admitted_unstored {
+                            assert!(tail.is_empty());
+                        }
+                        live.client.stop_session().await;
+                        continue;
+                    }
+
+                    assert!(!sup.is_running(&id).await);
+                    let quota = tail.iter().position(|row| matches!(
+                        row.event.as_ref(), Event::RateLimit { info } if info.kind == "rate_limit"
+                    )).expect("the owned limit is stored");
+                    let terminal = tail.iter().position(|row| matches!(
+                        row.event.as_ref(), Event::Stopped { reason } if reason == "rate_limited"
+                    )).expect("the exact worker publishes its terminal");
+                    assert!(quota < terminal);
+                    store.control_cache().forget(&id);
+                    assert!(matches!(store.rate_limit_park(&id).unwrap(), Known(Some(_))));
+                    assert_eq!(store.rate_limit_interrupted_agent_turn(&id).unwrap(), Known(true));
+                    assert_eq!(store.rate_limited_turn_prompt(&id).unwrap(), Known(None));
+                    assert_eq!(store.has_open_agent_turn(&id).unwrap(), Known(false));
+                }
+            })
+        })
+        .await;
     }
 }

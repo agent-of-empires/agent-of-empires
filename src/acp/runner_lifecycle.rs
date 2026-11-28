@@ -846,17 +846,6 @@ impl Lease {
             > 0
     }
 
-    /// The closing `Stopped` reason a stop asked for, published or not.
-    #[cfg(test)]
-    pub(crate) fn test_stop_reason(&self) -> Option<String> {
-        self.construction
-            .stop_completion
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|debt| debt.reason.clone())
-    }
-
     /// Retire the failed proxy birth without transferring a frozen Stop to the retry.
     pub(crate) fn release_torn_down_runner(&self) {
         let runner = self

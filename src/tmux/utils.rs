@@ -577,21 +577,36 @@ pub(crate) fn observe_checked_pane(
     let Some((first, state, _)) = observe_pane(session_name, deadline)? else {
         return Ok(None);
     };
-    let (checked, state) = if pane == first.identity.pane_id {
-        (first, state)
-    } else {
-        let (checked, state, _) =
-            inspect_physical_pane(pane, Some(&first.server.socket), deadline)?;
-        if checked.server != first.server
-            || checked.identity.session_id != first.identity.session_id
-        {
-            return Ok(None);
-        }
-        (checked, state)
-    };
-    let server_pid = checked.server.pid.to_string();
+    if pane != first.identity.pane_id {
+        return observe_selected_pane(session_name, &first, pane, deadline);
+    }
     let owned = state == PaneProbe::Alive
-        && session_holds_pane(session_name, Some(&server_pid), pane, deadline);
+        && session_holds_pane(
+            session_name,
+            Some(&first.server.pid.to_string()),
+            pane,
+            deadline,
+        );
+    Ok(owned.then_some(first))
+}
+
+/// Attest a live pin against first-pane evidence already captured for lifecycle preparation.
+pub(crate) fn observe_selected_pane(
+    session_name: &str,
+    first: &crate::session::LegacyToolObservation,
+    pane: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Result<Option<crate::session::LegacyToolObservation>> {
+    let (checked, state, _) = inspect_physical_pane(pane, Some(&first.server.socket), deadline)?;
+    let owned = state == PaneProbe::Alive
+        && checked.server == first.server
+        && checked.identity.session_id == first.identity.session_id
+        && session_holds_pane(
+            session_name,
+            Some(&first.server.pid.to_string()),
+            pane,
+            deadline,
+        );
     Ok(owned.then_some(checked))
 }
 

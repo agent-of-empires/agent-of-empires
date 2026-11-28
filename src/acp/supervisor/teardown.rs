@@ -2327,6 +2327,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: &str,
         observed: (&Lease, u64),
+        park_seq: u64,
     ) -> Result<(), SupervisorError> {
         self.shutdown_with_reason(
             session_id,
@@ -2336,6 +2337,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             StopFence {
                 observed: Some(observed.0),
                 admissions: Some(observed.1),
+                activity_seq: Some(park_seq),
                 ..StopFence::default()
             },
         )

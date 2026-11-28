@@ -49,8 +49,6 @@ mod tmux_send_keys;
 mod update_command;
 mod worktree_integration;
 
-#[cfg(unix)]
-mod acp_proxy_launch;
 mod agent_lifecycle_cli;
 mod build_cache_config;
 mod build_version_rerun;

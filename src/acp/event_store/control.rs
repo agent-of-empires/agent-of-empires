@@ -339,6 +339,13 @@ impl ControlProjection {
         self.budget = ControlKnowledge::Indeterminate;
     }
 
+    fn autonomous_limit_parked(&self) -> bool {
+        self.autonomous_open == ControlKnowledge::Known(true)
+            && self.main_open == ControlKnowledge::Known(false)
+            && self.interrupted_agent == ControlKnowledge::Known(true)
+            && matches!(self.park, ControlKnowledge::Known(Some(_)))
+    }
+
     fn consume(&mut self, row: ControlRow<'_>, metadata: &EventMetadata) -> Result<()> {
         use crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
         use ControlKnowledge::{Indeterminate, Known};
@@ -346,7 +353,13 @@ impl ControlProjection {
         if metadata.native_autonomous.is_some() {
             match row.effect {
                 ControlEffect::AutonomousStarted => self.autonomous_open = Known(true),
-                ControlEffect::AutonomousEnded => self.autonomous_open = Known(false),
+                ControlEffect::AutonomousEnded => {
+                    if self.autonomous_limit_parked() {
+                        self.park = Known(None);
+                        self.interrupted_agent = Known(false);
+                    }
+                    self.autonomous_open = Known(false);
+                }
                 ControlEffect::Indeterminate => self.autonomous_open = Indeterminate,
                 _ => {}
             }
@@ -428,6 +441,11 @@ impl ControlProjection {
                     cap_reached: false,
                     last_resume_attempt_ms: None,
                 }));
+                if metadata.autonomous_rate_limit.is_some() {
+                    self.interrupted_prompt = Known(None);
+                    self.interrupted_agent = Known(true);
+                    return Ok(());
+                }
                 // A qualified quota may be the last durable frame before a crash.
                 // It describes the work that was interrupted, not a completed stop.
                 self.interrupted_agent = match (self.main_open, self.operation_prompt) {
@@ -451,6 +469,14 @@ impl ControlProjection {
                 }
             }
             ControlKind::Stopped(reason) => {
+                if reason == "rate_limited"
+                    && metadata.host_action
+                    && self.autonomous_limit_parked()
+                {
+                    self.autonomous_open = Known(false);
+                    self.stopped_through = Known(row.seq);
+                    return Ok(());
+                }
                 if row.effect == ControlEffect::Refusal {
                     return Ok(());
                 }
@@ -765,10 +791,33 @@ impl super::EventStore {
                 None => ControlCursor::load(&tx, &self.schema, session_id)?,
             };
             let before = next.projection.budget;
+            if let Some(identity) = metadata.autonomous_rate_limit.as_deref() {
+                use ControlKnowledge::Known;
+                anyhow::ensure!(
+                    next.seq.checked_add(1) == Some(seq)
+                        && next.projection.main_open == Known(false)
+                        && next.projection.autonomous_open == Known(true)
+                        && Self::autonomous_commit(&tx, session_id)?.is_some_and(|run| {
+                            run.identity.as_ref() == identity && run.activity() == Known(true)
+                        }),
+                    "autonomous quota no longer belongs to the active Native run"
+                );
+            }
             let recorded = insert(&tx)?;
             if recorded == super::RecordDisposition::Inserted {
                 next.initialize_first_append_budget(seq);
-                Self::record_autonomous_boundary(&tx, session_id, seq, event, metadata)?;
+                let retires_limited_run =
+                    matches!(event, crate::acp::state::Event::Stopped { reason } if reason == "rate_limited")
+                        && metadata.host_action
+                        && next.projection.autonomous_limit_parked();
+                Self::record_autonomous_boundary(
+                    &tx,
+                    session_id,
+                    seq,
+                    event,
+                    metadata,
+                    retires_limited_run,
+                )?;
                 if next.seq.checked_add(1) == Some(seq) {
                     next.apply(seq, created_at_ms, event, metadata)?;
                 } else {
