@@ -326,6 +326,7 @@ mod attach {
             failure_policy: ProxyFailurePolicy::Refuse,
             display_name: "Fake".into(),
             compat: ProxyCompat::default(),
+            adapter: Default::default(),
         }
     }
 

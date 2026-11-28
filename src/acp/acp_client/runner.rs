@@ -715,6 +715,7 @@ mod tests {
             failure_policy: super::super::ProxyFailurePolicy::Refuse,
             display_name: "P".into(),
             compat: Default::default(),
+            adapter: Default::default(),
         };
         let adapter_args = ["--stdio".to_string(), "q r".to_string()];
         assert_eq!(

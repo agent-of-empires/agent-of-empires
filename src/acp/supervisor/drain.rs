@@ -4467,6 +4467,7 @@ mod tests {
             failure_policy: policy,
             display_name: "Fake".into(),
             compat: Default::default(),
+            adapter: Default::default(),
         });
         save_attested_test_record(id, 4343, 0);
         let lease = sup

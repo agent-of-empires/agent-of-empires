@@ -152,7 +152,11 @@ fn vet_initialize(
         let message = detail.user_message();
         IncompatibleAgentError { detail, message }
     })?;
-    agent_compat::validate(expected_agent, init).map_err(|err| {
+    match proxy {
+        Some(spec) => agent_compat::validate_declared(&spec.adapter, init),
+        None => agent_compat::validate(expected_agent, init),
+    }
+    .map_err(|err| {
         let message = err.user_message();
         warn!(
             target: "acp.protocol",
@@ -218,7 +222,10 @@ pub(super) async fn establish(
     let load_session_capable = init.agent_capabilities.load_session;
     // Re-derived on every connect (a respawn may land on another adapter
     // build) and emitted even when false so replay cannot keep a stale true.
-    let steering_capable = agent_compat::supports_steering(ctx.expected_agent, &init);
+    let steering_capable = match ctx.proxy.as_ref() {
+        Some(spec) => agent_compat::supports_steering_declared(&spec.adapter, &init),
+        None => agent_compat::supports_steering(ctx.expected_agent, &init),
+    };
     let prompt_caps = &init.agent_capabilities.prompt_capabilities;
     shared
         .emit(Event::PromptCapabilities {
@@ -876,6 +883,41 @@ mod tests {
     }
 
     #[test]
+    fn a_proxied_adapter_is_held_to_its_declared_compat_not_its_command_policy() {
+        let init: InitializeResponse = serde_json::from_str(
+            r#"{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"acme","version":"0.0.1"},"_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}}"#,
+        )
+        .unwrap();
+        let spec = |min: Option<&str>| ProxySpec {
+            plugin_id: "p".into(),
+            command: "proxy".into(),
+            args: vec![],
+            failure_policy: ProxyFailurePolicy::Refuse,
+            display_name: "P".into(),
+            compat: Default::default(),
+            adapter: crate::acp::agent_compat::DeclaredCompat {
+                min_version: min.map(|v| v.parse().unwrap()),
+                ..Default::default()
+            },
+        };
+        // The Claude command policy would refuse this name and version; the declaration rules.
+        assert!(
+            vet_initialize(ExpectedAgent::ClaudeAgentAcp, Some(&spec(None)), &init, "s").is_ok()
+        );
+        let refused = vet_initialize(
+            ExpectedAgent::ClaudeAgentAcp,
+            Some(&spec(Some("1.0.0"))),
+            &init,
+            "s",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            refused.detail,
+            StartupErrorDetail::IncompatibleAgentVersion { .. }
+        ));
+    }
+
+    #[test]
     fn a_response_failing_both_checks_reports_the_proxy_hello() {
         let init = |meta: &str, protocol: u32| -> InitializeResponse {
             serde_json::from_str(&format!(
@@ -891,6 +933,7 @@ mod tests {
             failure_policy: ProxyFailurePolicy::NeutralBoot,
             display_name: "P".into(),
             compat: Default::default(),
+            adapter: Default::default(),
         };
         // Protocol 0 fails the adapter check; the wrong plugin fails the hello.
         let both = vet_initialize(

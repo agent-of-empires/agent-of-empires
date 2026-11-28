@@ -5518,6 +5518,7 @@ time.sleep(60)
             failure_policy: policy,
             display_name: "Fake".into(),
             compat: Default::default(),
+            adapter: Default::default(),
         }
     }
 

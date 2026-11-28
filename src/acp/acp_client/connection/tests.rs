@@ -1352,6 +1352,7 @@ fn proxy_spec(compat: ProxyCompat) -> ProxySpec {
         failure_policy: ProxyFailurePolicy::Refuse,
         display_name: "P".into(),
         compat,
+        adapter: Default::default(),
     }
 }
 
