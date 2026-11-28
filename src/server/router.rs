@@ -371,6 +371,12 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::restart_plugin_worker).layer(read_only.clone()),
         )
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route(
+            "/api/plugins/{id}/provider-calls/{name}",
+            post(api::invoke_plugin_provider_call).layer(axum::extract::DefaultBodyLimit::max(
+                2 * aoe_plugin_api::PROVIDER_CALL_MAX_BYTES,
+            )),
+        )
         .route("/api/plugins/{id}/sessions", get(api::plugin_sessions))
         .route(
             "/api/plugins/{id}/settings/options/resolve",

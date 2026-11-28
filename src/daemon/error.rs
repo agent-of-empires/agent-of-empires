@@ -57,6 +57,16 @@ pub enum ApiErrorCode {
     AccountSwapUnavailable,
     ModelPinned,
     UnknownAgent,
+    ProviderPluginInactive,
+    ProviderCallUndeclared,
+    ProviderRequestTooLarge,
+    ProviderResponseTooLarge,
+    ProviderNoWorker,
+    ProviderWorkerGone,
+    ProviderTimeout,
+    ProviderSuperseded,
+    ProviderMethodNotFound,
+    ProviderRejected,
     TerminalSwitchRefused(TerminalSwitchReason),
 }
 
@@ -107,6 +117,16 @@ impl ApiErrorCode {
             Self::AccountSwapUnavailable => "account_swap_unavailable",
             Self::ModelPinned => "model_pinned",
             Self::UnknownAgent => "unknown_agent",
+            Self::ProviderPluginInactive => "provider_plugin_inactive",
+            Self::ProviderCallUndeclared => "provider_call_undeclared",
+            Self::ProviderRequestTooLarge => "provider_request_too_large",
+            Self::ProviderResponseTooLarge => "provider_response_too_large",
+            Self::ProviderNoWorker => "provider_no_worker",
+            Self::ProviderWorkerGone => "provider_worker_gone",
+            Self::ProviderTimeout => "provider_timeout",
+            Self::ProviderSuperseded => "provider_superseded",
+            Self::ProviderMethodNotFound => "provider_method_not_found",
+            Self::ProviderRejected => "provider_rejected",
             Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
@@ -144,6 +164,15 @@ impl ApiErrorCode {
             | Self::AccountSwapUnavailable
             | Self::ModelPinned => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
+            Self::ProviderPluginInactive | Self::ProviderCallUndeclared => StatusCode::NOT_FOUND,
+            Self::ProviderRequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::ProviderResponseTooLarge
+            | Self::ProviderWorkerGone
+            | Self::ProviderMethodNotFound
+            | Self::ProviderRejected => StatusCode::BAD_GATEWAY,
+            Self::ProviderNoWorker => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ProviderTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::ProviderSuperseded => StatusCode::CONFLICT,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed
             | Self::WorkingDirMissing
@@ -234,6 +263,16 @@ impl ApiErrorCode {
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
             b"model_pinned" => Self::ModelPinned,
             b"unknown_agent" => Self::UnknownAgent,
+            b"provider_plugin_inactive" => Self::ProviderPluginInactive,
+            b"provider_call_undeclared" => Self::ProviderCallUndeclared,
+            b"provider_request_too_large" => Self::ProviderRequestTooLarge,
+            b"provider_response_too_large" => Self::ProviderResponseTooLarge,
+            b"provider_no_worker" => Self::ProviderNoWorker,
+            b"provider_worker_gone" => Self::ProviderWorkerGone,
+            b"provider_timeout" => Self::ProviderTimeout,
+            b"provider_superseded" => Self::ProviderSuperseded,
+            b"provider_method_not_found" => Self::ProviderMethodNotFound,
+            b"provider_rejected" => Self::ProviderRejected,
             other => Self::TerminalSwitchRefused(
                 TerminalSwitchReason::ALL
                     .into_iter()

@@ -582,6 +582,40 @@ pub async fn invoke_plugin_action(
     }
 }
 
+/// `POST /api/plugins/{id}/provider-calls/{name}`: call the active plugin's declared
+/// `provider.<name>` worker method with the request body as params and return its result.
+/// The manifest fixes the method, timeout and size caps; see `plugin::provider_call`.
+///
+/// Read-write only, no elevation, like `invoke_plugin_action`: it mutates no host-managed state
+/// and grants no capability.
+pub async fn invoke_plugin_provider_call(
+    State(state): State<std::sync::Arc<AppState>>,
+    Path((id, name)): Path<(String, String)>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let Json(params) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(host) = state.plugin_host.as_ref() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_host",
+            "Plugin host is not running",
+        );
+    };
+    match plugin::provider_call::call_active(host.as_ref(), &id, &name, params).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => super::api_error_with_code_header(error.api_code(), error.to_string()),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct InvokeCommandBody {
     /// The session the command is invoked from. Forwarded to the worker so a
@@ -1654,6 +1688,58 @@ while not (p/'finish').exists():
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn provider_call_endpoint_serves_only_active_declared_calls() {
+        let _reload = plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        plugin::install_test_plugin(
+            "acme.quiet",
+            8,
+            &["runtime.worker"],
+            r#"["sh", "-c", "sleep 60"]"#,
+        );
+        plugin::reload_registry();
+        let call = |state: &std::sync::Arc<AppState>, id: &str| {
+            invoke_plugin_provider_call(
+                State(state.clone()),
+                Path((id.to_string(), "status".to_string())),
+                Ok(Json(json!({}))),
+            )
+        };
+
+        let no_host = crate::server::test_support::build_test_app_state(Vec::new());
+        assert_eq!(
+            call(&no_host, "acme.quiet").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let state =
+            crate::server::test_support::build_test_app_state_configured(Vec::new(), |state| {
+                state.plugin_host = Some(
+                    plugin::host::PluginHost::new(
+                        &crate::session::get_app_dir().unwrap(),
+                        "default",
+                        None,
+                        state.runtime.work.clone(),
+                    )
+                    .unwrap(),
+                );
+            });
+        for (id, code) in [
+            ("acme.unknown", "provider_plugin_inactive"),
+            ("acme.quiet", "provider_call_undeclared"),
+        ] {
+            let response = call(&state, id).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{id}");
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                code,
+                "{id}"
+            );
+        }
+    }
+
     async fn decode<T: serde::de::DeserializeOwned>(response: Response) -> T {
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
