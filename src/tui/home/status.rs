@@ -488,7 +488,13 @@ impl HomeView {
             {
                 continue;
             }
-            if !self.storages.contains_key(&profile.name) {
+            // A peer can delete and recreate the profile between snapshots; a
+            // store bound to the replaced directory never reads again.
+            let bound = self
+                .storages
+                .get(&profile.name)
+                .is_some_and(|storage| storage.verify_bound_profile().is_ok());
+            if !bound {
                 opened_storages.insert(
                     profile.name.clone(),
                     Storage::open(&profile.name, self.file_watch.clone())?,
@@ -504,10 +510,9 @@ impl HomeView {
                             .is_none_or(|local| local.source_profile != row.profile)
                 });
             if needs_metadata {
-                let storage = self
-                    .storages
+                let storage = opened_storages
                     .get(&profile.name)
-                    .or_else(|| opened_storages.get(&profile.name))
+                    .or_else(|| self.storages.get(&profile.name))
                     .expect("profile store staged");
                 profile_loads.insert(profile.name.clone(), storage.load_complete_with_groups()?.0);
             }
@@ -520,6 +525,7 @@ impl HomeView {
             let stores: Vec<(&str, &Storage)> = self
                 .storages
                 .iter()
+                .filter(|(name, _)| !opened_storages.contains_key(*name))
                 .chain(opened_storages.iter())
                 .map(|(name, storage)| (name.as_str(), storage))
                 .collect();
