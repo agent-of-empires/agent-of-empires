@@ -48,6 +48,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         Err(SupervisorError::UnknownAgent(name.into()))
     }
 
+    /// The plugin proxy to launch ahead of registry agent `name`'s adapter.
+    pub(super) async fn registry_proxy(
+        &self,
+        name: &str,
+    ) -> Option<crate::acp::acp_client::ProxySpec> {
+        self.registry
+            .lock()
+            .await
+            .resolved(name)
+            .and_then(|agent| agent.proxy.clone())
+    }
+
     /// Pick the agent name to spawn for an instance's tool.
     pub async fn pick_agent_for_tool(
         &self,

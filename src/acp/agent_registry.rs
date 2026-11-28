@@ -174,19 +174,6 @@ impl AgentRegistry {
                     "ACP agent id, alias or tool is claimed by more than one plugin; ignoring it");
                 continue;
             }
-            let agent = match ResolvedAcpAgent::from_plugin(
-                plugin.id(),
-                plugin.dir.as_deref(),
-                tool,
-                acp,
-            ) {
-                Ok(agent) => agent,
-                Err(error) => {
-                    tracing::warn!(target: "plugin.agents", plugin = plugin.id(), %tool, agent = %acp.id, %error,
-                        "plugin ACP agent cannot be resolved; ignoring it");
-                    continue;
-                }
-            };
             let replaced: Vec<String> = if crate::plugin::bundled_agents::contains(tool) {
                 self.agents
                     .values()
@@ -195,6 +182,25 @@ impl AgentRegistry {
                     .collect()
             } else {
                 Vec::new()
+            };
+            let bundled = replaced
+                .iter()
+                .filter_map(|id| self.agents.get(id))
+                .min_by_key(|builtin| (builtin.id != *tool, builtin.id.as_str()))
+                .map(|builtin| builtin.spec.clone());
+            let agent = match ResolvedAcpAgent::from_plugin(
+                plugin.id(),
+                plugin.dir.as_deref(),
+                tool,
+                acp,
+                bundled.as_ref(),
+            ) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    tracing::warn!(target: "plugin.agents", plugin = plugin.id(), %tool, agent = %acp.id, %error,
+                        "plugin ACP agent cannot be resolved; ignoring it");
+                    continue;
+                }
             };
             let taken = self.agents.values().find(|existing| {
                 !replaced.contains(&existing.id)
@@ -439,13 +445,72 @@ mod tests {
             }
         );
         assert_eq!(registry.resolved("zeta-cli").unwrap().id, "zeta-acp");
-        assert!(registry
-            .get("zeta-acp")
-            .unwrap()
-            .command
-            .ends_with("acme/bin/proxy"));
         assert_eq!(agent.env.allowlist, ["ZZ_KEY"]);
         assert_eq!(registry.agents.len(), 12);
+    }
+
+    #[test]
+    fn plugin_agent_launches_its_adapter_behind_the_declared_proxy() {
+        use aoe_plugin_api::agent_integration::{AcpAdapter, AcpCompat, AcpFailurePolicy};
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(temp.path(), "acme");
+        let declared = |tool: &str, id: &str, plugin: &str| {
+            let mut loaded = acp_plugin(plugin, tool, id, &[], &dir);
+            let acp = loaded.manifest.agent_integrations[0].acp.as_mut().unwrap();
+            acp.failure_policy = AcpFailurePolicy::NeutralBoot;
+            acp.compat = Some(AcpCompat {
+                expected_agent_name: Some("@acme/zeta-acp".into()),
+                min_version: Some("2.0.0".into()),
+                capability_min_versions: Default::default(),
+            });
+            acp.adapter = Some(AcpAdapter {
+                upstream_package: "@acme/zeta-acp".into(),
+                upstream_pin: "2.1.0".into(),
+                package_dir: "adapter".into(),
+                binary: None,
+            });
+            loaded
+        };
+        let registry = registry_of(vec![declared("zzzeta", "zeta-acp", "acme.zeta")]);
+        let agent = registry.resolved("zeta-acp").unwrap();
+        // The registry and launch command is the adapter; the proxy wraps it.
+        assert_eq!(agent.spec.command, "zeta-acp");
+        assert!(agent.spec.args.is_empty());
+        let proxy = agent.proxy.as_ref().unwrap();
+        assert!(proxy.command.ends_with("acme/bin/proxy"));
+        assert_eq!(proxy.plugin_id, "acme.zeta");
+        assert_eq!(proxy.display_name, "Acp");
+        assert!(proxy.args.is_empty());
+        assert_eq!(
+            proxy.failure_policy,
+            crate::acp::acp_client::ProxyFailurePolicy::NeutralBoot
+        );
+        assert_eq!(proxy.compat.agent_names, ["@acme/zeta-acp"]);
+        assert_eq!(
+            proxy.compat.version_req.as_ref().unwrap().to_string(),
+            ">=2.0.0"
+        );
+        assert_eq!(
+            proxy.adapter.min_version.as_ref().unwrap().to_string(),
+            "2.0.0"
+        );
+        assert!(registry.resolved("claude").unwrap().proxy.is_none());
+
+        // Without a declared adapter: the built-in adapter being taken over, else the tool name.
+        let mut takeover = acp_plugin("aoe.takeover", "claude", "claude-next", &[], &dir);
+        takeover.manifest.agent_integrations[0]
+            .acp
+            .as_mut()
+            .unwrap()
+            .adapter = None;
+        let plain = acp_plugin("acme.plain", "zzplain", "plain", &[], &dir);
+        let registry = registry_of(vec![takeover, plain]);
+        assert_eq!(
+            registry.resolved("claude-next").unwrap().spec.command,
+            "claude-agent-acp"
+        );
+        assert!(registry.resolved("claude-next").unwrap().proxy.is_some());
+        assert_eq!(registry.resolved("plain").unwrap().spec.command, "zzplain");
     }
 
     #[test]

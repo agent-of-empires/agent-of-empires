@@ -506,6 +506,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(ovr) = &req.agent_command_override {
             apply_agent_command_override(&req.agent, spec_from_registry, ovr, &mut spec)?;
         }
+        let proxy = match req.proxy.clone() {
+            Some(proxy) => Some(proxy),
+            None if spec_from_registry => self.registry_proxy(&req.agent).await,
+            None => None,
+        };
         let wrapper_substitution = wrapper_substitution_for(
             &*self.registry.lock().await,
             &req.tool,
@@ -685,7 +690,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 seed_history_replay,
                 prior_conversation: req.prior_conversation,
                 artifact_dir: crate::session::artifacts::session_artifact_dir(&req.session_id).ok(),
-                proxy: req.proxy.clone(),
+                proxy,
                 degraded: None,
                 wrapper_substitution,
                 generation,
@@ -2509,6 +2514,43 @@ time.sleep(60)
         });
         let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
         assert_eq!(exported(&config), Some(recorded));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_registry_plugin_agent_launches_its_adapter_behind_its_proxy() {
+        let (_home, _temp) = isolate_home();
+        let supervisor = Supervisor::new(VecSink::new());
+        let mut zeta =
+            crate::acp::resolved_agent::ResolvedAcpAgent::builtin("zeta", "zeta-adapter", &[], "d");
+        zeta.proxy = Some(proxy_spec(ProxyFailurePolicy::NeutralBoot));
+        supervisor
+            .registry
+            .lock()
+            .await
+            .agents
+            .insert("zeta".into(), zeta);
+
+        let mut request = spawn_request("plugin-proxy");
+        request.agent = "zeta".into();
+        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+        assert_eq!(config.spec.command, "zeta-adapter");
+        let proxy = config.proxy.expect("the registry proxy is launched");
+        assert_eq!(proxy.command, "/bin/proxy");
+        assert_eq!(proxy.failure_policy, ProxyFailurePolicy::NeutralBoot);
+
+        // A request's own proxy wins, and a built-in agent has none.
+        request.proxy = Some(proxy_spec(ProxyFailurePolicy::Refuse));
+        let (config, _) = supervisor.spawn_config(&request, 1).await.unwrap();
+        assert_eq!(
+            config.proxy.unwrap().failure_policy,
+            ProxyFailurePolicy::Refuse
+        );
+        let (config, _) = supervisor
+            .spawn_config(&spawn_request("builtin"), 1)
+            .await
+            .unwrap();
+        assert!(config.proxy.is_none());
     }
 
     #[tokio::test]

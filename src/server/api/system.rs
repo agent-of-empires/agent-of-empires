@@ -341,12 +341,15 @@ pub async fn list_agents(
             // registered even while a declaration provides the tool, so the row
             // keeps the adapter fields the builtin row would report. Selection
             // stays keyed on the bundled identity, not the plugin-chosen name.
-            let adapter = crate::plugin::bundled_agents::contains(integration.tool)
-                .then(|| acp_registry.get(integration.tool))
-                .flatten();
+            // A plugin's ACP agent reports its adapter, never its proxy.
+            let paired = acp_registry.paired_agent(integration.tool);
+            let adapter = paired.map(|agent| &agent.spec).or_else(|| {
+                crate::plugin::bundled_agents::contains(integration.tool)
+                    .then(|| acp_registry.get(integration.tool))
+                    .flatten()
+            });
             let (acp_command, acp_args) = acp_command_fields(adapter, data_dir.as_deref());
-            let acp_capable =
-                adapter.is_some() || acp_registry.paired_agent(integration.tool).is_some();
+            let acp_capable = adapter.is_some();
             let launch = registry
                 .get(integration.plugin)
                 .and_then(|owner| {
@@ -4289,7 +4292,9 @@ primitive_schema_version = 1
             .find(|agent| agent.name == "zzacp")
             .expect("the plugin row is listed");
         assert!(acp_row.acp_capable, "a paired plugin ACP agent is capable");
-        assert!(acp_row.acp_command.is_none());
+        // The adapter the proxy wraps, not the proxy itself.
+        assert_eq!(acp_row.acp_command.as_deref(), Some("zzacp"));
+        assert!(acp_row.acp_args.is_empty());
 
         let takeover = agents
             .iter()

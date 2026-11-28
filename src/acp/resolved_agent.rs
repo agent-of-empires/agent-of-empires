@@ -1,6 +1,7 @@
 //! Host-normalized ACP agent: one shape for built-in rows and plugin declarations.
 
-use super::acp_client::{provider_env_denyreason, ProxyFailurePolicy};
+use super::acp_client::{provider_env_denyreason, ProxyFailurePolicy, ProxySpec};
+use super::agent_compat::DeclaredCompat;
 use super::agent_registry::AgentSpec;
 use super::install_hints::env_allowlist_for;
 use aoe_plugin_api::agent_integration::{
@@ -23,8 +24,9 @@ pub struct ResolvedAcpAgent {
     /// The tool whose structured sessions spawn this agent; `None` for an agent no tool names.
     pub paired_tool: Option<String>,
     pub source: AcpAgentSource,
-    /// Launch argv (`command` plus `args`, never run through a shell), description and the
-    /// env allowlist the spawn path reads.
+    /// The adapter's launch argv (`command` plus `args`, never run through a shell), its
+    /// description and env allowlist, as the spawn path reads them. For a plugin agent the
+    /// proxy is not here: it is `proxy`.
     pub spec: AgentSpec,
     /// Sanitized: no key the host denies.
     pub env: AcpEnv,
@@ -32,6 +34,8 @@ pub struct ResolvedAcpAgent {
     pub modes: Vec<AcpMode>,
     pub failure_policy: ProxyFailurePolicy,
     pub adapter: Option<AcpAdapter>,
+    /// The plugin proxy the runner launches ahead of `spec`.
+    pub proxy: Option<ProxySpec>,
 }
 
 impl ResolvedAcpAgent {
@@ -70,20 +74,29 @@ impl ResolvedAcpAgent {
             modes: Vec::new(),
             failure_policy: ProxyFailurePolicy::Refuse,
             adapter: None,
+            proxy: None,
         }
     }
 
     /// Resolve an approved plugin's `acp` part. `plugin_dir` is the install root the proxy
-    /// must stay beneath.
+    /// must stay beneath. `bundled` is the built-in adapter the plugin takes over, which a
+    /// declaration without an `adapter` keeps wrapping.
     pub(crate) fn from_plugin(
         plugin_id: &str,
         plugin_dir: Option<&Path>,
         tool: &str,
         acp: &AcpDeclaration,
+        bundled: Option<&AgentSpec>,
     ) -> Result<ResolvedAcpAgent, String> {
         let dir = plugin_dir.ok_or("plugin has no install directory")?;
-        let command = resolve_beneath(dir, &acp.proxy.command)?;
+        let proxy_command = resolve_beneath(dir, &acp.proxy.command)?;
         let env = sanitize_env(&acp.env);
+        let adapter_compat = DeclaredCompat::from_declared(acp.compat.as_ref())?;
+        let (command, args) = adapter_argv(tool, acp.adapter.as_ref(), bundled);
+        let failure_policy = match acp.failure_policy {
+            AcpFailurePolicy::NeutralBoot => ProxyFailurePolicy::NeutralBoot,
+            AcpFailurePolicy::Refuse => ProxyFailurePolicy::Refuse,
+        };
         Ok(ResolvedAcpAgent {
             id: acp.id.clone(),
             aliases: acp.aliases.clone(),
@@ -93,24 +106,51 @@ impl ResolvedAcpAgent {
                 plugin_id: plugin_id.to_string(),
             },
             spec: AgentSpec {
-                command: command.to_string_lossy().into_owned(),
-                args: Vec::new(),
+                command,
+                args,
                 description: format!("{} (plugin {plugin_id})", acp.display_name),
                 env_allowlist: (!env.allowlist.is_empty()).then(|| env.allowlist.clone()),
             },
             env,
             compat: acp.compat.clone(),
             modes: acp.profile.modes.clone(),
-            failure_policy: match acp.failure_policy {
-                AcpFailurePolicy::NeutralBoot => ProxyFailurePolicy::NeutralBoot,
-                AcpFailurePolicy::Refuse => ProxyFailurePolicy::Refuse,
-            },
+            failure_policy,
             adapter: acp.adapter.clone(),
+            proxy: Some(ProxySpec {
+                plugin_id: plugin_id.to_string(),
+                command: proxy_command.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                failure_policy,
+                display_name: acp.display_name.clone(),
+                compat: adapter_compat.proxy_compat(),
+                adapter: adapter_compat,
+            }),
         })
     }
 
     pub(crate) fn answers_to(&self, name: &str) -> bool {
         self.id == name || self.aliases.iter().any(|alias| alias == name)
+    }
+}
+
+/// The adapter a proxy wraps: the declared upstream package's binary (its unscoped name, a
+/// bare command the usual lookup resolves), else the built-in adapter being taken over, else
+/// a command named like the tool.
+fn adapter_argv(
+    tool: &str,
+    adapter: Option<&AcpAdapter>,
+    bundled: Option<&AgentSpec>,
+) -> (String, Vec<String>) {
+    if let Some(adapter) = adapter {
+        let package = adapter.upstream_package.trim();
+        return (
+            package.rsplit('/').next().unwrap_or(package).to_string(),
+            Vec::new(),
+        );
+    }
+    match bundled {
+        Some(spec) => (spec.command.clone(), spec.args.clone()),
+        None => (tool.to_string(), Vec::new()),
     }
 }
 
