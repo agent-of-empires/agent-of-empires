@@ -3,15 +3,49 @@ import type { SessionResponse } from "../lib/types";
 import {
   fetchSessions,
   fetchTrashedSessions,
+  NOT_SENT,
+  reorderGroup,
+  updateSidebarView,
+  updateWorkspaceOrdering,
   type RuntimeCursor,
   type SessionMutation,
   type SessionsEnvelope,
+  type SidebarView,
+  type WorkspaceOrderingPatch,
+  type WriteResult,
 } from "../lib/api";
+import type { GroupMove, GroupOrder } from "../lib/groupOrder";
 import { noteDaemonChanged, setServerDown } from "../lib/connectionState";
+import {
+  DEFAULT_SIDEBAR_VIEW,
+  holdSettled,
+  holdStarted,
+  newWriteHold,
+  newWriteQueue,
+  pollMayReplace,
+} from "../lib/sidebarView";
 
 const POLL_INTERVAL = 3000;
 const POLL_DEADLINE_MS = 15000;
-const LOCAL_ORDERING_WINDOW_MS = 4000;
+
+const sameList = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+const keepIfSame = (next: string[]) => (prev: string[]) => (sameList(prev, next) ? prev : next);
+const keepIfSameOrder = (next: GroupOrder) => (prev: GroupOrder) => {
+  const names = Object.keys(next);
+  const same =
+    names.length === Object.keys(prev).length &&
+    names.every((name) => Object.hasOwn(prev, name) && sameList(prev[name]!, next[name]!));
+  return same ? prev : next;
+};
+
+/** The shared values a read installed; a value a local write still holds is absent. */
+export interface SharedRead {
+  cursor: RuntimeCursor;
+  order?: string[];
+  repositories?: string[];
+  groups?: GroupOrder;
+  sort?: SidebarView["sort"];
+}
 
 interface SessionState {
   sessions: SessionResponse[];
@@ -47,6 +81,19 @@ function withPushedStatus(row: SessionResponse, observed: RuntimeCursor, held: P
 export function useSessions() {
   const [state, setState] = useState<SessionState>({ sessions: [], observedById: {}, epoch: null });
   const [workspaceOrdering, setWorkspaceOrdering] = useState<string[]>([]);
+  const [repositoryOrder, setRepositoryOrder] = useState<string[]>([]);
+  const [sidebarView, setSidebarView] = useState<SidebarView>(DEFAULT_SIDEBAR_VIEW);
+  const [groupOrder, setGroupOrder] = useState<GroupOrder>({});
+  // This Client's own writes of each shared value, so a poll that predates one cannot undo it.
+  const orderHold = useRef(newWriteHold());
+  const repositoryHold = useRef(newWriteHold());
+  const viewHold = useRef(newWriteHold());
+  const groupHold = useRef(newWriteHold());
+  const orderingWrites = useRef(newWriteQueue());
+  const viewWrites = useRef(newWriteQueue());
+  const groupWrites = useRef(newWriteQueue());
+  // The newest pick of each view field, so a write that waited cannot overwrite a later pick.
+  const viewPicks = useRef<{ seq: number; latest: Partial<Record<keyof SidebarView, number>> }>({ seq: 0, latest: {} });
   const [error, setError] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [trashedCount, setTrashedCount] = useState(0);
@@ -67,7 +114,6 @@ export function useSessions() {
     if (!held || held.epoch !== cursor.epoch || held.revision < cursor.revision) seenRef.current.set(id, cursor);
   }, []);
 
-  const lastLocalOrderingAtRef = useRef<number>(0);
   // GET admission is global; only installed rows attest individual mutation receipts.
   const floorGet = useRef<RuntimeCursor | null>(null);
   const abandonedEpochs = useRef(new Set<string>());
@@ -75,15 +121,108 @@ export function useSessions() {
   // never with the global floor, and one from an epoch not yet installed waits for a read of that epoch.
   const pushedRef = useRef(new Map<string, PushedStatus>());
 
+  // A receipt from a restarted Daemon abandons the installed epoch, so a read of it still in flight cannot
+  // replace what this Client just wrote.
+  const noteWriteEpoch = useCallback((receipt: RuntimeCursor | null) => {
+    const floor = floorGet.current;
+    if (!receipt || !floor || floor.epoch === receipt.epoch || abandonedEpochs.current.has(receipt.epoch)) return;
+    abandonedEpochs.current.add(floor.epoch);
+  }, []);
+  const sharedReadListeners = useRef(new Set<(read: SharedRead) => void>());
+  /** Calls `listener` with each read's shared values, as installed; returns the unsubscribe. */
+  const onSharedRead = useCallback((listener: (read: SharedRead) => void) => {
+    const listeners = sharedReadListeners.current;
+    listeners.add(listener);
+    return () => void listeners.delete(listener);
+  }, []);
+
   const injectSession = useCallback((session: SessionResponse) => {
     setState((prev) =>
       prev.sessions.some((s) => s.id === session.id) ? prev : { ...prev, sessions: [session, ...prev.sessions] },
     );
   }, []);
 
-  const markLocalOrderingUpdate = useCallback(() => {
-    lastLocalOrderingAtRef.current = Date.now();
-  }, []);
+  /** Applies an ordering write at once and sends it; resolves with how it ended. */
+  const changeOrdering = useCallback(
+    async (patch: WorkspaceOrderingPatch) => {
+      const holds = [];
+      if (patch.order) {
+        setWorkspaceOrdering(patch.order);
+        holds.push(orderHold.current);
+      }
+      if (patch.repositories) {
+        setRepositoryOrder(patch.repositories);
+        holds.push(repositoryHold.current);
+      }
+      holds.forEach(holdStarted);
+      const result = await orderingWrites.current(() => updateWorkspaceOrdering(patch));
+      noteWriteEpoch(result.receipt);
+      for (const hold of holds) holdSettled(hold, result.receipt);
+      return result;
+    },
+    [noteWriteEpoch],
+  );
+
+  /** Applies a Group move at once and sends it after `after`, dropping it when that fails; the next poll then
+   *  restores what the Daemon holds. The Daemon refuses it once the profile's Group order left `base`. */
+  const moveGroup = useCallback(
+    async (
+      profile: string,
+      path: string,
+      move: GroupMove,
+      after?: Promise<WriteResult>,
+      base?: string[],
+      baseSort?: SidebarView["sort"],
+    ) => {
+      setGroupOrder((prev) => ({ ...prev, [profile]: move.order }));
+      holdStarted(groupHold.current);
+      const result = await groupWrites.current(async () =>
+        !after || (await after).receipt
+          ? reorderGroup({ profile, path }, move.direction, move.siblings, base, baseSort)
+          : NOT_SENT,
+      );
+      noteWriteEpoch(result.receipt);
+      holdSettled(groupHold.current, result.receipt);
+      return result;
+    },
+    [noteWriteEpoch],
+  );
+
+  /** Whether an ordering write is queued or in flight. */
+  const orderingSaving = useCallback(
+    () => orderHold.current.pending + repositoryHold.current.pending + groupHold.current.pending > 0,
+    [],
+  );
+
+  /**
+   * Applies a grouping or sort pick at once. The write is sent after the earlier picks' writes, waits for `after`,
+   * and is dropped when that fails; a field picked again meanwhile is left to the newer pick. Either way the next
+   * poll restores what the Daemon holds. The Daemon refuses a sort write once the sort left `baseSort`. Resolves
+   * with how the write ended.
+   */
+  const changeSidebarView = useCallback(
+    async (patch: Partial<SidebarView>, after?: Promise<WriteResult>, baseSort?: SidebarView["sort"]) => {
+      setSidebarView((prev) => ({ ...prev, ...patch }));
+      const picks = viewPicks.current;
+      const pick = ++picks.seq;
+      const fields = Object.keys(patch) as (keyof SidebarView)[];
+      for (const field of fields) picks.latest[field] = pick;
+      holdStarted(viewHold.current);
+      const result = await viewWrites.current(async () => {
+        const ready = !after || (await after).receipt !== null;
+        const current = fields.filter((field) => picks.latest[field] === pick);
+        const send = {
+          ...Object.fromEntries(current.map((field) => [field, patch[field]])),
+          ...(baseSort && current.includes("sort") && { base_sort: baseSort }),
+        };
+        return ready && current.length > 0 ? updateSidebarView(send) : NOT_SENT;
+      });
+      noteWriteEpoch(result.receipt);
+      holdSettled(viewHold.current, result.receipt);
+      return result;
+    },
+    [noteWriteEpoch],
+  );
 
   const applyResult = useCallback(
     (data: SessionsEnvelope | null) => {
@@ -154,10 +293,25 @@ export function useSessions() {
           }
           return { sessions: [...rows, ...carried], observedById, epoch: cursor.epoch };
         });
-        // Ignore server ordering while a local drag's PUT may still be landing.
-        if (Date.now() - lastLocalOrderingAtRef.current > LOCAL_ORDERING_WINDOW_MS) {
-          setWorkspaceOrdering(data.workspace_ordering);
+        const read: SharedRead = { cursor };
+        if (pollMayReplace(orderHold.current, cursor)) {
+          read.order = data.workspace_ordering;
+          setWorkspaceOrdering(keepIfSame(read.order));
         }
+        if (pollMayReplace(repositoryHold.current, cursor)) {
+          read.repositories = data.repository_order ?? [];
+          setRepositoryOrder(keepIfSame(read.repositories));
+        }
+        if (pollMayReplace(groupHold.current, cursor)) {
+          read.groups = data.group_order ?? {};
+          setGroupOrder(keepIfSameOrder(read.groups));
+        }
+        if (pollMayReplace(viewHold.current, cursor)) {
+          const view = data.sidebar_view ?? DEFAULT_SIDEBAR_VIEW;
+          read.sort = view.sort;
+          setSidebarView((prev) => (prev.group_by === view.group_by && prev.sort === view.sort ? prev : view));
+        }
+        for (const listener of sharedReadListeners.current) listener(read);
       } else {
         setError(true);
         setServerDown(true);
@@ -381,8 +535,14 @@ export function useSessions() {
     observedById: state.observedById,
     runtimeEpoch: state.epoch,
     workspaceOrdering,
-    setWorkspaceOrdering,
-    markLocalOrderingUpdate,
+    repositoryOrder,
+    sidebarView,
+    groupOrder,
+    moveGroup,
+    changeOrdering,
+    orderingSaving,
+    changeSidebarView,
+    onSharedRead,
     error,
     loaded,
     trashedCount,

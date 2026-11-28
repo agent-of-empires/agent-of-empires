@@ -79,15 +79,7 @@ feature_uses! {
 
 /// Web dashboard uses with no TUI counterpart; the shared ones go through [`FeatureUse`] names.
 const WEB_ONLY: &[&str] = &[
-    "sort_manual",
-    "sort_last_activity",
-    "sort_attention",
     "sort_plugin",
-    "axis_repo",
-    "axis_org",
-    "axis_group",
-    "axis_repo_group",
-    "axis_status",
     "pin_toggle",
     "focus_mode",
     "summarize",

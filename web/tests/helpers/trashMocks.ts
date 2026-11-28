@@ -119,17 +119,6 @@ export async function installTrashMocks(
   const busyDelete = new Set(opts.busyDeleteIds ?? []);
   let revision = 1;
 
-  if (opts.groupAxis) {
-    await page.addInitScript(() => {
-      try {
-        localStorage.setItem("aoe-sidebar-axis", "group");
-      } catch {
-        // Storage may be unavailable; the default axis applies.
-      }
-    });
-    await page.route("**/api/app-state/web-ui-state", (r) => r.fulfill({ json: { "aoe-sidebar-axis": "group" } }));
-  }
-
   await mockStaticApis(page);
   await mockSessionShellApis(page);
 
@@ -138,7 +127,11 @@ export async function installTrashMocks(
     const live = sessions.filter((s) => !handle.deletedIds.includes(s.id)).map((s) => sessionPayload(state.get(s.id)!));
     return r.fulfill({
       headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": String(revision) },
-      json: { sessions: live, workspace_ordering: [] },
+      json: {
+        sessions: live,
+        workspace_ordering: [],
+        ...(opts.groupAxis && { sidebar_view: { group_by: "group", sort: "custom" } }),
+      },
     });
   });
 

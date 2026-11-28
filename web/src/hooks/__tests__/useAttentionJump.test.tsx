@@ -6,6 +6,7 @@ import type { PluginUiEntry } from "../../lib/api";
 import { PluginUiProvider } from "../../lib/pluginUiContext";
 import { repoGroupToSidebarGroup } from "../../lib/sidebarGroups";
 import { nextAttentionSessionId } from "../../lib/sidebarSort";
+import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { repoGroup, session, workspace } from "./fixtures";
 import { useAttentionJump } from "../useAttentionJump";
 
@@ -57,6 +58,23 @@ describe("useAttentionJump (#4446)", () => {
     const { orderedIds, attention } = mountJump().result.current;
     expect([...attention]).toEqual(["b"]);
     expect(nextAttentionSessionId(orderedIds, attention, "a")).toBe("b");
+  });
+
+  it("jumps to a finished, unseen session only while the unread indicator is on", () => {
+    entriesRef.current = [];
+    const unreadGroups = [
+      repoGroupToSidebarGroup(repoGroup({ workspaces: [ws("a"), ws("b", { unread: true }), ws("c")] })),
+    ];
+    const mount = (enabled: boolean) =>
+      renderHook(() => useAttentionJump(unreadGroups), {
+        wrapper: ({ children }) => (
+          <UnreadIndicatorContext.Provider value={enabled}>
+            <PluginUiProvider>{children}</PluginUiProvider>
+          </UnreadIndicatorContext.Provider>
+        ),
+      }).result.current;
+    expect([...mount(true).attention]).toEqual(["b"]);
+    expect(mount(false).attention.size).toBe(0);
   });
 
   it("follows a tone appearing and clearing between polls", () => {

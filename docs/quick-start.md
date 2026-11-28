@@ -64,7 +64,7 @@ chosen height.
 
 A **project** is a saved directory path you register once so you can start sessions from it without retyping. Registering is only a convenience: `n` and `aoe add <path>` work on any path. Add one with `aoe project add /path/to/repo`, or press `p` in the TUI and then `a`. Once a project exists, `b` starts a session from it. See [Multi-repo workspaces](guides/multi-repo-workspaces.md#the-project-registry).
 
-A **group** is unrelated: it is a label you assign to existing sessions to sort them in the sidebar, set from the rename dialog or with `aoe group move`. Projects are where sessions start; groups are how they are bucketed once they exist. See [the grouping axes](guides/web/dashboard.md#sidebar-grouping-repo-organization-group-both-or-status).
+A **group** is unrelated: it is a label you assign to existing sessions to sort them in the sidebar, set from the rename dialog or with `aoe group move`. Projects are where sessions start; groups are how they are bucketed once they exist. See [the sidebar groupings](guides/web/dashboard.md#sidebar-grouping-and-sort).
 
 Rows keep their place when a session needs you. A session needs you when it is Waiting, in Error, flagged urgent, or finished and unread, and each header shows `●N` for those under it. `w` jumps to the next one, or to a session that just finished. **Show only sessions that need you** in the `Ctrl+K` palette hides the rest without reordering the list; a session that stops needing you while selected stays listed until you move off it.
 

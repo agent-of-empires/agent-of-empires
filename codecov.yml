@@ -133,7 +133,7 @@ component_management:
         - "web/src/components/StopSessionDialog.tsx"
         - "web/src/components/SessionGroupModal.tsx"
         - "web/src/components/BulkActionBar.tsx"
-        - "web/src/components/SidebarSortPicker.tsx"
+        - "web/src/components/sidebar/SidebarViewMenu.tsx"
         - "web/src/components/TopBar.tsx"
         - "web/src/components/ProjectsView.tsx"
 

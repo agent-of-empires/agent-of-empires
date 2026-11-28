@@ -75,7 +75,7 @@ describe("ProjectsSection", () => {
 
   it("explains the row's marker with the shared tooltip, not a native title", () => {
     const pinned: ProjectInfo = { name: "alpha", path: "/work/alpha", scope: "global", pinned: true };
-    // (registrations, marker, meaning); a pinned Project is listed here when the axis draws no ◆ header (#5065).
+    // (registrations, marker, meaning); a pinned Project is listed here when the grouping draws no ◆ header (#5065).
     const cases: [ProjectInfo[] | undefined, string, (typeof MARK_MEANING)[keyof typeof MARK_MEANING]][] = [
       [undefined, "◇", MARK_MEANING.project],
       [[pinned], "◆", MARK_MEANING.pinnedProject],
@@ -156,8 +156,8 @@ describe("ProjectsSection", () => {
     expect([label.textContent, label.getAttribute("title")]).toEqual(["Projects", "Projects, no sessions"]);
   });
 
-  // #5065: an axis without repository headers lists every Project, so the label drops "no sessions".
-  it("labels the section by whether the axis draws repository headers; compact stays Projects", () => {
+  // #5065: a grouping without repository headers lists every Project, so the label drops "no sessions".
+  it("labels the section by whether the grouping draws repository headers; compact stays Projects", () => {
     // (draws repository headers, compact, label, title)
     const cases: [boolean, boolean, string, string][] = [
       [true, false, "Projects, no sessions", "Projects, no sessions"],

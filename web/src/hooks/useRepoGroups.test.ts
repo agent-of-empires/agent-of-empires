@@ -5,14 +5,13 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { useRepoGroups, MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "./useRepoGroups";
 import type { SessionResponse, Workspace } from "../lib/types";
-import type { SidebarSortMode } from "../lib/sidebarSort";
+import type { SidebarSort } from "../lib/sidebarView";
 import { session, workspace } from "./__tests__/fixtures";
 
 const multiRepos = [
   { name: "repo-a", source_path: "/repo-a", branch: "main" },
   { name: "repo-b", source_path: "/repo-b", branch: "main" },
 ];
-const ORDER_KEY = "aoe-repo-group-order-v1";
 
 /** A single-session workspace; `path` defaults to `/<id's repo letter>`-style repo paths. */
 const ws = (id: string, path: string, over: Partial<SessionResponse> = {}, wsOver: Partial<Workspace> = {}) =>
@@ -21,13 +20,18 @@ const multi = (id = "multi", over: Partial<SessionResponse> = {}) =>
   ws(id, "/repo-a", { workspace_repos: multiRepos, ...over });
 const scratch = (id = "sc", over: Partial<SessionResponse> = {}) =>
   ws(id, `/home/u/.agent-of-empires/scratch/${id}`, { scratch: true, ...over });
-const recent = { last_accessed_at: "2025-09-01T00:00:00Z" };
+const newer = (day: number) => ({ created_at: `2025-0${day}-01T00:00:00Z` });
 
-function groupsOf(workspaces: Workspace[], mode?: SidebarSortMode, ordering = workspaces.map((w) => w.id)) {
-  return renderHook(() => useRepoGroups(workspaces, ordering, mode));
+function groupsOf(
+  workspaces: Workspace[],
+  sort: SidebarSort = "custom",
+  workspaceOrdering = workspaces.map((w) => w.id),
+  repositoryOrder: string[] = [],
+) {
+  return renderHook(() => useRepoGroups(workspaces, { sort, workspaceOrdering, repositoryOrder }));
 }
-const ids = (workspaces: Workspace[], mode?: SidebarSortMode, ordering?: string[]) =>
-  groupsOf(workspaces, mode, ordering).result.current.groups.map((g) => g.id);
+const ids = (workspaces: Workspace[], sort?: SidebarSort, repositoryOrder: string[] = []) =>
+  groupsOf(workspaces, sort, undefined, repositoryOrder).result.current.groups.map((g) => g.id);
 
 beforeEach(() => localStorage.clear());
 
@@ -59,152 +63,55 @@ describe("useRepoGroups grouping", () => {
   });
 });
 
-describe("useRepoGroups sort modes", () => {
-  it.each<[string, SidebarSortMode, Workspace[], string[] | undefined, string[]]>([
+describe("useRepoGroups header order", () => {
+  it.each<[string, SidebarSort, Workspace[], string[], string[]]>([
     [
-      "manual: groups by min workspace rank",
-      "manual",
+      "Custom: the shared repository order",
+      "custom",
       [ws("a1", "/repo-a"), ws("b1", "/repo-b")],
-      ["b1", "a1"],
+      ["/repo-b", "/repo-a"],
       ["/repo-b", "/repo-a"],
     ],
     [
-      "lastActivity: groups by freshest activity",
-      "lastActivity",
-      [ws("a1", "/repo-a"), ws("b1", "/repo-b", recent)],
-      undefined,
-      ["/repo-b", "/repo-a"],
-    ],
-    [
-      "lastActivity: ties break on repoPath",
-      "lastActivity",
-      [ws("b1", "/repo-b"), ws("a1", "/repo-a")],
-      undefined,
-      ["/repo-a", "/repo-b"],
-    ],
-    [
-      "lastActivity: synthetic groups stay at the bottom",
-      "lastActivity",
-      [scratch("sc", { last_accessed_at: "2025-12-31T00:00:00Z" }), multi("multi", recent), ws("real", "/repo-a")],
-      undefined,
-      ["/repo-a", MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID],
-    ],
-    [
-      "attention: a Waiting group floats up",
-      "attention",
-      [ws("a1", "/repo-a", { status: "Running" }), ws("b1", "/repo-b", { status: "Waiting" })],
-      undefined,
-      ["/repo-b", "/repo-a"],
-    ],
-  ])("%s", (_label, mode, workspaces, ordering, expected) => {
-    expect(ids(workspaces, mode, ordering)).toEqual(expected);
-  });
-
-  it.each<[SidebarSortMode, Workspace[], string[], string[]]>([
-    ["manual", [ws("new", "/repo-a", recent), ws("old", "/repo-a")], ["old", "new"], ["old", "new"]],
-    ["lastActivity", [ws("old", "/repo-a"), ws("new", "/repo-a", recent)], ["old", "new"], ["new", "old"]],
-    [
-      "attention",
-      [ws("running", "/repo-a", { status: "Running" }), ws("waiting", "/repo-a", { status: "Waiting" })],
-      ["running", "waiting"],
-      ["waiting", "running"],
-    ],
-  ])("%s orders workspaces within a group", (mode, workspaces, ordering, expected) => {
-    const { groups } = groupsOf(workspaces, mode, ordering).result.current;
-    expect(groups[0]!.workspaces.map((w) => w.id)).toEqual(expected);
-  });
-});
-
-describe("useRepoGroups plugin attention (#4446)", () => {
-  /** Mounts in `mode` with a plugin-toned session set that tests can swap between renders. */
-  function mountToned(workspaces: Workspace[], mode: SidebarSortMode, toned: string[]) {
-    const ordering = workspaces.map((w) => w.id);
-    return renderHook(
-      ({ attention }: { attention: ReadonlySet<string> }) =>
-        useRepoGroups(workspaces, ordering, mode, [], undefined, attention),
-      { initialProps: { attention: new Set(toned) } },
-    );
-  }
-  interface Mounted {
-    result: { current: { groups: { id: string; workspaces: { id: string }[] }[] } };
-  }
-  const groupIds = (m: Mounted) => m.result.current.groups.map((g) => g.id);
-  const wsIds = (m: Mounted) => m.result.current.groups[0]!.workspaces.map((w) => w.id);
-
-  it("sorts a toned workspace ahead of a Running one in attention mode", () => {
-    const list = [ws("running", "/repo-a", { status: "Running" }), ws("toned", "/repo-a", { status: "Stopped" })];
-    expect(wsIds(mountToned(list, "attention", []))).toEqual(["running", "toned"]);
-    expect(wsIds(mountToned(list, "attention", ["s-toned"]))).toEqual(["toned", "running"]);
-  });
-
-  it("ranks a repo group by its toned session in attention mode", () => {
-    const list = [ws("a1", "/repo-a"), ws("b1", "/repo-b", { status: "Running" })];
-    expect(groupIds(mountToned(list, "attention", []))).toEqual(["/repo-a", "/repo-b"]);
-    expect(groupIds(mountToned(list, "attention", ["s-b1"]))).toEqual(["/repo-b", "/repo-a"]);
-  });
-
-  it("re-sorts when a tone appears and again when it clears", () => {
-    const list = [ws("a1", "/repo-a"), ws("b1", "/repo-b", { status: "Running" })];
-    const mounted = mountToned(list, "attention", []);
-    expect(groupIds(mounted)).toEqual(["/repo-a", "/repo-b"]);
-    mounted.rerender({ attention: new Set(["s-b1"]) });
-    expect(groupIds(mounted)).toEqual(["/repo-b", "/repo-a"]);
-    mounted.rerender({ attention: new Set() });
-    expect(groupIds(mounted)).toEqual(["/repo-a", "/repo-b"]);
-  });
-
-  it("ignores tones outside attention mode", () => {
-    const list = [ws("a1", "/repo-a"), ws("b1", "/repo-b", { status: "Running" })];
-    expect(groupIds(mountToned(list, "lastActivity", ["s-b1"]))).toEqual(["/repo-a", "/repo-b"]);
-  });
-});
-
-describe("useRepoGroups manual group order (#1644)", () => {
-  it.each<[string, string[], Workspace[], SidebarSortMode, string[]]>([
-    [
-      "the stored order wins over min rank",
-      ["/repo-b", "/repo-a"],
-      [ws("a1", "/repo-a"), ws("b1", "/repo-b")],
-      "manual",
-      ["/repo-b", "/repo-a"],
-    ],
-    [
-      "an unstored group floats above ranked ones",
-      ["/repo-b", "/repo-c"],
-      [ws("a1", "/repo-a"), ws("b1", "/repo-b"), ws("c1", "/repo-c")],
-      "manual",
-      ["/repo-a", "/repo-b", "/repo-c"],
-    ],
-    [
-      "untouched synthetic groups sink",
+      "Custom: headers never moved come first, newest first",
+      "custom",
+      [ws("a1", "/repo-a", newer(1)), ws("b1", "/repo-b", newer(2)), ws("c1", "/repo-c", newer(3))],
       ["/repo-a"],
-      [ws("real", "/repo-a"), multi(), scratch()],
-      "manual",
-      ["/repo-a", MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID],
+      ["/repo-c", "/repo-b", "/repo-a"],
     ],
     [
-      "a dragged synthetic group holds its place",
-      [SCRATCH_GROUP_ID, "/repo-a"],
-      [ws("real", "/repo-a"), scratch()],
-      "manual",
-      [SCRATCH_GROUP_ID, "/repo-a"],
+      "Name: A to Z by header name, ignoring case",
+      "name",
+      [ws("b1", "/x/Beta"), ws("a1", "/x/alpha"), ws("c1", "/x/gamma")],
+      ["/x/gamma", "/x/Beta"],
+      ["/x/alpha", "/x/Beta", "/x/gamma"],
     ],
     [
-      "lastActivity ignores the stored order",
-      ["/repo-b", "/repo-a"],
-      [ws("a1", "/repo-a", recent), ws("b1", "/repo-b")],
-      "lastActivity",
-      ["/repo-a", "/repo-b"],
+      "synthetic groups stay at the bottom under every sort",
+      "name",
+      [scratch("sc"), multi("aaa"), ws("real", "/repo-z")],
+      [SCRATCH_GROUP_ID, MULTI_REPO_GROUP_ID],
+      ["/repo-z", MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID],
     ],
-  ])("%s", (_label, stored, workspaces, mode, expected) => {
-    localStorage.setItem(ORDER_KEY, JSON.stringify(stored));
-    expect(ids(workspaces, mode)).toEqual(expected);
+  ])("%s", (_label, sort, workspaces, repositoryOrder, expected) => {
+    expect(ids(workspaces, sort, repositoryOrder)).toEqual(expected);
+  });
+
+  it.each<[SidebarSort, string[]]>([
+    ["custom", ["zed", "abe"]],
+    ["name", ["abe", "zed"]],
+  ])("%s orders workspaces within a group", (sort, expected) => {
+    const workspaces = [ws("zed", "/repo-a", { title: "zed" }), ws("abe", "/repo-a", { title: "abe" })];
+    expect(groupsOf(workspaces, sort).result.current.groups[0]!.workspaces.map((w) => w.id)).toEqual(expected);
   });
 });
 
 describe("useRepoGroups stateful API", () => {
-  it("toggleRepoCollapsed and reorderRepoGroups persist", () => {
-    const { result } = groupsOf([ws("a1", "/repo-a"), ws("b1", "/repo-b")], "manual");
+  it("toggleRepoCollapsed persists", () => {
+    const { result } = groupsOf([ws("a1", "/repo-a"), ws("b1", "/repo-b")], "custom", undefined, [
+      "/repo-a",
+      "/repo-b",
+    ]);
     const first = () => result.current.groups[0]!;
 
     act(() => result.current.toggleRepoCollapsed("/repo-a"));
@@ -213,9 +120,5 @@ describe("useRepoGroups stateful API", () => {
     act(() => result.current.toggleRepoCollapsed("/repo-a"));
     expect(first().collapsed).toBe(false);
     expect(localStorage.getItem("aoe-repo-collapsed-/repo-a")).toBeNull();
-
-    act(() => result.current.reorderRepoGroups(["/repo-b", "/repo-a"]));
-    expect(result.current.groups.map((g) => g.id)).toEqual(["/repo-b", "/repo-a"]);
-    expect(localStorage.getItem(ORDER_KEY)).toBe(JSON.stringify(["/repo-b", "/repo-a"]));
   });
 });

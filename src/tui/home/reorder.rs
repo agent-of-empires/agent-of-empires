@@ -216,27 +216,52 @@ impl HomeView {
             }
             return self.refresh_after_stale_move();
         }
-        if freeze && self.group_by == GroupByMode::Group {
-            return self.freeze_in_place(id, order, delta);
+        if freeze {
+            let repositories =
+                repositories.map(crate::server::api::sessions::writable_repository_order);
+            return self.freeze_in_place(id, order, repositories, delta);
         }
         self.submit_custom_order(Some(order), repositories)
     }
 
-    /// Commit `order` with the Groups header order on screen, leaving session `id` in its
-    /// group, so the switch to Custom keeps the headers where they are.
+    /// Commit `order`, and `repositories` under Repository, with the Group header order on
+    /// screen, leaving session `id` in its group, so the switch to Custom keeps every header
+    /// where it is.
     fn freeze_in_place(
         &mut self,
         id: &str,
         order: Vec<String>,
+        repositories: Option<Vec<String>>,
         delta: isize,
     ) -> anyhow::Result<()> {
         let Some(row) = self.instances.get(id) else {
             return self.refresh_after_stale_move();
         };
-        let profile = row.source_profile.clone();
-        let source_group = row.group_path.clone();
-        let headers = self.displayed_headers(&profile);
-        let (freeze, switch) = self.frozen_order(order, &profile);
+        let (profile, source_group) = (row.source_profile.clone(), row.group_path.clone());
+        self.freeze_through(id, profile, source_group, order, repositories, delta)
+    }
+
+    /// `freeze_in_place` through session `id` of `profile` in `source_group`, which the
+    /// move names but leaves where it is.
+    fn freeze_through(
+        &mut self,
+        id: &str,
+        profile: String,
+        source_group: String,
+        order: Vec<String>,
+        repositories: Option<Vec<String>>,
+        delta: isize,
+    ) -> anyhow::Result<()> {
+        let headers = if self.group_by == GroupByMode::Group {
+            self.displayed_headers(&profile)
+        } else {
+            let Some(headers) = self.displayed_nested_headers(&profile) else {
+                self.flash_status("Pick Custom first: the Groups can't keep this order");
+                return Ok(());
+            };
+            headers
+        };
+        let (freeze, switch) = self.frozen_order(order, &profile, repositories);
         self.submit_namespace_intent(
             crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
                 id: id.to_owned(),
@@ -252,6 +277,61 @@ impl HomeView {
                 switch: Some(switch),
             },
         )
+    }
+
+    /// The profiles whose Groups the Repository headers show nested, by name.
+    fn nested_header_profiles(&self) -> Vec<String> {
+        let mut profiles: Vec<String> = self
+            .group_trees
+            .iter()
+            .filter(|(profile, _)| {
+                self.active_profile
+                    .as_deref()
+                    .is_none_or(|active| active == profile.as_str())
+            })
+            .filter(|(_, tree)| {
+                self.flat_items.iter().any(|item| {
+                    matches!(item, Item::Group { path, .. }
+                        if super::rows::split_project_view_path(path)
+                            .1
+                            .is_some_and(|path| tree.group_exists(path)))
+                })
+            })
+            .map(|(profile, _)| profile.clone())
+            .collect();
+        profiles.sort();
+        profiles
+    }
+
+    /// `profile`'s Groups nested under Repository headers, in the order the list shows them,
+    /// or None when two Repositories show them in orders no one profile-wide order keeps.
+    fn displayed_nested_headers(&self, profile: &str) -> Option<Vec<String>> {
+        let tree = self.group_trees.get(profile);
+        let mut shown: Vec<(&str, Vec<&str>)> = Vec::new();
+        for item in &self.flat_items {
+            let Item::Group { path, .. } = item else {
+                continue;
+            };
+            if let (repository, Some(path)) = super::rows::split_project_view_path(path) {
+                if tree.is_some_and(|t| t.group_exists(path)) {
+                    match shown.iter_mut().find(|(r, _)| *r == repository) {
+                        Some((_, paths)) => paths.push(path),
+                        None => shown.push((repository, vec![path])),
+                    }
+                }
+            }
+        }
+        let mut headers: Vec<String> = Vec::new();
+        for path in shown.iter().flat_map(|(_, paths)| paths) {
+            if !headers.iter().any(|h| h == path) {
+                headers.push((*path).to_owned());
+            }
+        }
+        let rank = |path: &str| headers.iter().position(|h| h == path);
+        shown
+            .iter()
+            .all(|(_, paths)| paths.windows(2).all(|w| rank(w[0]) < rank(w[1])))
+            .then_some(headers)
     }
 
     /// `profile`'s group headers in the order the list shows them.
@@ -331,9 +411,8 @@ impl HomeView {
                 if let Some((profile, before)) = frozen {
                     match self.group_order_anchor(&profile) {
                         Some(anchor) => {
-                            let order = written.0;
                             return self.undo_frozen_groups(
-                                anchor, profile, before, order, groups, change,
+                                anchor, profile, before, written, groups, change,
                             );
                         }
                         // Only a move puts a Group order back, and it needs a row to name.
@@ -359,7 +438,7 @@ impl HomeView {
         (id, source_group): (String, String),
         profile: String,
         before: Vec<String>,
-        order: Vec<String>,
+        (order, repositories): (Vec<String>, Vec<String>),
         after: Vec<String>,
         change: OrderChange,
     ) -> anyhow::Result<()> {
@@ -367,6 +446,7 @@ impl HomeView {
             order,
             base: self.ordering_base(),
             groups: after,
+            repositories: Some(repositories),
         };
         self.submit_namespace_intent(
             crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Session {
@@ -506,6 +586,7 @@ impl HomeView {
                 order,
                 repositories,
                 base: Some(base),
+                ..Default::default()
             })?;
         if !matches!(change, Some(OrderChange::Undo(_))) {
             self.order_undo = None;
@@ -516,11 +597,12 @@ impl HomeView {
 
     /// The order a move under Name or Newest first commits with the move, and the switch to
     /// Custom that follows it. `profile`'s stored group order goes with it, since the move
-    /// replaces that too.
+    /// replaces that too, and `repositories`, the Repository header order it commits.
     fn frozen_order(
         &self,
         order: Vec<String>,
         profile: &str,
+        repositories: Option<Vec<String>>,
     ) -> (crate::daemon::FrozenOrder, OrderChange) {
         let snapshot = self.session_feed.applied_snapshot();
         let sessions = snapshot
@@ -534,7 +616,12 @@ impl HomeView {
                 groups: Some((profile.to_owned(), groups.clone())),
                 ..self.order_undo_point()
             },
-            expected: (order.clone(), base.repositories.clone()),
+            expected: (
+                order.clone(),
+                repositories
+                    .clone()
+                    .unwrap_or_else(|| base.repositories.clone()),
+            ),
             sort_changes: self.sort_changes,
         };
         (
@@ -542,6 +629,7 @@ impl HomeView {
                 order,
                 base,
                 groups,
+                repositories,
             },
             change,
         )
@@ -730,11 +818,18 @@ impl HomeView {
     }
 
     fn move_header_row(&mut self, path: &str, delta: isize) -> anyhow::Result<()> {
-        if self.group_by == GroupByMode::Group {
+        let nested = super::rows::split_project_view_path(path).1.is_some();
+        if self.group_by == GroupByMode::Group || nested {
+            // Under Repository a nested header moves only under Custom; Groups switches from Name.
+            if nested && self.group_by != GroupByMode::Group && self.sort_order != SortOrder::Custom
+            {
+                self.flash_status("Pick the Custom sort (o) to arrange groups by hand");
+                return Ok(());
+            }
             return self.move_group_row(path, delta);
         }
         let Some(repo) = self.repository_path_for_header(path) else {
-            self.flash_status("Only repository headers move under the Repository grouping");
+            self.flash_status("This header does not move");
             return Ok(());
         };
         let mut order = self.displayed_repository_order();
@@ -764,6 +859,31 @@ impl HomeView {
         if !order.contains(&repo) || !order.contains(&other) {
             self.flash_status("This repository's path is too long for the Custom order");
             return Ok(());
+        }
+        // From Name or Newest first the nested Groups freeze with the rows, as a row move's do.
+        if let Some(rows) = rows {
+            match self.nested_header_profiles().as_slice() {
+                [] => {}
+                [profile] => {
+                    let Some((id, source_group)) = self.group_order_anchor(profile) else {
+                        return self.refresh_after_stale_move();
+                    };
+                    let profile = profile.clone();
+                    return self.freeze_through(
+                        &id,
+                        profile,
+                        source_group,
+                        rows,
+                        Some(order),
+                        delta,
+                    );
+                }
+                _ => {
+                    self.flash_status("Pick Custom first: the Groups can't keep this order");
+                    return Ok(());
+                }
+            }
+            return self.submit_custom_order(Some(rows), Some(order));
         }
         self.submit_custom_order(rows, Some(order))
     }
@@ -814,7 +934,7 @@ impl HomeView {
                 direction,
             )
             .unwrap_or(order);
-            self.frozen_order(order, &profile)
+            self.frozen_order(order, &profile, None)
         });
         let (freeze, switch) = frozen.unzip();
         self.submit_namespace_intent(
@@ -913,13 +1033,25 @@ impl HomeView {
 
     /// Move a group among its siblings. Under Name the move starts from the order on
     /// screen, which the stored group order and the shared row order then keep.
-    fn move_group_row(&mut self, group_path: &str, delta: isize) -> anyhow::Result<()> {
+    fn move_group_row(&mut self, header_path: &str, delta: isize) -> anyhow::Result<()> {
         anyhow::ensure!(delta == -1 || delta == 1, "Invalid row direction");
-        let group = self.canonical_group_location(group_path)?;
+        let group = if self.group_by == GroupByMode::Group {
+            self.canonical_group_location(header_path)?
+        } else {
+            let Some(group) = self.nested_group_location(header_path) else {
+                return Ok(());
+            };
+            group
+        };
         let freeze = self.sort_order != SortOrder::Custom;
-        let siblings = freeze.then(|| self.displayed_sibling_groups(&group));
+        // A stored Group with no shown session has no nested header, so only shown ones count.
+        let siblings = if self.group_by == GroupByMode::Group {
+            freeze.then(|| self.displayed_sibling_groups(&group))
+        } else {
+            Some(self.displayed_nested_siblings(header_path, &group))
+        };
         let (freeze, switch) = freeze
-            .then(|| self.frozen_order(self.displayed_workspace_order(), &group.profile))
+            .then(|| self.frozen_order(self.displayed_workspace_order(), &group.profile, None))
             .unzip();
         self.submit_namespace_intent(
             crate::daemon::NamespaceMutation::Reorder(crate::daemon::ReorderBody::Group {
@@ -927,9 +1059,86 @@ impl HomeView {
                 direction: move_direction(delta),
                 siblings,
                 freeze,
+                base: None,
+                base_sort: None,
             }),
             NamespaceIntent::ReorderGroup { switch },
         )
+    }
+
+    /// The profile Group behind a `repo/group` header under Repository: the one profile whose
+    /// sessions sit under it. Flashes why when there is none.
+    fn nested_group_location(&mut self, header_path: &str) -> Option<crate::daemon::GroupLocation> {
+        let (_, Some(path)) = super::rows::split_project_view_path(header_path) else {
+            return None;
+        };
+        let prefix = format!("{header_path}/");
+        let mut owners: Vec<String> = self
+            .instances
+            .values()
+            .filter(|inst| !inst.is_archived() && !inst.is_trashed())
+            .filter(|inst| {
+                self.active_profile
+                    .as_ref()
+                    .is_none_or(|p| inst.source_profile == *p)
+            })
+            .filter(|inst| {
+                let at = project_view_path(inst);
+                at == header_path || at.starts_with(&prefix)
+            })
+            .map(|inst| inst.source_profile.clone())
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        let location = match &owners[..] {
+            [profile]
+                if self
+                    .group_trees
+                    .get(profile)
+                    .is_some_and(|t| t.group_exists(path)) =>
+            {
+                crate::daemon::GroupLocation {
+                    profile: profile.clone(),
+                    path: path.to_owned(),
+                }
+            }
+            [_] | [] => {
+                self.flash_status("The group changed elsewhere; no change submitted");
+                return None;
+            }
+            _ => {
+                self.flash_status("Groups move only within one profile");
+                return None;
+            }
+        };
+        Some(location)
+    }
+
+    /// The stored paths of the nested headers in `header_path`'s repository that share `group`'s
+    /// parent, in the order the list shows them.
+    fn displayed_nested_siblings(
+        &self,
+        header_path: &str,
+        group: &crate::daemon::GroupLocation,
+    ) -> Vec<String> {
+        let parent = |path: &str| path.rsplit_once('/').map(|(head, _)| head.to_owned());
+        let repo = super::rows::split_project_view_path(header_path).0;
+        let mut siblings: Vec<String> = Vec::new();
+        for item in &self.flat_items {
+            let Item::Group { path, .. } = item else {
+                continue;
+            };
+            let (label, Some(path)) = super::rows::split_project_view_path(path) else {
+                continue;
+            };
+            if label == repo
+                && parent(path) == parent(&group.path)
+                && !siblings.iter().any(|s| s == path)
+            {
+                siblings.push(path.to_owned());
+            }
+        }
+        siblings
     }
 
     /// The headers sharing `group`'s parent and profile, in the order the list shows them.
@@ -1476,6 +1685,40 @@ mod tests {
         );
     }
 
+    /// A Group move conditioned on the sort is stale once the shared sort is another.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_group_move_on_another_sort_is_stale() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let rows: Vec<Instance> = [("one", "aaa"), ("two", "bbb")]
+            .into_iter()
+            .map(|(title, group)| {
+                let mut row = Instance::new(title, &format!("/tmp/{title}"));
+                row.group_path = group.into();
+                row
+            })
+            .collect();
+        storage
+            .update(|stored, groups| {
+                *stored = rows.clone();
+                *groups = ["aaa", "bbb"]
+                    .map(|path| crate::session::Group::new(path, path))
+                    .into();
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["reorder"]).await;
+        for (base_sort, expected) in [("name", "stale"), ("custom", "moved")] {
+            let body = serde_json::json!({"target":"group","group":{"profile":"reorder","path":"aaa"},
+                "direction":"down","base_sort":base_sort});
+            let (status, _, value) =
+                request_with_headers(&state, "POST", "/api/reorder", body).await;
+            assert!(status.is_success(), "{status}: {value}");
+            assert_eq!(value["status"], expected, "{base_sort}");
+        }
+    }
+
     async fn native_move(group: bool, snapshot_first: bool) {
         let _home = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
@@ -1717,7 +1960,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_split_workspace_moves_past_its_neighbour() {
-        use crate::tui::session_feed::ViewWrite;
         let _home = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
         let row = |title: &str, branch: &str, age: i64| {
@@ -1762,15 +2004,162 @@ mod tests {
                 view.flat_items = view.build_flat_items();
                 let id = rows.iter().find(|r| r.title == title).unwrap().id.clone();
                 view.select_session_by_id(&id);
-                let mut capture = view.session_feed.view_write_driver_for_test();
+                let mut capture = view.session_feed.namespace_capture_for_test();
                 view.move_row_at_cursor(delta).unwrap();
-                match capture().map(|captured| captured.write) {
-                    Some(ViewWrite::Ordering(patch)) => {
-                        assert_eq!(patch.order, Some(expected.map(String::clone).to_vec()));
+                // Under Repository the freeze carries the nested Group and header orders.
+                match capture().map(|(sent, _)| sent) {
+                    Some(crate::daemon::NamespaceMutation::Reorder(
+                        crate::daemon::ReorderBody::Session {
+                            destination: None,
+                            headers: Some(headers),
+                            freeze: Some(freeze),
+                            ..
+                        },
+                    )) => {
+                        assert_eq!(freeze.order, expected.map(String::clone).to_vec());
+                        assert_eq!(freeze.repositories, Some(vec!["/tmp/repo".to_string()]));
+                        assert_eq!(headers, ["aaa"]);
                     }
-                    other => panic!("{sort:?} {title}: expected an order write, got {other:?}"),
+                    _ => panic!("{sort:?} {title}: expected a frozen move"),
                 }
             }
+        }
+    }
+
+    /// Under Repository a freeze is refused once two Repositories show the Groups in orders
+    /// one profile-wide order cannot keep, as the dashboard refuses it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_freeze_refuses_repositories_that_disagree_on_the_group_order() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let row = |title: &str, repo: &str, group: &str, age: i64| {
+            let mut row = Instance::new(title, repo);
+            row.group_path = group.into();
+            row.created_at = crate::time::Timestamp::now() - crate::time::Duration::hours(age);
+            row
+        };
+        // Newest first shows alpha above beta under x, and beta above alpha under y.
+        let rows = vec![
+            row("x1", "/tmp/x", "alpha", 0),
+            row("x2", "/tmp/x", "alpha", 1),
+            row("x3", "/tmp/x", "beta", 2),
+            row("y1", "/tmp/y", "beta", 3),
+            row("y2", "/tmp/y", "alpha", 4),
+        ];
+        storage
+            .update(|stored, groups| {
+                *stored = rows.clone();
+                *groups = ["alpha", "beta"]
+                    .map(|path| crate::session::Group::new(path, path))
+                    .into();
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["reorder"]).await;
+        let mut view = HomeView::new_for_test(
+            Some("reorder".into()),
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        apply_published(&mut view, &state).await;
+        view.sort_order = SortOrder::Newest;
+        view.group_by = GroupByMode::Project;
+        view.flat_items = view.build_flat_items();
+        let nested: Vec<&str> = view
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Group { path, depth: 1, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nested, ["x/alpha", "x/beta", "y/beta", "y/alpha"]);
+        let mut capture = view.session_feed.namespace_capture_for_test();
+        // A row move and a Repository header move alike.
+        for header in [None, Some("x")] {
+            match header {
+                None => view.select_session_by_id(&rows[0].id),
+                Some(label) => {
+                    view.cursor = view
+                        .flat_items
+                        .iter()
+                        .position(|item| matches!(item, Item::Group { path, depth: 0, .. } if path == label))
+                        .unwrap();
+                    view.update_selected();
+                }
+            }
+            view.status_flash = None;
+            view.move_row_at_cursor(1).unwrap();
+            assert!(capture().is_none(), "{header:?}");
+            assert_eq!(
+                view.status_flash.as_ref().map(|f| f.text.as_str()),
+                Some("Pick Custom first: the Groups can't keep this order"),
+                "{header:?}"
+            );
+            assert_eq!(view.sort_order, SortOrder::Newest);
+        }
+    }
+
+    /// From Name a Repository header move freezes the nested Group order with the rows and
+    /// the header order, in one move.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_repository_header_move_under_name_freezes_its_groups() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("reorder").unwrap();
+        let rows: Vec<Instance> = [("x1", "/tmp/x"), ("y1", "/tmp/y")]
+            .into_iter()
+            .map(|(title, repo)| {
+                let mut row = Instance::new(title, repo);
+                row.group_path = "alpha".into();
+                row
+            })
+            .collect();
+        storage
+            .update(|stored, groups| {
+                *stored = rows.clone();
+                *groups = vec![crate::session::Group::new("alpha", "alpha")];
+                Ok(())
+            })
+            .unwrap();
+        let state = native_state(&["reorder"]).await;
+        let mut view = HomeView::new_for_test(
+            Some("reorder".into()),
+            crate::tmux::AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        apply_published(&mut view, &state).await;
+        view.sort_order = SortOrder::Name;
+        view.group_by = GroupByMode::Project;
+        view.flat_items = view.build_flat_items();
+        view.cursor = view
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Group { path, depth: 0, .. } if path == "x"))
+            .unwrap();
+        view.update_selected();
+        let mut capture = view.session_feed.namespace_capture_for_test();
+        view.move_row_at_cursor(1).unwrap();
+        match capture().map(|(sent, _)| sent) {
+            Some(crate::daemon::NamespaceMutation::Reorder(
+                crate::daemon::ReorderBody::Session {
+                    destination: None,
+                    headers: Some(headers),
+                    freeze: Some(freeze),
+                    ..
+                },
+            )) => {
+                assert_eq!(headers, ["alpha"]);
+                assert_eq!(
+                    freeze.repositories,
+                    Some(vec!["/tmp/y".to_string(), "/tmp/x".to_string()])
+                );
+                assert_eq!(freeze.order.len(), 2);
+            }
+            _ => panic!("expected a frozen move"),
         }
     }
 
@@ -1995,7 +2384,7 @@ mod tests {
             let undo = serde_json::json!({"target":"session","id":anchor,"profile":"reorder",
                 "source_group":anchor_group,"direction":"down","headers":["ccc","aaa","bbb"],
                 "freeze":{"order":[],"base":{"order":expected,"repositories":[]},
-                    "groups":frozen_groups}});
+                    "groups":frozen_groups,"repositories":[]}});
             let mut respond = view.session_feed.namespace_driver_for_test();
             view.undo_order_change().unwrap();
             let (status, headers, value) =

@@ -11,7 +11,7 @@ import {
 import { createPortal } from "react-dom";
 import { clampMenuPosition } from "../lib/menuPosition";
 
-// Shared hover tooltip used by the sidebar control row (grouping axis, filter, new session) and the sort picker.
+// Shared hover tooltip used by the sidebar control row (filter, new session) and other compact controls.
 export function Tooltip({
   text,
   detail,
@@ -25,7 +25,7 @@ export function Tooltip({
   /** A second, dimmer line. */
   detail?: string;
   children: ReactNode;
-  // Single-line callers (sidebar, sort picker) keep the default `whitespace-nowrap` pill.
+  // Single-line callers (sidebar controls) keep the default `whitespace-nowrap` pill.
   multiline?: boolean;
   /** Extra classes for the bubble. */
   bubbleClassName?: string;

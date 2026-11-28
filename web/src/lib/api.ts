@@ -194,9 +194,20 @@ export type SessionSettingOutcome =
   | { outcome: "committed"; mutation: SessionMutation }
   | { outcome: Exclude<SaveOutcome, "committed"> };
 
+/** The one grouping and sort every Client shows, owned by the Daemon. */
+export interface SidebarView {
+  group_by: "project" | "group";
+  sort: "custom" | "newest" | "name";
+}
+
 export interface SessionsEnvelope {
   sessions: SessionResponse[];
   workspace_ordering: string[];
+  /** Repository paths in the shared Custom order of the Repository headers. */
+  repository_order?: string[];
+  sidebar_view?: SidebarView;
+  /** Each profile's Group paths in the Custom order of its Group headers. */
+  group_order?: Record<string, string[]>;
   /** Trashed rows in the whole snapshot; the list itself omits them. */
   trashed_count?: number;
   cursor: RuntimeCursor;
@@ -297,12 +308,78 @@ export function fetchRecentProjects(): Promise<RecentProjectsEnvelope | null> {
   return fetchJson<RecentProjectsEnvelope>("/api/recent-projects");
 }
 
-export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
-  try {
-    return await fetchOk("/api/workspace-ordering", jsonInit("PUT", { order }));
-  } catch {
-    return false;
+/** An omitted list keeps its value on the Daemon; an empty one clears it. */
+export interface WorkspaceOrderingPatch {
+  order?: string[];
+  repositories?: string[];
+  /** The stored orders this write replaces; the Daemon refuses it with 409 once either changed. */
+  base?: { order: string[]; repositories: string[] };
+  /** With `base`, the sort and each named profile's Group order the write assumes; refused alike once changed. */
+  base_sort?: SidebarView["sort"];
+  base_groups?: Record<string, string[]>;
+}
+
+/** How a shared write ended: its receipt once committed, else `conflict` (refused for a stale `base`), `rejected`
+ *  (refused or not sent), or `uncertain` (no answer, a server error or no receipt, so it may have landed). */
+export type WriteResult =
+  | { receipt: RuntimeCursor; failure?: undefined }
+  | { receipt: null; failure: "conflict" | "rejected" | "uncertain" };
+
+export const NOT_SENT: WriteResult = { receipt: null, failure: "rejected" };
+
+// A write that never answers would hold polls off its value forever; past this it counts as failed.
+const WRITE_RECEIPT_DEADLINE_MS = 15_000;
+
+function writeResult(res: Response): WriteResult {
+  if (res.ok) {
+    const receipt = runtimeCursor(res);
+    return receipt ? { receipt } : { receipt: null, failure: "uncertain" };
   }
+  if (res.status === 409) return { receipt: null, failure: "conflict" };
+  return { receipt: null, failure: res.status >= 500 ? "uncertain" : "rejected" };
+}
+
+async function writeReceipt(url: string, init: RequestInit): Promise<WriteResult> {
+  try {
+    return writeResult(await fetch(url, { ...init, signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS) }));
+  } catch {
+    return { receipt: null, failure: "uncertain" };
+  }
+}
+
+export function updateWorkspaceOrdering(patch: WorkspaceOrderingPatch): Promise<WriteResult> {
+  return writeReceipt("/api/workspace-ordering", jsonInit("PUT", patch));
+}
+
+/** Arranges a Group's siblings as `siblings` lists them, then moves it one slot; a Group that did not move, or whose
+ *  profile's Group order no longer has `base`'s sibling order, or whose sort is no longer `baseSort`, is `rejected`. */
+export async function reorderGroup(
+  group: { profile: string; path: string },
+  direction: "up" | "down",
+  siblings: string[],
+  base?: string[],
+  baseSort?: SidebarView["sort"],
+): Promise<WriteResult> {
+  try {
+    const res = await fetch("/api/reorder", {
+      ...jsonInit("POST", { target: "group", group, direction, siblings, base, base_sort: baseSort }),
+      signal: AbortSignal.timeout(WRITE_RECEIPT_DEADLINE_MS),
+    });
+    const result = writeResult(res);
+    if (!res.ok) return result;
+    const outcome = (await res.json().catch(() => null)) as { status?: string } | null;
+    if (!outcome) return { receipt: null, failure: "uncertain" };
+    return outcome.status === "moved" ? result : NOT_SENT;
+  } catch {
+    return { receipt: null, failure: "uncertain" };
+  }
+}
+
+/** `base_sort` is the sort the write replaces; it is refused with `conflict` once that changed. */
+export function updateSidebarView(
+  patch: Partial<SidebarView> & { base_sort?: SidebarView["sort"] },
+): Promise<WriteResult> {
+  return writeReceipt("/api/sidebar-view", jsonInit("PATCH", patch));
 }
 
 export interface EnsureSessionResult {

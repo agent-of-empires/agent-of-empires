@@ -5300,7 +5300,7 @@ impl HomeView {
             && super::rows::split_project_view_path(path).1.is_some();
         Some(if nested_group {
             (
-                "Manage Groups Under My Groups".to_string(),
+                "Switch to Groups to Manage".to_string(),
                 format!("This is one of your Groups. {}", how("rename or delete it")),
             )
         } else {

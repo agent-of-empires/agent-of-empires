@@ -723,7 +723,10 @@ pub async fn reorder(
         ..
     } = &body
     {
-        if let Some(refused) = super::sessions::oversized_order(&freeze.order) {
+        if let Some(refused) = std::iter::once(&freeze.order)
+            .chain(&freeze.repositories)
+            .find_map(|list| super::sessions::oversized_order(list))
+        {
             return refused;
         }
     }
@@ -790,9 +793,21 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
     // A metadata-only transition may touch the entire live sibling set. Taking the
     // namespace write guard avoids selecting a partial set of per-session locks.
     let namespace = state.profile_namespace.write().await;
+    // A move conditioned on the sort holds the sort's lane, as an ordering write does, so
+    // the sort cannot change between the check and the commit.
+    let base_sort = match &body {
+        ReorderBody::Group { base_sort, .. } => *base_sort,
+        ReorderBody::Session { .. } => None,
+    };
+    let lane = match base_sort {
+        Some(_) => Some(state.sidebar_view_lane.lock().await),
+        None => None,
+    };
     if *state.canonical_health.read().await != RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    let stored_sort = state.canonical_metadata.read().await.sidebar_view.sort;
+    let sort_moved = base_sort.is_some_and(|sort| sort != stored_sort);
     let profile = match &body {
         ReorderBody::Session { profile, .. } => profile,
         ReorderBody::Group { group, .. } => &group.profile,
@@ -814,7 +829,7 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
         )),
         ReorderBody::Session { .. } => None,
     };
-    let result = if !exists {
+    let result = if !exists || sort_moved {
         Ok(ReorderOutcome::Stale)
     } else {
         let worker_state = state.clone();
@@ -847,6 +862,10 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                 }) {
                     return Ok(());
                 }
+                if matches!(&body, ReorderBody::Group { base: Some(base), .. } if !same_sibling_order(groups, base))
+                {
+                    return Ok(());
+                }
                 outcome = apply_canonical_reorder(rows, groups, &body, worker_state.cityhall_mode)?;
                 // CityHall may regroup a row but not rewrite the shared order, which it
                 // denies through `PUT /api/workspace-ordering`.
@@ -858,7 +877,12 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                     ReorderBody::Session {
                         destination: None, ..
                     }
-                    | ReorderBody::Group { .. } => frozen.map(OrderPlacement::Frozen),
+                    | ReorderBody::Group { .. } => frozen.map(|order| {
+                        OrderPlacement::Frozen(
+                            order,
+                            freeze.and_then(|freeze| freeze.repositories.clone()),
+                        )
+                    }),
                     ReorderBody::Session {
                         id,
                         source_group,
@@ -891,6 +915,7 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
             Err(error) => Err(error.into()),
         }
     };
+    drop(lane);
     drop(namespace);
     match result {
         Ok(outcome) => {
@@ -908,10 +933,34 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
     }
 }
 
+/// Whether the paths `stored` and `base` both name stand among their siblings in the same
+/// order in each.
+pub(crate) fn same_sibling_order(stored: &[crate::session::Group], base: &[String]) -> bool {
+    fn parent(path: &str) -> &str {
+        path.rsplit_once('/').map_or("", |(parent, _)| parent)
+    }
+    fn under<'a>(list: &[&'a String], dir: &str) -> Vec<&'a String> {
+        list.iter()
+            .filter(|path| parent(path) == dir)
+            .copied()
+            .collect()
+    }
+    let kept: Vec<&String> = stored
+        .iter()
+        .map(|group| &group.path)
+        .filter(|path| base.contains(path))
+        .collect();
+    let expected: Vec<&String> = base.iter().filter(|path| kept.contains(path)).collect();
+    expected
+        .iter()
+        .all(|path| under(&kept, parent(path)) == under(&expected, parent(path)))
+}
+
 /// The shared order write a moved reorder makes once its membership commits.
 enum OrderPlacement {
-    /// The order a move under Name or Newest first showed.
-    Frozen(Vec<String>),
+    /// The order a move under Name or Newest first showed, and its Repository header order
+    /// when it froze that too.
+    Frozen(Vec<String>, Option<Vec<String>>),
     /// The carried workspace at the edge of the destination it entered, in the stored order
     /// or `frozen`.
     Carry {
@@ -957,7 +1006,9 @@ impl OrderPlacement {
     /// Write the placement. The caller holds the publication guard.
     fn commit(self, state: &AppState) -> Result<()> {
         let (moved, peers, direction, frozen) = match self {
-            OrderPlacement::Frozen(order) => return commit_workspace_order(state, |_| Some(order)),
+            OrderPlacement::Frozen(order, repositories) => {
+                return commit_workspace_order(state, |_| Some(order), repositories)
+            }
             OrderPlacement::Carry {
                 moved,
                 peers,
@@ -975,36 +1026,48 @@ impl OrderPlacement {
             .iter()
             .map(|(workspace, _)| workspace.clone())
             .collect();
-        commit_workspace_order(state, |stored| {
-            let order = frozen.unwrap_or_else(|| {
-                // Only the destination's rows are placed; other unplaced rows stay newest first.
-                let placed: std::collections::HashSet<&str> =
-                    stored.iter().map(String::as_str).collect();
-                let mut order = super::sessions::merge_workspace_ordering(created, stored);
-                order.retain(|w| placed.contains(w.as_str()) || *w == moved || peers.contains(w));
-                order
-            });
-            let order =
-                place_at_entering_edge(order.clone(), &moved, &peers, direction).unwrap_or(order);
-            // Within what a Client's rewrite of the full order keeps, so that one drops nothing.
-            let bounded = super::sessions::bounded_live_order(live, order);
-            if bounded.is_none() {
-                tracing::warn!(target: "session.sync", workspace = %moved, "carried row left unplaced: the shared order is full");
-            }
-            bounded
-        })
+        commit_workspace_order(
+            state,
+            |stored| {
+                let order = frozen.unwrap_or_else(|| {
+                    // Only the destination's rows are placed; other unplaced rows stay newest
+                    // first.
+                    let placed: std::collections::HashSet<&str> =
+                        stored.iter().map(String::as_str).collect();
+                    let mut order = super::sessions::merge_workspace_ordering(created, stored);
+                    order.retain(|w| {
+                        placed.contains(w.as_str()) || *w == moved || peers.contains(w)
+                    });
+                    order
+                });
+                let order = place_at_entering_edge(order.clone(), &moved, &peers, direction)
+                    .unwrap_or(order);
+                // Within what a Client's rewrite of the full order keeps, so that one drops nothing.
+                let bounded = super::sessions::bounded_live_order(live, order);
+                if bounded.is_none() {
+                    tracing::warn!(target: "session.sync", workspace = %moved, "carried row left unplaced: the shared order is full");
+                }
+                bounded
+            },
+            None,
+        )
     }
 }
 
-/// Replace the stored row order with `next(stored)`, or keep it on None. A failed write
-/// degrades the runtime, since the stored order is then unknown.
+/// Replace the stored row order with `next(stored)`, or keep it on None, and the Repository
+/// header order with `repositories` when given. A failed write degrades the runtime, since
+/// the stored order is then unknown.
 fn commit_workspace_order(
     state: &AppState,
     next: impl FnOnce(&[String]) -> Option<Vec<String>>,
+    repositories: Option<Vec<String>>,
 ) -> Result<()> {
     let committed = crate::session::update_workspace_ordering(|ordering| {
         if let Some(order) = next(&ordering.order) {
             ordering.order = order;
+        }
+        if let Some(repositories) = repositories {
+            ordering.repositories = repositories;
         }
         Ok(())
     });
@@ -1019,7 +1082,10 @@ fn commit_workspace_order(
             return Err(error);
         }
     };
-    state.canonical_metadata.blocking_write().workspace_ordering = ordering.order;
+    let mut metadata = state.canonical_metadata.blocking_write();
+    metadata.workspace_ordering = ordering.order;
+    metadata.repository_order = ordering.repositories;
+    drop(metadata);
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

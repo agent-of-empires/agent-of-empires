@@ -104,8 +104,8 @@ test.describe("desktop rows", () => {
       await openDesktop(page, sessions, {
         ordering: order.map((title) => workspaceId(sessions.find((s) => s.title === title)!)),
       });
-      // #1418: drag needs manual sort, which must stay the default.
-      await expect(page.locator("[data-testid='sidebar-view-toggle']")).toHaveAttribute("data-sort-mode", "manual");
+      // #1418: Custom, where a drag lands where it is dropped, must stay the default.
+      await expect(page.locator("[data-testid='sidebar-view-toggle']")).toHaveAttribute("data-sort", "custom");
       await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(order);
     }
   });
@@ -193,17 +193,20 @@ test.describe("desktop rows", () => {
   });
 
   test("dragging a row onto a different repo group is a no-op", async ({ page }) => {
-    // Each repo has its own SortableContext, so a cross-group drop never reaches the reorder handler.
+    // A drop past the repo's own rows targets none of them, so it is not a move to the nearest.
     const sessions: MockSessionInput[] = [
       { id: "a1", title: "alpha-a", project_path: "/tmp/repo-a", branch: "feat/1" },
       { id: "a2", title: "beta-a", project_path: "/tmp/repo-a", branch: "feat/2" },
       { id: "b1", title: "alpha-b", project_path: "/tmp/repo-b", branch: "feat/1" },
       { id: "b2", title: "beta-b", project_path: "/tmp/repo-b", branch: "feat/2" },
     ];
-    const handle = await openDesktop(page, sessions, { ordering: sessions.map(workspaceId) });
+    const handle = await openDesktop(page, sessions, {
+      ordering: sessions.map(workspaceId),
+      repositoryOrder: ["/tmp/repo-a", "/tmp/repo-b"],
+    });
     const wrappers = page.locator(WRAPPERS);
     await expect(wrappers).toHaveCount(4);
-    await dragRow(page, wrappers.nth(1), wrappers.nth(2));
+    await dragRow(page, wrappers.nth(0), wrappers.nth(2));
     await expectNoOrderingPut(page, handle, 300);
     expect(await readVisibleSessionTitles(page)).toEqual(["alpha-a", "beta-a", "alpha-b", "beta-b"]);
   });
@@ -286,7 +289,7 @@ test.describe("touch rows", () => {
   });
 });
 
-// Group order is client-only (localStorage); the whole real header is the drag activator (#2207).
+// Repository header order is the shared Custom order (#5896); the whole real header is the drag activator (#2207).
 test.describe("group headers", () => {
   const twoRepos: MockSessionInput[] = [
     { id: "s-a", title: "alpha-session", project_path: "/tmp/repo-alpha", branch: "feat/a" },
@@ -322,8 +325,22 @@ test.describe("group headers", () => {
     await expect(dropped).toHaveAttribute("aria-expanded", "false");
   });
 
+  test("the Scratch header stays put: it offers no drag", async ({ page }) => {
+    const scratch = {
+      id: "s-x",
+      title: "scratch-session",
+      project_path: "/tmp/scratch",
+      branch: null,
+      fields: { scratch: true },
+    };
+    await openDesktop(page, [...twoRepos, scratch]);
+    await expect(page.getByText("Scratch", { exact: true })).toBeVisible();
+    await expect(draggable(page)).toHaveCount(2);
+    await expect.poll(() => groupNames(page)).toEqual(["repo-beta", "repo-alpha", "Scratch"]);
+  });
+
   test("drag a group header to reorder, order persists across reload", async ({ page }) => {
-    await openDesktop(page, twoRepos);
+    const handle = await openDesktop(page, twoRepos, { persistPutOrdering: true });
     await expect(draggable(page)).toHaveCount(2);
     const before = await groupNames(page);
     expect(before).toHaveLength(2);
@@ -338,8 +355,168 @@ test.describe("group headers", () => {
 
     const expected = [before[1], before[0]];
     await expect.poll(() => groupNames(page), { timeout: 4_000 }).toEqual(expected);
+    expect(handle.puts).toEqual([{ repositories: ["/tmp/repo-alpha", "/tmp/repo-beta"] }]);
     await page.reload();
     await expect(draggable(page)).toHaveCount(2);
     await expect.poll(() => groupNames(page), { timeout: 4_000 }).toEqual(expected);
+  });
+});
+
+// Group headers follow each profile's `groups.json` order under Custom; one request arranges the siblings.
+test.describe("Groups headers", () => {
+  const grouped: MockSessionInput[] = ["alpha", "beta", "gamma"].map((group) => ({
+    id: `s-${group}`,
+    title: `${group}-session`,
+    project_path: "/tmp/repo",
+    branch: `feat/${group}`,
+    group,
+  }));
+  const groupOrder = { default: ["alpha", "beta", "gamma"] };
+  const headers = (page: Page) => page.locator("[data-testid='sidebar-group-header']");
+  const names = (page: Page) =>
+    page.evaluate(() =>
+      Array.from(document.querySelectorAll<HTMLElement>("[data-testid='sidebar-group-header']"))
+        .map((h) => h.querySelector("span[title]")?.textContent?.trim() ?? "")
+        .filter(Boolean),
+    );
+  const dragHeader = async (page: Page, from: number, to: number) => {
+    const source = (await headers(page).nth(from).boundingBox())!;
+    const target = (await headers(page).nth(to).boundingBox())!;
+    await page.mouse.move(source.x + 40, source.y + source.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(target.x + 40, target.y + target.height / 3, { steps: 12 });
+    await page.mouse.up();
+  };
+
+  test("under Custom a header drag moves the Group in one request, and persists", async ({ page }) => {
+    const handle = await openDesktop(page, grouped, { groupOrder, view: { group_by: "group", sort: "custom" } });
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
+    await expect(headers(page).and(page.locator("[data-draggable='true']"))).toHaveCount(3);
+
+    await dragHeader(page, 2, 0);
+    await expect.poll(() => names(page), { timeout: 4_000 }).toEqual(["gamma", "alpha", "beta"]);
+    const step = {
+      target: "group",
+      group: { profile: "default", path: "gamma" },
+      direction: "up",
+      siblings: ["alpha", "gamma", "beta"],
+    };
+    await expect.poll(() => handle.reorders, { timeout: 4_000 }).toEqual([step]);
+    expect(handle.puts).toEqual([]);
+    await page.reload();
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["gamma", "alpha", "beta"]);
+  });
+
+  test("under Repository a nested Group header moves among the Groups of its repository", async ({ page }) => {
+    const handle = await openDesktop(page, grouped, { groupOrder });
+    const nested = page.getByTestId("sidebar-nested-subgroup").locator("[data-testid='sidebar-group-header']");
+    await expect(nested).toHaveCount(3);
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["repo", "alpha", "beta", "gamma"]);
+    await dragHeader(page, 1, 3);
+    await expect.poll(() => names(page), { timeout: 4_000 }).toEqual(["repo", "beta", "gamma", "alpha"]);
+    const step = {
+      target: "group",
+      group: { profile: "default", path: "alpha" },
+      direction: "down",
+      siblings: ["beta", "alpha", "gamma"],
+    };
+    await expect.poll(() => handle.reorders, { timeout: 4_000 }).toEqual([step]);
+  });
+
+  test("a tall Group header dropped on its sibling moves there, whatever lies under the lifted block", async ({
+    page,
+  }) => {
+    const tall: MockSessionInput[] = [
+      ...[1, 2, 3, 4, 5].map((n) => ({
+        id: `s-a${n}`,
+        title: `alpha-${n}`,
+        project_path: "/tmp/repo",
+        branch: `feat/a${n}`,
+        group: "alpha",
+      })),
+      { id: "s-b", title: "beta-session", project_path: "/tmp/repo", branch: "feat/b", group: "beta" },
+      { id: "s-o", title: "other-session", project_path: "/tmp/other", branch: "feat/o", group: "other" },
+    ];
+    const handle = await openDesktop(page, tall, {
+      groupOrder: { default: ["alpha", "beta", "other"] },
+      repositoryOrder: ["/tmp/repo", "/tmp/other"],
+    });
+    const nested = page.getByTestId("sidebar-nested-subgroup").locator("[data-testid='sidebar-group-header']");
+    await expect(nested).toHaveCount(3);
+    const source = (await nested.nth(0).boundingBox())!;
+    const target = (await nested.nth(1).boundingBox())!;
+    await page.mouse.move(source.x + 40, source.y + source.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(target.x + 40, target.y + target.height, { steps: 12 });
+    await page.mouse.up();
+    await expect
+      .poll(() => handle.reorders, { timeout: 4_000 })
+      .toEqual([
+        {
+          target: "group",
+          group: { profile: "default", path: "alpha" },
+          direction: "down",
+          // other sits under /tmp/other, so this Repository's move leaves its slot alone.
+          siblings: ["alpha", "beta"],
+        },
+      ]);
+  });
+
+  test("Ungrouped leads the Groups under Groups, as selection ranges count it", async ({ page }) => {
+    await openDesktop(
+      page,
+      [{ id: "s-u", title: "loose-session", project_path: "/tmp/repo", branch: "feat/u" }, ...grouped],
+      {
+        groupOrder,
+        view: { group_by: "group", sort: "custom" },
+      },
+    );
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["Ungrouped", "alpha", "beta", "gamma"]);
+  });
+
+  test("under Newest first a header drag switches to Custom from the headers on screen, then moves it", async ({
+    page,
+  }) => {
+    const handle = await openDesktop(page, grouped, { groupOrder, view: { group_by: "group", sort: "newest" } });
+    // Each Group's session is newer than the one before it.
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["gamma", "beta", "alpha"]);
+    await dragHeader(page, 2, 0);
+    await expect.poll(() => handle.viewPatches, { timeout: 4_000 }).toEqual([{ sort: "custom", base_sort: "newest" }]);
+    await expect.poll(() => names(page)).toEqual(["alpha", "gamma", "beta"]);
+    await expect(page.getByText("Switched to Custom")).toBeVisible();
+    expect(handle.reorders.at(-1)).toMatchObject({ group: { path: "alpha" }, direction: "up" });
+    await page.reload();
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "gamma", "beta"]);
+  });
+
+  test("a CityHall client moves a Group header onto its sibling in one request", async ({ page }) => {
+    const handle = await openDesktop(page, grouped, {
+      groupOrder,
+      cityhall: true,
+      view: { group_by: "group", sort: "custom" },
+    });
+    await waitForResponseBody(page, "/api/about");
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
+    await expect(page.locator(WRAPPERS)).toHaveCount(0);
+    await dragHeader(page, 2, 1);
+    await expect.poll(() => names(page), { timeout: 4_000 }).toEqual(["alpha", "gamma", "beta"]);
+    await expect
+      .poll(() => handle.reorders, { timeout: 4_000 })
+      .toEqual([
+        {
+          target: "group",
+          group: { profile: "default", path: "gamma" },
+          direction: "up",
+          siblings: ["alpha", "beta", "gamma"],
+        },
+      ]);
+    expect(handle.puts).toEqual([]);
+  });
+
+  test("a read-only viewer gets no draggable Group header", async ({ page }) => {
+    await openDesktop(page, grouped, { groupOrder, readOnly: true, view: { group_by: "group", sort: "custom" } });
+    await waitForResponseBody(page, "/api/about");
+    await expect.poll(() => names(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
+    await expect(page.locator("[data-testid='sidebar-group-header'][data-draggable='true']")).toHaveCount(0);
   });
 });

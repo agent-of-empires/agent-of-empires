@@ -1,54 +1,53 @@
 import type { ReactNode } from "react";
 import { House } from "lucide-react";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
-import type { SidebarAxis } from "../../lib/sidebarAxis";
+import type { SidebarGroupBy, SidebarSort } from "../../lib/sidebarView";
 import { SidebarViewMenu } from "./SidebarViewMenu";
-import type { SidebarSortMode } from "../../lib/sidebarSort";
 import { toneTextClass, type PluginFacetSpec, type PluginSortSpec } from "../../lib/pluginUi";
 
 type PluginSortRef = { pluginId: string; entryId: string };
 
-/** Heading above the list; the picker labels its axes itself. */
-const AXIS_HEADING: Record<SidebarAxis, string> = {
-  repo: "Sessions",
-  org: "Sessions",
-  group: "Groups",
-  "repo+group": "Sessions",
-  status: "Status",
-};
+/** Heading above the list; the menu labels its groupings itself. */
+const HEADING: Record<SidebarGroupBy, string> = { project: "Sessions", group: "Groups" };
 
 export function SidebarToolbar({
   compact,
-  axis,
-  onAxisChange,
-  sortMode,
-  onSortModeChange,
+  groupBy,
+  onGroupByChange,
+  sort,
+  onSortChange,
   pluginSorts,
   pluginSortRef,
   onPluginSortChange,
+  viewLocked,
   hasFacets,
   facetsActive,
   facetOpen,
   onToggleFacets,
   filterOpen,
+  filterActive,
   onToggleFilter,
   headingAnchored = false,
   phoneMenu,
   onHome,
 }: {
   compact: boolean;
-  axis: SidebarAxis;
-  onAxisChange: (axis: SidebarAxis) => void;
-  sortMode: SidebarSortMode;
-  onSortModeChange: (mode: SidebarSortMode) => void;
+  groupBy: SidebarGroupBy;
+  onGroupByChange: (groupBy: SidebarGroupBy) => void;
+  sort: SidebarSort;
+  onSortChange: (sort: SidebarSort) => void;
   pluginSorts: PluginSortSpec[];
   pluginSortRef: PluginSortRef | null;
   onPluginSortChange: (ref: PluginSortRef) => void;
+  /** A read-only viewer or a CityHall client cannot change the shared view. */
+  viewLocked?: boolean;
   hasFacets: boolean;
   facetsActive: boolean;
   facetOpen: boolean;
   onToggleFacets: () => void;
   filterOpen: boolean;
+  /** A filter applies while its panel is closed, such as Needs you. */
+  filterActive: boolean;
   onToggleFilter: () => void;
   /** The title carries the tour's sidebar step, for a list that fills the screen. */
   headingAnchored?: boolean;
@@ -57,7 +56,7 @@ export function SidebarToolbar({
   /** A phone's drawer titles itself with a Home button, back to the landing page. */
   onHome?: () => void;
 }) {
-  const axisHeading = AXIS_HEADING[axis];
+  const heading = HEADING[groupBy];
   return (
     <div
       className={`${compact ? "px-1" : "pl-4 pr-2"} pt-2.5 pb-1.5 max-md:pt-3 max-md:pb-2 max-md:pr-3 max-md:sticky max-md:top-0 max-md:z-10 max-md:bg-surface-950 flex items-center`}
@@ -74,7 +73,7 @@ export function SidebarToolbar({
               onHome ? "max-md:hidden" : ""
             }`}
           >
-            {axisHeading}
+            {heading}
           </span>
           {onHome && (
             <span className="md:hidden flex-1 flex">
@@ -90,14 +89,16 @@ export function SidebarToolbar({
             </span>
           )}
           <SidebarViewMenu
-            axis={axis}
-            onAxisChange={onAxisChange}
-            sortMode={sortMode}
-            onSortModeChange={onSortModeChange}
+            groupBy={groupBy}
+            onGroupByChange={onGroupByChange}
+            sort={sort}
+            onSortChange={onSortChange}
             pluginSorts={pluginSorts}
             pluginSortRef={pluginSortRef}
             onPluginSortChange={onPluginSortChange}
+            locked={viewLocked}
             filterOpen={filterOpen}
+            filterActive={filterActive}
             onToggleFilter={onToggleFilter}
             hasFacets={hasFacets}
             facetsActive={facetsActive}

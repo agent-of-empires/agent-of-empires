@@ -1,4 +1,4 @@
-// #2401: a plugin sort-key appears in the sort picker and reorders rows by the
+// #2401: a plugin sort-key appears in the view menu and reorders rows by the
 // referenced row-column's sort_value; a plugin filter-facet renders a control
 // that filters by filter_values, combined with the text filter. The comparator
 // math and the fallback when entries vanish live in the unit tests.
@@ -56,6 +56,7 @@ const GLOBAL_ENTRIES = [
       options: [
         { value: "running", label: "Running", tone: "success" },
         { value: "idle", label: "Idle" },
+        { value: "failed", label: "Failed" },
       ],
     },
   },
@@ -106,20 +107,21 @@ test.describe("Plugin sort-key and filter-facet slots (#2401)", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    // Manual order first.
+    // Custom order first.
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 8000 }).toEqual(["low-ws", "high-ws", "mid-ws"]);
 
-    // Open the picker; the plugin option appears below the built-ins.
+    // Open the menu; the plugin option appears below the built-ins, marked as this browser's alone.
     await page.locator(TOGGLE).click();
-    await page.locator("[data-testid='sidebar-sort-option-plugin-by-metric']").click();
-    await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", "plugin");
+    const option = page.locator("[data-testid='sidebar-sort-option-plugin-by-metric']");
+    await expect(option).toContainText("this browser");
+    await option.click();
+    await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort", "plugin");
 
     // Rows now order by sort_value descending: 100, 50, 1.
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["high-ws", "mid-ws", "low-ws"]);
 
-    // The plugin sort is ephemeral: not persisted to localStorage.
-    const stored = await page.evaluate(() => window.localStorage.getItem("aoe-sidebar-sort-mode"));
-    expect(stored).not.toBe("plugin");
+    // A row drag under a plugin sort does nothing.
+    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(0);
 
     // A plugin filter-facet filters rows by filter_values.
     await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(3, { timeout: 8000 });
@@ -138,5 +140,10 @@ test.describe("Plugin sort-key and filter-facet slots (#2401)", () => {
     // Deselecting restores all three rows.
     await page.locator("[data-testid='sidebar-facet-option-by-status-running']").click();
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toHaveLength(3);
+
+    // A facet no row matches says so without pointing at Needs you.
+    await page.locator("[data-testid='sidebar-facet-option-by-status-failed']").click();
+    await expect(page.getByText("No matching sessions")).toBeVisible();
+    await expect(page.getByText("Nothing needs you")).toHaveCount(0);
   });
 });

@@ -1,8 +1,8 @@
 import type { Workspace } from "../../lib/types";
 import {
   sidebarGroupHasLiveWorkspace,
+  UNGROUPED_GROUP_ID,
   type NestedSidebarGroup,
-  type OrgNestedGroup,
   type SidebarGroup,
   type SidebarWorkspaceView,
 } from "../../lib/sidebarGroups";
@@ -18,19 +18,30 @@ function workspaceMatchesQuery(ws: Workspace, q: string): boolean {
   );
 }
 
-/** A row survives when it or any enclosing header name matches `q`, and it passes the facet filter. */
-export function makeRowFilter(q: string, matchesFacets: (ws: Workspace) => boolean) {
+/** A row survives when it or any enclosing header name matches `q`, and it passes the facet and Needs you
+ *  filters. */
+export function makeRowFilter(
+  q: string,
+  matchesFacets: (ws: Workspace) => boolean,
+  needsYou?: (ws: Workspace) => boolean,
+) {
   return (v: SidebarWorkspaceView, ...groupNames: string[]) =>
     (!q || workspaceMatchesQuery(v.workspace, q) || groupNames.some((n) => n.toLowerCase().includes(q))) &&
-    matchesFacets(v.workspace);
+    matchesFacets(v.workspace) &&
+    (!needsYou || needsYou(v.workspace));
 }
 
 type RowFilter = ReturnType<typeof makeRowFilter>;
 
-/** Filters each group's rows and drops groups left empty. */
+/** Filters each group's rows and drops groups left empty. Under a repository the ungrouped rows have no header
+ *  of their own, so no "Ungrouped" name to match. */
 function filterLevel<G extends SidebarGroup>(groups: G[], keep: RowFilter, ...parentNames: string[]): G[] {
   return groups
-    .map((g) => ({ ...g, workspaces: g.workspaces.filter((v) => keep(v, g.displayName, ...parentNames)) }))
+    .map((g) => {
+      const names =
+        parentNames.length > 0 && g.id === UNGROUPED_GROUP_ID ? parentNames : [g.displayName, ...parentNames];
+      return { ...g, workspaces: g.workspaces.filter((v) => keep(v, ...names)) };
+    })
     .filter((g) => g.workspaces.length > 0);
 }
 
@@ -44,36 +55,39 @@ export function filterNested(groups: NestedSidebarGroup[], keep: RowFilter): Nes
     .filter((ng) => ng.subgroups.length > 0);
 }
 
-export function filterOrg(groups: OrgNestedGroup[], keep: RowFilter): OrgNestedGroup[] {
-  return groups
-    .map((og) => ({ org: og.org, repos: filterLevel(og.repos, keep, og.org.displayName) }))
-    .filter((og) => og.repos.length > 0);
-}
-
-/** The subgroups a nested axis renders: a collapsed repo hides every subgroup under it. */
+/** The subgroups the Repository grouping renders: a collapsed repo hides every subgroup under it, and its
+ *  ungrouped rows have no header to collapse them. */
 export function visibleSubgroups(groups: NestedSidebarGroup[], expandAll: boolean): SidebarGroup[] {
-  return groups.flatMap((ng) => (expandAll || !ng.repo.collapsed ? ng.subgroups : []));
+  return groups.flatMap((ng) =>
+    expandAll || !ng.repo.collapsed
+      ? ng.subgroups.map((sg) => (sg.id === UNGROUPED_GROUP_ID && sg.collapsed ? { ...sg, collapsed: false } : sg))
+      : [],
+  );
 }
 
-/** The repos an org axis renders: a collapsed org hides every repo under it. */
-export function visibleOrgRepos(groups: OrgNestedGroup[], expandAll: boolean): SidebarGroup[] {
-  return groups.flatMap((og) => (expandAll || !og.org.collapsed ? og.repos : []));
+/** Footer order: archived rows newest archived first, then snoozed rows soonest wake first, then the rest newest
+ *  accessed first. A snooze time is when it wakes, so it never competes with an archive time. */
+function sinkRank(ws: Workspace): [bucket: number, key: number] {
+  const times = (pick: (s: Workspace["sessions"][number]) => string | null | undefined) =>
+    ws.sessions.flatMap((s) => {
+      const ms = Date.parse(pick(s) ?? "");
+      return Number.isFinite(ms) ? [ms] : [];
+    });
+  // An empty list gives -Infinity from max and Infinity from min, so an unparsable time sorts last.
+  if (ws.sessions.some((s) => s.archived_at != null)) return [0, -Math.max(...times((s) => s.archived_at))];
+  if (ws.sessions.some((s) => s.snoozed_until != null)) return [1, Math.min(...times((s) => s.snoozed_until))];
+  return [2, -Math.max(...times((s) => s.last_accessed_at))];
 }
 
-function sinkTimeMs(ws: Workspace): number {
-  let best = Number.NEGATIVE_INFINITY;
-  for (const s of ws.sessions) {
-    const ts = s.archived_at ?? s.snoozed_until ?? s.last_accessed_at;
-    const ms = ts ? Date.parse(ts) : Number.NaN;
-    if (ms > best) best = ms;
-  }
-  return best;
+function compareSunk(a: Workspace, b: Workspace): number {
+  const [ab, ak] = sinkRank(a);
+  const [bb, bk] = sinkRank(b);
+  return ab - bb || (ak === bk ? 0 : ak < bk ? -1 : 1);
 }
 
-// Deduped by workspace: the status axis slices one workspace into a bucket per status, so the
-// footer lists it once with every archived session from those buckets. First bucket wins for
-// the row identity. Rows sort newest sunk first across groups, whatever the sidebar sort, matching
-// the TUI's Archived section.
+// Deduped by workspace: Groups slices one workspace into a Group per session group, so the
+// footer lists it once with every archived session from those slices. First slice wins for
+// the row identity. Rows follow `compareSunk` across groups, whatever the sidebar sort.
 export const sunkViews = (groups: SidebarGroup[]) => {
   const byId = new Map<string, SidebarWorkspaceView>();
   for (const g of groups) {
@@ -94,7 +108,7 @@ export const sunkViews = (groups: SidebarGroup[]) => {
       }
     }
   }
-  return [...byId.values()].sort((a, b) => sinkTimeMs(b.workspace) - sinkTimeMs(a.workspace) || 0);
+  return [...byId.values()].sort((a, b) => compareSunk(a.workspace, b.workspace));
 };
 
 /** Rendered row keys in render order, so Shift+click ranges only span visible rows. `allGroups`

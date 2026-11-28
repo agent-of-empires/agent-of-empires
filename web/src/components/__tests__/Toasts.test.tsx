@@ -142,6 +142,18 @@ describe("ToastProvider", () => {
     expect(screen.queryByText("Saved again")).toBeNull();
   });
 
+  it("keeps an info action toast whose action returns false, and lets its caller dismiss it", () => {
+    renderProvider();
+    let dismiss: (() => void) | undefined;
+    act(() => {
+      dismiss = toastBus.handler?.infoAction("Switched to Custom", "Undo", () => false);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    expect(screen.queryByText("Switched to Custom")).toBeTruthy();
+    act(() => dismiss?.());
+    expect(screen.queryByText("Switched to Custom")).toBeNull();
+  });
+
   it("removes a toast after its 6s lifetime elapses", () => {
     renderProvider();
     act(() => toastBus.handler?.info("temporary"));

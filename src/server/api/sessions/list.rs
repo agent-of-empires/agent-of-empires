@@ -529,6 +529,24 @@ impl serde::Serialize for ScopedSessions<'_> {
     }
 }
 
+/// Each profile's Group paths in `groups.json` order, the Custom order of its Group headers.
+struct GroupOrder<'a>(&'a [crate::daemon::ProfileSnapshot]);
+
+impl serde::Serialize for GroupOrder<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|profile| {
+            (
+                &profile.name,
+                profile
+                    .groups
+                    .iter()
+                    .map(|group| &group.path)
+                    .collect::<Vec<_>>(),
+            )
+        }))
+    }
+}
+
 pub(crate) struct SessionsView {
     snapshot: Arc<crate::server::runtime::PublishedSnapshot>,
     filter: SessionFilter,
@@ -542,6 +560,7 @@ impl serde::Serialize for SessionsView {
             workspace_ordering: &'a [String],
             repository_order: &'a [String],
             sidebar_view: crate::session::config::SidebarView,
+            group_order: GroupOrder<'a>,
             trashed_count: usize,
         }
         let rows = &self.snapshot.value.contents.sessions;
@@ -553,6 +572,7 @@ impl serde::Serialize for SessionsView {
             workspace_ordering: &self.snapshot.value.contents.workspace_ordering,
             repository_order: &self.snapshot.value.contents.repository_order,
             sidebar_view: self.snapshot.value.contents.sidebar_view,
+            group_order: GroupOrder(&self.snapshot.value.contents.profiles),
             trashed_count: rows.iter().filter(|row| row.trashed_at.is_some()).count(),
         }
         .serialize(serializer)
@@ -789,13 +809,19 @@ pub async fn update_workspace_ordering(
         return refused;
     }
     // A request dropped while it waits for the guards leaves nothing behind; once it holds
-    // them, the spawned commit owns them through reconciliation.
+    // them, the spawned commit owns them through reconciliation. One conditioned on the sort
+    // holds the sort's lane, taken before publication as a sort write takes it.
     let namespace = state.profile_namespace.clone().read_owned().await;
+    let lane = match body.base_sort {
+        Some(_) => Some(state.sidebar_view_lane.clone().lock_owned().await),
+        None => None,
+    };
     let publication = state.publication.clone().write_owned().await;
     match tokio::spawn(commit_workspace_ordering(
         state,
         body,
         namespace,
+        lane,
         publication,
     ))
     .await
@@ -811,16 +837,30 @@ async fn commit_workspace_ordering(
     state: Arc<AppState>,
     body: crate::daemon::WorkspaceOrderingPatch,
     namespace: tokio::sync::OwnedRwLockReadGuard<()>,
+    lane: Option<tokio::sync::OwnedMutexGuard<()>>,
     publication: tokio::sync::OwnedRwLockWriteGuard<()>,
 ) -> axum::response::Response {
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    if let Some(base) = &body.base {
+    {
         let metadata = state.canonical_metadata.read().await;
-        if base.order != metadata.workspace_ordering
-            || base.repositories != metadata.repository_order
-        {
+        let stale_orders = body.base.as_ref().is_some_and(|base| {
+            base.order != metadata.workspace_ordering
+                || base.repositories != metadata.repository_order
+        });
+        let stale_sort = body
+            .base_sort
+            .is_some_and(|sort| sort != metadata.sidebar_view.sort);
+        let stale_groups = body.base_groups.iter().flatten().any(|(name, paths)| {
+            let stored = metadata
+                .profiles
+                .iter()
+                .find(|profile| &profile.name == name)
+                .map_or(&[][..], |profile| &profile.groups[..]);
+            !crate::server::api::groups::same_sibling_order(stored, paths)
+        });
+        if stale_orders || stale_sort || stale_groups {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -870,6 +910,7 @@ async fn commit_workspace_ordering(
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.runtime.request_publish();
     drop(publication);
+    drop(lane);
     drop(namespace);
     let snapshot = match state.runtime.publish(&state).await {
         Ok(snapshot) => snapshot,
@@ -915,6 +956,17 @@ async fn commit_sidebar_view(
 ) -> axum::response::Response {
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    // Sort writes hold the lane, so the stored sort cannot change before this one commits.
+    let stored_sort = state.canonical_metadata.read().await.sidebar_view.sort;
+    if patch.base_sort.is_some_and(|sort| sort != stored_sort) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "message": "The sort changed elsewhere; try again on the refreshed list"
+            })),
+        )
+            .into_response();
     }
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_app_state(|app| {
@@ -985,8 +1037,9 @@ mod sidebar_view_tests {
             (
                 SidebarViewPatch {
                     group_by: Some(GroupByMode::Group),
-                    sort: None,
+                    ..Default::default()
                 },
+                StatusCode::OK,
                 SidebarView {
                     group_by: GroupByMode::Group,
                     sort: SortOrder::Custom,
@@ -994,20 +1047,35 @@ mod sidebar_view_tests {
             ),
             (
                 SidebarViewPatch {
-                    group_by: None,
                     sort: Some(SortOrder::Newest),
+                    base_sort: Some(SortOrder::Custom),
+                    ..Default::default()
                 },
+                StatusCode::OK,
+                SidebarView {
+                    group_by: GroupByMode::Group,
+                    sort: SortOrder::Newest,
+                },
+            ),
+            // A write built on a sort since replaced is refused.
+            (
+                SidebarViewPatch {
+                    sort: Some(SortOrder::Name),
+                    base_sort: Some(SortOrder::Custom),
+                    ..Default::default()
+                },
+                StatusCode::CONFLICT,
                 SidebarView {
                     group_by: GroupByMode::Group,
                     sort: SortOrder::Newest,
                 },
             ),
         ];
-        for (patch, expected) in steps {
+        for (patch, status, expected) in steps {
             let response = update_sidebar_view(State(state.clone()), Ok(Json(patch)))
                 .await
                 .into_response();
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), status);
             let snapshot = state.runtime.publish(&state).await.unwrap();
             assert_eq!(snapshot.value.contents.sidebar_view, expected);
             assert_eq!(
@@ -1083,6 +1151,55 @@ mod sidebar_view_tests {
         }
     }
 
+    /// An ordering write conditioned on the sort waits for a sort write in flight, so it
+    /// checks the sort that write leaves.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_ordering_write_on_the_sort_waits_for_a_sort_write() {
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            crate::session::update_app_state(|_| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let patch = SidebarViewPatch {
+            sort: Some(SortOrder::Name),
+            ..Default::default()
+        };
+        let sort = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while state.sidebar_view_lane.try_lock().is_ok() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the sort write never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let ordering = tokio::spawn(update_workspace_ordering(
+            State(state.clone()),
+            Ok(Json(crate::daemon::WorkspaceOrderingPatch {
+                order: Some(Vec::new()),
+                base_sort: Some(SortOrder::Custom),
+                ..Default::default()
+            })),
+        ));
+        tokio::task::yield_now().await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(sort.await.unwrap().into_response().status(), StatusCode::OK);
+        assert_eq!(
+            ordering.await.unwrap().into_response().status(),
+            StatusCode::CONFLICT
+        );
+    }
+
     /// A stalled write holds no publication guard, and once admitted it finishes after its
     /// request is dropped. Health lost during the write still invalidates older reloads.
     #[tokio::test]
@@ -1105,8 +1222,8 @@ mod sidebar_view_tests {
             held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
 
             let patch = SidebarViewPatch {
-                group_by: None,
                 sort: Some(SortOrder::Name),
+                ..Default::default()
             };
             let write = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
             let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1165,8 +1282,8 @@ mod sidebar_view_tests {
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         let exclusive = state.profile_namespace.write().await;
         let patch = SidebarViewPatch {
-            group_by: None,
             sort: Some(SortOrder::Name),
+            ..Default::default()
         };
         let write = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
         let ordering = tokio::spawn(update_workspace_ordering(
@@ -1448,6 +1565,47 @@ mod workspace_ordering_tests {
 
     #[tokio::test]
     #[serial]
+    async fn listing_publishes_each_profiles_group_order() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        state.canonical_metadata.write().await.profiles = ["work", "home"]
+            .into_iter()
+            .map(|name| crate::daemon::ProfileSnapshot {
+                name: name.into(),
+                description: None,
+                groups: ["zeta", "alpha/b", "alpha"]
+                    .into_iter()
+                    .map(|path| crate::session::Group::new(path, path))
+                    .take(if name == "work" { 3 } else { 1 })
+                    .collect(),
+                projects: Vec::new(),
+            })
+            .collect();
+        state.runtime.publish(&state).await?;
+        let response = list_sessions(
+            State(state),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
+        let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            envelope.group_order,
+            std::collections::BTreeMap::from([
+                ("home".into(), vec!["zeta".into()]),
+                (
+                    "work".into(),
+                    vec!["zeta".into(), "alpha/b".into(), "alpha".into()]
+                ),
+            ])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn unchanged_listing_answers_not_modified_without_a_body() -> anyhow::Result<()> {
         use axum::http::{header, HeaderMap, HeaderValue};
         let temp = tempdir()?;
@@ -1572,10 +1730,45 @@ mod workspace_ordering_tests {
         }
         assert_eq!(snapshot.contents.placed_workspaces, placed);
 
-        // A write built on an order since replaced is refused; one on the stored order lands.
-        for (base, expected) in [
-            (Vec::new(), StatusCode::CONFLICT),
-            (placed.clone(), StatusCode::OK),
+        state.canonical_metadata.write().await.profiles = vec![crate::daemon::ProfileSnapshot {
+            name: "work".into(),
+            description: None,
+            groups: ["x", "y"]
+                .into_iter()
+                .map(|path| crate::session::Group::new(path, path))
+                .collect(),
+            projects: Vec::new(),
+        }];
+        let groups = |paths: &[&str]| {
+            Some(std::collections::BTreeMap::from([(
+                "work".to_string(),
+                paths.iter().map(|p| p.to_string()).collect(),
+            )]))
+        };
+        // A write built on an order, sort or Group order since replaced is refused; one on
+        // the stored values lands, whatever Groups only one side names.
+        use crate::session::config::SortOrder;
+        let stored_sort = state.canonical_metadata.read().await.sidebar_view.sort;
+        let other_sort = if stored_sort == SortOrder::Name {
+            SortOrder::Newest
+        } else {
+            SortOrder::Name
+        };
+        for (base, base_sort, base_groups, expected) in [
+            (Vec::new(), None, None, StatusCode::CONFLICT),
+            (placed.clone(), Some(other_sort), None, StatusCode::CONFLICT),
+            (
+                placed.clone(),
+                None,
+                groups(&["y", "x"]),
+                StatusCode::CONFLICT,
+            ),
+            (
+                placed.clone(),
+                Some(stored_sort),
+                groups(&["x", "new", "y"]),
+                StatusCode::OK,
+            ),
         ] {
             let patch = crate::daemon::WorkspaceOrderingPatch {
                 order: Some(Vec::new()),
@@ -1584,6 +1777,8 @@ mod workspace_ordering_tests {
                     order: base,
                     repositories: vec!["/repo/b".into(), "/repo/a".into()],
                 }),
+                base_sort,
+                base_groups,
             };
             let response = update_workspace_ordering(State(state.clone()), Ok(Json(patch)))
                 .await

@@ -3,7 +3,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
 
-import { dragEnded, dragStarted, newDragClickGuard, useReleaseDragOnUnmount, useSuppressClickAfterDrag } from "./dnd";
+import type { CollisionDetection } from "@dnd-kit/core";
+
+import {
+  dragEnded,
+  dragStarted,
+  newDragClickGuard,
+  typedClosestCenter,
+  useReleaseDragOnUnmount,
+  useSuppressClickAfterDrag,
+} from "./dnd";
 
 type Step = "start" | "end" | "press" | "click" | "key click" | "wait 1s" | "list unmounts";
 
@@ -63,5 +72,36 @@ describe("drag click guard", () => {
       button.remove();
       unmount();
     }
+  });
+});
+
+describe("typedClosestCenter", () => {
+  it("targets the closest droppable of the dragged type in its own list, and none once the pointer leaves it", () => {
+    // Rows of lists A and B and one header, top to bottom; A's first row, or the header, is dragged.
+    const items = [
+      ["a1", "workspace", "A", 0],
+      ["a2", "workspace", "A", 20],
+      ["header", "group", "repos", 40],
+      ["b1", "workspace", "B", 60],
+    ] as const;
+    const rect = (top: number) => ({ top, left: 0, width: 100, height: 20, bottom: top + 20, right: 100 });
+    const droppableContainers = items.map(([id, type, list]) => ({
+      id,
+      data: { current: { type, sortable: { containerId: list } } },
+    }));
+    const target = (y: number, active = droppableContainers[0]) =>
+      typedClosestCenter({
+        active,
+        collisionRect: rect(y - 10),
+        droppableRects: new Map(items.map(([id, , , top]) => [id, rect(top)])),
+        droppableContainers,
+        pointerCoordinates: { x: 50, y },
+      } as unknown as Parameters<CollisionDetection>[0])[0]?.id;
+    expect(target(34)).toBe("a2");
+    // Over the header or B's row, both closer to A's last row than anything else of A's.
+    expect(target(48)).toBeUndefined();
+    expect(target(68)).toBeUndefined();
+    // No other list holds headers, so a header dragged anywhere has its one list to land in.
+    expect(target(80, droppableContainers[2])).toBe("header");
   });
 });

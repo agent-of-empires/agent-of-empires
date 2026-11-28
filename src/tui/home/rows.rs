@@ -55,7 +55,45 @@ impl NeedsYouCounts {
     }
 }
 
+/// Orders Group paths as the Custom tree does: a Group before its descendants, siblings in
+/// `order`, and siblings it lacks after the listed ones, by name. The web's `groupPathComparator`.
+pub(super) fn compare_group_paths(order: &[String], a: &str, b: &str) -> std::cmp::Ordering {
+    let rank = |path: &str| order.iter().position(|p| p == path).unwrap_or(usize::MAX);
+    let left: Vec<&str> = a.split('/').collect();
+    let right: Vec<&str> = b.split('/').collect();
+    for i in 0..left.len().min(right.len()) {
+        if left[i] == right[i] {
+            continue;
+        }
+        return rank(&left[..=i].join("/"))
+            .cmp(&rank(&right[..=i].join("/")))
+            .then_with(|| left[i].to_lowercase().cmp(&right[i].to_lowercase()));
+    }
+    left.len().cmp(&right.len())
+}
+
 impl HomeView {
+    /// The Group order behind headers that may merge profiles: the shown profile's
+    /// `groups.json` order, or every profile's by profile name, each path where first seen.
+    fn merged_group_order(&self) -> Vec<String> {
+        let mut names: Vec<&String> = self
+            .group_trees
+            .keys()
+            .filter(|name| self.active_profile.as_ref().is_none_or(|p| p == *name))
+            .collect();
+        names.sort();
+        let mut order: Vec<String> = Vec::new();
+        for group in names
+            .into_iter()
+            .flat_map(|n| self.group_trees[n].get_all_groups())
+        {
+            if !order.contains(&group.path) {
+                order.push(group.path);
+            }
+        }
+        order
+    }
+
     pub fn instances(&self) -> impl ExactSizeIterator<Item = &Instance> + '_ {
         self.instances.values()
     }
@@ -449,15 +487,42 @@ impl HomeView {
             ));
         }
         headers.sort_by_key(|(rank, _)| (rank.is_some(), *rank));
-        let headers: Vec<Group> = headers.into_iter().map(|(_, group)| group).collect();
-        // Under Custom a repository's own groups follow their rows' order, which a move
-        // from Name or Newest first keeps as shown.
-        let mut nested = seeded.clone();
+        let mut headers: Vec<Group> = headers.into_iter().map(|(_, group)| group).collect();
+        // Under Custom, nested Groups follow the Group order, as under Groups.
         if self.sort_order == SortOrder::Custom {
-            nested.sort_by_key(|i| i.custom_order_key());
+            let mut nested: Vec<(usize, String)> = Vec::new();
+            for inst in &seeded {
+                let (label, Some(group)) = split_project_view_path(&inst.group_path) else {
+                    continue;
+                };
+                let Some(at) = headers.iter().position(|h| h.path == label) else {
+                    continue;
+                };
+                let mut path = String::new();
+                for part in group.split('/') {
+                    if !path.is_empty() {
+                        path.push('/');
+                    }
+                    path.push_str(part);
+                    if !nested.iter().any(|(a, p)| *a == at && *p == path) {
+                        nested.push((at, path.clone()));
+                    }
+                }
+            }
+            let order = self.merged_group_order();
+            nested
+                .sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| compare_group_paths(&order, x, y)));
+            let nested: Vec<Group> = nested
+                .into_iter()
+                .map(|(at, path)| {
+                    let name = path.rsplit('/').next().unwrap_or(&path);
+                    Group::new(name, &format!("{}/{path}", headers[at].path))
+                })
+                .collect();
+            headers.extend(nested);
         }
         let mut tree =
-            GroupTree::new_with_group_paths(nested.iter().map(|i| i.group_path.as_str()), &headers);
+            GroupTree::new_with_group_paths(seeded.iter().map(|i| i.group_path.as_str()), &headers);
         let scratch = populated_labels
             .contains(crate::session::SCRATCH_GROUP_PATH)
             .then(|| {
@@ -511,5 +576,28 @@ impl HomeView {
         );
         append_trash_section(&mut items, &grouped, self.trashed_section_collapsed);
         items
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compare_group_paths;
+    use std::cmp::Ordering::{Greater, Less};
+
+    #[test]
+    fn group_paths_follow_the_order_then_names_with_parents_first() {
+        let order: Vec<String> = ["b", "a", "b/y", "b/x"].map(String::from).into();
+        for (a, b, expected) in [
+            ("b", "a", Less),
+            ("a", "b/x", Greater),
+            ("b", "b/y", Less),
+            ("b/y", "b/x", Less),
+            ("b/x", "b/Z", Less),
+            ("c", "a", Greater),
+            ("D", "c", Greater),
+            ("c/x", "d", Less),
+        ] {
+            assert_eq!(compare_group_paths(&order, a, b), expected, "{a} vs {b}");
+        }
     }
 }

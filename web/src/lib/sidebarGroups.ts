@@ -1,28 +1,17 @@
-import type { ProjectInfo, RepoGroup, SessionResponse, SessionStatus, Workspace, WorkspaceStatus } from "./types";
+import type { ProjectInfo, RepoGroup, SessionResponse, Workspace, WorkspaceStatus } from "./types";
 import { isSessionActive } from "./session";
-import {
-  compareWorkspacesByPluginSort,
-  compareWorkspacesForComputedSortMode,
-  type PluginSortContext,
-  type SidebarSortMode,
-  statusAttentionRank,
-  workspaceIsSunk,
-} from "./sidebarSort";
+import { compareNames, descending, headerNewestMs, workspaceIsSunk } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
 
 // Bucket for sessions with no `group_path`; also a localStorage collapse key.
 export const UNGROUPED_GROUP_ID = "__ungrouped__";
 
-// Bucket for repos with no resolvable remote owner; also a localStorage collapse key.
-export const NO_ORG_GROUP_ID = "__no_org__";
-
-// Header affordances per axis, gated here instead of by `kind` checks while rendering.
+// Header affordances per grouping, gated here instead of by `kind` checks while rendering.
 export interface SidebarGroupCapabilities {
-  reorder: boolean;
   create: "repo" | "generic";
 }
 
-// In the group axis `sessions` is a per-group slice, so use `workspace.id` for actions and `key` only for render/DnD identity.
+// Under Groups `sessions` is a per-group slice, so use `workspace.id` for actions and `key` only for render/DnD identity.
 export interface SidebarWorkspaceView {
   key: string;
   workspace: Workspace;
@@ -30,9 +19,9 @@ export interface SidebarWorkspaceView {
 
 export interface SidebarGroup {
   id: string;
-  kind: "repo" | "sessionGroup" | "org" | "status";
+  kind: "repo" | "sessionGroup";
   displayName: string;
-  /** `owner@host` of the Repository's remote; repo and org groups only. */
+  /** `owner@host` of the Repository's remote; repo groups only. */
   remoteOwnerKey: string | null;
   workspaces: SidebarWorkspaceView[];
   status: WorkspaceStatus;
@@ -41,7 +30,7 @@ export interface SidebarGroup {
   repoPath?: string;
   /** Set when `kind === "sessionGroup"`. Empty string for Ungrouped. */
   groupPath?: string;
-  /** Registered Projects for this repo path, pinned or not. Repo axis only. */
+  /** Registered Projects for this repo path, pinned or not. Repo groups only. */
   registeredProjects: ProjectInfo[];
   pinned: boolean;
   /** Pinned with no live workspace. */
@@ -68,10 +57,7 @@ export function repoGroupToSidebarGroup(group: RepoGroup): SidebarGroup {
     })),
     status: group.status,
     collapsed: group.collapsed,
-    capabilities: {
-      reorder: true,
-      create: synthetic ? "generic" : "repo",
-    },
+    capabilities: { create: synthetic ? "generic" : "repo" },
     repoPath: group.repoPath,
     registeredProjects: synthetic ? [] : group.registeredProjects,
     pinned,
@@ -92,14 +78,31 @@ function groupDisplayName(path: string): string {
   return path.split("/").join(" / ");
 }
 
-function workspaceComparator(opts: {
-  sortMode: SidebarSortMode;
-  pluginSort?: PluginSortContext;
-  pluginAttention?: ReadonlySet<string>;
-}): (a: Workspace, b: Workspace) => number {
-  return opts.pluginSort
-    ? compareWorkspacesByPluginSort(opts.pluginSort)
-    : compareWorkspacesForComputedSortMode(opts.sortMode, opts.pluginAttention);
+/** How Group headers are ordered: by a path comparator, or "newest" for the Newest first sort. */
+export type PathOrder = "newest" | ((a: string, b: string) => number);
+
+/** Orders Group paths as the TUI's tree under Newest first: a Group before its descendants, siblings by the newest
+ *  session under them in `workspaces`, then by name. */
+export function newestPathComparator(workspaces: readonly Workspace[]): (a: string, b: string) => number {
+  const members = new Map<string, SessionResponse[]>();
+  for (const s of workspaces.flatMap((ws) => ws.sessions)) {
+    const parts = normalizeGroupPath(s.group_path).split("/");
+    for (let i = 1; i <= parts.length; i++) {
+      const prefix = parts.slice(0, i).join("/");
+      members.set(prefix, [...(members.get(prefix) ?? []), s]);
+    }
+  }
+  const newest = new Map([...members].map(([path, sessions]) => [path, headerNewestMs(sessions)] as const));
+  return (a, b) => {
+    const left = a.split("/");
+    const right = b.split("/");
+    for (let i = 0; i < Math.min(left.length, right.length); i++) {
+      if (left[i] === right[i]) continue;
+      const at = (parts: string[]) => newest.get(parts.slice(0, i + 1).join("/")) ?? Number.NEGATIVE_INFINITY;
+      return descending(at(left), at(right)) || compareNames(left[i]!, right[i]!) || (left[i]! < right[i]! ? -1 : 1);
+    }
+    return left.length - right.length;
+  };
 }
 
 // Split workspaces by per-session `group_path`; a workspace spanning groups appears once per group.
@@ -107,22 +110,24 @@ export function buildSessionGroups(
   workspaces: Workspace[],
   opts: {
     idleDecayWindowMs: number;
-    // `manual` falls back to last activity on this axis.
-    sortMode: SidebarSortMode;
-    pluginSort?: PluginSortContext;
-    pluginAttention?: ReadonlySet<string>;
+    compareWorkspace: (a: Workspace, b: Workspace) => number;
     // `groupPath` is "" for Ungrouped, letting nested callers avoid the sentinel id.
     isCollapsed: (groupId: string, groupPath: string) => boolean;
+    /** Every session in Ungrouped, whatever its Group. */
+    ungrouped?: boolean;
+    /** Orders Group paths; name order when absent. */
+    comparePaths?: PathOrder;
   },
 ): SidebarGroup[] {
-  const compareWorkspace = workspaceComparator(opts);
+  const { compareWorkspace } = opts;
+  const comparePaths = opts.comparePaths === "newest" ? newestPathComparator(workspaces) : opts.comparePaths;
   const byGroup = new Map<string, SidebarWorkspaceView[]>();
   const order: string[] = [];
 
   for (const ws of workspaces) {
     const sessionsByGroup = new Map<string, SessionResponse[]>();
     for (const session of ws.sessions) {
-      const gp = normalizeGroupPath(session.group_path);
+      const gp = opts.ungrouped ? "" : normalizeGroupPath(session.group_path);
       const existing = sessionsByGroup.get(gp);
       if (existing) existing.push(session);
       else sessionsByGroup.set(gp, [session]);
@@ -162,7 +167,7 @@ export function buildSessionGroups(
       workspaces: views,
       status: hasActive ? "active" : "idle",
       collapsed: opts.isCollapsed(id, gp),
-      capabilities: { reorder: false, create: "generic" },
+      capabilities: { create: "generic" },
       groupPath: gp,
       registeredProjects: [],
       pinned: false,
@@ -171,74 +176,13 @@ export function buildSessionGroups(
   }
 
   groups.sort((a, b) => {
-    if (a.id === UNGROUPED_GROUP_ID) return 1;
-    if (b.id === UNGROUPED_GROUP_ID) return -1;
-    return a.displayName.localeCompare(b.displayName);
+    // Ungrouped rows lead, as the TUI's tree puts them first.
+    if (a.id === UNGROUPED_GROUP_ID) return -1;
+    if (b.id === UNGROUPED_GROUP_ID) return 1;
+    return comparePaths ? comparePaths(a.groupPath!, b.groupPath!) : compareNames(a.displayName, b.displayName);
   });
 
   return groups;
-}
-
-export const statusGroupId = (status: string) => `status:${status}`;
-
-// Split workspaces by the status of each session; a workspace spanning statuses appears once per status.
-export function buildStatusGroups(
-  workspaces: Workspace[],
-  opts: {
-    idleDecayWindowMs: number;
-    sortMode: SidebarSortMode;
-    pluginSort?: PluginSortContext;
-    pluginAttention?: ReadonlySet<string>;
-    isCollapsed: (groupId: string) => boolean;
-  },
-): SidebarGroup[] {
-  const compareWorkspace = workspaceComparator(opts);
-  const byStatus = new Map<SessionStatus, SidebarWorkspaceView[]>();
-
-  for (const ws of workspaces) {
-    const sessionsByStatus = new Map<SessionStatus, SessionResponse[]>();
-    for (const session of ws.sessions) {
-      const existing = sessionsByStatus.get(session.status);
-      if (existing) existing.push(session);
-      else sessionsByStatus.set(session.status, [session]);
-    }
-
-    for (const [status, sessions] of sessionsByStatus) {
-      const sliced: Workspace = {
-        ...ws,
-        sessions,
-        status: sessions.some((s) => isSessionActive(s, opts.idleDecayWindowMs)) ? "active" : "idle",
-      };
-      const view: SidebarWorkspaceView = { key: `${status}::${ws.id}`, workspace: sliced };
-      const bucket = byStatus.get(status);
-      if (bucket) bucket.push(view);
-      else byStatus.set(status, [view]);
-    }
-  }
-
-  // The Attention sort's order, shared with the TUI and the Board's cards; ties fall
-  // back to the status spelling so unknown statuses still get a stable place.
-  const buckets = [...byStatus.entries()].sort(
-    ([a], [b]) => statusAttentionRank(a) - statusAttentionRank(b) || a.localeCompare(b),
-  );
-
-  return buckets.map(([status, views]) => {
-    views.sort((a, b) => compareWorkspace(a.workspace, b.workspace));
-    const id = statusGroupId(status);
-    return {
-      id,
-      kind: "status",
-      displayName: status,
-      remoteOwnerKey: null,
-      workspaces: views,
-      status: views.some((v) => v.workspace.status === "active") ? "active" : "idle",
-      collapsed: opts.isCollapsed(id),
-      capabilities: { reorder: false, create: "generic" },
-      registeredProjects: [],
-      pinned: false,
-      pinnedEmpty: false,
-    };
-  });
 }
 
 export function sidebarGroupHasLiveWorkspace(group: SidebarGroup): boolean {
@@ -260,39 +204,32 @@ export function archivableWorkspaces(group: SidebarGroup): Workspace[] {
     });
 }
 
-// Repo-axis group with its workspaces split into user-group subgroups.
+// A Repository header with its workspaces split into the user's Groups. Ungrouped rows render straight under the
+// header, as in the TUI, which also keeps Scratch sessions out of Groups.
 export interface NestedSidebarGroup {
   repo: SidebarGroup;
   subgroups: SidebarGroup[];
 }
 
-// Repo order and collapse come from the repo axis; subgroups split each repo's workspaces.
 export function buildNestedSidebarGroups(
   repoGroups: RepoGroup[],
   opts: {
     idleDecayWindowMs: number;
-    sortMode: SidebarSortMode;
-    pluginSort?: PluginSortContext;
-    pluginAttention?: ReadonlySet<string>;
+    compareWorkspace: (a: Workspace, b: Workspace) => number;
     isSubgroupCollapsed: (repoId: string, groupPath: string) => boolean;
+    comparePaths?: PathOrder;
   },
 ): NestedSidebarGroup[] {
   return repoGroups.map((repoGroup) => {
     const repo = repoGroupToSidebarGroup(repoGroup);
     const subgroups = buildSessionGroups(repoGroup.workspaces, {
+      ungrouped: repoGroup.id === SCRATCH_GROUP_ID,
       idleDecayWindowMs: opts.idleDecayWindowMs,
-      sortMode: opts.sortMode,
-      pluginSort: opts.pluginSort,
-      pluginAttention: opts.pluginAttention,
+      compareWorkspace: opts.compareWorkspace,
+      comparePaths: opts.comparePaths,
       isCollapsed: (_groupId, groupPath) => opts.isSubgroupCollapsed(repo.id, groupPath),
     });
-    return {
-      repo: {
-        ...repo,
-        capabilities: { ...repo.capabilities, reorder: false },
-      },
-      subgroups,
-    };
+    return { repo, subgroups };
   });
 }
 
@@ -302,75 +239,4 @@ export function nestedSidebarGroupHasLiveWorkspace(group: NestedSidebarGroup): b
 
 export function nestedSidebarGroupShouldRender(group: NestedSidebarGroup): boolean {
   return group.repo.pinnedEmpty || group.subgroups.some(sidebarGroupShouldRender);
-}
-
-// A partition of repos by host-scoped remote owner.
-export interface OrgNestedGroup {
-  org: SidebarGroup;
-  repos: SidebarGroup[];
-}
-
-// Repo properties and order come from the repo axis; collapse is keyed per org.
-export function buildOrgGroups(
-  repoGroups: RepoGroup[],
-  opts: {
-    isOrgCollapsed: (orgId: string) => boolean;
-    isRepoCollapsed: (orgId: string, repoId: string) => boolean;
-  },
-): OrgNestedGroup[] {
-  const byOrg = new Map<string, RepoGroup[]>();
-  const order: string[] = [];
-
-  for (const repoGroup of repoGroups) {
-    const orgId = repoGroup.remoteOwnerKey ?? NO_ORG_GROUP_ID;
-    const bucket = byOrg.get(orgId);
-    if (bucket) {
-      bucket.push(repoGroup);
-    } else {
-      byOrg.set(orgId, [repoGroup]);
-      order.push(orgId);
-    }
-  }
-
-  const result: OrgNestedGroup[] = order.map((orgId) => {
-    const members = byOrg.get(orgId)!;
-    const repos = members.map((repoGroup) => {
-      const repo = repoGroupToSidebarGroup(repoGroup);
-      return {
-        ...repo,
-        collapsed: opts.isRepoCollapsed(orgId, repo.id),
-        capabilities: { ...repo.capabilities, reorder: false },
-      };
-    });
-    const workspaces = repos.flatMap((r) => r.workspaces);
-    const hasActive = repos.some((r) => r.status === "active");
-    // `orgId` is the host-scoped key, so read the display owner off a member.
-    const displayName = orgId === NO_ORG_GROUP_ID ? "No organization" : (members[0]?.remoteOwner ?? orgId);
-    const org: SidebarGroup = {
-      id: orgId,
-      kind: "org",
-      displayName,
-      remoteOwnerKey: orgId === NO_ORG_GROUP_ID ? null : orgId,
-      workspaces,
-      status: hasActive ? "active" : "idle",
-      collapsed: opts.isOrgCollapsed(orgId),
-      capabilities: { reorder: false, create: "generic" },
-      registeredProjects: [],
-      pinned: false,
-      pinnedEmpty: false,
-    };
-    return { org, repos };
-  });
-
-  result.sort((a, b) => {
-    if (a.org.id === NO_ORG_GROUP_ID) return 1;
-    if (b.org.id === NO_ORG_GROUP_ID) return -1;
-    return a.org.displayName.localeCompare(b.org.displayName);
-  });
-
-  return result;
-}
-
-export function orgNestedGroupShouldRender(group: OrgNestedGroup): boolean {
-  return group.repos.some(sidebarGroupShouldRender);
 }

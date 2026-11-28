@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { NestedSidebarGroup, OrgNestedGroup, SidebarGroup, SidebarWorkspaceView } from "../../lib/sidebarGroups";
+import {
+  UNGROUPED_GROUP_ID,
+  type NestedSidebarGroup,
+  type SidebarGroup,
+  type SidebarWorkspaceView,
+} from "../../lib/sidebarGroups";
 import type { Workspace } from "../../lib/types";
-import { renderedOrder, sunkViews, visibleOrgRepos, visibleSubgroups } from "./filterGroups";
+import { renderedOrder, sunkViews, visibleSubgroups } from "./filterGroups";
 
 type SessionStub = {
   id: string;
@@ -21,7 +26,7 @@ const archived = (status: string, workspaceId: string, sessionId: string): Sideb
 });
 
 describe("sunkViews", () => {
-  it("lists a workspace sliced across status buckets once, with every archived session", () => {
+  it("lists a workspace sliced across Groups once, with every archived session", () => {
     const groups = [
       group("status:Idle", [archived("Idle", "w1", "s-idle")]),
       group("status:Running", [archived("Running", "w1", "s-running")]),
@@ -45,26 +50,46 @@ describe("sunkViews", () => {
     expect(sunkViews(groups)).toEqual([]);
   });
 
-  it("orders rows newest sunk first across groups, whatever the group order", () => {
+  it("lists archived rows newest first, then snoozed rows soonest wake first, whatever the group order", () => {
     const row = (groupId: string, id: string, sessions: SessionStub[]) => ({
       key: `${groupId}::${id}`,
       workspace: workspace(id, sessions),
     });
     const groups = [
       group("a", [
-        row("a", "old", [{ id: "s1", archived_at: "2026-01-01T00:00:00Z", last_accessed_at: "2026-06-01T00:00:00Z" }]),
-        row("a", "stale", [{ id: "s2", archived_at: "2026-01-01T00:00:00Z" }]),
+        row("a", "late-wake", [{ id: "s1", snoozed_until: "2027-06-01T00:00:00Z" }]),
+        row("a", "old", [{ id: "s2", archived_at: "2026-01-01T00:00:00Z", last_accessed_at: "2026-06-01T00:00:00Z" }]),
+        row("a", "stale", [{ id: "s3", archived_at: "2026-01-01T00:00:00Z" }]),
       ]),
       group("b", [
-        row("b", "snoozed", [{ id: "s3", snoozed_until: "2026-03-01T00:00:00Z" }]),
+        row("b", "soon-wake", [{ id: "s4", snoozed_until: "2027-01-01T00:00:00Z" }]),
         row("b", "mixed", [
-          { id: "s4", archived_at: "2026-01-01T00:00:00Z" },
-          { id: "s5", archived_at: "2026-04-01T00:00:00Z" },
+          { id: "s5", archived_at: "2026-01-01T00:00:00Z" },
+          { id: "s6", archived_at: "2026-04-01T00:00:00Z" },
+        ]),
+        row("b", "trashed-and-snoozed", [
+          { id: "s7", trashed_at: "2026-02-01T00:00:00Z" },
+          { id: "s8", snoozed_until: "2027-03-01T00:00:00Z" },
         ]),
       ]),
     ];
-    // archived_at wins over later activity; ties keep group order.
-    expect(sunkViews(groups).map((v) => v.workspace.id)).toEqual(["mixed", "snoozed", "old", "stale"]);
+    // A future wake time never outranks an archive; archived_at wins over later activity; ties keep group order.
+    expect(sunkViews(groups).map((v) => v.workspace.id)).toEqual([
+      "mixed",
+      "old",
+      "stale",
+      "soon-wake",
+      "trashed-and-snoozed",
+      "late-wake",
+    ]);
+    expect(renderedOrder([], false, true, groups)).toEqual([
+      "b::mixed",
+      "a::old",
+      "a::stale",
+      "b::soon-wake",
+      "b::trashed-and-snoozed",
+      "a::late-wake",
+    ]);
   });
 });
 
@@ -100,19 +125,20 @@ describe("renderedOrder", () => {
 });
 
 describe("visible parents", () => {
-  it("drops the children a collapsed repo or org hides", () => {
+  it("drops the children a collapsed repo hides", () => {
     const nested = [
       { repo: group("/a", []), subgroups: [group("feature", [live("a")])] },
       { repo: { ...group("/b", []), collapsed: true }, subgroups: [group("fix", [live("b")])] },
     ] as NestedSidebarGroup[];
     expect(visibleSubgroups(nested, false).map((g) => g.id)).toEqual(["feature"]);
     expect(visibleSubgroups(nested, true).map((g) => g.id)).toEqual(["feature", "fix"]);
+  });
 
-    const orgs = [
-      { org: { ...group("acme", []), collapsed: true }, repos: [group("/a", [])] },
-      { org: group("other", []), repos: [group("/b", [])] },
-    ] as OrgNestedGroup[];
-    expect(visibleOrgRepos(orgs, false).map((g) => g.id)).toEqual(["/b"]);
-    expect(visibleOrgRepos(orgs, true).map((g) => g.id)).toEqual(["/a", "/b"]);
+  it("ranges over a repo's ungrouped rows even when a browser saved them collapsed", () => {
+    const shut = (id: string) => ({ ...group(id, [live(id)]), collapsed: true });
+    const nested = [
+      { repo: group("/a", []), subgroups: [shut(UNGROUPED_GROUP_ID), shut("fix")] },
+    ] as NestedSidebarGroup[];
+    expect(renderedOrder(visibleSubgroups(nested, false), false, false)).toEqual([`${UNGROUPED_GROUP_ID}-row`]);
   });
 });

@@ -63,7 +63,7 @@ describe("useSidebarTriage pending actions", () => {
     const unreadCall = held();
     vi.mocked(setSessionArchive).mockReturnValue(archiveCall.promise);
     vi.mocked(setSessionUnread).mockReturnValue(unreadCall.promise);
-    // A Repository/Org/Group axis shows the workspace as one row again.
+    // The Repository grouping shows the workspace as one row again.
     const combined: Workspace = { ...archivedSlice, sessions: [...archivedSlice.sessions, ...unreadSlice.sessions] };
     const { result, rerender } = renderHook(
       ({ workspaces }: { workspaces: Workspace[] }) => useSidebarTriage(workspaces),

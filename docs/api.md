@@ -420,9 +420,9 @@ a disconnect does not cancel admitted work or authorize replay.
 
 Change the one sidebar grouping and sort the Daemon owns. The body is
 `{"group_by": "project" | "group", "sort": "custom" | "newest" | "name"}`; an
-omitted field keeps its value. The response is the whole value, with the mutation receipt
-headers, and every Client receives it as `sidebar_view` in the runtime snapshot;
-the TUI shows it. Refused under `--read-only` and in CityHall mode.
+omitted field keeps its value. The response is the whole value, with the mutation
+receipt headers, and every Client receives it as `sidebar_view` in the runtime
+snapshot and shows it. Refused under `--read-only` and in CityHall mode.
 
 ## GET /api/sessions
 
@@ -438,6 +438,7 @@ The response is an object, not a bare array:
   "workspace_ordering": ["/path/to/repo::main"],
   "repository_order": ["/path/to/repo"],
   "sidebar_view": { "group_by": "project", "sort": "custom" },
+  "group_order": { "default": ["work", "work/api"] },
   "trashed_count": 0
 }
 ```
@@ -452,8 +453,12 @@ The response is an object, not a bare array:
   workspace's position in this list.
 - `repository_order`: repository paths in the shared Custom order of the
   Repository headers; headers not listed come first, newest first.
-- `sidebar_view`: the grouping and sort the Daemon publishes, which the TUI
-  follows (see `PATCH /api/sidebar-view`).
+- `sidebar_view`: the grouping and sort every Client shows (see
+  `PATCH /api/sidebar-view`).
+- `group_order`: each profile's Group paths, nested ones included, in the
+  Custom order of its Group headers (its `groups.json` order). Siblings keep
+  their relative order in the list; `POST /api/reorder` moves one a slot, after
+  arranging its siblings as an optional `siblings` list gives them.
 
 `PUT /api/workspace-ordering` takes `{"order": [...], "repositories": [...]}`;
 an omitted list keeps its value and an empty one clears it. An optional
@@ -461,7 +466,12 @@ an omitted list keeps its value and an empty one clears it. An optional
 write was built from; when either no longer matches, the write is refused with
 409. Take `base.order` from the runtime snapshot's `placed_workspaces` and
 `base.repositories` from its `repository_order`, not from `workspace_ordering`,
-which also lists workspaces never placed. The response holds the merged `order`
+which also lists workspaces never placed. An optional `base_sort` and
+`base_groups` (profile to Group paths) are refused alike once the sort differs
+or the paths both name stand among their siblings in another order.
+`PATCH /api/sidebar-view` takes the same `base_sort`, and a Group move on
+`POST /api/reorder` an optional `base` list of its profile's Group paths and
+`base_sort`, which it answers `stale` on. The response holds the merged `order`
 and the stored `repositories`, so its `order` is not the next write's base.
 
 Clients written against the historical bare-array response must be updated to

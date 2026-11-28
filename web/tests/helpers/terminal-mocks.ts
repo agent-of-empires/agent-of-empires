@@ -126,13 +126,12 @@ export async function mockTerminalApis(
         sessions: [
           sessionResponse({
             id: "pinch-test",
-            group_path: "/tmp",
             tool: opts.tool ?? "claude",
             status: "Running",
             ...opts.sessionFields,
           }),
           ...(opts.extraSessions ?? []).map((session) =>
-            sessionResponse({ ...session, group_path: "/tmp", tool: opts.tool ?? "claude", status: "Running" }),
+            sessionResponse({ ...session, tool: opts.tool ?? "claude", status: "Running" }),
           ),
         ],
         workspace_ordering: [],

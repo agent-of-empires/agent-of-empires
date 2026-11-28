@@ -444,6 +444,8 @@ pub(in crate::tui::home) async fn settle_reorder(
             direction,
             siblings,
             freeze: None,
+            base: None,
+            base_sort: None,
         }
     } else {
         let id = view.selected_session.clone().expect("selected session");
@@ -1195,7 +1197,7 @@ fn repository_mode_header_refusals_name_what_was_selected() {
     for (path, title) in [
         ("alpha", "Cannot Modify Repository Headers"),
         (archived.as_str(), "Cannot Modify Repository Headers"),
-        ("alpha/work", "Manage Groups Under My Groups"),
+        ("alpha/work", "Switch to Groups to Manage"),
     ] {
         for open in [
             HomeView::open_rename_for_selected,
@@ -2645,6 +2647,8 @@ async fn test_ctrl_arrows_move_a_session_under_custom_sort() {
         serde_json::to_value(crate::daemon::SidebarViewPatch {
             group_by: Some(crate::session::config::GroupByMode::Group),
             sort: Some(SortOrder::Custom),
+
+            ..Default::default()
         })
         .unwrap(),
     )
@@ -2752,6 +2756,8 @@ async fn test_ctrl_arrows_under_name_start_custom_from_the_screen_order() {
         serde_json::to_value(crate::daemon::SidebarViewPatch {
             group_by: Some(crate::session::config::GroupByMode::Group),
             sort: Some(SortOrder::Name),
+
+            ..Default::default()
         })
         .unwrap(),
     )
@@ -3400,6 +3406,136 @@ fn test_row_moves_never_regroup_under_repository_grouping() {
     );
 }
 
+/// Under Repository + Custom, nested Group headers follow the Group order and move through it
+/// among the shown siblings, past a Group with no shown session; under Name they stay A to Z.
+#[test]
+#[serial]
+fn repository_mode_orders_and_moves_nested_groups_by_the_group_order() {
+    use crate::daemon::{MoveDirection, NamespaceMutation, ReorderBody};
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            instance_in("z1", "/tmp/alpha", "zeta"),
+            instance_in("b1", "/tmp/alpha", "beta/child"),
+            instance_in("m1", "/tmp/alpha", "mid"),
+        ],
+        false,
+    );
+    let view = &mut env.view;
+    view.group_by = GroupByMode::Project;
+    let order = ["zeta", "hidden", "beta", "beta/child"]
+        .map(|p| Group::new(p.rsplit('/').next().unwrap(), p));
+    view.group_trees.insert(
+        "test".into(),
+        GroupTree::new_with_group_paths(std::iter::empty(), &order),
+    );
+    for (sort, expected) in [
+        (
+            SortOrder::Custom,
+            [
+                "alpha",
+                "alpha/zeta",
+                "alpha/beta",
+                "alpha/beta/child",
+                "alpha/mid",
+            ],
+        ),
+        (
+            SortOrder::Name,
+            [
+                "alpha",
+                "alpha/beta",
+                "alpha/beta/child",
+                "alpha/mid",
+                "alpha/zeta",
+            ],
+        ),
+    ] {
+        view.sort_order = sort;
+        let headers: Vec<String> = view
+            .build_flat_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                Item::Group { path, .. } => Some(path),
+                Item::Session { .. } | Item::Suggested { .. } => None,
+            })
+            .collect();
+        assert_eq!(headers, expected, "{sort:?}");
+    }
+
+    let mut respond = view.session_feed.namespace_driver_for_test();
+    view.sort_order = SortOrder::Custom;
+    view.selected_group = Some("alpha/beta".into());
+    view.move_row_at_cursor(-1).unwrap();
+    assert!(
+        matches!(
+            respond(Err("refused".into())),
+            Some(NamespaceMutation::Reorder(ReorderBody::Group { group, direction: MoveDirection::Up, siblings: Some(siblings), freeze: None, base: None, base_sort: None }))
+                if group.profile == "test" && group.path == "beta" && siblings == ["zeta", "beta", "mid"]
+        ),
+        "a nested header moves its profile's Group among the shown siblings"
+    );
+    view.pending_namespace_intent = None;
+
+    let mut shared = instance_in("o1", "/tmp/alpha", "beta");
+    shared.source_profile = "other".into();
+    view.add_instance(shared);
+    view.active_profile = None;
+    for (sort, flash) in [
+        (
+            SortOrder::Name,
+            "Pick the Custom sort (o) to arrange groups by hand",
+        ),
+        (SortOrder::Custom, "Groups move only within one profile"),
+    ] {
+        view.sort_order = sort;
+        view.move_row_at_cursor(1).unwrap();
+        assert!(respond(Err("refused".into())).is_none(), "{sort:?}");
+        assert_eq!(
+            view.status_flash.as_ref().map(|f| f.text.as_str()),
+            Some(flash),
+            "{sort:?}"
+        );
+    }
+}
+
+/// Under Groups and Name a nested Group header moves, starting from the headers on screen.
+#[test]
+#[serial]
+fn my_groups_moves_a_nested_header_under_name() {
+    use crate::daemon::{NamespaceMutation, ReorderBody};
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            instance_in("c1", "/tmp/alpha", "beta/child"),
+            instance_in("d1", "/tmp/alpha", "beta/delta"),
+        ],
+        false,
+    );
+    let view = &mut env.view;
+    view.group_by = GroupByMode::Group;
+    view.sort_order = SortOrder::Name;
+    let order =
+        ["beta", "beta/delta", "beta/child"].map(|p| Group::new(p.rsplit('/').next().unwrap(), p));
+    view.group_trees.insert(
+        "test".into(),
+        GroupTree::new_with_group_paths(std::iter::empty(), &order),
+    );
+    view.rebuild_flat_items();
+    let mut respond = view.session_feed.namespace_driver_for_test();
+    view.selected_group = Some("beta/delta".into());
+    view.move_row_at_cursor(-1).unwrap();
+    assert!(matches!(
+        respond(Err("refused".into())),
+        Some(NamespaceMutation::Reorder(ReorderBody::Group { group, siblings: Some(siblings), .. }))
+            if group.path == "beta/delta" && siblings == ["beta/child", "beta/delta"]
+    ));
+}
+
 /// A group that exists only because a session names it has no `groups.json` row yet. Moving
 /// it must still persist the new order, or the next load rebuilds the original one.
 #[tokio::test]
@@ -3633,43 +3769,6 @@ async fn test_cross_group_move_lands_in_an_empty_neighbour() {
 }
 
 /// Session id of the row titled `title`.
-/// Under Custom a repository's own groups follow their rows' order, so a switch from Name,
-/// which commits the rows as shown, keeps the groups where they were.
-#[test]
-#[serial]
-fn test_repository_groups_follow_their_rows_under_custom() {
-    use crate::session::config::{GroupByMode, SortOrder};
-
-    let instances = [
-        instance_in("a1", "/r/repo", "alpha"),
-        instance_in("b1", "/r/repo", "beta"),
-    ];
-    let mut env = seeded_env(test_home(), &instances, false);
-    let (a, b) = (
-        custom_order_id_of(&env.view, "a1"),
-        custom_order_id_of(&env.view, "b1"),
-    );
-    env.view
-        .mutate_instance(&a, |inst| inst.sort_index = Some(0));
-    env.view.mutate_instance(&b, |inst| {
-        inst.sort_index = Some(1);
-        inst.created_at = crate::time::Timestamp::now() + crate::time::Duration::hours(1);
-    });
-    env.view.group_by = GroupByMode::Project;
-    env.view.sort_order = SortOrder::Custom;
-    env.view.flat_items = env.view.build_flat_items();
-    let nested: Vec<&str> = env
-        .view
-        .flat_items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Group { name, depth: 1, .. } => Some(name.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(nested, ["alpha", "beta"]);
-}
-
 /// A move waits for the Daemon's first snapshot, which carries the order it replaces, and
 /// never reorders an archived row, which keeps its archive order.
 #[test]

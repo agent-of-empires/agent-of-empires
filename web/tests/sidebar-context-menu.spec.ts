@@ -5,7 +5,12 @@
 import type { Locator, Page, Route } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
 import { iPhone13 } from "./helpers/viewports";
-import { installSidebarMocks, threeSessionsInOneRepo, type MockSessionInput } from "./helpers/sidebarMocks";
+import {
+  installSidebarMocks,
+  threeSessionsInOneRepo,
+  type MockSessionInput,
+  type SidebarView,
+} from "./helpers/sidebarMocks";
 import { openMobileSidebar } from "./helpers/sidebar";
 
 const ROW = "[data-testid='sidebar-session-row']";
@@ -21,12 +26,16 @@ const THREE: MockSessionInput[] = ["Mongols", "Goths", "Persians"].map((title, i
   id: `s-${i + 1}`,
   title,
   project_path: `/tmp/repo-${"abc"[i]}`,
-  group: `/tmp/repo-${"abc"[i]}`,
   branch: null,
 }));
 
-async function openSidebar(page: Page, sessions: MockSessionInput[]) {
-  await installSidebarMocks(page, { sessions });
+/** Repository headers in the order the sessions are given, rather than newest first. */
+async function openSidebar(page: Page, sessions: MockSessionInput[], view?: SidebarView) {
+  await installSidebarMocks(page, {
+    sessions,
+    view,
+    repositoryOrder: [...new Set(sessions.map((s) => s.project_path))],
+  });
   await page.goto("/");
   await expect(page.locator("header")).toBeVisible();
 }
@@ -347,30 +356,32 @@ test.describe("Context resume badge", () => {
     await expect(page).toHaveURL(/\/session\/running$/);
   });
 
-  for (const axis of ["group", "repo+group"]) {
-    test(`keeps the badge and activation on the same ${axis} slice`, async ({ page }) => {
-      await page.addInitScript((axis) => localStorage.setItem("aoe-sidebar-axis", axis), axis);
-      await page.route("**/api/app-state/web-ui-state", (r) => r.fulfill({ json: { "aoe-sidebar-axis": axis } }));
-      await openSidebar(page, [
-        {
-          ...session("idle", "Idle session", {
-            status: "Stopped",
-            context_resume: { state: "unavailable", reason: "no_target" },
-          }),
-          project_path: "/tmp/shared",
-          branch: "shared",
-          group: "A",
-        },
-        {
-          ...session("running", "Running session", {
-            status: "Running",
-            context_resume: { state: "available" },
-          }),
-          project_path: "/tmp/shared",
-          branch: "shared",
-          group: "B",
-        },
-      ]);
+  for (const groupBy of ["group", "project"] as const) {
+    test(`keeps the badge and activation on the same ${groupBy} slice`, async ({ page }) => {
+      await openSidebar(
+        page,
+        [
+          {
+            ...session("idle", "Idle session", {
+              status: "Stopped",
+              context_resume: { state: "unavailable", reason: "no_target" },
+            }),
+            project_path: "/tmp/shared",
+            branch: "shared",
+            group: "A",
+          },
+          {
+            ...session("running", "Running session", {
+              status: "Running",
+              context_resume: { state: "available" },
+            }),
+            project_path: "/tmp/shared",
+            branch: "shared",
+            group: "B",
+          },
+        ],
+        { group_by: groupBy, sort: "custom" },
+      );
 
       const row = page.locator('a[href="/session/idle"]');
       await expect(row).toContainText("ctx:no");

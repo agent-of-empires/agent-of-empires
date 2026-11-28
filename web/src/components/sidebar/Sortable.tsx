@@ -20,7 +20,7 @@ export function SortableSessionRow({
   const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: rowKey ?? props.workspace.id,
     disabled: dragOff,
-    data: { type: "workspace" },
+    data: { type: "workspace", workspaceId: props.workspace.id },
   });
   return (
     // Only `listeners`: dnd-kit's `attributes` would add a second focusable button role.
@@ -42,20 +42,26 @@ export function SortableSessionRow({
   );
 }
 
-/** Sortable wrapper around a whole group block (header plus rows) so it moves as a unit. */
-export function SortableRepoGroup({
+/** Sortable wrapper around a whole group block (header plus rows) so it moves as a unit. A Group header carries
+ *  its path; a Repository header none. */
+export function SortableGroupBlock({
   groupId,
+  groupPath,
+  repoId,
   disabled,
   children,
 }: {
   groupId: string;
+  groupPath?: string;
+  /** The Repository a nested Group header sits in. */
+  repoId?: string;
   disabled: boolean;
   children: (handle: DragHandleProps) => ReactNode;
 }) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({
     id: groupId,
     disabled,
-    data: { type: "group" },
+    data: groupPath === undefined ? { type: "group" } : { type: "sessionGroup", groupPath, repoId },
   });
   return (
     <div

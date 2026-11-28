@@ -75,33 +75,32 @@ test("arrow keys up a scrolled list keep the focused row clear of the pinned tit
   }
 });
 
-// Two repos that are also two Groups, so both axes show two headers of two rows each.
-const twoByTwo: MockSessionInput[] = [
-  { id: "s-a1", title: "a-one", project_path: "/tmp/repo-a", branch: "a/one", group: "g-a" },
-  { id: "s-a2", title: "a-two", project_path: "/tmp/repo-a", branch: "a/two", group: "g-a" },
-  { id: "s-b1", title: "b-one", project_path: "/tmp/repo-b", branch: "b/one", group: "g-b" },
-  { id: "s-b2", title: "b-two", project_path: "/tmp/repo-b", branch: "b/two", group: "g-b" },
-];
+// Two repos of two rows each: under Groups also two Groups, so either grouping shows two headers. Under
+// Repository they stay out of Groups, which would nest a header of their own inside each repository.
+const twoByTwo = (grouped: boolean): MockSessionInput[] =>
+  [
+    { id: "s-a1", title: "a-one", project_path: "/tmp/repo-a", branch: "a/one", group: "g-a" },
+    { id: "s-a2", title: "a-two", project_path: "/tmp/repo-a", branch: "a/two", group: "g-a" },
+    { id: "s-b1", title: "b-one", project_path: "/tmp/repo-b", branch: "b/one", group: "g-b" },
+    { id: "s-b2", title: "b-two", project_path: "/tmp/repo-b", branch: "b/two", group: "g-b" },
+  ].map((s) => (grouped ? s : { ...s, group: undefined }));
 
-async function showAxis(page: Page, axis: string) {
-  const toggle = page.getByTestId("sidebar-view-toggle");
-  await toggle.click();
-  await page.getByTestId(`sidebar-axis-option-${axis}`).click();
-  await expect(toggle).toHaveAttribute("data-axis", axis);
-}
-
-for (const [axis, compact] of [
-  ["repo", false],
+for (const [groupBy, compact] of [
+  ["project", false],
   ["group", false],
-  ["repo", true],
+  ["project", true],
 ] as const) {
-  test(`headers are one tab stop each and share the arrow keys with rows (${axis} axis${compact ? ", compact" : ""})`, async ({
+  test(`headers are one tab stop each and share the arrow keys with rows (${groupBy}${compact ? ", compact" : ""})`, async ({
     page,
   }) => {
-    await installSidebarMocks(page, { sessions: twoByTwo });
+    await installSidebarMocks(page, {
+      sessions: twoByTwo(groupBy === "group"),
+      // Headers never moved sit newest first; listing them keeps repo-a on top.
+      repositoryOrder: ["/tmp/repo-a", "/tmp/repo-b"],
+      view: { group_by: groupBy, sort: "custom" },
+    });
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await showAxis(page, axis);
     if (compact) {
       await page.getByRole("separator", { name: "Resize sidebar" }).focus();
       await page.keyboard.press("Home");
@@ -175,16 +174,17 @@ for (const [axis, compact] of [
 // Nested lists put a Group's rows inside its parent's. Repo "/tmp/a" with Group "b" and repo
 // "/tmp/a::b" would share a rows id if "::" weren't only ever the separator.
 const nested: MockSessionInput[] = [
-  { id: "s-n1", title: "n-one", project_path: "/tmp/a", branch: "n/one", group: "b", remote_owner: "acme" },
-  { id: "s-n2", title: "n-two", project_path: "/tmp/a::b", branch: "n/two", group: "g", remote_owner: "acme" },
+  { id: "s-n1", title: "n-one", project_path: "/tmp/a", branch: "n/one", group: "b" },
+  { id: "s-n2", title: "n-two", project_path: "/tmp/a::b", branch: "n/two", group: "g" },
 ];
 
-for (const axis of ["repo+group", "org"] as const) {
-  test(`arrow keys reach a nested header and its rows (${axis} axis)`, async ({ page }) => {
+{
+  test("arrow keys reach a nested header and its rows (Repository)", async ({ page }) => {
     await installSidebarMocks(page, { sessions: nested });
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    await showAxis(page, axis);
+    // Each repository and its Group.
+    await expect(page.locator("[data-testid='sidebar-group-header']")).toHaveCount(4);
 
     const ids = await page
       .locator("[data-testid='sidebar-group-header'] button[aria-controls]")
@@ -226,10 +226,9 @@ test("the Snoozed & archived toggle is a header for the arrow keys", async ({ pa
       fields: { archived_at: "2026-01-01T00:00:00Z" },
     },
   ];
-  await installSidebarMocks(page, { sessions });
+  await installSidebarMocks(page, { sessions, view: { group_by: "group", sort: "custom" } });
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.goto("/");
-  await showAxis(page, "group");
 
   const press = async (key: string, focused: Locator) => {
     await page.keyboard.press(key);
@@ -256,7 +255,8 @@ test.describe("Archive all that empties a Group", () => {
   // `fields` is merged into each list response, so an archive shows up on the next refresh.
   // `hold` keeps an archive reply back until released.
   async function setup(page: Page, sessions: MockSessionInput[], hold?: Promise<void>) {
-    await installSidebarMocks(page, { sessions });
+    // Repository headers in the order given, rather than newest first.
+    await installSidebarMocks(page, { sessions, repositoryOrder: sessions.map((s) => s.project_path) });
     await page.route("**/api/sessions/*/archive", async (r) => {
       const id = new URL(r.request().url()).pathname.split("/")[3];
       await hold;
@@ -305,7 +305,6 @@ test.describe("Archive all that empties a Group", () => {
       { ...one("s-w", "repo-w"), group: "g-w" },
       { ...one("s-x", "repo-x"), group: "g-x" },
     ]);
-    await showAxis(page, "repo+group");
     const parentX = header(page, "/tmp/repo-x");
     const childX = page.locator(`[id="${await parentX.getAttribute("aria-controls")}"] button[aria-expanded]`).first();
     const parentW = header(page, "/tmp/repo-w");
