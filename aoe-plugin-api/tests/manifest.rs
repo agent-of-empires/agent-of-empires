@@ -1221,12 +1221,26 @@ fn agent_profile_is_validated() {
             PROFILE.replace("\"(^|/)", "\"(?:a)(?P<n>b)"),
             Some("memory_path_regex"),
         ),
-        // Allowed: the core Claude regex (two unbounded repeats) and bounded repeats.
+        (
+            PROFILE.replace(
+                "\"(^|/)",
+                &format!("\"{}{}", "a?".repeat(36), "a".repeat(36)),
+            ),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"a?b?c?"),
+            Some("memory_path_regex"),
+        ),
+        // Allowed: the core Claude regex (two quantifiers), lazy quantifiers counted once,
+        // and `(?:` not counted.
         (
             with_regex(r"/\\.claude/projects/[^/]+/memory/.*\\.md$"),
             None,
         ),
-        (with_regex(r"a{1,3}b{2}c*d\\b"), None),
+        (with_regex(r"a{1,3}b{2}d\\b"), None),
+        (with_regex(r"a*?b+?"), None),
+        (with_regex(r"(?:a)b+c?"), None),
         (
             PROFILE.replace("command = \"example\"\n", ""),
             Some("profile requires command"),

@@ -966,27 +966,37 @@ fn has_nested_quantifier(pattern: &str) -> bool {
     false
 }
 
-/// Number of unbounded repeats (`*`, `+`, `{n,}`) in the pattern. Sequential overlapping ones
-/// backtrack polynomially in the browser's regex engine.
-fn unbounded_repeats(pattern: &str) -> usize {
+/// Number of quantifiers (`*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}`) in the pattern. A `?` that
+/// makes a quantifier lazy, and the `?` of `(?:`, do not count. Sequential overlapping
+/// quantifiers backtrack polynomially in the browser's regex engine.
+fn quantifier_count(pattern: &str) -> usize {
     let chars: Vec<char> = pattern.chars().collect();
     let mut count = 0;
     let mut in_class = false;
+    let mut after_quantifier = false;
     let mut i = 0;
     while i < chars.len() {
+        let mut quantifier = false;
         match chars[i] {
             '\\' => i += 1,
             _ if in_class => in_class = chars[i] != ']',
             '[' => in_class = true,
-            '*' | '+' => count += 1,
+            '(' => i += usize::from(chars.get(i + 1) == Some(&'?')),
+            '?' if after_quantifier => {}
+            '*' | '+' | '?' => {
+                count += 1;
+                quantifier = true;
+            }
             '{' => {
                 if let Some(end) = brace_quantifier(&chars, i) {
-                    count += usize::from(chars[end - 1] == ',');
+                    count += 1;
+                    quantifier = true;
                     i = end;
                 }
             }
             _ => {}
         }
+        after_quantifier = quantifier;
         i += 1;
     }
     count
@@ -1033,7 +1043,7 @@ fn validate_agent_profile(
     use crate::agent_integration::{
         AGENT_PROFILE_LIST_MAX, AGENT_PROFILE_REGEX_MAX, AGENT_PROFILE_STRING_MAX,
     };
-    const AGENT_PROFILE_REGEX_UNBOUNDED_MAX: usize = 2;
+    const AGENT_PROFILE_REGEX_QUANTIFIER_MAX: usize = 2;
     let cards = &profile.card_aliases;
     let titles = &profile.special_titles;
     let lists: [(&str, &[String]); 14] = [
@@ -1105,10 +1115,11 @@ fn validate_agent_profile(
             ),
         );
         check(
-            unbounded_repeats(pattern) <= AGENT_PROFILE_REGEX_UNBOUNDED_MAX,
+            quantifier_count(pattern) <= AGENT_PROFILE_REGEX_QUANTIFIER_MAX,
             format!(
                 "agent_integrations[{i}].profile.memory_path_regex must have at most \
-                 {AGENT_PROFILE_REGEX_UNBOUNDED_MAX} unbounded repeats (`*`, `+`, `{{n,}}`)"
+                 {AGENT_PROFILE_REGEX_QUANTIFIER_MAX} quantifiers (`*`, `+`, `?`, `{{n}}`, `{{n,}}`, \
+                 `{{n,m}}`)"
             ),
         );
         check(
