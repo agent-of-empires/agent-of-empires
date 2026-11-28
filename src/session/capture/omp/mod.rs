@@ -28,12 +28,14 @@ mod container;
 mod layout;
 mod options;
 
-use container::*;
+use crate::session::capture::container_exec_command;
+#[cfg(test)]
+use container::CONTAINER_BREADCRUMB_SCRIPT;
 use layout::*;
 
 pub(crate) use container::{omp_poll_fn_sandboxed, try_capture_omp_session_id_in_container};
 pub(crate) use layout::{
-    omp_host_routing_environment, read_container_environment, resolve_omp_store_layout,
+    omp_host_routing_environment, resolve_omp_store_layout,
     resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment,
 };
@@ -41,7 +43,6 @@ pub(crate) use options::{reject_omp_secret_args, OmpCliCaptureOptions};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DOTENV_BYTES: usize = 1024 * 1024;
-const MAX_CONTAINER_ENV_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTAINER_PROBE_BYTES: usize = 16 * 1024;
 const MAX_BREADCRUMB_BYTES: usize = 16 * 1024;
 const MAX_LAUNCH_MARKER_BYTES: usize = MAX_BREADCRUMB_BYTES + 1024;

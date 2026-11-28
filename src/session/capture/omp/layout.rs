@@ -678,30 +678,6 @@ pub(super) fn absolute_path(cwd: &Path, path: &Path) -> PathBuf {
     crate::git::template::lexical_normalize(&path)
 }
 
-pub(crate) fn read_container_environment(
-    runtime: &crate::containers::RuntimeExecutionSnapshot,
-    container_name: &str,
-) -> Result<HashMap<String, String>> {
-    let command = container_exec_command(container_name, None, Some(runtime), &["env", "-0"]);
-    let output = super::super::run_with_timeout_limit(
-        command,
-        COMMAND_TIMEOUT,
-        "container exec (native environment probe)",
-        MAX_CONTAINER_ENV_BYTES,
-    )?;
-    let text = String::from_utf8(output).context("Container environment is not UTF-8")?;
-    let mut values = HashMap::new();
-    for line in text.split(char::from(0)) {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if crate::session::environment::is_valid_env_key(key) {
-            values.insert(key.to_string(), value.to_string());
-        }
-    }
-    Ok(values)
-}
-
 pub(super) fn read_container_dotenv_content(
     runtime: &crate::containers::RuntimeExecutionSnapshot,
     container_name: &str,
