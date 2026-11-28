@@ -146,19 +146,6 @@ impl Instance {
             ResumeIntent::Cleared | ResumeIntent::Fork { .. }
         ) || matches!(self.resume_intent, ResumeIntent::Use(_))
             && self.launch_has_session_publisher();
-        // OMP seeds its poller with the in-memory sid. Keeping the pin there
-        // would suppress the first equal observation, which is the launch's
-        // confirmation. Leave the durable sid intact but make this launch's
-        // generation report it back through the guarded sync path.
-        let await_omp_pin_confirmation = matches!(
-            (&expected_prior_intent, new_sid.as_deref()),
-            (ResumeIntent::Use(pinned), Some(sid)) if pinned == sid
-        ) && self.resolved_capture_backend()
-            == Some(crate::agents::SessionCaptureBackend::Omp)
-            && self
-                .omp_capture_generation
-                .as_deref()
-                .is_some_and(|generation| !generation.starts_with("tombstone-"));
 
         let instance_id = self.id.clone();
         let new_sid_for_closure = new_sid.clone();
@@ -310,9 +297,6 @@ impl Instance {
                         }
                     }
                 }
-                if await_omp_pin_confirmation {
-                    self.set_agent_conversation(None, None, None);
-                }
                 SidPersistOutcome::Published
             }
             Ok(SidWrite::Skipped)
@@ -322,13 +306,6 @@ impl Instance {
                     Some(disk) => {
                         self.adopt_conversation_state(disk.conversation_state());
                         self.resume_probe_failed_sid = disk.resume_probe_failed_sid;
-                        let disk_still_awaits_confirmation = matches!(
-                            (&self.resume_intent, self.agent_session_id.as_deref()),
-                            (ResumeIntent::Use(pinned), Some(sid)) if pinned == sid
-                        );
-                        if await_omp_pin_confirmation && disk_still_awaits_confirmation {
-                            self.set_agent_conversation(None, None, None);
-                        }
                         SidPersistOutcome::Published
                     }
                     None => {
