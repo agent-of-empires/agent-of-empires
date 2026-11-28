@@ -555,6 +555,29 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/plugins/{id}/provider-calls/{name}`: the plugin worker's reply to its declared
+    /// `provider.<name>` method.
+    pub async fn call_plugin_provider(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, HttpError> {
+        let path = format!(
+            "/api/plugins/{}/provider-calls/{}",
+            path_segment(plugin_id)?,
+            path_segment(name)?
+        );
+        // The daemon enforces the declared timeout; this only outlasts the longest one.
+        let transport =
+            std::time::Duration::from_millis(aoe_plugin_api::PROVIDER_CALL_MAX_TIMEOUT_MS)
+                + std::time::Duration::from_secs(10);
+        self.mutate_with(reqwest::Method::POST, &path, |request| {
+            request.json(params).timeout(transport)
+        })
+        .await
+    }
+
     /// `POST /api/plugins/{id}/worker/restart`: the daemon reloads plugins from
     /// disk and replaces this plugin's worker after its tree changed.
     pub async fn restart_plugin_worker(&self, plugin_id: &str) -> Result<(), HttpError> {
