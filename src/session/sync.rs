@@ -1118,6 +1118,7 @@ mod tests {
             binding: execution,
             capture: None,
             container: None,
+            container_cwd: None,
         });
         inst
     }
@@ -1777,6 +1778,7 @@ mod tests {
                 root: root.clone(),
             }),
             container: None,
+            container_cwd: None,
         });
         seed_instances_on_disk(profile, &[&owner, &claimant]);
         crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
@@ -1852,6 +1854,7 @@ mod tests {
             binding: source,
             capture: None,
             container: None,
+            container_cwd: None,
         });
         seed_instance_on_disk(profile, &inst);
 
@@ -1904,6 +1907,7 @@ mod tests {
                 binding: source.clone(),
                 capture: None,
                 container: None,
+                container_cwd: None,
             };
             let mut qualified = Instance::new("qualified", "/tmp/x");
             qualified.source_profile = profile.to_string();
@@ -2212,6 +2216,7 @@ mod tests {
             },
             capture: None,
             container: None,
+            container_cwd: None,
         };
         let mut inst = Instance::new(
             "pi-stale-after-failed-path",
@@ -2361,6 +2366,7 @@ mod tests {
             },
             capture: None,
             container: None,
+            container_cwd: None,
         };
         inst.active_execution = Some(execution.clone());
         seed_instance_on_disk(profile, &inst);
@@ -2611,6 +2617,7 @@ mod tests {
                     root: root.clone(),
                 }),
                 container: None,
+                container_cwd: None,
             });
             // The binding `start.rs` reserves for a fork child.
             inst.set_agent_conversation(

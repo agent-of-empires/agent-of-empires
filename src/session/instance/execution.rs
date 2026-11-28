@@ -243,8 +243,11 @@ fn ensure_claude_store_root(
 /// resume nor a `/tmp` wipe, so without this a session can stay `Preallocated`
 /// for good and be refused as a fork parent despite holding a complete
 /// transcript. Existence uses the same probe as the `--resume` arm.
+///
+/// `container_cwd` is the cwd a sandboxed agent sees, under which it names its project.
 pub(super) fn transcript_confirms_reserved_claude_conversation(
     binding: &ConversationBinding,
+    container_cwd: Option<&str>,
 ) -> bool {
     if binding.provenance != ConversationProvenance::Preallocated {
         return false;
@@ -258,12 +261,19 @@ pub(super) fn transcript_confirms_reserved_claude_conversation(
     let Some(store) = single_store(&execution.stores) else {
         return false;
     };
-    !crate::session::capture::claude_host_transcript_confirmed_absent(
-        &execution.cwd.to_string_lossy(),
-        &binding.session_id,
-        &[],
-        Some(store),
-    )
+    // Confirmation needs the transcript seen: a lookup that can't tell confirms nothing.
+    let seen = match container_cwd {
+        Some(cwd) => {
+            crate::session::capture::claude_transcript_lookup_in(store, cwd, &binding.session_id)
+        }
+        None => crate::session::capture::claude_host_transcript_lookup(
+            &execution.cwd.to_string_lossy(),
+            &binding.session_id,
+            &[],
+            Some(store),
+        ),
+    };
+    seen == Some(true)
 }
 
 /// Confirms, from inside a live pane's sidecar poller, the reserved Claude id
@@ -278,6 +288,7 @@ pub(super) fn transcript_confirms_reserved_claude_conversation(
 pub(super) struct ReservedClaudeConfirmation {
     binding: ConversationBinding,
     active: ActiveExecution,
+    container_cwd: Option<String>,
     superseded: std::cell::Cell<bool>,
     confirmed: std::cell::OnceCell<crate::session::poller::SessionIdObservation>,
 }
@@ -295,6 +306,12 @@ impl ReservedClaudeConfirmation {
         })?;
         Some(Self {
             binding: binding.clone(),
+            container_cwd: active.container.is_some().then(|| {
+                active
+                    .container_cwd
+                    .clone()
+                    .unwrap_or_else(|| instance.container_workdir())
+            }),
             active: active.clone(),
             superseded: std::cell::Cell::new(false),
             confirmed: std::cell::OnceCell::new(),
@@ -329,7 +346,10 @@ impl ReservedClaudeConfirmation {
         if let Some(confirmed) = self.confirmed.get() {
             return Some(confirmed.clone());
         }
-        if !transcript_confirms_reserved_claude_conversation(&self.binding) {
+        if !transcript_confirms_reserved_claude_conversation(
+            &self.binding,
+            self.container_cwd.as_deref(),
+        ) {
             return None;
         }
         let execution = self.binding.execution.clone()?;
@@ -374,6 +394,10 @@ pub(crate) struct ActiveExecution {
     pub(crate) binding: ExecutionBinding,
     pub(crate) capture: Option<CaptureContext>,
     pub(crate) container: Option<crate::containers::ContainerExecutionSnapshot>,
+    /// The canonical cwd a sandboxed launch ran in, inside its container. Rows recorded
+    /// before it was kept have none and fall back to the configured workdir.
+    #[serde(default)]
+    pub(crate) container_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4757,13 +4781,47 @@ sandbox = "unsupported"
         );
         std::fs::create_dir_all(&project_dir).unwrap();
         std::fs::write(project_dir.join(format!("{present}.jsonl")), "data\n").unwrap();
+        // A sandboxed Claude names its project by the container's cwd (#5960).
+        let boxed = "22222222-3333-4444-5555-666666666666";
+        let container_dir = store.path().join("projects").join(
+            crate::session::capture::encode_claude_project_path("/workspace/project"),
+        );
+        std::fs::create_dir_all(&container_dir).unwrap();
+        std::fs::write(container_dir.join(format!("{boxed}.jsonl")), "data\n").unwrap();
+
+        // A project dir that is a link to itself: the lookup can't tell, so nothing confirms.
+        let looped = store.path().join("projects").join(
+            crate::session::capture::encode_claude_project_path("/workspace/looped"),
+        );
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
 
         use ConversationProvenance::{Preallocated, Unknown};
         let second = store.path().join("second");
-        // (sid, agent, filesystem, provenance, extra store, confirmed)
-        for (sid, agent, filesystem, provenance, extra, confirmed) in [
-            (present, "claude", "host", Preallocated, None, true),
-            (absent, "claude", "host", Preallocated, None, false),
+        let sandboxed = Some("/workspace/project");
+        // (sid, agent, filesystem, provenance, extra store, container cwd, confirmed)
+        for (sid, agent, filesystem, provenance, extra, container_cwd, confirmed) in [
+            (present, "claude", "host", Preallocated, None, None, true),
+            (absent, "claude", "host", Preallocated, None, None, false),
+            (boxed, "claude", "host", Preallocated, None, sandboxed, true),
+            (boxed, "claude", "host", Preallocated, None, None, false),
+            (
+                boxed,
+                "claude",
+                "host",
+                Preallocated,
+                None,
+                Some("/workspace/looped"),
+                false,
+            ),
+            (
+                present,
+                "claude",
+                "host",
+                Preallocated,
+                None,
+                sandboxed,
+                false,
+            ),
             // A container store is not on this filesystem.
             (
                 present,
@@ -4771,16 +4829,18 @@ sandbox = "unsupported"
                 "container:session",
                 Preallocated,
                 None,
+                None,
                 false,
             ),
-            (present, "codex", "host", Preallocated, None, false),
-            (present, "claude", "host", Unknown, None, false),
+            (present, "codex", "host", Preallocated, None, None, false),
+            (present, "claude", "host", Unknown, None, None, false),
             (
                 present,
                 "claude",
                 "host",
                 Preallocated,
                 Some(&second),
+                None,
                 false,
             ),
         ] {
@@ -4801,9 +4861,9 @@ sandbox = "unsupported"
                 transcript_path: None,
             };
             assert_eq!(
-                transcript_confirms_reserved_claude_conversation(&binding),
+                transcript_confirms_reserved_claude_conversation(&binding, container_cwd),
                 confirmed,
-                "sid={sid} agent={agent} filesystem={filesystem} provenance={provenance:?} extra={extra:?}"
+                "sid={sid} agent={agent} filesystem={filesystem} provenance={provenance:?} extra={extra:?} container_cwd={container_cwd:?}"
             );
         }
     }
@@ -4875,6 +4935,88 @@ sandbox = "unsupported"
             None,
             "latched after a /clear"
         );
+    }
+
+    /// A sandboxed reserved id is confirmed under the canonical cwd its launch ran in, not the
+    /// configured workdir, which can be an alias of it. A row recorded without one keeps the
+    /// configured workdir.
+    #[test]
+    fn reserved_claude_confirmation_reads_the_launch_container_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let reserved = "019342ab-1234-7def-8901-abcdef012346";
+        let mut inst = super::super::test_helpers::reserved_claude_instance(root.path(), reserved);
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "fixture".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/link".into()),
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+        });
+        let store = &inst.active_execution.as_ref().unwrap().binding.stores[0];
+        let project =
+            store
+                .join("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    "/workspace/project",
+                ));
+        // (case, cwd the launch recorded, the transcript appears only after the poller's first
+        // read, confirms the reserved id)
+        for (case, recorded, late, confirms) in [
+            (
+                "canonical-recorded",
+                Some("/workspace/project"),
+                false,
+                true,
+            ),
+            ("late-transcript", Some("/workspace/project"), true, true),
+            ("recorded-before-upgrade", None, false, false),
+        ] {
+            let _ = std::fs::remove_dir_all(&project);
+            if !late {
+                std::fs::create_dir_all(&project).unwrap();
+                std::fs::write(project.join(format!("{reserved}.jsonl")), "{}\n").unwrap();
+            }
+            let active = inst.active_execution.as_mut().unwrap();
+            active.container = Some(crate::containers::ContainerExecutionSnapshot {
+                runtime: crate::containers::RuntimeExecutionSnapshot {
+                    kind: crate::session::ContainerRuntimeName::Docker,
+                    program: root.path().join("docker"),
+                    cwd: root.path().to_path_buf(),
+                    endpoint: String::new(),
+                    local_mounts: true,
+                    routing: Vec::new(),
+                    global_arguments: Vec::new(),
+                },
+                name: "fixture".into(),
+                id: "fixture-id".into(),
+                mounts: Vec::new(),
+                shadow_mounts: Vec::new(),
+            });
+            active.container_cwd = recorded.map(str::to_owned);
+            let confirmation = ReservedClaudeConfirmation::for_instance(&inst).unwrap();
+            if late {
+                // No identity hook: the poller's read before the agent wrote its transcript.
+                assert_eq!(
+                    confirmation.observe(None, || None).map(|o| o.sid),
+                    None,
+                    "{case}: nothing to confirm yet"
+                );
+                std::fs::create_dir_all(&project).unwrap();
+                std::fs::write(project.join(format!("{reserved}.jsonl")), "{}\n").unwrap();
+            }
+            assert_eq!(
+                confirmation
+                    .observe(None, || None)
+                    .map(|observation| observation.sid),
+                confirms.then(|| reserved.to_owned()),
+                "{case}"
+            );
+        }
     }
 
     fn hermes_fixture() -> (tempfile::TempDir, NativeLaunchInputs, rusqlite::Connection) {

@@ -1742,6 +1742,7 @@ mod tests {
                     cwd: "/workspace".into(),
                 }),
                 container: None,
+                container_cwd: None,
             });
         };
         bind(&mut current, &shared_store);
@@ -2292,6 +2293,7 @@ mod tests {
             },
             capture: None,
             container: None,
+            container_cwd: None,
         };
         let mut inst = Instance::new("foreign-poller", "/tmp/foreign-poller");
         let mut poller = crate::session::poller::SessionPoller::new(

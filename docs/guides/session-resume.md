@@ -113,7 +113,7 @@ Pi/OMP transcript rebinding is host-only. For other agents that support sandboxe
 
 This records an assertion about the intended native target, separately from any observed conversation. The pin is sticky. If the execution context changes, restore it or explicitly rebind the intended conversation before retrying. Legacy IDs and IDs from old unqualified publishers remain unknown after migration; current configuration does not relabel them.
 
-When a launch requests resume, AoE preserves an unknown stored ID and attempts it only when native execution resolves. A qualified capture can establish its binding. If the native resume probe fails, AoE preserves the ID, records a durable failure marker, and returns `resume_failed` without starting fresh in that call.
+When a launch requests resume, AoE preserves an unknown stored ID and attempts it only when native execution resolves. A qualified capture can establish its binding. If the native resume probe fails, AoE preserves the ID, records a durable failure marker, and returns `resume_failed` without starting fresh in that call. The probe watches a host resume for about 2 seconds. A sandboxed resume is watched for up to 10 seconds, until the agent's screen reads idle, because the agent starts inside the container after `docker exec` does.
 
 Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. Capturing a different ID clears it; an explicit `set-session-id` assertion or a successful launch can also clear it.
 

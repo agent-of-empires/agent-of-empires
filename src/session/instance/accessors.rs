@@ -1080,6 +1080,7 @@ mod tests {
             },
             capture: None,
             container: None,
+            container_cwd: None,
         });
 
         let (capture, context) = instance

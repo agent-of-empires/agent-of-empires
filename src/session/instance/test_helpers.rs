@@ -294,6 +294,7 @@ pub(super) fn reserved_claude_instance(root: &std::path::Path, sid: &str) -> Ins
         binding: execution.clone(),
         capture: None,
         container: None,
+        container_cwd: None,
     });
     instance.set_agent_conversation(
         Some(sid.into()),

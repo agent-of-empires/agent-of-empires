@@ -3506,6 +3506,112 @@ sandbox = "unsupported"
         assert!(matches!(&child.resume_intent, ResumeIntent::Fork { from } if from == parent_sid));
     }
 
+    /// The container's SessionStart writer must publish the leaf a sandboxed launch reads (#5960).
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_claude_sidecar_reaches_its_launch() {
+        use std::io::Write;
+        if which::which("jq").is_err() {
+            eprintln!("skipping: jq not on PATH");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        // Its own hook base, never the per-user one.
+        let (_hooks, _, _hook_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = "sandbox-sidecar-leaf";
+        super::super::test_helpers::declare_execution_aliases(
+            profile,
+            &[("claude", "claude")],
+            temp.path(),
+        );
+        let mut inst = Instance::new("claude-sidecar", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        inst.source_profile = profile.into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "fixture".into(),
+            container_name: "claude-sidecar".into(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace/project".into()),
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+        });
+        let config = inst.build_container_config_for_test().unwrap();
+        let _transport = super::super::test_helpers::install_container_transport(
+            temp.path(),
+            "claude-sidecar",
+            &config.volumes,
+        );
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/claude"),
+        )
+        .unwrap();
+        let execution = inst.resolve_native_execution(None).unwrap();
+        let source = execution
+            .routing
+            .iter()
+            .find(|(key, _)| key == crate::hooks::SESSION_SOURCE_ENV)
+            .and_then(|(_, value)| value.clone())
+            .expect("a sandboxed launch exports its source");
+        let active = super::super::execution::ActiveExecution {
+            launch_id: execution.inputs.launch_id.clone(),
+            binding: execution.binding.clone(),
+            capture: execution.capture.clone(),
+            container: execution.inputs.container.clone(),
+            container_cwd: None,
+        };
+        let mounted = config
+            .volumes
+            .iter()
+            .find(|mount| {
+                mount
+                    .container_path
+                    .starts_with(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
+            })
+            .expect("hook dir is bind-mounted");
+        let host_base = std::path::Path::new(&mounted.host_path).parent().unwrap();
+        let writer = crate::hooks::hook_command_session_id(
+            crate::hooks::HookInstallTarget::Sandbox,
+            crate::agents::HookIdentityField::SessionId,
+            None,
+        )
+        .replace(
+            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
+            host_base.to_str().unwrap(),
+        );
+        let minted = "22222222-2222-4222-8222-222222222222";
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", &writer])
+            .env("AOE_INSTANCE_ID", &inst.id)
+            .env(crate::hooks::SESSION_SOURCE_ENV, &source)
+            .env_remove("AOE_AGENT_BIN")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!(r#"{{"session_id":"{minted}"}}"#).as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        let observed =
+            super::super::execution::hook_session_observation(&inst.id, Some(&active), None);
+        assert_eq!(
+            observed.map(|observation| observation.sid).as_deref(),
+            Some(minted)
+        );
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+    }
+
     #[test]
     #[serial_test::serial]
     fn sandboxed_assertion_keeps_the_native_container_store() {
@@ -3573,24 +3679,42 @@ sandbox = "unsupported"
                 .as_deref(),
             Some("/root/.claude")
         );
-        inst.resume_intent = ResumeIntent::Default;
-        inst.resume_binding = None;
-        inst.set_agent_conversation(
-            Some(sid.into()),
-            Some(crate::session::ConversationBinding::unknown(sid)),
-            None,
-        );
-        let carried = inst
-            .prepare_launch_command(inst.conversation_state())
-            .unwrap();
-        assert!(carried
-            .command
-            .unwrap()
-            .contains(&format!("--resume {sid}")));
-        assert_eq!(
-            inst.agent_session_binding,
-            Some(crate::session::ConversationBinding::unknown(sid))
-        );
+        // A carried id resumes only when the container's store holds its transcript (#5960).
+        let transcript = resumed.binding.stores[0]
+            .join("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                "/workspace/project",
+            ))
+            .join(format!("{sid}.jsonl"));
+        for (written, want, other) in [
+            (false, "--session-id", "--resume"),
+            (true, "--resume", "--session-id"),
+        ] {
+            if written {
+                std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+                std::fs::write(&transcript, "").unwrap();
+            }
+            inst.resume_intent = ResumeIntent::Default;
+            inst.resume_binding = None;
+            inst.set_agent_conversation(
+                Some(sid.into()),
+                Some(crate::session::ConversationBinding::unknown(sid)),
+                None,
+            );
+            let carried = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap();
+            let command = carried.command.unwrap();
+            assert!(
+                command.contains(&format!("{want} {sid}")),
+                "{written}: {command}"
+            );
+            assert!(
+                !command.contains(&format!("{other} {sid}")),
+                "{written}: only {want}: {command}"
+            );
+            assert_eq!(inst.agent_session_id.as_deref(), Some(sid), "{written}");
+        }
     }
 
     #[test]

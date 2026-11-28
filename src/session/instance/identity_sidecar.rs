@@ -644,6 +644,7 @@ mod tests {
                 root: root.clone(),
             }),
             container: None,
+            container_cwd: None,
         });
         inst.set_agent_conversation(
             Some(sid.into()),

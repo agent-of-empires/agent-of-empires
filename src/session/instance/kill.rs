@@ -680,6 +680,7 @@ mod tests {
                 },
                 capture: Some(CaptureContext::PrimeStatus(runtime.clone())),
                 container: None,
+                container_cwd: None,
             });
             storage
                 .update(|instances, _| {
@@ -901,6 +902,7 @@ mod tests {
                     runtime: Some(runtime.clone()),
                 }),
                 container: None,
+                container_cwd: None,
             });
             storage
                 .update(|rows, _| {
@@ -1076,6 +1078,7 @@ mod tests {
             binding: execution,
             capture: Some(CaptureContext::Hooks(sidecar.clone())),
             container: None,
+            container_cwd: None,
         });
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
         storage

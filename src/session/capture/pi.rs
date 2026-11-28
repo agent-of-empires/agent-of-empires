@@ -398,6 +398,7 @@ mod tests {
                 root: canonical_root.clone(),
             }),
             container: None,
+            container_cwd: None,
         };
         crate::hooks::write_session_id_via_guard(&inst.id, current, Some(launch)).unwrap();
         let scoped = pi_sidecar_poll_fn(inst.id.clone(), source, Some(active.clone()));

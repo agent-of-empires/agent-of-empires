@@ -172,6 +172,11 @@ const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// restart path's latency, not in agent responsiveness afterward.
 const RESUME_PROBE_POST_SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
 
+/// How long a sandboxed resume is watched for its agent dying. Its pane runs `docker exec`,
+/// never a shell, so the post-shell grace would start with the pane, before the agent in the
+/// container has read its session id.
+const RESUME_PROBE_CONTAINER_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Instance {
     pub fn restart_with_size(&mut self, size: Option<(u16, u16)>) -> Result<StartOutcome> {
         self.restart_with_size_opts(size, false)
@@ -286,6 +291,55 @@ impl Instance {
             }
             if now >= deadline {
                 return Ok(ProbeResult::Alive);
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
+    /// [`Self::probe_settle`], except that a sandboxed resume is watched until its agent's
+    /// screen reads idle.
+    fn probe_resume(&self, sandboxed: bool) -> Result<ProbeResult> {
+        if sandboxed {
+            if let Some(probe) =
+                self.probe_until_idle(RESUME_PROBE_CONTAINER_MAX, RESUME_PROBE_POLL)
+            {
+                return probe;
+            }
+        }
+        self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL)
+    }
+
+    /// `Dead` when the pane dies before the agent's screen reads idle by its manifest, else
+    /// `Alive` once it does or `max` passes. `None` for an agent without a manifest.
+    fn probe_until_idle(
+        &self,
+        max: std::time::Duration,
+        poll: std::time::Duration,
+    ) -> Option<Result<ProbeResult>> {
+        let session = match self.tmux_session() {
+            Ok(session) => session,
+            Err(error) => return Some(Err(error)),
+        };
+        let started = std::time::Instant::now();
+        let deadline = started + max;
+        #[cfg(test)]
+        let mut past_host_grace = false;
+        loop {
+            if !session.exists() || session.is_pane_dead() {
+                return Some(Ok(ProbeResult::Dead));
+            }
+            #[cfg(test)]
+            if !past_host_grace && started.elapsed() >= RESUME_PROBE_POST_SHELL_GRACE {
+                past_host_grace = true;
+                tests::container_probe_past_host_grace(&session);
+            }
+            if self.screen_reads_idle(&session)? {
+                #[cfg(test)]
+                tests::container_probe_read_idle();
+                return Some(Ok(ProbeResult::Alive));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Some(Ok(ProbeResult::Alive));
             }
             std::thread::sleep(poll);
         }
@@ -798,7 +852,7 @@ impl Instance {
             });
         };
 
-        let probe = match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
+        let probe = match self.probe_resume(self.is_sandboxed()) {
             Ok(probe) => probe,
             Err(error) => {
                 self.capture_poller.clear();
@@ -876,6 +930,7 @@ mod tests {
             binding,
             capture: Some(CaptureContext::Hooks(directory.join(leaf.as_ref()))),
             container: None,
+            container_cwd: None,
         });
         let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
         storage
@@ -1334,9 +1389,91 @@ mod tests {
             "account swap must consume target store"
         );
     }
+    /// A sandboxed resume is watched past the host's 2 s grace until its agent's screen reads
+    /// idle. Each fake lives until the test ends it, so rows assert order, not timing: the
+    /// sandboxed agent dies only once the probe has watched past the host's grace.
+    #[test]
+    #[serial]
+    fn a_sandboxed_resume_is_watched_until_its_screen_reads_idle() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app = crate::session::test_support::isolate_app_dir();
+        const LIVES: &str = "exec cat";
+        const PROMPT: &str = "printf '%s\\n%s\\n%s\\n' ──────── '❯ ' ────────; exec cat";
+        // (script, sandboxed, end the agent once the probe is past the host grace, want, whether the
+        // probe accepted an idle screen rather than waiting out its deadline)
+        for (script, sandboxed, end_past_grace, want, read_idle) in [
+            (LIVES, true, true, ProbeResult::Dead, false),
+            (LIVES, false, false, ProbeResult::Alive, false),
+            (PROMPT, true, false, ProbeResult::Alive, true),
+        ] {
+            READ_IDLE.with(|seen| seen.set(false));
+            let mut inst = Instance::new("probe-idle", "/tmp");
+            inst.tool = "claude".to_string();
+            let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+            let mut args: Vec<String> = ["new-session", "-d", "-s", &name, "-x", "80", "-y", "24"]
+                .map(String::from)
+                .into();
+            args.extend(["sh".to_string(), "-c".to_string(), script.to_string()]);
+            crate::tmux::utils::append_pane_base_index_args(&mut args, &name);
+            crate::tmux::utils::append_remain_on_exit_args(&mut args, &name);
+            assert!(crate::tmux::tmux_command()
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+            crate::tmux::refresh_session_cache();
+            let ended = std::rc::Rc::new(std::cell::Cell::new(false));
+            if end_past_grace {
+                let ended = ended.clone();
+                let observer: PostShellCallback = Box::new(move |session| {
+                    // EOF on the tty ends `cat`, so the pane dies.
+                    assert!(crate::tmux::tmux_command()
+                        .args(["send-keys", "-t", session.name(), "C-d"])
+                        .status()
+                        .unwrap()
+                        .success());
+                    ended.set(true);
+                });
+                PAST_GRACE_OBSERVER.with(|slot| *slot.borrow_mut() = Some(observer));
+            }
+            assert_eq!(
+                inst.probe_resume(sandboxed).unwrap(),
+                want,
+                "{script} sandboxed={sandboxed}"
+            );
+            assert_eq!(
+                ended.get(),
+                end_past_grace,
+                "{script} sandboxed={sandboxed}"
+            );
+            assert_eq!(
+                READ_IDLE.with(std::cell::Cell::get),
+                read_idle,
+                "{script} sandboxed={sandboxed}: idle accepted"
+            );
+            PAST_GRACE_OBSERVER.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
     type PostShellCallback = Box<dyn FnOnce(&crate::tmux::Session)>;
     thread_local! {
         static POST_SHELL_OBSERVER: std::cell::RefCell<Option<PostShellCallback>> = const { std::cell::RefCell::new(None) };
+        static PAST_GRACE_OBSERVER: std::cell::RefCell<Option<PostShellCallback>> = const { std::cell::RefCell::new(None) };
+        static READ_IDLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn container_probe_read_idle() {
+        READ_IDLE.with(|seen| seen.set(true));
+    }
+
+    pub(super) fn container_probe_past_host_grace(session: &crate::tmux::Session) {
+        let observer = PAST_GRACE_OBSERVER.with(|slot| slot.borrow_mut().take());
+        if let Some(observer) = observer {
+            observer(session);
+        }
     }
 
     pub(super) fn post_shell_observed(session: &crate::tmux::Session) {
