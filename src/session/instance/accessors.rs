@@ -402,7 +402,7 @@ impl Instance {
         }
         words
             .first()
-            .is_some_and(|executable| executable == agent.binary)
+            .is_some_and(|executable| agent.matches_binary(executable))
             && !words.iter().any(|word| word == "--")
     }
 
@@ -617,7 +617,7 @@ impl Instance {
         if crate::agents::AGENTS
             .iter()
             .chain(crate::plugin::bundled_agents::definitions())
-            .any(|other| other.binary == program && other.name != agent.name)
+            .any(|other| other.matches_binary(program) && other.name != agent.name)
         {
             return None;
         }

@@ -2089,6 +2089,7 @@ impl Drop for BlockedProbeWorker<'_> {
 #[cfg(test)]
 pub(crate) struct AgentAvailabilityGuard {
     prev: Option<HashMap<String, (bool, std::time::Instant)>>,
+    prev_binaries: HashMap<String, String>,
 }
 
 #[cfg(test)]
@@ -2099,6 +2100,11 @@ impl AgentAvailabilityGuard {
                 .read()
                 .expect("agent availability lock")
                 .clone(),
+            prev_binaries: DISCOVERED_AGENT_BINARIES
+                .read()
+                .expect("discovered agent binaries lock")
+                .clone()
+                .unwrap_or_default(),
         }
     }
 
@@ -2130,6 +2136,9 @@ impl AgentAvailabilityGuard {
         if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
             *cache = None;
         }
+        if let Ok(mut binaries) = DISCOVERED_AGENT_BINARIES.write() {
+            *binaries = None;
+        }
     }
 
     /// Whether the memo currently holds any answer.
@@ -2147,6 +2156,13 @@ impl Drop for AgentAvailabilityGuard {
     fn drop(&mut self) {
         if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
             *cache = self.prev.take();
+        }
+        if let Ok(mut binaries) = DISCOVERED_AGENT_BINARIES.write() {
+            *binaries = if self.prev_binaries.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut self.prev_binaries))
+            };
         }
     }
 }
@@ -3207,17 +3223,28 @@ fn agent_available_direct(
     use crate::agents::DetectionMethod;
     match &agent.detection {
         DetectionMethod::Which(binary) => {
-            if binary.contains('/') || binary.contains('\\') {
-                return Some(std::path::Path::new(binary).exists());
+            let mut all_paths = true;
+            for candidate in std::iter::once(*binary).chain(agent.fallback_binaries.iter().copied())
+            {
+                if candidate.contains('/') || candidate.contains('\\') {
+                    if std::path::Path::new(candidate).exists() {
+                        return Some(true);
+                    }
+                    continue;
+                }
+                all_paths = false;
+                let found = agent_probe_output(
+                    Command::new("which").arg(candidate),
+                    AGENT_PROBE_TIMEOUT,
+                    cancel,
+                )
+                .is_some_and(|output| output.status.success());
+                if found {
+                    return Some(true);
+                }
             }
-            let found = agent_probe_output(
-                Command::new("which").arg(binary),
-                AGENT_PROBE_TIMEOUT,
-                cancel,
-            )
-            .is_some_and(|output| output.status.success());
-            if found {
-                Some(true)
+            if all_paths {
+                Some(false)
             } else {
                 None
             }
@@ -3234,32 +3261,47 @@ fn agent_available_direct(
     }
 }
 
-/// One probe command per agent, chained with `;` so every probe runs
-/// regardless of earlier results. Each hit prints a `AOE_AGENT_OK <name>`
-/// marker line that [`parse_login_shell_probe`] picks out of whatever else
-/// the user's login shell prints (motd, nvm chatter, ...).
+/// One probe command per agent (or per candidate binary), chained with `;` so
+/// every probe runs regardless of earlier results. Each hit prints an
+/// `AOE_AGENT_OK <name>` marker line that [`parse_login_shell_probe`] picks
+/// out of whatever else the user's login shell prints (motd, nvm chatter, ...).
 fn login_shell_probe_script(agents: &[&crate::agents::AgentDef<'_>]) -> String {
     use crate::agents::DetectionMethod;
-    agents
-        .iter()
-        .map(|agent| {
-            let probe = match &agent.detection {
-                DetectionMethod::Which(binary) => {
-                    format!("which {}", shell_words::quote(binary))
+    let mut probes = Vec::new();
+    for agent in agents {
+        let quoted_name = shell_words::quote(agent.name);
+        match &agent.detection {
+            DetectionMethod::Which(binary) => {
+                if agent.fallback_binaries.is_empty() {
+                    probes.push(format!(
+                        "which {} >/dev/null 2>&1 && echo {} {}",
+                        shell_words::quote(binary),
+                        LOGIN_PROBE_MARKER,
+                        quoted_name
+                    ));
+                } else {
+                    for candidate in
+                        std::iter::once(*binary).chain(agent.fallback_binaries.iter().copied())
+                    {
+                        let quoted_candidate = shell_words::quote(candidate);
+                        probes.push(format!(
+                            "which {quoted_candidate} >/dev/null 2>&1 && echo {LOGIN_PROBE_MARKER} {quoted_name} {quoted_candidate}"
+                        ));
+                    }
                 }
-                DetectionMethod::RunWithArg(binary, arg) => {
-                    format!("{} {}", shell_words::quote(binary), shell_words::quote(arg))
-                }
-            };
-            format!(
-                "{} >/dev/null 2>&1 && echo {} {}",
-                probe,
-                LOGIN_PROBE_MARKER,
-                shell_words::quote(agent.name)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+            }
+            DetectionMethod::RunWithArg(binary, arg) => {
+                probes.push(format!(
+                    "{} {} >/dev/null 2>&1 && echo {} {}",
+                    shell_words::quote(binary),
+                    shell_words::quote(arg),
+                    LOGIN_PROBE_MARKER,
+                    quoted_name
+                ));
+            }
+        }
+    }
+    probes.join("; ")
 }
 
 const LOGIN_PROBE_MARKER: &str = "AOE_AGENT_OK";
@@ -3268,9 +3310,26 @@ fn parse_login_shell_probe(stdout: &str) -> std::collections::HashSet<String> {
     stdout
         .lines()
         .filter_map(|line| line.trim().strip_prefix(LOGIN_PROBE_MARKER))
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(str::to_string)
         .collect()
+}
+
+fn parse_login_shell_probe_binaries(stdout: &str) -> HashMap<String, HashSet<String>> {
+    let mut matched: HashMap<String, HashSet<String>> = HashMap::new();
+    for line in stdout.lines() {
+        let Some(rest) = line.trim().strip_prefix(LOGIN_PROBE_MARKER) else {
+            continue;
+        };
+        let mut tokens = rest.split_whitespace();
+        if let (Some(name), Some(binary)) = (tokens.next(), tokens.next()) {
+            matched
+                .entry(name.to_string())
+                .or_default()
+                .insert(binary.to_string());
+        }
+    }
+    matched
 }
 
 /// One login shell for all agents, since profile startup is slow.
@@ -3282,19 +3341,50 @@ fn login_shell_probe(
         return std::collections::HashSet::new();
     }
     let shell = crate::session::user_shell();
-    agent_probe_output(
+    let Some(output) = agent_probe_output(
         Command::new(&shell).args(["-lc", &login_shell_probe_script(agents)]),
         LOGIN_SHELL_PROBE_TIMEOUT,
         cancel,
-    )
-    .map(|o| parse_login_shell_probe(&String::from_utf8_lossy(&o.stdout)))
-    .unwrap_or_default()
+    ) else {
+        return std::collections::HashSet::new();
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let matched_binaries = parse_login_shell_probe_binaries(&stdout);
+    if let Ok(mut binaries) = DISCOVERED_AGENT_BINARIES.write() {
+        let map = binaries.get_or_insert_with(HashMap::new);
+        for agent in agents {
+            if agent.fallback_binaries.is_empty() {
+                continue;
+            }
+            if let Some(found_bins) = matched_binaries.get(agent.name) {
+                if let Some(preferred) = agent
+                    .candidate_binaries()
+                    .find(|candidate| found_bins.contains(*candidate))
+                {
+                    map.insert(agent.name.to_string(), preferred.to_string());
+                }
+            } else {
+                map.remove(agent.name);
+            }
+        }
+    }
+    parse_login_shell_probe(&stdout)
 }
 
 /// Process-wide positive and negative availability cache. Startup warms it for
 /// settings and API callers; TTL expiry and Recheck refresh external installations.
 static AGENT_AVAILABILITY: RwLock<Option<HashMap<String, (bool, std::time::Instant)>>> =
     RwLock::new(None);
+
+/// Executable names discovered via login-shell probe for agents with fallback binaries.
+static DISCOVERED_AGENT_BINARIES: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
+
+pub(crate) fn discovered_agent_binary(agent_name: &str) -> Option<String> {
+    DISCOVERED_AGENT_BINARIES
+        .read()
+        .ok()
+        .and_then(|cache| cache.as_ref()?.get(agent_name).cloned())
+}
 
 /// Refresh external installations without charging every settings keystroke for a probe.
 const AGENT_AVAILABILITY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -3305,6 +3395,9 @@ static AGENT_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 thread_local! {
     static AGENT_PROBE_MISS_GATE: std::cell::RefCell<Option<(
+        std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
+    static AGENT_PROBE_WARM_READ_GATE: std::cell::RefCell<Option<(
         std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>,
     )>> = const { std::cell::RefCell::new(None) };
     static AGENT_PROBE_LOCK_CONTENDED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -3328,6 +3421,9 @@ pub(crate) fn invalidate_agent_availability() {
     let _probe_guard = lock_agent_probe();
     if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
         *cache = None;
+    }
+    if let Ok(mut binaries) = DISCOVERED_AGENT_BINARIES.write() {
+        *binaries = None;
     }
 }
 
@@ -3360,21 +3456,74 @@ fn partition_cached_agents<'a>(
 pub(crate) fn probe_agents_available(
     agents: &[&crate::agents::AgentDef<'_>],
 ) -> std::collections::HashSet<String> {
-    probe_agents_available_inner(agents, None, false)
+    probe_agents_available_inner(agents, None, false).0
+}
+
+fn snapshot_discovered_binaries(
+    agents: &[&crate::agents::AgentDef<'_>],
+    found: &HashSet<String>,
+) -> HashMap<String, String> {
+    let mut discovered = HashMap::new();
+    if let Ok(cache) = DISCOVERED_AGENT_BINARIES.read() {
+        if let Some(map) = cache.as_ref() {
+            for name in found {
+                if let Some(bin) = map.get(name) {
+                    discovered.insert(name.clone(), bin.clone());
+                }
+            }
+        }
+    }
+    for agent in agents {
+        if found.contains(agent.name)
+            && !agent.fallback_binaries.is_empty()
+            && !discovered.contains_key(agent.name)
+        {
+            if let Some(bin) = agent
+                .candidate_binaries()
+                .find(|candidate| which::which(candidate).is_ok())
+            {
+                discovered.insert(agent.name.to_string(), bin.to_string());
+            }
+        }
+    }
+    discovered
 }
 
 fn probe_agents_available_inner(
     agents: &[&crate::agents::AgentDef<'_>],
     cancel: Option<&tokio_util::sync::CancellationToken>,
     force: bool,
-) -> std::collections::HashSet<String> {
-    let (mut found, uncached) = if force {
+) -> (std::collections::HashSet<String>, HashMap<String, String>) {
+    let (mut found, mut uncached) = if force {
         (HashSet::new(), agents.to_vec())
     } else {
         partition_cached_agents(agents)
     };
+    #[cfg(test)]
+    if let Some((entered, resume)) =
+        AGENT_PROBE_WARM_READ_GATE.with(|gate| gate.borrow_mut().take())
+    {
+        let _ = entered.send(());
+        let _ = resume.recv();
+    }
     if uncached.is_empty() {
-        return found;
+        let discovered = snapshot_discovered_binaries(agents, &found);
+        let inconsistent: Vec<_> = agents
+            .iter()
+            .copied()
+            .filter(|agent| {
+                found.contains(agent.name)
+                    && !agent.fallback_binaries.is_empty()
+                    && !discovered.contains_key(agent.name)
+            })
+            .collect();
+        if inconsistent.is_empty() {
+            return (found, discovered);
+        }
+        for agent in inconsistent {
+            found.remove(agent.name);
+            uncached.push(agent);
+        }
     }
 
     #[cfg(test)]
@@ -3387,7 +3536,8 @@ fn probe_agents_available_inner(
     let _probe_guard = if let Some(cancel) = cancel {
         loop {
             if cancel.is_cancelled() {
-                return found;
+                let discovered = snapshot_discovered_binaries(agents, &found);
+                return (found, discovered);
             }
             match AGENT_PROBE_LOCK.try_lock() {
                 Ok(guard) => break guard,
@@ -3404,11 +3554,24 @@ fn probe_agents_available_inner(
         *AGENT_AVAILABILITY
             .write()
             .unwrap_or_else(|error| error.into_inner()) = None;
+        *DISCOVERED_AGENT_BINARIES
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
-    let (already_found, uncached) = partition_cached_agents(&uncached);
+    let (already_found, mut uncached) = partition_cached_agents(&uncached);
     found.extend(already_found);
+    let discovered = snapshot_discovered_binaries(agents, &found);
+    for agent in agents {
+        if found.contains(agent.name)
+            && !agent.fallback_binaries.is_empty()
+            && !discovered.contains_key(agent.name)
+        {
+            found.remove(agent.name);
+            uncached.push(*agent);
+        }
+    }
     if uncached.is_empty() {
-        return found;
+        return (found, discovered);
     }
 
     // Pass 1 is cheap per agent (`which` / a version run on the inherited
@@ -3417,7 +3580,8 @@ fn probe_agents_available_inner(
     let mut needs_shell: Vec<&crate::agents::AgentDef<'_>> = Vec::new();
     for agent in uncached {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            return found;
+            let discovered = snapshot_discovered_binaries(agents, &found);
+            return (found, discovered);
         }
         match agent_available_direct(agent, cancel) {
             Some(ok) => results.push((agent.name, ok)),
@@ -3426,7 +3590,8 @@ fn probe_agents_available_inner(
     }
     let shell_found = login_shell_probe(&needs_shell, cancel);
     if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-        return found;
+        let discovered = snapshot_discovered_binaries(agents, &found);
+        return (found, discovered);
     }
     for agent in needs_shell {
         results.push((agent.name, shell_found.contains(agent.name)));
@@ -3444,11 +3609,30 @@ fn probe_agents_available_inner(
             found.insert(name.to_string());
         }
     }
-    found
+    let discovered = snapshot_discovered_binaries(agents, &found);
+    (found, discovered)
 }
 
 pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef<'_>) -> bool {
     probe_agents_available(&[agent]).contains(agent.name)
+}
+
+/// Resolve and capture the host executable name for an agent with fallback binaries.
+pub(crate) fn probe_agent_discovered_binary(agent: &crate::agents::AgentDef<'_>) -> Option<String> {
+    if agent.fallback_binaries.is_empty() {
+        return None;
+    }
+    if let Some(found) = agent
+        .candidate_binaries()
+        .find(|bin| which::which(bin).is_ok())
+    {
+        return Some(found.to_string());
+    }
+    let (found, mut discovered) = probe_agents_available_inner(&[agent], None, false);
+    found
+        .contains(agent.name)
+        .then(|| discovered.remove(agent.name))
+        .flatten()
 }
 
 /// A nonblocking UI snapshot: cached answers, with local PATH lookups for misses.
@@ -3468,16 +3652,18 @@ pub(crate) fn agent_availability_snapshot(
             }
         }
     }
-    found.extend(
-        uncached
-            .into_iter()
-            .filter_map(|agent| match agent.detection {
-                crate::agents::DetectionMethod::Which(binary) if which::which(binary).is_ok() => {
-                    Some(agent.name.to_string())
-                }
-                _ => None,
-            }),
-    );
+    found.extend(uncached.into_iter().filter_map(|agent| {
+        match agent.detection {
+            crate::agents::DetectionMethod::Which(binary)
+                if std::iter::once(binary)
+                    .chain(agent.fallback_binaries.iter().copied())
+                    .any(|candidate| which::which(candidate).is_ok()) =>
+            {
+                Some(agent.name.to_string())
+            }
+            _ => None,
+        }
+    }));
     found
 }
 
@@ -3537,7 +3723,7 @@ impl AvailableTools {
             .iter()
             .chain(crate::plugin::bundled_agents::available())
             .collect();
-        let found = probe_agents_available_inner(&refs, Some(cancel), force);
+        let (found, _) = probe_agents_available_inner(&refs, Some(cancel), force);
         let session = crate::session::config::Config::load()
             .ok()
             .map(load_session);
@@ -3625,7 +3811,7 @@ fn load_session(config: crate::session::config::Config) -> crate::session::confi
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     /// Invalidation must clear after an in-flight probe publishes, not before.
     #[test]
     #[serial_test::serial]
@@ -3665,7 +3851,7 @@ mod tests {
 
     // Isolate process-wide probe and socket state from unrelated tests.
     #[cfg(unix)]
-    pub(super) fn run_probe_test_in_subprocess() -> bool {
+    pub(crate) fn run_probe_test_in_subprocess() -> bool {
         const CHILD_ENV: &str = "AOE_AGENT_PROBE_TEST_CHILD";
         let thread = std::thread::current();
         let test = thread.name().expect("named test thread");
@@ -6080,5 +6266,164 @@ AOE_AGENT_OK\n";
             ["kimi", "omp"].iter().map(|s| s.to_string()).collect(),
             "markers parse through profile noise; mid-line and empty markers are ignored"
         );
+    }
+
+    #[test]
+    fn login_shell_probe_script_includes_fallback_binaries() {
+        let claude = crate::agents::get_agent("claude").unwrap();
+        let cursor = crate::agents::get_agent("cursor").unwrap();
+        let script = login_shell_probe_script(&[claude, cursor]);
+        assert_eq!(
+            script,
+            "which claude >/dev/null 2>&1 && echo AOE_AGENT_OK claude; \
+             which agent >/dev/null 2>&1 && echo AOE_AGENT_OK cursor agent; \
+             which cursor-agent >/dev/null 2>&1 && echo AOE_AGENT_OK cursor cursor-agent"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn cursor_detected_via_cursor_agent_fallback_on_clean_path() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        let login_bin = home.path().join("login-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&login_bin).unwrap();
+
+        let make_exec = |path: &std::path::Path, content: &str| {
+            std::fs::write(path, content).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // Hermetic `which` checking only the current PATH directories.
+        make_exec(
+            &bin.join("which"),
+            "#!/bin/sh\nIFS=:; for d in $PATH; do [ -x \"$d/$1\" ] && exit 0; done; exit 1\n",
+        );
+        make_exec(&bin.join("login-shell"), "#!/bin/sh\nexit 0\n");
+
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.path().to_path_buf()),
+            ("PATH", bin.clone()),
+            ("SHELL", bin.join("login-shell")),
+        ]);
+        let memo = AgentAvailabilityGuard::capture();
+        let cursor = crate::agents::get_agent("cursor").unwrap();
+
+        // Neither `agent` nor `cursor-agent` present.
+        memo.clear();
+        assert!(!agent_availability_snapshot(&[cursor]).contains("cursor"));
+        assert!(!probe_agents_available(&[cursor]).contains("cursor"));
+        assert_eq!(cursor.resolved_binary(), "agent");
+
+        // Only `cursor-agent` present on PATH.
+        let cursor_agent = bin.join("cursor-agent");
+        make_exec(&cursor_agent, "#!/bin/sh\nexit 0\n");
+        memo.clear();
+        assert!(agent_availability_snapshot(&[cursor]).contains("cursor"));
+        assert!(probe_agents_available(&[cursor]).contains("cursor"));
+        assert_eq!(cursor.resolved_binary(), "cursor-agent");
+
+        // Only `agent` present on PATH.
+        std::fs::remove_file(&cursor_agent).unwrap();
+        let agent_bin = bin.join("agent");
+        make_exec(&agent_bin, "#!/bin/sh\nexit 0\n");
+        memo.clear();
+        assert!(agent_availability_snapshot(&[cursor]).contains("cursor"));
+        assert!(probe_agents_available(&[cursor]).contains("cursor"));
+        assert_eq!(cursor.resolved_binary(), "agent");
+
+        // Only `cursor-agent` present on login shell PATH.
+        std::fs::remove_file(&agent_bin).unwrap();
+        make_exec(&login_bin.join("cursor-agent"), "#!/bin/sh\nexit 0\n");
+        make_exec(
+            &bin.join("login-shell"),
+            &format!(
+                "#!/bin/sh\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                shell_words::quote(login_bin.to_str().unwrap())
+            ),
+        );
+        memo.clear();
+        assert!(!agent_availability_snapshot(&[cursor]).contains("cursor"));
+        assert!(probe_agents_available(&[cursor]).contains("cursor"));
+        assert_eq!(cursor.resolved_binary(), "cursor-agent");
+        assert_eq!(cursor.launch_base_command(), "cursor-agent");
+
+        // Both `agent` and `cursor-agent` on login shell PATH: primary `agent` wins.
+        make_exec(&login_bin.join("agent"), "#!/bin/sh\nexit 0\n");
+        memo.clear();
+        assert!(probe_agents_available(&[cursor]).contains("cursor"));
+        assert_eq!(cursor.resolved_binary(), "agent");
+    }
+
+    /// A concurrent refresh clearing discovery between the warm availability read
+    /// and the discovered-binary read must re-probe under `AGENT_PROBE_LOCK`
+    /// rather than returning `None` and falling back to the missing primary name.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn warm_cache_probe_reprobes_when_refresh_clears_discovery_between_reads() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        let login_bin = home.path().join("login-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&login_bin).unwrap();
+
+        let make_exec = |path: &std::path::Path, content: &str| {
+            std::fs::write(path, content).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        make_exec(
+            &bin.join("which"),
+            "#!/bin/sh\nIFS=:; for d in $PATH; do [ -x \"$d/$1\" ] && exit 0; done; exit 1\n",
+        );
+        make_exec(&login_bin.join("cursor-agent"), "#!/bin/sh\nexit 0\n");
+        make_exec(
+            &bin.join("login-shell"),
+            &format!(
+                "#!/bin/sh\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                shell_words::quote(login_bin.to_str().unwrap())
+            ),
+        );
+
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.path().to_path_buf()),
+            ("PATH", bin.clone()),
+            ("SHELL", bin.join("login-shell")),
+        ]);
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+        let cursor = crate::agents::get_agent("cursor").unwrap();
+
+        // Warm both availability and discovered-binary caches.
+        assert_eq!(
+            probe_agent_discovered_binary(cursor).as_deref(),
+            Some("cursor-agent")
+        );
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            AGENT_PROBE_WARM_READ_GATE.with(|gate| {
+                *gate.borrow_mut() = Some((entered_tx, resume_rx));
+            });
+            probe_agent_discovered_binary(cursor)
+        });
+
+        // Wait until the warm caller has read availability, then clear discovery
+        // before it reads `DISCOVERED_AGENT_BINARIES`.
+        entered_rx.recv().expect("warm read gate entered");
+        invalidate_agent_availability();
+        resume_tx.send(()).expect("warm read gate resumed");
+
+        assert_eq!(handle.join().unwrap().as_deref(), Some("cursor-agent"));
     }
 }

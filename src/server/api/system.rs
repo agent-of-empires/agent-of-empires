@@ -307,7 +307,7 @@ pub async fn list_agents(
                     display_name: crate::acp::display_name_for(a.name)
                         .unwrap_or(a.name)
                         .to_string(),
-                    binary: a.binary.to_string(),
+                    binary: a.resolved_binary().to_string(),
                     host_only: a.host_only,
                     always_yolo: crate::agents::is_always_yolo(a.name),
                     acp_always_yolo: crate::agents::is_always_yolo(a.name),
@@ -5293,5 +5293,46 @@ command = "zzzeta"
             get_session_agent_default_model(State(state), axum::extract::Path("missing".into()))
                 .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// On a `cursor-agent`-only host, `/api/agents` reports the resolved
+    /// `cursor-agent` binary and its path on the daemon's PATH.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_agents_reports_resolved_cursor_agent_binary_and_path() {
+        if crate::tmux::tests::run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cursor_agent = bin.join("cursor-agent");
+        std::fs::write(&cursor_agent, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cursor_agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let _env = crate::session::test_support::EnvGuard::set(&[("PATH", path.as_str())]);
+        let memo = crate::tmux::AgentAvailabilityGuard::capture();
+        memo.clear();
+
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let Ok(Json(agents)) =
+            list_agents(State(state), axum::extract::Query(AgentsQuery::default())).await
+        else {
+            panic!("list_agents failed");
+        };
+        let cursor = agents.iter().find(|a| a.name == "cursor").unwrap();
+        assert!(
+            cursor.installed,
+            "cursor should be detected via cursor-agent"
+        );
+        assert_eq!(cursor.binary, "cursor-agent");
+        assert_eq!(
+            cursor.path.as_deref(),
+            Some(cursor_agent.to_string_lossy().as_ref())
+        );
     }
 }

@@ -1384,6 +1384,29 @@ impl NativeLaunchInputs {
         self.canonical_path(&path)
     }
 
+    fn resolve_agent_program(
+        &self,
+        agent: &AgentDef<'_>,
+        program: &str,
+        allow_fallback: bool,
+    ) -> Result<PathBuf> {
+        if !allow_fallback || agent.fallback_binaries.is_empty() {
+            return self.resolve_program(program);
+        }
+        let mut first_err = None;
+        for candidate in agent.candidate_binaries() {
+            match self.resolve_program(candidate) {
+                Ok(path) => return Ok(path),
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        Err(first_err.unwrap_or_else(|| anyhow::anyhow!("native program is unavailable")))
+    }
+
     fn resolve_program(&self, program: &str) -> Result<PathBuf> {
         let path = self.environment.get("PATH").map(String::as_str);
         let Some(container) = &self.container else {
@@ -1464,6 +1487,46 @@ pub(super) fn hook_session_observation(
     Some(observation)
 }
 
+/// Syncs sandbox `AOE_AGENT_PROGRAM` (fallback only) and `AOE_AGENT_EXE` (direct launches only).
+fn sync_sandbox_agent_identity_env(
+    docker_env: &mut crate::session::environment::DockerExecEnv,
+    environment: &mut std::collections::HashMap<String, String>,
+    agent: &AgentDef<'_>,
+    program: &std::path::Path,
+    direct_capture: bool,
+) {
+    docker_env
+        .env
+        .retain(|(key, _)| key != "AOE_AGENT_PROGRAM" && key != "AOE_AGENT_EXE");
+    environment.remove("AOE_AGENT_PROGRAM");
+    environment.remove("AOE_AGENT_EXE");
+    let fallback = program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty() && *name != agent.binary && agent.matches_binary(name))
+        .or_else(|| {
+            agent
+                .fallback_binaries
+                .iter()
+                .copied()
+                .find(|name| !name.is_empty() && *name != agent.binary)
+        });
+    if let Some(name) = fallback {
+        docker_env
+            .env
+            .push(("AOE_AGENT_PROGRAM".into(), name.to_owned()));
+        environment.insert("AOE_AGENT_PROGRAM".into(), name.to_owned());
+    }
+    if direct_capture {
+        if let Some(exe) = program.to_str().filter(|path| !path.is_empty()) {
+            docker_env
+                .env
+                .push(("AOE_AGENT_EXE".into(), exe.to_owned()));
+            environment.insert("AOE_AGENT_EXE".into(), exe.to_owned());
+        }
+    }
+}
+
 impl Instance {
     pub(super) fn sandbox_launch_environment(
         &self,
@@ -1501,12 +1564,21 @@ impl Instance {
                 .env
                 .push((crate::hooks::SESSION_SOURCE_ENV.into(), source.to_owned()));
         }
-        // The container has no launch pid, so the session-id hook identifies a
-        // nested agent by this binary name instead.
+        // Identify nested agents by primary/fallback binary name while excluding declared wrappers.
         if let Some(agent) = agent {
             environment
                 .env
                 .push(("AOE_AGENT_BIN".into(), agent.binary.to_owned()));
+            if let Some(fallback) = agent
+                .fallback_binaries
+                .iter()
+                .copied()
+                .find(|name| !name.is_empty() && *name != agent.binary)
+            {
+                environment
+                    .env
+                    .push(("AOE_AGENT_PROGRAM".into(), fallback.to_owned()));
+            }
         }
         if let Some((key, value)) = agent.and_then(|agent| {
             agent
@@ -1890,7 +1962,7 @@ impl Instance {
                 .iter()
                 .chain(crate::plugin::bundled_agents::definitions())
         };
-        let direct = retained().find(|agent| agent.binary == program);
+        let direct = retained().find(|agent| agent.matches_binary(program));
         let declared = config
             .agent_execution_as
             .get(tool)
@@ -1940,7 +2012,10 @@ impl Instance {
                 !AGENTS
                     .iter()
                     .chain(crate::plugin::bundled_agents::definitions())
-                    .any(|agent| Some(agent.binary) == basename && agent.name != actual.name),
+                    .any(|agent| {
+                        basename.is_some_and(|b| agent.matches_binary(b))
+                            && agent.name != actual.name
+                    }),
                 "wrapper command names a different native agent"
             );
             if !config.agent_config_dir.contains_key(tool) {
@@ -2047,12 +2122,24 @@ impl Instance {
             }),
             "managed conversation requires an immutable container execution identity"
         );
-        let program =
-            inputs.resolve_program(parsed.words.first().context("native program is missing")?)?;
+        let program = inputs.resolve_agent_program(
+            agent,
+            parsed.words.first().context("native program is missing")?,
+            self.command.is_empty(),
+        )?;
         anyhow::ensure!(
             program.is_absolute() && program.to_str().is_some(),
             "native program must have an absolute UTF-8 path"
         );
+        if let Some(docker_env) = inputs.docker_env.as_mut() {
+            sync_sandbox_agent_identity_env(
+                docker_env,
+                &mut inputs.environment,
+                agent,
+                &program,
+                direct_capture,
+            );
+        }
         let mut prime = None;
         let mut prime_runtime = None;
         let value = |key: &str| inputs.environment.get(key).cloned();
@@ -5397,5 +5484,151 @@ sandbox = "unsupported"
             ManagedResumeCause::PiTranscriptBindingRequired
         );
         assert!(!error.is::<super::super::ManagedResumeRefused>());
+    }
+
+    /// Sandboxed sessions must not expose declared wrappers in
+    /// `AOE_AGENT_PROGRAM` (a native wrapper spawning the foreground agent as a
+    /// child would otherwise be counted as a second nested agent), while agents
+    /// with declared fallback binaries (Cursor -> `cursor-agent`) still expose
+    /// the fallback binary name.
+    #[test]
+    fn sandbox_launch_environment_separates_declared_wrappers_from_fallback_binaries() {
+        let config = crate::session::config::Config::default();
+        let env_val = |env: &crate::session::environment::DockerExecEnv, key: &str| {
+            env.env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+
+        let mut wrapped_claude = Instance::new("wrapped-claude", "/tmp/project");
+        wrapped_claude.tool = "company-claude".into();
+        wrapped_claude.command = "company-claude".into();
+        wrapped_claude.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "wrapped-claude",
+            Some("/workspace"),
+        ));
+        let claude = crate::agents::get_agent("claude").unwrap();
+        let claude_env = wrapped_claude
+            .sandbox_launch_environment(Some(claude), None, "default", None, &config)
+            .unwrap();
+        assert_eq!(
+            env_val(&claude_env, "AOE_AGENT_BIN").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(env_val(&claude_env, "AOE_AGENT_PROGRAM"), None);
+
+        let mut wrapped_cursor = Instance::new("wrapped-cursor", "/tmp/project");
+        wrapped_cursor.tool = "company-cursor".into();
+        wrapped_cursor.command = "company-cursor".into();
+        wrapped_cursor.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "wrapped-cursor",
+            Some("/workspace"),
+        ));
+        let cursor = crate::agents::get_agent("cursor").unwrap();
+        let cursor_env = wrapped_cursor
+            .sandbox_launch_environment(Some(cursor), None, "default", None, &config)
+            .unwrap();
+        assert_eq!(
+            env_val(&cursor_env, "AOE_AGENT_BIN").as_deref(),
+            Some("agent")
+        );
+        assert_eq!(
+            env_val(&cursor_env, "AOE_AGENT_PROGRAM").as_deref(),
+            Some("cursor-agent")
+        );
+    }
+
+    /// Direct sandbox launches record the canonical executable path in
+    /// `AOE_AGENT_EXE` so nested invocations under a different symlink/argv[0]
+    /// spelling are still counted, while declared wrappers omit `AOE_AGENT_EXE`
+    /// so the wrapper process itself is never counted as an agent.
+    #[test]
+    fn sync_sandbox_agent_identity_env_tracks_direct_exe_and_excludes_wrappers() {
+        let config = crate::session::config::Config::default();
+        let env_val = |env: &crate::session::environment::DockerExecEnv, key: &str| {
+            env.env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+
+        let mut cursor_inst = Instance::new("cursor-direct", "/tmp/project");
+        cursor_inst.tool = "cursor".into();
+        cursor_inst.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "cursor-direct",
+            Some("/workspace"),
+        ));
+        let cursor = crate::agents::get_agent("cursor").unwrap();
+        let mut cursor_docker_env = cursor_inst
+            .sandbox_launch_environment(Some(cursor), None, "default", None, &config)
+            .unwrap();
+        let mut cursor_env_map: std::collections::HashMap<String, String> =
+            cursor_docker_env.env.iter().cloned().collect();
+
+        // Symlinked `cursor-agent` -> `/opt/cursor-real` directly invoked:
+        // keeps `AOE_AGENT_PROGRAM=cursor-agent` and adds `AOE_AGENT_EXE=/opt/cursor-real`.
+        sync_sandbox_agent_identity_env(
+            &mut cursor_docker_env,
+            &mut cursor_env_map,
+            cursor,
+            std::path::Path::new("/opt/cursor-real"),
+            true,
+        );
+        assert_eq!(
+            env_val(&cursor_docker_env, "AOE_AGENT_PROGRAM").as_deref(),
+            Some("cursor-agent")
+        );
+        assert_eq!(
+            env_val(&cursor_docker_env, "AOE_AGENT_EXE").as_deref(),
+            Some("/opt/cursor-real")
+        );
+        assert_eq!(
+            cursor_env_map.get("AOE_AGENT_EXE").map(String::as_str),
+            Some("/opt/cursor-real")
+        );
+
+        // Declared wrapper around Cursor: keeps fallback binary name but
+        // omits `AOE_AGENT_EXE` so the wrapper binary is not counted.
+        sync_sandbox_agent_identity_env(
+            &mut cursor_docker_env,
+            &mut cursor_env_map,
+            cursor,
+            std::path::Path::new("/usr/local/bin/company-cursor"),
+            false,
+        );
+        assert_eq!(
+            env_val(&cursor_docker_env, "AOE_AGENT_PROGRAM").as_deref(),
+            Some("cursor-agent")
+        );
+        assert_eq!(env_val(&cursor_docker_env, "AOE_AGENT_EXE"), None);
+        assert_eq!(cursor_env_map.get("AOE_AGENT_EXE"), None);
+
+        // Declared wrapper around Claude: omits both `AOE_AGENT_PROGRAM` and `AOE_AGENT_EXE`.
+        let mut claude_inst = Instance::new("claude-wrapper", "/tmp/project");
+        claude_inst.tool = "company-claude".into();
+        claude_inst.command = "company-claude".into();
+        claude_inst.sandbox_info = Some(super::super::test_helpers::test_sandbox(
+            "claude-wrapper",
+            Some("/workspace"),
+        ));
+        let claude = crate::agents::get_agent("claude").unwrap();
+        let mut claude_docker_env = claude_inst
+            .sandbox_launch_environment(Some(claude), None, "default", None, &config)
+            .unwrap();
+        let mut claude_env_map: std::collections::HashMap<String, String> =
+            claude_docker_env.env.iter().cloned().collect();
+        sync_sandbox_agent_identity_env(
+            &mut claude_docker_env,
+            &mut claude_env_map,
+            claude,
+            std::path::Path::new("/usr/local/bin/company-claude"),
+            false,
+        );
+        assert_eq!(env_val(&claude_docker_env, "AOE_AGENT_PROGRAM"), None);
+        assert_eq!(env_val(&claude_docker_env, "AOE_AGENT_EXE"), None);
+        assert_eq!(claude_env_map.get("AOE_AGENT_EXE"), None);
     }
 }

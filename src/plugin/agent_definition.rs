@@ -140,6 +140,7 @@ impl<'a> DefinitionData<'a> {
         Some(AgentDef {
             name: &entry.tool,
             binary,
+            fallback_binaries: &[],
             launch_subcommand: None,
             aliases: &self.aliases,
             detection: DetectionMethod::Which(binary),

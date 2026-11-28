@@ -403,6 +403,8 @@ pub enum SidecarFormat {
 pub struct AgentDef<'a> {
     pub name: &'a str,
     pub binary: &'a str,
+    /// Alternative executable names accepted when `binary` is not installed.
+    pub fallback_binaries: &'a [&'a str],
     /// Must not be combined with `ResumeStrategy::Subcommand`, which inserts after the binary.
     pub launch_subcommand: Option<&'a str>,
     pub aliases: &'a [&'a str],
@@ -640,6 +642,7 @@ const fn agent(
     AgentDef {
         name,
         binary,
+        fallback_binaries: &[],
         launch_subcommand: None,
         aliases: &[],
         detection: DetectionMethod::Which(binary),
@@ -813,6 +816,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         ..agent("gemini", "gemini", "npm install -g @google/gemini-cli")
     },
     AgentDef {
+        fallback_binaries: &["cursor-agent"],
         aliases: &["agent"],
         yolo: Some(YoloMode::CliFlag("--yolo")),
         detect_status: status_detection::detect_cursor_status,
@@ -1036,7 +1040,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
     },
 ];
 
-impl AgentDef<'_> {
+impl<'a> AgentDef<'a> {
     /// Whether a fork can run in this context. A host-only fork needs a host
     /// parent, and a `ValueFlag` fork leaves the child id to the agent, so it
     /// needs a capture context that can read it.
@@ -1164,10 +1168,51 @@ impl AgentDef<'_> {
         agent_help_advertises(command, flag).then_some(flag)
     }
 
-    pub fn launch_base_command(&self) -> String {
+    /// Primary binary followed by any fallback executable names.
+    pub fn candidate_binaries(&self) -> impl Iterator<Item = &'a str> + '_ {
+        std::iter::once(self.binary).chain(self.fallback_binaries.iter().copied())
+    }
+
+    /// Whether `program` matches the agent's primary binary or any fallback binary.
+    pub fn matches_binary(&self, program: &str) -> bool {
+        self.candidate_binaries().any(|bin| bin == program)
+    }
+
+    /// Executable name to launch on the host: prefers `binary`, falls back to
+    /// the first entry in `fallback_binaries` found on `PATH` or discovered by
+    /// the login-shell probe, or `binary` if none resolve.
+    pub fn resolved_binary(&self) -> &'a str {
+        if self.fallback_binaries.is_empty() || which::which(self.binary).is_ok() {
+            return self.binary;
+        }
+        if let Some(found) = self
+            .fallback_binaries
+            .iter()
+            .copied()
+            .find(|bin| which::which(bin).is_ok())
+        {
+            return found;
+        }
+        if let Some(discovered) = crate::tmux::discovered_agent_binary(self.name) {
+            if let Some(candidate) = self.candidate_binaries().find(|bin| *bin == discovered) {
+                return candidate;
+            }
+        }
+        self.binary
+    }
+
+    pub fn primary_launch_base_command(&self) -> String {
         match self.launch_subcommand {
             Some(sub) => format!("{} {}", self.binary, sub),
             None => self.binary.to_string(),
+        }
+    }
+
+    pub fn launch_base_command(&self) -> String {
+        let binary = self.resolved_binary();
+        match self.launch_subcommand {
+            Some(sub) => format!("{} {}", binary, sub),
+            None => binary.to_string(),
         }
     }
 }
@@ -2698,6 +2743,7 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
             ("kimi-code", Some("kimi")),
             ("", Some("claude")),
             ("agent", Some("cursor")),
+            ("cursor-agent", Some("cursor")),
             // Longest token wins: prime-agent contains cursor's "agent" alias.
             ("prime-agent --mode acp", Some("prime-agent")),
             ("unknown-tool", None),
@@ -2705,6 +2751,70 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
         for (cmd, expected) in cases {
             assert_eq!(resolve_tool_name(cmd), expected, "{cmd:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cursor_resolves_fallback_binary_when_only_cursor_agent_is_on_path() {
+        if crate::tmux::tests::run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("PATH", bin.as_path())]);
+        let cursor = get_agent("cursor").unwrap();
+
+        // Neither installed: defaults to the primary binary.
+        assert_eq!(cursor.resolved_binary(), "agent");
+        assert_eq!(cursor.launch_base_command(), "agent");
+        assert!(cursor.matches_binary("agent"));
+        assert!(cursor.matches_binary("cursor-agent"));
+        assert!(!cursor.matches_binary("claude"));
+
+        // Only `cursor-agent` installed: resolves and launches `cursor-agent`.
+        let cursor_agent = bin.join("cursor-agent");
+        std::fs::write(&cursor_agent, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cursor_agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(cursor.resolved_binary(), "cursor-agent");
+        assert_eq!(cursor.launch_base_command(), "cursor-agent");
+
+        let mut instance = crate::session::Instance::new("cursor-fallback", "/tmp");
+        instance.tool = "cursor".to_string();
+        assert_eq!(instance.get_tool_command(), "cursor-agent");
+        instance.command = "cursor-agent".to_string();
+        assert!(!instance.has_command_override());
+
+        // Sandboxed launches must not adopt the host's fallback binary.
+        let mut sandboxed = crate::session::Instance::new("cursor-sandbox", "/tmp");
+        sandboxed.tool = "cursor".to_string();
+        sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "example:latest".to_string(),
+            container_name: "aoe-test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            provider: None,
+        });
+        assert_eq!(sandboxed.get_tool_command(), "agent");
+
+        // Both installed: primary `agent` takes precedence.
+        let agent_bin = bin.join("agent");
+        std::fs::write(&agent_bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&agent_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(cursor.resolved_binary(), "agent");
+        assert_eq!(cursor.launch_base_command(), "agent");
+
+        // Only `agent` installed: resolves to `agent`.
+        std::fs::remove_file(&cursor_agent).unwrap();
+        assert_eq!(cursor.resolved_binary(), "agent");
+        assert_eq!(cursor.launch_base_command(), "agent");
     }
 
     #[test]

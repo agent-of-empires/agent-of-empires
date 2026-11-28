@@ -2456,7 +2456,7 @@ impl SessionConfig {
             return resolved;
         }
         crate::agents::get_agent(tool)
-            .map(|agent| agent.binary.to_string())
+            .map(|agent| agent.resolved_binary().to_string())
             .unwrap_or_default()
     }
 
