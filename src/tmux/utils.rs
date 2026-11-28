@@ -872,11 +872,16 @@ pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
     let Some(first) = first.into_iter().next() else {
         return PaneProbe::Missing;
     };
+    probe_pane_at(&first, &deadline)
+}
+
+/// [`probe_pane`] of the pane `target` names.
+fn probe_pane_at(target: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> PaneProbe {
     // `tmux_query_command`, not `tmux_command`: `classify_pane_probe` matches
     // the ENOENT marker in tmux's `error connecting to <socket> (<strerror>)`,
     // and glibc localizes `strerror` by `LC_MESSAGES`.
     let mut command = crate::tmux::tmux_query_command();
-    command.args(["display-message", "-t", &first, "-p", "#{pane_dead}"]);
+    command.args(["display-message", "-t", target, "-p", "#{pane_dead}"]);
     let Ok(output) = deadline.run(&mut command) else {
         return PaneProbe::Unknown;
     };
@@ -884,8 +889,44 @@ pub(crate) fn probe_pane(session_name: &str) -> PaneProbe {
     classify_pane_probe(output.status.success(), stdout.trim(), &output.stderr)
 }
 
+/// [`is_pane_dead`] of the pane `target` names.
+pub(crate) fn is_pane_dead_at(target: &str) -> bool {
+    probe_pane_at(target, &crate::tmux::TmuxCommandDeadline::new()) == PaneProbe::Dead
+}
+
 pub fn first_pane_id(session_name: &str) -> Option<String> {
     first_pane_id_with_deadline(session_name, &crate::tmux::TmuxCommandDeadline::new())
+}
+
+/// Whether `session` holds `pane`, a `#{pane_id}`, and on the server `server_pid` when given.
+/// Lists the session's panes rather than resolving `pane`, because a window linked into several
+/// sessions resolves through whichever was active last, and a moved pane keeps its id.
+pub(crate) fn session_holds_pane(
+    session: &str,
+    server_pid: Option<&str>,
+    pane: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> bool {
+    let target = format!("={session}:");
+    let mut command = crate::tmux::tmux_query_command();
+    command.args([
+        "list-panes",
+        "-s",
+        "-t",
+        &target,
+        "-F",
+        "#{pid}\t#{pane_id}",
+    ]);
+    deadline.run(&mut command).is_ok_and(|out| {
+        out.status.success()
+            && std::str::from_utf8(&out.stdout).is_ok_and(|lines| {
+                lines.lines().any(|line| {
+                    line.split_once('\t').is_some_and(|(pid, id)| {
+                        id == pane && server_pid.is_none_or(|want| want == pid)
+                    })
+                })
+            })
+    })
 }
 
 pub(crate) fn first_pane_id_with_deadline(
@@ -1059,12 +1100,16 @@ fn classify_live_panes(succeeded: bool, stdout: &[u8], stderr: &[u8]) -> bool {
 }
 
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
-    let first = first_pane_id(session_name)?;
+    pane_current_command_at(&first_pane_id(session_name)?)
+}
+
+/// [`pane_current_command`] of the pane `target` names.
+pub(crate) fn pane_current_command_at(target: &str) -> Option<String> {
     crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
-            &first,
+            target,
             "-p",
             "#{pane_current_command}",
         ])
@@ -1075,6 +1120,17 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// How many rows the pane `target` shows.
+pub(crate) fn pane_height_at(target: &str) -> Option<usize> {
+    crate::tmux::tmux_query_command()
+        .args(["display-message", "-t", target, "-p", "#{pane_height}"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
 /// The terminal title the pane's program published over OSC, for callers
 /// outside the batched poll that reads it as part of [`crate::tmux::PaneMetadata`].
 ///
@@ -1083,9 +1139,13 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
 /// matched by `^`-anchored rules, so trimming here would let the same pane
 /// read one way through the poller and another through `aoe session capture`.
 pub(crate) fn pane_title(session_name: &str) -> Option<String> {
-    let target = format!("={session_name}:^");
+    pane_title_at(&format!("={session_name}:^"))
+}
+
+/// [`pane_title`] of the pane `target` names.
+pub(crate) fn pane_title_at(target: &str) -> Option<String> {
     crate::tmux::tmux_query_command()
-        .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
+        .args(["display-message", "-t", target, "-p", "#{pane_title}"])
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -1102,15 +1162,16 @@ fn strip_display_delimiter(raw: &str) -> &str {
 }
 
 pub(crate) fn pane_start_command_is_protected(session_name: &str) -> bool {
-    let Some(first) = first_pane_id(session_name) else {
-        return false;
-    };
-    let target = first;
+    first_pane_id(session_name).is_some_and(|first| pane_start_command_is_protected_at(&first))
+}
+
+/// [`pane_start_command_is_protected`] of the pane `target` names.
+pub(crate) fn pane_start_command_is_protected_at(target: &str) -> bool {
     crate::tmux::tmux_query_command()
         .args([
             "display-message",
             "-t",
-            &target,
+            target,
             "-p",
             "#{pane_start_command}",
         ])

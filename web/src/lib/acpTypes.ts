@@ -303,7 +303,8 @@ export type IncompatibleAgentDetail =
 export type IntegrationLostReason =
   | { kind: "contract_violation"; detail: string }
   | { kind: "hold_overflow" }
-  | { kind: "lease_overflow" };
+  | { kind: "lease_overflow" }
+  | { kind: "proxy_exited" };
 
 export interface OperationErrorEvidence {
   source: "terminal_text" | "tmux_observation" | "local_prompt_result" | "runner_completion" | "transcript_recovery";
@@ -572,6 +573,8 @@ export interface ReducedState {
   }>;
   current_mode_id: string | null;
   auth_status?: AuthStatus | null;
+  /** Absent means no loss. */
+  integration_lost?: IntegrationLostReason | null;
   turn_active: boolean;
   cancelling: boolean;
   compacting: boolean;
@@ -669,6 +672,8 @@ export interface AcpState {
   startupError: string | null;
   /** Why `startupError` happened, when the Daemon said; set and cleared with it. */
   startupCause: StartupCause | null;
+  /** Why the Agent's plugin integration was lost; cleared when the Agent's session is assigned again. */
+  integrationLost: IntegrationLostReason | null;
   /** Counts the events that cleared the startup error; a late blocked launch from before one is stale. */
   startupRecoveries: number;
   /** `startupRecoveries` as each in-flight prompt was sent, for the refused-launch guard. */
@@ -1099,6 +1104,7 @@ export function emptyAcpState(): AcpState {
     lagged: false,
     startupError: null,
     startupCause: null,
+    integrationLost: null,
     startupRecoveries: 0,
     promptRecoveries: {},
     incompatibleAgent: null,
@@ -1149,6 +1155,8 @@ function isSteeredContinuation(state: AcpState): boolean {
   return state.serverTurnActive && !!state.promptCapabilities?.steering;
 }
 
+const PROXY_DEGRADED_NOTICE_ID = "notice-proxy-degraded";
+
 function applyNewTurnResets(next: AcpState): void {
   next.startupRecoveries += 1;
   next.startupError = null;
@@ -1180,9 +1188,9 @@ function applyNewTurnResets(next: AcpState): void {
   next.monitorWorkSeen = false;
   next.monitorDescription = null;
   next.contextPrimerAvailable = null;
-  // Advisories describe the turn they arrived in; the transcript keeps history.
-  next.sessionNotices = [];
-  next.dismissedNoticeIds = [];
+  // Advisories describe the turn they arrived in, except the degraded-proxy banner; the transcript keeps history.
+  next.sessionNotices = next.sessionNotices.filter((n) => n.id === PROXY_DEGRADED_NOTICE_ID);
+  next.dismissedNoticeIds = next.dismissedNoticeIds.filter((id) => id === PROXY_DEGRADED_NOTICE_ID);
 }
 
 /** Pure reducer. Drops frames whose seq is not above `state.lastSeq` so replays are idempotent. */
@@ -1270,7 +1278,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.sessionNotices = next.sessionNotices.map((n) => (n.id === id ? entry : n));
       return next;
     }
-    next.sessionNotices = [...next.sessionNotices, entry].slice(-MAX_SESSION_NOTICES);
+    // The degraded-proxy banner outlives the cap, like the daemon's reducer.
+    const notices = [...next.sessionNotices, entry];
+    while (notices.length > MAX_SESSION_NOTICES) {
+      const oldest = notices.findIndex((n) => n.id !== PROXY_DEGRADED_NOTICE_ID);
+      if (oldest < 0) break;
+      notices.splice(oldest, 1);
+    }
+    next.sessionNotices = notices;
     return next;
   }
   if ("AuthStatusUpdated" in event) {
@@ -1367,11 +1382,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("IntegrationLost" in event) {
-    const { reason } = event.IntegrationLost;
-    next.startupError = `Agent integration lost: ${
-      reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")
-    }`;
-    next.startupCause = null;
+    next.integrationLost = event.IntegrationLost.reason;
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
@@ -1449,6 +1460,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     endRestart(next);
     next.startupError = null;
     next.startupCause = null;
+    next.integrationLost = null;
     next.startupRecoveries += 1;
     next.incompatibleAgent = null;
     next.workerStopped = false;
@@ -1457,6 +1469,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.agentUnresponsive = false;
     next.agentOrphaned = false;
     next.rateLimit = null;
+    // A degraded worker re-asserts the notice after assignment.
+    next.sessionNotices = next.sessionNotices.filter((n) => n.id !== PROXY_DEGRADED_NOTICE_ID);
     next.rateLimitParked = false;
     return next;
   }
@@ -1507,6 +1521,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.lastError = null;
     next.lastErrorEvidence = null;
     next.interactionError = null;
+    next.integrationLost = null;
     next.retriedError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
     // The switch emits Stopped { user_stopped } first; keep its banner hidden through the handshake.
@@ -1752,6 +1767,9 @@ export function applyReducedState(
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,
     authStatus: reduced.auth_status ?? null,
+    // The daemon is authoritative: a loss whose frame is outside the replay
+    // window still shows, and a snapshot without the field clears a stale one.
+    integrationLost: reduced.integration_lost ?? null,
     // A false frame cannot suppress a prompt whose POST is still unacknowledged.
     serverTurnActive: reduced.turn_active,
     turnActive: deriveTurnActive({

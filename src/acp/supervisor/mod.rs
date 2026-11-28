@@ -497,6 +497,8 @@ pub struct SpawnRequest {
     pub prior_conversation: bool,
     /// Claude store selected by the conversation binding for a host Claude worker.
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
+    /// Plugin proxy to launch ahead of the adapter.
+    pub proxy: Option<crate::acp::acp_client::ProxySpec>,
 }
 
 #[derive(Clone)]

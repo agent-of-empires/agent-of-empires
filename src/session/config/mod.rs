@@ -798,70 +798,33 @@ fn default_replay_events() -> u32 {
     0
 }
 
-/// Session list sort order
+/// Session list sort order. No order reacts to session state, so rows hold still.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortOrder {
+    /// The order the user arranged. Rows never moved sit on top, newest first.
     #[default]
-    Newest,
-    Attention,
-    LastActivity,
-    Oldest,
-    AZ,
-    ZA,
-    /// User-defined order: rows keep the position the user moved them to
-    /// (`Instance::sort_index` for sessions, `groups.json` order for groups).
     Custom,
+    /// Creation time, newest on top.
+    Newest,
+    Name,
 }
 
 impl SortOrder {
-    pub fn cycle(self) -> Self {
-        match self {
-            SortOrder::Newest => SortOrder::Attention,
-            SortOrder::Attention => SortOrder::LastActivity,
-            SortOrder::LastActivity => SortOrder::Oldest,
-            SortOrder::Oldest => SortOrder::AZ,
-            SortOrder::AZ => SortOrder::ZA,
-            SortOrder::ZA => SortOrder::Custom,
-            SortOrder::Custom => SortOrder::Newest,
-        }
-    }
-
-    pub fn cycle_reverse(self) -> Self {
-        match self {
-            SortOrder::Newest => SortOrder::Custom,
-            SortOrder::Custom => SortOrder::ZA,
-            SortOrder::Attention => SortOrder::Newest,
-            SortOrder::LastActivity => SortOrder::Attention,
-            SortOrder::Oldest => SortOrder::LastActivity,
-            SortOrder::AZ => SortOrder::Oldest,
-            SortOrder::ZA => SortOrder::AZ,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
-            SortOrder::Newest => "Newest",
-            SortOrder::Attention => "Attention",
-            SortOrder::LastActivity => "Recent",
-            SortOrder::Oldest => "Oldest",
-            SortOrder::AZ => "A-Z",
-            SortOrder::ZA => "Z-A",
             SortOrder::Custom => "Custom",
+            SortOrder::Newest => "Newest first",
+            SortOrder::Name => "Name",
         }
     }
 
-    /// Letter that selects this order in the sort picker. Unique across the variants, so a
-    /// press applies one order rather than stepping through the ones sharing a first letter.
+    /// Letter that selects this order in the sort picker.
     pub fn mnemonic(self) -> char {
         match self {
-            SortOrder::Newest => 'n',
-            SortOrder::Attention => 't',
-            SortOrder::LastActivity => 'r',
-            SortOrder::Oldest => 'o',
-            SortOrder::AZ => 'a',
-            SortOrder::ZA => 'z',
             SortOrder::Custom => 'c',
+            SortOrder::Newest => 'n',
+            SortOrder::Name => 'a',
         }
     }
 }
@@ -870,41 +833,39 @@ impl SortOrder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupByMode {
+    /// Repository headers, with the user's Groups nested inside each.
     #[default]
-    Manual,
     Project,
-    Org,
-    Status,
+    /// The user's own Groups, across repositories.
+    Group,
 }
 
 impl GroupByMode {
-    pub fn cycle(self) -> Self {
-        match self {
-            GroupByMode::Manual => GroupByMode::Project,
-            GroupByMode::Project => GroupByMode::Org,
-            GroupByMode::Org => GroupByMode::Status,
-            GroupByMode::Status => GroupByMode::Manual,
-        }
-    }
-
     pub fn label(self) -> &'static str {
         match self {
-            GroupByMode::Manual => "Manual",
-            GroupByMode::Project => "Project",
-            GroupByMode::Org => "Org",
-            GroupByMode::Status => "Status",
+            GroupByMode::Project => "Repository",
+            GroupByMode::Group => "Groups",
         }
     }
 
-    /// Letter that selects this mode in the group-by picker. See [`SortOrder::mnemonic`].
+    /// Letter that selects this mode in the group-by picker.
     pub fn mnemonic(self) -> char {
         match self {
-            GroupByMode::Manual => 'm',
             GroupByMode::Project => 'p',
-            GroupByMode::Org => 'g',
-            GroupByMode::Status => 's',
+            GroupByMode::Group => 'g',
         }
     }
+}
+
+/// Decodes an optional value, reading one this build cannot decode (such as a removed enum
+/// variant) as `None`.
+fn unknown_as_none<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = Option::<toml::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| value.try_into().ok()))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -992,10 +953,20 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub has_acknowledged_volume_ignores_globs: bool,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Lenient so a removed order still loads before migration v068 rewrites it.
+    #[serde(
+        default,
+        deserialize_with = "unknown_as_none",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sort_order: Option<SortOrder>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Lenient so a removed grouping still loads before migration v068 rewrites it.
+    #[serde(
+        default,
+        deserialize_with = "unknown_as_none",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub group_by: Option<GroupByMode>,
 
     /// Last directory the user navigated to in the new-session dir picker.
@@ -1015,21 +986,10 @@ pub struct AppStateConfig {
     /// Paths of project-mode sidebar folders the user has collapsed. Stored as
     /// the set of collapsed paths (absent/expanded folders are not listed), so
     /// the choice survives restarts. Group-mode collapse lives on the per-profile
-    /// GroupTrees in session storage; project-mode folders are auto-derived and
-    /// have no group record, so their collapse state is persisted here instead.
+    /// GroupTrees in session storage; Repository-mode headers, and the Groups nested
+    /// under them (`repo/group`), are derived, so their collapse state lives here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_group_collapsed: Vec<String>,
-
-    /// Paths of org-mode sidebar folders the user has collapsed. Same shape
-    /// and rationale as `project_group_collapsed`: org headers are derived
-    /// from each session's resolved remote owner rather than a persisted
-    /// group record, so their collapse state has nowhere else to live.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub org_group_collapsed: Vec<String>,
-
-    /// Collapsed paths of the status-mode sidebar folders, alongside `org_group_collapsed`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub status_group_collapsed: Vec<String>,
 
     /// Ids of tips the user has already seen/acknowledged. Drives the unseen
     /// badge count and stops earned tips from re-popping. Ids come from
@@ -1629,9 +1589,9 @@ pub struct SessionConfig {
     pub strict_hotkeys: bool,
 
     /// Default snooze for `aoe session snooze` (1-43200 min, picker overrides).
-    /// During the snooze window the session is treated like archive: sinks to
-    /// the bottom, renders italic+dim with a `z ` prefix, ignored by the
-    /// attention sort, then rejoins the active list when the timer expires.
+    /// The TUI keeps a snoozed row in place, dimmed with a `z ` prefix and its
+    /// remaining time; the web dashboard sinks it. Either way it returns to
+    /// normal when the timer expires.
     #[serde(default = "default_snooze_duration_minutes")]
     #[setting(
         label = "Snooze for",
@@ -1639,7 +1599,7 @@ pub struct SessionConfig {
         min = 1,
         max = 43200,
         validate = "range:1:43200",
-        summary = "How long a Snooze lasts. Snoozed Sessions sink to the bottom and come back when it ends."
+        summary = "How long a Snooze lasts. Snoozed Sessions come back to normal when it ends."
     )]
     pub snooze_duration_minutes: u32,
 
@@ -1780,7 +1740,7 @@ pub struct SessionConfig {
 
     /// Show the age column at the right edge of each session row: time since
     /// the agent stopped on Idle rows, time since last access on Unknown rows,
-    /// and remaining snooze time under the Attention sort.
+    /// and remaining snooze time on snoozed rows.
     #[serde(default = "default_true")]
     #[setting(
         label = "Show Session age",
@@ -1920,8 +1880,7 @@ pub struct SessionConfig {
     /// Show an unread indicator on sessions. When on (default), a session
     /// whose turn just finished is painted in the theme's unread color until
     /// you view it (Tab into live-send or Enter to attach), and you can flag
-    /// a session unread for later with `U`; unread rows also sort just below
-    /// Waiting in the Attention sort. Turn this off to disable the indicator,
+    /// a session unread for later with `U`. Turn this off to disable the indicator,
     /// the auto-marking, and the `U` toggle entirely.
     ///
     /// `global_only`: the gate is a single process-wide flag
@@ -1939,15 +1898,12 @@ pub struct SessionConfig {
     )]
     pub unread_indicator: bool,
 
-    /// Pin favorited sessions to the top of their sibling scope in every sort
-    /// order of the TUI session list, not just Attention. A group holding a
-    /// favorited session is pinned the same way. When on (default), favoriting
-    /// is a general "keep this where I can find it" marker; when off, the star
-    /// only biases the Attention sort (its tier-local tiebreak) and the
-    /// favorite key is inert everywhere else, which is the pre-1.14 behavior.
+    /// Pin favorited sessions to the top of their sibling scope under the Name
+    /// and Newest first sorts of the TUI session list; Custom keeps the order the user arranged. A
+    /// group holding a favorited session is pinned the same way. When off, the
+    /// favorite key is inert.
     ///
-    /// Governs the TUI list only. The web dashboard keeps favorite as a
-    /// within-tier Attention signal and has its own pin control.
+    /// Governs the TUI list only. The web dashboard has its own pin control.
     ///
     /// `global_only`: read through a single process-wide flag
     /// (`crate::session::favorites_first`) on the sort hot path, so a
@@ -5877,6 +5833,36 @@ mod tests {
 
         update_app_state(|state| state.has_seen_welcome = true).unwrap();
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
+    }
+
+    /// Removed sorts and groupings read as unpicked, so Config loads before v068 rewrites them.
+    #[test]
+    fn removed_sort_and_grouping_values_load_as_unpicked() {
+        for (sort, group) in [
+            ("oldest", "manual"),
+            ("oldest", "org"),
+            ("attention", "status"),
+            ("last_activity", "manual"),
+            ("a_z", "org"),
+            ("z_a", "status"),
+        ] {
+            let state: AppStateConfig = toml::from_str(&format!(
+                "sort_order = \"{sort}\"\ngroup_by = \"{group}\"\nhas_seen_welcome = true\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                (state.sort_order, state.group_by),
+                (None, None),
+                "{sort}/{group}"
+            );
+            assert!(state.has_seen_welcome);
+        }
+        let state: AppStateConfig =
+            toml::from_str("sort_order = \"name\"\ngroup_by = \"group\"\n").unwrap();
+        assert_eq!(state.sort_order, Some(SortOrder::Name));
+        assert_eq!(state.group_by, Some(GroupByMode::Group));
+        let state: AppStateConfig = toml::from_str("sort_order = \"newest\"\n").unwrap();
+        assert_eq!(state.sort_order, Some(SortOrder::Newest));
     }
 
     /// A blank or absent `default_image` is the automatic image; a request

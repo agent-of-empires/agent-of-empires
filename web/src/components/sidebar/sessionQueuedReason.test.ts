@@ -16,11 +16,11 @@ describe("sessionQueuedReason", () => {
     ["compacting", { queue_reason: "compacting" }, "sends after compacting"],
     ["no worker", { queue_reason: "worker_down", acp_worker_state: "absent" }, "sends when Codex starts"],
     ["a worker starting", { queue_reason: "turn_active", acp_worker_state: "resuming" }, "sends when Codex starts"],
-    ["a lost integration", { queue_reason: "integration_lost" }, null],
+    ["a lost integration", { queue_reason: "integration_lost" }, "held: the agent integration was lost"],
     [
       "a lost integration on a parked session",
       { queue_reason: "integration_lost", rate_limit: limit, rate_limit_auto_resume: true },
-      null,
+      "held: the agent integration was lost",
     ],
     ["nothing holding it", {}, null],
     [
