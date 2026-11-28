@@ -505,6 +505,30 @@ describe("plugin sorts", () => {
     await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBe("Cost"));
   });
 
+  it("retries a failed clear of a marker this tab set before a reload", async () => {
+    sessionStorage.setItem("aoe-web-plugin-sort-marker", "Cost");
+    daemon.sidebar_view = { ...daemon.sidebar_view, web_plugin_sort: "Cost" };
+    let refused = false;
+    server.use(
+      http.patch(
+        "*/api/sidebar-view",
+        () => {
+          refused = true;
+          return new HttpResponse(null, { status: 500 });
+        },
+        { once: true },
+      ),
+    );
+    const { result } = mount();
+    await waitFor(() => expect(refused).toBe(true));
+    await act(async () => {});
+    expect(daemon.sidebar_view.web_plugin_sort).toBe("Cost");
+    expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBe("Cost");
+    await pollAt(result, 2);
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined());
+    await waitFor(() => expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBeNull());
+  });
+
   it("writes no marker where the Daemon refuses view changes", async () => {
     const { result } = mount({ viewWritable: false });
     await waitFor(() => expect(rows(result)).toHaveLength(3));

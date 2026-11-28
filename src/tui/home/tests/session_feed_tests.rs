@@ -4177,6 +4177,41 @@ fn a_peer_view_change_is_named_only_when_the_list_moves() {
     }
 }
 
+/// A web change is named only for what it moves on screen: a local pick already showing
+/// Groups leaves only the sort to name, though the last observed view had Repository.
+#[test]
+#[serial]
+fn a_peer_change_names_only_what_moved_on_screen() {
+    use crate::session::config::ClientKind::Web;
+    use crate::session::config::{GroupByMode, SidebarView, SortOrder};
+    let mut env = create_test_env_empty();
+    let id = structured_row(&mut env, Status::Idle);
+    let mut older = Instance::new("alpha", "/tmp/alpha");
+    older.source_profile = "test".into();
+    older.created_at =
+        crate::time::Timestamp::from_millis(crate::time::Timestamp::now().as_millis() - 3_600_000)
+            .unwrap();
+    env.view.add_instance(older);
+    env.view
+        .mutate_instance(&id, |row| row.title = "zulu".into());
+    seed_profile("test", &env.view.cloned_instances());
+    let seen = SidebarView::default();
+    env.view
+        .show_sidebar_view(GroupByMode::Group, SortOrder::Custom);
+    env.view.status_flash = None;
+    let view = SidebarView {
+        group_by: GroupByMode::Group,
+        sort: SortOrder::Name,
+        changed_by: Some(Web),
+        web_plugin_sort: None,
+    };
+    assert!(env.view.follow_sidebar_view(&view, Some(&seen)));
+    assert_eq!(
+        env.view.status_flash_text(),
+        Some("Sort changed on the web")
+    );
+}
+
 /// Snapshots are not shown while a local pick is in flight, so once the write settles the
 /// view takes the Daemon's value, including a peer's change or a replacement Daemon's.
 #[test]

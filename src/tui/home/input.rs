@@ -5322,6 +5322,7 @@ impl HomeView {
             return false;
         }
         let before = self.visible_list();
+        let shown = (self.group_by, self.sort_order);
         self.show_sidebar_view(view.group_by, view.sort);
         let place = match view.changed_by {
             Some(ClientKind::Web) => "on the web",
@@ -5330,8 +5331,10 @@ impl HomeView {
         let Some(seen) = seen else {
             return true;
         };
-        let grouping = seen.group_by != view.group_by;
-        let sort = seen.sort != view.sort;
+        // Name only what moved on screen and since `seen`; a local pick already showing a value
+        // is not the peer's change.
+        let grouping = seen.group_by != view.group_by && shown.0 != view.group_by;
+        let sort = seen.sort != view.sort && shown.1 != view.sort;
         if (grouping || sort) && self.visible_list() != before {
             let what = match (grouping, sort) {
                 (true, true) => "Grouping and sort",

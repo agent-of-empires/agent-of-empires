@@ -407,10 +407,15 @@ export function useSidebarModel({
       staleChecked.current = true;
       const stale = rememberedMarker();
       if (!stale || markerSent.current !== null) return;
-      rememberMarker(null);
-      if (viewWritable && daemonMarker === stale) void changeSidebarView({ web_plugin_sort: null });
+      if (!viewWritable || daemonMarker !== stale) {
+        rememberMarker(null);
+        return;
+      }
+      // Unknown until the clear lands, so a failed one is retried and the tab's record kept until then.
+      markerSent.current = undefined;
+      sendMarker(null);
     },
-    [viewWritable, changeSidebarView],
+    [viewWritable, sendMarker],
   );
   const loaded = polledView !== null;
   const daemonMarker = polledView?.web_plugin_sort;
