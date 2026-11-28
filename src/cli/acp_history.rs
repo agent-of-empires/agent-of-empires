@@ -208,7 +208,7 @@ mod tests {
     use super::*;
     use crate::acp::state::test_support::prompt;
     use crate::acp::state::ToolCall;
-    use crate::acp::transcript::TranscriptModel;
+    use crate::acp::transcript::RetainedTranscriptBuilder;
     use crate::acp::Event;
 
     fn chunk(text: &str, id: Option<&str>) -> Event {
@@ -246,11 +246,11 @@ mod tests {
     }
 
     fn fold(events: &[Event]) -> Vec<Entry> {
-        let mut model = TranscriptModel::new();
+        let mut model = RetainedTranscriptBuilder::default();
         for (i, event) in events.iter().enumerate() {
-            model.apply_event(i as u64 + 1, event);
+            model.apply(i as u64 + 1, event);
         }
-        entries(&model.into_retained())
+        entries(&model.finish())
     }
 
     fn e(role: Role, text: &str) -> Entry {

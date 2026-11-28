@@ -95,6 +95,19 @@ impl Timestamp {
         UtcDateTime::from_unix_timestamp(secs).ok().map(Self)
     }
 
+    pub(crate) fn from_unix_parts(secs: i64, nanos: u32) -> Option<Self> {
+        if nanos >= 1_000_000_000 {
+            return None;
+        }
+        UtcDateTime::from_unix_timestamp_nanos(i128::from(secs) * 1_000_000_000 + i128::from(nanos))
+            .ok()
+            .map(Self)
+    }
+
+    pub(crate) fn subsec_nanos(self) -> u32 {
+        self.0.nanosecond()
+    }
+
     pub fn from_millis(millis: i64) -> Option<Self> {
         UtcDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
             .ok()

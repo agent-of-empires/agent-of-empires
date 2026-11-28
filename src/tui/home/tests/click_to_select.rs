@@ -4,10 +4,8 @@
 use super::*;
 use ratatui::layout::Rect;
 
-/// Inner rect chosen with comfortable headroom so all sessions fit
-/// without "[N more above/below]" indicators consuming a row.
 fn setup_inner(env: &mut TestEnv) {
-    env.view.list_inner_area = Rect::new(1, 1, 28, 10);
+    render_geometry(&mut env.view);
 }
 
 #[test]
@@ -30,6 +28,7 @@ fn click_selects_session_at_clicked_row() {
     let t0 = std::time::Instant::now();
     assert_eq!(env.view.handle_click_at(t0, 5, 3), expected);
     assert_eq!(env.view.cursor, 2);
+    setup_inner(&mut env);
     let t1 = t0 + std::time::Duration::from_millis(1500);
     assert_eq!(env.view.handle_click_at(t1, 5, 3), expected);
     assert_eq!(env.view.cursor, 2);
@@ -44,7 +43,6 @@ fn select_only_click_on_different_row_exits_live_mode() {
     use crate::session::config::{update_config, ClickAction};
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
     let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
 
@@ -62,6 +60,7 @@ fn select_only_click_on_different_row_exits_live_mode() {
         exit_chords: Vec::new(),
         leader: None,
     });
+    setup_inner(&mut env);
 
     let action = env.view.handle_click(5, 3);
     assert_eq!(action, None, "SelectOnly click never emits an action");
@@ -81,7 +80,6 @@ fn select_only_click_on_live_row_exits_live_mode() {
     use crate::session::config::{update_config, ClickAction};
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
     let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
     // Row 3 resolves to index 2, so make index 2 the live row.
     env.view.cursor = 2;
     env.view.update_selected();
@@ -100,6 +98,7 @@ fn select_only_click_on_live_row_exits_live_mode() {
         exit_chords: Vec::new(),
         leader: None,
     });
+    setup_inner(&mut env);
 
     let action = env.view.handle_click(5, 3);
     assert_eq!(action, None, "SelectOnly click never emits an action");
@@ -116,7 +115,6 @@ fn single_click_on_archived_row_selects_without_reviving() {
     // look" gesture: no EnterLiveSend to respawn the pane and no auto-unarchive, even under
     // the default `click_action = LiveSend`. Bringing it back stays explicit.
     let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
     // Keep archived rows visible so the archived row is clickable.
     env.view.archived_section_collapsed = false;
 
@@ -190,8 +188,6 @@ fn trash_inspection_never_requests_interaction() {
                 let idx = env.view.flat_items.iter().position(
                     |item| matches!(item, Item::Session { id: candidate, .. } if candidate == &id)
                 ).unwrap();
-                render_geometry(&mut env.view);
-                let row = shelf_row_for_idx(&env.view, idx);
                 env.view.live_send = Some(LiveSendState {
                     session_id: "previous".into(),
                     title: "previous".into(),
@@ -200,10 +196,13 @@ fn trash_inspection_never_requests_interaction() {
                     exit_chords: Vec::new(),
                     leader: None,
                 });
+                render_geometry(&mut env.view);
+                let row = shelf_row_for_idx(&env.view, idx);
                 let now = std::time::Instant::now();
                 assert_eq!(env.view.handle_click_at(now, 5, row), None);
                 assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
                 assert!(env.view.live_send.is_none());
+                render_geometry(&mut env.view);
                 assert_eq!(
                     env.view
                         .handle_click_at(now + std::time::Duration::from_millis(100), 5, row),
@@ -423,6 +422,7 @@ fn double_click_still_attaches_under_select_only() {
         "first click under SelectOnly must not emit an action"
     );
     let t1 = t0 + std::time::Duration::from_millis(100);
+    setup_inner(&mut env);
     let second = env.view.handle_click_at(t1, 5, 3);
     let expected_id = match &env.view.flat_items[2] {
         crate::session::Item::Session { id, .. } => id.clone(),
@@ -443,7 +443,6 @@ fn double_click_tears_down_live_send_before_tmux_attach() {
     // worker is stranded against a pane we are leaving and detaching returns to live mode.
     use crate::session::config::{update_config, ClickAction};
     let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
 
@@ -466,11 +465,11 @@ fn double_click_tears_down_live_send_before_tmux_attach() {
         exit_chords: Vec::new(),
         leader: None,
     });
+    setup_inner(&mut env);
 
     let t0 = std::time::Instant::now();
-    // Seed last_click so the next click within the threshold is treated
-    // as the second click of a double-click on the same row.
-    env.view.last_click = Some((t0, 5, 3));
+    assert!(env.view.handle_click_at(t0, 5, 3).is_none());
+    setup_inner(&mut env);
     let t1 = t0 + std::time::Duration::from_millis(100);
     let action = env.view.handle_click_at(t1, 5, 3);
 
@@ -541,7 +540,6 @@ fn structured_click_keeps_a_relay_on_the_same_session() {
     // relay stays: the user did not move off the pane it is aimed at.
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
     let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
@@ -557,8 +555,13 @@ fn structured_click_keeps_a_relay_on_the_same_session() {
         leader: None,
     });
 
+    setup_inner(&mut env);
     let now = std::time::Instant::now();
     assert_eq!(env.view.handle_click_at(now, 5, 1), None);
+    assert!(matches!(
+        env.view.last_click.as_ref().map(|click| &click.target),
+        Some(super::super::RowClickTarget::Session(clicked)) if clicked == &id
+    ));
     assert!(
         env.view.live_send.is_some(),
         "a relay on the clicked session is left alone"
@@ -719,6 +722,7 @@ fn two_clicks_on_different_rows_do_not_activate() {
         Some(crate::tui::app::Action::EnterLiveSend(id_row2)),
         "first click enters live mode for its row"
     );
+    setup_inner(&mut env);
     let t1 = t0 + Duration::from_millis(100);
     let second = env.view.handle_click_at(t1, 5, 3);
     assert_eq!(
@@ -758,6 +762,7 @@ fn double_click_activates_clicked_row_even_if_cursor_moved_between_clicks() {
     // refresh would.
     env.view.cursor = 0;
     env.view.update_selected();
+    setup_inner(&mut env);
 
     let t1 = t0 + Duration::from_millis(150);
     let action = env.view.handle_click_at(t1, 5, 3);
@@ -781,7 +786,6 @@ fn click_on_other_session_while_live_switches_target() {
     use crate::tui::home::live_send::LiveSendState;
 
     let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
 
@@ -803,6 +807,7 @@ fn click_on_other_session_while_live_switches_target() {
         exit_chords: Vec::new(),
         leader: None,
     });
+    setup_inner(&mut env);
 
     // Click session B's row.
     let action = env.view.handle_click(5, 3);
@@ -821,7 +826,6 @@ fn click_on_already_live_session_is_noop() {
     use crate::tui::home::live_send::LiveSendState;
 
     let mut env = create_test_env_with_sessions(3);
-    setup_inner(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
 
@@ -838,6 +842,7 @@ fn click_on_already_live_session_is_noop() {
         exit_chords: Vec::new(),
         leader: None,
     });
+    setup_inner(&mut env);
 
     let action = env.view.handle_click(5, 3);
     assert!(
@@ -864,7 +869,6 @@ fn click_on_session_that_cannot_go_live_only_selects() {
     ];
     for (label, mutate) in cases {
         let mut env = create_test_env_with_sessions(3);
-        setup_inner(&mut env);
         env.view.cursor = 0;
         env.view.update_selected();
         let target_id = match &env.view.flat_items[2] {
@@ -872,6 +876,7 @@ fn click_on_session_that_cannot_go_live_only_selects() {
             _ => panic!("flat_items[2] should be a session"),
         };
         env.view.mutate_instance(&target_id, mutate);
+        setup_inner(&mut env);
 
         let t0 = Instant::now();
         assert!(
@@ -881,6 +886,7 @@ fn click_on_session_that_cannot_go_live_only_selects() {
         assert_eq!(env.view.cursor, 2, "{label}");
         if label == "creating" {
             let t1 = t0 + Duration::from_millis(150);
+            setup_inner(&mut env);
             assert!(
                 env.view.handle_click_at(t1, 5, 3).is_none(),
                 "Creating sessions are not attachable; double-click should noop"
@@ -1006,6 +1012,7 @@ async fn click_on_group_row_toggles_collapsed() {
         profile: env.view.profile_for_cursor(group_idx).unwrap(),
         path: group_path.clone(),
     };
+    let first_click = std::time::Instant::now();
     super::pickers_groups_sort::settle_namespace(
         &state,
         &mut env.view,
@@ -1014,8 +1021,9 @@ async fn click_on_group_row_toggles_collapsed() {
             collapsed: !was_collapsed,
         }),
         |view| {
+            render_geometry(view);
             assert!(
-                view.handle_click(5, click_row).is_none(),
+                view.handle_click_at(first_click, 5, click_row).is_none(),
                 "single click on a group should not activate"
             );
             Ok(())
@@ -1036,4 +1044,97 @@ async fn click_on_group_row_toggles_collapsed() {
         })
         .expect("group row should still be present after toggle");
     assert_ne!(was_collapsed, now_collapsed, "group collapsed state flips");
+    render_geometry(&mut env.view);
+    let mut commands = env.view.session_feed.namespace_driver_for_test();
+    assert!(env
+        .view
+        .handle_click_at(
+            first_click + std::time::Duration::from_millis(100),
+            5,
+            click_row,
+        )
+        .is_none());
+    assert!(
+        commands(Err("unexpected second collapse".into())).is_none(),
+        "a double-click must not undo its canonical collapse"
+    );
+}
+
+#[test]
+#[serial]
+fn sidebar_click_survives_structured_preview_focus_handoff() {
+    use crate::session::config::NarrowLayout;
+    use crate::tui::structured_view::embedded::EmbeddedView;
+
+    for right_click in [false, true] {
+        let mut env = create_test_env_with_sessions(3);
+        let selected = env.view.selected_session.clone().unwrap();
+        env.view
+            .mutate_instance(&selected, |row| row.view = crate::session::View::Structured);
+        env.view.set_view_mode(ViewMode::Structured);
+        let mut preview = EmbeddedView::for_test(&selected, None);
+        preview.activate();
+        env.view.structured_preview = Some(preview);
+        env.view.narrow_layout = NarrowLayout::OnePane;
+        render_home_to_string(&mut env.view, 60, 40);
+        assert!(env.view.list_inner_area.is_empty());
+        env.view.structured_preview.as_mut().unwrap().deactivate();
+        assert!(env.view.handle_click(5, 3).is_none());
+        assert!(!env.view.handle_right_click(5, 3));
+        assert_eq!(
+            env.view.selected_session.as_deref(),
+            Some(selected.as_str())
+        );
+
+        env.view.structured_preview.as_mut().unwrap().activate();
+        render_geometry(&mut env.view);
+        let list = env.view.list_inner_area;
+        assert!(!list.is_empty());
+        env.view.structured_preview.as_mut().unwrap().deactivate();
+        if right_click {
+            assert!(env.view.handle_right_click(list.x, list.y + 2));
+            assert!(env.view.context_menu.is_some());
+        } else {
+            env.view.handle_click(list.x, list.y + 2);
+        }
+        assert_eq!(
+            env.view.cursor, 2,
+            "focus handoff must not discard the row click"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn reordered_row_does_not_inherit_another_sessions_double_click() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.sort_order = crate::session::config::SortOrder::Custom;
+    let ids: Vec<_> = env.view.instances().map(|row| row.id.clone()).collect();
+    for (index, id) in ids.iter().enumerate() {
+        env.view
+            .mutate_instance(id, |row| row.sort_index = Some(index as u32));
+    }
+    env.view.refresh_projection_presentation();
+    render_geometry(&mut env.view);
+    let list = env.view.list_inner_area;
+    let first_click = std::time::Instant::now();
+    assert_eq!(
+        env.view.handle_click_at(first_click, list.x, list.y + 2),
+        Some(Action::EnterLiveSend(ids[2].clone()))
+    );
+    env.view
+        .mutate_instance(&ids[1], |row| row.sort_index = Some(2));
+    env.view
+        .mutate_instance(&ids[2], |row| row.sort_index = Some(1));
+    env.view.refresh_projection_presentation();
+    render_geometry(&mut env.view);
+    assert_eq!(
+        env.view.handle_click_at(
+            first_click + std::time::Duration::from_millis(100),
+            list.x,
+            list.y + 2,
+        ),
+        Some(Action::EnterLiveSend(ids[1].clone())),
+        "the newly displayed session receives a single click, not an attach"
+    );
 }

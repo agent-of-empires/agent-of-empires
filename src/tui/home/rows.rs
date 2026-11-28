@@ -39,6 +39,48 @@ pub(super) fn split_project_view_path(path: &str) -> (&str, Option<&str>) {
 }
 
 impl HomeView {
+    pub(super) fn rows_paint(&self) -> HomeRowsPaint {
+        HomeRowsPaint {
+            revision: self.rows_revision,
+            cursor: self.cursor,
+            search_bar_visible: self.search_bar_visible(),
+            list_width: self.list_width,
+            list_height: self.list_height,
+            sidebar_position: self.sidebar_position,
+            sidebar_collapsed: self.sidebar_collapsed,
+            narrow_layout: self.narrow_layout,
+            show_diagnostics: self.show_diagnostics,
+            show_shortcut_bar: self.show_shortcut_bar,
+            show_last_prompt: self.show_last_prompt,
+            non_live_overlay: self.has_non_live_send_overlay(),
+        }
+    }
+
+    pub(in crate::tui) fn invalidate_rows(&mut self) {
+        self.invalidate_row_model();
+        self.last_click = None;
+    }
+
+    fn invalidate_row_model(&mut self) {
+        self.rows_revision = crate::tui::terminal_output::next_interaction_revision();
+        self.presented_rows = None;
+    }
+
+    pub(in crate::tui) fn acknowledge_rows(&mut self, paint: Option<HomeRowsPaint>) {
+        self.presented_rows = paint.filter(|paint| *paint == self.rows_paint());
+    }
+
+    pub(in crate::tui) fn rows_presented(&self) -> bool {
+        self.presentation_ready && self.presented_rows == Some(self.rows_paint())
+    }
+
+    pub(super) fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.view_mode != mode {
+            self.invalidate_rows();
+            self.view_mode = mode;
+        }
+    }
+
     pub fn instances(&self) -> impl ExactSizeIterator<Item = &Instance> + '_ {
         self.instances.values()
     }
@@ -163,6 +205,7 @@ impl HomeView {
 
     /// Rebuild the rows and, while stopped sessions are hidden, every group header's full count.
     pub(super) fn refresh_flat_items(&mut self) {
+        self.invalidate_row_model();
         self.flat_items = self.build_flat_items();
         self.group_totals = if self.hide_stopped_in_groups {
             self.build_flat_items_hiding(false)

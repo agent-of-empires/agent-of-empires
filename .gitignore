@@ -3,6 +3,8 @@
 !.claude/skills/
 # Rust build artifacts
 /target/
+/vendor/crossterm/Cargo.lock
+/vendor/crossterm/target/
 # JS / Python tooling artifacts (per-subproject installs in web/, website/, etc.)
 node_modules/
 .venv/

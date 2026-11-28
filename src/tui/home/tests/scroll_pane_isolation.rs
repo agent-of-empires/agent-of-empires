@@ -574,15 +574,17 @@ fn wheel_over_preview_with_scrollable_content_moves_preview_only() {
 #[serial]
 fn wheel_over_list_still_moves_list_cursor() {
     let mut env = create_test_env_with_sessions(3);
-    setup_panes(&mut env);
     env.view.cursor = 0;
     env.view.update_selected();
+    render_geometry(&mut env.view);
+    let list = env.view.list_inner_area;
 
-    let handled = env.view.handle_scroll_down(5, 10);
+    let handled = env.view.handle_scroll_down(list.x, list.y);
     assert!(handled);
     assert_eq!(env.view.cursor, 1, "wheel over list should advance cursor");
+    render_geometry(&mut env.view);
 
-    let handled = env.view.handle_scroll_up(5, 10);
+    let handled = env.view.handle_scroll_up(list.x, list.y);
     assert!(handled);
     assert_eq!(env.view.cursor, 0, "wheel over list should retreat cursor");
 }

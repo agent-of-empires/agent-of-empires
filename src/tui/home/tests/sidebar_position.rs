@@ -16,6 +16,7 @@ fn render(view: &mut HomeView, width: u16) -> Buffer {
             );
         })
         .unwrap();
+    view.acknowledge_rows(view.painted_rows);
     terminal.backend().buffer().clone()
 }
 
@@ -291,7 +292,8 @@ fn narrow_one_pane_swaps_to_an_interactive_structured_session() {
         "a read-only transcript does not take the screen"
     );
 
-    let mut structured = crate::tui::structured_view::embedded::EmbeddedView::for_test(&inst.id);
+    let mut structured =
+        crate::tui::structured_view::embedded::EmbeddedView::for_test(&inst.id, None);
     structured.activate();
     env.view.structured_preview = Some(structured);
     render(&mut env.view, width);

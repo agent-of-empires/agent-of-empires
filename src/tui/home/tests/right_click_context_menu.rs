@@ -6,11 +6,9 @@ use super::*;
 use crate::session::config::SortOrder;
 use crate::session::Item;
 use crate::tui::dialogs::ContextMenuAction;
-use ratatui::layout::Rect;
 
 fn setup_inner(env: &mut TestEnv) {
-    env.view.list_inner_area = Rect::new(1, 1, 28, 10);
-    env.view.list_area = Rect::new(0, 0, 30, 12);
+    render_geometry(&mut env.view);
 }
 
 #[test]
@@ -316,6 +314,7 @@ fn right_click_fork_requires_provenance_not_a_tool_label() {
         instance.agent_session_binding = binding;
         instance.tool = "status-alias".into();
     });
+    setup_inner(&mut env);
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env
         .view
@@ -339,7 +338,6 @@ fn right_click_fork_requires_provenance_not_a_tool_label() {
 #[serial]
 fn right_click_session_menu_hides_fork_for_unforkable_agent() {
     let mut env = create_test_env_with_sessions(1);
-    setup_inner(&mut env);
     let id = match &env.view.flat_items[0] {
         Item::Session { id, .. } => id.clone(),
         _ => panic!("expected a session row"),
@@ -347,6 +345,7 @@ fn right_click_session_menu_hides_fork_for_unforkable_agent() {
     env.view
         .mutate_instance(&id, |inst| inst.tool = "gemini".to_string());
     env.view.flat_items = env.view.build_flat_items();
+    setup_inner(&mut env);
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env
         .view
@@ -371,11 +370,11 @@ fn right_click_session_menu_offers_snooze_and_fork() {
     let mut env = create_test_env_empty();
     env.view.add_instance(observed_fork_parent("claude"));
     env.view.add_instance(observed_fork_parent("claude"));
-    setup_inner(&mut env);
 
     for sort in [SortOrder::Custom, SortOrder::Name] {
         env.view.sort_order = sort;
         env.view.flat_items = env.view.build_flat_items();
+        setup_inner(&mut env);
         assert!(env.view.handle_right_click(5, 1), "{sort:?}");
         let actions: Vec<ContextMenuAction> = env
             .view
@@ -446,6 +445,7 @@ fn sidebar_clicks_that_open_nothing() {
     setup_inner(&mut env);
     for (label, overlay, click) in cases {
         env.view.show_help = overlay;
+        setup_inner(&mut env);
         assert!(!click(&mut env.view), "{label}");
         assert!(env.view.context_menu.is_none(), "{label}");
         assert!(env.view.new_dialog.is_none(), "{label}");
@@ -458,7 +458,6 @@ fn left_click_on_empty_sidebar_in_live_mode_exits_live_mode() {
     // Quick-exit gesture: with live-send active, a click on the empty sidebar drops out of
     // live mode, mirroring Ctrl+Q for users who came in by clicking.
     let mut env = create_test_env_with_sessions(2);
-    setup_inner(&mut env);
     use crate::tui::home::live_send;
     env.view.live_send = Some(live_send::LiveSendState {
         session_id: "fake".to_string(),
@@ -468,6 +467,7 @@ fn left_click_on_empty_sidebar_in_live_mode_exits_live_mode() {
         exit_chords: live_send::parse_chord_list(live_send::DEFAULT_EXIT_CHORD),
         leader: None,
     });
+    setup_inner(&mut env);
     assert!(env.view.live_send.is_some());
     assert!(env.view.handle_empty_list_click(5, 5));
     assert!(

@@ -135,8 +135,8 @@ impl HomeView {
             }
             LoginRequest::CopyLink => {
                 if let Some(url) = self.sandbox_login_url() {
-                    crate::tui::clipboard::copy_to_clipboard(&url);
-                    self.flash_status("copied the sign-in link");
+                    let status = crate::tui::clipboard::copy_to_clipboard(&url);
+                    self.flash_status(status);
                 }
             }
         }
@@ -146,17 +146,13 @@ impl HomeView {
         &mut self,
         url: &str,
         open: impl FnOnce(&str) -> std::io::Result<()>,
-        copy: impl FnOnce(&str) -> usize,
+        copy: impl FnOnce(&str) -> String,
     ) {
         // The link carries the login's `state`: it never goes into the status bar.
-        let status = match open(url) {
-            Ok(()) => "opened the sign-in link",
-            Err(_) => {
-                copy(url);
-                "no browser here; copied the sign-in link"
-            }
-        };
-        self.flash_status(status);
+        match open(url) {
+            Ok(()) => self.flash_status("opened the sign-in link"),
+            Err(_) => self.flash_status(format!("no browser here; {}", copy(url))),
+        }
     }
 
     fn sandbox_login_url(&self) -> Option<String> {

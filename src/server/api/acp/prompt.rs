@@ -33,13 +33,14 @@ pub struct PromptDispatchResponse {
 
 /// 503 for a worker that could not be resumed; the client retries.
 fn resume_failed_response(err: &SupervisorError) -> Response {
-    let body = match err {
-        SupervisorError::CapacityFull { current, limit } => {
-            format!("worker_capacity_full ({current}/{limit})")
-        }
-        e => format!("worker_not_ready: {e}"),
-    };
-    (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    match err {
+        SupervisorError::CapacityFull { current, limit } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("worker_capacity_full ({current}/{limit})"),
+        )
+            .into_response(),
+        e => worker_not_ready_response(format!("worker_not_ready: {e}")),
+    }
 }
 
 /// A newer stop refused the start this prompt asked for. Unlike `worker_not_ready` it is
@@ -54,7 +55,7 @@ fn stop_fenced_refused() -> Response {
 }
 
 fn worker_not_ready() -> Response {
-    (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+    worker_not_ready_response("worker_not_ready")
 }
 
 /// `no_revive` refused: reviving (snoozed/idle-dormant wake, or a
@@ -720,11 +721,7 @@ pub async fn acp_prompt_diff_comments(
     }
     // Publish only once a worker exists, or the card strands on "running" (#3172).
     if let Err(e) = state.acp_supervisor.wait_until_ready(&id).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("worker_not_ready: {e}"),
-        )
-            .into_response();
+        return worker_not_ready_response(format!("worker_not_ready: {e}"));
     }
     state
         .acp_supervisor

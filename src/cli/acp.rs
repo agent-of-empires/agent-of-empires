@@ -1371,9 +1371,9 @@ mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
 
-    /// A pruned log (first retained seq 5) served in two pages of two frames.
+    /// A pruned log with an append between pages.
     #[tokio::test]
-    async fn transcript_reads_past_a_retention_gap_to_the_newest_entries() {
+    async fn transcript_reads_past_a_retention_gap_without_crossing_the_snapshot_cap() {
         use axum::{extract::Query, routing::get, Router};
         use std::collections::HashMap;
         let frame = move |seq: u64| {
@@ -1388,7 +1388,7 @@ mod tests {
                 let first = q["since"] == "0";
                 axum::Json(serde_json::json!({
                     "frames": if first { vec![frame(5), frame(6)] } else { vec![frame(7), frame(8)] },
-                    "lost": first, "highest_seq": 8, "lowest_seq": 5,
+                    "lost": first, "highest_seq": if first { 7 } else { 8 }, "lowest_seq": 5,
                     "next_cursor": if first { 6 } else { 8 }, "has_more": first,
                     "history_identity": "snapshot",
                 }))
@@ -1406,7 +1406,8 @@ mod tests {
         let got = transcript_entries(&client, "s", 0, 2).await.unwrap();
         server.abort();
         let texts: Vec<_> = got.entries.iter().map(|e| e.text.as_str()).collect();
-        assert_eq!(texts, ["m5", "m6", "m7", "m8"]);
+        assert_eq!(texts, ["m5", "m6", "m7"]);
+        assert_eq!(got.highest_seq, 7);
         assert!(got.partial);
     }
 

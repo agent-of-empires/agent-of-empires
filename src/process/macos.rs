@@ -6,8 +6,68 @@ use std::process::Command;
 
 pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
-    restore_environment_value, terminate_process_group, try_wait_status_hook,
+    restore_environment_value, terminate_process_group, try_wait_group_status,
 };
+
+pub(super) fn reopen_terminal_fd(
+    fd: std::os::fd::BorrowedFd<'_>,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut path = [0; 4096];
+    // SAFETY: the buffer is writable and larger than Darwin's MAXPATHLEN.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let path = std::ffi::CStr::from_bytes_until_nul(&path)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    super::unix::open_terminal_path(std::path::Path::new(std::ffi::OsStr::from_bytes(
+        path.to_bytes(),
+    )))
+}
+
+pub(super) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
+{
+    std::iter::once(("pbcopy", &[] as &'static [&'static str]))
+}
+
+pub(super) fn terminal_writable(
+    file: &std::fs::File,
+    remaining: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if remaining.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let fd = file.as_raw_fd();
+    if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let mut writable = unsafe { std::mem::zeroed::<libc::fd_set>() };
+    let timeout = libc::timespec {
+        tv_sec: remaining.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+        tv_nsec: remaining.subsec_nanos().into(),
+    };
+    // Darwin's controlling-terminal alias supports select, not poll.
+    // SAFETY: the checked descriptor fits the live set; pselect borrows both locals.
+    let ready = unsafe {
+        libc::FD_ZERO(&mut writable);
+        libc::FD_SET(fd, &mut writable);
+        libc::pselect(
+            fd + 1,
+            std::ptr::null_mut(),
+            &mut writable,
+            std::ptr::null_mut(),
+            &timeout,
+            std::ptr::null(),
+        )
+    };
+    match ready {
+        0 => Err(std::io::ErrorKind::TimedOut.into()),
+        -1 => Err(std::io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
 
 /// A fixed-size disk image. The caller owns the recovery marker and must settle
 /// every Git writer before calling `close`. Deliberately no Drop cleanup: an
@@ -1918,17 +1978,32 @@ pub(super) fn processes_matching(
 }
 
 pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
+    runner_group_executing_before(
+        group,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    )
+}
+
+pub(super) fn runner_group_executing_before(
+    group: u32,
+    deadline: std::time::Instant,
+) -> anyhow::Result<bool> {
+    let deadline = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(2));
     let mut command = Command::new("ps");
     command
         .args(["-A", "-o", "pid=,pgid=,stat="])
         .env("LC_ALL", "C");
-    let output = crate::session::capture::run_with_timeout_limit(
+    let output = crate::session::capture::run_with_deadline_limit(
         command,
-        std::time::Duration::from_secs(2),
+        deadline,
         "runner group census",
         1024 * 1024,
     )?;
     for line in std::str::from_utf8(&output)?.lines() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "runner group census timed out"
+        );
         let mut fields = line.split_ascii_whitespace();
         fields
             .next()

@@ -12,8 +12,6 @@ use similar::{ChangeTag, TextDiff};
 
 use aoe_plugin_api::UiSlot;
 
-use ansi_to_tui::IntoText;
-
 use super::input::{Focus, Intent};
 use super::reducer::{
     AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion, ToolOutcome,
@@ -1093,8 +1091,7 @@ fn render_transcript(
         );
     }
 
-    let (text, groups) =
-        wrapped_transcript_rows(state, theme, text_area.width, ToolOutputMode::Compact);
+    let (text, groups) = wrapped_transcript_rows(state, theme, text_area.width);
     // Pre-wrapped at the render width, so visual rows are logical rows.
     let total = text.lines.len().min(u16::MAX as usize) as u16;
     let max = total.saturating_sub(text_area.height);
@@ -1354,35 +1351,23 @@ pub struct TranscriptGeometry {
     pub total_lines: usize,
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum ToolOutputMode<'a> {
-    Compact,
-    Retained(&'a [crate::acp::transcript::UnfinishedToolOutput]),
-}
-
-/// The transcript pre-wrapped at `width`: the single source of transcript
-/// geometry for painting, scroll clamping, and selection. The live projection
-/// is cached, so an unchanged transcript costs a clone rather than a re-wrap.
+#[cfg(test)]
 pub(super) fn wrapped_transcript(
     state: &StructuredViewState,
     theme: &Theme,
     width: u16,
-    tool_output: ToolOutputMode,
 ) -> Text<'static> {
-    wrapped_transcript_rows(state, theme, width, tool_output).0
+    wrapped_transcript_rows(state, theme, width).0
 }
 
-/// [`wrapped_transcript`] plus, per visual row, the transcript row identity it
-/// came from, so a scroll anchor can find its own row again after the
-/// projection moves it.
+/// Wrap the transcript and retain each visual row's identity for scroll anchoring.
 pub(super) fn wrapped_transcript_rows(
     state: &StructuredViewState,
     theme: &Theme,
     width: u16,
-    tool_output: ToolOutputMode,
 ) -> (Text<'static>, Vec<Option<String>>) {
     let revision = state.transcript.projection_revision();
-    if let ToolOutputMode::Compact = tool_output {
+    {
         let cached = state.transcript_cache.borrow();
         if let Some(hit) = cached.as_ref().filter(|hit| {
             hit.matches(
@@ -1396,10 +1381,8 @@ pub(super) fn wrapped_transcript_rows(
             return (hit.text.clone(), hit.groups.clone());
         }
     }
-    let projected = project_transcript_rows(state, theme, width, tool_output);
-    // The retained reader builds its own cache over outputs the state does not
-    // hold, so only the compact projection is stored here.
-    if let ToolOutputMode::Compact = tool_output {
+    let projected = project_transcript_rows(state, theme, width);
+    {
         *state.transcript_cache.borrow_mut() = Some(TranscriptTextCache {
             revision,
             width,
@@ -1419,23 +1402,20 @@ pub(super) fn project_transcript(
     state: &StructuredViewState,
     theme: &Theme,
     width: u16,
-    tool_output: ToolOutputMode,
 ) -> Text<'static> {
-    project_transcript_rows(state, theme, width, tool_output).0
+    project_transcript_rows(state, theme, width).0
 }
 
 fn project_transcript_rows(
     state: &StructuredViewState,
     theme: &Theme,
     width: u16,
-    tool_output: ToolOutputMode,
 ) -> (Text<'static>, Vec<Option<String>>) {
     let text = transcript_lines(
         &state.transcript,
         theme,
         state.path_roots.as_ref(),
         state.show_full_thinking,
-        tool_output,
     );
     let mut wrapped: Vec<Line<'static>> = Vec::with_capacity(text.lines.len());
     let mut groups: Vec<Option<String>> = Vec::with_capacity(text.lines.len());
@@ -1672,108 +1652,52 @@ fn painted_cells(text: &str) -> usize {
 }
 
 pub(super) fn wrap_line_into(mut line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
-    use ratatui::buffer::CellWidth;
-    use unicode_segmentation::UnicodeSegmentation;
-
-    // A grapheme can only span a span boundary when a span ends inside one, so
-    // plain ASCII (which has no combining or joined clusters) skips the join.
+    use crate::tui::rich_text::wrap::{Breaks, MemoryGlyphs};
     let plain = line.spans.iter().all(|span| is_plain_ascii(&span.content));
     if plain {
         line.spans.retain(|span| !span.content.is_empty());
     } else {
         join_split_graphemes(&mut line);
     }
-    let width = width.max(1) as usize;
     let painted_width: usize = line
         .spans
         .iter()
         .map(|span| painted_cells(&span.content))
         .sum();
-    if painted_width <= width {
+    if painted_width <= usize::from(width.max(1)) {
         out.push(line);
         return;
     }
-    let emit = |glyphs: &[(usize, std::ops::Range<usize>, usize)], out: &mut Vec<Line<'static>>| {
-        if glyphs.is_empty() {
-            return;
+    let glyphs = MemoryGlyphs::new(&line, painted_width as u64);
+    let mut source = 0;
+    let mut base = 0u64;
+    for range in Breaks::new(glyphs, width) {
+        let range = range.expect("valid in-memory grapheme ranges");
+        while source < line.spans.len()
+            && base + line.spans[source].content.len() as u64 <= range.start
+        {
+            base += line.spans[source].content.len() as u64;
+            source += 1;
         }
         let mut spans = Vec::new();
-        let mut i = 0;
-        while i < glyphs.len() {
-            let source = glyphs[i].0;
-            let start = glyphs[i].1.start;
-            let mut end = glyphs[i].1.end;
-            i += 1;
-            while i < glyphs.len() && glyphs[i].0 == source {
-                end = glyphs[i].1.end;
-                i += 1;
+        while source < line.spans.len() && base < range.end {
+            let span = &line.spans[source];
+            let end = base + span.content.len() as u64;
+            let from = range.start.saturating_sub(base) as usize;
+            let to = (range.end.min(end) - base) as usize;
+            if from != to {
+                spans.push(Span::styled(span.content[from..to].to_owned(), span.style));
             }
-            spans.push(Span::styled(
-                line.spans[source].content[start..end].to_owned(),
-                line.spans[source].style,
-            ));
+            if end > range.end {
+                break;
+            }
+            base = end;
+            source += 1;
         }
         let mut wrapped = Line::from(spans).style(line.style);
         wrapped.alignment = line.alignment;
         out.push(wrapped);
-    };
-    let mut row: Vec<(usize, std::ops::Range<usize>, usize)> = Vec::new();
-    let mut row_width = 0;
-    let mut last_space = None;
-    let mut push = |span_index: usize,
-                    range: std::ops::Range<usize>,
-                    cells: usize,
-                    is_space: bool,
-                    out: &mut Vec<Line<'static>>| {
-        while row_width + cells > width && row_width > 0 {
-            if let Some(cut) = last_space {
-                emit(&row[..cut], out);
-                row.drain(..=cut);
-            } else {
-                emit(&row, out);
-                row.clear();
-            }
-            row_width = row.iter().map(|glyph| glyph.2).sum();
-            last_space = row
-                .iter()
-                .rposition(|(index, range, _)| &line.spans[*index].content[range.clone()] == " ");
-        }
-        if is_space {
-            last_space = Some(row.len());
-        }
-        row.push((span_index, range, cells));
-        row_width += cells;
-        if cells > width {
-            emit(&row, out);
-            row.clear();
-            row_width = 0;
-            last_space = None;
-        }
-    };
-    for (span_index, span) in line.spans.iter().enumerate() {
-        if plain {
-            for (byte, glyph) in span.content.bytes().enumerate() {
-                push(span_index, byte..byte + 1, 1, glyph == b' ', out);
-            }
-            continue;
-        }
-        for (byte, grapheme) in span.content.grapheme_indices(true) {
-            let cells = if grapheme.contains(char::is_control) {
-                0
-            } else {
-                grapheme.cell_width() as usize
-            };
-            push(
-                span_index,
-                byte..byte + grapheme.len(),
-                cells,
-                grapheme == " ",
-                out,
-            );
-        }
     }
-    drop(push);
-    emit(&row, out);
 }
 
 fn render_status(
@@ -2147,7 +2071,6 @@ fn transcript_lines(
     theme: &Theme,
     path_roots: Option<&SessionPathRoots>,
     full_thinking: bool,
-    tool_output: ToolOutputMode,
 ) -> TranscriptText {
     let rows = transcript.rows();
     // One card per tool call at its start row; the last terminal row wins.
@@ -2182,7 +2105,6 @@ fn transcript_lines(
         subagents: transcript.subagents(),
         theme,
         path_roots,
-        tool_output,
     };
 
     let mut out = TranscriptText::new();
@@ -2294,19 +2216,6 @@ fn transcript_lines(
         }
         i += 1;
     }
-    if let ToolOutputMode::Retained(outputs) = tool_output {
-        for output in outputs {
-            out.push(Line::styled(
-                format!(
-                    "Retained tool output · completion unavailable · {}",
-                    output.tool_call_id
-                ),
-                Style::default().fg(theme.hint),
-            ));
-            out.extend(styled_output_lines(&output.text));
-            out.push(Line::default());
-        }
-    }
     if out.is_empty() {
         out.push(Line::from(Span::styled(
             "(no events yet, waiting for the agent…)",
@@ -2338,7 +2247,6 @@ struct ToolBlocks<'a> {
     subagents: &'a [SubagentRecord],
     theme: &'a Theme,
     path_roots: Option<&'a SessionPathRoots>,
-    tool_output: ToolOutputMode<'a>,
 }
 
 impl ToolBlocks<'_> {
@@ -2350,10 +2258,7 @@ impl ToolBlocks<'_> {
                 .iter()
                 .find(|record| record.parent_tool_call_id.as_deref() == Some(id))
         });
-        let mut lines = if matches!(self.tool_output, ToolOutputMode::Retained(_)) {
-            let completion = id.and_then(|id| self.completions.get(id)).copied();
-            retained_tool_lines(row, completion, self.theme, self.path_roots)
-        } else {
+        let mut lines = {
             let mut card = tool_card_from_rows(row, self.completions);
             // The roster, not the launch call, says whether the child is still
             // active: a stop at turn end must not close a running child's card,
@@ -2483,60 +2388,6 @@ fn note_line(kind: NoteKind, text: &str) -> Line<'static> {
         format!("· {text}"),
         Style::default().add_modifier(modifier),
     ))
-}
-
-fn retained_tool_lines(
-    start: &TranscriptRow,
-    completion: Option<&TranscriptRow>,
-    theme: &Theme,
-    path_roots: Option<&SessionPathRoots>,
-) -> Vec<Line<'static>> {
-    let marker = match completion.map(|row| row.kind) {
-        Some(TranscriptRowKind::ToolComplete) => "✓ ",
-        Some(TranscriptRowKind::ToolError) => "✗ ",
-        Some(TranscriptRowKind::ToolStopped) => "◼ ",
-        _ => "",
-    };
-    let mut lines = vec![Line::styled(
-        format!("tool {marker}· {}", start.text),
-        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-    )];
-    if let Some(tool) = &start.tool {
-        lines.extend(styled_output_lines(&tool.args_preview));
-        for diff in &tool.diffs {
-            let path = relative_display_path(&diff.path, path_roots);
-            if let Some(before) = &diff.old_text {
-                lines.push(Line::from(format!("Before: {path}")));
-                lines.extend(styled_output_lines(before));
-            }
-            if let Some(after) = &diff.new_text {
-                lines.push(Line::from(format!("After: {path}")));
-                lines.extend(styled_output_lines(after));
-            }
-        }
-    }
-    if let Some(completion) = completion {
-        if completion.async_subagent {
-            lines.push(Line::from("runs in background"));
-        } else if completion.output.is_empty() {
-            lines.extend(styled_output_lines(&completion.text));
-        } else {
-            let has_text = completion.output.iter().any(|block| match block {
-                ToolOutputBlock::Text { text }
-                | ToolOutputBlock::Resource {
-                    text: Some(text), ..
-                } => !text.is_empty(),
-                _ => false,
-            });
-            if !has_text && !completion.text.is_empty() {
-                lines.extend(styled_output_lines(&completion.text));
-            }
-            lines.extend(styled_output_lines(&summarize_output_blocks(
-                &completion.output,
-            )));
-        }
-    }
-    lines
 }
 
 fn tool_card_from_rows(
@@ -2897,14 +2748,24 @@ fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
     out
 }
 
-/// Tool output lines with ANSI SGR styling applied, raw text on parse failure.
+/// Tool output with the same ANSI decoder as the disk-backed reader.
 fn styled_output_lines(content: &str) -> Vec<Line<'static>> {
-    if content.contains('\u{1b}') {
-        if let Ok(text) = content.into_text() {
-            return text.lines;
-        }
+    if !content.contains('\u{1b}') {
+        return content
+            .lines()
+            .map(|line| Line::from(line.to_owned()))
+            .collect();
     }
-    content.lines().map(|l| Line::from(l.to_string())).collect()
+    use crate::tui::rich_text::{ansi, MemoryLines};
+    let mut output = MemoryLines::default();
+    ansi::render_str(
+        content,
+        ansi::Mode::Text,
+        |range| Ok(content[range.start as usize..range.end as usize].to_owned()),
+        &mut output,
+    )
+    .expect("valid in-memory ANSI source");
+    output.lines
 }
 
 /// Fallback for unknown kinds: truncated args and output.
@@ -3504,11 +3365,7 @@ mod tests {
             .transcript
             .set_rows(server_rows(&[chunk(&"wide ".repeat(20))]));
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let rows = |width| {
-            wrapped_transcript(&state, &theme, width, ToolOutputMode::Compact)
-                .lines
-                .len()
-        };
+        let rows = |width| wrapped_transcript(&state, &theme, width).lines.len();
         let wide = rows(60);
         assert!(rows(30) > wide, "a narrower frame must re-wrap");
     }
@@ -4117,9 +3974,7 @@ mod tests {
             chunk("Build", "m-c"),
             chunk("ing now", "m-c"),
         ]));
-        let out = joined(
-            &transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact).lines,
-        );
+        let out = joined(&transcript_lines(&t, &Theme::default(), None, false).lines);
         assert!(!out.contains("#4656.The waiter"), "{out:?}");
         assert!(
             out.contains("for #4656.") && out.contains("The waiter has the lock."),
@@ -4142,13 +3997,12 @@ mod tests {
             thought("options\nsecond line", "t-a"),
             thought(&long, "t-b"),
         ]));
-        let lines: Vec<String> =
-            transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact)
-                .lines
-                .iter()
-                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
-                .filter(|line: &String| !line.is_empty())
-                .collect();
+        let lines: Vec<String> = transcript_lines(&t, &Theme::default(), None, false)
+            .lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .filter(|line: &String| !line.is_empty())
+            .collect();
         assert_eq!(
             lines,
             [
@@ -4158,13 +4012,12 @@ mod tests {
         );
 
         // Expanded, the same thoughts render whole: every line, no elision.
-        let expanded: Vec<String> =
-            transcript_lines(&t, &Theme::default(), None, true, ToolOutputMode::Compact)
-                .lines
-                .iter()
-                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
-                .filter(|line: &String| !line.trim().is_empty())
-                .collect();
+        let expanded: Vec<String> = transcript_lines(&t, &Theme::default(), None, true)
+            .lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .filter(|line: &String| !line.trim().is_empty())
+            .collect();
         let body = expanded.join("\n");
         assert!(body.contains("Weighing options"), "{body:?}");
         assert!(body.contains("second line"), "{body:?}");
@@ -4187,9 +4040,7 @@ mod tests {
             "<div>\nCompare both alternatives.\n</div>",
             "t-a",
         )]));
-        let body = joined(
-            &transcript_lines(&t, &Theme::default(), None, true, ToolOutputMode::Compact).lines,
-        );
+        let body = joined(&transcript_lines(&t, &Theme::default(), None, true).lines);
         assert!(body.contains("Compare both alternatives."), "{body:?}");
     }
 
@@ -4498,9 +4349,7 @@ mod tests {
                 text: String::new(),
             },
         ]));
-        let out = joined(
-            &transcript_lines(&t, &Theme::default(), None, false, ToolOutputMode::Compact).lines,
-        );
+        let out = joined(&transcript_lines(&t, &Theme::default(), None, false).lines);
         assert_eq!(out.matches("Compaction summary").count(), 1, "{out:?}");
         for want in [
             "working on it",
@@ -4555,7 +4404,7 @@ mod tests {
     }
 
     fn tool_lines(t: &AcpTranscript) -> Vec<String> {
-        transcript_lines(t, &Theme::default(), None, false, ToolOutputMode::Compact)
+        transcript_lines(t, &Theme::default(), None, false)
             .lines
             .iter()
             .map(line_text)
