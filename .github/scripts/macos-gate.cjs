@@ -21,8 +21,8 @@ const EXACT = [
 ];
 // A PR lockfile bump runs post-merge; the queue still checks it.
 const QUEUE_ONLY = ['Cargo.lock'];
-// pulls.listFiles stops listing here.
-const FILE_LIMIT = 3000;
+// The compare API lists at most 300 files.
+const FILE_LIMIT = 300;
 const CFG = /target_os\s*=\s*"macos"/;
 const MACOS_CHECK = 'Cargo Test (macos)';
 
@@ -69,17 +69,15 @@ module.exports = async function macosGate({ github, context, core, queueRef }) {
   if (!number) return run(`no PR number in ${queueRef}`);
   const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
 
-  let files;
+  // The event's own revisions, so a re-run classifies the commit it tests. In
+  // the queue, base_sha is the entry ahead of this one, so this lists only this PR.
+  const { data: diff } = await github.rest.repos.compareCommitsWithBasehead({
+    ...context.repo,
+    basehead: pr ? `${pr.base.sha}...${pr.head.sha}` : `${queue.base_sha}...${queue.head_sha}`,
+  });
   if (pr) {
     if (current.labels.some(l => l.name === 'ci-macos')) return run('ci-macos label');
-    files = await github.paginate(github.rest.pulls.listFiles, {
-      ...context.repo, pull_number: number, per_page: 100,
-    });
   } else {
-    // base_sha is the entry ahead of this one, so this lists only this PR.
-    const { data: diff } = await github.rest.repos.compareCommitsWithBasehead({
-      ...context.repo, basehead: `${queue.base_sha}...${queue.head_sha}`,
-    });
     // An entry stacked behind others also holds their changes, so only the
     // first skips. Main still runs macOS after the merge.
     if (await aloneInQueue(github, context, queue) &&
@@ -88,11 +86,9 @@ module.exports = async function macosGate({ github, context, core, queueRef }) {
       return core.setOutput('run', 'false');
     }
     if (current.labels.some(l => l.name === 'ci-macos')) return run('ci-macos label');
-    // The compare API lists at most 300 files.
-    files = diff.files.length >= 300 ? null : diff.files;
   }
-  if (!files || files.length >= FILE_LIMIT) return run('diff too large to inspect');
-  const hit = sensitiveFile(files, !pr);
+  if (diff.files.length >= FILE_LIMIT) return run('diff too large to inspect');
+  const hit = sensitiveFile(diff.files, !pr);
   if (hit) return run(`${hit.filename} is macOS-sensitive`);
   core.notice('macOS skipped: runs post-merge on main. Add ci-macos and re-run this job to run it here.');
   core.setOutput('run', 'false');
