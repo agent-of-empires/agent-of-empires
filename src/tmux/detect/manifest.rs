@@ -602,8 +602,21 @@ impl Manifest {
                         anyhow::anyhow!("input_box {what} {p:?} is not a valid regex: {e}")
                     })
                 };
+                let prompt = compile("prompt", &geometry.prompt)?;
+                if !geometry.prompt.starts_with('^') {
+                    anyhow::bail!(
+                        "input_box prompt {:?} must start with ^ to match at the line start",
+                        geometry.prompt
+                    );
+                }
+                if prompt.is_match("") {
+                    anyhow::bail!(
+                        "input_box prompt {:?} must not match an empty line",
+                        geometry.prompt
+                    );
+                }
                 Ok::<_, anyhow::Error>(InputBox {
-                    prompt: compile("prompt", &geometry.prompt)?,
+                    prompt,
                     chrome: geometry
                         .chrome
                         .iter()
@@ -770,6 +783,27 @@ not = [{ region = "evidence(secondary)", contains = ["cancel"] }]
                 Manifest::parse(&boxed, &[]).expect("compiles with [input_box]");
             }
         }
+    }
+
+    #[test]
+    fn input_box_prompt_must_be_anchored_and_non_empty() {
+        let parse = |prompt: &str| {
+            Manifest::parse(
+                &format!("id = \"t\"\nrules = []\n[input_box]\nprompt = '{prompt}'\n"),
+                &[],
+            )
+        };
+        for (prompt, message) in [
+            (">", "start with ^"),
+            (r"\s*>", "start with ^"),
+            ("^", "empty line"),
+            (r"^\s*", "empty line"),
+        ] {
+            let err = parse(prompt).err().expect("must not compile");
+            assert!(err.to_string().contains(message), "{prompt}: {err}");
+        }
+        parse(r"^\s*>\s").expect("anchored prompt compiles");
+        Manifest::parse(include_str!("manifests/claude.toml"), &[]).expect("claude manifest");
     }
 
     #[test]
