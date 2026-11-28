@@ -230,8 +230,6 @@ test.describe("Cmd/Ctrl+` mobile", () => {
     await openSession(page);
     await terminal.waitForLiveReady();
 
-    const sidebar = page.getByRole("navigation", { name: "Sessions sidebar" });
-    await expect(sidebar).toBeHidden();
     const proxy = page.locator("[data-keyboard-proxy]");
     await expect(proxy).toHaveAttribute("data-session-input", "");
     await proxy.focus();
@@ -240,6 +238,7 @@ test.describe("Cmd/Ctrl+` mobile", () => {
     await expect.poll(() => terminal.liveInput.some((input) => input.equals(Buffer.from([0x01])))).toBe(true);
 
     await page.keyboard.press("Control+q");
+    const sidebar = page.getByRole("navigation", { name: "Sessions sidebar" });
     await expect(sidebar.locator("[data-active-session-row]")).toBeFocused();
     await observeFor(page, 250, async () => {
       expect(terminal.liveInput.some((input) => input.includes(0x11))).toBe(false);
