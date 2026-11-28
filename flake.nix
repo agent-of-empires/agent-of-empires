@@ -57,6 +57,7 @@
                 ./bundled_sounds
                 ./docker
                 ./tests/fixtures/cli-read
+                ./tests/fixtures/input-line
                 ./tests/fixtures/pull-progress
                 ./tests/fixtures/pull-stderr
                 ./web/tests/helpers/fakeAcpAgent.mjs

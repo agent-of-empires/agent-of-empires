@@ -23,7 +23,8 @@ use super::state::{
 use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::acp::state::{
-    AuthStatusKind, SessionUsage, SubagentRecord, SubagentState, ToolOutputBlock,
+    AuthStatusKind, IntegrationLostReason, SessionUsage, SubagentRecord, SubagentState,
+    ToolOutputBlock,
 };
 use crate::acp::transcript::{TranscriptRow, TranscriptRowKind};
 use crate::tui::components::hover::paint_hover_bg;
@@ -316,8 +317,8 @@ pub(super) fn compute_layout(area: Rect, state: &StructuredViewState) -> ViewLay
         .constraints([
             Constraint::Min(5), // transcript
             Constraint::Length(approval_height),
-            Constraint::Length(notices_strip_height(state)), // 0 when none
-            Constraint::Length(queue_height),                // queued prompts strip (0 when empty)
+            Constraint::Length(notices_strip_height(state, area.width)), // 0 when none
+            Constraint::Length(queue_height), // queued prompts strip (0 when empty)
             Constraint::Length(composer_height(state)),
             Constraint::Length(1), // status line
         ])
@@ -430,10 +431,66 @@ fn queued_strip_height(state: &StructuredViewState) -> u16 {
 const CLOSE_LABEL: &str = " × ";
 const CLOSE_LABEL_WIDTH: u16 = 3;
 
-/// One line per undismissed advisory. Capped daemon-side, so this never
-/// starves the transcript.
-fn notices_strip_height(state: &StructuredViewState) -> u16 {
-    state.visible_notices().count() as u16
+/// What went wrong, per reason; the Daemon holds the session's queue meanwhile.
+fn integration_lost_text(reason: &IntegrationLostReason) -> String {
+    let what = match reason {
+        IntegrationLostReason::ContractViolation { detail } => {
+            format!("The integration broke the protocol: {detail}.")
+        }
+        IntegrationLostReason::HoldOverflow => {
+            "The integration held back too many messages.".to_string()
+        }
+        IntegrationLostReason::LeaseOverflow => {
+            "The integration left too many requests open.".to_string()
+        }
+        IntegrationLostReason::ProxyExited => "The integration process exited.".to_string(),
+    };
+    format!(" {what} Messages you send stay queued.")
+}
+
+/// A long contract-violation detail is cut here rather than crowd the transcript.
+const INTEGRATION_LOST_MAX_ROWS: usize = 3;
+
+/// The lost-integration line wrapped to `width`, ellipsized on its last row.
+fn integration_lost_lines(
+    reason: &IntegrationLostReason,
+    width: u16,
+    title: Style,
+    hint: Style,
+) -> Vec<Line<'static>> {
+    let line = Line::from(vec![
+        Span::styled(" Agent integration lost ", title),
+        Span::styled(integration_lost_text(reason), hint),
+    ]);
+    let mut lines = Vec::new();
+    wrap_line_into(line, width, &mut lines);
+    if lines.len() > INTEGRATION_LOST_MAX_ROWS {
+        let last: String = lines[INTEGRATION_LOST_MAX_ROWS - 1]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        lines.truncate(INTEGRATION_LOST_MAX_ROWS);
+        let clipped = crate::tui::components::text::truncate_to_width(
+            &format!("{last}\u{2026}"),
+            width as usize,
+        );
+        lines[INTEGRATION_LOST_MAX_ROWS - 1] = Line::from(Span::styled(clipped, hint));
+    }
+    lines
+}
+
+/// The wrapped lost-integration rows, then one line per undismissed advisory.
+/// Advisories are capped daemon-side, so this never starves the transcript.
+fn notices_strip_height(state: &StructuredViewState, width: u16) -> u16 {
+    let lost = state
+        .transcript
+        .integration_lost
+        .as_ref()
+        .map_or(0, |reason| {
+            integration_lost_lines(reason, width, Style::default(), Style::default()).len()
+        });
+    (state.visible_notices().count() + lost) as u16
 }
 
 /// Agent-pushed advisories, toned by severity, each dismissable with `x` or a
@@ -445,7 +502,19 @@ fn render_notices(
     state: &StructuredViewState,
 ) -> Vec<(Rect, Intent)> {
     let mut buttons = Vec::new();
+    let mut first_notice_row = 0;
+    if let Some(reason) = &state.transcript.integration_lost {
+        let title = Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD);
+        let lines =
+            integration_lost_lines(reason, area.width, title, Style::default().fg(theme.hint));
+        first_notice_row = lines.len();
+        let height = (first_notice_row as u16).min(area.height);
+        frame.render_widget(Paragraph::new(lines), Rect { height, ..area });
+    }
     for (row, notice) in state.visible_notices().enumerate() {
+        let row = row + first_notice_row;
         let Some(y) = area
             .y
             .checked_add(row as u16)
@@ -2836,6 +2905,97 @@ mod tests {
         state.transcript.session_notices.clear();
         state.prune_dismissed_notices();
         assert!(state.dismissed_notices.is_empty());
+    }
+
+    #[test]
+    fn integration_lost_renders_a_line_per_reason_above_the_notices() {
+        let mut state = test_state();
+        state.transcript.session_notices = vec![SessionNotice {
+            id: "notice-1".into(),
+            severity: "info".into(),
+            title: "Fast mode turned off".into(),
+            description: None,
+        }];
+        let strip = |state: &StructuredViewState| -> Vec<String> {
+            render_rows(state, 100, 24, true)
+                .into_iter()
+                .filter(|row| row.contains("integration") || row.contains('×'))
+                .collect()
+        };
+
+        for (reason, expected) in [
+            (
+                IntegrationLostReason::ProxyExited,
+                "The integration process exited.",
+            ),
+            (
+                IntegrationLostReason::ContractViolation {
+                    detail: "bad seq".into(),
+                },
+                "The integration broke the protocol: bad seq.",
+            ),
+            (
+                IntegrationLostReason::HoldOverflow,
+                "The integration held back too many messages.",
+            ),
+            (
+                IntegrationLostReason::LeaseOverflow,
+                "The integration left too many requests open.",
+            ),
+        ] {
+            state.transcript.integration_lost = Some(reason);
+            let rows = strip(&state);
+            assert_eq!(rows.len(), 2, "{rows:?}");
+            assert!(rows[0].contains("Agent integration lost"), "{rows:?}");
+            assert!(rows[0].contains(expected), "{rows:?}");
+            assert!(
+                rows[0].contains("Messages you send stay queued."),
+                "{rows:?}"
+            );
+            assert!(rows[1].contains("Fast mode turned off"), "{rows:?}");
+        }
+
+        state.transcript.integration_lost = None;
+        assert_eq!(strip(&state).len(), 1);
+    }
+
+    #[test]
+    fn integration_lost_wraps_at_80_columns_and_caps_long_detail() {
+        let mut state = test_state();
+        state.transcript.session_notices = vec![SessionNotice {
+            id: "notice-1".into(),
+            severity: "info".into(),
+            title: "Fast mode turned off".into(),
+            description: None,
+        }];
+        let rows = |state: &StructuredViewState| render_rows(state, 80, 24, true);
+
+        state.transcript.integration_lost = Some(IntegrationLostReason::ProxyExited);
+        let text = rows(&state).join("\n");
+        assert!(text.contains("process exited"), "{text}");
+        assert!(text.contains("queued."), "{text}");
+        let all = rows(&state);
+        let lost = all
+            .iter()
+            .position(|r| r.contains("Agent integration lost"));
+        let notice = all.iter().position(|r| r.contains("Fast mode turned off"));
+        assert!(notice > lost.map(|i| i + 1), "{all:?}");
+        assert!(all[notice.unwrap()].contains('×'), "{all:?}");
+
+        state.transcript.integration_lost = Some(IntegrationLostReason::ContractViolation {
+            detail: "word ".repeat(100),
+        });
+        let all = rows(&state);
+        let lost = all
+            .iter()
+            .position(|r| r.contains("Agent integration lost"))
+            .expect("lost line");
+        let notice = all
+            .iter()
+            .position(|r| r.contains("Fast mode turned off"))
+            .expect("notice row");
+        assert_eq!(notice - lost, 3, "{all:?}");
+        assert!(all[lost + 2].trim_end().ends_with('\u{2026}'), "{all:?}");
     }
 
     #[test]

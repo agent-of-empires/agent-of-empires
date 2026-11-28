@@ -26,6 +26,8 @@ pub(crate) enum SendKeysError {
     StructuredView,
     Ignored,
     Blocked(crate::session::StartBlocked),
+    /// The agent's input box held a person's unsent text for the whole wait.
+    InputLineBusy,
     Gone,
     Tmux(anyhow::Error),
     Preparation {
@@ -40,6 +42,21 @@ pub(crate) struct TerminalSendError {
     committed_cursor: Option<Box<(axum::http::HeaderValue, axum::http::HeaderValue)>>,
 }
 
+/// Which pane a terminal send types into, and how long it waits there for a draft to clear.
+pub(crate) struct SendPane {
+    /// A pane the caller already checked (MCP's dialog check), addressed instead of the live one.
+    pub checked: Option<String>,
+    pub draft_wait: std::time::Duration,
+}
+
+impl SendPane {
+    /// The session's live pane, with [`INPUT_LINE_WAIT`] for a draft.
+    pub(crate) const LIVE: SendPane = SendPane {
+        checked: None,
+        draft_wait: INPUT_LINE_WAIT,
+    };
+}
+
 /// Revive through the native lifecycle command, then send under immutable pane ownership.
 pub(crate) async fn send_terminal_message(
     service: &SessionService,
@@ -47,6 +64,7 @@ pub(crate) async fn send_terminal_message(
     message: String,
     revive: bool,
     refuse_if_ignored: bool,
+    target: SendPane,
 ) -> Result<bool, TerminalSendError> {
     let mut committed_cursor = None;
     send_terminal_message_inner(
@@ -55,6 +73,7 @@ pub(crate) async fn send_terminal_message(
         message,
         revive,
         refuse_if_ignored,
+        target,
         &mut committed_cursor,
     )
     .await
@@ -70,6 +89,7 @@ async fn send_terminal_message_inner(
     message: String,
     revive: bool,
     refuse_if_ignored: bool,
+    target: SendPane,
     committed_cursor: &mut Option<(axum::http::HeaderValue, axum::http::HeaderValue)>,
 ) -> Result<bool, SendKeysError> {
     let state = service.native_state().map_err(SendKeysError::Tmux)?;
@@ -221,11 +241,26 @@ async fn send_terminal_message_inner(
                 TerminalNotRunning
             );
             let session = instance.tmux_session()?;
-            session.wait_until_ready(
-                std::time::Duration::from_secs(5),
-                crate::agents::ready_markers(&instance.tool),
+            // Readiness, the draft check and the keys all address this one pane.
+            let pane = match target.checked {
+                Some(pane) => pane,
+                None => session
+                    .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+                    .map_err(|_| TerminalNotRunning)?,
+            };
+            session
+                .wait_until_ready_in(
+                    &pane,
+                    std::time::Duration::from_secs(5),
+                    crate::agents::ready_markers(&instance.tool),
+                )
+                .map_err(|_| TerminalNotRunning)?;
+            // Typed after a person's unsent text, the message would merge with it on Enter.
+            anyhow::ensure!(
+                instance.wait_for_input_line(&session, &pane, target.draft_wait),
+                InputLineBusy
             );
-            session.send_keys_with_delay(&message, instance.send_keys_enter_delay())?;
+            session.send_keys_to_pane(&pane, &message, instance.send_keys_enter_delay())?;
             anyhow::Ok((instance, ownership))
         })
         .await
@@ -272,6 +307,8 @@ async fn send_terminal_message_inner(
             SendKeysError::Gone
         } else if error.is::<TerminalNotRunning>() {
             SendKeysError::NotRunning
+        } else if error.is::<InputLineBusy>() {
+            SendKeysError::InputLineBusy
         } else if let Some(response) = super::lifecycle::lifecycle_rejection(&state, &error) {
             SendKeysError::Preparation {
                 response: Box::new(response),
@@ -291,6 +328,13 @@ struct TerminalNotRunning;
 #[error("Session is ignored")]
 struct IgnoredSession;
 
+#[derive(Debug, thiserror::Error)]
+#[error("The agent's input box holds unsent text")]
+struct InputLineBusy;
+
+/// How long a send waits for a person's draft to clear before refusing.
+const INPUT_LINE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl IntoResponse for TerminalSendError {
     fn into_response(self) -> axum::response::Response {
         let mut response = match self.error {
@@ -298,6 +342,10 @@ impl IntoResponse for TerminalSendError {
             SendKeysError::NotRunning => crate::server::api::api_error_with_code_header(
                 crate::daemon::ApiErrorCode::SessionNotRunning,
                 "Terminal session is not running",
+            ),
+            SendKeysError::InputLineBusy => crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::InputLineBusy,
+                crate::tmux::InputLine::BUSY_MESSAGE,
             ),
             SendKeysError::Preparation { response, .. } => *response,
             SendKeysError::Transient(status) => (
@@ -379,7 +427,16 @@ pub async fn send_message(
     }
 
     let revive = req.revive;
-    match send_terminal_message(&state.session_service, &id, req.message, revive, false).await {
+    match send_terminal_message(
+        &state.session_service,
+        &id,
+        req.message,
+        revive,
+        false,
+        SendPane::LIVE,
+    )
+    .await
+    {
         Ok(_) => {
             tracing::info!(target: "session.lifecycle", session = %id, len, revive, "terminal message sent");
             match state.runtime.publish(&state).await {
@@ -800,6 +857,17 @@ mod send_output_tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"],
             "session_not_running"
+        );
+
+        let response = TerminalSendError {
+            error: SendKeysError::InputLineBusy,
+            committed_cursor: None,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers()[crate::daemon::ERROR_CODE_HEADER],
+            "input_line_busy"
         );
 
         let response = TerminalSendError {

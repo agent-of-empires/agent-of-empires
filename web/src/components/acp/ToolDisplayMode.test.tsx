@@ -33,13 +33,14 @@ import {
 } from "./ToolDisplayMode";
 import { ToolCard } from "./ToolCards";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import { profileFor } from "../../lib/__tests__/agentProfileFixtures";
 import { fixtures, makeError } from "./__fixtures__/toolCalls";
 
 const STORAGE_KEY = "aoe.acp.toolDensity.v1";
 
 function Wrap({ density, toolKey, children }: { density: ToolDensity; toolKey?: string; children: ReactNode }) {
   return (
-    <AgentProfileProvider toolKey={toolKey ?? null}>
+    <AgentProfileProvider profile={profileFor(toolKey)}>
       <ToolDisplayModeProvider density={density}>{children}</ToolDisplayModeProvider>
     </AgentProfileProvider>
   );

@@ -51,6 +51,8 @@ pub enum ApiErrorCode {
     SmartRenameTimeout,
     GroupNotEmpty,
     SessionNotRunning,
+    /// A person's unsent text is in the terminal agent's input box.
+    InputLineBusy,
     SessionArchived,
     SessionTrashed,
     AccountSwapUnavailable,
@@ -101,6 +103,7 @@ impl ApiErrorCode {
             Self::SmartRenameTimeout => "smart_rename_timeout",
             Self::GroupNotEmpty => "group_not_empty",
             Self::SessionNotRunning => "session_not_running",
+            Self::InputLineBusy => "input_line_busy",
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
             Self::AccountSwapUnavailable => "account_swap_unavailable",
@@ -137,6 +140,7 @@ impl ApiErrorCode {
             | Self::PluginAlreadyInstalled
             | Self::GroupNotEmpty
             | Self::SessionNotRunning
+            | Self::InputLineBusy
             | Self::SessionArchived
             | Self::SessionTrashed
             | Self::AccountSwapUnavailable
@@ -227,6 +231,7 @@ impl ApiErrorCode {
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
             b"group_not_empty" => Self::GroupNotEmpty,
             b"session_not_running" => Self::SessionNotRunning,
+            b"input_line_busy" => Self::InputLineBusy,
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
@@ -330,6 +335,12 @@ mod tests {
                 "session_not_running",
                 false,
                 Some(ApiErrorCode::SessionNotRunning),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "input_line_busy",
+                false,
+                Some(ApiErrorCode::InputLineBusy),
             ),
             (
                 StatusCode::CONFLICT,

@@ -30,23 +30,51 @@ permissions:
   contents: read
 
 jobs:
-  fmt:
-    name: Format
+  quick-checks:
+    # Seconds-long checks share one runner. Release PR Up To Date fails a stale
+    # release PR in the merge queue (see release-pr-fresh.sh) and passes elsewhere.
+    name: Quick checks
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-quick-checks-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Runs before the toolchain: no cargo needed, under a second, and it
-      # covers the failure class from #3974 (a raw NUL committed into a source
-      # file, which makes git call the file binary and hides its diff from
-      # review) on EVERY PR. Nothing else catches it: the code compiles and
-      # the tests pass.
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      # #3974: a raw NUL makes git treat a source file as binary and hide its
+      # diff from review, while the code still compiles and passes tests.
       - name: Check no source file carries a raw NUL byte
         run: |
           set -euo pipefail
           python3 scripts/check-no-nul-in-source.py --self-test
           python3 scripts/check-no-nul-in-source.py
-      - uses: ./.github/actions/rust-toolchain
+      # Self-tests for scripts other workflows rely on.
+      - run: node --test .github/scripts/cancel-obsolete-queue-runs.test.cjs .github/scripts/macos-gate.test.cjs .github/scripts/change-gate.test.cjs
+      - run: scripts/verify-shared-target.sh --self-test
+      - run: python3 .github/scripts/select-internal-pr.py --self-test
+      - run: python3 .github/scripts/check-dependabot-pr.py --self-test
+      - run: python3 .github/scripts/classify-cachix-failure.py --self-test
+      - run: python3 .github/scripts/nightly-notes.py --self-test
+      - run: .github/scripts/release-pr-fresh.sh --self-test
+      - run: python3 scripts/check-no-claude-in-core.py --self-test
+      # Disabled until C25 to C29 remove Claude from core on
+      # integration/claude-removal; enable there by dropping the `if`.
+      - name: Check core has no Claude references
+        if: ${{ false }}
+        run: python3 scripts/check-no-claude-in-core.py
+      - name: Release PR Up To Date
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: .github/scripts/release-pr-fresh.sh
+      - uses: $/.github/actions/rust-toolchain
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -54,19 +82,19 @@ jobs:
   clippy:
     name: Clippy
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-clippy-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-clippy-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/rust-toolchain
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
+      - uses: $/.github/actions/rust-toolchain
         with:
           components: clippy
-      - uses: ./.github/actions/kache
+      - uses: $/.github/actions/kache
         with:
           manifest-key: clippy
       # `--all-features` so the `web`-gated dashboard tree gets linted too.
@@ -74,9 +102,8 @@ jobs:
       # would otherwise build, so this job still needs no Node setup; same
       # trick as the rustdoc step in the docs job.
       #
-      # `--all-targets` so the test binaries join this gate: without it a bare
-      # `cargo clippy` checks the lib and bins only, and the Format job cannot
-      # stand in for it, since rustfmt type-checks and lints nothing.
+      # `--all-targets` so test binaries are linted too; rustfmt in Quick checks
+      # type-checks nothing.
       - name: Clippy (all features)
         run: |
           mkdir -p target/ci-web-dist
@@ -109,23 +136,23 @@ jobs:
   msrv:
     name: MSRV
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-msrv-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-msrv-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
       - name: Read rust-version
         id: msrv
         run: |
           python3 -c 'import tomllib; print("version=" + tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])' >> "$GITHUB_OUTPUT"
-      - uses: ./.github/actions/rust-toolchain
+      - uses: $/.github/actions/rust-toolchain
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: ./.github/actions/kache
+      - uses: $/.github/actions/kache
         with:
           manifest-key: msrv
       # Lib and bins only: dev-dependencies such as `serial_test` may need a
@@ -145,12 +172,14 @@ jobs:
   web-lint:
     name: Lint (web)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-web-lint-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -171,31 +200,31 @@ jobs:
   deny:
     name: Supply Chain
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-deny-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
       - name: Test toolchain editor
         run: |
           python3 -m venv "$RUNNER_TEMP/toolchain-editor"
           "$RUNNER_TEMP/toolchain-editor/bin/python" -m pip install --require-hashes -r .github/scripts/requirements-toolchain.txt
           "$RUNNER_TEMP/toolchain-editor/bin/python" .github/scripts/update-rust-toolchain.py --self-test
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
 
   docs:
     # Also the skill check: both build xtask.
     name: Docs
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-docs-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-docs-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 25
     permissions:
       contents: read
       id-token: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/rust-toolchain
-      - uses: ./.github/actions/kache
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
+      - uses: $/.github/actions/rust-toolchain
+      - uses: $/.github/actions/kache
         with:
           manifest-key: docs
       - name: Build xtask and workspace member tests
@@ -231,40 +260,13 @@ jobs:
           printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
           AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo doc --no-deps --features web
 
-  script-selftests:
-    # Toolchain-free self-tests for the scripts other workflows rely on:
-    # verify-shared-target.sh (kache verify), select-internal-pr.py
-    # (nix-npm-hash.yml), check-dependabot-pr.py (dependabot-auto-merge.yml),
-    # classify-cachix-failure.py (cachix-push.yml), nightly-notes.py (nightly.yml)
-    # and release-pr-fresh.sh.
-    name: Script Self-Tests
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: node --test .github/scripts/cancel-obsolete-queue-runs.test.cjs
-      - run: scripts/verify-shared-target.sh --self-test
-      - run: python3 .github/scripts/select-internal-pr.py --self-test
-      - run: python3 .github/scripts/check-dependabot-pr.py --self-test
-      - run: python3 .github/scripts/classify-cachix-failure.py --self-test
-      - run: python3 .github/scripts/nightly-notes.py --self-test
-      - run: .github/scripts/release-pr-fresh.sh --self-test
-      - run: python3 scripts/check-no-claude-in-core.py --self-test
-      # Disabled until C25 to C29 remove Claude from core on
-      # integration/claude-removal; enable there by dropping the `if`.
-      - name: Check core has no Claude references
-        if: ${{ false }}
-        run: python3 scripts/check-no-claude-in-core.py
-
   nix:
     name: Nix Eval
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
       # Runs before Nix is even installed: no toolchain, a couple of seconds, and
       # it covers the failure class from #3204 (an embedded asset dropped by the
       # Cargo source filter) on EVERY PR, which is why the compile-based Nix
@@ -274,7 +276,7 @@ jobs:
           set -euo pipefail
           python3 scripts/check-nix-embedded-assets.py --self-test
           python3 scripts/check-nix-embedded-assets.py
-      - uses: ./.github/actions/install-nix
+      - uses: $/.github/actions/install-nix
       - name: Evaluate flake outputs (all systems)
         run: |
           set -euo pipefail
@@ -324,33 +326,21 @@ jobs:
           echo ""
           echo "=== All evaluations passed ==="
 
-  nix-build:
-    name: Nix Build
+  nix-changes:
+    # Decides on a 1 vCPU runner whether the 8 vCPU Nix builds below need to
+    # boot at all; most runs touch no flake file.
+    name: Nix Changes
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
-    # Cold release builds on the hosted fallback can exceed the RunsOn budget.
-    timeout-minutes: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 60 || 45 }}
-    # Builds the default (aoe) crate through crane. Nix Eval only evaluates
-    # derivations, so a flake recipe that compiles nowhere (a bad source filter,
-    # a missing buildInput) passes it but fails here.
-    #
-    # Gated to the flake recipe itself, and deliberately NOT to `src/**`. This is
-    # a ~20 minute compile with no binary cache, so firing it on every Rust PR
-    # would roughly triple the CI critical path. The one code-driven way to break
-    # the build source, adding an embedded asset the Cargo filter drops (#3204),
-    # is covered on every PR by the seconds-long
-    # `scripts/check-nix-embedded-assets.py` step in Nix Eval. Post-merge,
-    # cachix-push.yml builds a Rust package on every push to main matching
-    # `src/**`, `Cargo.*`, the build scripts or an embedded-asset directory
-    # (see its `paths:` list), so wider breakage still surfaces there.
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-changes-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.changes.outputs.build }}
+      web: ${{ steps.changes.outputs.web }}
     steps:
-      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-
       - name: Detect relevant changes
         id: changes
         env:
@@ -373,79 +363,67 @@ jobs:
               BASE="$EVENT_BEFORE"
             fi
           fi
-          # Only the flake recipe: `flake.nix` carries the source filter, the
-          # buildInputs and the package definitions, and `flake.lock` pins
-          # nixpkgs and crane. A change to either can break the build in a way
-          # evaluation cannot see, and neither is touched by an ordinary PR.
-          # A git failure here would leave the pipeline non-zero and skip the
-          # build, so keep the diff simple enough that it cannot fail.
-          if git diff --name-only "$BASE"...HEAD \
-            | grep -E '^(flake\.nix|flake\.lock)$' \
-            >/dev/null; then
-            echo "relevant=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "relevant=false" >> "$GITHUB_OUTPUT"
-          fi
+          # A git failure fails this job, which makes the builds run.
+          files=$(git diff --name-only "$BASE"...HEAD)
+          changed() {
+            if grep -qE "$1" <<<"$files"; then
+              echo true
+            else
+              echo false
+            fi
+          }
+          # `flake.nix` carries the source filter, buildInputs and package
+          # definitions; `flake.lock` pins nixpkgs and crane. Either can break
+          # the build in a way evaluation cannot see.
+          echo "build=$(changed '^(flake\.nix|flake\.lock)$')" >> "$GITHUB_OUTPUT"
+          echo "web=$(changed '^(web/package-lock\.json|flake\.nix|flake\.lock)$')" >> "$GITHUB_OUTPUT"
 
-      - uses: ./.github/actions/install-nix
-        if: steps.changes.outputs.relevant == 'true'
-
+  nix-build:
+    name: Nix Build
+    needs: nix-changes
+    # Runs if the gate did not succeed, so a broken gate cannot pass this check.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.nix-changes.result != 'success' || needs.nix-changes.outputs.build == 'true') }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
+    timeout-minutes: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 60 || 45 }}
+    # Builds the default (aoe) crate through crane. Nix Eval only evaluates
+    # derivations, so a flake recipe that compiles nowhere (a bad source filter,
+    # a missing buildInput) passes it but fails here.
+    #
+    # Gated to the flake recipe itself, and deliberately NOT to `src/**`. This is
+    # a ~20 minute compile with no binary cache, so firing it on every Rust PR
+    # would roughly triple the CI critical path. The one code-driven way to break
+    # the build source, adding an embedded asset the Cargo filter drops (#3204),
+    # is covered on every PR by the seconds-long
+    # `scripts/check-nix-embedded-assets.py` step in Nix Eval. Post-merge,
+    # cachix-push.yml builds a Rust package on every push to main matching
+    # `src/**`, `Cargo.*`, the build scripts or an embedded-asset directory
+    # (see its `paths:` list), so wider breakage still surfaces there.
+    steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/install-nix
       - name: Build default package
-        if: steps.changes.outputs.relevant == 'true'
         run: nix build --no-link --print-out-paths -L .#packages.x86_64-linux.default
 
   nix-build-web:
     name: Nix Build Web
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-web-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    needs: nix-changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.nix-changes.result != 'success' || needs.nix-changes.outputs.web == 'true') }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-web-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 30
     # Catches npmDepsHash desync at PR time even if the nix-npm-hash bot
     # is offline. Path-gated so Rust-only PRs keep fast feedback.
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
-
-      - name: Detect relevant changes
-        id: changes
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          EVENT_BEFORE: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            BASE="origin/$BASE_REF"
-          elif [ "$EVENT_NAME" = "merge_group" ]; then
-            BASE="$QUEUE_BASE_SHA"
-          else
-            # `github.event.before` is the SHA before the push, which
-            # covers multi-commit pushes correctly. Falls back to the
-            # empty tree on the initial-push edge case (`before` is all
-            # zeros, no `HEAD~1` exists yet) so the diff still resolves.
-            if [ -z "$EVENT_BEFORE" ] || [ "$EVENT_BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              BASE=$(git hash-object -t tree /dev/null)
-            else
-              BASE="$EVENT_BEFORE"
-            fi
-          fi
-          if git diff --name-only "$BASE"...HEAD \
-            | grep -E '^(web/package-lock\.json|flake\.nix|flake\.lock)$' \
-            >/dev/null; then
-            echo "relevant=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "relevant=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: ./.github/actions/install-nix
-        if: steps.changes.outputs.relevant == 'true'
-
+      - uses: $/.github/actions/install-nix
       - name: Build aoe-web-frontend
-        if: steps.changes.outputs.relevant == 'true'
         # Builds only the npm + vite frontend (validates npmDepsHash
         # as a side effect). Skips the full Rust crate so this job
         # runs in 1-2 min instead of 20-30 min; Cargo Test + Nix Eval
@@ -454,33 +432,15 @@ jobs:
           set -euo pipefail
           nix build --no-link .#packages.x86_64-linux.aoe-web-frontend
 
-  release-pr-fresh:
-    # Fails a stale release PR in the merge queue; see release-pr-fresh.sh.
-    # Passes on other events so it can be a required check.
-    name: Release PR Up To Date
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'merge_group'
-        with:
-          persist-credentials: false
-      - if: github.event_name == 'merge_group'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_REF: ${{ github.event.merge_group.head_ref }}
-          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
-        run: .github/scripts/release-pr-fresh.sh
-
   website:
     name: Website Build
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-website-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm

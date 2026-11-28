@@ -44,7 +44,7 @@ function readCard(path: string, result: ActivityRow | undefined, extra: Record<s
   const tool: ToolCall = makeToolCall({ kind: "read", args_preview: JSON.stringify({ file_path: path, ...extra }) });
   const rendered = render(
     <AcpFileRefContext.Provider value={{ fileRefSession: session }}>
-      <AgentProfileProvider toolKey={null}>
+      <AgentProfileProvider profile={null}>
         <ToolCard tool={tool} result={result} />
       </AgentProfileProvider>
     </AcpFileRefContext.Provider>,

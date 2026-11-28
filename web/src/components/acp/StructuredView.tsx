@@ -12,7 +12,8 @@ import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { isNewSessionStarting, notRunningCopy } from "./startupWait";
-import { AgentProfileProvider, useClearAliases, useCompactAliases } from "../../lib/agentProfileContext";
+import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
+import type { AgentProfile } from "../../lib/agentProfile";
 import { queuedReason } from "./queuedReason";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
@@ -64,16 +65,15 @@ interface Props {
   agentDefaultsHref?: string | null;
   /** Opens a Settings link in the app. */
   onOpenSettings?: (href: string) => void;
-  /** Session `tool` registry key; selects the AgentProfile. */
+  /** Session `tool` registry key. */
   tool: string | null | undefined;
+  /** The session's `agent_profile`; the default profile when an older daemon omits it. */
+  agentProfile?: AgentProfile;
   /** Resolved ACP agent key; the switch-agent modal's fallback before any `AgentSwitched`. */
   acpAgent: string | null;
   /** `hasStartedBefore(session)`. */
   startedBefore?: boolean;
   acpProvider: string | null;
-  /** Server-owned conversation-reset slash aliases (`/clear`, `/new`). */
-  clearAliases?: readonly string[];
-  compactAliases?: readonly string[];
   /** Start this Session, for a queued row's "Start and send". */
   onStartSession?: () => void;
   archivedAt: string | null;
@@ -113,9 +113,7 @@ export function StructuredView(props: Props) {
   const {
     sessionId,
     acpWorkerState,
-    tool,
-    clearAliases,
-    compactAliases,
+    agentProfile,
     archivedAt,
     snoozedUntil,
     queuedCount,
@@ -126,7 +124,7 @@ export function StructuredView(props: Props) {
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
     <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
-      <AgentProfileProvider toolKey={tool} clearAliases={clearAliases} compactAliases={compactAliases}>
+      <AgentProfileProvider profile={agentProfile}>
         <ToolDisplayModeProvider density={toolDensity}>
           <ToolExpansionProvider>
             <AcpRuntime
@@ -460,8 +458,7 @@ function ComposerDock({
     acpWorkerState === "running" && status !== "open" && !state.workerStopped && !state.workerRestarting;
   const agentName = useAgentDisplayNames();
   const signInAgent = state.agent ?? acpAgent ?? view.tool;
-  const clearAliases = useClearAliases();
-  const compactAliases = useCompactAliases();
+  const { clear_aliases: clearAliases, compact_aliases: compactAliases } = useAgentProfile();
   // The Daemon's solo commands: they run as their own turn, never steered into one.
   const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
   const { agentDefaultsHref, onOpenSettings } = view;
@@ -531,7 +528,9 @@ function ComposerDock({
         rejected={state.rejectedPrompts}
         onRetry={ctx.retryRejectedPrompt}
         onDismiss={ctx.dismissRejectedPrompt}
-        disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
+        disabled={
+          state.workerRestarting || state.workerStopped || Boolean(state.startupError) || Boolean(state.integrationLost)
+        }
       />
 
       <SessionNoticesStrip notices={visibleSessionNotices(state)} onDismiss={ctx.dismissSessionNotice} />

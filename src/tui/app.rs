@@ -3573,7 +3573,7 @@ impl App {
         self.home.try_present_reload_failure_dialog();
         self.home.clear_unread_on_view(session_id);
         self.home.stamp_last_accessed(session_id);
-        self.select_after_attach(session_id);
+        self.home.select_session_by_id(session_id);
 
         if let Err(e) = attach_result {
             tracing::warn!(target: "tui.input", "tmux attach returned error: {}", e);
@@ -3642,20 +3642,12 @@ impl App {
         )?;
         self.needs_redraw = true;
         self.home.apply_session_feed_before_input();
-        self.select_after_attach(&ready.id);
+        self.home.select_session_by_id(&ready.id);
         if let Err(error) = attach_result {
             tracing::warn!(target: "tui.input", %error, "Native tmux attach failed");
             self.set_status(format!("Attach failed: {error}"));
         }
         Ok(())
-    }
-
-    fn select_after_attach(&mut self, session_id: &str) {
-        if self.home.sort_order() == crate::session::config::SortOrder::Attention {
-            self.home.select_top_attention(Some(session_id));
-        } else {
-            self.home.select_session_by_id(session_id);
-        }
     }
 
     fn run_background_tool_session(&mut self, session_id: &str, tool_name: &str) {

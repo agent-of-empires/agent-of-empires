@@ -22,6 +22,9 @@ pub enum AcpError {
     /// instead of burning the respawn budget against the same limit.
     #[error("agent is rate-limited during startup: {}", .0.status)]
     RateLimited(Box<crate::acp::state::RateLimitInfo>),
+    /// The runner's proxy launch config could not be written; no proxy ran.
+    #[error("proxy launch config: {0}")]
+    ProxyLaunchConfig(String),
     #[error("transport error: {0}")]
     Transport(String),
     #[error("runner attach handshake timed out")]

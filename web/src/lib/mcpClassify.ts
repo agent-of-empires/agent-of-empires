@@ -2,7 +2,7 @@
 
 import type { ToolCall } from "./acpTypes";
 import { parseJsonObject, pickStr } from "./acpArgs";
-import type { AgentProfile } from "./agentProfiles";
+import type { AgentProfile } from "./agentProfile";
 
 const DEFAULT_MCP_PREFIXES = ["mcp__"];
 
@@ -38,7 +38,7 @@ function parseMcpName(name: string, prefix: string): { server: string; verb: str
 
 export function classifyMcp(tool: ToolCall, profile?: AgentProfile | null): McpHit | NotMcp {
   const name = nameOf(tool);
-  const prefixes = profile?.mcpPrefixes ?? DEFAULT_MCP_PREFIXES;
+  const prefixes = profile?.mcp_prefixes ?? DEFAULT_MCP_PREFIXES;
   for (const prefix of prefixes) {
     const hit = parseMcpName(name, prefix);
     if (hit) {

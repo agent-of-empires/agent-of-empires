@@ -395,16 +395,11 @@ fn trash_system_health_releases_reader_keyboard() {
     assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
 }
 
-/// Footer discoverability hints track where each key actually does something.
-/// Snooze works on a session row in every sort; Archive is Attention-only.
-/// Fav follows its keybind's own gate (`Context::FavoritesUsable`): usable in
-/// Attention, or in any sort order while `favorites_first` is on. The
-/// underlying keybinds are unchanged; only the footer adapts so it doesn't
-/// waste width on a shortcut that would not visibly do anything.
+/// The footer advertises Fav only while `favorites_first` makes `f` pin rows
+/// (`Context::FavoritesUsable`), Snooze on every session row, and no Archive.
 #[test]
 #[serial]
-fn footer_hides_attention_workflow_hints_outside_attention_sort() {
-    use crate::session::config::SortOrder;
+fn footer_fav_hint_follows_favorites_first() {
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -433,45 +428,12 @@ fn footer_hides_attention_workflow_hints_outside_attention_sort() {
         out
     };
 
-    // Newest sort with favorites-first OFF: no attention-workflow shortcuts,
-    // Fav excluded, because `f` is inert here.
-    crate::session::set_favorites_first(false);
-    env.view.sort_order = SortOrder::Newest;
-    let newest_off = render_footer(&mut env);
-    assert!(
-        newest_off.contains("Snooze"),
-        "Snooze hint should appear in Newest sort; its key works there.\n{newest_off}"
-    );
-    for hint in ["Fav", "Archive"] {
-        assert!(
-            !newest_off.contains(hint),
-            "{hint} hint should be hidden in Newest sort with favorites-first off.\n{newest_off}"
-        );
-    }
-
-    // Newest sort with favorites-first ON: Fav is advertised because `f` pins
-    // here, but Archive stays Attention-only.
-    crate::session::set_favorites_first(true);
-    let newest_on = render_footer(&mut env);
-    for hint in ["Snooze", "Fav"] {
-        assert!(
-            newest_on.contains(hint),
-            "{hint} hint should appear in Newest sort with favorites-first on.\n{newest_on}"
-        );
-    }
-    assert!(
-        !newest_on.contains("Archive"),
-        "Archive hint should stay hidden outside Attention sort.\n{newest_on}"
-    );
-
-    // Attention sort: footer advertises all three regardless of the flag.
-    env.view.sort_order = SortOrder::Attention;
-    let attention_out = render_footer(&mut env);
-    for hint in ["Snooze", "Fav", "Archive"] {
-        assert!(
-            attention_out.contains(hint),
-            "{hint} hint should appear in Attention sort.\n{attention_out}"
-        );
+    for favorites_first in [false, true] {
+        crate::session::set_favorites_first(favorites_first);
+        let footer = render_footer(&mut env);
+        assert_eq!(footer.contains("Fav"), favorites_first, "{footer}");
+        assert!(footer.contains("Snooze"), "{footer}");
+        assert!(!footer.contains("Archive"), "{footer}");
     }
 
     crate::session::set_favorites_first(original);
@@ -1667,7 +1629,7 @@ fn w_skips_snoozed_waiting_session() {
 #[test]
 #[serial]
 fn w_skips_snoozed_idle_session_in_fallback() {
-    let (mut env, running, idle) = attention_env_running_then_idle();
+    let (mut env, running, idle) = env_running_then_idle();
     let running_id = match env.view.flat_items.get(running) {
         Some(Item::Session { id, .. }) => id.clone(),
         _ => panic!("expected the running row to be a session item"),
@@ -1762,7 +1724,7 @@ fn w_skips_archived_waiting_session() {
 #[test]
 #[serial]
 fn w_skips_archived_idle_session_in_fallback() {
-    let (mut env, running, idle) = attention_env_running_then_idle();
+    let (mut env, running, idle) = env_running_then_idle();
     let running_id = match env.view.flat_items.get(running) {
         Some(Item::Session { id, .. }) => id.clone(),
         _ => panic!("expected the running row to be a session item"),

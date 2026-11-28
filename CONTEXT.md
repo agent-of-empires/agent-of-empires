@@ -72,7 +72,7 @@ A Session that is trashed, snoozed, archived or ignored. The "do not bother me" 
 Forcing a Session to the top of the dashboard. Pinning cancels Archive, Ignore and Snooze.
 
 **Favorite**:
-A user mark on a Session. Favoriting cancels Archive, Ignore and Snooze, like Pin. In the TUI, favorites-first (on by default) lifts favorites to the top of their scope, except that Attention sort ranks a favorite only within its tier after urgency and Custom sort keeps manual order; the web sidebar uses favorite only as a tiebreak within its attention tier.
+A user mark on a Session. Favoriting cancels Archive, Ignore and Snooze, like Pin. In the TUI, favorites-first (on by default) lifts favorites to the top of their scope under the Name and Newest first sorts, while the Custom sort keeps the order the user arranged; the web sidebar uses favorite only as a tiebreak within its attention tier.
 _Avoid_: star, pin (different concept)
 
 **Unread**:
@@ -223,6 +223,16 @@ _Avoid_: server, agent daemon
 **Client**:
 A program that pilots a Daemon: the TUI, the CLI or the Web dashboard. Target (#2734): reaches the Daemon only through its API, holding no Session runtime state. Today the Web dashboard and both local and remote TUI use the Daemon for canonical Session state; the CLI cutover is incomplete.
 _Avoid_: surface, frontend
+
+**Client-only build**:
+An `aoe` build without the Daemon. It cannot start one, so it only pilots a Daemon that is already running. Target (#4504): what Windows ships.
+
+**Pane lifecycle**:
+Creating, respawning and killing the tmux sessions that host a Session's panes, and syncing their environment. Target (#3840): owned by the Daemon.
+_Avoid_: tmux ownership
+
+**Pane I/O**:
+Reading and writing an existing pane without changing its lifecycle: Attach, Live-send, capture and the live preview stream. The TUI does it locally; the Daemon does it for the Web dashboard terminal.
 
 **Remote Daemon**:
 A Daemon on another machine that a Client reaches over the network. Plain Daemon means the one on the user's own machine.
