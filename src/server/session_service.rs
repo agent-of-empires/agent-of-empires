@@ -6439,15 +6439,8 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
-        let _env = crate::session::test_support::EnvGuard::set(&[
-            ("HOME", temp.path()),
-            ("XDG_CONFIG_HOME", temp.path()),
-            ("USERPROFILE", temp.path()),
-        ]);
-        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
-        let _reload = crate::plugin::ReloadRegistryOnDrop;
-        crate::plugin::agent_integration::install_test_manifest(
-            "acme.marker",
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let manifest: aoe_plugin_api::PluginManifest = toml::from_str(
             r#"
 id = "acme.marker"
 name = "Marker"
@@ -6460,29 +6453,25 @@ command = "marker-helper"
 [agent_integrations.launch]
 ready_markers = ["ask anything"]
 "#,
-        );
-        crate::plugin::reload_registry();
+        )
+        .unwrap();
+        let _registry =
+            crate::plugin::install_test_registry(vec![crate::plugin::registry::LoadedPlugin {
+                manifest,
+                enabled: true,
+                trust: aoe_plugin_api::TrustLevel::Community,
+                validation: crate::plugin::registry::ValidationState::Local,
+                source: None,
+                dir: None,
+                manifest_hash: String::new(),
+                granted: true,
+            }]);
 
         let mut inst =
             terminal_turn_instance("sess-plugin-shell", "term-plugin-shell", "must-not-type");
         inst.project_path = temp.path().to_string_lossy().to_string();
         inst.tool = "marker-helper".into();
         inst.command = "marker-helper".into();
-        eprintln!(
-            "DBG dir={:?} errors={:?} active={:?} declares={} ready={:?}",
-            crate::plugin::plugins_dir(),
-            crate::plugin::registry().load_errors(),
-            crate::plugin::registry()
-                .all()
-                .iter()
-                .map(|p| (p.id().to_string(), p.active(), p.granted, p.enabled))
-                .collect::<Vec<_>>(),
-            crate::plugin::agent_integration::registry_declares(
-                &crate::plugin::registry(),
-                "marker-helper"
-            ),
-            inst.ready_markers()
-        );
         assert!(inst.has_command_override(), "the command classifies as one");
         assert!(inst.launches_agent_itself());
         assert_eq!(inst.ready_markers(), ["ask anything"]);
