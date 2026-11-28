@@ -2098,7 +2098,7 @@ fn restart_stage_line(event: crate::migrations::progress::Event) -> Option<Strin
             ..
         } => Some(format!("Migrating data ({position}/{total}): {name}")),
         Event::Step(line) | Event::Progress(line) => Some(line),
-        Event::Notice(_) | Event::Finished { .. } => None,
+        Event::Notice(_) | Event::SandboxDeferred { .. } | Event::Finished { .. } => None,
     }
 }
 

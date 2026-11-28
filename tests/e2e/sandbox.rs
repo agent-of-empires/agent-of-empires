@@ -105,6 +105,94 @@ fn test_cli_add_sandbox_on_create_hooks_run_in_container() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+#[parallel]
+fn migrate_reports_a_running_sandbox_until_it_stops() {
+    let current = agent_of_empires::migrations::current_schema_version();
+    for schema in [current - 1, current, 32] {
+        migrate_running_sandbox_from_schema(schema);
+    }
+}
+
+#[cfg(unix)]
+fn migrate_running_sandbox_from_schema(schema: u32) {
+    use agent_of_empires::{containers::DockerContainer, session::Instance};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut h = TuiTestHarness::new_in_tmp("migrate_running_sandbox");
+    fs::set_permissions(h.home_path(), fs::Permissions::from_mode(0o700)).unwrap();
+    h.append_config("[sandbox]\ncontainer_runtime = \"docker\"");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    let running = h.home_path().join("running-container");
+    h.set_env("AOE_TEST_RUNNING_CONTAINER", running.as_os_str());
+    let bin = h.install_path_command("docker");
+    fs::write(
+        bin.join("docker"),
+        r#"#!/bin/sh
+case "$1" in
+  --version|info) exit 0 ;;
+  ps)
+    if [ -f "$AOE_TEST_RUNNING_CONTAINER" ]; then
+      printf '%s\trunning\n' "$(cat "$AOE_TEST_RUNNING_CONTAINER")"
+    fi
+    exit 0 ;;
+  inspect|"container")
+    echo 'Error: No such container: fixture' >&2
+    exit 1 ;;
+esac
+exit 1
+"#,
+    )
+    .unwrap();
+    h.run_cli_ok(&["migrate"]);
+    fs::write(
+        crate::harness::app_dir_in(h.home_path()).join(".schema_version"),
+        schema.to_string(),
+    )
+    .unwrap();
+
+    let mut instance = Instance::new("Legacy sandbox", h.project_path().to_str().unwrap());
+    instance.tool = "codex".into();
+    let name = DockerContainer::generate_name(&instance.id);
+    let mut row = serde_json::to_value(&instance).unwrap();
+    row["sandbox_store_generation"] = serde_json::json!(2);
+    row["sandbox_info"] = serde_json::json!({
+        "enabled": true, "image": "fixture", "container_name": name
+    });
+    fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
+    let original = h
+        .home_path()
+        .join(".codex/sandbox-v2")
+        .join(&instance.id)
+        .join("sessions/original.jsonl");
+    fs::create_dir_all(original.parent().unwrap()).unwrap();
+    fs::write(&original, b"original").unwrap();
+    fs::write(&running, name).unwrap();
+
+    let output = h.run_cli(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("stop its container").count(),
+        1,
+        "schema {schema}: {stderr}"
+    );
+    assert!(!output.status.success(), "schema {schema}: {stderr}");
+    assert!(stderr.contains(&instance.id), "{stderr}");
+    assert!(stderr.contains("isolation remains pending"), "{stderr}");
+    assert!(!stderr.contains("migrations complete"), "{stderr}");
+    assert!(h.read_sessions()[0].get("sandbox_content_policy").is_none());
+    assert_eq!(fs::read(&original).unwrap(), b"original");
+
+    fs::remove_file(running).unwrap();
+    let output = h.run_cli(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("migrations complete"), "{stderr}");
+    assert_eq!(h.read_sessions()[0]["sandbox_content_policy"], 1);
+}
+
 /// `aoe sandbox reclaim` reports the stores whose session resolves in no
 /// profile, and removes them only when asked. The stub `docker` on PATH
 /// answers "not running" for every container, which is the quiescent arm; the

@@ -16,6 +16,7 @@ use crate::session::AnchoredDir;
 const RECEIPTS: &str = "sandbox-content-receipts";
 pub(crate) const RECOVERY: &str = ".aoe-sandbox-recovery";
 pub(crate) const CONTENT_POLICY: u8 = 1;
+pub(super) const VERSION: u32 = 33;
 
 #[cfg(test)]
 pub(super) struct TestReconcileGuard {
@@ -2196,15 +2197,16 @@ fn migrate_target(
         return Ok(false);
     }
     if running(id)? || detached_writer_live(app, id)? {
-        progress::notice(format!(
-            "sandbox {id}: stop its container and structured runner to isolate native history"
-        ));
+        progress::sandbox_deferred(
+            id,
+            "stop its container and structured runner to isolate native history",
+        );
         return Ok(false);
     }
     if let Some(message) =
         recovery_exposure(app, &migration_targets(app, &roots)?, exposure)?.refusal(None)
     {
-        progress::notice(format!("{message}; this sandbox stays pending"));
+        progress::sandbox_deferred(id, format_args!("{message}; this sandbox stays pending"));
         return Ok(false);
     }
     let (path, mut receipt) = checked_receipt(app, &row, tool, &roots)?;
@@ -2251,7 +2253,12 @@ fn migrate_target(
     };
     let mut current_roots = row_roots(current, tool, home, &fresh_config)?;
     container_config::expand_content_roles(&mut current_roots, home, &fresh_config.session)?;
+    let sandbox_enabled = current
+        .pointer("/sandbox_info/enabled")
+        .and_then(Value::as_bool)
+        == Some(true);
     if current_roots != roots
+        || !sandbox_enabled
         || !row_tools(current).contains(tool)
         || current.get("project_path") != row.get("project_path")
         || [
@@ -2271,23 +2278,45 @@ fn migrate_target(
             != row.pointer("/sandbox_info/container_workdir")
         || current.get("workspace_info") != receipt.retired_identity.get("workspace_info")
     {
-        // A container could have started after the stage was seeded, so the
-        // seed is dropped with the plan it was made for.
         discard_stage(app, &mut receipt, &path)?;
+        if sandbox_enabled {
+            for pending_tool in row_tools(current) {
+                let mut pending_roots = row_roots(current, &pending_tool, home, &fresh_config)?;
+                container_config::expand_content_roles(
+                    &mut pending_roots,
+                    home,
+                    &fresh_config.session,
+                )?;
+                if !pending_roots.is_empty()
+                    && !roots_ready(app, id, &pending_tool, &pending_roots)?
+                {
+                    progress::sandbox_deferred(
+                        id,
+                        "session configuration changed during native history isolation",
+                    );
+                    break;
+                }
+            }
+        }
         return Ok(false);
     }
     layout::refresh_liveness();
-    if running(id)? || detached_writer_live(app, id)? || !reap(id)? {
-        progress::notice(format!(
-            "sandbox {id}: stop its container and structured runner to isolate native history"
-        ));
+    let liveness_blocker = if running(id)? || detached_writer_live(app, id)? {
+        Some("stop its container and structured runner to isolate native history")
+    } else if !reap(id)? {
+        Some("container runtime could not confirm whether its old container can be removed")
+    } else {
+        None
+    };
+    if let Some(message) = liveness_blocker {
+        progress::sandbox_deferred(id, message);
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
     if let Some(message) =
         recovery_exposure(app, &migration_targets(app, &roots)?, exposure)?.refusal(None)
     {
-        progress::notice(format!("{message}; this sandbox stays pending"));
+        progress::sandbox_deferred(id, format_args!("{message}; this sandbox stays pending"));
         discard_stage(app, &mut receipt, &path)?;
         return Ok(false);
     }
@@ -2368,9 +2397,10 @@ fn reconcile_in(
                     return Err(error);
                 }
                 tracing::warn!(target: "session.profile", %error, %id, %tool, "Native source kept changing during content isolation");
-                progress::notice(format!(
-                    "sandbox {id}: native configuration kept changing; content isolation remains pending"
-                ));
+                progress::sandbox_deferred(
+                    &id,
+                    "native configuration kept changing; content isolation remains pending",
+                );
             }
         } else {
             let config = crate::session::config::profile_config::resolve_config(
@@ -2711,6 +2741,11 @@ mod tests {
         let registry = app.join("sessions.json");
         fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
         AFTER_STAGE_HOOK.with(|hook| *hook.borrow_mut() = Some(mutate_workspace_after_stage));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let _reporter = progress::install(Some(std::sync::Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        })));
         let result = migrate_target(
             &app,
             &home,
@@ -2723,6 +2758,11 @@ mod tests {
         AFTER_STAGE_HOOK.with(|hook| *hook.borrow_mut() = None);
 
         assert!(!result, "workspace drift must invalidate the staged carry");
+        assert!(events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            progress::Event::SandboxDeferred { id, message }
+                if id == &instance.id && message.contains("session configuration changed")
+        )));
         let receipt = read_receipt(&receipt_path(&app, &instance.id, "codex").unwrap())
             .unwrap()
             .unwrap();
@@ -5197,6 +5237,65 @@ mod tests {
             Phase::Staged,
             "a rename the journal has not recorded is still mid-publication"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_migrate_fails_until_the_running_sandbox_stops() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        instance.sandbox_store_generation = 2;
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        fs::create_dir_all(roots[0].path.join("sessions")).unwrap();
+        fs::write(roots[0].path.join("sessions/original.jsonl"), b"original").unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({
+            "enabled": true, "image": "fixture", "container_name": "aoe-sandbox-fixture"
+        });
+        fs::write(
+            app.join("sessions.json"),
+            serde_json::to_vec(&[row]).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            app.join(".schema_version"),
+            super::super::current_schema_version().to_string(),
+        )
+        .unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+
+        let probes = install_test_reconcile_probes(|_| Ok(true), |_| Ok(true), |_| Ok(Vec::new()));
+        let args = crate::cli::migrate::MigrateArgs::default();
+        let result = crate::cli::migrate::run(&args).await;
+        assert!(!roots_ready(&app, &instance.id, "codex", &roots).unwrap());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(&instance.id), "{error}");
+        assert!(error.contains("aoe migrate"), "{error}");
+        drop(probes);
+
+        let _probes =
+            install_test_reconcile_probes(|_| Ok(false), |_| Ok(true), |_| Ok(Vec::new()));
+        crate::cli::migrate::run(&args).await.unwrap();
+        assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
     }
 
     /// The announced runner dispatches through the production wiring from

@@ -226,8 +226,11 @@ sessions keep the shared store until they are started again.
 
 A sandbox still running during an upgrade remains pending: transcript capture
 pauses until it is stopped, isolated and launched again. If native configuration
-changes throughout isolation, that session remains pending; `aoe migrate`
-continues with other sessions and retries later. A running sandbox whose mounts
+changes throughout isolation, that session also remains pending.
+`aoe migrate` continues with other sessions, names the sandboxes whose native
+history isolation was deferred, and exits with a nonzero status. Address the reported
+blockers, such as stopping a sandbox container and its structured runner, then
+run `aoe migrate` again. A running sandbox whose mounts
 AoE cannot prove clear of `.aoe-sandbox-recovery` holds back moving any original
 there, and `aoe migrate` names it; launches that retire no original proceed.
 In the Daemon's environment, `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for

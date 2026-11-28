@@ -27,6 +27,10 @@ pub enum Event {
     Progress(String),
     /// A line worth keeping on screen: a deferral, something skipped, a hint.
     Notice(String),
+    SandboxDeferred {
+        id: String,
+        message: String,
+    },
     Finished {
         version: u32,
         elapsed: Duration,
@@ -45,7 +49,9 @@ pub fn tracing_reporter() -> Reporter {
             tracing::info!(target: "migrations", version, name, "running migration");
         }
         Event::Step(message) => tracing::info!(target: "migrations", "{message}"),
-        Event::Notice(message) => tracing::warn!(target: "migrations", "{message}"),
+        Event::Notice(message) | Event::SandboxDeferred { message, .. } => {
+            tracing::warn!(target: "migrations", "{message}");
+        }
         Event::Finished { version, elapsed } => {
             tracing::info!(
                 target: "migrations",
@@ -132,6 +138,13 @@ pub(crate) fn notice(message: impl Into<String>) {
     report(Event::Notice(message.into()));
 }
 
+pub(super) fn sandbox_deferred(id: &str, message: impl std::fmt::Display) {
+    report(Event::SandboxDeferred {
+        id: id.to_owned(),
+        message: format!("sandbox {id}: {message}"),
+    });
+}
+
 /// Renders events into one status line plus a queue of lines to keep, for a
 /// terminal that redraws the status line in place (the TUI boot spinner, a CLI
 /// on a TTY).
@@ -167,7 +180,9 @@ impl ConsoleProgress {
                 self.detail.clear();
             }
             Event::Progress(detail) => self.detail = detail,
-            Event::Notice(line) => self.lines.push(line),
+            Event::Notice(line) | Event::SandboxDeferred { message: line, .. } => {
+                self.lines.push(line);
+            }
             Event::Finished { elapsed, .. } => {
                 // Sub-second migrations are not worth a line.
                 if elapsed >= Duration::from_secs(1) {
