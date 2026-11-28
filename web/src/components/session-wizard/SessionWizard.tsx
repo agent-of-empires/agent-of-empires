@@ -69,8 +69,9 @@ import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
 import { useSandboxImageRowStatus } from "./useSandboxImageRowStatus";
 import { useLatestRef } from "../../hooks/useLatestRef";
 import { PULL_GATED_HINT, PULL_LATEST_HINT, pullLatestChecked, pullLatestOffer } from "./pullLatestImage";
+import { WaitForUpdateChoice } from "./WaitForUpdateChoice";
 import { CopyCommand } from "../SandboxImageBanner";
-import { notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
+import { notifySandboxImagePulled, notifySandboxImagePullStarted } from "../../lib/sandboxImageEvents";
 import { BUTTON_INLINE, BUTTON_SECONDARY } from "../../lib/surfaces";
 import { CloseButton, DialogHeader, ModalFrame } from "../Dialog";
 import { DIALOG_BODY } from "../../lib/surfaces";
@@ -347,6 +348,8 @@ export function SessionWizard({
     if (!hasFinePointer() && !panelRef.current?.contains(document.activeElement)) closeRef.current?.focus();
   }, []);
   const pullLatestRef = useRef<HTMLDivElement>(null);
+  // The create joined a running download, so its pull stage waits rather than pulls.
+  const [waitingForUpdate, setWaitingForUpdate] = useState(false);
   // The failure box grows the footer and shrinks the form above it; keep the pull box it blames in view.
   useEffect(() => {
     if (state.failure && failureFields(state.failure).includes("pullLatestImage"))
@@ -775,7 +778,13 @@ export function SessionWizard({
         : null;
       // Recorded before the request goes out, so a reload mid-flight still has the key.
       if (pending) registerPendingCreate(pending, { claimed: true });
-      const send = (retry: boolean) => createSession(pending && retry ? retryBody(pending) : body);
+      const send = (retry: boolean) => {
+        // Decided at each send, network retries and resends included: the download this create
+        // would join may have ended.
+        setWaitingForUpdate(!!body.pull_latest_image && !!pullOfferRef.current?.running);
+        return createSession(pending && retry ? retryBody(pending) : body);
+      };
+      if (body.pull_latest_image) notifySandboxImagePullStarted();
       let result = await send(!!resume);
       for (let attempt = 0; result.network && pending && attempt < NETWORK_RETRIES; attempt++) {
         await waitUntilOnline();
@@ -812,7 +821,8 @@ export function SessionWizard({
         safeSetItem(LAST_USED_INSTRUCTION_KEY, body.custom_instruction ?? "");
         if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
         for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
-        if (body.pull_latest_image) notifySandboxImagePulled();
+        // An empty image is the Daemon's default, which only the banner's status resolves.
+        if (body.pull_latest_image) notifySandboxImagePulled(body.sandbox_image || undefined);
         if (background) onCreatedInBackground?.(result.session);
         else onCreated(result.session);
       } else if (background) {
@@ -1326,7 +1336,16 @@ export function SessionWizard({
           )}
         </FieldRow>
       </RowGroup>
-      {pullOffer && (
+      {pullOffer?.running && (
+        <div ref={pullLatestRef} className="mt-3">
+          <WaitForUpdateChoice
+            progress={pullOffer.running}
+            wait={pullLatestChecked(pullOffer, d.pullLatestImage)}
+            onChange={(wait) => handleChange("pullLatestImage", wait)}
+          />
+        </div>
+      )}
+      {pullOffer && !pullOffer.running && (
         <div ref={pullLatestRef} className="mt-3 flex flex-col gap-1" data-testid="wizard-pull-latest">
           <label className={`flex items-center gap-2 ${pullOffer.command ? "" : "cursor-pointer"}`}>
             <input
@@ -1420,7 +1439,7 @@ export function SessionWizard({
           </div>
         )}
         {creating ? (
-          <CreateProgressView progress={progress} />
+          <CreateProgressView progress={progress} waitingForUpdate={waitingForUpdate} />
         ) : panel ? (
           <>
             <PanelHeader title={PANEL_TITLE[panel]} onBack={() => setPanel(null)} />

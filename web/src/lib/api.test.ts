@@ -694,11 +694,42 @@ const requestCases: RequestCase[] = [
     { body: { fingerprint: "fp" }, result: { kind: "ok" } },
   ],
   ["POST /api/sandbox/image-pull", () => api.pullSandboxImage(), { result: { ok: true } }],
+  // The accepted reply names the image the Daemon pulled, which may be a default changed since the click.
+  [
+    "POST /api/sandbox/image-pull",
+    () => api.pullSandboxImage(),
+    { respond: json({ image: "sb:2", pull: { state: "running" } }, 202), result: { ok: true, image: "sb:2" } },
+  ],
   // A refusal carries the Daemon's reason for the banner to show.
   [
     "POST /api/sandbox/image-pull",
     () => api.pullSandboxImage(),
     { respond: json({ message: "pulls are off" }, 403), result: { ok: false, message: "pulls are off" } },
+  ],
+  // The cancel's reply carries the pull's new state, so the banner shows the outcome without waiting for a poll.
+  [
+    "POST /api/sandbox/image-pull/cancel",
+    () => api.cancelSandboxImagePull("sb:1"),
+    {
+      body: { image: "sb:1" },
+      respond: json({ image: "sb:1", pull: { state: "cancelled" } }),
+      result: { ok: true, pull: { state: "cancelled" } },
+    },
+  ],
+  [
+    // A reply about another image says nothing about this one's pull.
+    "POST /api/sandbox/image-pull/cancel",
+    () => api.cancelSandboxImagePull("sb:1"),
+    { body: { image: "sb:1" }, respond: json({ image: "sb:2", pull: { state: "cancelled" } }), result: { ok: true } },
+  ],
+  [
+    "POST /api/sandbox/image-pull/cancel",
+    () => api.cancelSandboxImagePull("sb:1"),
+    {
+      body: { image: "sb:1" },
+      respond: json({ message: "pulls are off" }, 403),
+      result: { ok: false, message: "pulls are off" },
+    },
   ],
   [
     "POST /api/sandbox/image-dismiss",
@@ -862,6 +893,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchProfileAgents", () => api.fetchProfileAgents("work"), null],
   ["pullSandboxImage", () => api.pullSandboxImage(), { ok: false }],
   ["dismissSandboxImage", () => api.dismissSandboxImage("sha256:new"), false],
+  ["cancelSandboxImagePull", () => api.cancelSandboxImagePull("sb:1"), { ok: false }],
 ];
 
 describe("failure fallbacks", () => {

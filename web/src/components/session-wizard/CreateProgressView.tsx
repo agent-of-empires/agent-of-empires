@@ -9,8 +9,16 @@ const STAGE_LABEL: Record<CreateProgress["stage"], string> = {
   starting: "Starting session",
 };
 
-/** Live stage and hook output of an in-flight create, like the TUI's Running Hooks dialog. */
-export function CreateProgressView({ progress }: { progress: CreateProgress | null }) {
+/** Live stage and hook output of an in-flight create, like the TUI's Running Hooks dialog.
+ *  `waitingForUpdate`: the create joined a download already running, so its pull stage waits for it. */
+export function CreateProgressView({
+  progress,
+  waitingForUpdate = false,
+}: {
+  progress: CreateProgress | null;
+  waitingForUpdate?: boolean;
+}) {
+  const stage = progress?.stage ?? "preparing";
   const outputRef = useRef<HTMLPreElement | null>(null);
   // Set while the reader sits at the bottom; scrolling up to read stops the follow.
   const followRef = useRef(true);
@@ -30,8 +38,9 @@ export function CreateProgressView({ progress }: { progress: CreateProgress | nu
           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
         </svg>
         <span className="text-sm font-medium text-text-primary">
-          {STAGE_LABEL[progress?.stage ?? "preparing"]}
-          ...
+          {stage === "pulling_image" && waitingForUpdate
+            ? "Waiting for the sandbox image update…"
+            : `${STAGE_LABEL[stage]}...`}
         </span>
       </div>
       {progress?.stage === "pulling_image" && (

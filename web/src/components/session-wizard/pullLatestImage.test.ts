@@ -10,21 +10,60 @@ const status = (over: Record<string, unknown>) =>
     dismissed: false,
     pull_blocked: null,
     pull_command: "docker pull sb:1",
+    pull: { state: "idle" },
     ...over,
   }) as unknown as SandboxImageStatus;
 const ON = { sandbox: true, structured: true };
 
 describe("pullLatestOffer", () => {
   it.each<[string, Parameters<typeof pullLatestOffer>[0], typeof ON, ReturnType<typeof pullLatestOffer>]>([
-    ["an update", status({}), ON, { checkedByDefault: true, command: null }],
-    ["a dismissed update", status({ dismissed: true }), ON, { checkedByDefault: false, command: null }],
+    ["an update", status({}), ON, { checkedByDefault: true, command: null, running: null }],
+    ["a dismissed update", status({ dismissed: true }), ON, { checkedByDefault: false, command: null, running: null }],
     [
       "pulls turned off",
       status({ pull_blocked: "disabled" }),
       ON,
-      { checkedByDefault: true, command: "docker pull sb:1" },
+      { checkedByDefault: true, command: "docker pull sb:1", running: null },
     ],
-    ["CityHall", status({ pull_blocked: "cityhall" }), ON, { checkedByDefault: true, command: "docker pull sb:1" }],
+    [
+      "CityHall",
+      status({ pull_blocked: "cityhall" }),
+      ON,
+      { checkedByDefault: true, command: "docker pull sb:1", running: null },
+    ],
+    // A running download is offered over any local image, even after a dismiss, so Launch can wait.
+    [
+      "a download over the latest image",
+      status({
+        state: "current",
+        dismissed: true,
+        pull: { state: "running", phase: "downloading", layers_done: 3, layers_known: 7 },
+      }),
+      ON,
+      { checkedByDefault: true, command: null, running: { phase: "downloading", done: 3, known: 7 } },
+    ],
+    [
+      "a download while a check failed",
+      status({ state: "check_failed", error: "timeout", pull: { state: "running" } }),
+      ON,
+      { checkedByDefault: true, command: null, running: { phase: "downloading" } },
+    ],
+    [
+      "a first pull's download, with no current image to start on",
+      status({ state: "unknown", reason: "not_pulled", pull: { state: "running", phase: "downloading" } }),
+      ON,
+      null,
+    ],
+    [
+      "a gated download",
+      status({
+        state: "current",
+        pull_blocked: "disabled",
+        pull: { state: "running", phase: "downloading", layers_done: 3, layers_known: 7 },
+      }),
+      ON,
+      null,
+    ],
     ["Terminal view", status({}), { sandbox: true, structured: false }, null],
     ["the Sandbox off", status({}), { sandbox: false, structured: true }, null],
     ["the latest image", status({ state: "current" }), ON, null],
@@ -39,7 +78,7 @@ describe("pullLatestOffer", () => {
 });
 
 describe("pullLatestChecked", () => {
-  const offer = { checkedByDefault: true, command: null };
+  const offer = { checkedByDefault: true, command: null, running: null };
   it.each<[string, Parameters<typeof pullLatestChecked>[0], boolean | null, boolean]>([
     ["the default", offer, null, true],
     ["the dismissed default", { ...offer, checkedByDefault: false }, null, false],

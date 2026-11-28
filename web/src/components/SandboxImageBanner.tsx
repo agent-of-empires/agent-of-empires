@@ -1,10 +1,12 @@
 import { useId, useRef, useState, type ReactNode } from "react";
-import type { SandboxImageBannerView } from "../hooks/useSandboxImageBanner";
+import { layerCount, type SandboxImageBannerView } from "../hooks/useSandboxImageBanner";
 import { writeClipboard } from "../lib/clipboard";
 import { BUTTON_INLINE } from "../lib/surfaces";
 
-const WHY =
-  "Sandboxed sessions run in a container image that AoE doesn't update automatically. Newer AoE versions can need a newer image; without it, Structured view sessions stop with an adapter error.";
+const WHY = [
+  "Sandboxed Sessions run in the current image. Newer AoE versions may need this update, or Structured view stops with an adapter error.",
+  "Existing Sessions keep their image. To move one over after an update, use Recreate container in its menu.",
+];
 
 // Text stays at text contrast on every tint in every built-in theme (text-primary at least 5.99:1,
 // text-subtle 4.84:1). A status hue on its own tint falls short (status-running is 2.68:1 and
@@ -15,60 +17,96 @@ const TONES = {
   failed: { bar: "bg-status-error/10 border-status-error/30 text-text-primary", dot: "bg-status-error" },
 };
 
+export const CANCEL_NOT_READY = "Available once the Daemon confirms the download.";
+
 /** Top-of-app banner for a newer sandbox image, with the pull and its outcome. */
 export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
   switch (view.kind) {
     case "available":
       return (
-        <Bar tone="brand" label="Sandbox image update available" onDismiss={view.onDismiss}>
-          <span>Sandbox image update available</span>
+        <Bar tone="brand" status="Sandbox image update available" onDismiss={view.onDismiss}>
           <Image name={view.image} />
           <button type="button" onClick={view.onUpdate} className={BUTTON_INLINE}>
             Update now
           </button>
-          <Disclosure label="Why?">{WHY}</Disclosure>
+          <Disclosure label="Why?">
+            <span className="block">{WHY[0]}</span>
+            <span className="mt-3 block">{WHY[1]}</span>
+          </Disclosure>
         </Bar>
       );
     case "gated":
       return (
-        <Bar tone="brand" label="Sandbox image update available" onDismiss={view.onDismiss}>
-          <span>Sandbox image update available. Run on the Daemon&apos;s machine:</span>
-          <CopyCommand command={view.command} />
+        <Bar
+          tone="brand"
+          status="Sandbox image update available. Run on the Daemon's machine:"
+          onDismiss={view.onDismiss}
+        >
+          <CopyCommand command={view.command} announce />
         </Bar>
       );
-    case "updating":
+    case "updating": {
+      const { progress } = view;
       return (
-        <Bar tone="brand" label="Downloading sandbox image">
-          <svg className="animate-spin h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
-          </svg>
-          <span>Downloading sandbox image…</span>
-          <span className="text-text-subtle">· sessions keep running</span>
+        <Bar
+          tone="brand"
+          lead={<Spinner />}
+          status={`${progress.phase === "unpacking" ? "Unpacking sandbox image…" : "Downloading sandbox image…"}${
+            view.cancelRefused !== null ? " Couldn't cancel." : ""
+          }`}
+          onDismiss={view.onHide}
+          dismissLabel="Hide sandbox image notice"
+          fraction={progress.known ? (progress.done ?? 0) / progress.known : undefined}
+        >
+          {layerCount(progress) && <span aria-hidden="true">{layerCount(progress)}</span>}
+          <span className="text-text-subtle">· Sessions keep running</span>
+          {view.onCancel && (
+            <button
+              type="button"
+              onClick={view.onCancel}
+              disabled={view.cancelling || !view.cancelReady}
+              title={view.cancelReady ? undefined : CANCEL_NOT_READY}
+              className={BUTTON_INLINE}
+            >
+              Cancel
+            </button>
+          )}
+          {view.cancelRefused !== null && (
+            <Disclosure label="Details">
+              <pre className="whitespace-pre-wrap break-all font-mono">{view.cancelRefused}</pre>
+            </Disclosure>
+          )}
         </Bar>
       );
+    }
     case "done":
+      return <Bar tone="done" status="Sandbox image updated. Applies to new Sessions." onDismiss={view.onDismiss} />;
+    case "cancelled":
       return (
-        <Bar tone="done" label="Sandbox image updated" onDismiss={view.onDismiss}>
-          <span>Sandbox image updated. New sessions use it; running sessions keep the image they started with.</span>
+        <Bar tone="brand" status="Update cancelled. Sessions keep the current image." onDismiss={view.onDismiss}>
+          {view.onUpdate && (
+            <button type="button" onClick={view.onUpdate} className={BUTTON_INLINE}>
+              Update now
+            </button>
+          )}
         </Bar>
       );
     case "config_unreadable":
       return (
-        <Bar tone="failed" label="AoE can't read its configuration" onDismiss={view.onDismiss}>
-          <span>
-            AoE can&apos;t read its configuration (config.toml or state.toml), so sandbox image updates aren&apos;t
-            checked. Fix the file, then reload.
-          </span>
-        </Bar>
+        <Bar
+          tone="failed"
+          status="AoE can't read its configuration (config.toml or state.toml), so sandbox image updates aren't checked. Fix the file, then reload."
+          onDismiss={view.onDismiss}
+        />
       );
     case "failed":
       return (
-        <Bar tone="failed" label="Couldn't download the sandbox image" onDismiss={view.onDismiss}>
-          <span>Couldn&apos;t download the sandbox image</span>
-          <button type="button" onClick={view.onRetry} className={BUTTON_INLINE}>
-            Retry
-          </button>
+        <Bar tone="failed" status={view.message} onDismiss={view.onDismiss}>
+          {view.onRetry && (
+            <button type="button" onClick={view.onRetry} className={BUTTON_INLINE}>
+              Retry
+            </button>
+          )}
           <Disclosure label="Details">
             <pre className="whitespace-pre-wrap break-all font-mono">{view.error}</pre>
           </Disclosure>
@@ -77,32 +115,49 @@ export function SandboxImageBanner({ view }: { view: SandboxImageBannerView }) {
   }
 }
 
+/** `status` is the only live part, so a changing count beside it isn't announced; `fraction` draws the
+ *  progress bar on the bottom edge, which the text duplicates. */
 function Bar({
   tone,
-  label,
+  lead,
+  status,
   onDismiss,
+  dismissLabel = "Dismiss sandbox image notice",
+  fraction,
   children,
 }: {
   tone: keyof typeof TONES;
-  label: string;
+  lead?: ReactNode;
+  status: string;
   onDismiss?: () => void;
-  children: ReactNode;
+  dismissLabel?: string;
+  fraction?: number;
+  children?: ReactNode;
 }) {
   const { bar, dot } = TONES[tone];
   return (
     <div
-      role="status"
-      aria-label={label}
+      data-testid="sandbox-image-banner"
       className={`relative border-b px-4 py-2 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-xs font-mono animate-fade-in ${onDismiss ? "pr-10 sm:pr-4" : ""} ${bar}`}
     >
       {/* On a phone the line wraps, and a lone dot or close button would take a row of its own. */}
       <span className={`hidden sm:block w-1.5 h-1.5 rounded-full shrink-0 ${dot}`} />
+      {lead}
+      <span role="status">{status}</span>
       {children}
+      {fraction !== undefined && (
+        <span
+          aria-hidden="true"
+          data-testid="sandbox-image-progress"
+          className="absolute left-0 bottom-0 h-0.5 bg-brand-500"
+          style={{ width: `${Math.min(1, Math.max(0, fraction)) * 100}%` }}
+        />
+      )}
       {onDismiss && (
         <button
           type="button"
           onClick={onDismiss}
-          aria-label="Dismiss sandbox image notice"
+          aria-label={dismissLabel}
           className="absolute right-2 top-1 sm:static sm:ml-2 min-h-8 text-text-subtle hover:text-text-primary cursor-pointer text-base leading-none px-1"
         >
           &times;
@@ -112,16 +167,29 @@ function Bar({
   );
 }
 
+/** Still while the user prefers reduced motion; the text carries the progress. */
+export function Spinner({ size = "h-3.5 w-3.5" }: { size?: string }) {
+  return (
+    <svg className={`animate-spin motion-reduce:animate-none ${size} shrink-0`} viewBox="0 0 24 24" aria-hidden="true">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+    </svg>
+  );
+}
+
 function Image({ name }: { name: string }) {
   return <span className="text-text-subtle break-all">· {name}</span>;
 }
 
-/** A toggle with its panel below the banner; Escape closes it. */
+/**
+ * A toggle with its panel below the banner; Escape closes it. Below md the panel is a full-width row of the banner
+ * instead, since a phone's banner card clips anything drawn outside it.
+ */
 function Disclosure({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const panelId = useId();
   return (
-    <span onKeyDown={(e) => e.key === "Escape" && setOpen(false)}>
+    <span className="max-md:contents" onKeyDown={(e) => e.key === "Escape" && setOpen(false)}>
       <button
         type="button"
         aria-expanded={open}
@@ -134,7 +202,7 @@ function Disclosure({ label, children }: { label: string; children: ReactNode })
       <span
         id={panelId}
         hidden={!open}
-        className="absolute left-1/2 top-full z-30 mt-1 w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 rounded-md border border-surface-700 bg-surface-850 p-3 text-left font-sans text-xs leading-relaxed text-text-primary shadow-lg"
+        className="absolute left-1/2 top-full z-30 mt-1 w-[min(32rem,calc(100vw-2rem))] -translate-x-1/2 rounded-md border border-surface-700 bg-surface-850 p-3 text-left font-sans text-xs leading-relaxed text-text-primary shadow-lg max-md:static max-md:basis-full max-md:w-full max-md:translate-x-0 max-md:shadow-none"
       >
         {children}
       </span>
@@ -142,7 +210,8 @@ function Disclosure({ label, children }: { label: string; children: ReactNode })
   );
 }
 
-export function CopyCommand({ command }: { command: string }) {
+/** `announce` makes the copy feedback its own live region, for a caller that doesn't hold it in one. */
+export function CopyCommand({ command, announce = false }: { command: string; announce?: boolean }) {
   const [feedback, setFeedback] = useState<"copied" | "failed" | null>(null);
   const codeRef = useRef<HTMLElement>(null);
   const copy = async () => {
@@ -166,8 +235,7 @@ export function CopyCommand({ command }: { command: string }) {
       <button type="button" onClick={() => void copy()} className={BUTTON_INLINE} aria-label={`Copy ${command}`}>
         Copy
       </button>
-      {/* Callers put it inside a live region, so this is announced without a nested one. */}
-      <span>
+      <span role={announce ? "status" : undefined}>
         {feedback === "copied" ? "Copied" : feedback === "failed" ? "Couldn't copy. Select and copy it." : ""}
       </span>
     </span>

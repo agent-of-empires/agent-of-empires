@@ -1724,8 +1724,21 @@ export async function dismissUpdate(version: string): Promise<boolean> {
 
 // --- Sandbox image ---
 
-/** The Daemon's last pull of an image, kept until the next one starts. */
-export type SandboxImagePull = { state: "idle" | "running" | "done" } | { state: "failed"; error: string };
+/** Where a running pull is; each count is left out until the runtime's output shows it. */
+export interface SandboxImagePullProgress {
+  phase?: "downloading" | "unpacking";
+  layers_done?: number;
+  layers_known?: number;
+}
+
+export type SandboxImagePullFailure = "timeout" | "network" | "disk_space" | "auth" | "other";
+
+/** The Daemon's last pull of an image, kept until the next one starts. `cancelled` is an explicit
+ *  Cancel; `message` is the failure's shared wording and `error` the runtime's output. */
+export type SandboxImagePull =
+  | { state: "idle" | "done" | "cancelled" }
+  | ({ state: "running" } & SandboxImagePullProgress)
+  | { state: "failed"; reason: SandboxImagePullFailure; message: string; error: string };
 
 export type SandboxImageState =
   | { state: "available"; remote_digest: string }
@@ -1764,9 +1777,26 @@ export async function fetchSandboxImageStatus(
   return { error: stringField(reply.payload, "error") ?? `http_${reply.status}` };
 }
 
-/** `message` explains a refusal: the gate is off, read-only, or the configuration is unreadable. */
-export function pullSandboxImage(): Promise<{ ok: boolean; message?: string }> {
-  return okWithMessage("/api/sandbox/image-pull", { method: "POST" });
+/** Pulls the default image as of the request's arrival; `image` is the one the Daemon took. `message`
+ *  explains a refusal: the gate is off, read-only, or the configuration is unreadable. */
+export async function pullSandboxImage(): Promise<{ ok: boolean; image?: string; message?: string }> {
+  const reply = await send("/api/sandbox/image-pull", { method: "POST" }).catch(() => null);
+  if (!reply) return { ok: false };
+  if (!reply.ok) return { ok: false, message: stringField(reply.payload, "message") };
+  const image = stringField(reply.payload, "image");
+  return image === undefined ? { ok: true } : { ok: true, image };
+}
+
+/** Cancels `image`'s pull for every client; `pull` is the state it ended in, only when the reply is
+ *  about that image. */
+export async function cancelSandboxImagePull(
+  image: string,
+): Promise<{ ok: boolean; pull?: SandboxImagePull; message?: string }> {
+  const reply = await send("/api/sandbox/image-pull/cancel", jsonInit("POST", { image })).catch(() => null);
+  if (!reply) return { ok: false };
+  if (!reply.ok) return { ok: false, message: stringField(reply.payload, "message") };
+  const payload = reply.payload as { image?: string; pull?: SandboxImagePull } | null;
+  return payload?.pull && payload.image === image ? { ok: true, pull: payload.pull } : { ok: true };
 }
 
 export function dismissSandboxImage(digest: string): Promise<boolean> {

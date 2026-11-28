@@ -9,6 +9,7 @@ import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OPEN_HEADER_MENU_EVENT, OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginHeaderStartSegments, PluginStatusBarSegments } from "./plugin/PluginSlots";
+import { SandboxPullChip } from "./SandboxPullChip";
 import { PluginPageButtons } from "./plugin/PluginPageButtons";
 import { PanelControl, TerminalToggle, type PanelControlProps } from "./PanelControl";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -367,6 +368,7 @@ export function TopBar({
           rightColumnVisible ? "md:w-[var(--aoe-right-panel-width)]" : ""
         }`}
       >
+        <SandboxPullChip />
         <PluginStatusBarSegments />
         {isDevBuild && (
           <span

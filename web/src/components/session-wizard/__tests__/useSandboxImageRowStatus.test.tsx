@@ -4,12 +4,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, renderHook } from "@testing-library/react";
 
 import { fetchSandboxImageStatus, type SandboxImageStatus } from "../../../lib/api";
-import { IMAGE_RECHECK_MS, sandboxImageStatusLabel, useSandboxImageRowStatus } from "../useSandboxImageRowStatus";
+import {
+  IDLE_RECHECK_MS,
+  IMAGE_RECHECK_MS,
+  RUNNING_RECHECK_MS,
+  sandboxImageStatusLabel,
+  useSandboxImageRowStatus,
+} from "../useSandboxImageRowStatus";
 
 vi.mock("../../../lib/api", () => ({ fetchSandboxImageStatus: vi.fn() }));
 const fetchStatus = vi.mocked(fetchSandboxImageStatus);
 
-const status = (state: Record<string, unknown>) => ({ image: "sb:1", ...state }) as unknown as SandboxImageStatus;
+const status = (state: Record<string, unknown>) =>
+  ({ image: "sb:1", pull: { state: "idle" }, ...state }) as unknown as SandboxImageStatus;
 
 describe("sandboxImageStatusLabel", () => {
   it.each([
@@ -55,6 +62,63 @@ describe("useSandboxImageRowStatus", () => {
     await act(async () => vi.advanceTimersByTime(1));
     expect(fetchStatus.mock.calls.slice(1)).toEqual([["sb:22", { fresh: false }]]);
     expect(result.current?.label).toBe("Update status unknown");
+  });
+
+  it("re-checks every 2 s while the image downloads, slows once it ends, and stops when the dialog closes", async () => {
+    const running = status({ state: "current", pull: { state: "running", layers_done: 1, layers_known: 7 } });
+    fetchStatus.mockResolvedValue(running);
+    const { result, unmount } = renderHook(() => useSandboxImageRowStatus("sb:1", true));
+    await settle();
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+    fetchStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } }));
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS));
+    expect(fetchStatus.mock.calls.slice(1)).toEqual([["sb:1", { fresh: false }]]);
+    expect(result.current?.reply).toMatchObject({ pull: { state: "done" } });
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS * 3));
+    expect(fetchStatus).toHaveBeenCalledTimes(2);
+
+    fetchStatus.mockResolvedValue(running);
+    unmount();
+    const { unmount: close } = renderHook(() => useSandboxImageRowStatus("sb:1", true));
+    await settle();
+    const calls = fetchStatus.mock.calls.length;
+    close();
+    await act(async () => vi.advanceTimersByTime(IDLE_RECHECK_MS * 3));
+    expect(fetchStatus).toHaveBeenCalledTimes(calls);
+  });
+
+  it("shows a pull that starts after an idle answer, without reopening the dialog", async () => {
+    const { result } = renderHook(() => useSandboxImageRowStatus("sb:1", true));
+    await settle();
+    expect(result.current?.reply).toMatchObject({ pull: { state: "idle" } });
+    fetchStatus.mockResolvedValue(status({ state: "current", pull: { state: "running" } }));
+    await act(async () => vi.advanceTimersByTime(IDLE_RECHECK_MS - 1));
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTime(1));
+    expect(fetchStatus.mock.calls.slice(1)).toEqual([["sb:1", { fresh: false }]]);
+    expect(result.current?.reply).toMatchObject({ pull: { state: "running" } });
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS));
+    expect(fetchStatus, "a running pull isn't followed at 2 s").toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    ["the Daemon can't be reached", null],
+    ["the Daemon refuses", { error: "http_502" }],
+  ])("keeps showing a running pull and re-checking when %s", async (_name, failure) => {
+    const running = status({ state: "current", pull: { state: "running" } });
+    fetchStatus.mockResolvedValue(running);
+    const { result } = renderHook(() => useSandboxImageRowStatus("sb:1", true));
+    await settle();
+    fetchStatus.mockResolvedValue(failure as never);
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS));
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS));
+    expect(fetchStatus).toHaveBeenCalledTimes(3);
+    expect(result.current?.reply).toBe(running);
+    fetchStatus.mockResolvedValue(status({ state: "current", pull: { state: "done" } }));
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS));
+    expect(result.current?.reply).toMatchObject({ pull: { state: "done" } });
+    await act(async () => vi.advanceTimersByTime(RUNNING_RECHECK_MS * 3));
+    expect(fetchStatus).toHaveBeenCalledTimes(4);
   });
 
   it("asks for the default image when none is set, and not at all while disabled", async () => {

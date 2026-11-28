@@ -27,7 +27,8 @@ import type { SuggestionPrepared } from "../../../lib/types";
 import { useAgentDisplayNames } from "../../../lib/agentDisplayName";
 import { startPendingCreates } from "../../../lib/pendingCreates";
 import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
-import { SANDBOX_IMAGE_PULLED_EVENT } from "../../../lib/sandboxImageEvents";
+import { SANDBOX_IMAGE_PULLED_EVENT, SANDBOX_IMAGE_PULL_STARTED_EVENT } from "../../../lib/sandboxImageEvents";
+import { RUNNING_RECHECK_MS } from "../useSandboxImageRowStatus";
 
 const createSession = vi.fn();
 const onOpenSettingsTab = vi.fn();
@@ -1672,6 +1673,7 @@ describe("SessionWizard Sandbox image status", () => {
       image: "ghcr.io/x/sb:1",
       state: "available",
       remote_digest: "sha256:b",
+      pull: { state: "idle" },
     } as never);
     renderWizard();
     const row = screen.getByTestId("wizard-sandbox-row");
@@ -1691,6 +1693,7 @@ describe("SessionWizard Sandbox image status", () => {
     vi.mocked(fetchSandboxImageStatus).mockResolvedValueOnce({
       image: "ghcr.io/x/sb:2",
       state: "current",
+      pull: { state: "idle" },
     } as never);
     renderWizard();
     await waitFor(() => expect(vi.mocked(fetchSandboxImageStatus)).toHaveBeenCalled());
@@ -1707,6 +1710,7 @@ describe("SessionWizard Pull latest image first", () => {
     dismissed: false,
     pull_blocked: null,
     pull_command: `docker pull ${IMAGE}`,
+    pull: { state: "idle" },
   };
   afterEach(() => {
     vi.mocked(fetchDockerStatus)
@@ -1746,8 +1750,121 @@ describe("SessionWizard Pull latest image first", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
     expect(payload(0).pull_latest_image).toBe(checked || undefined);
-    // Only a create that pulled tells the update banner to ask again.
+    // Only a create that pulled tells the update banner to ask again, naming the image its row showed.
     await waitFor(() => expect(pulled).toHaveBeenCalledTimes(checked ? 1 : 0));
+    if (checked) expect((pulled.mock.calls[0][0] as CustomEvent).detail, "the pulled image").toBe(IMAGE);
+  });
+
+  describe("while the image downloads", () => {
+    const RUNNING = {
+      ...UPDATE,
+      state: "current",
+      pull: { state: "running", phase: "downloading", layers_done: 3, layers_known: 7 },
+    };
+    const choice = (name: string) => screen.findByRole("radio", { name: new RegExp(`^${name}`) });
+
+    it("offers Wait, by default, and Launch joins the download and says it waits", async () => {
+      const started = vi.fn();
+      window.addEventListener(SANDBOX_IMAGE_PULL_STARTED_EVENT, started);
+      onTestFinished(() => window.removeEventListener(SANDBOX_IMAGE_PULL_STARTED_EVENT, started));
+      let resolve!: (v: unknown) => void;
+      createSession.mockReturnValueOnce(new Promise((r) => (resolve = r)));
+      vi.mocked(fetchCreateProgress).mockResolvedValue({ stage: "pulling_image", hook: null, output: [] });
+      onTestFinished(() => {
+        resolve({ ok: true, session: { id: "s1" } });
+        vi.mocked(fetchCreateProgress).mockResolvedValue(null);
+      });
+      open(RUNNING);
+      const group = await screen.findByRole("radiogroup", { name: "Sandbox image" });
+      expect(group.textContent).toContain(
+        "An update is downloading (3 of 7 layers). This Session starts on the new image when it finishes.",
+      );
+      expect(((await choice("Wait for the update")) as HTMLInputElement).checked).toBe(true);
+      expect(screen.queryByRole("checkbox", { name: "Pull latest image first" })).toBeNull();
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+      expect(payload(0).pull_latest_image).toBe(true);
+      expect(started).toHaveBeenCalledOnce();
+      await screen.findByText("Waiting for the sandbox image update…", undefined, { timeout: 3000 });
+    });
+
+    it("says a resend pulls on its own once the download it would have joined has ended", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      onTestFinished(() => {
+        vi.useRealTimers();
+        vi.mocked(fetchCreateProgress).mockResolvedValue(null);
+      });
+      let current: object = RUNNING;
+      open(RUNNING);
+      vi.mocked(fetchSandboxImageStatus).mockImplementation(async (image) =>
+        image === IMAGE ? (current as never) : null,
+      );
+      await choice("Wait for the update");
+      // Every response to the first send is lost, so its outcome is unknown.
+      createSession.mockResolvedValue({ ok: false, error: "Network error: offline", network: true });
+      await launch();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+      // The download ends before the user resends.
+      current = { ...UPDATE, state: "current", pull: { state: "done" } };
+      await vi.advanceTimersByTimeAsync(RUNNING_RECHECK_MS * 2);
+      createSession.mockReturnValue(new Promise(() => {}));
+      vi.mocked(fetchCreateProgress).mockResolvedValue({ stage: "pulling_image", hook: null, output: [] });
+      const sent = createSession.mock.calls.length;
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(sent + 1));
+      expect(payload(sent).pull_latest_image).toBe(true);
+      await screen.findByText("Pulling latest image...", undefined, { timeout: 3000 });
+      expect(screen.queryByText("Waiting for the sandbox image update…")).toBeNull();
+    });
+
+    it("says a network retry pulls on its own once the download it would have joined has ended", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      onTestFinished(() => {
+        vi.useRealTimers();
+        vi.mocked(fetchCreateProgress).mockResolvedValue(null);
+      });
+      let current: object = RUNNING;
+      open(RUNNING);
+      vi.mocked(fetchSandboxImageStatus).mockImplementation(async (image) =>
+        image === IMAGE ? (current as never) : null,
+      );
+      await choice("Wait for the update");
+      let loseFirst: (result: object) => void = () => {};
+      createSession.mockImplementationOnce(() => new Promise((resolve) => (loseFirst = resolve)));
+      createSession.mockReturnValue(new Promise(() => {}));
+      vi.mocked(fetchCreateProgress).mockResolvedValue({ stage: "pulling_image", hook: null, output: [] });
+      await launch();
+      await screen.findByText("Waiting for the sandbox image update…", undefined, { timeout: 3000 });
+      // The download ends while the first send is out, and then its answer is lost.
+      current = { ...UPDATE, state: "current", pull: { state: "done" } };
+      await vi.advanceTimersByTimeAsync(RUNNING_RECHECK_MS * 2);
+      loseFirst({ ok: false, error: "Network error: offline", network: true });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+      await screen.findByText("Pulling latest image...", undefined, { timeout: 3000 });
+      expect(screen.queryByText("Waiting for the sandbox image update…")).toBeNull();
+    });
+
+    it("Start now launches on the current image without joining", async () => {
+      const started = vi.fn();
+      window.addEventListener(SANDBOX_IMAGE_PULL_STARTED_EVENT, started);
+      onTestFinished(() => window.removeEventListener(SANDBOX_IMAGE_PULL_STARTED_EVENT, started));
+      open(RUNNING);
+      fireEvent.click(await choice("Start now on the current image"));
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+      expect(payload(0).pull_latest_image).toBeUndefined();
+      expect(started).not.toHaveBeenCalled();
+    });
+  });
+
+  it("shows no image option at all when the image is current and nothing downloads", async () => {
+    open({ ...UPDATE, state: "current" });
+    const row = screen.getByTestId("wizard-sandbox-row");
+    await waitFor(() => expect(row.textContent).toContain(IMAGE));
+    expect(screen.queryByTestId("wizard-pull-latest")).toBeNull();
+    expect(screen.queryByTestId("wizard-wait-for-update")).toBeNull();
   });
 
   it("unchecking it launches with the current image", async () => {

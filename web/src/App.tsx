@@ -288,6 +288,7 @@ import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import type { CommandAction } from "./components/command-palette/types";
 import { useConversationSearch } from "./hooks/useConversationSearch";
 import { BannerStack } from "./components/BannerStack";
+import { SandboxImageProvider } from "./components/SandboxImageProvider";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
@@ -3251,381 +3252,388 @@ function AppContent({
           readOnly={caps.readOnly}
           available={!error}
         >
-          <div
-            // The session drawer's colour on a phone: its home, and behind a Session card the drawer pushes aside, so
-            // nothing lighter shows past the card's rounded edge.
-            className={`h-(--app-height) flex flex-col ${phoneDrawer ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
-            // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
-            style={
-              phoneDrawer ? ({ "--phone-header-h": "76px", "--phone-overlay-top": "76px" } as CSSProperties) : undefined
-            }
-          >
-            {phoneDrawer && (
-              // Under the clock, which an installed app draws beneath: the page colour, never content. Fixed and opaque,
-              // so iOS 26 tints the status bar from it rather than blurring; under sheets and dialogs, and following the
-              // visible viewport while the keyboard pans the page.
-              <div
-                className={`md:hidden fixed inset-x-0 top-[var(--vv-offset-top,0px)] z-30 h-[env(safe-area-inset-top)] transition-colors duration-[400ms] [mask-image:linear-gradient(to_bottom,#000_calc(100%-0.375rem),transparent)] ${
-                  drawerPushed || phoneHome ? "bg-surface-950" : "bg-surface-900"
-                }`}
-              />
-            )}
-            {!phoneDrawer && (
-              // A phone's Settings heads its own page; a wide one puts Back and its search in this header.
-              <div className={showSettings ? "max-md:hidden" : undefined}>{topBar}</div>
-            )}
-            {/* A phone's pages host the banners under their own top controls. */}
-            {!phonePagesHostBanners && bannerStack}
-            {focusMode && focusSession.title !== null && !focusSession.gone && (
-              <FocusModeNote title={focusSession.title} />
-            )}
+          <SandboxImageProvider>
+            <div
+              // The session drawer's colour on a phone: its home, and behind a Session card the drawer pushes aside, so
+              // nothing lighter shows past the card's rounded edge.
+              className={`h-(--app-height) flex flex-col ${phoneDrawer ? "bg-surface-950" : "bg-surface-900"} md:bg-surface-950 md:chrome-canvas text-text-primary overflow-hidden safe-area-inset`}
+              // What a phone's floating header covers, for the views that keep their banners and first lines clear of it.
+              style={
+                phoneDrawer
+                  ? ({ "--phone-header-h": "76px", "--phone-overlay-top": "76px" } as CSSProperties)
+                  : undefined
+              }
+            >
+              {phoneDrawer && (
+                // Under the clock, which an installed app draws beneath: the page colour, never content. Fixed and opaque,
+                // so iOS 26 tints the status bar from it rather than blurring; under sheets and dialogs, and following the
+                // visible viewport while the keyboard pans the page.
+                <div
+                  className={`md:hidden fixed inset-x-0 top-[var(--vv-offset-top,0px)] z-30 h-[env(safe-area-inset-top)] transition-colors duration-[400ms] [mask-image:linear-gradient(to_bottom,#000_calc(100%-0.375rem),transparent)] ${
+                    drawerPushed || phoneHome ? "bg-surface-950" : "bg-surface-900"
+                  }`}
+                />
+              )}
+              {!phoneDrawer && (
+                // A phone's Settings heads its own page; a wide one puts Back and its search in this header.
+                <div className={showSettings ? "max-md:hidden" : undefined}>{topBar}</div>
+              )}
+              {/* A phone's pages host the banners under their own top controls. */}
+              {!phonePagesHostBanners && bannerStack}
+              {focusMode && focusSession.title !== null && !focusSession.gone && (
+                <FocusModeNote title={focusSession.title} />
+              )}
 
-            <div className="flex flex-1 min-h-0">
-              {!fullPageView && !focusMode && (
-                <WorkspaceSidebar
-                  drawer={phoneDrawer}
-                  onHome={
+              <div className="flex flex-1 min-h-0">
+                {!fullPageView && !focusMode && (
+                  <WorkspaceSidebar
+                    drawer={phoneDrawer}
+                    onHome={
+                      phoneDrawer
+                        ? () => {
+                            setSidebarOpen(false);
+                            handleGoDashboard();
+                          }
+                        : undefined
+                    }
+                    menuItems={appMenu}
+                    observedById={observedById}
+                    runtimeEpoch={runtimeEpoch}
+                    onSessionMutation={applySessionMutation}
+                    groups={sidebarGroups}
+                    nestedGroups={nestedGroups}
+                    orgGroups={orgGroups}
+                    trashedWorkspaces={trashedWorkspaces}
+                    trashedCount={trashedCount}
+                    trashLoaded={trashLoaded}
+                    onLoadTrash={loadTrash}
+                    onToggleSubgroup={toggleSubgroupCollapsed}
+                    onToggleOrg={toggleOrgCollapsed}
+                    onToggleOrgRepo={toggleOrgRepoCollapsed}
+                    onReorderWorkspaces={handleReorderWorkspaces}
+                    onReorderGroups={reorderRepoGroups}
+                    activeId={activeWorkspace?.id ?? null}
+                    activeSessionId={activeSessionId}
+                    open={sidebarOpen}
+                    onOpenChange={setSidebarOpen}
+                    onSelect={handleSelectWorkspace}
+                    onToggleGroup={toggleSidebarGroup}
+                    onNew={(prefill) => {
+                      setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
+                      setShowSessionWizard(true);
+                    }}
+                    onCreateSession={handleCreateSession}
+                    onOpenPalette={() => setShowPalette(true)}
+                    onPinProject={projectsReady ? handlePinProject : undefined}
+                    onUnpinProject={projectsReady ? handleUnpinProject : undefined}
+                    onEditProjectSettings={handleEditProjectSettings}
+                    savedProjects={savedProjects}
+                    onAddProject={handleAddProject}
+                    onEditProject={handleEditProject}
+                    onRemoveProject={handleRemoveProject}
+                    onSettings={handleOpenSettings}
+                    onDeleteSession={handleDeleteSession}
+                    onRestoreSession={handleRestoreSession}
+                    onEmptyTrash={handleEmptyTrash}
+                    onRetryTrash={handleRetryTrash}
+                    onStopSession={handleStopSession}
+                    onStartSession={handleStartSession}
+                    onSwitchView={handleSwitchView}
+                    readOnly={caps.readOnly}
+                    canManageProjects={caps.canManageProjects}
+                    sortMode={sidebarSortMode}
+                    onSortModeChange={selectSidebarSortMode}
+                    pluginSortRef={pluginSortRef}
+                    onPluginSortChange={selectPluginSort}
+                    axis={sidebarAxis}
+                    onAxisChange={setSidebarAxis}
+                    suggestions={{
+                      readOnly: caps.readOnly || !caps.canManageSuggestions,
+                      cityhall: caps.cityhall,
+                      onEditPreset: caps.canManageSuggestions
+                        ? (providerId, criterion) =>
+                            requestNavigate(
+                              `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion })}`,
+                            )
+                        : undefined,
+                      onPrepare: (prefill) => {
+                        setWizardPrefill(prefill);
+                        setShowSessionWizard(true);
+                      },
+                      onOpenSession: (id) => requestNavigate(`/session/${encodeURIComponent(id)}`),
+                      onViewAll: () => requestNavigate("/suggestions"),
+                    }}
+                  />
+                )}
+
+                <div
+                  ref={cardRef}
+                  // With a Session open on a phone this is a card over the session drawer: the drawer pushes it aside
+                  // whole, header and all, as clawbolt's and Claude's apps do.
+                  className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${phoneHome ? "max-md:pt-[var(--phone-header-h)]" : ""} ${
                     phoneDrawer
-                      ? () => {
-                          setSidebarOpen(false);
-                          handleGoDashboard();
+                      ? `max-md:relative max-md:z-10 ${phoneHome ? "max-md:bg-surface-950" : "max-md:bg-surface-900"} max-md:has-[>[data-phone-banner]:not(:empty)]:[--phone-overlay-top:0px]`
+                      : ""
+                  } ${
+                    drawerPushed
+                      ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-[28px] max-md:overflow-hidden max-md:drawer-card-shadow"
+                      : ""
+                  }`}
+                >
+                  {phoneDrawer && (
+                    // Floats over the Session, which scrolls beneath it; only its controls take taps. Placed by `top`, not a
+                    // transform, which would bound the ⋯ backdrop's `fixed` box to this strip.
+                    <div className="md:hidden absolute inset-x-0 top-[var(--vv-offset-top,0px)] z-30 pointer-events-none [&_button]:pointer-events-auto [&_[role=menu]]:pointer-events-auto [&_[data-testid=session-title-pill]]:pointer-events-auto">
+                      {topBar}
+                    </div>
+                  )}
+                  {phoneDrawer && (
+                    // In the card's flow under the floating header, whose menus open over it. While it shows, the
+                    // views below it start right under it instead of clearing the header themselves.
+                    <div
+                      data-phone-banner
+                      className={`md:hidden shrink-0 mx-3 mb-2 ${phoneHome ? "" : "mt-[var(--phone-header-h)]"} ${PHONE_BANNER_CARD}`}
+                    >
+                      {bannerStack}
+                    </div>
+                  )}
+                  {renderContent()}
+                  {phoneDrawer && (
+                    // Dims the pushed-aside Session; a tap on it closes the drawer.
+                    <button
+                      ref={scrimRef}
+                      type="button"
+                      tabIndex={-1}
+                      aria-label="Close sessions"
+                      data-testid="sidebar-drawer-scrim"
+                      onClick={() => setSidebarOpen(false)}
+                      className={`md:hidden absolute inset-0 z-40 bg-black/15 cursor-pointer transition-[opacity,visibility] duration-[400ms] motion-reduce:transition-none ${
+                        drawerPushed ? "opacity-100" : "opacity-0 invisible"
+                      }`}
+                    />
+                  )}
+                </div>
+              </div>
+
+              {titleMenu && renderSessionMenu(titleMenu)}
+              {legend && <SidebarLegend anchor={legend.anchor} onClose={closeLegend} opener={legend.opener} />}
+
+              {showSessionWizard && (
+                <SessionWizard
+                  restore={wizardRestore ?? undefined}
+                  onReopenFailure={reopenFailure}
+                  servedProfile={servedProfileReady ? serverAbout?.profile : undefined}
+                  onRetryServedProfile={refreshServerAbout}
+                  onClose={() => {
+                    setShowSessionWizard(false);
+                    setWizardPrefill(undefined);
+                    clearRestore();
+                  }}
+                  onOpenSettingsTab={openSettingsTab}
+                  onCreated={(session?: SessionResponse) => {
+                    if (session) {
+                      injectSession(session);
+                      navigate(`/session/${encodeURIComponent(session.id)}`);
+                      if (window.innerWidth < 768) setSidebarOpen(false);
+                    }
+                    setShowSessionWizard(false);
+                    setWizardPrefill(undefined);
+                    clearRestore();
+                  }}
+                  onCreatedInBackground={(session?: SessionResponse) => {
+                    if (!session) return;
+                    injectSession(session);
+                    toastBus.handler?.info(`"${session.title}" is ready`);
+                  }}
+                  prefill={wizardPrefill}
+                  nameOnly={caps.nameOnlyWizard}
+                  onEditPreset={
+                    caps.canManageSuggestions
+                      ? ({ providerId, criterion }) => {
+                          setShowSessionWizard(false);
+                          setWizardPrefill(undefined);
+                          const q = new URLSearchParams({
+                            preset_provider: providerId,
+                            preset_criterion: criterion,
+                            from: "suggestions",
+                          });
+                          navigate(`/settings/suggestions?${q}`);
                         }
                       : undefined
                   }
-                  menuItems={appMenu}
-                  observedById={observedById}
-                  runtimeEpoch={runtimeEpoch}
-                  onSessionMutation={applySessionMutation}
-                  groups={sidebarGroups}
-                  nestedGroups={nestedGroups}
-                  orgGroups={orgGroups}
-                  trashedWorkspaces={trashedWorkspaces}
-                  trashedCount={trashedCount}
-                  trashLoaded={trashLoaded}
-                  onLoadTrash={loadTrash}
-                  onToggleSubgroup={toggleSubgroupCollapsed}
-                  onToggleOrg={toggleOrgCollapsed}
-                  onToggleOrgRepo={toggleOrgRepoCollapsed}
-                  onReorderWorkspaces={handleReorderWorkspaces}
-                  onReorderGroups={reorderRepoGroups}
-                  activeId={activeWorkspace?.id ?? null}
-                  activeSessionId={activeSessionId}
-                  open={sidebarOpen}
-                  onOpenChange={setSidebarOpen}
-                  onSelect={handleSelectWorkspace}
-                  onToggleGroup={toggleSidebarGroup}
-                  onNew={(prefill) => {
-                    setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
-                    setShowSessionWizard(true);
-                  }}
-                  onCreateSession={handleCreateSession}
-                  onOpenPalette={() => setShowPalette(true)}
-                  onPinProject={projectsReady ? handlePinProject : undefined}
-                  onUnpinProject={projectsReady ? handleUnpinProject : undefined}
-                  onEditProjectSettings={handleEditProjectSettings}
-                  savedProjects={savedProjects}
-                  onAddProject={handleAddProject}
-                  onEditProject={handleEditProject}
-                  onRemoveProject={handleRemoveProject}
-                  onSettings={handleOpenSettings}
-                  onDeleteSession={handleDeleteSession}
-                  onRestoreSession={handleRestoreSession}
-                  onEmptyTrash={handleEmptyTrash}
-                  onRetryTrash={handleRetryTrash}
-                  onStopSession={handleStopSession}
-                  onStartSession={handleStartSession}
-                  onSwitchView={handleSwitchView}
-                  readOnly={caps.readOnly}
-                  canManageProjects={caps.canManageProjects}
-                  sortMode={sidebarSortMode}
-                  onSortModeChange={selectSidebarSortMode}
-                  pluginSortRef={pluginSortRef}
-                  onPluginSortChange={selectPluginSort}
-                  axis={sidebarAxis}
-                  onAxisChange={setSidebarAxis}
-                  suggestions={{
-                    readOnly: caps.readOnly || !caps.canManageSuggestions,
-                    cityhall: caps.cityhall,
-                    onEditPreset: caps.canManageSuggestions
-                      ? (providerId, criterion) =>
-                          requestNavigate(
-                            `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion })}`,
-                          )
-                      : undefined,
-                    onPrepare: (prefill) => {
-                      setWizardPrefill(prefill);
-                      setShowSessionWizard(true);
-                    },
-                    onOpenSession: (id) => requestNavigate(`/session/${encodeURIComponent(id)}`),
-                    onViewAll: () => requestNavigate("/suggestions"),
+                />
+              )}
+
+              {projectForm && (
+                <ProjectFormModal
+                  initial={projectForm.editProject}
+                  profile={projectForm.profile}
+                  onClose={() => setProjectForm(null)}
+                  onSaved={() => refreshProjects()}
+                />
+              )}
+
+              {scratchSettingsOpen && (
+                <ScratchOverridesModal
+                  profile={serverAbout?.profile ?? ""}
+                  onClose={() => setScratchSettingsOpen(false)}
+                />
+              )}
+
+              {tour.tourElement}
+
+              {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
+              {terminalSwitcherOpen && canOpenTerminals && (
+                <TerminalSwitcherOverlay
+                  groups={shellGroups}
+                  newTerminalFor={isMdUp ? newTerminalFor : undefined}
+                  onPick={pickShell}
+                  onNew={() => newTerminal()}
+                  onClose={() => setTerminalSwitcherOpen(false)}
+                />
+              )}
+
+              {tips.isOpen && (
+                <TipsModal
+                  tips={tips.tips}
+                  startIndex={tips.startIndex}
+                  enabled={tips.enabled}
+                  onMarkSeen={tips.markSeen}
+                  onSetEnabled={tips.setEnabled}
+                  onClose={tips.close}
+                />
+              )}
+
+              {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
+
+              {deletingSession && deletingCleanupDefaults && (
+                <DeleteSessionDialog
+                  sessionTitle={deletingSession.title}
+                  branchName={deletingBranchName}
+                  hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
+                  isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
+                  isScratch={deletingSessions.some((session) => session.scratch)}
+                  cleanupDefaults={deletingCleanupDefaults}
+                  defaultToTrash={deletingDefaultToTrash}
+                  affectedSessions={deletingSessions.map((session) => ({
+                    id: session.id,
+                    title: session.title,
+                    isSandboxed: session.is_sandboxed,
+                  }))}
+                  worktreeSharedWith={deletingWorktreeSharedWith}
+                  onConfirm={handleConfirmDelete}
+                  onTrash={handleConfirmTrash}
+                  onCancel={() => setDeletingSessions([])}
+                />
+              )}
+
+              {stoppingSession && (
+                <StopSessionDialog
+                  sessionTitle={stoppingSession.title}
+                  onConfirm={handleConfirmStop}
+                  onCancel={() => setStoppingSessionId(null)}
+                />
+              )}
+
+              {switchViewTarget && switchViewSession && (
+                <SwitchViewDialog
+                  sessionTitle={switchViewSession.title}
+                  toStructured={switchViewTarget.toStructured}
+                  keepsContext={switchViewSession.keeps_context ?? false}
+                  onConfirm={handleConfirmSwitchView}
+                  onCancel={() => setSwitchViewTarget(null)}
+                />
+              )}
+
+              <CommandPalette
+                open={showPalette}
+                onClose={() => {
+                  setShowPalette(false);
+                  setPaletteQuery("");
+                }}
+                actions={[
+                  ...commandActions,
+                  ...conversationActions,
+                  ...pluginPageActions,
+                  suggestionsAction,
+                  ...settingsCommands,
+                  ...pluginCommandActions,
+                ]}
+                onSearchChange={setPaletteQuery}
+                searching={conversationSearching}
+              />
+
+              {pluginLinkPicker}
+
+              {snoozeTargetId && (
+                <SnoozeModal
+                  title="Snooze session"
+                  onCancel={() => setSnoozeTargetId(null)}
+                  onPick={(minutes) => {
+                    reportFeatureUse("snooze_toggle");
+                    const id = snoozeTargetId;
+                    setSnoozeTargetId(null);
+                    void setSessionSnooze(id, minutes).then((result) => {
+                      if (result) applySession(result);
+                      else reportError("Failed to snooze session");
+                    });
                   }}
                 />
               )}
 
-              <div
-                ref={cardRef}
-                // With a Session open on a phone this is a card over the session drawer: the drawer pushes it aside
-                // whole, header and all, as clawbolt's and Claude's apps do.
-                className={`flex-1 flex flex-col min-h-0 min-w-0 ${PUSH_MOTION} ${phoneHome ? "max-md:pt-[var(--phone-header-h)]" : ""} ${
-                  phoneDrawer
-                    ? `max-md:relative max-md:z-10 ${phoneHome ? "max-md:bg-surface-950" : "max-md:bg-surface-900"} max-md:has-[>[data-phone-banner]:not(:empty)]:[--phone-overlay-top:0px]`
-                    : ""
-                } ${
-                  drawerPushed
-                    ? "max-md:translate-x-[var(--aoe-drawer-w)] max-md:rounded-[28px] max-md:overflow-hidden max-md:drawer-card-shadow"
-                    : ""
-                }`}
-              >
-                {phoneDrawer && (
-                  // Floats over the Session, which scrolls beneath it; only its controls take taps. Placed by `top`, not a
-                  // transform, which would bound the ⋯ backdrop's `fixed` box to this strip.
-                  <div className="md:hidden absolute inset-x-0 top-[var(--vv-offset-top,0px)] z-30 pointer-events-none [&_button]:pointer-events-auto [&_[role=menu]]:pointer-events-auto [&_[data-testid=session-title-pill]]:pointer-events-auto">
-                    {topBar}
-                  </div>
-                )}
-                {phoneDrawer && (
-                  // In the card's flow under the floating header, whose menus open over it. While it shows, the
-                  // views below it start right under it instead of clearing the header themselves.
-                  <div
-                    data-phone-banner
-                    className={`md:hidden shrink-0 mx-3 mb-2 ${phoneHome ? "" : "mt-[var(--phone-header-h)]"} ${PHONE_BANNER_CARD}`}
-                  >
-                    {bannerStack}
-                  </div>
-                )}
-                {renderContent()}
-                {phoneDrawer && (
-                  // Dims the pushed-aside Session; a tap on it closes the drawer.
-                  <button
-                    ref={scrimRef}
-                    type="button"
-                    tabIndex={-1}
-                    aria-label="Close sessions"
-                    data-testid="sidebar-drawer-scrim"
-                    onClick={() => setSidebarOpen(false)}
-                    className={`md:hidden absolute inset-0 z-40 bg-black/15 cursor-pointer transition-[opacity,visibility] duration-[400ms] motion-reduce:transition-none ${
-                      drawerPushed ? "opacity-100" : "opacity-0 invisible"
-                    }`}
-                  />
-                )}
-              </div>
-            </div>
-
-            {titleMenu && renderSessionMenu(titleMenu)}
-            {legend && <SidebarLegend anchor={legend.anchor} onClose={closeLegend} opener={legend.opener} />}
-
-            {showSessionWizard && (
-              <SessionWizard
-                restore={wizardRestore ?? undefined}
-                onReopenFailure={reopenFailure}
-                servedProfile={servedProfileReady ? serverAbout?.profile : undefined}
-                onRetryServedProfile={refreshServerAbout}
-                onClose={() => {
-                  setShowSessionWizard(false);
-                  setWizardPrefill(undefined);
-                  clearRestore();
-                }}
-                onOpenSettingsTab={openSettingsTab}
-                onCreated={(session?: SessionResponse) => {
-                  if (session) {
-                    injectSession(session);
-                    navigate(`/session/${encodeURIComponent(session.id)}`);
-                    if (window.innerWidth < 768) setSidebarOpen(false);
+              {singlePane && activeWorkspace && activeSession && (
+                <MobileRightPanelPicker
+                  open={pickerOpen}
+                  active={rightPanelView}
+                  sessionTitle={activeSession.title}
+                  availablePanes={dockPaneIds}
+                  describePane={paneDescriptor}
+                  shellGroups={caps.canUseTerminal ? shellGroups : []}
+                  onPickShell={(shell) => {
+                    setPickerOpen(false);
+                    pickShell(shell);
+                  }}
+                  shownShell={
+                    rightPanelView === "paired" && mobileShellShown
+                      ? {
+                          ...mobileShellShown,
+                          mode: shownShellMode(mobileShellShown.sessionId, mobileShellShown.index),
+                        }
+                      : null
                   }
-                  setShowSessionWizard(false);
-                  setWizardPrefill(undefined);
-                  clearRestore();
-                }}
-                onCreatedInBackground={(session?: SessionResponse) => {
-                  if (!session) return;
-                  injectSession(session);
-                  toastBus.handler?.info(`"${session.title}" is ready`);
-                }}
-                prefill={wizardPrefill}
-                nameOnly={caps.nameOnlyWizard}
-                onEditPreset={
-                  caps.canManageSuggestions
-                    ? ({ providerId, criterion }) => {
-                        setShowSessionWizard(false);
-                        setWizardPrefill(undefined);
-                        const q = new URLSearchParams({
-                          preset_provider: providerId,
-                          preset_criterion: criterion,
-                          from: "suggestions",
-                        });
-                        navigate(`/settings/suggestions?${q}`);
-                      }
+                  onSelect={handlePickView}
+                  onClose={closePicker}
+                />
+              )}
+
+              <textarea
+                ref={setKeyboardProxyRef}
+                data-keyboard-proxy
+                data-session-input={
+                  activeSession &&
+                  !fullPageView &&
+                  (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
+                    ? ""
                     : undefined
                 }
+                aria-hidden="true"
+                tabIndex={-1}
+                // Keep the element in the visual viewport. Focusing a zero-size
+                // textarea thousands of pixels above an iOS PWA can leave WebKit's
+                // focus scroll in a broken state until the keyboard is toggled.
+                // This matches the live terminal's hidden input geometry.
+                className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
+                style={{ caretColor: "transparent", color: "transparent" }}
+                // Typed text stays in this textarea as IME context (see
+                // bindHiddenInput), so keep the OS from rewriting it the way the
+                // live terminal's own hidden input already does.
+                autoCapitalize="off"
+                autoCorrect="off"
+                autoComplete="off"
+                spellCheck={false}
               />
-            )}
-
-            {projectForm && (
-              <ProjectFormModal
-                initial={projectForm.editProject}
-                profile={projectForm.profile}
-                onClose={() => setProjectForm(null)}
-                onSaved={() => refreshProjects()}
-              />
-            )}
-
-            {scratchSettingsOpen && (
-              <ScratchOverridesModal
-                profile={serverAbout?.profile ?? ""}
-                onClose={() => setScratchSettingsOpen(false)}
-              />
-            )}
-
-            {tour.tourElement}
-
-            {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
-            {terminalSwitcherOpen && canOpenTerminals && (
-              <TerminalSwitcherOverlay
-                groups={shellGroups}
-                newTerminalFor={isMdUp ? newTerminalFor : undefined}
-                onPick={pickShell}
-                onNew={() => newTerminal()}
-                onClose={() => setTerminalSwitcherOpen(false)}
-              />
-            )}
-
-            {tips.isOpen && (
-              <TipsModal
-                tips={tips.tips}
-                startIndex={tips.startIndex}
-                enabled={tips.enabled}
-                onMarkSeen={tips.markSeen}
-                onSetEnabled={tips.setEnabled}
-                onClose={tips.close}
-              />
-            )}
-
-            {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
-
-            {deletingSession && deletingCleanupDefaults && (
-              <DeleteSessionDialog
-                sessionTitle={deletingSession.title}
-                branchName={deletingBranchName}
-                hasManagedWorktree={deletingSessions.some((session) => session.has_cleanable_worktree ?? false)}
-                isSandboxed={deletingSessions.some((session) => session.is_sandboxed)}
-                isScratch={deletingSessions.some((session) => session.scratch)}
-                cleanupDefaults={deletingCleanupDefaults}
-                defaultToTrash={deletingDefaultToTrash}
-                affectedSessions={deletingSessions.map((session) => ({
-                  id: session.id,
-                  title: session.title,
-                  isSandboxed: session.is_sandboxed,
-                }))}
-                worktreeSharedWith={deletingWorktreeSharedWith}
-                onConfirm={handleConfirmDelete}
-                onTrash={handleConfirmTrash}
-                onCancel={() => setDeletingSessions([])}
-              />
-            )}
-
-            {stoppingSession && (
-              <StopSessionDialog
-                sessionTitle={stoppingSession.title}
-                onConfirm={handleConfirmStop}
-                onCancel={() => setStoppingSessionId(null)}
-              />
-            )}
-
-            {switchViewTarget && switchViewSession && (
-              <SwitchViewDialog
-                sessionTitle={switchViewSession.title}
-                toStructured={switchViewTarget.toStructured}
-                keepsContext={switchViewSession.keeps_context ?? false}
-                onConfirm={handleConfirmSwitchView}
-                onCancel={() => setSwitchViewTarget(null)}
-              />
-            )}
-
-            <CommandPalette
-              open={showPalette}
-              onClose={() => {
-                setShowPalette(false);
-                setPaletteQuery("");
-              }}
-              actions={[
-                ...commandActions,
-                ...conversationActions,
-                ...pluginPageActions,
-                suggestionsAction,
-                ...settingsCommands,
-                ...pluginCommandActions,
-              ]}
-              onSearchChange={setPaletteQuery}
-              searching={conversationSearching}
-            />
-
-            {pluginLinkPicker}
-
-            {snoozeTargetId && (
-              <SnoozeModal
-                title="Snooze session"
-                onCancel={() => setSnoozeTargetId(null)}
-                onPick={(minutes) => {
-                  reportFeatureUse("snooze_toggle");
-                  const id = snoozeTargetId;
-                  setSnoozeTargetId(null);
-                  void setSessionSnooze(id, minutes).then((result) => {
-                    if (result) applySession(result);
-                    else reportError("Failed to snooze session");
-                  });
-                }}
-              />
-            )}
-
-            {singlePane && activeWorkspace && activeSession && (
-              <MobileRightPanelPicker
-                open={pickerOpen}
-                active={rightPanelView}
-                sessionTitle={activeSession.title}
-                availablePanes={dockPaneIds}
-                describePane={paneDescriptor}
-                shellGroups={caps.canUseTerminal ? shellGroups : []}
-                onPickShell={(shell) => {
-                  setPickerOpen(false);
-                  pickShell(shell);
-                }}
-                shownShell={
-                  rightPanelView === "paired" && mobileShellShown
-                    ? { ...mobileShellShown, mode: shownShellMode(mobileShellShown.sessionId, mobileShellShown.index) }
-                    : null
-                }
-                onSelect={handlePickView}
-                onClose={closePicker}
-              />
-            )}
-
-            <textarea
-              ref={setKeyboardProxyRef}
-              data-keyboard-proxy
-              data-session-input={
-                activeSession &&
-                !fullPageView &&
-                (!singlePane || rightPanelView === "agent" || rightPanelView === "paired")
-                  ? ""
-                  : undefined
-              }
-              aria-hidden="true"
-              tabIndex={-1}
-              // Keep the element in the visual viewport. Focusing a zero-size
-              // textarea thousands of pixels above an iOS PWA can leave WebKit's
-              // focus scroll in a broken state until the keyboard is toggled.
-              // This matches the live terminal's hidden input geometry.
-              className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
-              style={{ caretColor: "transparent", color: "transparent" }}
-              // Typed text stays in this textarea as IME context (see
-              // bindHiddenInput), so keep the OS from rewriting it the way the
-              // live terminal's own hidden input already does.
-              autoCapitalize="off"
-              autoCorrect="off"
-              autoComplete="off"
-              spellCheck={false}
-            />
-          </div>
+            </div>
+          </SandboxImageProvider>
         </SessionActionProvider>
       </DiffScopeContext.Provider>
     </AcpPrefsProvider>

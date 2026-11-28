@@ -57,9 +57,10 @@ vi.mock("../../hooks/useSandboxImageBanner", async (importOriginal) => {
     ...mod,
     useSandboxImageBanner: () =>
       forced
-        ? forced.sandbox
-          ? { kind: "available", image: "img", onUpdate: () => {}, onDismiss: () => {} }
-          : null
+        ? {
+            view: forced.sandbox ? { kind: "available", image: "img", onUpdate: () => {}, onDismiss: () => {} } : null,
+            running: null,
+          }
         : mod.useSandboxImageBanner(),
   };
 });
@@ -70,7 +71,16 @@ vi.mock("../../lib/platform", async (importOriginal) => ({
   installHint: () => hint,
 }));
 
-import { BannerStack } from "../BannerStack";
+import { BannerStack as Stack } from "../BannerStack";
+import { SandboxImageProvider } from "../SandboxImageProvider";
+
+function BannerStack(props: Parameters<typeof Stack>[0]) {
+  return (
+    <SandboxImageProvider>
+      <Stack {...props} />
+    </SandboxImageProvider>
+  );
+}
 
 function status(overrides?: Partial<UpdateStatus>): UpdateStatus {
   return {
@@ -102,9 +112,9 @@ const NAMES: [RegExp, string][] = [
 
 function shown(container: HTMLElement): string[] {
   // Top-level banners only; a banner's own copy feedback is a status region inside it.
-  return Array.from(
-    container.querySelectorAll(':scope > [role="alert"], :scope > [role="status"], :scope > [role="region"]'),
-  ).map((el) => {
+  const top =
+    ':scope > [role="alert"], :scope > [role="status"], :scope > [role="region"], :scope > [data-testid="sandbox-image-banner"]';
+  return Array.from(container.querySelectorAll(top)).map((el) => {
     const text = `${el.getAttribute("aria-label") ?? ""} ${el.textContent ?? ""}`;
     return NAMES.find(([re]) => re.test(text))?.[1] ?? text;
   });
