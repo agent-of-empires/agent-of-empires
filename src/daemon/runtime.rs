@@ -239,6 +239,8 @@ pub struct RuntimeContents {
     pub profiles: Vec<ProfileSnapshot>,
     pub workspace_ordering: Vec<String>,
     pub global_projects: Vec<ProjectResponse>,
+    #[serde(default)]
+    pub sidebar_view: crate::session::config::SidebarView,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

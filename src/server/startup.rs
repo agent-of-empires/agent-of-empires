@@ -1085,6 +1085,7 @@ pub(crate) async fn start_server(
         profile_namespace: Arc::new(RwLock::new(())),
         publication: Arc::new(RwLock::new(())),
         reload_lane: tokio::sync::Mutex::new(()),
+        sidebar_view_lane: Arc::new(tokio::sync::Mutex::new(())),
         canonical_metadata: RwLock::new(canonical_metadata),
         canonical_health: RwLock::new(canonical_health),
         canonical_diagnostics: std::sync::RwLock::new(canonical_diagnostics),

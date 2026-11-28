@@ -694,15 +694,37 @@ pub async fn update_workspace_ordering(
         )
             .into_response();
     }
+    // A request dropped while it waits for the guards leaves nothing behind; once it holds
+    // them, the spawned commit owns them through reconciliation.
+    let namespace = state.profile_namespace.clone().read_owned().await;
+    let publication = state.publication.clone().write_owned().await;
+    match tokio::spawn(commit_workspace_ordering(
+        state,
+        body.order,
+        namespace,
+        publication,
+    ))
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
 
-    let namespace = state.profile_namespace.read().await;
-    let publication = state.publication.write().await;
+/// Owns an admitted ordering write through reconciliation, so a dropped request cannot
+/// release its guards before the canonical metadata catches up with the disk.
+async fn commit_workspace_ordering(
+    state: Arc<AppState>,
+    order: Vec<String>,
+    namespace: tokio::sync::OwnedRwLockReadGuard<()>,
+    publication: tokio::sync::OwnedRwLockWriteGuard<()>,
+) -> axum::response::Response {
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_workspace_ordering(move |ordering| {
-            ordering.order = body.order;
+            ordering.order = order;
             Ok(())
         })
     })
@@ -742,6 +764,318 @@ pub async fn update_workspace_ordering(
             order: &snapshot.value.contents.workspace_ordering,
         }),
     )
+}
+
+/// Change the shared grouping or sort. Clients receive it in the runtime snapshot this
+/// write publishes.
+pub async fn update_sidebar_view(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<crate::daemon::SidebarViewPatch>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(patch) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    // Same lock order and admission as the ordering write: namespace, then this write's lane.
+    let namespace = state.profile_namespace.clone().read_owned().await;
+    let lane = state.sidebar_view_lane.clone().lock_owned().await;
+    match tokio::spawn(commit_sidebar_view(state, patch, namespace, lane)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Owns an admitted sidebar view write through reconciliation, like the ordering commit.
+async fn commit_sidebar_view(
+    state: Arc<AppState>,
+    patch: crate::daemon::SidebarViewPatch,
+    namespace: tokio::sync::OwnedRwLockReadGuard<()>,
+    lane: tokio::sync::OwnedMutexGuard<()>,
+) -> axum::response::Response {
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        crate::session::update_app_state(|app| {
+            if let Some(group_by) = patch.group_by {
+                app.group_by = Some(group_by);
+            }
+            if let Some(sort) = patch.sort {
+                app.sort_order = Some(sort);
+            }
+            app.sidebar_view()
+        })
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(std::convert::identity);
+    let view = match result {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "sidebar view commit failed");
+            *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: Vec::new(),
+            };
+            state.runtime.request_publish();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "message": "Failed to save the sidebar view" })),
+            )
+                .into_response();
+        }
+    };
+    // Bumped before any early return, so a reload that read state.toml before this write
+    // discards itself and the healing reload reads this value.
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let publication = state.publication.write().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    state.canonical_metadata.write().await.sidebar_view = view;
+    state.runtime.request_publish();
+    drop(publication);
+    drop(lane);
+    drop(namespace);
+    let snapshot = match state.runtime.publish(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    crate::server::runtime::mutation_response(
+        &snapshot.value.cursor,
+        Json(snapshot.value.contents.sidebar_view),
+    )
+}
+
+#[cfg(test)]
+mod sidebar_view_tests {
+    use super::*;
+    use crate::daemon::SidebarViewPatch;
+    use crate::session::config::{GroupByMode, SidebarView, SortOrder};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_patch_changes_only_its_own_field_and_reaches_the_snapshot() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let steps = [
+            (
+                SidebarViewPatch {
+                    group_by: Some(GroupByMode::Group),
+                    sort: None,
+                },
+                SidebarView {
+                    group_by: GroupByMode::Group,
+                    sort: SortOrder::Custom,
+                },
+            ),
+            (
+                SidebarViewPatch {
+                    group_by: None,
+                    sort: Some(SortOrder::Newest),
+                },
+                SidebarView {
+                    group_by: GroupByMode::Group,
+                    sort: SortOrder::Newest,
+                },
+            ),
+        ];
+        for (patch, expected) in steps {
+            let response = update_sidebar_view(State(state.clone()), Ok(Json(patch)))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let snapshot = state.runtime.publish(&state).await.unwrap();
+            assert_eq!(snapshot.value.contents.sidebar_view, expected);
+            assert_eq!(
+                crate::session::Config::load()
+                    .unwrap()
+                    .app_state
+                    .sidebar_view(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_patch_leaves_the_stored_view_unchanged() {
+        use crate::server::test_support;
+        use tower::ServiceExt;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let read_only = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.read_only = true,
+        );
+        let cityhall = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.cityhall_mode = true,
+        );
+        let degraded = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+        );
+        *degraded.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+            code: crate::daemon::ReloadFailureCode::Metadata,
+            profiles: Vec::new(),
+        };
+        for (name, state, status) in [
+            ("read-only", read_only, StatusCode::FORBIDDEN),
+            ("CityHall", cityhall, StatusCode::FORBIDDEN),
+            ("degraded", degraded, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = test_support::build_router_for_test(state)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PATCH")
+                        .uri("/api/sidebar-view")
+                        .header("host", "localhost")
+                        .header("content-type", "application/json")
+                        .extension(axum::extract::ConnectInfo(
+                            "127.0.0.1:5555".parse::<std::net::SocketAddr>().unwrap(),
+                        ))
+                        .body(axum::body::Body::from(r#"{"sort":"name"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{name}");
+            assert_eq!(
+                crate::session::Config::load()
+                    .unwrap()
+                    .app_state
+                    .sidebar_view()
+                    .sort,
+                SortOrder::Custom,
+                "{name}"
+            );
+        }
+    }
+
+    /// A stalled write holds no publication guard, and once admitted it finishes after its
+    /// request is dropped. Health lost during the write still invalidates older reloads.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stalled_write_frees_publication_and_outlives_its_dropped_request() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        for degrade_mid_write in [false, true] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                crate::session::update_app_state(|_| {
+                    held_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                })
+                .unwrap();
+            });
+            held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+            let patch = SidebarViewPatch {
+                group_by: None,
+                sort: Some(SortOrder::Name),
+            };
+            let write = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while state.sidebar_view_lane.try_lock().is_ok() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the write never started"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(
+                tokio::time::timeout(Duration::from_secs(5), state.publication.write())
+                    .await
+                    .expect("a stalled sidebar write must not hold publication"),
+            );
+            assert!(!write.is_finished());
+            let epoch = state.mutation_epoch.load(Ordering::SeqCst);
+            if degrade_mid_write {
+                *state.canonical_health.write().await = crate::daemon::RuntimeHealth::Degraded {
+                    code: crate::daemon::ReloadFailureCode::Metadata,
+                    profiles: Vec::new(),
+                };
+                release_tx.send(()).unwrap();
+                let response = write.await.unwrap().into_response();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            } else {
+                write.abort();
+                assert!(write.await.is_err_and(|error| error.is_cancelled()));
+                release_tx.send(()).unwrap();
+            }
+            holder.join().unwrap();
+            // The admitted commit keeps its lane until the canonical view matches the disk.
+            let _lane =
+                tokio::time::timeout(Duration::from_secs(10), state.sidebar_view_lane.lock())
+                    .await
+                    .expect("the detached commit never finished");
+            assert!(state.mutation_epoch.load(Ordering::SeqCst) > epoch);
+            let expected = if degrade_mid_write {
+                SortOrder::Custom
+            } else {
+                SortOrder::Name
+            };
+            assert_eq!(
+                state.canonical_metadata.read().await.sidebar_view.sort,
+                expected
+            );
+        }
+    }
+
+    /// A request still waiting for the namespace guard leaves no commit behind when dropped.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_request_dropped_before_admission_writes_nothing() {
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let exclusive = state.profile_namespace.write().await;
+        let patch = SidebarViewPatch {
+            group_by: None,
+            sort: Some(SortOrder::Name),
+        };
+        let write = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
+        let ordering = tokio::spawn(update_workspace_ordering(
+            State(state.clone()),
+            Ok(Json(UpdateWorkspaceOrderingBody {
+                order: vec!["w".into()],
+            })),
+        ));
+        tokio::task::yield_now().await;
+        write.abort();
+        ordering.abort();
+        assert!(write.await.is_err_and(|error| error.is_cancelled()));
+        assert!(ordering.await.is_err_and(|error| error.is_cancelled()));
+        drop(exclusive);
+        // Both writers are gone, so the guards they would hold are free at once.
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), state.profile_namespace.write())
+                .await
+                .expect("a dropped request kept a namespace guard"),
+        );
+        let stored = crate::session::Config::load().unwrap().app_state;
+        assert_eq!(stored.sidebar_view().sort, SortOrder::Custom);
+        assert!(crate::session::load_workspace_ordering()
+            .unwrap()
+            .order
+            .is_empty());
+    }
 }
 
 #[cfg(test)]

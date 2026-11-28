@@ -45,11 +45,12 @@ pub use wire::{
     PromptAttachmentKind, PromptAttachmentRef, PromptOrigin, PurgeOutcome, QueuedPromptEntry,
     ReclaimOwnershipBody, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
     ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
-    SessionLookupError, SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody,
-    StopAuxiliaryBody, TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome,
-    TrashRelocationOutcome, TrashSessionBody, Tristate, UpdateArchiveBody, UpdateDiffBaseBody,
-    UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody,
-    UpdateSnoozeBody, UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
+    SessionLookupError, SessionResponse, SessionsEnvelope, SetWorktreeNameBody, SidebarViewPatch,
+    StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget, TerminalTargetStatus,
+    TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate, UpdateArchiveBody,
+    UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody,
+    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 pub use wire::{
     ApplyUpdateBody, InstallPreviewBody, PluginJob, PluginJobAccepted, PluginJobKind, PluginJobLog,
@@ -1003,6 +1004,20 @@ impl DaemonClient {
         let url = self
             .sessions_url
             .join("groups")
+            .map_err(|_| DaemonClientError::Transport)?;
+        self.request_mutation(self.http.patch(url).json(body), epoch)
+            .await
+    }
+
+    /// Change the shared sidebar grouping or sort.
+    pub async fn set_sidebar_view(
+        &self,
+        body: &SidebarViewPatch,
+        epoch: &str,
+    ) -> Result<RuntimeCursor, DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("sidebar-view")
             .map_err(|_| DaemonClientError::Transport)?;
         self.request_mutation(self.http.patch(url).json(body), epoch)
             .await

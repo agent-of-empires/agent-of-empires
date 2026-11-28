@@ -4605,7 +4605,7 @@ impl HomeView {
         // Dynamic session/group entries, one per flat_items row, so the user can
         // fuzzy-search and jump to it. In-flight sessions are tagged in the title so it is
         // clear that Stop/Delete will be a no-op for them.
-        for (idx, item) in self.flat_items.iter().enumerate() {
+        for item in &self.flat_items {
             match item {
                 Item::Session { id, .. } => {
                     let Some(inst) = self.get_instance(id) else {
@@ -4635,10 +4635,15 @@ impl HomeView {
                         group: PaletteGroup::Sessions,
                         keywords: vec!["session", "jump", "select"],
                         hotkey: String::new(),
-                        payload: PaletteAction::JumpToCursor(idx),
+                        payload: PaletteAction::JumpToSession(id.clone()),
                     });
                 }
-                Item::Group { name, path, .. } => {
+                Item::Group {
+                    name,
+                    path,
+                    profile,
+                    ..
+                } => {
                     // The synthetic Archived header (and its Project-mode sub-folders)
                     // is not a real group, so skip it: the palette must not surface the
                     // sentinel path or offer Jump-to-group navigation the rest of the
@@ -4663,7 +4668,11 @@ impl HomeView {
                         group: PaletteGroup::Groups,
                         keywords: vec!["group", "jump"],
                         hotkey: String::new(),
-                        payload: PaletteAction::JumpToCursor(idx),
+                        payload: PaletteAction::JumpToGroup {
+                            path: path.clone(),
+                            profile: profile.clone(),
+                            group_by: self.group_by,
+                        },
                     });
                 }
                 Item::Suggested { .. } => {}
@@ -4700,7 +4709,7 @@ impl HomeView {
 
     /// Apply a palette pick: `Key` re-enters the action dispatch with the synthesized
     /// event (bypassing strict normalization, which the palette already accounts for),
-    /// `JumpToCursor` moves the selection.
+    /// `JumpToSession` and `JumpToGroup` move the selection.
     fn dispatch_palette_action(
         &mut self,
         action: PaletteAction,
@@ -4729,9 +4738,22 @@ impl HomeView {
             }
             PaletteAction::Activate => self.activate_selected_session(),
             PaletteAction::LiveSend => self.start_live_send(),
-            PaletteAction::JumpToCursor(idx) => {
-                if !self.flat_items.is_empty() {
-                    self.cursor = idx.min(self.flat_items.len() - 1);
+            PaletteAction::JumpToSession(id) => {
+                self.jump_to_session_id(&id);
+                None
+            }
+            PaletteAction::JumpToGroup {
+                path,
+                profile,
+                group_by,
+            } => {
+                if group_by != self.group_by {
+                    return None;
+                }
+                if let Some(idx) = self.flat_items.iter().position(|item| {
+                    matches!(item, Item::Group { path: p, profile: pr, .. } if *p == path && *pr == profile)
+                }) {
+                    self.cursor = idx;
                     self.update_selected();
                 }
                 None
@@ -5145,33 +5167,86 @@ impl HomeView {
         if new_order != self.sort_order {
             crate::tui::telemetry::report_feature_use(new_order.into());
         }
-        self.sort_order = new_order;
-        if self.search_active && !self.search_query.value().is_empty() {
-            self.refresh_flat_items();
-            self.update_search();
-        } else {
-            self.rebuild_flat_items();
-            self.reseat_cursor_after_rebuild();
-        }
-        let sort_order = self.sort_order;
-        if let Err(e) = update_app_state(|state| {
-            state.sort_order = Some(sort_order);
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to save sort order: {}", e);
-        }
+        self.show_sidebar_view(self.group_by, new_order);
+        self.save_sidebar_view(crate::daemon::SidebarViewPatch {
+            sort: Some(new_order),
+            ..Default::default()
+        });
     }
 
     pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
         crate::tui::telemetry::report_feature_use(new_mode.into());
-        self.group_by = new_mode;
-        self.rebuild_flat_items();
-        self.reseat_cursor_after_rebuild();
-        let group_by = self.group_by;
-        if let Err(e) = update_app_state(|state| {
-            state.group_by = Some(group_by);
-        }) {
-            tracing::warn!(target: "tui.input", "Failed to save group_by mode: {}", e);
+        self.show_sidebar_view(new_mode, self.sort_order);
+        self.save_sidebar_view(crate::daemon::SidebarViewPatch {
+            group_by: Some(new_mode),
+            ..Default::default()
+        });
+    }
+
+    pub(super) fn show_sidebar_view(&mut self, group_by: GroupByMode, sort_order: SortOrder) {
+        self.group_by = group_by;
+        self.sort_order = sort_order;
+        if self.search_active && !self.search_query.value().is_empty() {
+            self.refresh_flat_items();
+            self.update_search();
+            if self.search_matches.is_empty() {
+                self.reseat_cursor_after_rebuild();
+            }
+        } else {
+            self.rebuild_flat_items();
+            self.reseat_cursor_after_rebuild();
         }
+    }
+
+    /// The Daemon owns the choice: a connected one that refuses the write at once keeps its
+    /// value, while an offline view keeps the pick.
+    fn save_sidebar_view(&mut self, patch: crate::daemon::SidebarViewPatch) {
+        if let Err(error) = self.session_feed.submit_sidebar_view(patch) {
+            self.flash_status(format!("Grouping and sort not saved: {error}"));
+            if !matches!(
+                self.session_feed.mutation_block(),
+                Some(crate::tui::session_feed::MutationBlock::Offline)
+            ) {
+                self.converge_sidebar_view();
+            }
+        }
+    }
+
+    /// Show the applied snapshot's grouping and sort once no pick is on its way. With no
+    /// snapshot, forget the baseline so the next one is adopted even when it repeats the value
+    /// seen before. Returns whether the rows changed.
+    pub(super) fn converge_sidebar_view(&mut self) -> bool {
+        if self.session_feed.sidebar_view_pending() {
+            return false;
+        }
+        let Some(view) = self
+            .session_feed
+            .applied_snapshot()
+            .map(|snapshot| snapshot.contents.sidebar_view)
+        else {
+            self.observed_sidebar_view = None;
+            return false;
+        };
+        self.observed_sidebar_view = Some(view);
+        if (view.group_by, view.sort) == (self.group_by, self.sort_order) {
+            return false;
+        }
+        self.show_sidebar_view(view.group_by, view.sort);
+        true
+    }
+
+    /// Follow the Daemon's grouping and sort when a snapshot changes it, unless this view's
+    /// own change is still on its way there.
+    pub(super) fn adopt_sidebar_view(&mut self, view: crate::session::config::SidebarView) {
+        // Pending first: a value seen while this view's write is in flight stays unrecorded,
+        // so the next snapshot still counts as a change.
+        if self.session_feed.sidebar_view_pending()
+            || self.observed_sidebar_view.replace(view) == Some(view)
+            || (view.group_by == self.group_by && view.sort == self.sort_order)
+        {
+            return;
+        }
+        self.show_sidebar_view(view.group_by, view.sort);
     }
 
     /// Info-dialog copy for a rename/delete attempted on a header under the Repository grouping.
@@ -7346,12 +7421,17 @@ impl HomeView {
         let Some(state) = self.live_send.clone() else {
             return;
         };
-        if !self
-            .get_instance(&state.session_id)
-            .is_some_and(|inst| self.hidden_by_filter(inst))
-        {
+        let Some(by_filter) = self.get_instance(&state.session_id).and_then(|inst| {
+            if self.hidden_by_filter(inst) {
+                Some(true)
+            } else {
+                self.session_row(&state.session_id)
+                    .is_none()
+                    .then_some(false)
+            }
+        }) else {
             return;
-        }
+        };
         let selection = (
             self.cursor,
             self.selected_session.clone(),
@@ -7365,7 +7445,11 @@ impl HomeView {
             self.selected_group,
             self.selected_group_profile,
         ) = selection;
-        self.flash_status("Live mode ended: its session is hidden (y to show)");
+        self.flash_status(if by_filter {
+            "Live mode ended: its session is hidden (y to show)"
+        } else {
+            "Live mode ended: its session is under a collapsed header"
+        });
     }
 
     /// Tear down live-send state and restore the tmux window's automatic sizing:

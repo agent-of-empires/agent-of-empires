@@ -150,6 +150,7 @@ impl HomeView {
         self.session_feed_failed_cursor = None;
         self.canonical_metadata_lag = None;
         self.pending_created_attach = None;
+        self.observed_sidebar_view = None;
         self.set_sidebar_source(crate::tui::session_feed::SidebarSource::Connecting, None);
         self.session_feed
             .connect_prepared(self.active_profile.clone().unwrap_or_default(), prepared);
@@ -861,6 +862,7 @@ impl HomeView {
                                 self.canonical_metadata_lag = None;
                                 self.reload_failure_state.record_canonical(&Ok(()));
                                 self.observed_workspace_ordering = persisted_ordering;
+                                self.adopt_sidebar_view(snapshot.contents.sidebar_view);
                                 metadata_changed |=
                                     self.session_feed.mark_snapshot_applied(snapshot);
                                 snapshot_applied = true;
@@ -1157,6 +1159,15 @@ impl HomeView {
         let row_outcomes = self.session_feed.drain_session_outcomes();
         let namespace = self.session_feed.drain_namespace_result();
         let mut changed = !row_outcomes.is_empty() || namespace.is_some();
+        if let Some(result) = self.session_feed.drain_sidebar_view_result() {
+            if let Err(error) = result {
+                self.flash_status(format!("Grouping and sort not saved: {error}"));
+                changed = true;
+            }
+            // Snapshots applied while the write was pending were not shown or recorded, so
+            // converge on the Daemon's value, which may carry another Client's change.
+            changed |= self.converge_sidebar_view();
+        }
         let mut purge_notes: Vec<(String, String)> = Vec::new();
         for (id, outcome) in row_outcomes {
             match outcome {

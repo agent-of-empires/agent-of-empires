@@ -299,6 +299,7 @@ impl NativeRuntime {
             profiles: metadata.profiles.clone(),
             workspace_ordering,
             global_projects: metadata.global_projects.clone(),
+            sidebar_view: metadata.sidebar_view,
         };
         if contents.health == RuntimeHealth::Healthy {
             self.owner_diagnostics.send_if_modified(|current| {

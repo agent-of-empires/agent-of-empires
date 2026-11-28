@@ -318,6 +318,16 @@ pub struct MoveGroupBody {
     pub source: GroupLocation,
     pub target: GroupLocation,
 }
+/// Change the shared grouping, the sort, or both; an absent field keeps its value.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidebarViewPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<crate::session::config::GroupByMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<crate::session::config::SortOrder>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct CollapseGroupBody {
     pub group: GroupLocation,

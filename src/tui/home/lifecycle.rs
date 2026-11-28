@@ -76,6 +76,7 @@ impl HomeView {
             storages,
             active_profile,
             instances: Self::build_instances_map(all_instances),
+            observed_sidebar_view: None,
             observed_workspace_ordering: crate::session::load_workspace_ordering()
                 .map(|ordering| ordering.order)
                 .unwrap_or_default(),

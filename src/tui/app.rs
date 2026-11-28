@@ -2942,6 +2942,7 @@ impl App {
                 if let Some(serve) = &mut self.home.serve_view {
                     serve.finish_launch(Ok(prepared.target), None);
                 }
+                self.home.observed_sidebar_view = None;
                 self.home.session_feed.connect_prepared(
                     self.home.active_profile.clone().unwrap_or_default(),
                     Some(prepared.runtime),

@@ -58,8 +58,16 @@ pub enum PaletteAction {
     Activate,
     /// Enter live-send mode, `Tab` being likewise not relocatable.
     LiveSend,
-    /// Move the cursor to a position in `flat_items`.
-    JumpToCursor(usize),
+    /// Select this session's row. Rows can move while the palette is open, so entries name
+    /// their target rather than its index.
+    JumpToSession(String),
+    /// Select this group header's row. Header paths of different groupings can collide, so
+    /// a pick made under another grouping selects nothing.
+    JumpToGroup {
+        path: String,
+        profile: Option<String>,
+        group_by: crate::session::config::GroupByMode,
+    },
     ToolSession(String),
     /// Open this http(s) link in the browser.
     OpenLink(String),
@@ -528,18 +536,18 @@ mod tests {
             ));
         }
 
-        // A dynamic session entry round-trips its cursor index.
+        // A dynamic session entry round-trips its session id.
         let entries = vec![PaletteCommand {
             id: "jump-test",
             title: "Jump to my-session".to_string(),
             group: PaletteGroup::Sessions,
             keywords: vec!["session"],
             hotkey: String::new(),
-            payload: PaletteAction::JumpToCursor(7),
+            payload: PaletteAction::JumpToSession("s7".into()),
         }];
         match CommandPaletteDialog::new(entries).handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(PaletteAction::JumpToCursor(idx)) => assert_eq!(idx, 7),
-            _ => panic!("expected JumpToCursor"),
+            DialogResult::Submit(PaletteAction::JumpToSession(id)) => assert_eq!(id, "s7"),
+            _ => panic!("expected JumpToSession"),
         }
     }
 
