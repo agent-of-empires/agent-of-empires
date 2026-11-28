@@ -466,3 +466,23 @@ async fn rewire_invalidates_on_inode_change_with_same_canonical_path() {
     e.view.rewire_disk_subscriptions(&names(&[profile]));
     assert_eq!(identities(&e.view), (replacement, replacement));
 }
+
+/// A peer that deletes and recreates the active profile between two snapshots
+/// leaves the held store bound to the old directory; projection must rebind.
+#[tokio::test]
+#[serial]
+async fn projection_rebinds_a_profile_recreated_between_snapshots() {
+    let mut e = env("recycled", &[]);
+    let snapshot = super::tests::fixture_snapshot(Vec::new(), "recycled", "test", 0);
+    e.view
+        .apply_canonical_projection(&snapshot, true)
+        .expect("first projection");
+
+    let dir = crate::session::get_profile_dir_path("recycled").unwrap();
+    std::fs::remove_dir_all(&dir).expect("remove profile");
+    std::fs::create_dir_all(&dir).expect("recreate profile");
+
+    e.view
+        .apply_canonical_projection(&snapshot, true)
+        .expect("projection after the profile was recreated");
+}
