@@ -70,8 +70,17 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                         });
                         continue;
                     }
+                    // The native identity still owns its file while a plugin takes the listing.
                     if let Some(agent) =
                         crate::session::resolved_agent_for(&profile, tool, detect_as)
+                            .or_else(|| crate::agents::native_definition(tool))
+                            .or_else(|| {
+                                crate::agents::native_definition(
+                                    &crate::tmux::status_rules::effective_detect_as(
+                                        &profile, tool, detect_as,
+                                    ),
+                                )
+                            })
                     {
                         if agent.hook_config.is_some() {
                             push_relocated_target(&mut targets, agent, root, &config);
@@ -565,6 +574,39 @@ mod tests {
             &[],
             &Default::default(),
         ));
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn relocated_claude_wrapper_is_a_hook_target_while_a_plugin_takes_claude_over() {
+        let app = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _home = crate::session::test_support::isolate_home(app.path());
+        crate::session::test_support::install_agent_plugin(
+            "aoe.claude",
+            "id = \"aoe.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
+             command = \"claude-next\"\n[agent_integrations.launch]\noneshot_flag = \"-p\"\n",
+        );
+        assert!(crate::agents::get_agent("claude").is_none());
+
+        let relocated = app.path().join("work-claude-dir");
+        let profile_dir = crate::session::get_profile_dir("relocated-claude").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "[session.agent_config_dir]\nwork-claude = \"{}\"\n\
+                 [session.agent_detect_as]\nwork-claude = \"claude\"\n",
+                relocated.display()
+            ),
+        )
+        .unwrap();
+
+        assert!(iter_hook_targets()
+            .into_iter()
+            .any(|target| target.agent_name == "claude"
+                && target.path == relocated.join("settings.json")));
     }
 
     #[test]
