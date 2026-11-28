@@ -239,15 +239,15 @@ pub(super) fn allowlisted_env_pairs_for(allowlist: Option<&[String]>) -> Vec<(St
 
 /// AoE's own adapter defaults, or a plugin's declared ones, applied below every explicit
 /// env layer so a user-set value always wins.
-pub(super) fn adapter_default_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
-    if let Some(env) = &config.spec.plugin_env {
+pub(super) fn adapter_default_env_pairs(spec: &AgentSpec) -> Vec<(String, String)> {
+    if let Some(env) = &spec.plugin_env {
         return env
             .defaults
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
     }
-    crate::acp::agent_compat::ExpectedAgent::from_command(&config.spec.command)
+    crate::acp::agent_compat::ExpectedAgent::from_command(&spec.command)
         .default_env()
         .iter()
         .map(|&(key, value)| (key.to_string(), value.to_string()))
@@ -273,7 +273,7 @@ pub(super) fn apply_env_filter(
     extra_path_dirs: &[PathBuf],
 ) -> EnvKeys {
     let mut keys = EnvKeys::default();
-    for (key, value) in adapter_default_env_pairs(config) {
+    for (key, value) in adapter_default_env_pairs(&config.spec) {
         cmd.env(&key, value);
         keys.forwarded.push(key);
     }

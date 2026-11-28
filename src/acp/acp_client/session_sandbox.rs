@@ -198,7 +198,7 @@ pub(super) fn build_sandbox_docker_argv(
         &mut seen_keys,
         &config.provider_env,
         allowlisted_env_pairs(config),
-        adapter_default_env_pairs(config),
+        adapter_default_env_pairs(&config.spec),
         config.spec.host_only_env(),
     ) {
         if forwards {
@@ -287,7 +287,8 @@ pub(super) fn claim_launch_env(
 
 /// The environment a sandboxed launch of the adapter `spec` runs with, as far as its
 /// authentication is concerned: `sandbox_env` first, then what `claim_launch_env` forwards
-/// of the request's `provider_env` and the allowlisted host variables the daemon has set.
+/// of the request's `provider_env`, the allowlisted host variables the daemon has set and the
+/// adapter's defaults (a plugin's may carry the credential).
 /// Resolved in memory for the admission check; the request's values are never stored.
 pub fn effective_launch_env(
     sandbox_env: &[crate::containers::EnvEntry],
@@ -295,12 +296,11 @@ pub fn effective_launch_env(
     spec: Option<&crate::acp::AgentSpec>,
 ) -> Vec<crate::containers::EnvEntry> {
     let mut claimed = sandbox_env.iter().map(|e| e.key().to_string()).collect();
-    // AoE's adapter defaults carry no authentication, so they take no part in the admission.
     let forwarded = claim_launch_env(
         &mut claimed,
         request,
         allowlisted_env_pairs_for(spec.and_then(|s| s.env_allowlist.as_deref())),
-        Vec::new(),
+        spec.map_or_else(Vec::new, adapter_default_env_pairs),
         spec.map_or(&[], |s| s.host_only_env()),
     )
     .into_iter()
@@ -659,6 +659,32 @@ mod tests {
                 .all(|entry| entry.key() != "ZZ_HOME"),
             "the admission drops a host-only key too"
         );
+    }
+
+    /// A plugin default such as a credential satisfies the admission like the launch it models;
+    /// without any route the admission sees no credential.
+    #[test]
+    fn effective_launch_env_counts_a_plugin_default() {
+        let mut spec = crate::acp::agent_registry::AgentRegistry::with_defaults()
+            .get("claude")
+            .expect("claude default")
+            .clone();
+        spec.env_allowlist = None;
+        spec.plugin_env = Some(aoe_plugin_api::agent_integration::AcpEnv {
+            allowlist: vec![],
+            host_only: vec![],
+            defaults: [("ZZ_ADMIT_KEY".to_string(), "k".to_string())].into(),
+        });
+        let keys = |spec: &crate::acp::AgentSpec| -> Vec<String> {
+            effective_launch_env(&[], &[], Some(spec))
+                .iter()
+                .map(|e| e.key().to_string())
+                .collect()
+        };
+        assert_eq!(keys(&spec), vec!["ZZ_ADMIT_KEY"]);
+
+        spec.plugin_env = None;
+        assert!(!keys(&spec).contains(&"ZZ_ADMIT_KEY".to_string()));
     }
 
     /// The request's `provider_env` must win a shared key over the adapter's
