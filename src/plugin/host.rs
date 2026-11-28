@@ -3222,7 +3222,14 @@ rl.on('line', (line) => {
         // Replies to the first request, echoing its envelope id.
         let echo = r##"["sh", "-c", 'read line; id=${line#*\"id\":\"}; id=${id%%\"*}; echo "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"ok\":true}}"; sleep 60']"##;
         install_worker("acme.echo", echo);
-        install_worker("acme.silent", r#"["sh", "-c", "read line; sleep 60"]"#);
+        let received = temp.path().join("silent-received");
+        install_worker(
+            "acme.silent",
+            &format!(
+                r#"["sh", "-c", "read line; touch {}; sleep 60"]"#,
+                received.display()
+            ),
+        );
         install_worker("acme.quitter", r#"["sh", "-c", "read line; exit 0"]"#);
         let registry = crate::plugin::reload_registry();
         let host = PluginHost::new(
@@ -3234,17 +3241,17 @@ rl.on('line', (line) => {
         .unwrap();
         host.start(&registry).await;
 
-        let declared = |id: &str| {
+        let declared = |id: &str, timeout_ms: u64| {
             aoe_plugin_api::PluginManifest::from_toml_str(&format!(
                 "id = \"{id}\"\nname = \"P\"\nversion = \"1.0.0\"\napi_version = 29\n\
                  capabilities = [\"runtime.worker\"]\n\n\
                  [runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n\n\
-                 [[provider_calls]]\nname = \"status\"\ntimeout_ms = 500\n"
+                 [[provider_calls]]\nname = \"status\"\ntimeout_ms = {timeout_ms}\n"
             ))
             .unwrap()
         };
-        let call = |id: &'static str| {
-            let manifest = declared(id);
+        let call = |id: &'static str, timeout_ms: u64| {
+            let manifest = declared(id, timeout_ms);
             let hash = registry.get(id).unwrap().manifest_hash.clone();
             let host = host.clone();
             async move {
@@ -3259,15 +3266,23 @@ rl.on('line', (line) => {
             }
         };
 
-        assert_eq!(call("acme.echo").await.unwrap(), json!({"ok": true}));
+        assert_eq!(
+            call("acme.echo", 10_000).await.unwrap(),
+            json!({"ok": true})
+        );
+        let silent = tokio::spawn(call("acme.silent", 2_000));
+        wait_until("the silent worker to receive the request", || async {
+            received.exists()
+        })
+        .await;
         assert!(matches!(
-            call("acme.silent").await,
+            silent.await.unwrap(),
             Err(crate::plugin::provider_call::ProviderCallError::Worker(
                 WorkerRequestError::Timeout
             ))
         ));
         assert!(matches!(
-            call("acme.quitter").await,
+            call("acme.quitter", 10_000).await,
             Err(crate::plugin::provider_call::ProviderCallError::Worker(
                 WorkerRequestError::WorkerGone
             ))
