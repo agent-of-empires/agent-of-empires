@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
-import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
+import type { AgentProfile, CardKind } from "../../lib/agentProfile";
 import { classifyMcp } from "../../lib/mcpClassify";
 import { classifyMemory } from "../../lib/memoryClassify";
 import { reclassifyBash } from "../../lib/toolReclassify";
@@ -81,23 +81,23 @@ const KIND_CARDS: Record<string, (props: { tool: ToolCall; result?: ActivityRow 
 function renderToolCard(tool: ToolCall, result: ActivityRow | undefined, profile: AgentProfile) {
   // Structured recall wins over the path-sniffing memory classifier.
   if (tool.memory_recall) return <MemoryRecallCard tool={tool} result={result} />;
-  const memory = classifyMemory(tool);
+  const memory = classifyMemory(tool, profile);
   if (memory.isMemory) return <MemoryCard tool={tool} result={result} hit={memory} />;
   const mcp = classifyMcp(tool, profile);
   if (mcp.isMcp) return <McpToolCard tool={tool} result={result} server={mcp.server} verb={mcp.verb} />;
-  const { capabilities, specialTitles } = profile;
-  if (capabilities.skills) {
+  const { special_titles: specialTitles } = profile;
+  if (profile.skills) {
     const skill = classifySkill(tool, profile);
     if (skill.isSkill) return <SkillToolCard tool={tool} result={result} skillName={skill.name} />;
   }
-  if (capabilities.todos) {
+  if (profile.todos) {
     const todos = classifyTodoWrite(tool, profile);
     if (todos.isTodoWrite) return <TodoUpdateCard tool={tool} result={result} todos={todos.todos} />;
   }
   if (classifyWorkflow(tool, profile)) return <WorkflowToolCard tool={tool} result={result} />;
   const special =
-    (capabilities.wakeup ? classifySpecialTool(tool, specialTitles.scheduleNames, SCHEDULE_TOOLS) : null) ??
-    classifySpecialTool(tool, specialTitles.harnessNames, HARNESS_TOOLS);
+    (profile.supports_wakeup_tools ? classifySpecialTool(tool, specialTitles.schedule_names, SCHEDULE_TOOLS) : null) ??
+    classifySpecialTool(tool, specialTitles.harness_names, HARNESS_TOOLS);
   if (special) return <SpecialToolCard tool={tool} result={result} name={special} />;
   const { kind, provenance } = reclassifyBash(tool);
   const effectiveKind = resolveEffectiveKind(tool, kind, profile);
@@ -114,7 +114,7 @@ function resolveEffectiveKind(tool: ToolCall, reclassifiedKind: string, profile:
   if (KNOWN_KINDS.has(reclassifiedKind)) return reclassifiedKind;
   const name = tool.name?.trim() ?? "";
   if (!name) return reclassifiedKind;
-  for (const [card, aliases] of Object.entries(profile.aliases) as [CardKind, string[]][]) {
+  for (const [card, aliases] of Object.entries(profile.card_aliases) as [CardKind, string[]][]) {
     if (aliases.includes(name)) return card;
   }
   return reclassifiedKind;

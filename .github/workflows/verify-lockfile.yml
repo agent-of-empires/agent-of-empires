@@ -1,0 +1,26 @@
+# Fails when .github/workflows/actions.lock is out of sync with the
+# workflows or a locked pin no longer verifies upstream.
+
+name: verify-lockfile
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify actions lockfile
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-verify-lockfile-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: gh extension install github/gh-actions-lock --pin v0.5.1
+      - run: gh actions-lock --verify

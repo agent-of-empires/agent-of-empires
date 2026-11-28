@@ -109,11 +109,7 @@ fn the_row_sits_directly_above_archived_and_trash() {
         (true, false, true),
         (true, true, true),
     ];
-    for group_by in [
-        GroupByMode::Manual,
-        GroupByMode::Project,
-        GroupByMode::Status,
-    ] {
+    for group_by in [GroupByMode::Group, GroupByMode::Project] {
         for (archived, collapsed, trashed) in cases {
             let case =
                 format!("{group_by:?} archived={archived} collapsed={collapsed} trashed={trashed}");
@@ -1083,19 +1079,6 @@ fn z_in_the_pane_dismisses_then_restores_within_the_undo_window() {
 
 #[test]
 #[serial]
-fn status_grouping_keeps_the_suggested_row() {
-    use crate::session::config::GroupByMode;
-    let mut env = create_test_env_with_sessions(1);
-    env.view
-        .suggestions_feed
-        .set_snapshot_for_test(snapshot(2, &[]));
-    env.view.group_by = GroupByMode::Status;
-    env.view.rebuild_flat_items();
-    assert_eq!(suggested_rows(&env).len(), 1);
-}
-
-#[test]
-#[serial]
 fn a_failed_background_load_keeps_the_snapshot_and_stays_quiet() {
     let mut env = create_test_env_with_sessions(1);
     env.view
@@ -1316,7 +1299,7 @@ fn the_suggestions_tip_signal_follows_the_daemon_snapshot() {
 fn an_undelivered_first_prompt_is_announced_once_per_failure() {
     let mut env = create_test_env_with_sessions(1);
     let instance = env.view.instances().next().unwrap().clone();
-    let mut row = crate::server::api::sessions::session_response_from_instance(&instance, false);
+    let mut row = crate::server::api::sessions::session_response_from_instance(&instance);
     row.initial_prompt_error = Some("the agent was not ready".into());
     let announce = |env: &mut TestEnv, row: &crate::daemon::SessionResponse| {
         env.view.announce_prompt_failure(row);
@@ -1464,7 +1447,7 @@ fn blocked_on_folder_trust() -> (TestEnv, String, mpsc::Receiver<String>) {
     use crate::tui::session_feed::SessionFeedResult;
     let mut env = create_test_env_with_sessions(1);
     let instance = env.view.instances().next().unwrap().clone();
-    let mut row = crate::server::api::sessions::session_response_from_instance(&instance, false);
+    let mut row = crate::server::api::sessions::session_response_from_instance(&instance);
     row.initial_prompt_error = Some("Claude Code is asking whether to trust this folder.".into());
     row.initial_prompt_error_code = Some("agent_folder_not_trusted".into());
     let rows = fixture_snapshot(vec![row], "test", "test", 5);

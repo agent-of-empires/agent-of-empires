@@ -28,13 +28,45 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    # Path-gates the expensive jobs on pull requests; push and merge_group
+    # skip it, and its dependents then run in full. RunsOn keeps it out of the
+    # shared GitHub-hosted queue for same-repo PRs.
+    name: Change gate
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-changes-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      web: ${{ steps.decide.outputs.web }}
+      live: ${{ steps.decide.outputs.live }}
+      legs: ${{ steps.decide.outputs.legs }}
+      skipped_legs: ${{ steps.decide.outputs.skipped_legs }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: decide
+        uses: actions/github-script@v9.0.0
+        env:
+          # The release-PR rule every job here uses, so the stubs match it.
+          RELEASE: ${{ github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-') }}
+        with:
+          script: |
+            const gate = require('./.github/scripts/change-gate.cjs');
+            await gate({ github, context, core, release: process.env.RELEASE === 'true' });
+
   cargo-linux:
     # Each leg builds its own feature set on its own runner and cache key. The
-    # branch ruleset requires every leg's context by name; keep it and the
-    # cargo-linux-release-pr matrix in sync if the leg set changes.
+    # branch ruleset requires every leg's context by name; keep it, the
+    # fallback matrix below and LEGS in .github/scripts/change-gate.cjs in
+    # sync if the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-cargo-{1}-{2}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, matrix.leg, github.run_attempt) }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.legs != '[]') }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-cargo-{1}-{2}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, matrix.leg, github.run_attempt) }}
     timeout-minutes: ${{ matrix.leg == 'web-e2e' && (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 60 || 40 }}
     permissions:
       contents: read
@@ -42,18 +74,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        leg: [web-e2e, core-rest, bare-core]
+        leg: ${{ fromJSON(needs.changes.result == 'success' && needs.changes.outputs.legs || '["web-e2e","core-rest","bare-core"]') }}
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -64,11 +96,11 @@ jobs:
         if: matrix.leg == 'web-e2e'
         working-directory: web
         run: npm ci --dry-run --ignore-scripts --no-audit --no-fund
-      - uses: ./.github/actions/rust-toolchain
-      - uses: ./.github/actions/kache
+      - uses: $/.github/actions/rust-toolchain
+      - uses: $/.github/actions/kache
         with:
           manifest-key: test-${{ matrix.leg }}
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@v2.88.0
         if: matrix.leg == 'core-rest'
         with:
           tool: cargo-nextest
@@ -271,97 +303,62 @@ jobs:
           sudo env AOE_PRIVDROP_TESTS=1 \
             "$test_binary" privdrop_ --test-threads=1 --nocapture
 
-  cargo-linux-release-pr:
+  cargo-linux-skipped:
     # A matrix job skipped at job level posts one unexpanded context, so this
-    # reports the three required cargo-linux contexts on release PRs instead.
-    # The merge queue runs the real legs.
+    # reports each required cargo-linux context the change gate skipped, and
+    # every one on a release PR whose gate failed. The merge queue runs every
+    # leg.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-')
-    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && ((needs.changes.result == 'success' && needs.changes.outputs.skipped_legs != '[]') || (needs.changes.result != 'success' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-'))) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-cargo-skip-{1}-{2}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, matrix.leg, github.run_attempt) }}
     permissions: {}
     strategy:
       matrix:
-        leg: [web-e2e, core-rest, bare-core]
+        leg: ${{ fromJSON(needs.changes.result == 'success' && needs.changes.outputs.skipped_legs || '["web-e2e","core-rest","bare-core"]') }}
     steps:
-      - run: echo "Release PR, so the merge queue runs this leg."
+      - run: echo "The change gate skipped this leg; the merge queue runs it."
 
   macos-gate:
     # Decides on Linux whether macOS runs, so a skip holds no macOS runner.
-    # It runs for macOS-sensitive changes or the ci-macos label. After adding
-    # the label, re-run this job; GitHub re-runs its dependents with it.
+    # It runs for macOS-sensitive changes or the ci-macos label, except in the
+    # first queue entry when its PR already passed it. After adding the label,
+    # re-run this job; GitHub re-runs its dependents with it.
     name: macOS gate
     if: github.event_name != 'push'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-macos-gate-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
     permissions:
+      checks: read
       contents: read
       pull-requests: read
     outputs:
       run: ${{ steps.decide.outputs.run }}
     steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
       - id: decide
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: actions/github-script@v9.0.0
         env:
           QUEUE_REF: ${{ github.event.merge_group.head_ref }}
         with:
           script: |
-            const run = reason => { core.notice(`macOS runs: ${reason}`); core.setOutput('run', 'true'); };
-            const pr = context.payload.pull_request;
-            const queue = context.payload.merge_group;
-            // refs/heads/gh-readonly-queue/<base>/pr-<number>-<base sha>
-            const number = pr?.number ?? Number(/\/pr-(\d+)-[0-9a-f]+$/.exec(process.env.QUEUE_REF)?.[1]);
-            if (!number) return run(`no PR number in ${process.env.QUEUE_REF}`);
-            const { data: current } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
-            if (current.labels.some(l => l.name === 'ci-macos')) return run('ci-macos label');
-
-            const prefixes = [
-              'src/process/', 'src/git/', 'src/migrations/', 'src/containers/',
-              'src/session/config/container_config/',
-              '.github/actions/rust-toolchain/',
-            ];
-            // Existing macOS-only bodies can change without touching their cfg.
-            const exact = [
-              'src/hooks/dir_guard.rs', 'src/server/api/system.rs',
-              'src/server/api/sessions/file_edit.rs', 'src/session/anchored_fs.rs',
-              'src/session/mod.rs', 'src/sound/playback.rs',
-              'src/tui/clipboard.rs', 'src/tui/open_url.rs',
-              'src/session/config/container_config.rs',
-              'src/session/instance/container.rs',
-              'src/session/sandbox_store_reclaim.rs',
-              'build.rs', 'rust-toolchain.toml',
-              // A PR lockfile bump runs post-merge; the queue still checks it.
-              ...(pr ? [] : ['Cargo.lock']),
-            ];
-            const cfg = /target_os\s*=\s*"macos"/;
-            const sensitive = path => !!path &&
-              (exact.includes(path) || prefixes.some(p => path.startsWith(p)));
-            // A queue entry is diffed whole, so every PR in the group counts.
-            const base = pr ? pr.base.sha : queue.base_sha;
-            const head = pr ? pr.head.sha : queue.head_sha;
-            const { data: diff } = await github.rest.repos.compareCommitsWithBasehead({
-              ...context.repo, basehead: `${base}...${head}`,
-            });
-            // The compare API lists at most 300 files.
-            if (diff.files.length >= 300) return run('diff too large to inspect');
-            const hit = diff.files.find(f =>
-              sensitive(f.filename) || sensitive(f.previous_filename) ||
-              // Only Rust and TOML hold the cfg; binaries have no patch.
-              (!f.patch && /\.(rs|toml)$/.test(f.filename)) ||
-              f.patch?.split('\n').some(line =>
-                /^[+-](?![+-]{2} )/.test(line) && cfg.test(line)));
-            if (hit) return run(`${hit.filename} is macOS-sensitive`);
-            core.notice('macOS skipped: runs post-merge on main. Add ci-macos and re-run this job to run it here.');
-            core.setOutput('run', 'false');
+            const gate = require('./.github/scripts/macos-gate.cjs');
+            await gate({ github, context, core, queueRef: process.env.QUEUE_REF });
 
   cargo-macos:
-    # Push always runs; a failed gate also runs it rather than pass unchecked.
+    # Push runs once the Linux legs finish, whatever they report; a failed
+    # gate also runs it rather than pass unchecked. PR and queue runs need
+    # Linux to pass, so a run that fails or is superseded there never holds
+    # one of the few macOS runners.
     # Both Cargo steps share e2e-tests; no frontend build is needed on macOS.
     name: Cargo Test (macos)
-    needs: macos-gate
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.macos-gate.result != 'success' || needs.macos-gate.outputs.run == 'true') }}
+    needs: [macos-gate, cargo-linux]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.macos-gate.result != 'success' || needs.macos-gate.outputs.run == 'true') && (github.event_name == 'push' || needs.cargo-linux.result == 'success' || needs.cargo-linux.result == 'skipped') }}
     runs-on: macos-latest
     permissions:
       contents: read
-      id-token: write
     # Allow cold compilation and both test stages within a bounded job.
     timeout-minutes: 90
     env:
@@ -369,23 +366,23 @@ jobs:
       # debug info shrinks both. Backtraces lose file and line numbers.
       CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: ./.github/actions/rust-toolchain
-      - uses: ./.github/actions/kache
+      - uses: $/.github/actions/rust-toolchain
+      - uses: $/.github/actions/kache
         with:
           manifest-key: test-macos
       - name: Install tmux
         run: brew install tmux
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@v2.88.0
         with:
           tool: cargo-nextest
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
       - name: Vendored Crossterm consumer regressions (native kqueue)
@@ -409,20 +406,21 @@ jobs:
 
   vitest:
     name: Vitest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-vitest-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-vitest-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 15
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -456,7 +454,7 @@ jobs:
         run: sed -i 's|^SF:src/|SF:web/src/|' web/coverage/vitest/lcov.info
       - name: Upload to Codecov (vitest flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           # The codecov-action's `files` input is additive, not restrictive:
@@ -476,13 +474,13 @@ jobs:
         if: ${{ !cancelled() }}
         # Test-analytics upload only; a Codecov network blip must not fail the job.
         continue-on-error: true
-        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        uses: codecov/test-results-action@v1.2.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           disable_search: true
           files: web/test-report.junit.xml
           flags: vitest
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: vitest-coverage
@@ -491,17 +489,20 @@ jobs:
 
   bundle-analysis:
     name: Bundle Analysis
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-bundle-analysis-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -523,20 +524,21 @@ jobs:
 
   playwright:
     name: Playwright (mocked)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.web == 'true') }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -558,7 +560,7 @@ jobs:
       # already ships the apt packages Chromium needs.
       - name: Cache Playwright browsers
         id: playwright-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
@@ -579,7 +581,7 @@ jobs:
         run: npm run coverage:merge
       - name: Upload to Codecov (playwright-mocked flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           # See the matching comment in the vitest upload step: without
@@ -595,19 +597,19 @@ jobs:
         if: ${{ !cancelled() }}
         # Test-analytics upload only; a Codecov network blip must not fail the job.
         continue-on-error: true
-        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        uses: codecov/test-results-action@v1.2.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           disable_search: true
           files: web/test-report.junit.xml
           flags: playwright-mocked
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: playwright-report
           path: web/playwright-report/
           retention-days: 14
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: playwright-mocked-coverage
@@ -618,29 +620,30 @@ jobs:
     # Unsharded: shards each repeat the ~2 min cargo build and hold a runner
     # from the shared concurrency pool, which costs more wall than it saves.
     name: Playwright (live)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-live-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.changes.result != 'success' || needs.changes.outputs.live == 'true') }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-live-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
         with:
           # These jobs run repository-controlled build/test code after checkout
           # and never push, so the job token must not linger in .git/config
           # (zizmor artipacked). Matches the hardened convention in ci.yml and
           # release.yml.
           persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - uses: ./.github/actions/rust-toolchain
-      - uses: ./.github/actions/kache
+      - uses: $/.github/actions/rust-toolchain
+      - uses: $/.github/actions/kache
         with:
           manifest-key: playwright-live
       - name: Install tmux
@@ -665,7 +668,7 @@ jobs:
       # because ubuntu-latest already has the apt prerequisites.
       - name: Cache Playwright browsers
         id: playwright-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
@@ -689,7 +692,7 @@ jobs:
         run: npm run coverage:merge
       - name: Upload to Codecov (playwright-live flag)
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        uses: codecov/codecov-action@v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           # See the matching comment in the vitest upload step: without
@@ -705,19 +708,19 @@ jobs:
         if: ${{ !cancelled() }}
         # Test-analytics upload only; a Codecov network blip must not fail the job.
         continue-on-error: true
-        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3 # v1.2.1
+        uses: codecov/test-results-action@v1.2.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           disable_search: true
           files: web/test-report.junit.xml
           flags: playwright-live
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: playwright-live-report
           path: web/playwright-live-report/
           retention-days: 14
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@v7.0.2
         if: ${{ !cancelled() }}
         with:
           name: playwright-live-coverage

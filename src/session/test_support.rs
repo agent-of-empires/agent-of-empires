@@ -551,14 +551,18 @@ host = "pane_scoped"
 sandbox = "pane_scoped"
 "#
     );
-    let dir = crate::plugin::plugins_dir()
-        .unwrap()
-        .join("acme.omp-cutover");
+    install_agent_plugin("acme.omp-cutover", &manifest);
+}
+
+/// Installs an approved plugin from `manifest`. Bind an isolated app directory and
+/// `crate::plugin::ReloadRegistryOnDrop` around the caller.
+pub(crate) fn install_agent_plugin(id: &str, manifest: &str) {
+    let dir = crate::plugin::plugins_dir().unwrap().join(id);
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+    std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
     crate::session::update_config(|config| {
         config.plugins.insert(
-            "acme.omp-cutover".into(),
+            id.into(),
             crate::session::PluginConfig {
                 grant: Some(crate::session::CapabilityGrant {
                     manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),

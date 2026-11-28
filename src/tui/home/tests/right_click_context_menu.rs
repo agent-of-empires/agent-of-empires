@@ -65,8 +65,7 @@ fn right_click_on_group_uses_group_menu() {
 
 /// Session-menu entries route through the same helpers as their keys: Rename like `r`,
 /// Archive like `z` (immediate, no dialog), Delete like `d`. Esc cancels without a dialog.
-/// Attention sort shows the full menu: New Session / Rename / Archive / Snooze / Mark unread
-/// / Add project / Delete.
+/// The menu reads New Session / Rename / Archive / Snooze / Mark unread / Add project / Delete.
 #[test]
 #[serial]
 fn session_menu_entries_route_like_their_keys() {
@@ -88,8 +87,6 @@ fn session_menu_entries_route_like_their_keys() {
     for (label, downs, submit, check) in cases {
         let mut env = create_test_env_with_sessions(2);
         disable_delete_to_trash();
-        env.view.sort_order = SortOrder::Attention;
-        env.view.flat_items = env.view.build_flat_items();
         setup_inner(&mut env);
         assert!(env.view.handle_right_click(5, 1), "{label}");
         let id = env.view.selected_session.clone().unwrap();
@@ -365,48 +362,36 @@ fn right_click_session_menu_hides_fork_for_unforkable_agent() {
     );
 }
 
-/// The Snooze row mirrors the `'h'` keybinding, which acts on a session row in every
-/// sort. For a forkable agent the Fork row is sort-independent.
+/// The Snooze row mirrors the `'h'` keybinding, and a forkable agent gets the Fork row, in
+/// every sort.
 #[test]
 #[serial]
-fn right_click_session_menu_offers_snooze_in_every_sort() {
+fn right_click_session_menu_offers_snooze_and_fork() {
     let mut env = create_test_env_empty();
     env.view.add_instance(observed_fork_parent("claude"));
     env.view.add_instance(observed_fork_parent("claude"));
 
-    let menu_actions = |env: &TestEnv| -> Vec<ContextMenuAction> {
-        env.view
+    for sort in [SortOrder::Custom, SortOrder::Name] {
+        env.view.sort_order = sort;
+        env.view.flat_items = env.view.build_flat_items();
+        setup_inner(&mut env);
+        assert!(env.view.handle_right_click(5, 1), "{sort:?}");
+        let actions: Vec<ContextMenuAction> = env
+            .view
             .context_menu
             .as_ref()
             .unwrap()
             .items_for_test()
             .iter()
             .map(|(a, _)| *a)
-            .collect()
-    };
-
-    // Newest sort (the default): the Snooze row is present.
-    env.view.sort_order = SortOrder::Newest;
-    env.view.flat_items = env.view.build_flat_items();
-    setup_inner(&mut env);
-    assert!(env.view.handle_right_click(5, 1));
-    assert!(
-        menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
-        "Snooze must appear in every sort"
-    );
-    assert!(menu_actions(&env).contains(&ContextMenuAction::Fork));
-    env.view.context_menu = None;
-
-    // Attention sort: Snooze row present.
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-    setup_inner(&mut env);
-    assert!(env.view.handle_right_click(5, 1));
-    assert!(
-        menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
-        "Snooze must appear in Attention sort"
-    );
-    assert!(menu_actions(&env).contains(&ContextMenuAction::Fork));
+            .collect();
+        assert!(
+            actions.contains(&ContextMenuAction::ToggleSnooze),
+            "{sort:?}"
+        );
+        assert!(actions.contains(&ContextMenuAction::Fork), "{sort:?}");
+        env.view.context_menu = None;
+    }
 }
 
 #[test]

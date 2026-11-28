@@ -586,7 +586,7 @@ fn test_uppercase_p_picker_switch_profile() {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
@@ -815,7 +815,7 @@ fn test_group_has_managed_worktrees_and_containers() {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
@@ -986,7 +986,7 @@ async fn deleting_subgroups_moves_members_to_the_selected_destination() {
         let state = native_state(&["alpha", "beta"]).await;
         let mut view = test_view(None);
         refresh_native_fixture(&state, &mut view).await;
-        view.group_by = crate::session::config::GroupByMode::Manual;
+        view.group_by = crate::session::config::GroupByMode::Group;
         view.flat_items = view.build_flat_items();
         view.cursor = view
             .flat_items
@@ -1168,6 +1168,36 @@ fn test_archive_selected_group_project_mode() {
     assert_eq!(submitted, expected);
 }
 
+/// Under Repository, rename and delete refuse every header, naming a nested Group as the
+/// user's own rather than as automatic.
+#[test]
+#[serial]
+fn repository_mode_header_refusals_name_what_was_selected() {
+    let (_temp, _guard) = test_home();
+    let mut view = test_view(Some("test"));
+    view.group_by = crate::session::config::GroupByMode::Project;
+    let archived = crate::session::archived_project_sub_path("alpha");
+    for (path, title) in [
+        ("alpha", "Cannot Modify Repository Headers"),
+        (archived.as_str(), "Cannot Modify Repository Headers"),
+        ("alpha/work", "Manage Groups Under My Groups"),
+    ] {
+        for open in [
+            HomeView::open_rename_for_selected,
+            HomeView::open_delete_for_selected,
+        ] {
+            view.info_dialog = None;
+            view.selected_group = Some(path.to_string());
+            open(&mut view);
+            assert_eq!(
+                view.info_dialog.as_ref().map(|d| d.title()),
+                Some(title),
+                "{path}"
+            );
+        }
+    }
+}
+
 /// The group-level prompt opens a confirmation carrying the `archive_group` action and
 /// counts only active members, and no-ops silently when nothing is left to archive.
 #[test]
@@ -1201,95 +1231,6 @@ fn test_prompt_archive_selected_group() {
     assert!(env.view.active_sessions_in_selected_group().is_empty());
     env.view.prompt_archive_selected_group();
     assert!(env.view.confirm_dialog.is_none());
-}
-
-#[test]
-#[serial]
-fn status_group_archive_preserves_prompt_membership_and_eligibility() {
-    use crate::session::config::GroupByMode;
-    use crate::session::Status;
-
-    for scenario in ["joins", "trashed", "removed"] {
-        let temp = TempDir::new().unwrap();
-        let _guard = setup_test_home(&temp);
-        let storage = Storage::new_unwatched("test").unwrap();
-
-        let mut kept = Instance::new("kept", "/tmp/kept");
-        kept.status = Status::Running;
-        let mut changed = Instance::new("changed", "/tmp/changed");
-        changed.status = if scenario == "joins" {
-            Status::Idle
-        } else {
-            Status::Running
-        };
-        let instances = vec![kept, changed];
-        storage
-            .update(|i, g| {
-                *i = instances.to_vec();
-                *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-
-        let mut view = HomeView::new_for_test(
-            Some("test".to_string()),
-            AvailableTools::with_tools(&["claude"]),
-            crate::file_watch::FileWatchService::noop(),
-        )
-        .unwrap();
-        view.group_by = GroupByMode::Status;
-        view.flat_items = view.build_flat_items();
-        view.cursor = view
-            .flat_items
-            .iter()
-            .position(|item| matches!(item, Item::Group { path, .. } if path == "Running"))
-            .expect("Running header");
-        view.update_selected();
-        assert_eq!(view.selected_group.as_deref(), Some("Running"));
-        view.handle_key(key(crossterm::event::KeyCode::Char('z')), None);
-        assert_eq!(
-            view.confirm_dialog.as_ref().map(|d| d.action()),
-            Some("archive_group")
-        );
-
-        let id_of = |view: &HomeView, title: &str| {
-            view.instances()
-                .find(|i| i.title == title)
-                .map(|i| i.id.clone())
-                .expect("seeded instance")
-        };
-        let kept_id = id_of(&view, "kept");
-        let changed_id = id_of(&view, "changed");
-        match scenario {
-            "joins" => view.instances.get_mut(&changed_id).unwrap().status = Status::Running,
-            "trashed" => view.instances.get_mut(&changed_id).unwrap().trash(),
-            "removed" => {
-                view.instances.shift_remove(&changed_id);
-            }
-            _ => unreachable!(),
-        }
-        view.rebuild_flat_items();
-
-        let mut respond = view.session_feed.command_driver_for_test();
-        render_geometry(&mut view);
-        view.handle_key(key(crossterm::event::KeyCode::Char('y')), None);
-        assert!(view.confirm_dialog.is_none());
-        let cursor = || crate::daemon::RuntimeCursor {
-            epoch: "test".into(),
-            revision: 2,
-        };
-        let (id, mutation) = respond(Ok(cursor())).unwrap();
-        assert!(
-            matches!(mutation, crate::daemon::SessionMutation::Archive(body) if body.archived && body.kill_pane),
-            "{scenario}"
-        );
-        assert_eq!(id, kept_id, "{scenario}");
-        assert!(respond(Ok(cursor())).is_none(), "{scenario}");
-        if scenario == "trashed" {
-            let trashed = view.instances.get(&changed_id).expect("trashed instance");
-            assert!(trashed.is_trashed() && !trashed.is_archived());
-        }
-    }
 }
 
 #[tokio::test]
@@ -1343,7 +1284,7 @@ async fn test_delete_group_with_sessions_updates_groups_field() {
     .unwrap();
     let state = native_state(&["test", "other"]).await;
     apply_published(&mut view, &state).await;
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
@@ -1548,96 +1489,77 @@ async fn test_group_collapsed_state_persists_across_reload() {
     );
 }
 
-/// Project and org folder collapse must survive a restart. Both kinds of header are
-/// auto-derived and have no group record, so their state is written to `app_state` rather
-/// than the per-profile GroupTree, and a fresh `HomeView` restores it. A collapse entry for
-/// a folder that no longer exists is pruned on save, so the persisted set cannot grow
-/// without bound.
+/// Repository header collapse must survive a restart. The headers are derived and have no
+/// group record, so their state is written to `app_state` rather than the per-profile
+/// GroupTree, and a fresh `HomeView` restores it. A collapse entry for a header that no
+/// longer exists is pruned on save, so the persisted set cannot grow without bound.
 #[test]
 #[serial]
 fn test_derived_group_collapsed_state_persists_to_config() {
     use crate::session::config::GroupByMode;
 
-    for mode in [GroupByMode::Project, GroupByMode::Org] {
-        let mut env = create_test_env_two_projects_mixed_attention();
-        env.view.group_by = mode;
-        env.view.flat_items = env.view.build_flat_items();
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
 
-        let (group_idx, group_path) = env
-            .view
-            .flat_items
-            .iter()
-            .enumerate()
-            .find_map(|(idx, item)| match item {
-                Item::Group {
-                    path, collapsed, ..
-                } => {
-                    assert!(!collapsed, "{mode:?} folder should start expanded");
-                    Some((idx, path.clone()))
-                }
-                _ => None,
-            })
-            .expect("a derived folder header");
-
-        let saved_paths = || {
-            let config = crate::session::config::load_config()
-                .unwrap()
-                .expect("config should exist after collapse");
-            match mode {
-                GroupByMode::Project => config.app_state.project_group_collapsed,
-                _ => config.app_state.org_group_collapsed,
+    let (group_idx, group_path) = env
+        .view
+        .flat_items
+        .iter()
+        .enumerate()
+        .find_map(|(idx, item)| match item {
+            Item::Group {
+                path, collapsed, ..
+            } => {
+                assert!(!collapsed, "folder should start expanded");
+                Some((idx, path.clone()))
             }
-        };
+            _ => None,
+        })
+        .expect("a derived folder header");
 
-        // Enter routes through toggle_group_collapsed, which persists.
-        env.view.cursor = group_idx;
-        env.view.update_selected();
-        env.view.handle_key(key(KeyCode::Enter), None);
-        assert!(
-            saved_paths().contains(&group_path),
-            "{mode:?}: the collapsed folder path should be persisted to app_state"
-        );
+    let saved_paths = || {
+        crate::session::config::load_config()
+            .unwrap()
+            .expect("config should exist after collapse")
+            .app_state
+            .project_group_collapsed
+    };
 
-        let fresh = HomeView::new_for_test(
-            Some("test".to_string()),
-            AvailableTools::with_tools(&["claude"]),
-            crate::file_watch::FileWatchService::noop(),
-        )
-        .unwrap();
-        let restored = match mode {
-            GroupByMode::Project => fresh.project_group_collapsed.get(&group_path),
-            _ => fresh.org_group_collapsed.get(&group_path),
-        };
-        assert_eq!(
-            restored.copied(),
-            Some(true),
-            "{mode:?}: a relaunched HomeView should restore the collapsed folder"
-        );
+    // Enter routes through toggle_group_collapsed, which persists.
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(
+        saved_paths().contains(&group_path),
+        "the collapsed folder path should be persisted to app_state"
+    );
 
-        match mode {
-            GroupByMode::Project => {
-                env.view
-                    .project_group_collapsed
-                    .insert("/repos/deleted-ghost".to_string(), true);
-                env.view.save_project_group_collapsed();
-            }
-            _ => {
-                env.view
-                    .org_group_collapsed
-                    .insert("/repos/deleted-ghost".to_string(), true);
-                env.view.save_org_group_collapsed();
-            }
-        }
-        let saved = saved_paths();
-        assert!(
-            saved.contains(&group_path),
-            "{mode:?}: a live collapsed folder must stay persisted"
-        );
-        assert!(
-            !saved.iter().any(|p| p == "/repos/deleted-ghost"),
-            "{mode:?}: a collapse entry for a nonexistent folder must be pruned"
-        );
-    }
+    let fresh = HomeView::new_for_test(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.project_group_collapsed.get(&group_path).copied(),
+        Some(true),
+        "a relaunched HomeView should restore the collapsed folder"
+    );
+
+    env.view
+        .project_group_collapsed
+        .insert("/repos/deleted-ghost".to_string(), true);
+    env.view.save_project_group_collapsed();
+    let saved = saved_paths();
+    assert!(
+        saved.contains(&group_path),
+        "a live collapsed folder must stay persisted"
+    );
+    assert!(
+        !saved.iter().any(|p| p == "/repos/deleted-ghost"),
+        "a collapse entry for a nonexistent folder must be pruned"
+    );
 }
 
 /// `<` / `>` move the divider left / right by 5 from its default, so with the sidebar on
@@ -1947,7 +1869,7 @@ fn test_shift_o_opens_sort_picker_in_strict_mode() {
 
     let mut env = create_test_env_with_mixed_sessions();
     env.view.strict_hotkeys = true;
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
+    assert_eq!(env.view.sort_order, SortOrder::Custom);
 
     // Shift+O: opens the sort picker.
     env.view
@@ -1978,7 +1900,7 @@ fn test_shift_o_opens_sort_picker_in_strict_mode() {
     assert!(env.view.sort_picker_dialog.is_none());
 
     // Sort order is unchanged because no selection was confirmed.
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
+    assert_eq!(env.view.sort_order, SortOrder::Custom);
     // Sanity: message dialog must NOT have been opened as a side effect.
     assert!(env.view.send_message_dialog.is_none());
 }
@@ -2041,67 +1963,38 @@ async fn test_strict_mode_h_collapses_group() {
 
 #[tokio::test]
 #[serial]
-async fn test_non_strict_h_snoozes_on_a_session_row_in_any_sort() {
-    // `h` snoozes the cursor's session in every sort; on a group header there is no
-    // session to snooze, so it falls through to the unconditional `Left | Char('h')`
-    // collapse.
-    use crate::session::config::SortOrder;
-
+async fn test_non_strict_h_snoozes_a_session_and_collapses_a_group() {
+    // On a session `h` opens the snooze duration dialog; on a group header it falls through
+    // to the `Left | Char('h')` collapse.
     let mut env = create_test_env_with_groups();
     let profiles = crate::session::list_profiles().unwrap();
     let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
     apply_published(&mut env.view, &state).await;
     env.view.strict_hotkeys = false;
 
-    // Attention sort flattens groups, so seed a cursor-on-session scenario and assert that
-    // `h` opens the snooze duration dialog; the snooze itself fires on the pick.
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
     let session_idx = env
         .view
         .flat_items
         .iter()
         .position(|item| matches!(item, Item::Session { .. }))
-        .expect("setup should produce a session in Attention sort");
+        .expect("setup should produce a session");
     env.view.cursor = session_idx;
     env.view.update_selected();
     env.view.handle_key(key(KeyCode::Char('h')), None);
     assert!(
         env.view.snooze_duration_dialog.is_some(),
-        "`h` in Attention sort must open the snooze duration dialog"
+        "`h` on a session must open the snooze duration dialog"
     );
-    // Tear the dialog back down before exercising the Newest case so the
-    // next handle_key doesn't get swallowed by dialog input.
+    // Tear the dialog back down so the next handle_key doesn't get swallowed by dialog input.
     env.view.snooze_duration_dialog = None;
     env.view.pending_snooze_session = None;
 
-    // Newest sort: a session row is still snoozable, so the dialog opens there too.
-    env.view.sort_order = SortOrder::Newest;
-    env.view.flat_items = env.view.build_flat_items();
-    let session_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Session { .. }))
-        .expect("setup should produce a session in Newest sort");
-    env.view.cursor = session_idx;
-    env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Char('h')), None);
-    assert!(
-        env.view.snooze_duration_dialog.is_some(),
-        "`h` on a session row must open the snooze dialog in every sort"
-    );
-    env.view.snooze_duration_dialog = None;
-    env.view.pending_snooze_session = None;
-
-    // On a group header `h` still collapses instead of snoozing.
-    env.view.flat_items = env.view.build_flat_items();
     let group_idx = env
         .view
         .flat_items
         .iter()
         .position(|item| matches!(item, Item::Group { .. }))
-        .expect("setup should produce a group in Newest sort");
+        .expect("setup should produce a group");
     env.view.cursor = group_idx;
     env.view.update_selected();
     let group = env
@@ -2125,20 +2018,19 @@ async fn test_non_strict_h_snoozes_on_a_session_row_in_any_sort() {
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
         assert!(
             *collapsed,
-            "non-strict 'h' on a group header must collapse the group, not snooze"
+            "non-strict 'h' on a group must collapse it, not snooze"
         );
     }
 }
 
 #[test]
 #[serial]
-fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
-    // #1524: in non-strict Attention sort, `w` must jump to the next waiting/idle session
-    // (#796) rather than snoozing the cursor's session. Snooze lives on `h`/`H`; the snooze
-    // arm used to shadow the jump arm in exactly the sort users triage in.
+fn test_non_strict_w_jumps_to_next_waiting() {
+    // #1524: in non-strict mode `w` must jump to the next waiting/idle session (#796) rather
+    // than snoozing the cursor's session. Snooze lives on `h`/`H`.
     use crate::session::Status;
 
-    let (mut env, running, _waiting) = attention_env_running_then_waiting();
+    let (mut env, running, _waiting) = env_running_then_waiting();
     env.view.cursor = running;
     env.view.update_selected();
 
@@ -2146,7 +2038,7 @@ fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
 
     assert!(
         env.view.snooze_duration_dialog.is_none(),
-        "`w` in Attention sort must jump, not open the snooze dialog"
+        "`w` must jump, not open the snooze dialog"
     );
     let landed = match env.view.flat_items.get(env.view.cursor) {
         Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
@@ -2161,10 +2053,10 @@ fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
 
 #[test]
 #[serial]
-fn test_non_strict_w_on_running_jumps_to_idle_in_attention_sort() {
+fn test_non_strict_w_on_running_jumps_to_idle() {
     use crate::session::Status;
 
-    let (mut env, running, _idle) = attention_env_running_then_idle();
+    let (mut env, running, _idle) = env_running_then_idle();
     env.view.cursor = running;
     env.view.update_selected();
 
@@ -2187,14 +2079,13 @@ fn test_non_strict_w_on_running_jumps_to_idle_in_attention_sort() {
 
 #[test]
 #[serial]
-fn test_non_strict_w_cycles_through_all_idle_sessions_in_attention_sort() {
-    use crate::session::config::{GroupByMode, SortOrder};
+fn test_non_strict_w_cycles_through_all_idle_sessions() {
+    use crate::session::config::GroupByMode;
     use crate::session::Status;
 
     let mut env = create_test_env_empty();
     env.view.strict_hotkeys = false;
-    env.view.group_by = GroupByMode::Manual;
-    env.view.sort_order = SortOrder::Attention;
+    env.view.group_by = GroupByMode::Group;
     env.view.idle_decay_window = std::time::Duration::ZERO;
 
     for (index, minutes_ago) in [5, 10, 15, 20].into_iter().enumerate() {
@@ -2245,8 +2136,8 @@ fn test_non_strict_w_cycles_through_all_idle_sessions_in_attention_sort() {
 
 #[test]
 #[serial]
-fn test_non_strict_w_on_collapsed_project_group_reveals_idle_in_attention_sort() {
-    use crate::session::config::{GroupByMode, SortOrder};
+fn test_non_strict_w_on_collapsed_project_group_reveals_idle() {
+    use crate::session::config::GroupByMode;
     use crate::session::Status;
 
     let temp = TempDir::new().unwrap();
@@ -2275,7 +2166,6 @@ fn test_non_strict_w_on_collapsed_project_group_reveals_idle_in_attention_sort()
     .unwrap();
     view.strict_hotkeys = false;
     view.group_by = GroupByMode::Project;
-    view.sort_order = SortOrder::Attention;
     view.project_group_collapsed
         .insert("alpha".to_string(), true);
     view.flat_items = view.build_flat_items();
@@ -2319,7 +2209,7 @@ fn test_strict_mode_ctrl_g_opens_group_picker() {
 
     let mut env = create_test_env_with_sessions(3);
     env.view.strict_hotkeys = true;
-    env.view.group_by = GroupByMode::Manual;
+    env.view.group_by = GroupByMode::Group;
 
     env.view.handle_key(
         KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
@@ -2333,8 +2223,8 @@ fn test_strict_mode_ctrl_g_opens_group_picker() {
         env.view.pending_paste.is_none(),
         "Ctrl+G must not leak into the typing-guard catch-all"
     );
-    // Down + Enter switches to Project.
-    env.view.handle_key(key(KeyCode::Down), None);
+    // Up + Enter switches to Repository.
+    env.view.handle_key(key(KeyCode::Up), None);
     env.view.handle_key(key(KeyCode::Enter), None);
     assert_eq!(env.view.group_by, GroupByMode::Project);
 
@@ -2612,36 +2502,28 @@ fn work_group_titles(view: &HomeView) -> Vec<&str> {
     titles
 }
 
-/// Sort order reaches the sessions inside a group: the picker's AZ and ZA entries reorder
-/// the work group, and six `o` presses wrap back to Newest and its original order.
+/// Sort order reaches the sessions inside a group: the picker's Name entry reorders the work
+/// group, and with the picker open a mnemonic applies its order outright.
 #[test]
 #[serial]
 fn test_o_key_flat_items_follow_sort_order() {
     use crate::session::config::SortOrder;
 
-    for (downs, order, expected) in [
-        (4, SortOrder::AZ, ["Apple", "Mango", "Zebra"]),
-        (5, SortOrder::ZA, ["Zebra", "Mango", "Apple"]),
-    ] {
-        let mut env = create_test_env_with_mixed_sessions();
-        assert_eq!(env.view.sort_order, SortOrder::Newest);
+    let mut env = create_test_env_with_mixed_sessions();
+    assert_eq!(env.view.sort_order, SortOrder::Custom);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Down), None);
+    env.view.handle_key(key(KeyCode::Down), None);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert_eq!(env.view.sort_order, SortOrder::Name);
+    assert_eq!(work_group_titles(&env.view), ["Apple", "Mango", "Zebra"]);
 
-        env.view.handle_key(key(KeyCode::Char('o')), None);
-        for _ in 0..downs {
-            env.view.handle_key(key(KeyCode::Down), None);
-        }
-        env.view.handle_key(key(KeyCode::Enter), None);
-
-        assert_eq!(env.view.sort_order, order);
-        assert_eq!(work_group_titles(&env.view), expected);
-    }
-
-    // With the picker open a mnemonic applies its order outright, no arrow keys.
     let mut env = create_test_env_with_mixed_sessions();
     for (letter, expected) in [
-        ('c', SortOrder::Custom),
-        ('t', SortOrder::Attention),
+        ('a', SortOrder::Name),
         ('n', SortOrder::Newest),
+        ('c', SortOrder::Custom),
+        ('a', SortOrder::Name),
     ] {
         env.view.handle_key(key(KeyCode::Char('o')), None);
         env.view.handle_key(key(KeyCode::Char(letter)), None);
@@ -2669,11 +2551,10 @@ fn test_o_key_clamps_cursor_when_list_shrinks() {
     let filtered_count = env.view.search_matches.len();
     assert!(filtered_count < initial_items);
 
-    // Open the sort picker and pick Attention (one entry down from Newest).
+    // Open the sort picker and pick Name.
     env.view.handle_key(key(KeyCode::Char('o')), None);
-    env.view.handle_key(key(KeyCode::Down), None);
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert_eq!(env.view.sort_order, SortOrder::Attention);
+    env.view.handle_key(key(KeyCode::Char('a')), None);
+    assert_eq!(env.view.sort_order, SortOrder::Name);
 
     let valid_max = env.view.flat_items.len().saturating_sub(1);
     assert!(env.view.cursor <= valid_max);
@@ -2703,7 +2584,7 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view =
         HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     let mut profiles: Vec<&str> = view
         .instances()
@@ -2810,7 +2691,7 @@ fn test_ctrl_arrows_do_not_reorder_under_a_computed_sort() {
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_mixed_sessions();
-    env.view.apply_sort_order(SortOrder::Newest);
+    env.view.apply_sort_order(SortOrder::Name);
     let before: Vec<String> = work_group_titles(&env.view)
         .into_iter()
         .map(str::to_string)
@@ -3307,7 +3188,7 @@ fn test_cursor_restore_keeps_the_group_profile() {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     // Deliberately the header that is not first: a path-only restore would land on the
     // other profile's row, which is what this pins.
@@ -3316,20 +3197,20 @@ fn test_cursor_restore_keeps_the_group_profile() {
         .iter()
         .position(|i| {
             matches!(i, Item::Group { path, profile, .. }
-            if path == "work" && profile.as_deref() == Some("first"))
+            if path == "work" && profile.as_deref() == Some("second"))
         })
-        .expect("first profile's work header");
+        .expect("second profile's work header");
     assert!(target > 0, "the other profile's header comes earlier");
     view.cursor = target;
     view.update_selected();
-    assert_eq!(view.selected_group_profile.as_deref(), Some("first"));
+    assert_eq!(view.selected_group_profile.as_deref(), Some("second"));
 
     view.rebuild_flat_items_keeping_cursor();
 
     assert!(
         matches!(view.flat_items.get(view.cursor), Some(Item::Group { path, profile, .. })
-            if path == "work" && profile.as_deref() == Some("first")),
-        "cursor stayed on the first profile's header"
+            if path == "work" && profile.as_deref() == Some("second")),
+        "cursor stayed on the second profile's header"
     );
 }
 
@@ -3827,7 +3708,7 @@ async fn test_an_empty_group_moves_in_a_unified_single_profile_view() {
     let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
     apply_published(&mut view, &state).await;
     assert!(view.active_profile.is_none(), "a unified view");
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.apply_sort_order(SortOrder::Custom);
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -4059,7 +3940,7 @@ async fn test_a_hidden_destination_falls_back_to_the_header_in_its_own_profile()
     let profiles = crate::session::list_profiles().unwrap();
     let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
     apply_published(&mut view, &state).await;
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.apply_sort_order(SortOrder::Custom);
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -4117,7 +3998,7 @@ fn same_named_groups_across_profiles_are_tagged_and_listed_once() {
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view =
         HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
 
     assert_eq!(view.all_group_paths(), vec!["solo", "work"]);
@@ -4159,7 +4040,7 @@ async fn reveal_expands_only_target_profile_and_keeps_creation_attach_until_all_
     use crate::daemon::{MutationReceipt, NamespaceMutation, NamespaceOutcome};
     let mut env = create_test_env_empty();
     env.view.active_profile = None;
-    env.view.group_by = crate::session::config::GroupByMode::Manual;
+    env.view.group_by = crate::session::config::GroupByMode::Group;
     let mut target = Instance::new("created-exact", "/tmp/target");
     target.source_profile = "test".into();
     target.group_path = "parent/child".into();
@@ -4261,7 +4142,7 @@ async fn reveal_expands_only_target_profile_and_keeps_creation_attach_until_all_
 async fn creation_reveal_keeps_owed_attach_while_newer_metadata_frame_is_unapplied() {
     use crate::daemon::{MutationReceipt, NamespaceOutcome};
     let mut env = create_test_env_empty();
-    env.view.group_by = crate::session::config::GroupByMode::Manual;
+    env.view.group_by = crate::session::config::GroupByMode::Group;
     let mut target = Instance::new("created-exact", "/tmp/target");
     target.source_profile = "test".into();
     target.group_path = "work".into();

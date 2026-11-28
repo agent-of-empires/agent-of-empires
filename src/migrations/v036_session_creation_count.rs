@@ -31,15 +31,32 @@ pub fn run() -> Result<()> {
             }
         }
     }
-    // Archives and trash retain their rows; purged history cannot be recovered.
-    let seeded = crate::session::config::update_app_state(|state| {
-        if state.sessions_created_seeded {
-            return false;
-        }
-        state.sessions_created = state.sessions_created.max(ids.len() as u64);
-        state.sessions_created_seeded = true;
-        true
-    })?;
+    // Archives and trash retain their rows; purged history cannot be recovered. The state is
+    // edited as a raw table: a later migration may still have to rewrite values that the
+    // current `AppStateConfig` no longer decodes.
+    let state_path = crate::session::config::state_path()?;
+    let seeded = crate::session::LockedDataFile::open(&state_path)?.update(
+        |content| Ok(content.parse::<toml::Table>()?),
+        |state| Ok(toml::to_string_pretty(state)?),
+        |state| -> Result<bool, std::convert::Infallible> {
+            if state
+                .get("sessions_created_seeded")
+                .and_then(toml::Value::as_bool)
+                == Some(true)
+            {
+                return Ok(false);
+            }
+            let created = state
+                .get("sessions_created")
+                .and_then(toml::Value::as_integer)
+                .unwrap_or(0)
+                .max(i64::try_from(ids.len()).unwrap_or(i64::MAX));
+            state.insert("sessions_created".into(), created.into());
+            state.insert("sessions_created_seeded".into(), true.into());
+            Ok(true)
+        },
+    )?;
+    let Ok((seeded, _)) = seeded;
     if seeded {
         tracing::info!(target: "migrations.v036",
             "v036: seeded session creation count from {} retained sessions",

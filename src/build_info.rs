@@ -1,17 +1,56 @@
-//! Compile-time build identity.
+//! Build identity.
 //!
-//! [`BUILD_VERSION`] is the string `build.rs` stamps via the
-//! `AOE_BUILD_VERSION` rustc-env. It pairs the package version with a git
-//! commit identity (e.g. `1.9.5+g7f31a9c42e01`, or `…-dirty` for an
-//! uncommitted working tree), falling back to the bare `CARGO_PKG_VERSION`
-//! when no VCS identity is available.
+//! Release builds use the `AOE_BUILD_VERSION` that `build.rs` stamps: the
+//! package version plus a git commit (e.g. `1.9.5+g7f31a9c42e01`, or `…-dirty`
+//! for an uncommitted working tree), or the bare `CARGO_PKG_VERSION` when no
+//! VCS identity is available. Unstamped debug builds use the running
+//! executable's mtime and size.
 //!
 //! Acp worker records embed this value so the daemon can respawn
 //! workers left running on an older binary after `aoe update`. See #1754.
 
-/// Build identity of this binary. Stamped by `build.rs`; falls back to the
-/// package version when `AOE_BUILD_VERSION` was not emitted.
-pub const BUILD_VERSION: &str = match option_env!("AOE_BUILD_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
+use std::sync::LazyLock;
+
+/// Build identity of this binary. `main` calls it at startup so a debug
+/// identity describes the executable that started, not a later rebuild.
+pub fn build_version() -> &'static str {
+    if let Some(stamped) = stamp(option_env!("AOE_BUILD_VERSION")) {
+        return stamped;
+    }
+    static EXE: LazyLock<String> = LazyLock::new(exe_identity);
+    &EXE
+}
+
+/// `build.rs` stamps an empty value in debug builds.
+fn stamp(raw: Option<&'static str>) -> Option<&'static str> {
+    raw.filter(|s| !s.is_empty())
+}
+
+fn exe_identity() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let Ok(meta) = std::env::current_exe().and_then(std::fs::metadata) else {
+        return version.to_string();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    format!("{version}+exe.{mtime}.{}", meta.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stamp;
+
+    #[test]
+    fn an_empty_stamp_counts_as_unset() {
+        for (raw, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("1.0.0+gabc"), Some("1.0.0+gabc")),
+        ] {
+            assert_eq!(stamp(raw), expected, "{raw:?}");
+        }
+    }
+}

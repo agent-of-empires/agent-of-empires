@@ -45,9 +45,11 @@ codecov:
 # One flag per test type. Each CI job uploads its own LCOV with its own
 # flag, and Codecov merges them server-side into the combined coverage
 # report (see https://docs.codecov.com/docs/flags). All three jobs run on
-# every PR, so no carryforward: carried-forward sessions count toward
-# `after_n_builds` above, so with carryforward on a single upload satisfied
-# the gate and codecov/patch was posted from partial coverage.
+# every PR that changes web/src, so no carryforward: carried-forward sessions
+# count toward `after_n_builds` above, so with carryforward on a single upload
+# satisfied the gate and codecov/patch was posted from partial coverage. On
+# other PRs the Tests change gate skips vitest and playwright-mocked, so
+# Codecov posts nothing; no web/src line changed.
 flags:
   vitest:
     paths:
