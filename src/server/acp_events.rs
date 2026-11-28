@@ -3909,45 +3909,73 @@ mod tests {
                     if !main_running {
                         live.finish_prompt(&request, None).await;
                     }
-                    live.state.acp_control_cache.forget(&id);
-                    live.state
-                        .instances
-                        .write()
-                        .await
-                        .iter_mut()
-                        .find(|row| row.id == id)
-                        .unwrap()
-                        .status = Status::Stopped;
-                    seed_acp_statuses(live.state.clone()).await;
-                    assert_eq!(
-                        live.state
-                            .instances
-                            .read()
-                            .await
-                            .iter()
-                            .find(|row| row.id == id)
-                            .unwrap()
-                            .status,
-                        Status::Running,
-                    );
-                    finish_projection_resource(&mut live, &path, false).await;
-                    live.state.acp_control_cache.forget(&id);
-                    seed_acp_statuses(live.state.clone()).await;
-                    assert_eq!(
-                        live.state
-                            .instances
-                            .read()
-                            .await
-                            .iter()
-                            .find(|row| row.id == id)
-                            .unwrap()
-                            .status,
-                        if main_running {
+                    for task_running in [true, false] {
+                        if !task_running {
+                            finish_projection_resource(&mut live, &path, false).await;
+                        }
+                        let expected = if main_running || task_running {
                             Status::Running
                         } else {
                             Status::Idle
-                        },
-                    );
+                        };
+                        let baseline = if expected == Status::Running {
+                            Status::Stopped
+                        } else {
+                            Status::Running
+                        };
+                        let _pause = live.client.pause_drain().await;
+                        live.state
+                            .instances
+                            .write()
+                            .await
+                            .iter_mut()
+                            .find(|row| row.id == id)
+                            .unwrap()
+                            .status = baseline;
+                        // The live task tailer still takes the observation fences for file I/O.
+                        // Startup seeding deliberately leaves the row alone on contention.
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            loop {
+                                live.state.acp_control_cache.forget(&id);
+                                seed_acp_statuses(live.state.clone()).await;
+                                let actual = live.state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == id)
+                                    .unwrap()
+                                    .status;
+                                if actual == expected {
+                                    break;
+                                }
+                                assert_eq!(actual, baseline);
+                                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "seed did not reach {expected:?}: main={main_running}, task={task_running}"
+                            )
+                        });
+                        let folded = live
+                            .state
+                            .session_service
+                            .fold_control_state(&id)
+                            .await
+                            .unwrap();
+                        assert_eq!(folded.turn_active, main_running);
+                        let task = folded
+                            .background_tasks
+                            .iter()
+                            .find(|task| task.task_id == "projection-task");
+                        assert_eq!(task.is_some(), task_running);
+                        if let Some(task) = task {
+                            assert!(task.resource_ref.is_some());
+                        }
+                        assert_eq!(folded.sidebar_status(), expected);
+                    }
                 })
             })
             .await;
