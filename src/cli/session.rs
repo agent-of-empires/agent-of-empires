@@ -1271,7 +1271,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             let title = inst.title.clone();
             let res = tokio::task::spawn_blocking(move || {
                 let result = inst.restart_with_size(size);
-                if result.is_ok() {
+                if matches!(
+                    result,
+                    Ok(StartOutcome::Fresh
+                        | StartOutcome::Resumed
+                        | StartOutcome::FreshAfterFailedResume { .. })
+                ) {
                     let file_watch = crate::file_watch::FileWatchService::noop();
                     crate::session::sync::capture_launched_session_id_blocking(
                         &mut inst,
@@ -1309,7 +1314,9 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             }
         }
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
-        if let Some(inst) = inst_opt {
+        if let Some(inst) =
+            inst_opt.filter(|_| !matches!(&result, Ok(StartOutcome::Indeterminate { .. })))
+        {
             restarted.push(inst);
         }
         match result {
@@ -1317,6 +1324,9 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 title,
                 format!("resume failed for sid {sid}; preserved for explicit retry"),
             )),
+            Ok(StartOutcome::Indeterminate { cause }) => {
+                failed.push((title, cause.message().to_owned()))
+            }
             Ok(StartOutcome::FreshAfterFailedResume { sid }) => {
                 fresh_after_failed_resume.push((title.clone(), sid));
                 succeeded.push((id, title));
@@ -1431,6 +1441,9 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         false,
         crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
     )?;
+    if let StartOutcome::Indeterminate { cause } = outcome {
+        bail!("{}", cause.message());
+    }
     let title = working.title.clone();
     let session_id = working.id.clone();
 
@@ -1469,6 +1482,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         StartOutcome::ResumeFailed { sid } => {
             bail!("Resume failed for sid {sid}; preserved for explicit retry");
         }
+        StartOutcome::Indeterminate { cause } => bail!("{}", cause.message()),
         StartOutcome::FreshAfterFailedResume { sid } => {
             println!(
                 "Restarted session: {} (started fresh after a prior resume failed for sid {}; the old conversation remains in the agent's history)",
@@ -2738,7 +2752,8 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             if let Some((_, stage)) = pending_recovery {
                 anyhow::ensure!(matches!(stage,
                     crate::session::TerminalHandoffStage::TerminalCommitOwed
-                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed),
+                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed
+                        | crate::session::TerminalHandoffStage::ProjectionCleanupOwed),
                     "terminal handoff must finish original retirement before its native target can change");
                 let pending = inst.terminal_handoff.as_ref().expect("pending recovery");
                 anyhow::ensure!(pending.final_event_seq.is_some(),
@@ -2748,14 +2763,41 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     && pending.generation == inst.lifecycle_generation,
                     crate::session::LifecycleReservationError::Superseded);
                 pending.ensure_original_stopped(&inst.id)?;
-                let pane = inst.tmux_session()?;
-                if pane.exists_live() {
-                    anyhow::ensure!(pane.is_pane_dead(),
-                        "terminal handoff pane is live; retry disable to complete adoption before changing its target");
-                    let launch = pending.launch.as_ref().ok_or_else(|| anyhow::anyhow!(
-                        "existing dead pane has no handoff receipt; pane retained"))?;
-                    crate::session::Instance::ensure_terminal_handoff_pane_matches(pane.name(),
-                        crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                // The target launch may own newer units than the retired Native Original.
+                // Observe those exact obligations without stopping or adopting a new peer.
+                let target_scopes = crate::process::systemd::resolve_unknown_scopes(
+                    &inst.id, inst.terminal_scopes.as_deref(),
+                ).context("terminal target scope ownership remains unresolved")?;
+                for scope in &target_scopes {
+                    anyhow::ensure!(crate::process::systemd::scope_stopped(&inst.id, scope)?,
+                        "terminal target scope remains live; complete its explicit shutdown before selecting a target");
+                }
+                if let Some(launch) = pending.launch.as_ref() {
+                let socket = launch.receipt.as_ref().map(|receipt| receipt.server.socket.as_str())
+                    .or_else(|| launch.birth_inventory.as_ref().map(|inventory| inventory.socket()))
+                    .context("terminal handoff has no captured physical socket; restore its original ownership evidence")?;
+                let complete = crate::tmux::utils::capture_pane_birth_inventory(
+                    Some(socket), &crate::tmux::TmuxCommandDeadline::new(),
+                ).context("cannot prove terminal pane absence from its complete physical inventory")?;
+                if let Some(receipt) = launch.receipt.as_deref() {
+                    if complete.receipt_present(receipt)? {
+                        let actual = inst.tmux_session()?;
+                        let probe = crate::session::Instance::ensure_terminal_handoff_pane_matches(actual.name(),
+                            crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                        anyhow::ensure!(probe == crate::tmux::utils::PaneProbe::Dead,
+                            "terminal handoff pane is live; close it explicitly in tmux before selecting a target");
+                    }
+                } else {
+                    complete.ensure_only_preexisting_panes(
+                        launch.birth_inventory.as_ref().context("missing pre-birth physical inventory")?,
+                    )?;
+                }
+                } else {
+                    anyhow::ensure!(
+                        stage == crate::session::TerminalHandoffStage::TerminalCommitOwed
+                            && !pending.launch_started,
+                        "terminal handoff has no pre-birth checkpoint; cannot prove an unknown birth absent"
+                    );
                 }
             }
             inst.source_profile = storage.profile().to_string();
@@ -2772,7 +2814,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
-            if let Some((intent_id, _)) = pending_recovery {
+            if let Some((intent_id, stage)) = pending_recovery {
                 let context = match &new_intent {
                     crate::session::ResumeIntent::Use(_) => {
                         let native_store = inst.resume_binding.as_ref().and_then(|binding| binding.execution.clone())
@@ -2798,7 +2840,10 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 pending.source_acp_session_id = source_acp_session_id;
                 pending.set_terminal(Some(target));
                 pending.launch_started = false;
-                // Retain the original checkpoint solely as the owned dead-pane receipt.
+                if stage == crate::session::TerminalHandoffStage::ProjectionCleanupOwed {
+                    pending.stage = crate::session::TerminalHandoffStage::TerminalLaunchOwed;
+                }
+                // Keep pending.launch as prior-attempt evidence, not proof of an unrecorded birth.
             }
             Ok(inst.title.clone())
         })
@@ -3483,6 +3528,78 @@ mod session_mutation_tests {
         let row = stored(&storage, &id);
         assert_eq!(row.resume_intent, ResumeIntent::Use(SID_B.to_string()));
         assert_eq!(row.resume_probe_failed_sid, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_session_id_repairs_a_retired_handoff_before_birth() {
+        use crate::session::{
+            TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffOutcome,
+            TerminalHandoffStage,
+        };
+
+        let temp = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "repair-unborn-handoff";
+        let mut row = Instance::new("handoff", temp.path().to_str().unwrap());
+        row.view = crate::session::View::Structured;
+        row.source_profile = profile.into();
+        row.lifecycle_generation = 1;
+        row.terminal_scopes = Some(Vec::new());
+        let (_, id) = seed(profile, row.clone());
+        let storage = Storage::open_unwatched(profile).unwrap();
+        let intent_id = uuid::Uuid::new_v4();
+        row.terminal_handoff = Some(Box::new(TerminalHandoffIntent {
+            id: intent_id,
+            profile: profile.into(),
+            profile_identity: storage.bound_profile_identity().unwrap(),
+            generation: 1,
+            target_generation: 1,
+            stage: TerminalHandoffStage::TerminalCommitOwed,
+            context: TerminalHandoffContext::Discard,
+            source_acp_session_id: None,
+            source_event_seq: 0,
+            final_event_seq: Some(0),
+            source_conversation: row.conversation_state(),
+            runner: crate::session::purge_owners::RunnerCapture::Uncaptured {
+                scopes: Vec::new(),
+                producer_epoch: None,
+                producer_id: None,
+                prime: crate::acp::runner_lifecycle::PrimeOwnership::NotPrime,
+            },
+            unborn_fence: None,
+            terminal: None,
+            outcome: TerminalHandoffOutcome::Fresh,
+            launch_required: true,
+            launch_started: false,
+            launch: None,
+            selector_ended: false,
+        }));
+        storage
+            .update(|rows, _| {
+                rows[0].terminal_handoff = row.terminal_handoff.take();
+                Ok(())
+            })
+            .unwrap();
+        let args = || SetSessionIdArgs {
+            identifier: id.clone(),
+            session_id: String::new(),
+            store: None,
+        };
+        set_session_id(profile, args()).await.unwrap();
+        let repaired = stored(&storage, &id);
+        let handoff = repaired.terminal_handoff.unwrap();
+        assert_eq!(handoff.id, intent_id);
+        assert_eq!(handoff.generation, 2);
+        assert_eq!(handoff.terminal.unwrap().intent, ResumeIntent::Cleared);
+        storage
+            .update(|rows, _| {
+                rows[0].terminal_handoff.as_mut().unwrap().launch_started = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(set_session_id(profile, args()).await.is_err());
+        assert_eq!(stored(&storage, &id).lifecycle_generation, 2);
     }
 
     #[tokio::test]

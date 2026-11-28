@@ -109,6 +109,7 @@ impl Instance {
             launch_admission: None,
             before_start_minted_for_launch: false,
             capture_started_at: None,
+            unproven_native_birth_generation: None,
             launch_executable: None,
             pi_extension_launched: false,
             identity_publisher_launched: false,

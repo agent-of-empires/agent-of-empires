@@ -81,8 +81,10 @@ pub(crate) use instance::generate_id;
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
 pub(crate) use instance::resume_profile_config;
+#[cfg(all(test, unix))]
+pub(crate) use instance::test_helpers::frozen_test_helper;
 #[cfg(test)]
-pub(crate) use instance::test_helpers::publish_host_pi_transcript;
+pub(crate) use instance::test_helpers::{publish_host_pi_transcript, seed_claude_transcript};
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
 pub use instance::LastError;
@@ -102,19 +104,19 @@ pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND
 pub use instance::{
     AuxiliaryObservation, AuxiliaryTarget, ConversationBinding, ConversationProvenance,
     DetectionState, EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation,
-    Instance, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity, LegacyToolObservation,
-    LifecycleOperation, LifecycleReservation, LifecycleReservationError, ManagedResumeCause,
-    PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency, PollerStart,
-    SandboxInfo, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket, SessionGone,
-    StartBlocked, StartOutcome, Status, SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES,
+    Instance, LaunchIndeterminateCause, LaunchSidOutcome, LegacyToolAdoption, LegacyToolIdentity,
+    LegacyToolObservation, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
+    ManagedResumeCause, PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency,
+    PollerStart, SandboxInfo, SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket,
+    SessionGone, StartBlocked, StartOutcome, Status, SuggestionOrigin, TerminalInfo,
+    TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, MAX_INITIAL_PROMPT_BYTES,
     TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
-    ConversationState, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
-    ResumeLaunchOptions, ResumeProfileConfig, TerminalContextResume,
+    ConversationState, LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused,
+    ResumeAttemptPolicy, ResumeLaunchOptions, ResumeProfileConfig, TerminalContextResume,
 };
-pub(crate) use instance::{Handoff, Held, SandboxPin, Unserved};
+pub(crate) use instance::{Held, SandboxPin, Unserved};
 pub(crate) use instance::{
     TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffOutcome,
     TerminalHandoffStage, TerminalHandoffUnbornFence,
@@ -214,9 +216,9 @@ pub(crate) use storage::{
     acquire_recovery_storage_flock, acquire_session_title_lock, acquire_storage_flock,
     acquire_storage_shared_flock, atomic_write, backup_before_migration, read_file_no_follow,
     replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage,
-    GroupMovePlan, LaunchConfig, LockedDataFile, NativeStoreUnavailable, ProfileMoveRejected,
-    SessionCommitApplied, SessionMutation, SessionStore, StorageFlock, StorageTransition,
-    MAX_SYMLINK_HOPS, STORAGE_LOCK_FILENAME,
+    GroupMovePlan, LaunchConfig, LifecycleRelease, LockedDataFile, NativeStoreUnavailable,
+    ProfileMoveRejected, SessionCommitApplied, SessionMutation, SessionStore, StorageFlock,
+    StorageTransition, MAX_SYMLINK_HOPS, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

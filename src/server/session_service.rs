@@ -5965,6 +5965,8 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let inst = terminal_turn_instance("sess-pane", "term-pane", "unused");
         let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let target = crate::tmux::test_helpers::only_pane_id(pane.name());
+        crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
         let tmux = crate::tmux::Session::from_name(pane.name());
         let pane_id = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&inst)
             .unwrap()
@@ -6197,6 +6199,27 @@ mod tests {
             let inst = terminal_turn_instance(&id, &format!("term-{case}"), "must-not-be-typed");
             let pane =
                 (!script.is_empty()).then(|| start_terminal_pane(&inst, script, remain_on_exit));
+            if let Some(pane) = &pane {
+                let target = crate::tmux::test_helpers::only_pane_id(pane.name());
+                if remain_on_exit {
+                    crate::tmux::test_helpers::wait_for_pane_dead(&target);
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while !pane_text(pane).contains("login banner, nothing is running here")
+                            || !crate::tmux::utils::is_shell_command(
+                                &crate::tmux::test_helpers::pane_field(
+                                    &target,
+                                    "#{pane_current_command}",
+                                ),
+                            )
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the login shell is observable");
+                }
+            }
             let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
                 .session_service
                 .clone();

@@ -44,7 +44,7 @@ pub(crate) use container::{
     forget_before_start_resolution, BeforeStartHook, BeforeStartHookError, Releasing,
 };
 mod execution;
-pub(crate) use capture_slot::{Handoff, Held, Unserved};
+pub(crate) use capture_slot::{Held, Unserved};
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
 pub use execution::{
     ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,
@@ -94,10 +94,11 @@ pub use last_error::LastError;
 pub(crate) use last_error::TmuxAbsence;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
-pub use resume::ManagedResumeCause;
 pub(crate) use resume::{
-    LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
+    LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
+    ResumeLaunchOptions,
 };
+pub use resume::{LaunchIndeterminateCause, ManagedResumeCause};
 pub(crate) use sid_persist::{
     persist_session_to_storage, persist_session_with_storage, CaptureCommit, SidPersistOutcome,
     SidWrite,
@@ -345,6 +346,10 @@ pub(crate) struct TerminalHandoffLaunch {
     pub(crate) capture_started_at: Option<SystemTime>,
     pub(crate) omp_capture_metadata: Option<OmpCaptureMetadata>,
     pub(crate) confirm_desired_conversation: bool,
+    pub(crate) receipt: Option<std::sync::Arc<LegacyToolObservation>>,
+    /// Negative evidence only; never substitutes for the launch's birth receipt.
+    #[serde(default)]
+    pub(crate) birth_inventory: Option<crate::tmux::utils::PaneBirthInventory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1071,6 +1076,10 @@ pub struct Instance {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_started_at: Option<std::time::SystemTime>,
+
+    /// A pane launch was dispatched but its birth has not been proved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unproven_native_birth_generation: Option<u64>,
 
     /// Set when this pane's launch line carried the Pi session-id extension.
     /// After reload, the recorded Pi capture context admits its scoped publisher.

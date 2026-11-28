@@ -1,6 +1,10 @@
 //! Tearing a session down.
 
 use super::*;
+#[derive(Debug, thiserror::Error)]
+#[error("Owned pane was removed, but runtime cleanup failed")]
+pub(super) struct RuntimeRemovedCleanupFailed;
+
 pub(crate) struct PiSidecarUpdate {
     session_id: Option<String>,
     path: Option<String>,
@@ -179,6 +183,110 @@ impl Instance {
             .prime_runtime()
             .map_or(Ok(()), |runtime| runtime.cleanup());
         combine_teardown_results(pane, native)
+    }
+
+    /// Revival removes only the physical target and state captured before hooks.
+    /// Process handles are signalled only after tmux acknowledges the atomic guard.
+    pub(super) fn kill_for_revival_locked(
+        &self,
+        expected: Option<&resume::RevivalTarget>,
+    ) -> Result<()> {
+        let removed = (|| -> Result<(Option<crate::process::CapturedProcessTree>, bool)> {
+            let current = crate::tmux::unique_agent_session_name(&self.id)?;
+            let Some(expected) = expected else {
+                anyhow::ensure!(
+                    current.is_none(),
+                    LaunchIndeterminateCause::OwnershipUnproven
+                );
+                return Ok((None, false));
+            };
+            let name = current.ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+            let processes =
+                self.remove_captured_runtime_locked(&name, &expected.pane, Some(expected.state))?;
+            Ok((processes, true))
+        })();
+        let (processes, removed_pane) = match removed {
+            Ok(removed) => removed,
+            Err(error) => {
+                let cause = error
+                    .downcast_ref::<LaunchIndeterminateCause>()
+                    .copied()
+                    .unwrap_or(LaunchIndeterminateCause::OwnershipUnproven);
+                tracing::warn!(target: "session.store", session = %self.id, %error,
+                    "revival ownership, state or exclusivity unproven; runtime retained");
+                return Err(cause.into());
+            }
+        };
+        self.finish_removed_runtime_cleanup(processes, removed_pane)
+    }
+
+    fn remove_captured_runtime_locked(
+        &self,
+        session_name: &str,
+        expected: &LegacyToolObservation,
+        state: Option<crate::tmux::utils::PaneProbe>,
+    ) -> Result<Option<crate::process::CapturedProcessTree>> {
+        use crate::tmux::utils::PaneProbe;
+        let observation = crate::tmux::utils::probe_owned_pane(
+            session_name,
+            expected,
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )?
+        .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+        anyhow::ensure!(
+            observation.exclusive
+                && state.is_none_or(|state| state == observation.state)
+                && matches!(observation.state, PaneProbe::Alive | PaneProbe::Dead),
+            LaunchIndeterminateCause::OwnershipUnproven
+        );
+        let processes = if observation.state == PaneProbe::Alive {
+            Some(crate::process::CapturedProcessTree::capture(
+                expected
+                    .identity
+                    .pane_pid
+                    .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?,
+            )?)
+        } else {
+            None
+        };
+        crate::tmux::utils::remove_owned_pane(expected, observation.state == PaneProbe::Dead)?;
+        Ok(processes)
+    }
+
+    fn finish_removed_runtime_cleanup(
+        &self,
+        processes: Option<crate::process::CapturedProcessTree>,
+        removed_pane: bool,
+    ) -> Result<()> {
+        let cleanup: Result<()> = (|| {
+            if let Some(processes) = processes {
+                processes
+                    .settle(std::time::Duration::from_millis(100))
+                    .context("removed runtime child process cleanup failed")?;
+            }
+            self.capture_poller.stop();
+            if let Some(runtime) = self.prime_runtime() {
+                runtime.cleanup()?;
+            }
+            Ok(())
+        })();
+        if removed_pane {
+            cleanup.context(RuntimeRemovedCleanupFailed)
+        } else {
+            cleanup
+        }
+    }
+
+    pub(super) fn clean_failed_launch_runtime(&self, probe: &resume::LaunchProbe) -> Result<()> {
+        let pane = probe
+            .pane
+            .as_deref()
+            .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+        // Only a receipt from this launch permits either state: a newborn may have exited,
+        // but an automatic revival must retain its original captured state.
+        let processes = self.remove_captured_runtime_locked(&probe.tmux_session, pane, None)?;
+        self.finish_removed_runtime_cleanup(processes, true)?;
+        self.release_scope()
     }
 
     pub(crate) fn kill_clean_in(&self, storage: &dyn crate::session::SessionStore) -> Result<u64> {
@@ -549,6 +657,109 @@ impl Instance {
 mod tests {
 
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn revival_refuses_a_window_linked_to_another_session() {
+        use crate::tmux::test_helpers::{pane_field, wait_for_pane_command, TmuxTestSession};
+
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let owner = Instance::new("revival-linked-owner", root.path().to_str().unwrap());
+        let alias = Instance::new("revival-linked-alias", root.path().to_str().unwrap());
+        let owner_session = owner.tmux_session().unwrap();
+        let alias_session = alias.tmux_session().unwrap();
+        let _owner = TmuxTestSession::from_name(owner_session.name());
+        let _alias = TmuxTestSession::from_name(alias_session.name());
+        let physical = owner_session
+            .create_with_size_env_and_container_env(
+                root.path().to_str().unwrap(),
+                Some("exec sleep 120"),
+                None,
+                "default",
+                &[],
+                &[],
+                None,
+            )
+            .unwrap()
+            .expect("managed live pane");
+        let pane = &physical.identity.pane_id;
+        wait_for_pane_command(pane, "sleep");
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                alias_session.name(),
+                "-t",
+                &physical.identity.session_id,
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            pane_field(
+                pane,
+                "#{session_windows}|#{window_panes}|#{window_linked}|#{window_linked_sessions}"
+            ),
+            "1|1|1|1",
+            "window_linked detects sharing even when linked_sessions counts one session group"
+        );
+        let context = pane_field(pane, "#{session_id}");
+        let alias_id = pane_field(&format!("={}:", alias_session.name()), "#{session_id}");
+        let window = pane_field(pane, "#{window_id}");
+        let links = crate::tmux::tmux_command()
+            .args(["list-windows", "-a", "-F", "#{session_id}|#{window_id}"])
+            .output()
+            .unwrap();
+        assert!(links.status.success());
+        let links = std::str::from_utf8(&links.stdout).unwrap();
+        let owner_link = format!("{}|{window}", physical.identity.session_id);
+        let alias_link = format!("{alias_id}|{window}");
+        assert!(links.lines().any(|link| link == owner_link));
+        assert!(links.lines().any(|link| link == alias_link));
+        let instance = if context == physical.identity.session_id {
+            &owner
+        } else {
+            assert_eq!(context, alias_id);
+            &alias
+        };
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let _lifecycle = storage
+            .acquire_instance_lifecycle_lock(&instance.id)
+            .unwrap();
+        let pid = pane_field(pane, "#{pane_pid}").parse().unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        let releases = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = releases.clone();
+        let _release = crate::process::systemd::release_probe::install(move |_| {
+            observed.set(observed.get() + 1);
+        });
+
+        let captured = instance
+            .capture_revival_target()
+            .unwrap()
+            .expect("linked-window fixture must expose its actual original pane");
+        let result = instance.kill_for_revival_locked(Some(&captured));
+        assert!(
+            result.is_err(),
+            "revival must not kill the process shared by another session: {result:?}"
+        );
+        assert!(owner_session.exists_live());
+        assert!(alias_session.exists_live());
+        assert_eq!(pane_field(pane, "#{pane_dead}"), "0");
+        assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
+        assert_eq!(releases.get(), 0);
+    }
     #[cfg(target_os = "linux")]
     #[test]
     #[serial_test::serial]
@@ -655,9 +866,22 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        crate::session::config::update_app_state(|state| state.has_acknowledged_agent_hooks = true)
+            .unwrap();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexec sleep 60\n",
+        );
         let profile = "prime-pane-cleanup-failure";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
-        for clean in [false, true] {
+        for operation in ["kill", "kill_clean", "revival"] {
             let mut inst = Instance::new("Prime cleanup failure", root.path().to_str().unwrap());
             inst.source_profile = profile.into();
             let runtime = crate::process::prime::PrimeRuntime::new(
@@ -703,16 +927,23 @@ mod tests {
                 .unwrap()
                 .success());
             crate::tmux::refresh_session_cache();
-            let result = if clean {
-                inst.kill_clean_in(&storage).map(|_| ())
-            } else {
-                inst.kill()
+            let result = match operation {
+                "kill_clean" => inst.kill_clean_in(&storage).map(|_| ()),
+                "revival" => inst
+                    .restart_with_resume_policy(None, false, ResumeAttemptPolicy::Allow)
+                    .map(|_| ()),
+                "kill" => inst.kill(),
+                _ => unreachable!(),
             };
             crate::tmux::refresh_session_cache();
-            assert!(result.is_err());
             assert!(
                 !crate::tmux::session_exists(&name),
                 "cleanup error left the pane running"
+            );
+            assert!(
+                result.is_err(),
+                "{operation}: native cleanup failed after the actual pane was removed; \
+                 it must not be reported as an indeterminate refusal that preserved the runtime"
             );
             let persisted = storage
                 .load()
@@ -720,7 +951,9 @@ mod tests {
                 .into_iter()
                 .find(|row| row.id == inst.id)
                 .unwrap();
-            assert_eq!(persisted.status, Status::Error);
+            if operation != "revival" {
+                assert_eq!(persisted.status, Status::Error);
+            }
             assert_eq!(
                 persisted.prime_runtime().unwrap().directory,
                 runtime.directory

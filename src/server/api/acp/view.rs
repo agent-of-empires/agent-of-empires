@@ -601,7 +601,9 @@ impl Drop for TerminalHandoff {
             SessionStore::defer_lifecycle_release(
                 native,
                 self.session_id.clone(),
-                crate::session::LifecycleOperation::Launch,
+                crate::session::LifecycleRelease::Reservation(
+                    crate::session::LifecycleOperation::Launch,
+                ),
                 key.generation,
                 None,
             );
@@ -1328,6 +1330,43 @@ fn commit_terminal_in(
     })
 }
 
+/// A prepared payload is not a birth receipt. The existing no-launch transition is
+/// only for a still-blocked row; it neither adopts a pane nor attests a missing birth.
+fn ensure_handoff_launch_receipt(row: &Instance, key: HandoffKey) -> anyhow::Result<()> {
+    let intent = row
+        .terminal_handoff
+        .as_ref()
+        .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+    anyhow::ensure!(
+        row.view == View::Terminal
+            && row.lifecycle_generation == key.generation
+            && intent.id == key.id
+            && intent.generation == key.generation
+            && intent.target_generation <= key.generation,
+        crate::session::LifecycleReservationError::Superseded
+    );
+    if intent.selector_ended && intent.launch.is_none() {
+        return Ok(());
+    }
+    if !intent.launch_required && !intent.launch_started && intent.launch.is_none() {
+        anyhow::ensure!(
+            row.ensure_startable().is_err(),
+            crate::session::LaunchIndeterminateCause::OwnershipUnproven
+        );
+        return Ok(());
+    }
+    let launch = intent
+        .launch
+        .as_ref()
+        .ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?;
+    anyhow::ensure!(
+        launch.receipt.is_some()
+            && launch.generation >= intent.target_generation
+            && launch.generation <= key.generation,
+        crate::session::LaunchIndeterminateCause::OwnershipUnproven
+    );
+    Ok(())
+}
 /// A session id whose next `finish_handoff_in` runs this hook before canonical adoption.
 #[cfg(test)]
 type FinishAdoptionHook = (String, Box<dyn FnOnce() + Send>);
@@ -1360,6 +1399,7 @@ fn finish_handoff_in(
             row.view == View::Terminal,
             LifecycleReservationError::Superseded
         );
+        ensure_handoff_launch_receipt(row, key)?;
         let intent = matching_handoff(row, profile, profile_identity, key)?;
         anyhow::ensure!(
             intent.stage == TerminalHandoffStage::ProjectionCleanupOwed,
@@ -1753,6 +1793,20 @@ fn drive_terminal_handoff(
                             .storage()
                             .acquire_instance_lifecycle_lock(&launch_id)?;
                         if !ended {
+                            ensure_handoff_launch_receipt(&row, attempt)?;
+                            let launch = row
+                                .terminal_handoff
+                                .as_ref()
+                                .and_then(|intent| intent.launch.as_ref())
+                                .ok_or(
+                                    crate::session::LaunchIndeterminateCause::OwnershipUnproven,
+                                )?;
+                            let terminal = row.tmux_session()?;
+                            Instance::ensure_terminal_handoff_pane_matches(
+                                terminal.name(),
+                                attempt,
+                                launch,
+                            )?;
                             held.store().adopt_runtime_fields(&row)?;
                             held.store().refresh_pane_observations(&row)?;
                         }
@@ -1771,6 +1825,10 @@ fn drive_terminal_handoff(
                             anyhow::ensure!(
                                 intent.stage == HandoffStage::TerminalLaunchOwed,
                                 crate::session::LifecycleReservationError::Superseded
+                            );
+                            anyhow::ensure!(
+                                !ended || intent.launch.is_none(),
+                                crate::session::LaunchIndeterminateCause::OwnershipUnproven
                             );
                             intent.stage = HandoffStage::ProjectionCleanupOwed;
                             if ended {
@@ -1799,6 +1857,19 @@ fn drive_terminal_handoff(
                             .into_iter()
                             .find(|row| row.id == cleanup_id)
                             .ok_or(crate::session::SessionGone)?;
+                        ensure_handoff_launch_receipt(&current, key)?;
+                        if let Some(launch) = current
+                            .terminal_handoff
+                            .as_ref()
+                            .and_then(|intent| intent.launch.as_ref())
+                        {
+                            let terminal = current.tmux_session()?;
+                            Instance::ensure_terminal_handoff_pane_matches(
+                                terminal.name(),
+                                key,
+                                launch,
+                            )?;
+                        }
                         let identity = native.storage().bound_profile_identity()?;
                         let recorded = matching_handoff(
                             &mut current,
@@ -3394,6 +3465,394 @@ mod tests {
             .expect("the committed handoff is still owed");
         assert_eq!(retired.stage, HandoffStage::TerminalLaunchOwed);
         Ok((state, [reserved, handoff_outcome(&retired)]))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn unproven_terminal_birth_keeps_handoff_and_projection() -> anyhow::Result<()> {
+        unproven_terminal_birth_at_recovery(None).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn unproven_terminal_birth_stays_pending_during_maintenance() -> anyhow::Result<()> {
+        unproven_terminal_birth_at_recovery(Some(HandoffRecovery::Maintenance)).await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    async fn unproven_terminal_birth_stays_pending_after_app_state_reconstruction(
+    ) -> anyhow::Result<()> {
+        unproven_terminal_birth_at_recovery(Some(HandoffRecovery::Startup)).await
+    }
+
+    #[cfg(unix)]
+    async fn unproven_terminal_birth_at_recovery(
+        recovery: Option<HandoffRecovery>,
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            crate::tmux::test_helpers::tmux_available(),
+            "tmux is required"
+        );
+        let real_tmux = which::which("tmux")?;
+        let root = tempfile::TempDir::with_prefix_in("aoe-", "/tmp")?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _environment = crate::session::test_support::EnvGuard::unset(&[
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "CLAUDE_CONFIG_DIR",
+        ])
+        .and_set("HOME", root.path())
+        .and_set("XDG_CONFIG_HOME", root.path().join(".config"))
+        .and_set("CLAUDE_CONFIG_DIR", root.path().join(".claude"));
+        let agent_pid_file = root.path().join("actual-host-agent.pid");
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(), "claude",
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
+                crate::session::environment::shell_escape_script_word(&agent_pid_file.to_string_lossy()),
+            ),
+        );
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })?;
+        let bin = root.path().join("tmux-bin");
+        std::fs::create_dir(&bin)?;
+        let shim = bin.join("tmux");
+        let quote = crate::session::environment::shell_escape_script_word;
+        std::fs::write(&shim, format!(
+            "#!/bin/sh\nfor arg do\nif [ \"$arg\" = new-session ]; then {} \"$@\" >/dev/null; exit $?; fi\ndone\nexec {} \"$@\"\n",
+            quote(&real_tmux.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+        ))?;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let mut source = Instance::new("unproven-terminal-handoff", root.path().to_str().unwrap());
+        source.source_profile = "default".into();
+        source.view = View::Structured;
+        source.command = "claude".into();
+        let name = crate::tmux::Session::generate_name(&source.id, &source.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        let peer =
+            crate::tmux::test_helpers::TmuxTestSession::new("unrelated-preexisting-birth-peer");
+        anyhow::ensure!(
+            crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", peer.name(), "exec sleep 60"])
+                .output()?
+                .status
+                .success(),
+            "create a genuine unrelated pane before the launch"
+        );
+        let peer_pane = crate::tmux::test_helpers::only_pane_id(peer.name());
+        crate::tmux::test_helpers::wait_for_pane_command(&peer_pane, "sleep");
+        let peer_pid =
+            crate::tmux::test_helpers::pane_field(&peer_pane, "#{pane_pid}").parse::<u32>()?;
+        let peer_birth = crate::process::process_birth_identity(peer_pid)?.unwrap();
+        let events = Arc::new(crate::acp::event_store::EventStore::open(
+            &root.path().join("events.db"),
+            100,
+        )?);
+        let (state, _) = retired_native_handoff_with_event_store(&source, events.clone()).await?;
+        let sentinel = events.highest_seq_checked(&source.id)? + 1;
+        events.record(
+            &source.id,
+            sentinel,
+            &crate::acp::Event::Stopped {
+                reason: "projection sentinel".into(),
+            },
+        )?;
+        let response = terminal_handoff_request(state.clone(), source.id.clone(), None).await;
+        let durable = crate::session::Storage::open_unwatched("default")?
+            .load()?
+            .into_iter()
+            .find(|row| row.id == source.id)
+            .unwrap();
+        assert!(
+            crate::tmux::Session::from_name(&name).exists_live(),
+            "unproven birth must preserve the actual terminal"
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            durable.terminal_handoff.as_ref().unwrap().stage,
+            HandoffStage::TerminalLaunchOwed
+        );
+        assert!(
+            events
+                .replay_from(&source.id, 0)
+                .iter()
+                .any(|(seq, _)| *seq == sentinel),
+            "unproven terminal ownership must not erase the retained projection"
+        );
+        assert!(
+            durable.terminal_handoff.as_ref().unwrap().launch.is_some(),
+            "the persisted pre-birth launch checkpoint is part of the recovery precondition"
+        );
+        if let Some(mode) = recovery {
+            use crate::tmux::test_helpers::{only_pane_id, pane_field};
+            let pane = only_pane_id(&name);
+            crate::tmux::test_helpers::wait_for_pane_agent_command(&pane, &agent_pid_file, "sleep");
+            let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>()?;
+            let birth = crate::process::process_birth_identity(pid)?
+                .expect("the unproven terminal nevertheless has a real process birth");
+            let storage = crate::session::Storage::open_unwatched("default")?;
+            let recovered = if matches!(mode, HandoffRecovery::Startup) {
+                let recovered =
+                    crate::server::test_support::build_test_app_state_impl_with_event_store(
+                        storage.load()?,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Some(events.clone()),
+                        |_| {},
+                        |supervisor| supervisor,
+                    );
+                crate::server::test_support::refresh_canonical_metadata_for_test(&recovered).await;
+                recovered
+            } else {
+                state
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                recover_pending_terminal_handoffs(&recovered, mode),
+            )
+            .await?;
+            let current = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
+            assert_eq!(
+                current.terminal_handoff.as_ref().map(|intent| intent.stage),
+                Some(HandoffStage::TerminalLaunchOwed),
+                "prepared metadata and a live marker cannot replace the missing birth receipt"
+            );
+            assert!(
+                events
+                    .replay_from(&source.id, 0)
+                    .iter()
+                    .any(|(seq, _)| *seq == sentinel),
+                "recovery without a physical receipt must retain the projection"
+            );
+            assert_eq!(
+                only_pane_id(&name),
+                pane,
+                "recovery must not replay the launch"
+            );
+            assert_eq!(crate::process::process_birth_identity(pid)?, Some(birth));
+            recovered.runtime.work.drain().await;
+        } else {
+            use clap::Parser;
+            #[derive(Parser)]
+            struct SessionCli {
+                #[command(subcommand)]
+                command: crate::cli::session::SessionCommands,
+            }
+            state.runtime.work.drain().await;
+            let storage = crate::session::Storage::open_unwatched("default")?;
+            let old_key = handoff_key(&durable)?;
+            let old_pane = crate::tmux::test_helpers::only_pane_id(&name);
+            crate::tmux::test_helpers::wait_for_pane_agent_command(
+                &old_pane,
+                &agent_pid_file,
+                "sleep",
+            );
+            let old_pid =
+                crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}").parse::<u32>()?;
+            let old_birth = crate::process::process_birth_identity(old_pid)?
+                .expect("unproven birth still names a real live process");
+            let (old_physical, _, _) =
+                crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                    .expect(
+                    "physical original pane exists independently of its missing durable receipt",
+                );
+            storage.update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == source.id).unwrap();
+                row.terminal_handoff.as_mut().unwrap().stage = HandoffStage::ProjectionCleanupOwed;
+                Ok(())
+            })?;
+            let select_fresh = || async {
+                if let Some(binary) = std::env::var_os("AOE_S1_OPERATOR_BINARY") {
+                    let output = tokio::process::Command::new(binary)
+                        .args([
+                            "--profile",
+                            "default",
+                            "session",
+                            "set-session-id",
+                            source.id.as_str(),
+                            "",
+                        ])
+                        .env(crate::tmux::TMUX_SOCKET_ENV, &old_physical.server.socket)
+                        .output()
+                        .await?;
+                    anyhow::ensure!(
+                        output.status.success(),
+                        "matching normal CLI refused: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    Ok(())
+                } else {
+                    crate::cli::session::run(
+                        "default",
+                        SessionCli::try_parse_from([
+                            "aoe-session",
+                            "set-session-id",
+                            source.id.as_str(),
+                            "",
+                        ])?
+                        .command,
+                    )
+                    .await
+                }
+            };
+            assert!(select_fresh().await.is_err());
+            assert!(crate::process::process_birth_is_live(old_pid, &old_birth)?);
+            let refused = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
+            assert_eq!(handoff_key(&refused)?, old_key);
+            assert_eq!(
+                refused.terminal_handoff.as_ref().unwrap().stage,
+                HandoffStage::ProjectionCleanupOwed
+            );
+            let renamed = "operator-moved-unproven-birth";
+            let _renamed = crate::tmux::test_helpers::TmuxTestSession::from_name(renamed);
+            anyhow::ensure!(
+                crate::tmux::tmux_command()
+                    .args(["rename-session", "-t", &name, renamed])
+                    .output()?
+                    .status
+                    .success(),
+                "rename the real unproven birth outside the AoE name prefix"
+            );
+            assert!(
+                select_fresh().await.is_err(),
+                "renaming a living unproven pane must not grant new target authority"
+            );
+            let unchanged = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
+            assert_eq!(handoff_key(&unchanged)?, old_key);
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}"),
+                old_pid.to_string()
+            );
+            assert!(crate::process::process_birth_is_live(old_pid, &old_birth)?);
+            anyhow::ensure!(
+                crate::tmux::tmux_command()
+                    .args(["rename-session", "-t", renamed, &name])
+                    .output()?
+                    .status
+                    .success(),
+                "restore the same physical pane name before explicit operator close"
+            );
+            anyhow::ensure!(
+                crate::tmux::tmux_command()
+                    .args(["join-pane", "-s", &old_pane, "-t", &peer_pane])
+                    .output()?
+                    .status
+                    .success(),
+                "move the real unproven pane outside pane zero"
+            );
+            assert!(
+                select_fresh().await.is_err(),
+                "moving a living unproven pane must not grant new target authority"
+            );
+            let unmoved_target = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
+            assert_eq!(handoff_key(&unmoved_target)?, old_key);
+            assert!(crate::process::process_birth_is_live(old_pid, &old_birth)?);
+            drop(_path);
+            anyhow::ensure!(
+                crate::tmux::tmux_command()
+                    .args(["kill-pane", "-t", &old_pane])
+                    .output()?
+                    .status
+                    .success(),
+                "operator must explicitly close the exact unproven pane"
+            );
+            assert!(crate::tmux::agent_pane_metadata_in(
+                &crate::tmux::batch_pane_metadata()?,
+                &source.id,
+                &source.title
+            )?
+            .is_none());
+            select_fresh().await?;
+            let selected = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
+            let renewed = selected.terminal_handoff.as_ref().unwrap();
+            assert_eq!(renewed.id, old_key.id);
+            assert!(renewed.generation > old_key.generation);
+            assert_eq!(renewed.target_generation, renewed.generation);
+            assert_eq!(renewed.stage, HandoffStage::TerminalLaunchOwed);
+            assert!(matches!(renewed.context, HandoffContext::Discard));
+            assert!(renewed.launch.as_ref().unwrap().receipt.is_none());
+            assert!(events
+                .replay_from(&source.id, 0)
+                .iter()
+                .any(|(seq, _)| *seq == sentinel));
+            let response = terminal_handoff_request(state.clone(), source.id.clone(), None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let completed = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
+            assert!(completed.terminal_handoff.is_none());
+            assert!(completed.lifecycle_reservation.is_none());
+            assert!(completed.lifecycle_generation > renewed.generation);
+            let new_pane = crate::tmux::test_helpers::only_pane_id(&name);
+            let (new_physical, _, _) =
+                crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                    .expect("new physical pane exists");
+            let new_pid = new_physical.identity.pane_pid.expect("new pane PID");
+            let new_birth = crate::process::process_birth_identity(new_pid)?
+                .expect("new pane has a real process birth");
+            assert_ne!(
+                (&new_physical.server, &new_pane, new_pid, &new_birth),
+                (&old_physical.server, &old_pane, old_pid, &old_birth),
+                "bare pane IDs may be reused only on a different physical server or birth"
+            );
+            let repeat = terminal_handoff_request(state.clone(), source.id.clone(), None).await;
+            assert_eq!(repeat.status(), StatusCode::OK);
+            assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), new_pane);
+            assert_eq!(
+                crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new(),)?
+                    .unwrap()
+                    .0,
+                new_physical,
+                "a repeated request must retain the actual new physical owner"
+            );
+            assert!(crate::process::process_birth_is_live(new_pid, &new_birth)?);
+            assert!(events.replay_from(&source.id, 0).is_empty());
+            assert_eq!(
+                crate::tmux::test_helpers::only_pane_id(peer.name()),
+                peer_pane
+            );
+            assert!(crate::process::process_birth_is_live(
+                peer_pid,
+                &peer_birth
+            )?);
+            state.runtime.work.drain().await;
+        }
+        Ok(())
     }
 
     /// A no-choice fresh switch reserves Fresh, so retirement deletes the ACP conversation; the
@@ -5344,7 +5803,7 @@ mod tests {
     /// completes rather than reporting the command-selector ending.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_switch_that_adopts_a_live_pane_without_a_launch_completes() -> anyhow::Result<()> {
+    async fn a_switch_does_not_adopt_a_live_pane_without_a_receipt() -> anyhow::Result<()> {
         let _home = crate::session::test_support::isolate_app_dir();
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
         let _store = crate::session::test_support::EnvGuard::set(&[(
@@ -5404,13 +5863,16 @@ mod tests {
         .into_response();
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 8192).await?;
-        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
         let stored = crate::session::Storage::open_unwatched("default")?
             .load()?
             .into_iter()
             .find(|r| r.id == row.id)
             .unwrap();
-        assert!(stored.terminal_handoff.is_none());
+        assert_eq!(
+            stored.terminal_handoff.as_ref().unwrap().stage,
+            HandoffStage::TerminalLaunchOwed
+        );
         assert_eq!(stored.view, View::Terminal);
         assert_ne!(stored.status, Status::Error);
         assert_eq!(
@@ -5428,12 +5890,23 @@ mod tests {
     /// A switch owed with the command's own selector beside AoE's id ends, whether or not a launch
     /// was already refused, and a restart without the selector launches. A pane an earlier attempt
     /// kept is adopted instead.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
     async fn an_owed_switch_the_command_selector_refuses_ends_and_a_restart_launches(
     ) -> anyhow::Result<()> {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            return crate::process::exec_frozen_environment();
+        }
         let _home = crate::session::test_support::isolate_app_dir();
         let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let _native_helper = crate::session::frozen_test_helper(
+            &home,
+            concat!(
+                module_path!(),
+                "::an_owed_switch_the_command_selector_refuses_ends_and_a_restart_launches"
+            ),
+        );
         let _store = crate::session::test_support::EnvGuard::set(&[(
             "CLAUDE_CONFIG_DIR",
             home.join(".claude"),
@@ -5456,7 +5929,7 @@ mod tests {
         let owed = |title: &str| {
             let mut row = structured_claude_row(title, path, None);
             row.command = "claude --resume old-id".into();
-            row.agent_session_id = Some("sid-held".into());
+            row.agent_session_id = Some(uuid::Uuid::new_v4().to_string());
             row
         };
         let flag_removed = owed("owed own selector, flag removed");
@@ -5652,9 +6125,13 @@ mod tests {
                     })
                     .await??;
                     set_command("claude --resume old-id")?;
+                    let expected = format!(
+                        "--session-id {}\n",
+                        held.agent_session_id.as_deref().unwrap()
+                    );
                     assert_eq!(
-                        argv_record(&argv, "--session-id sid-held\n").await,
-                        "--session-id sid-held\n",
+                        argv_record(&argv, &expected).await,
+                        expected,
                         "the kept pane ran"
                     );
                     // Pane ids are never reused within a tmux server; the PID lookup is not
@@ -5878,13 +6355,16 @@ mod tests {
                 &flag_removed,
                 Some("claude".to_string()),
                 "claude",
-                "--session-id sid-held\n",
+                format!(
+                    "--session-id {}\n",
+                    flag_removed.agent_session_id.as_deref().unwrap()
+                ),
             ),
             (
                 &id_cleared,
                 None,
                 "claude --resume old-id",
-                "--resume old-id\n",
+                "--resume old-id\n".to_owned(),
             ),
         ] {
             let _ = std::fs::remove_file(&argv);
@@ -5899,9 +6379,15 @@ mod tests {
             .await;
             let status = response.status();
             let body = axum::body::to_bytes(response.into_body(), 8192).await?;
-            assert!(status.is_success(), "{}: {status}: {body:?}", row.title);
+            assert!(
+                status.is_success(),
+                "{}: {status}: {body:?}; argv: {:?}; pane: {:?}",
+                row.title,
+                std::fs::read_to_string(&argv),
+                crate::tmux::first_pane_id(stored(&row.id)?.tmux_session()?.name())
+            );
             assert_eq!(
-                argv_record(&argv, launched).await,
+                argv_record(&argv, &launched).await,
                 launched,
                 "{}",
                 row.title
