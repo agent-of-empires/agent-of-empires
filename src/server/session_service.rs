@@ -2999,19 +2999,19 @@ impl SessionService {
             )
         };
         let agent = match self.acp_supervisor.worker_agent_key(id).await {
-            Some(key)
-                if text
-                    .is_some_and(|t| !crate::acp::agent_profiles::could_be_declared_alias(t)) =>
-            {
-                let profile =
-                    crate::acp::agent_profiles::resolve_for(crate::plugin::registry(), &key)
-                        .profile;
-                return Some(Classified {
-                    agent: key,
-                    profile,
-                });
+            Some(key) => {
+                let undeclared = text
+                    .is_some_and(|t| !crate::acp::agent_profiles::could_be_declared_alias(t))
+                    .then(|| crate::acp::agent_profiles::resolve_undeclared(&key))
+                    .flatten();
+                if let Some(profile) = undeclared {
+                    return Some(Classified {
+                        agent: key,
+                        profile,
+                    });
+                }
+                SessionAgent::Worker(key)
             }
-            Some(key) => SessionAgent::Worker(key),
             None => next,
         };
         Some(agent.classify(&source_profile, &project_path).await)

@@ -200,17 +200,21 @@ impl SessionAgent {
     /// [`Self::profile_with`], naming the agent, for a session whose configuration resolves
     /// from `profile` and `project_path`. A built-in worker skips the configuration read.
     pub(crate) async fn classify(self, profile: &str, project_path: &Path) -> Classified {
-        use crate::acp::agent_profiles::{is_builtin, resolve_for};
+        use crate::acp::agent_profiles::{is_builtin, resolve_for, resolve_undeclared};
         let fallback = match &self {
-            Self::Worker(key) if is_builtin(key) => {
+            // A bundled fallback a plugin declares can be shadowed by a custom agent, so
+            // only an undeclared built-in skips the config read.
+            Self::Worker(key) if is_builtin(key) && resolve_undeclared(key).is_some() => {
                 return Classified {
                     agent: key.clone(),
-                    profile: resolve_for(crate::plugin::registry(), key).profile,
+                    profile: resolve_for(crate::plugin::registry(), key, std::iter::empty())
+                        .profile,
                 }
             }
+            // Fallback for a failed config read: custom agents are unknown.
             Self::Worker(key) => Classified {
                 agent: key.clone(),
-                profile: resolve_for(crate::plugin::registry(), key).profile,
+                profile: resolve_for(crate::plugin::registry(), key, std::iter::empty()).profile,
             },
             Self::Next { .. } => self.classify_with(
                 &AgentRegistry::with_defaults(),

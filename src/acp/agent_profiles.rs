@@ -559,21 +559,24 @@ pub fn alias_profile(alias: &str) -> Option<&'static AgentProfile> {
     }
 }
 
-/// [`resolve_for`] that also knows the session's custom agents, and where a custom agent takes the reset alias `session` declares for it.
+/// The names of the session's custom agents that have a command.
+pub fn custom_agent_names(
+    session: &crate::session::config::SessionConfig,
+) -> impl Iterator<Item = &str> {
+    session
+        .custom_agents
+        .iter()
+        .filter(|(_, command)| !command.trim().is_empty())
+        .map(|(name, _)| name.as_str())
+}
+
+/// [`resolve_for`] with the session's custom agents, where a custom agent takes the reset alias `session` declares for it.
 pub fn resolve_with_config(
     registry: Arc<crate::plugin::PluginRegistry>,
     key: &str,
     session: &crate::session::config::SessionConfig,
 ) -> Arc<AgentProfile> {
-    let resolved = resolve_declared(
-        registry,
-        key,
-        session
-            .custom_agents
-            .iter()
-            .filter(|(_, command)| !command.trim().is_empty())
-            .map(|(name, _)| name.as_str()),
-    );
+    let resolved = resolve_for(registry, key, custom_agent_names(session));
     if matches!(resolved.source, ProfileSource::Plugin { .. }) {
         return resolved.profile;
     }
@@ -635,21 +638,23 @@ impl ResolvedProfile {
     }
 }
 
-/// The profile for `key` under `registry`: the declaration of the plugin that wins the tool,
-/// else the core profile, else the default. It does not know the user's custom agents, so a
-/// custom agent named like a plugin tool still gets the plugin's profile; use
-/// [`resolve_with_config`] where the session config is at hand.
-pub fn resolve_for(registry: Arc<crate::plugin::PluginRegistry>, key: &str) -> ResolvedProfile {
-    resolve_declared(registry, key, std::iter::empty())
+/// The profile of a `key` no plugin declares, which no custom agent can shadow, so it needs
+/// no session config. `None` when a plugin declares it.
+pub fn resolve_undeclared(key: &str) -> Option<Arc<AgentProfile>> {
+    let resolved = resolve_for(crate::plugin::registry(), key, std::iter::empty());
+    (!matches!(resolved.source, ProfileSource::Plugin { .. })).then_some(resolved.profile)
 }
 
-fn resolve_declared<'a>(
+/// The profile for `key` under `registry`: the declaration of the plugin that wins the tool,
+/// else the core profile, else the default. A name in `custom_names` is a user's custom agent
+/// and shadows a plugin's tool of that name.
+pub fn resolve_for<'a>(
     registry: Arc<crate::plugin::PluginRegistry>,
     key: &str,
-    custom_agents: impl Iterator<Item = &'a str>,
+    custom_names: impl IntoIterator<Item = &'a str>,
 ) -> ResolvedProfile {
     if let Some(agent) =
-        crate::plugin::agent_integration::declared_agent(registry, key, custom_agents)
+        crate::plugin::agent_integration::declared_agent(registry, key, custom_names)
     {
         if let Some(declaration) = &agent.contribution().profile {
             return ResolvedProfile {

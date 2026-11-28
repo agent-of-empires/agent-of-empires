@@ -271,12 +271,14 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> std::sync::Arc<crate::acp::agent_profiles::AgentProfile> {
         use crate::acp::agent_profiles::resolve_for;
         let Some((agent_key, source_profile, cwd)) = self.worker_agent(session_id).await else {
-            return resolve_for(crate::plugin::registry(), "claude").profile;
+            return resolve_for(crate::plugin::registry(), "claude", std::iter::empty()).profile;
         };
         // Only a `/clear` or `/new` can match a declared alias, so other prompts skip the
-        // configuration read.
+        // configuration read unless a plugin declares the agent.
         if !crate::acp::agent_profiles::could_be_declared_alias(text) {
-            return resolve_for(crate::plugin::registry(), &agent_key).profile;
+            if let Some(profile) = crate::acp::agent_profiles::resolve_undeclared(&agent_key) {
+                return profile;
+            }
         }
         super::SessionAgent::Worker(agent_key)
             .classify(&source_profile.unwrap_or_default(), &cwd)

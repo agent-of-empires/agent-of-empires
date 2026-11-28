@@ -3535,7 +3535,7 @@ command = "acme-omp-shim"
             (vec![], "unknown", ProfileSource::Default, vec![], false),
         ];
         for (index, (plugins, tool, source, clear, reviewed)) in cases.into_iter().enumerate() {
-            let resolved = resolve_for(test_registry(&plugins), tool);
+            let resolved = resolve_for(test_registry(&plugins), tool, std::iter::empty());
             let context = format!("case {index} {tool}");
             assert_eq!(resolved.source, source, "{context}");
             assert_eq!(resolved.profile.clear_aliases, clear, "{context}");
@@ -3563,13 +3563,35 @@ command = "acme-omp-shim"
     }
 
     #[test]
+    fn a_shadowing_custom_agent_gets_the_unreviewed_profile() {
+        use crate::acp::agent_profiles::{resolve_for, ProfileSource};
+        use crate::plugin::automation_policy::{classify_mode, ModeDecision};
+        use aoe_plugin_api::acp::ApprovalClass;
+        let registry = test_registry(&[(
+            profile_manifest("aoe.fresh", "fresh", "clear_aliases = [\"/reset\"]\n"),
+            true,
+        )]);
+        let plugin = resolve_for(registry.clone(), "fresh", std::iter::empty());
+        assert_eq!(plugin.source, ProfileSource::Plugin { reviewed: true });
+        assert_eq!(plugin.profile.clear_aliases, ["/reset"]);
+
+        let custom = resolve_for(registry, "fresh", ["fresh"]);
+        assert_eq!(custom.source, ProfileSource::Default);
+        assert!(custom.profile.clear_aliases.is_empty());
+        assert_eq!(
+            classify_mode(&custom, None, None),
+            ModeDecision::Class(ApprovalClass::Unattended)
+        );
+    }
+
+    #[test]
     fn a_plugin_profile_keeps_no_host_trust_fields() {
         use crate::acp::agent_profiles::resolve_for;
         let registry = test_registry(&[(
             profile_manifest("aoe.claude", "claude", "todos = true\n"),
             true,
         )]);
-        let profile = resolve_for(registry, "claude").profile;
+        let profile = resolve_for(registry, "claude", std::iter::empty()).profile;
         assert!(profile.todos);
         assert_eq!(profile.mcp_prefixes, ["mcp__"]);
         assert!(profile.native_config_agent.is_none());
@@ -3592,11 +3614,23 @@ command = "acme-omp-shim"
         };
         let (first, second) = (with("/one"), with("/two"));
         assert_eq!(
-            resolve_for(first.clone(), "fresh").profile.clear_aliases,
+            resolve_for(first.clone(), "fresh", std::iter::empty())
+                .profile
+                .clear_aliases,
             ["/one"]
         );
-        assert_eq!(resolve_for(second, "fresh").profile.clear_aliases, ["/two"]);
-        assert_eq!(resolve_for(first, "fresh").profile.clear_aliases, ["/one"]);
+        assert_eq!(
+            resolve_for(second, "fresh", std::iter::empty())
+                .profile
+                .clear_aliases,
+            ["/two"]
+        );
+        assert_eq!(
+            resolve_for(first, "fresh", std::iter::empty())
+                .profile
+                .clear_aliases,
+            ["/one"]
+        );
     }
 
     struct IsolatedRegistry {

@@ -289,7 +289,11 @@ mod tests {
             ("shady-agent", Some("acceptEdits"), false, Class(Unattended)),
         ];
         for (agent, mode, discovered, expected) in cases {
-            let resolved = crate::acp::agent_profiles::resolve_for(registry.clone(), agent);
+            let resolved = crate::acp::agent_profiles::resolve_for(
+                registry.clone(),
+                agent,
+                std::iter::empty(),
+            );
             let seen = classify_mode(&resolved, mode, discovered.then_some(&catalog));
             assert_eq!(seen, expected, "{agent} {mode:?} discovered={discovered}");
         }

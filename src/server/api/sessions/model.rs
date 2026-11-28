@@ -45,6 +45,8 @@ pub(super) fn session_response_from_instance_with_plan(
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or(inst.tool.as_str()),
+        // No session config here, so a shadowing custom agent is not known.
+        std::iter::empty(),
     )
     .profile;
     let agent_profile_wire = crate::acp::agent_profiles::AgentProfileWire::new(
