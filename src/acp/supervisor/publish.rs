@@ -24,7 +24,7 @@ pub struct UserPrompt<'a> {
     pub origin: crate::daemon::PromptOrigin,
     pub origin_plugin: Option<String>,
     /// The profile a caller already cut the turn with; `None` looks it up.
-    pub classified_as: Option<&'static crate::acp::agent_profiles::AgentProfile>,
+    pub classified_as: Option<std::sync::Arc<crate::acp::agent_profiles::AgentProfile>>,
 }
 
 impl<S: BroadcastSink> Supervisor<S> {
@@ -268,15 +268,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: &str,
         text: &str,
-    ) -> &'static crate::acp::agent_profiles::AgentProfile {
-        use crate::acp::agent_profiles::resolve;
+    ) -> std::sync::Arc<crate::acp::agent_profiles::AgentProfile> {
+        use crate::acp::agent_profiles::resolve_for;
         let Some((agent_key, source_profile, cwd)) = self.worker_agent(session_id).await else {
-            return resolve("claude");
+            return resolve_for(crate::plugin::registry(), "claude").profile;
         };
         // Only a `/clear` or `/new` can match a declared alias, so other prompts skip the
         // configuration read.
         if !crate::acp::agent_profiles::could_be_declared_alias(text) {
-            return resolve(&agent_key);
+            return resolve_for(crate::plugin::registry(), &agent_key).profile;
         }
         super::SessionAgent::Worker(agent_key)
             .classify(&source_profile.unwrap_or_default(), &cwd)

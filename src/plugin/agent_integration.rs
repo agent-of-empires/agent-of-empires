@@ -315,6 +315,14 @@ impl DeclaredAgent {
     fn plugin_id(&self) -> &str {
         self.registry.all()[self.plugin_index].id()
     }
+
+    /// Whether the declaring plugin is in a reserved namespace.
+    pub(crate) fn reserved_namespace(&self) -> bool {
+        self.registry.all()[self.plugin_index]
+            .manifest
+            .id
+            .is_reserved_namespace()
+    }
 }
 
 /// Whether any active plugin declares a launch command for `tool`.
@@ -3454,6 +3462,124 @@ command = "acme-omp-shim"
                 assert!(!registry_declares(&registry, tool));
             }
         }
+    }
+
+    fn profile_manifest(id: &str, tool: &str, extra_profile: &str) -> String {
+        format!(
+            "id = \"{id}\"\nname = \"Profiled\"\nversion = \"1.0.0\"\napi_version = 30\n\n\
+             [[agent_integrations]]\ntool = \"{tool}\"\ncommand = \"{tool}-next\"\n\
+             [agent_integrations.launch]\noneshot_flag = \"-p\"\n\
+             [agent_integrations.profile]\n{extra_profile}"
+        )
+    }
+
+    #[test]
+    fn a_plugin_profile_resolves_by_selection_and_reviews_by_namespace() {
+        use crate::acp::agent_profiles::{resolve_for, AgentProfileWire, ProfileSource};
+        // (plugins, tool, source, clear aliases, reviewed)
+        type Case = (
+            Vec<(String, bool)>,
+            &'static str,
+            ProfileSource,
+            Vec<&'static str>,
+            bool,
+        );
+        let cases: Vec<Case> = vec![
+            // A new tool id has no core entry: the plugin supplies the profile.
+            (
+                vec![(
+                    profile_manifest("acme.new", "fresh", "clear_aliases = [\"/reset\"]\n"),
+                    true,
+                )],
+                "fresh",
+                ProfileSource::Plugin { reviewed: false },
+                vec!["/reset"],
+                false,
+            ),
+            // An ordinary plugin cannot replace the bundled claude profile.
+            (
+                vec![(
+                    profile_manifest("acme.x", "claude", "clear_aliases = [\"/wipe\"]\n"),
+                    true,
+                )],
+                "claude",
+                ProfileSource::Core,
+                vec!["/clear"],
+                true,
+            ),
+            // A reserved plugin replaces it, and is reviewed.
+            (
+                vec![(
+                    profile_manifest("aoe.claude", "claude", "clear_aliases = [\"/wipe\"]\n"),
+                    true,
+                )],
+                "claude",
+                ProfileSource::Plugin { reviewed: true },
+                vec!["/wipe"],
+                true,
+            ),
+            // A disabled plugin declares nothing.
+            (
+                vec![(
+                    profile_manifest("acme.new", "fresh", "clear_aliases = [\"/reset\"]\n"),
+                    false,
+                )],
+                "fresh",
+                ProfileSource::Default,
+                vec![],
+                false,
+            ),
+            // A core profile outside the reviewed set stays unreviewed.
+            (vec![], "opencode", ProfileSource::Core, vec!["/new"], false),
+            (vec![], "codex", ProfileSource::Core, vec!["/new"], true),
+            (vec![], "unknown", ProfileSource::Default, vec![], false),
+        ];
+        for (index, (plugins, tool, source, clear, reviewed)) in cases.into_iter().enumerate() {
+            let resolved = resolve_for(test_registry(&plugins), tool);
+            let context = format!("case {index} {tool}");
+            assert_eq!(resolved.source, source, "{context}");
+            assert_eq!(resolved.profile.clear_aliases, clear, "{context}");
+            assert_eq!(resolved.reviewed(), reviewed, "{context}");
+            let wire = AgentProfileWire::new(&resolved.profile, false);
+            assert_eq!(wire.clear_aliases, clear, "{context}");
+        }
+    }
+
+    #[test]
+    fn a_plugin_profile_keeps_no_host_trust_fields() {
+        use crate::acp::agent_profiles::resolve_for;
+        let registry = test_registry(&[(
+            profile_manifest("aoe.claude", "claude", "todos = true\n"),
+            true,
+        )]);
+        let profile = resolve_for(registry, "claude").profile;
+        assert!(profile.todos);
+        assert_eq!(profile.mcp_prefixes, ["mcp__"]);
+        assert!(profile.native_config_agent.is_none());
+        assert!(!profile.expands_mcp_env_refs && !profile.legacy_mode_fallback);
+        assert!(profile.fullscreen_probe.is_none() && profile.oneshot_gate.is_none());
+    }
+
+    #[test]
+    fn two_registries_resolve_the_same_tool_without_shared_state() {
+        use crate::acp::agent_profiles::resolve_for;
+        let with = |alias: &str| {
+            test_registry(&[(
+                profile_manifest(
+                    "acme.new",
+                    "fresh",
+                    &format!("clear_aliases = [\"{alias}\"]\n"),
+                ),
+                true,
+            )])
+        };
+        let (first, second) = (with("/one"), with("/two"));
+        assert_eq!(
+            resolve_for(first.clone(), "fresh").profile.clear_aliases,
+            ["/one"]
+        );
+        assert_eq!(resolve_for(second, "fresh").profile.clear_aliases, ["/two"]);
+        assert_eq!(resolve_for(first, "fresh").profile.clear_aliases, ["/one"]);
     }
 
     struct IsolatedRegistry {

@@ -4844,8 +4844,8 @@ mod tests {
             .insert("inherits".into(), "claude".into());
         for (agent, _) in agents {
             assert_eq!(
-                config.clear_alias_profile(agent).map(|p| p.key),
-                (agent == "own").then_some(crate::acp::agent_profiles::CUSTOM_CLEAR.key),
+                config.clear_alias_profile(agent).map(|p| p.key.as_str()),
+                (agent == "own").then_some(crate::acp::agent_profiles::CUSTOM_CLEAR.key.as_str()),
                 "{agent}"
             );
         }

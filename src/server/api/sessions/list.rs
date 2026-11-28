@@ -177,7 +177,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             };
             let profile = match &agent {
                 SessionAgent::Worker(key) if crate::acp::agent_profiles::is_builtin(key) => {
-                    crate::acp::agent_profiles::resolve(key)
+                    crate::acp::agent_profiles::resolve_for(crate::plugin::registry(), key).profile
                 }
                 _ => {
                     let (session_cfg, default_agent) =
@@ -186,7 +186,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 }
             };
             resp.agent_profile = crate::acp::agent_profiles::AgentProfileWire::new(
-                profile,
+                &profile,
                 profile.probe_fullscreen(&probes),
             );
             resp.claude_fullscreen = inst.tool == "claude" && resp.agent_profile.fullscreen;
@@ -432,7 +432,9 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             rate_limit_parked: sessions[i].rate_limit.is_some(),
         };
         let control = state.session_service.fold_control_state(&id).await;
-        let solo = crate::acp::agent_profiles::resolve(&agent_key).is_solo_command(&first);
+        let solo = crate::acp::agent_profiles::resolve_for(crate::plugin::registry(), &agent_key)
+            .profile
+            .is_solo_command(&first);
         sessions[i].queue_reason = crate::acp::dispatch::queue_hold(&control, worker, solo);
     }
 

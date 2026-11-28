@@ -466,8 +466,14 @@ mod tests {
         ]);
         let codex = ids(&["read-only", "agent", "agent-full-access"]);
         let session = Some(ModeSetTarget::SessionMode);
-        let claude_yolo = agent_profiles::resolve("claude").yolo_mode_id.unwrap();
-        let codex_yolo = agent_profiles::resolve("codex").yolo_mode_id.unwrap();
+        let claude_yolo = agent_profiles::resolve("claude")
+            .yolo_mode_id
+            .as_deref()
+            .unwrap();
+        let codex_yolo = agent_profiles::resolve("codex")
+            .yolo_mode_id
+            .as_deref()
+            .unwrap();
         let cases = [
             // Underscore and case folding on both sides.
             ("accept_edits", &claude, None, session),

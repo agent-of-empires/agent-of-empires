@@ -165,13 +165,18 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
                 })
                 .unwrap_or_default();
             models.sort_by(|a, b| a.id.cmp(&b.id));
+            let resolved = crate::acp::agent_profiles::resolve_for(crate::plugin::registry(), &id);
             let mut modes: Vec<AcpModeCapability> = entry
                 .map(|e| {
                     choices(e, ConfigOptionCategory::Mode)
                         .map(|choice| AcpModeCapability {
                             id: choice.value.clone(),
                             display_name: choice.name.clone(),
-                            approval_class: match classify_mode(&id, Some(&choice.value), entry) {
+                            approval_class: match classify_mode(
+                                &resolved,
+                                Some(&choice.value),
+                                entry,
+                            ) {
                                 ModeDecision::Class(class) => class,
                                 // Advertised modes always classify; fail
                                 // closed if that invariant ever breaks.
@@ -329,7 +334,9 @@ async fn admit_and_create(
     }
 
     // Host-side approval classification; the plugin cannot self-label.
-    let class = match classify_mode(&req.agent_id, req.mode_id.as_deref(), entry) {
+    let resolved =
+        crate::acp::agent_profiles::resolve_for(crate::plugin::registry(), &req.agent_id);
+    let class = match classify_mode(&resolved, req.mode_id.as_deref(), entry) {
         ModeDecision::Class(class) => class,
         ModeDecision::UnknownMode => {
             return Err(DispatchError::with_kind(

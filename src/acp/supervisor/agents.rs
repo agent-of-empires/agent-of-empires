@@ -156,7 +156,7 @@ pub(crate) enum SessionAgent {
 #[derive(Debug, Clone)]
 pub(crate) struct Classified {
     pub(crate) agent: String,
-    pub(crate) profile: &'static crate::acp::agent_profiles::AgentProfile,
+    pub(crate) profile: std::sync::Arc<crate::acp::agent_profiles::AgentProfile>,
 }
 
 impl SessionAgent {
@@ -166,7 +166,7 @@ impl SessionAgent {
         registry: &AgentRegistry,
         session_config: &crate::session::config::SessionConfig,
         default_agent: &str,
-    ) -> &'static crate::acp::agent_profiles::AgentProfile {
+    ) -> std::sync::Arc<crate::acp::agent_profiles::AgentProfile> {
         self.classify_with(registry, session_config, default_agent)
             .profile
     }
@@ -189,24 +189,28 @@ impl SessionAgent {
                 )
             }
         };
-        let profile = crate::acp::agent_profiles::resolve_with_config(&agent, session_config);
+        let profile = crate::acp::agent_profiles::resolve_with_config(
+            crate::plugin::registry(),
+            &agent,
+            session_config,
+        );
         Classified { agent, profile }
     }
 
     /// [`Self::profile_with`], naming the agent, for a session whose configuration resolves
     /// from `profile` and `project_path`. A built-in worker skips the configuration read.
     pub(crate) async fn classify(self, profile: &str, project_path: &Path) -> Classified {
-        use crate::acp::agent_profiles::{is_builtin, resolve};
+        use crate::acp::agent_profiles::{is_builtin, resolve_for};
         let fallback = match &self {
             Self::Worker(key) if is_builtin(key) => {
                 return Classified {
                     agent: key.clone(),
-                    profile: resolve(key),
+                    profile: resolve_for(crate::plugin::registry(), key).profile,
                 }
             }
             Self::Worker(key) => Classified {
                 agent: key.clone(),
-                profile: resolve(key),
+                profile: resolve_for(crate::plugin::registry(), key).profile,
             },
             Self::Next { .. } => self.classify_with(
                 &AgentRegistry::with_defaults(),

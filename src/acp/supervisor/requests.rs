@@ -154,7 +154,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             (Some(id), _) => Some(id.to_string()),
             (None, true) => crate::acp::agent_profiles::resolve(agent_key)
                 .yolo_mode_id
-                .map(str::to_string),
+                .clone(),
             (None, false) => None,
         };
         apply_mode(client, session_id, mode_id.as_deref(), "conversation reset").await;

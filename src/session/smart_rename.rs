@@ -1038,10 +1038,10 @@ struct BannerMatcher {
 
 /// Compiled once per profile key; a profile's patterns are static.
 fn banner_matcher(profile: &AgentProfile) -> &'static BannerMatcher {
-    static CACHE: LazyLock<Mutex<HashMap<&'static str, &'static BannerMatcher>>> =
+    static CACHE: LazyLock<Mutex<HashMap<String, &'static BannerMatcher>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
     let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-    cache.entry(profile.key).or_insert_with(|| {
+    cache.entry(profile.key.clone()).or_insert_with(|| {
         let ci = |pattern: &str| format!("(?i){pattern}");
         Box::leak(Box::new(BannerMatcher {
             gate: profile
