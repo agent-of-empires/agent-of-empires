@@ -139,7 +139,7 @@ For reply-enabled integrations, the provider report's `reply_keys` must contain 
 
 `[agent_integrations.profile]` declares how the web dashboard and TUI render and drive the agent's structured view, with the field names of the host's built-in agent profile. It requires `api_version >= 30` and the entry's `command`. Every field is optional.
 
-- Slash commands: `clear_aliases` and `compact_aliases`, each a single token starting with `/`; `clear_requires_driven_reset`.
+- Slash commands: `clear_aliases` and `compact_aliases`, each an array of single-token strings starting with `/` (for example `clear_aliases = ["/clear"]`); `clear_requires_driven_reset`.
 - Capabilities: `supports_exit_plan_mode`, `supports_wakeup_tools`, `emits_heartbeat_keepalives`, `supports_subagents`, `todos`, `skills`, `mobile_monitor_only`.
 - Names: `parent_meta_namespaces`, `subagent_tool_names`, `mcp_prefixes`, `yolo_mode_id`.
 - Tool cards: `card_aliases` with `execute`, `read`, `edit`, `delete`, `search`, `fetch`, `think`; `special_titles` with `skill_names`, `schedule_names`, `harness_names`, `workflow_names`.
