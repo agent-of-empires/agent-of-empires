@@ -1475,18 +1475,26 @@ impl Session {
                     "-p",
                     "-t",
                     pane,
-                    "#{pane_id}|#{pane_dead}|#{session_id}",
+                    "#{pane_id}|#{pane_dead}|#{session_id}|#{pane_pid}",
                 ]))?;
                 let observed = std::str::from_utf8(&live.stdout)?.trim_end();
-                let matches = observed.split_once("|0|").is_some_and(|(id, session_id)| {
-                    id == pane
-                        && self
-                            .physical
-                            .as_ref()
-                            .is_none_or(|physical| session_id == physical.identity.session_id)
-                });
-                if !live.status.success() || !matches {
+                let Some((session_id, pane_pid)) = observed
+                    .strip_prefix(pane)
+                    .and_then(|rest| rest.strip_prefix("|0|"))
+                    .and_then(|identity| identity.split_once('|'))
+                    .filter(|_| live.status.success())
+                else {
                     bail!("tmux pane '{pane}' is gone or dead");
+                };
+                if let Some(physical) = &self.physical {
+                    let pid = pane_pid
+                        .parse::<u32>()
+                        .context(crate::session::NativeInputError::Ownership)?;
+                    anyhow::ensure!(
+                        session_id == physical.identity.session_id
+                            && Some(pid) == physical.identity.pane_pid,
+                        crate::session::NativeInputError::Ownership
+                    );
                 }
                 self.capture_target(pane, 0)
             },

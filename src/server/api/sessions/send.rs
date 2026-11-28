@@ -43,12 +43,49 @@ pub(crate) struct TerminalSendError {
     committed_cursor: Option<Box<(axum::http::HeaderValue, axum::http::HeaderValue)>>,
 }
 
-/// Row and physical pane captured before MCP inspects the prompt.
+/// Native row and physical pane captured before MCP inspects the prompt.
 pub(crate) struct CheckedSendPane {
-    pub created_at: crate::time::Timestamp,
-    pub lifecycle_generation: u64,
-    pub profile: String,
-    pub physical: Arc<crate::session::LegacyToolObservation>,
+    id: String,
+    identity: crate::daemon::NativePreparationIdentity,
+    name: String,
+    physical: Arc<crate::session::LegacyToolObservation>,
+}
+
+impl CheckedSendPane {
+    pub(crate) fn capture(
+        instance: &Instance,
+        name: &str,
+        pane: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> anyhow::Result<Option<Self>> {
+        let storage = crate::session::Storage::open_reference(&instance.source_profile)?;
+        let identity = crate::daemon::NativePreparationIdentity::from_instance(
+            instance,
+            storage.bound_profile_identity()?,
+        );
+        let Some((first, _, _)) = crate::tmux::utils::observe_pane(name, deadline)? else {
+            return Ok(None);
+        };
+        let Some(physical) =
+            crate::tmux::utils::observe_selected_pane(name, &first, pane, deadline)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            id: instance.id.clone(),
+            identity,
+            name: name.to_owned(),
+            physical: Arc::new(physical),
+        }))
+    }
+
+    pub(crate) fn pane_id(&self) -> &str {
+        &self.physical.identity.pane_id
+    }
+
+    pub(crate) fn session(&self) -> crate::tmux::Session {
+        crate::tmux::Session::from_observation(&self.name, Arc::clone(&self.physical))
+    }
 }
 
 /// Which pane a terminal send types into, and how long it waits there for a draft to clear.
@@ -129,7 +166,7 @@ async fn send_terminal_message_inner(
         .ok_or(SendKeysError::NotFound)?;
     let worker_state = state.clone();
     let initial_id = id.to_owned();
-    let (native, before, initial_identity, mut existing_target, initial_ready) =
+    let (native, before, initial_identity, mut existing_target, initial_ready, selected) =
         tokio::task::spawn_blocking(move || -> Result<_, SendKeysError> {
             let error_state = worker_state.clone();
             let native = crate::server::session_store::NativeSessionStore::open(
@@ -161,6 +198,47 @@ async fn send_terminal_message_inner(
                 );
                 let physical = super::ensure::physical_agent_target(&before)?;
                 let ready = physical.as_ref().is_some_and(|(_, _, ready)| *ready);
+                // Preparation owns the first pane; delivery can own an attested live pin.
+                let selected = match (checked, &physical) {
+                    (Some(checked), physical) => {
+                        anyhow::ensure!(
+                            !revive
+                                && checked.id == before.id
+                                && checked.identity.matches(&before)
+                                && checked.identity.matches_source(native.storage()),
+                            crate::session::LifecycleReservationError::Superseded
+                        );
+                        let (name, first, _) = physical.as_ref().ok_or(TerminalNotRunning)?;
+                        anyhow::ensure!(
+                            checked.name == name.as_str()
+                                && checked.physical.server == first.server
+                                && checked.physical.identity.session_id
+                                    == first.identity.session_id,
+                            crate::session::NativeInputError::Ownership
+                        );
+                        Some(checked.physical)
+                    }
+                    (None, Some((name, first, _))) => {
+                        let deadline = crate::tmux::TmuxCommandDeadline::new();
+                        crate::tmux::Session::from_name(name)
+                            .live_channel_pane(&deadline)
+                            .filter(|pane| pane != &first.identity.pane_id)
+                            .map(|pane| {
+                                crate::tmux::utils::observe_selected_pane(
+                                    name, first, &pane, &deadline,
+                                )
+                                .map_err(|error| {
+                                    error.context(crate::session::NativeInputError::Ownership)
+                                })?
+                                .map(Arc::new)
+                                .ok_or_else(|| {
+                                    anyhow::Error::new(crate::session::NativeInputError::Ownership)
+                                })
+                            })
+                            .transpose()?
+                    }
+                    (None, None) => None,
+                };
                 let target =
                     physical.map(
                         |(tmux_session, physical, _)| crate::daemon::TerminalTarget {
@@ -171,10 +249,12 @@ async fn send_terminal_message_inner(
                             status: crate::daemon::TerminalTargetStatus::Alive,
                         },
                     );
-                Ok((identity, target, ready))
+                Ok((identity, target, ready, selected))
             })()
             .map_err(|error| terminal_send_failure(&error_state, error))?;
-            Ok((native, before, captured.0, captured.1, captured.2))
+            Ok((
+                native, before, captured.0, captured.1, captured.2, captured.3,
+            ))
         })
         .await
         .map_err(|error| terminal_send_failure(&state, error.into()))??;
@@ -211,30 +291,6 @@ async fn send_terminal_message_inner(
         .map_err(|error| terminal_send_failure(&state, error))?;
     drop(initial_guard);
     drop(initial_namespace);
-    if let Some(checked) = &checked {
-        if revive
-            || checked.created_at != before.created_at
-            || checked.lifecycle_generation != initial_identity.lifecycle_generation
-            || checked.profile != initial_identity.profile
-        {
-            return Err(terminal_send_failure(
-                &state,
-                crate::session::LifecycleReservationError::Superseded.into(),
-            ));
-        }
-        let live = existing_target
-            .as_ref()
-            .and_then(|target| target.physical.as_ref())
-            .ok_or(SendKeysError::NotRunning)?;
-        if checked.physical.server != live.server
-            || checked.physical.identity.session_id != live.identity.session_id
-        {
-            return Err(terminal_send_failure(
-                &state,
-                crate::session::NativeInputError::Ownership.into(),
-            ));
-        }
-    }
     let mut target = if revive {
         let response = super::lifecycle::prepare_captured_terminal_session(
             state.clone(),
@@ -280,7 +336,7 @@ async fn send_terminal_message_inner(
         }
         target
     } else {
-        if !initial_ready {
+        if !initial_ready && selected.is_none() {
             return Err(SendKeysError::NotRunning);
         }
         existing_target.take().ok_or(SendKeysError::NotRunning)?
@@ -351,8 +407,8 @@ async fn send_terminal_message_inner(
             "Session no longer has a terminal agent"
         );
         let name = target.tmux_session;
-        let physical = target
-            .physical
+        let physical = selected
+            .or(target.physical)
             .ok_or(crate::session::NativeInputError::Ownership)?;
         drop(_ownership);
         let fence = crate::session::NativeInputFence::capture(
@@ -363,7 +419,6 @@ async fn send_terminal_message_inner(
             true,
             expected.profile_identity,
         )?;
-        let physical = checked.map_or(physical, |checked| checked.physical);
         let pane = &physical.identity.pane_id;
         let mut session = crate::tmux::Session::from_observation(&name, Arc::clone(&physical))
             .with_native_input_fence(fence);
@@ -374,7 +429,13 @@ async fn send_terminal_message_inner(
                 std::time::Duration::from_secs(5),
                 crate::agents::ready_markers(&instance.tool),
             )
-            .map_err(|_| TerminalNotRunning)?;
+            .map_err(|error| {
+                if error.is::<crate::session::NativeInputError>() {
+                    error
+                } else {
+                    TerminalNotRunning.into()
+                }
+            })?;
         session.admit_agent_input(instance.expects_shell())?;
         anyhow::ensure!(
             instance.wait_for_input_line(&session, pane, draft_wait),
