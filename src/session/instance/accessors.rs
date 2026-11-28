@@ -76,6 +76,7 @@ impl Instance {
             agent_session_binding: None,
             resume_binding: None,
             active_execution: None,
+            sandbox_launch: None,
             omp_capture_generation: None,
             lifecycle_generation: 0,
             resume_probe_failed_sid: None,

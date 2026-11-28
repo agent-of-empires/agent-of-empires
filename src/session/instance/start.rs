@@ -257,7 +257,7 @@ impl Instance {
         let result = (|| {
             if corpse_pane {
                 let publication = self.prime_root_publication(true);
-                self.kill_clean_locked()?;
+                self.kill_for_restart()?;
                 prepared = self.refresh_prepared_prime_launch_after_pane_stop_in(
                     CaptureStorage::Scoped(storage),
                     prepared,
@@ -936,6 +936,7 @@ impl Instance {
             .as_ref()
             .filter(|execution| execution.inputs.container.is_none())
             .map(|execution| execution.program.clone());
+        self.sandbox_launch = prepared.sandbox_launch.take();
         if let Some(execution) = prepared.execution.take() {
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
@@ -1259,6 +1260,80 @@ fn attested_default_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No migration adds the record (adding-a-migration.md: an optional field whose missing and
+    /// null forms mean the same thing), so both read as unmarked, and a written row reads back.
+    #[test]
+    fn a_stored_row_reads_its_sandbox_launch_record_in_every_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut written = Instance::new("record", "/tmp");
+        written.sandbox_launch = Some(super::super::SandboxLaunch {
+            launch_id: "launch-2".into(),
+            container: crate::containers::launch_stop::fake_container(dir.path(), "docker", ""),
+        });
+        let written = serde_json::to_value(&written).unwrap();
+        let mut old = written.clone();
+        old.as_object_mut().unwrap().remove("sandbox_launch");
+        let mut null = old.clone();
+        null["sandbox_launch"] = serde_json::Value::Null;
+        for (shape, row, want) in [
+            ("written", written.clone(), Some("launch-2")),
+            ("old", old, None),
+            ("null", null, None),
+        ] {
+            let row: Instance = serde_json::from_value(row).unwrap();
+            assert_eq!(
+                row.sandbox_launch
+                    .as_ref()
+                    .map(|launch| launch.launch_id.as_str()),
+                want,
+                "{shape}"
+            );
+            if shape == "written" {
+                assert_eq!(serde_json::to_value(&row).unwrap(), written);
+            }
+        }
+    }
+
+    /// Each launch replaces the sandbox launch record: a launch with no execution stores its own, and one
+    /// that brings none (an execution, or a capture that failed) leaves none behind.
+    #[test]
+    fn a_launch_replaces_the_sandbox_launch_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |launch_id: &str| super::super::SandboxLaunch {
+            launch_id: launch_id.into(),
+            container: crate::containers::launch_stop::fake_container(dir.path(), "docker", ""),
+        };
+        for (prior, launched, want) in [
+            (None, Some(record("launch-2")), Some(record("launch-2"))),
+            (
+                Some(record("launch-1")),
+                Some(record("launch-2")),
+                Some(record("launch-2")),
+            ),
+            (Some(record("launch-1")), None, None),
+        ] {
+            let mut inst = Instance::new("record", "/tmp");
+            inst.sandbox_launch = prior;
+            let mut prepared = PreparedLaunch {
+                command: None,
+                is_existing: false,
+                omp_capture_plan: None,
+                fork_mints_child: false,
+                launch_env: Default::default(),
+                expected_conversation: inst.conversation_state(),
+                sandbox_context_reset: None,
+                canonical_conversation: None,
+                expected_prior_omp_generation: None,
+                execution: None,
+                sandbox_launch: launched.clone(),
+                require_conversation_publication: false,
+            };
+            inst.apply_prepared_launch_state(&mut prepared, None);
+            assert_eq!(inst.sandbox_launch, want, "{launched:?}");
+            assert!(inst.active_execution.is_none());
+        }
+    }
 
     #[cfg(unix)]
     fn frozen_test_helper(
