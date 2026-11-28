@@ -202,8 +202,10 @@ impl Instance {
     ///   longer be running a shell, so a keystroke doesn't land in the boot
     ///   prompt that runs before the agent binary takes over.
     pub(crate) fn wait_for_pane_ready(&self, session: &tmux::Session) {
+        // A wrapper's pane process is unrecognisable to `is_pane_running_shell`,
+        // but a plugin launch runs the program its declaration names.
         let shell_check_unreliable = self.expects_shell()
-            || self.has_command_override()
+            || !self.launches_agent_itself()
             || crate::hooks::read_hook_status(&self.id).is_some();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
         loop {

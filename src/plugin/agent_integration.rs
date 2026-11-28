@@ -1299,6 +1299,29 @@ pub fn respond(
 }
 
 #[cfg(test)]
+pub(crate) fn install_test_manifest(plugin_id: &str, manifest: &str) {
+    use crate::session::{CapabilityGrant, PluginConfig};
+
+    let dir = super::plugins_dir().unwrap().join(plugin_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+    crate::session::update_config(|config| {
+        config.plugins.insert(
+            plugin_id.to_string(),
+            PluginConfig {
+                grant: Some(CapabilityGrant {
+                    manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(manifest.as_bytes()),
+                    capabilities: vec!["session.integration".into()],
+                    granted_at: crate::time::Timestamp::now(),
+                }),
+                ..PluginConfig::default()
+            },
+        );
+    })
+    .unwrap();
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::SystemTime;
@@ -1618,30 +1641,6 @@ send_keys_enter_delay_ms = {delay_ms}
 "#
         );
         install_test_manifest(plugin_id, &manifest);
-    }
-
-    fn install_test_manifest(plugin_id: &str, manifest: &str) {
-        use crate::session::{CapabilityGrant, PluginConfig};
-
-        let dir = super::super::plugins_dir().unwrap().join(plugin_id);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
-        crate::session::update_config(|config| {
-            config.plugins.insert(
-                plugin_id.to_string(),
-                PluginConfig {
-                    grant: Some(CapabilityGrant {
-                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
-                            manifest.as_bytes(),
-                        ),
-                        capabilities: vec!["session.integration".into()],
-                        granted_at: crate::time::Timestamp::now(),
-                    }),
-                    ..PluginConfig::default()
-                },
-            );
-        })
-        .unwrap();
     }
 
     #[test]

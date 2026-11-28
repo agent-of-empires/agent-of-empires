@@ -6429,6 +6429,73 @@ mod tests {
         assert!(turn.error.is_some_and(|e| e.contains("no ready marker")));
     }
 
+    /// A plugin launch stores its declared command, so the automatic-input probe
+    /// must still refuse a pane that has fallen back to a shell. The declared
+    /// marker is on screen, so only the shell check can refuse it.
+    #[test]
+    #[serial_test::serial]
+    fn a_plugin_launch_in_a_shell_pane_is_not_an_agent() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        crate::plugin::agent_integration::install_test_manifest(
+            "acme.marker",
+            r#"
+id = "acme.marker"
+name = "Marker"
+version = "1.0.0"
+api_version = 29
+[[agent_integrations]]
+tool = "marker-helper"
+command = "marker-helper"
+
+[agent_integrations.launch]
+ready_markers = ["ask anything"]
+"#,
+        );
+        crate::plugin::reload_registry();
+
+        let mut inst =
+            terminal_turn_instance("sess-plugin-shell", "term-plugin-shell", "must-not-type");
+        inst.project_path = temp.path().to_string_lossy().to_string();
+        inst.tool = "marker-helper".into();
+        inst.command = "marker-helper".into();
+        eprintln!(
+            "DBG dir={:?} errors={:?} active={:?} declares={} ready={:?}",
+            crate::plugin::plugins_dir(),
+            crate::plugin::registry().load_errors(),
+            crate::plugin::registry()
+                .all()
+                .iter()
+                .map(|p| (p.id().to_string(), p.active(), p.granted, p.enabled))
+                .collect::<Vec<_>>(),
+            crate::plugin::agent_integration::registry_declares(
+                &crate::plugin::registry(),
+                "marker-helper"
+            ),
+            inst.ready_markers()
+        );
+        assert!(inst.has_command_override(), "the command classifies as one");
+        assert!(inst.launches_agent_itself());
+        assert_eq!(inst.ready_markers(), ["ask anything"]);
+
+        let _pane = start_terminal_pane(&inst, "echo 'ask anything'; exec sh", false);
+        assert!(
+            crate::server::api::sessions::ready_agent_session_for_automatic_input(&inst)
+                .unwrap()
+                .is_none(),
+            "a shell is not the agent, even with its marker on screen"
+        );
+    }
+
     /// A stored command for the agent's own binary, as a plugin launch writes
     /// from its declaration, is the agent; anything else is a wrapper and is
     /// refused before any capture.
