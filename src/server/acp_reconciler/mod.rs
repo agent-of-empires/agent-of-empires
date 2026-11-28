@@ -2600,18 +2600,25 @@ mod tests {
         tick.run(&state).await;
         assert!(service.sandbox_login.is_held(id));
         crate::session::test_support::write_fake_shared_credential(&shared);
-        tick.run(&state).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                tick.run(&state).await;
+                if !std::fs::read_to_string(&calls)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the release resumes the parked session");
         let submission = service.prompt_submission_for_session(id).await.unwrap();
         drop(submission);
         assert!(
             service.sandbox_login.is_held(id),
             "the failed launch keeps the login release retryable"
-        );
-        assert!(
-            !std::fs::read_to_string(&calls)
-                .unwrap_or_default()
-                .is_empty(),
-            "the release resumed the parked session"
         );
 
         // The fake runtime cannot start the worker; a recording fake stands in for it.
