@@ -1358,7 +1358,7 @@ mod tests {
 id = "acme.sidecar"
 name = "Sidecar"
 version = "1.0.0"
-api_version = 28
+api_version = 29
 [[agent_integrations]]
 tool = "example-helper"
 command = "example-helper"
