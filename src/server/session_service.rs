@@ -6533,12 +6533,17 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        // (case, whether the draft is in the pinned pane rather than pane 0)
-        for (case, draft_in_pinned) in [("draft-in-pane-0", false), ("draft-in-pinned", true)] {
+        // (case, whether to prepare the session, whether the draft is in the pinned pane)
+        for (case, revive, draft_in_pinned) in [
+            ("draft-in-pane-0", false, false),
+            ("draft-in-pinned", false, true),
+            ("prepare-with-draft-in-pane-0", true, false),
+        ] {
             let id = format!("sess-pinned-{case}");
             let mut inst =
                 terminal_turn_instance(&id, &format!("term-pinned-{case}"), "initial-turn");
             inst.tool = "claude".into();
+            inst.source_profile = "default".into();
             crate::server::test_support::seed_instances_on_disk_for_test(
                 &inst.source_profile,
                 vec![inst.clone()],
@@ -6578,12 +6583,11 @@ mod tests {
                 &state.session_service,
                 &id,
                 "hello".to_string(),
-                false,
+                revive,
                 false,
                 crate::server::api::sessions::SendPane::LIVE,
             )
             .await
-            .map(|_| ())
             .map_err(|e| e.error);
 
             if draft_in_pinned {
@@ -6595,14 +6599,16 @@ mod tests {
                     "{case}: {}",
                     screen(&pinned)
                 );
+                assert!(disk_turn("default", &id).is_some(), "{case}");
                 assert!(
                     !screen(&pinned).contains("hello"),
                     "{case}: {}",
                     screen(&pinned)
                 );
             } else {
-                assert!(sent.is_ok(), "{case}: {}", screen(&pinned));
+                assert!(matches!(sent, Ok(false)), "{case}: {}", screen(&pinned));
                 wait_for(&pinned, "❯ hello");
+                assert!(disk_turn("default", &id).is_none(), "{case}");
             }
             assert!(
                 !screen(&first).contains("hello"),

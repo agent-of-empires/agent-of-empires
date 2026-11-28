@@ -596,7 +596,7 @@ async fn original_human_decisions_cross_pending_and_applied_without_current_auth
                         }
                         if retire_pending {
                             assert!(result_before_decision);
-                            client.stop_session().await;
+                            Box::pin(client.stop_session()).await;
                             let denied = resolve_original_decision_http(
                                 scope.state.clone(), &client.id, &nonce, permission,
                             ).await;
@@ -628,7 +628,7 @@ async fn original_human_decisions_cross_pending_and_applied_without_current_auth
                                     Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}))
                                 },
                             );
-                            let replacement = scope.resume_stopped(&client.id, config).await;
+                            let replacement = Box::pin(scope.resume_stopped(&client.id, config)).await;
                             replacement.ready().await;
                             assert_eq!(replacement.selected_native_session(), native_sid);
                             assert_ne!(replacement.connected_runner(), Some(owner));
@@ -644,8 +644,8 @@ async fn original_human_decisions_cross_pending_and_applied_without_current_auth
                                 .filter(|method| method.as_str() == "session/load").count(), 1);
                             assert!(!replacement_peer.requests().iter()
                                 .any(|method| method == "session/new" || method == "session/prompt"));
-                            replacement.stop_and_forget().await;
-                            scope.finish_conversation_case().await;
+                            Box::pin(replacement.stop_and_forget()).await;
+                            Box::pin(scope.finish_conversation_case()).await;
                             continue;
                         }
                         if !permission {
@@ -750,8 +750,8 @@ async fn original_human_decisions_cross_pending_and_applied_without_current_auth
                                 && method != expected_method
                         }), "HTTP decisions must not start another lifecycle RPC");
                         drop(socket);
-                        client.stop_and_forget().await;
-                        scope.finish_conversation_case().await;
+                        Box::pin(client.stop_and_forget()).await;
+                        Box::pin(scope.finish_conversation_case()).await;
             }
             server.abort();
             let _ = server.await;

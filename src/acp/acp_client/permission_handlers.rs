@@ -1029,7 +1029,8 @@ mod tests {
             Box::pin(async move {
                 for target in ["load", "new"] {
                 let mut stage = "Native constructor request";
-                let observed = tokio::time::timeout(Duration::from_secs(30), async {
+                // Keep the managed lifecycle case out of Timeout's inline future.
+                let observed = tokio::time::timeout(Duration::from_secs(30), Box::pin(async {
                     let directory = scope.tempdir();
                     let original_file = directory.path().join("constructor-original.txt");
                     std::fs::write(&original_file, "Original constructor I/O").unwrap();
@@ -1049,10 +1050,10 @@ mod tests {
                                 })
                             },
                         );
-                        let original = scope.spawn(config, "elicitation-prime").await.unwrap();
+                        let original = Box::pin(scope.spawn(config, "elicitation-prime")).await.unwrap();
                         original.ready().await;
                         let id = original.id.clone();
-                        original.stop_session().await;
+                        Box::pin(original.stop_session()).await;
                         assert_eq!(original_native.requests(), ["initialize", "session/new"]);
                         Some(id)
                     } else {
@@ -1091,8 +1092,8 @@ mod tests {
                         },
                     );
                     let mut client = match original_id {
-                        Some(id) => scope.resume_stopped(&id, config).await,
-                        None => scope.spawn(config, "native-elicitation").await.unwrap(),
+                        Some(id) => Box::pin(scope.resume_stopped(&id, config)).await,
+                        None => Box::pin(scope.spawn(config, "native-elicitation")).await.unwrap(),
                     };
                     let constructor_id = new_received.await.unwrap();
                     stage = "Original constructor I/O";
@@ -1286,7 +1287,7 @@ mod tests {
                     );
                     stage = "owned shutdown";
                     client.shutdown().await.unwrap();
-                })
+                }))
                 .await;
                 observed.unwrap_or_else(|_| panic!("managed elicitation timed out during {stage}"));
                 }

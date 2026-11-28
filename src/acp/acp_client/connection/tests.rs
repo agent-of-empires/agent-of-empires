@@ -2617,10 +2617,8 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
 
 struct DirectConnection {
     events: mpsc::Receiver<crate::acp::event_sender::SdkEvent>,
-    agent_write: SharedWrite,
     connection: tokio::task::JoinHandle<()>,
     agent: tokio::task::JoinHandle<()>,
-    shutdown: tokio_util::sync::CancellationToken,
     _commands: mpsc::Sender<super::super::commands::QueuedClientCmd>,
     _cwd: tempfile::TempDir,
 }
@@ -2737,10 +2735,8 @@ async fn spawn_direct_connection(
         ready,
         DirectConnection {
             events,
-            agent_write,
             connection,
             agent,
-            shutdown,
             _commands: commands,
             _cwd: cwd,
         },
@@ -2936,90 +2932,107 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
     .await;
 }
 
-/// A limit that ends an agent-initiated turn must end the connection, or the
-/// drain loop never drops the worker and the reaper skips it as still running
-/// (#4373). The limit is a rejected window, or only the agent's text (#5990).
+/// Native lifecycle owns its terminal; ambient quota hints cannot replace it.
+/// A matching failed Native prompt still keeps the exact rejected window.
 #[tokio::test]
-async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
-    let resets_at = crate::time::Timestamp::now().as_unix_secs() + 3600;
-    let usage = |meta: &str| {
-        format!(
-            r#"{{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{{"amount":0.1,"currency":"USD"}}{meta}}}"#
-        )
-    };
-    let limit_text = r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"You've hit your 5-hour limit · resets 10pm (America/New_York)"}}"#;
-    // (name, updates, expected RateLimit resets_at and kind)
-    let cases = [
-        (
-            "rejected window",
-            vec![usage(&format!(
-                r#","_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}"#
-            ))],
-            Some(resets_at),
-            "five_hour",
-        ),
-        (
-            "limit text only",
-            vec![limit_text.to_string(), usage("")],
-            None,
-            "rate_limit",
-        ),
-    ];
-    for (name, updates, want_reset, want_kind) in cases {
-        let (ready, mut fake) = spawn_direct_connection("s-limit", "", None, false).await;
-        ready.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !matches!(
-                fake.next_event().await.expect("connection remains open"),
-                Event::AcpSessionAssigned { .. }
-            ) {}
-        })
-        .await
-        .expect("session commits");
+#[serial_test::serial]
+async fn rate_limit_hints_do_not_override_an_owned_autonomous_terminal() {
+    use crate::acp::event_store::ControlKnowledge::Known;
 
-        for update in updates {
-            write_line(
-                &fake.agent_write,
-                &format!(
-                    r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-limit","update":{update}}}}}"#
-                ),
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+        Box::pin(async move {
+            let resets_at = crate::time::Timestamp::now().as_unix_secs() + 3600;
+            let report = |window: &str, reset: i64| serde_json::json!({
+                "sessionUpdate":"usage_update","used":10,"size":100,
+                "cost":{"amount":0.1,"currency":"USD"},
+                "_meta":{"_claude/rateLimit":{
+                    "status":"rejected","rateLimitType":window,"resetsAt":reset
+                }}
+            });
+            let frame = |update: serde_json::Value| serde_json::json!({
+                "jsonrpc":"2.0","method":"session/update",
+                "params":{"sessionId":"s-autonomous-quota","update":update}
+            });
+            let owned_report = frame(report("five_hour", resets_at)).to_string();
+            let first_prompt = std::cell::Cell::new(true);
+            let (ready, mut fake) = spawn_fake_connection_raw(
+                scope,
+                "s-autonomous-quota",
+                None,
+                false,
+                r#","_meta":{"ompAutonomousTurns":{"version":1}}"#,
+                (None, None),
+                move |id| {
+                    if first_prompt.replace(false) {
+                        return vec![serde_json::json!({
+                            "jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}
+                        }).to_string()];
+                    }
+                    vec![
+                        owned_report.clone(),
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-32603,"message":"limit reached","data":{"errorKind":"rate_limit"}
+                        }}).to_string(),
+                    ]
+                },
             )
             .await;
-        }
+            ready.expect("the Native peer negotiates its own lifecycle");
 
-        // The idle grace is wall-clock, so the deadline covers it with margin.
-        let mut seen = Vec::new();
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while let Some(event) = fake.next_event().await {
-                seen.push(event);
+            // Establish known absence of a park with an actual main result.
+            // An autonomous terminal cannot initialize missing main knowledge.
+            fake.cmd_tx.send(ClientCmd::Prompt(PromptInput::default())).await.unwrap();
+            let baseline = collect_terminal(&mut fake).await;
+            assert!(matches!(baseline.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete"));
+            assert_native_prompt_succeeded(scope, &fake);
+            let baseline_prompt_id = fake.native_prompt_id.load(Ordering::Acquire);
+            let store = &scope.state.acp_event_store;
+            assert!(matches!(store.rate_limit_park(&fake.event_rx.id).unwrap(), Known(None)));
+
+            let run = uuid::Uuid::new_v4();
+            let lifecycle = |method: &str, stop: Option<&str>| {
+                let mut params = serde_json::json!({
+                    "version":1,"sessionId":"s-autonomous-quota","runId":run,"source":"irc"
+                });
+                if let Some(reason) = stop {
+                    params["stopReason"] = reason.into();
+                }
+                serde_json::json!({"jsonrpc":"2.0","method":method,"params":params})
+            };
+            for message in [
+                lifecycle("_omp/autonomous_turn/start", None),
+                frame(serde_json::json!({"sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":"You've hit your 5-hour limit · resets 10pm (America/New_York)"}})),
+                frame(report("seven_day", resets_at + 7200)),
+                lifecycle("_omp/autonomous_turn/end", Some("end_turn")),
+            ] {
+                write_line(&fake.agent_write, &message.to_string()).await;
             }
-        })
-        .await
-        .expect("the connection must end after parking, closing the event channel");
-        tokio::time::timeout(Duration::from_secs(10), fake.connection)
-            .await
-            .expect("connection task ends")
-            .expect("connection task does not panic");
+            let seen = collect_terminal(&mut fake).await;
+            assert!(matches!(seen.last(), Some(Event::Stopped { reason }) if reason == "agent_idle"));
+            assert!(seen.iter().any(|event| matches!(event, Event::UsageUpdated { .. })));
+            assert!(!seen.iter().any(|event| matches!(event, Event::RateLimit { .. })));
+            assert!(matches!(store.rate_limit_park(&fake.event_rx.id).unwrap(), Known(None)));
+            assert_eq!(fake.native_prompt_id.load(Ordering::Acquire), baseline_prompt_id);
 
-        let limit = seen.iter().position(|e| {
-            matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.as_unix_secs()) == want_reset)
-        });
-        let stopped = seen
-            .iter()
-            .position(|e| matches!(e, Event::Stopped { reason } if reason == "rate_limited"));
-        assert!(
-            limit.is_some() && limit < stopped,
-            "{name}: RateLimit then Stopped(rate_limited) expected: {seen:?}"
-        );
-        // The rejected window travels on the event, so a later report for another window of the
-        // same account cannot replace this deadline in the account table.
-        assert!(
-            matches!(&seen[limit.unwrap()], Event::RateLimit { info } if info.kind == want_kind),
-            "{name}: the event names its window: {seen:?}"
-        );
-        fake.agent.abort();
-        let _ = fake.agent.await;
-    }
+            fake.cmd_tx.send(ClientCmd::Prompt(PromptInput::default())).await.unwrap();
+            let seen = collect_terminal(&mut fake).await;
+            assert!(matches!(seen.last(), Some(Event::Stopped { reason }) if reason == "rate_limited"));
+            assert_eq!(
+                seen.iter().filter_map(|event| match event {
+                    Event::RateLimit { info } => Some((info.kind.as_str(), info.resets_at.map(|t| t.as_unix_secs()))),
+                    _ => None,
+                }).collect::<Vec<_>>(),
+                [("five_hour", Some(resets_at))],
+                "the rejected window belongs to the failed prompt, not the earlier hint"
+            );
+            assert!(matches!(store.rate_limit_park(&fake.event_rx.id).unwrap(), Known(Some(_))));
+            fake.event_rx.shutdown().await.expect("retire the exact owner");
+            fake.agent.abort();
+            let _ = fake.agent.await;
+        })
+    })
+    .await;
 }
 
 /// A proxy that exits after a valid hello but before the connection is ready
@@ -3057,65 +3070,99 @@ async fn proxy_lost_between_hello_and_ready_is_integration_lost() {
     fake.agent.abort();
 }
 
-/// Closes the agent's end and returns every event the ended connection emitted.
-/// The channel closes only when the connection task is done, so none are missed.
-async fn close_agent_and_collect(mut fake: DirectConnection) -> Vec<Event> {
-    fake.agent_write.lock().await.shutdown().await.unwrap();
-    let mut events = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while let Some(event) = fake.next_event().await {
-            events.push(event);
-        }
-    })
-    .await
-    .expect("connection ends once the agent closes");
-    fake.connection.await.unwrap();
-    fake.agent.abort();
-    events
-}
-
-/// A proxied agent that closes its transport after the hello loses its
-/// integration; an agent that never proved it was proxied fails as before, and
-/// a close the daemon asked for emits neither.
+/// Native EOF always publishes its denial; only a verified proxy also loses
+/// its integration. A close the daemon requested emits neither.
 #[tokio::test]
+#[serial_test::serial]
 async fn closing_the_transport_after_a_hello_loses_the_integration() {
-    // (name, hello, daemon shut the connection down first, expect proxy_exited, expect connection unavailable)
-    let cases = [
-        ("proxied", GOOD_HELLO, false, true, false),
-        ("no hello", "", false, false, true),
-        ("deliberate close", GOOD_HELLO, true, false, false),
-    ];
-    for (name, hello, deliberate, proxy_exited, unavailable) in cases {
-        let (ready, mut fake) = spawn_direct_connection("s-x", hello, None, false).await;
-        ready.expect(name);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !matches!(
-                fake.next_event().await.expect("connection remains open"),
-                Event::AcpSessionAssigned { .. }
-            ) {}
-        })
-        .await
-        .expect("session commits before closing the transport");
-        if deliberate {
-            fake.shutdown.cancel();
-        }
-        let events = close_agent_and_collect(fake).await;
-        assert_eq!(
-            events.iter().any(|e| matches!(
-                e,
-                Event::IntegrationLost {
-                    reason: IntegrationLostReason::ProxyExited
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+        Box::pin(async move {
+            for (sid, hello, deliberate) in [
+                ("s-proxied", GOOD_HELLO, false),
+                ("s-unproxied", "", false),
+                ("s-deliberate", GOOD_HELLO, true),
+            ] {
+                let (ready, mut fake) =
+                    spawn_fake_connection_raw(scope, sid, None, false, hello, (None, None), |_| {
+                        Vec::new()
+                    })
+                    .await;
+                ready.expect("the Native original is ready");
+                assert_eq!(fake.event_rx.verified_proxy(), !hello.is_empty());
+                let store = &scope.state.acp_event_store;
+                let id = &fake.event_rx.id;
+                let before = store.highest_seq(id).unwrap();
+                if deliberate {
+                    fake.event_rx.actual().shutdown().await.unwrap();
                 }
-            )),
-            proxy_exited,
-            "{name}: {events:?}"
-        );
-        assert_eq!(
-            events
-                .iter()
-                .any(|e| matches!(e, Event::AcpConnectionUnavailable { .. })),
-            unavailable,
-            "{name}: {events:?}"
-        );
-    }
+                fake.agent_write.lock().await.shutdown().await.unwrap();
+                let proxy_exited = !hello.is_empty() && !deliberate;
+                if !deliberate {
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let event =
+                                fake.event_rx.recv().await.expect("owned loss is published");
+                            let received = if proxy_exited {
+                                matches!(
+                                    event,
+                                    Event::IntegrationLost {
+                                        reason: IntegrationLostReason::ProxyExited
+                                    }
+                                )
+                            } else {
+                                matches!(
+                                    event,
+                                    Event::AcpConnectionUnavailable {
+                                        source: crate::acp::state::AcpConnectionSource::Native,
+                                        ..
+                                    }
+                                )
+                            };
+                            if received {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .expect("Native EOF reaches the managed drain");
+                }
+                fake.event_rx
+                    .shutdown()
+                    .await
+                    .expect("retire the exact owner");
+                let events = store.replay_from(&fake.event_rx.id, before).unwrap();
+                let lost = events.iter().position(|row| {
+                    matches!(
+                        row.event.as_ref(),
+                        Event::IntegrationLost {
+                            reason: IntegrationLostReason::ProxyExited
+                        }
+                    )
+                });
+                let unavailable = events.iter().position(|row| {
+                    matches!(
+                        row.event.as_ref(),
+                        Event::AcpConnectionUnavailable {
+                            source: crate::acp::state::AcpConnectionSource::Native,
+                            ..
+                        }
+                    )
+                });
+                assert_eq!(unavailable.is_some(), !deliberate, "{sid}");
+                assert_eq!(lost.is_some(), proxy_exited, "{sid}");
+                if proxy_exited {
+                    assert!(unavailable.unwrap() < lost.unwrap());
+                }
+                assert!(
+                    !events
+                        .iter()
+                        .any(|row| matches!(row.event.as_ref(), Event::AgentStartupError { .. })),
+                    "{sid}"
+                );
+                fake.agent.abort();
+                let _ = fake.agent.await;
+            }
+        })
+    })
+    .await;
 }

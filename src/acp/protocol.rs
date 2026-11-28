@@ -106,6 +106,8 @@ pub struct AcpBroadcastFrame {
     pub(crate) availability_denial: bool,
     pub(crate) host_action: bool,
     pub(crate) native_autonomous: Option<Arc<crate::acp::event_sender::NativeAutonomousMetadata>>,
+    pub(crate) autonomous_rate_limit:
+        Option<Arc<crate::acp::event_sender::NativeAutonomousIdentity>>,
     /// Which installed worker produced this frame, for in-process
     /// consumers that must reject a replaced worker's queued frames. Never serialized.
     pub worker_generation: Option<u64>,
@@ -135,6 +137,7 @@ impl AcpBroadcastFrame {
             availability_denial: self.availability_denial,
             host_action: self.host_action,
             native_autonomous: self.native_autonomous.clone(),
+            autonomous_rate_limit: self.autonomous_rate_limit.clone(),
             reported_session_id: self
                 .native_autonomous
                 .as_ref()
@@ -167,6 +170,7 @@ impl AcpBroadcastFrame {
             availability_denial: metadata.availability_denial,
             host_action: metadata.host_action,
             native_autonomous: metadata.native_autonomous.clone(),
+            autonomous_rate_limit: metadata.autonomous_rate_limit.clone(),
             worker_generation,
             sidebar_status,
         }
@@ -241,6 +245,7 @@ impl<'de> Deserialize<'de> for AcpBroadcastFrame {
             availability_denial: false,
             host_action: false,
             native_autonomous: None,
+            autonomous_rate_limit: None,
             worker_generation: None,
             sidebar_status: None,
         })

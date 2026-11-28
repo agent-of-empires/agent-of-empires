@@ -1489,16 +1489,28 @@ impl Session {
                         "-p",
                         "-t",
                         pane,
-                        "#{pane_id}|#{pane_dead}",
+                        "#{pane_id}|#{pane_dead}|#{session_id}|#{pane_pid}",
                     ])
                     .output()?;
-                if !live.status.success()
-                    || !String::from_utf8_lossy(&live.stdout)
-                        .trim_end()
-                        .split_once('|')
-                        .is_some_and(|(id, dead)| id == pane && dead == "0")
-                {
+                let observed = std::str::from_utf8(&live.stdout)?.trim_end();
+                let Some((session_id, pane_pid)) = observed
+                    .strip_prefix(pane)
+                    .and_then(|rest| rest.strip_prefix("|0|"))
+                    .and_then(|identity| identity.split_once('|'))
+                    .filter(|_| live.status.success())
+                else {
                     bail!("tmux pane '{pane}' is gone or dead");
+                };
+                if let Some(physical) = &self.physical {
+                    let pid = pane_pid
+                        .parse::<u32>()
+                        .context(crate::session::NativeInputError::Ownership)?;
+                    anyhow::ensure!(
+                        pane == physical.identity.pane_id
+                            && session_id == physical.identity.session_id
+                            && Some(pid) == physical.identity.pane_pid,
+                        crate::session::NativeInputError::Ownership
+                    );
                 }
                 self.capture_target(pane, 0)
             },
@@ -7311,5 +7323,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn wait_until_ready_in_rejects_a_respawned_observed_pane() {
+        if !tmux_available() {
+            return;
+        }
+        let guard = TmuxTestSession::new("ready_respawn");
+        let name = guard.name();
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", name, "exec cat"])
+            .status()
+            .unwrap()
+            .success());
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        let (physical, _, _) = crate::tmux::utils::observe_pane(name, &deadline)
+            .unwrap()
+            .unwrap();
+        let pane = physical.identity.pane_id.clone();
+        let session = Session::from_observation(name, std::sync::Arc::new(physical));
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "respawn-pane",
+                "-k",
+                "-t",
+                &pane,
+                "echo 'ask anything'; exec cat",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let error = session
+            .wait_until_ready_in(&pane, Duration::from_secs(1), &["ask anything"])
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<crate::session::NativeInputError>(),
+            Some(crate::session::NativeInputError::Ownership)
+        ));
     }
 }

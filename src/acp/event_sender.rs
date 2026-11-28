@@ -139,6 +139,8 @@ pub(crate) struct EventMetadata {
     pub(crate) host_action: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) native_autonomous: Option<Arc<NativeAutonomousMetadata>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) autonomous_rate_limit: Option<Arc<NativeAutonomousIdentity>>,
 }
 
 impl EventMetadata {
@@ -158,6 +160,7 @@ impl EventMetadata {
             availability_denial: false,
             host_action: false,
             native_autonomous: None,
+            autonomous_rate_limit: None,
         }
     }
 
@@ -199,6 +202,7 @@ impl EventMetadata {
             && self.resource_witness.is_none()
             && self.child_provenance.is_none()
             && self.native_autonomous.is_none()
+            && self.autonomous_rate_limit.is_none()
             && !self.availability_denial
             && !self.host_action
     }
@@ -288,6 +292,13 @@ impl EventMetadata {
         unavailable: Option<(AcpConnectionUnavailability, Option<NativeEventSubject>)>,
         resource_matches: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.autonomous_rate_limit.is_none()
+                || (self.host_action
+                    && self.native_autonomous.is_none()
+                    && matches!(kind, ControlKind::Quota)),
+            "autonomous quota repair requires a host quota event"
+        );
         if let Some(autonomous) = self.native_autonomous.as_deref() {
             use super::control_protocol::NativeAutonomousPhase;
             anyhow::ensure!(
@@ -555,6 +566,7 @@ impl AcpEventData {
 
 /// Private SDK barriers do not allocate or masquerade as public Event payloads.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Keep the common SDK event allocation-free.
 pub enum SdkEvent {
     Data(AcpEventData),
     EstablishmentClosed {
@@ -1714,6 +1726,7 @@ impl EventSender {
             availability_denial: false,
             host_action: false,
             native_autonomous: None,
+            autonomous_rate_limit: None,
         };
         sender.current_scope = Some(context);
         sender.constructor_scope = None;
