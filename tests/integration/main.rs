@@ -28,6 +28,7 @@ mod frozen_environment;
 mod home_isolation;
 
 mod acp_lint_stream;
+mod agents_detect;
 mod daemon_client;
 #[cfg(debug_assertions)]
 mod hidden_env_batch;

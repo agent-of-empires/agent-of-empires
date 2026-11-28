@@ -212,6 +212,36 @@ fn strip_prompt<'a>(manifest: &Manifest, line: &'a str) -> Option<&'a str> {
     Some(&line[prompt.find(line)?.end()..])
 }
 
+/// The verdict of a fixture run: the deciding rule and what it publishes.
+pub struct FixtureDetection {
+    pub rule: String,
+    pub status: Option<Status>,
+    pub visible: bool,
+    pub diagnostic: Option<String>,
+}
+
+/// Evaluate manifest `source` over a capture with the plain surface adapter, so a manifest
+/// under development can be tried against a saved pane. `None` when no rule matches.
+pub fn detect_with_manifest_source(
+    source: &str,
+    pane: &str,
+    observation: &Observation<'_>,
+) -> anyhow::Result<Option<FixtureDetection>> {
+    let manifest = Manifest::parse(source, adapter::PLAIN.evidence_names)?;
+    let screen = crate::tmux::utils::strip_ansi(pane);
+    Ok(
+        (adapter::PLAIN.evaluate)(&manifest, Rows::new(&screen), observation).map(|evaluation| {
+            let rule = evaluation.rule;
+            FixtureDetection {
+                rule: rule.id.clone(),
+                status: (!rule.skip_state_update).then_some(rule.state).flatten(),
+                visible: rule.visible,
+                diagnostic: evaluation.diagnostic.map(str::to_owned),
+            }
+        }),
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn submitted_prompt_from_source<'a>(source: &str, line: &'a str) -> Option<&'a str> {
     let manifest = Manifest::parse(source, adapter::PLAIN.evidence_names).expect("manifest");
