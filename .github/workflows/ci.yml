@@ -33,8 +33,7 @@ jobs:
   quick-checks:
     # Seconds-long checks share one runner. Release PR Up To Date fails a stale
     # release PR in the merge queue (see release-pr-fresh.sh) and passes elsewhere.
-    # Named Format because the main ruleset requires that check (#6148).
-    name: Format
+    name: Quick checks
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-quick-checks-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 10
@@ -103,7 +102,7 @@ jobs:
       # would otherwise build, so this job still needs no Node setup; same
       # trick as the rustdoc step in the docs job.
       #
-      # `--all-targets` so test binaries are linted too; rustfmt in Format
+      # `--all-targets` so test binaries are linted too; rustfmt in Quick checks
       # type-checks nothing.
       - name: Clippy (all features)
         run: |
