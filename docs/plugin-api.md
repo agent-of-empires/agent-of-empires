@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `28`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `29`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 28
+api_version = 29
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `28`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `29`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
@@ -39,6 +39,7 @@ capabilities = ["runtime.worker"]
 | `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 23` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
 | `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, the session-id capture extension requires API 22, and the `hooks` and `trust` tables require API 28, each with a host implementing them. Provider-native status and replies require `session.integration`. |
+| `provider_calls` | array of tables | no | Worker methods the host can call on request. Requires `api_version >= 29`, a `[runtime]` and `runtime.worker`. See [Provider calls](#provider-calls-api_version--29). |
 
 ## Agent integrations
 
@@ -603,6 +604,27 @@ Limits:
 - A session with no route gets none of a plugin's servers, and AoE raises one notification per plugin and launch naming the cause: no endpoint, no socket on this platform, a socket that did not start, a container without this daemon's mount (recreate it), a VM-backed runtime, a container user that cannot open the socket, an image without `node`, a container that could not be checked, or a host session whose URL the plaintext gate would reject. The workers are still asked `mcp.session.servers`, so only plugins that offered servers are told.
 
 Any plugin holding `mcp.rewrite` sees the entries from `mcp.session.servers`, with credential references instead of values and `plugin` set. An agent that does not expand references gets none of the plugin-served entries: they are dropped before any hook runs, so no hook sees them. For other agents a hook can replace them by key like any entry. Entries a hook adds with `serve` get their credential only after the last hook. See [Hooks](#hooksmcp_rewrite-api_version--24). If that hook fails for a sandboxed session, the session gets no MCP servers at all, plugin-served ones included.
+
+## Provider calls (`api_version >= 29`)
+
+A worker can expose methods that the daemon calls on request, for `aoe plugin call <id> <name> [--params <JSON>]` and `POST /api/plugins/{id}/provider-calls/{name}` (the body is the params). Only an enabled, granted plugin is called, and only for a name its manifest declares.
+
+```toml
+[[provider_calls]]
+name = "status"
+timeout_ms = 5000
+max_bytes = 1048576
+```
+
+| Key | Default | Notes |
+|---|---|---|
+| `name` | required | `[a-z0-9_.-]+`, unique in the manifest, not starting with `provider.`. |
+| `timeout_ms` | `5000` | `1` to `60000`. |
+| `max_bytes` | `1048576` | `1` to `16777216`. Bounds both the serialized request params and the serialized reply `result`. |
+
+The host sends a JSON-RPC request with method `provider.<name>`, the params as sent, and a string id like `h-1`; answer with the same id. A worker that does not implement the method replies with JSON-RPC "method not found".
+
+Failures keep their cause and map to distinct statuses and `AoE-Error-Code` values: plugin not active or call not declared (404), params over `max_bytes` (413), reply over `max_bytes` (502), no running worker (503), worker exited, method not found or request rejected (502), timeout (504), worker launched from a different manifest (409).
 
 ## Plugin storage
 
