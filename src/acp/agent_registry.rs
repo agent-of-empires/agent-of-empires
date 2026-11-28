@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn every_agent_has_a_display_name() {
-        for (name, _) in AgentRegistry::with_defaults().list() {
+        for (name, _) in AgentRegistry::builtin().list() {
             assert!(display_name_for(name).is_some(), "{name}");
         }
         for agent in crate::agents::native_agents() {
