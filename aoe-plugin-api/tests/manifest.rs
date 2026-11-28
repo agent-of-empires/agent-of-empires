@@ -1321,3 +1321,105 @@ fn identity_hooks_need_a_bare_executable_name() {
         parse(28, &body(command, true));
     }
 }
+
+const ACP_CAP: &str = "capabilities = [\"acp.agent.provide\"]\n";
+const ACP: &str = "[agent_integrations.acp]\n\
+    id = \"example\"\n\
+    aliases = [\"example-cli\"]\n\
+    display_name = \"Example\"\n\
+    failure_policy = \"neutral_boot\"\n\
+    [agent_integrations.acp.proxy]\n\
+    command = \"bin/proxy\"\n\
+    protocol_version = 1\n\
+    primitive_schema_version = 1\n\
+    [agent_integrations.acp.adapter]\n\
+    upstream_package = \"@example/acp\"\n\
+    upstream_pin = \"1.2.3\"\n\
+    package_dir = \"adapter\"\n\
+    [agent_integrations.acp.adapter.binary]\n\
+    digests = \"sha256_asset\"\n\
+    [agent_integrations.acp.adapter.binary.assets]\n\
+    aarch64-apple-darwin = \"example-darwin-arm64.zip\"\n\
+    [agent_integrations.acp.env]\n\
+    allowlist = [\"EXAMPLE_API_KEY\", \"EXAMPLE_HOME\"]\n\
+    host_only = [\"EXAMPLE_HOME\"]\n\
+    [agent_integrations.acp.env.defaults]\n\
+    EXAMPLE_MODE = \"fast\"\n\
+    [agent_integrations.acp.compat]\n\
+    expected_agent_name = \"example\"\n\
+    min_version = \"1.0.0\"\n\
+    [agent_integrations.acp.compat.capability_min_versions]\n\
+    fork = \"1.1.0\"\n\
+    [[agent_integrations.acp.profile.modes]]\n\
+    id = \"plan\"\n\
+    approval_class = \"guarded\"\n";
+
+fn acp_body(acp: &str) -> String {
+    format!("{ACP_CAP}{}", agent(acp))
+}
+
+#[test]
+fn acp_declaration_is_gated_and_round_trips() {
+    let body = acp_body(ACP);
+    let parsed = parse(30, &body);
+    let acp = parsed.agent_integrations[0].acp.as_ref().unwrap();
+    assert_eq!(acp.id, "example");
+    assert_eq!(acp.profile.modes.len(), 1);
+    assert_eq!(
+        PluginManifest::from_toml_str(&toml::to_string(&parsed).unwrap())
+            .expect("round-trips")
+            .agent_integrations[0],
+        parsed.agent_integrations[0]
+    );
+
+    let errors = invalid(29, &body);
+    let want = "agent_integrations[0].acp requires api_version >= 30";
+    assert!(errors.iter().any(|e| e.contains(want)), "{errors:?}");
+
+    let errors = invalid(30, &agent(ACP));
+    let want = "acp requires the acp.agent.provide capability";
+    assert!(errors.iter().any(|e| e.contains(want)), "{errors:?}");
+
+    let unknown = ACP.replace("display_name", "unknown_field = 1\ndisplay_name");
+    let err = PluginManifest::from_toml_str(&manifest(30, &acp_body(&unknown))).unwrap_err();
+    assert!(err.to_string().contains("unknown_field"), "{err}");
+}
+
+#[test]
+fn acp_declaration_rejects_bad_fields() {
+    let cases: [(&str, &str, &str); 25] = [
+        ("id = \"example\"", "id = \"Bad Id\"", "acp.id"),
+        ("id = \"example\"", "id = \"\"", "acp.id"),
+        ("[\"example-cli\"]", "[\"example\"]", "aliases"),
+        ("[\"example-cli\"]", "[\"a\", \"a\"]", "aliases"),
+        ("display_name = \"Example\"", "display_name = \"\"", "display_name"),
+        ("command = \"bin/proxy\"", "command = \"/bin/proxy\"", "proxy.command"),
+        ("command = \"bin/proxy\"", "command = \"../proxy\"", "proxy.command"),
+        ("command = \"bin/proxy\"", "command = \"\"", "proxy.command"),
+        ("protocol_version = 1", "protocol_version = 2", "protocol_version"),
+        ("primitive_schema_version = 1", "primitive_schema_version = 0", "primitive_schema_version"),
+        ("upstream_pin = \"1.2.3\"", "upstream_pin = \"^1.2.3\"", "upstream_pin"),
+        ("upstream_pin = \"1.2.3\"", "upstream_pin = \">=1.2\"", "upstream_pin"),
+        ("package_dir = \"adapter\"", "package_dir = \"../adapter\"", "package_dir"),
+        ("package_dir = \"adapter\"", "package_dir = \"/adapter\"", "package_dir"),
+        ("\"example-darwin-arm64.zip\"", "\"\"", "binary.assets"),
+        ("[agent_integrations.acp.adapter.binary.assets]", "[agent_integrations.acp.adapter.binary.assets]\nlinux = \"a/b\"", "binary.assets"),
+        ("allowlist = [\"EXAMPLE_API_KEY\"", "allowlist = [\"EXAMPLE_*\"", "env.allowlist"),
+        ("allowlist = [\"EXAMPLE_API_KEY\"", "allowlist = [\"1BAD\"", "env.allowlist"),
+        ("host_only = [\"EXAMPLE_HOME\"]", "host_only = [\"OTHER\"]", "host_only"),
+        ("EXAMPLE_MODE = \"fast\"", "EXAMPLE_MODE = \"a\\u0000b\"", "env.defaults"),
+        ("EXAMPLE_MODE = \"fast\"", "\"BAD-NAME\" = \"x\"", "env.defaults"),
+        ("min_version = \"1.0.0\"", "min_version = \"one\"", "compat"),
+        ("fork = \"1.1.0\"", "fork = \"latest\"", "compat"),
+        ("id = \"plan\"", "id = \"\"", "profile.modes"),
+        ("approval_class = \"guarded\"\n", "approval_class = \"guarded\"\n[[agent_integrations.acp.profile.modes]]\nid = \"plan\"\napproval_class = \"interactive\"\n", "profile.modes"),
+    ];
+    for (from, to, want) in cases {
+        assert!(ACP.contains(from), "{from}");
+        let errors = invalid(30, &acp_body(&ACP.replace(from, to)));
+        assert!(
+            errors.iter().any(|e| e.contains("acp") && e.contains(want)),
+            "{to}: {errors:?}"
+        );
+    }
+}

@@ -39,6 +39,139 @@ pub struct AgentIntegrationContribution {
     /// Requires API 28: the folder-trust record the host writes before launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<AgentTrustDeclaration>,
+    /// Requires API 30 and `acp.agent.provide`: the plugin supplies the agent's ACP adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp: Option<AcpDeclaration>,
+}
+
+/// Proxy wire versions the host speaks; `AcpProxy` must declare exactly these.
+pub const ACP_PROXY_PROTOCOL_VERSION: u32 = 1;
+pub const ACP_PRIMITIVE_SCHEMA_VERSION: u32 = 1;
+
+/// How a plugin supplies an agent's ACP adapter and proxy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpDeclaration {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    pub display_name: String,
+    pub proxy: AcpProxy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<AcpAdapter>,
+    #[serde(default, skip_serializing_if = "AcpEnv::is_empty")]
+    pub env: AcpEnv,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<AcpCompat>,
+    #[serde(default, skip_serializing_if = "AcpProfile::is_empty")]
+    pub profile: AcpProfile,
+    pub failure_policy: AcpFailurePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpProxy {
+    /// Plugin-relative path of the proxy executable.
+    pub command: String,
+    pub protocol_version: u32,
+    pub primitive_schema_version: u32,
+}
+
+/// The upstream adapter package the host installs for the proxy to wrap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpAdapter {
+    pub upstream_package: String,
+    /// Exact upstream version, no range operators.
+    pub upstream_pin: String,
+    /// Plugin-relative directory holding the lockfile and install inputs.
+    pub package_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<AcpAdapterBinary>,
+}
+
+/// A prebuilt standalone adapter the host prefers over the package install.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpAdapterBinary {
+    /// Release asset name per Rust target triple, such as `aarch64-apple-darwin`.
+    pub assets: BTreeMap<String, String>,
+    pub digests: AcpDigestSource,
+}
+
+/// Where the host reads the expected digest of a release asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpDigestSource {
+    /// A `<asset>.sha256` file in the same release.
+    Sha256Asset,
+    /// The digest the release API reports for the asset.
+    ReleaseApi,
+}
+
+/// Environment the host passes to the adapter process.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpEnv {
+    /// Exact variable names forwarded from the host environment.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+    /// Allowlisted variables kept out of sandboxed containers.
+    #[serde(default)]
+    pub host_only: Vec<String>,
+    /// Values set when the host environment does not provide the variable.
+    #[serde(default)]
+    pub defaults: BTreeMap<String, String>,
+}
+
+impl AcpEnv {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpCompat {
+    /// `agentInfo.name` the adapter must report in `initialize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_agent_name: Option<String>,
+    /// Lowest adapter version the host accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_version: Option<String>,
+    /// Lowest adapter version that offers each named capability.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capability_min_versions: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpProfile {
+    #[serde(default)]
+    pub modes: Vec<AcpMode>,
+}
+
+impl AcpProfile {
+    fn is_empty(&self) -> bool {
+        self.modes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcpMode {
+    pub id: String,
+    pub approval_class: crate::acp::ApprovalClass,
+}
+
+/// What the host does when the plugin's adapter cannot start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpFailurePolicy {
+    /// Start the session on the neutral bundled boot.
+    NeutralBoot,
+    /// Fail the session.
+    Refuse,
 }
 
 /// Hook events the host knows how to install into a JSON settings file.
@@ -588,7 +721,7 @@ fn literal_word(word: &str) -> bool {
     })
 }
 
-fn valid_env_key(key: &str) -> bool {
+pub(crate) fn valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')

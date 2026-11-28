@@ -12,10 +12,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Version of the `_meta.aoe` primitive wire shape.
-pub const PRIMITIVE_SCHEMA_VERSION: u32 = 1;
+pub const PRIMITIVE_SCHEMA_VERSION: u32 =
+    aoe_plugin_api::agent_integration::ACP_PRIMITIVE_SCHEMA_VERSION;
 
 /// Version of the proxy hello and process contract.
-pub const PROXY_PROTOCOL_VERSION: u32 = 1;
+pub const PROXY_PROTOCOL_VERSION: u32 =
+    aoe_plugin_api::agent_integration::ACP_PROXY_PROTOCOL_VERSION;
 
 /// Longest lease a single frame may grant.
 pub const MAX_LEASE_TTL_MS: u64 = 60 * 60 * 1000;
