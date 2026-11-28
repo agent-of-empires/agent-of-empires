@@ -201,6 +201,57 @@ pub fn input_line(agent: &str, capture: &str) -> InputLine {
     }
 }
 
+/// The text after the `[input_box]` prompt glyph on `line`; `None` when the agent's manifest
+/// declares no input box or the line does not start with the prompt.
+pub fn submitted_prompt<'a>(agent: &str, line: &'a str) -> Option<&'a str> {
+    strip_prompt(&detector(agent)?.manifest, line)
+}
+
+fn strip_prompt<'a>(manifest: &Manifest, line: &'a str) -> Option<&'a str> {
+    let prompt = &manifest.input_box.as_ref()?.prompt;
+    let found = prompt.find(line)?;
+    let end = found.end();
+    let boundary = line[..end].ends_with(char::is_whitespace)
+        || line[end..].chars().next().is_none_or(char::is_whitespace);
+    boundary.then(|| &line[end..])
+}
+
+/// The verdict of a fixture run: the deciding rule and what it publishes.
+pub struct FixtureDetection {
+    pub rule: String,
+    pub status: Option<Status>,
+    pub visible: bool,
+    pub diagnostic: Option<String>,
+}
+
+/// Evaluate manifest `source` over a capture with the plain surface adapter, so a manifest
+/// under development can be tried against a saved pane. `None` when no rule matches.
+pub fn detect_with_manifest_source(
+    source: &str,
+    pane: &str,
+    observation: &Observation<'_>,
+) -> anyhow::Result<Option<FixtureDetection>> {
+    let manifest = Manifest::parse(source, adapter::PLAIN.evidence_names)?;
+    let screen = crate::tmux::utils::strip_ansi(pane);
+    Ok(
+        (adapter::PLAIN.evaluate)(&manifest, Rows::new(&screen), observation).map(|evaluation| {
+            let rule = evaluation.rule;
+            FixtureDetection {
+                rule: rule.id.clone(),
+                status: (!rule.skip_state_update).then_some(rule.state).flatten(),
+                visible: rule.visible,
+                diagnostic: evaluation.diagnostic.map(str::to_owned),
+            }
+        }),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn submitted_prompt_from_source<'a>(source: &str, line: &'a str) -> Option<&'a str> {
+    let manifest = Manifest::parse(source, adapter::PLAIN.evidence_names).expect("manifest");
+    strip_prompt(&manifest, line)
+}
+
 /// Evaluate an agent manifest over an ANSI-stripped capture.
 pub fn detect<'a>(
     agent: &str,
@@ -237,6 +288,48 @@ pub(crate) fn rule_max_age(agent: &str, rule_id: &str) -> Option<std::time::Dura
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_box_geometry_comes_from_the_manifest() {
+        let source = r#"
+id = "t"
+[input_box]
+prompt = '^\s*>\s'
+chrome = ['^\[hint\]']
+
+[[rules]]
+id = "status_slot"
+state = "running"
+priority = 20
+region = "last_non_empty_above_prompt_box"
+contains = ["working"]
+
+[[rules]]
+id = "box_draft"
+state = "waiting"
+priority = 10
+region = "prompt_box_body"
+contains = ["draft"]
+"#;
+        let winner = |pane: &str| {
+            detect_with_manifest_source(source, pane, &Observation::new("", None, true))
+                .expect("manifest compiles")
+                .map(|d| d.rule)
+        };
+        for (name, pane, expected) in [
+            // The configured chrome line above the box is skipped to reach the status slot.
+            (
+                "chrome skipped",
+                "working on it\n[hint] press ? for help\n> typing",
+                Some("status_slot"),
+            ),
+            ("box body", "all quiet\n> my draft", Some("box_draft")),
+            // `❯` is not this manifest's prompt, so there is no box and no status slot.
+            ("foreign glyph", "working on it\n❯ my draft", None),
+        ] {
+            assert_eq!(winner(pane).as_deref(), expected, "{name}");
+        }
+    }
 
     #[test]
     fn manifests_compile() {

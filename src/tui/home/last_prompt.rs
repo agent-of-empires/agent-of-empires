@@ -7,11 +7,11 @@
 //! recent submitted prompt, which the home view paints as a one-line footer
 //! (toggled with `Ctrl+L`).
 //!
-//! It is a best-effort heuristic tuned to the Claude Code TUI, whose submitted
-//! prompts render as a line beginning with the `❯ ` marker. The live input box
-//! at the very bottom uses the same marker, so the box — the region below the
-//! last horizontal rule — is excluded, and an in-progress draft is never
-//! mistaken for a sent prompt.
+//! It is a best-effort heuristic. A tool's detection manifest names the glyph
+//! its submitted prompts start with (`[input_box] prompt`); a tool without one
+//! shows nothing. The live input box at the very bottom uses the same glyph, so
+//! the box, the region below the last horizontal rule, is excluded, and an
+//! in-progress draft is never mistaken for a sent prompt.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,10 +26,6 @@ pub(super) type LastPromptSlot = Arc<Mutex<Option<LastPromptCache>>>;
 pub(super) fn new_slot() -> LastPromptSlot {
     Arc::new(Mutex::new(None))
 }
-
-/// Marker Claude Code renders before each submitted user prompt (and before the
-/// live input line, which is why the input box is excluded by rule).
-const PROMPT_MARKER: &str = "❯ ";
 
 /// How many lines of scrollback to scrape. Generous enough to find the last
 /// prompt behind a long agent turn (a quiet turn can emit hundreds of lines),
@@ -59,17 +55,23 @@ pub(super) struct LastPromptCache {
 }
 
 /// Capture the pane for `tmux_name` and return its last submitted prompt.
-fn scrape(tmux_name: &str) -> Option<String> {
+fn scrape(tmux_name: &str, tool: &str) -> Option<String> {
     let pane = Session::from_name(tmux_name)
         .capture_plain(CAPTURE_LINES)
         .ok()?;
-    extract_last_prompt(&pane)
+    extract_last_prompt(&pane, |line| {
+        crate::tmux::detect::submitted_prompt(tool, line)
+    })
 }
 
 /// Pure extraction: given captured pane text, return the most recent submitted
-/// prompt, or `None`. Submitted prompts are `❯ `-prefixed lines above the live
-/// input box; the box is the trailing region after the last horizontal rule.
-fn extract_last_prompt(pane: &str) -> Option<String> {
+/// prompt, or `None`. `submitted` strips the tool's prompt glyph from a line.
+/// Submitted prompts sit above the live input box, which is the trailing
+/// region after the last horizontal rule.
+fn extract_last_prompt(
+    pane: &str,
+    submitted: impl for<'a> Fn(&'a str) -> Option<&'a str>,
+) -> Option<String> {
     let lines: Vec<&str> = pane.lines().collect();
     // The live input box is the trailing pair of horizontal rules (top border,
     // input line(s), bottom border); scan only the transcript above its top
@@ -87,7 +89,7 @@ fn extract_last_prompt(pane: &str) -> Option<String> {
         n => rules[n - 2],
     };
     lines[..scan_end].iter().rev().find_map(|line| {
-        let rest = line.trim_start().strip_prefix(PROMPT_MARKER)?;
+        let rest = submitted(line)?;
         // Collapse runs of whitespace to single spaces (the footer is one line)
         // and cap the length so a huge prompt is not carried in full.
         let collapsed = rest.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -116,14 +118,35 @@ fn is_horizontal_rule(line: &str) -> bool {
             .all(|c| c == ' ' || ('\u{2500}'..='\u{257F}').contains(&c))
 }
 
+/// The tool whose prompt manifest the footer reads. A wrapper with its own
+/// status rules keeps the wrapper name for status, so fall back to its alias
+/// when that name has no manifest.
+fn footer_tool(row: &crate::daemon::SessionResponse) -> String {
+    use crate::tmux::status_rules::{detection_tool, effective_detect_as};
+    let tool = detection_tool(&row.profile, &row.tool, &row.detect_as);
+    if crate::tmux::detect::has_manifest(&tool) {
+        return tool.into_owned();
+    }
+    let alias = effective_detect_as(&row.profile, &row.tool, &row.detect_as);
+    if alias.is_empty() {
+        tool.into_owned()
+    } else {
+        alias.into_owned()
+    }
+}
+
 impl super::HomeView {
-    pub(super) fn last_prompt_identity(&self) -> Option<(&str, &str, u64)> {
+    fn last_prompt_row(&self) -> Option<&crate::daemon::SessionResponse> {
         let id = self
             .live_send
             .as_ref()
             .map(|state| state.session_id.as_str())
             .or(self.selected_session.as_deref())?;
-        let row = self.session_feed.applied_session(id)?;
+        self.session_feed.applied_session(id)
+    }
+
+    pub(super) fn last_prompt_identity(&self) -> Option<(&str, &str, u64)> {
+        let row = self.last_prompt_row()?;
         Some((
             self.session_feed.applied_epoch()?,
             row.id.as_str(),
@@ -178,10 +201,11 @@ impl super::HomeView {
             };
             let epoch = epoch.to_owned();
             let session_id = id.to_owned();
+            let tool = self.last_prompt_row().map(footer_tool).unwrap_or_default();
             self.last_prompt_in_flight = true;
             let slot = self.last_prompt_slot.clone();
             std::thread::spawn(move || {
-                let text = scrape(&pane);
+                let text = scrape(&pane, &tool);
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Some(LastPromptCache {
                         pane,
@@ -218,6 +242,54 @@ impl super::HomeView {
 mod tests {
     use super::*;
 
+    fn claude(pane: &str) -> Option<String> {
+        extract_last_prompt(pane, |line| {
+            crate::tmux::detect::submitted_prompt("claude", line)
+        })
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn footer_falls_back_to_the_alias_when_the_wrapper_has_status_rules() {
+        use crate::session::config::StatusRule;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let mut config = crate::session::Config::default();
+        config
+            .agents
+            .entry("wrapper-with-rules".to_string())
+            .or_default()
+            .status_rules = vec![StatusRule {
+            status: crate::agents::HookStatus::Running,
+            contains: Some("spin".to_string()),
+            regex: None,
+        }];
+        crate::tmux::status_rules::install_from_config("default", &config);
+        let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
+            "id": "s", "tool": "wrapper-with-rules", "detect_as": "claude",
+        }))
+        .unwrap();
+        let tool = footer_tool(&row);
+        assert_eq!(tool, "claude");
+        assert_eq!(
+            crate::tmux::detect::submitted_prompt(&tool, "❯ hello").map(str::trim),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn footer_follows_the_instance_alias_of_a_wrapper() {
+        let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
+            "id": "s", "tool": "wrapper-without-rules", "detect_as": "claude",
+        }))
+        .unwrap();
+        let tool = footer_tool(&row);
+        assert_eq!(tool, "claude");
+        assert_eq!(
+            crate::tmux::detect::submitted_prompt(&tool, "❯ hello").map(str::trim),
+            Some("hello")
+        );
+    }
+
     #[test]
     fn extracts_the_last_submitted_prompt_above_the_input_box() {
         let pane = "\
@@ -230,7 +302,7 @@ mod tests {
 ❯ draft not yet sent
 ────────────────────────────────────────
   ⏵⏵ bypass permissions on";
-        assert_eq!(extract_last_prompt(pane).as_deref(), Some("drugie pytanie"));
+        assert_eq!(claude(pane).as_deref(), Some("drugie pytanie"));
     }
 
     #[test]
@@ -241,39 +313,56 @@ mod tests {
 ────────────────────────────────────────
 ❯
 ────────────────────────────────────────";
-        assert_eq!(
-            extract_last_prompt(pane).as_deref(),
-            Some("co robi ten serwis")
-        );
+        assert_eq!(claude(pane).as_deref(), Some("co robi ten serwis"));
+    }
+
+    #[test]
+    fn a_glyph_without_a_following_space_is_not_a_prompt() {
+        let pane = "❯ first\n● reply\n❯pasted\n● reply";
+        assert_eq!(claude(pane).as_deref(), Some("first"));
     }
 
     #[test]
     fn none_when_no_prompt_present() {
-        assert_eq!(
-            extract_last_prompt("just some output\nno markers here"),
-            None
-        );
-        assert_eq!(extract_last_prompt(""), None);
+        assert_eq!(claude("just some output\nno markers here"), None);
+        assert_eq!(claude(""), None);
     }
 
     #[test]
     fn no_rule_falls_back_to_the_last_marker_line() {
         let pane = "❯ only prompt\n● reply";
-        assert_eq!(extract_last_prompt(pane).as_deref(), Some("only prompt"));
+        assert_eq!(claude(pane).as_deref(), Some("only prompt"));
     }
 
     #[test]
     fn whitespace_is_collapsed() {
         let pane = "❯   lots    of   spaces\n● reply";
-        assert_eq!(extract_last_prompt(pane).as_deref(), Some("lots of spaces"));
+        assert_eq!(claude(pane).as_deref(), Some("lots of spaces"));
     }
 
     #[test]
     fn long_prompt_is_truncated_with_an_ellipsis() {
         let long = "x".repeat(MAX_PROMPT_CHARS + 50);
         let pane = format!("❯ {long}\n● reply");
-        let got = extract_last_prompt(&pane).expect("prompt");
+        let got = claude(&pane).expect("prompt");
         assert_eq!(got.chars().count(), MAX_PROMPT_CHARS + 1);
         assert!(got.ends_with('…'));
+    }
+
+    #[test]
+    fn another_tools_manifest_marker_is_read() {
+        let source = "id = \"test\"\nrules = []\n[input_box]\nprompt = '^\\s*>\\s'\n";
+        let pane = "\
+> first question
+reply
+> second   question
+reply
+────────────────────────────────────────
+> draft
+────────────────────────────────────────";
+        let got = extract_last_prompt(pane, |line| {
+            crate::tmux::detect::submitted_prompt_from_source(source, line)
+        });
+        assert_eq!(got.as_deref(), Some("second question"));
     }
 }

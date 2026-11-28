@@ -1195,6 +1195,10 @@ pub struct SessionResponse {
     pub sort_index: Option<u32>,
     #[serde(default)]
     pub tool: String,
+    /// Built-in agent the session's pane heuristics follow; empty when the
+    /// session has no alias of its own.
+    #[serde(default)]
+    pub detect_as: String,
     #[serde(default)]
     pub command: String,
     #[serde(default)]

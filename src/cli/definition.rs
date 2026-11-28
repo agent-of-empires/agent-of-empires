@@ -98,7 +98,10 @@ pub enum Commands {
     Add(Box<AddArgs>),
 
     /// List supported agents and their install status
-    Agents,
+    Agents {
+        #[command(subcommand)]
+        command: Option<crate::cli::agents::AgentsCommand>,
+    },
 
     /// Initialize .agent-of-empires/config.toml in a repository
     Init(InitArgs),
@@ -380,7 +383,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
 pub fn command_name(command: &Commands) -> Option<&'static str> {
     Some(match command {
         Commands::Add(_) => "add",
-        Commands::Agents => "agents",
+        Commands::Agents { .. } => "agents",
         Commands::Init(_) => "init",
         Commands::List(_) => "list",
         Commands::Ps(_) => "ps",

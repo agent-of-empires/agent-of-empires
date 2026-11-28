@@ -363,7 +363,12 @@ async fn run(
                 TmuxCommands::Status(args) => cli::tmux::run_status(args),
             });
         }
-        Some(Commands::Agents) => return exit_zero(cli::agents::run()),
+        Some(Commands::Agents { command }) => {
+            return exit_zero(match command {
+                None => cli::agents::run(),
+                Some(cli::agents::AgentsCommand::Detect(args)) => cli::agents::run_detect(args),
+            })
+        }
         Some(Commands::Logs(args)) => return exit_zero(cli::logs::run(args).await),
         Some(Commands::LogLevel(args)) => return exit_zero(cli::log_level::run(args).await),
         Some(Commands::Sounds { command }) => return exit_zero(cli::sounds::run(command).await),

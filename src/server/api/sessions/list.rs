@@ -826,6 +826,7 @@ mod workspace_ordering_tests {
             parent_session_id: None,
             group_path: String::new(),
             tool: "claude".to_string(),
+            detect_as: String::new(),
             command: String::new(),
             extra_args: String::new(),
             status: "Idle".to_string(),

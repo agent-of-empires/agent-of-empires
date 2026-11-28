@@ -66,7 +66,7 @@ pub fn read_hook_status_age(instance_id: &str) -> Option<std::time::Duration> {
     meta.modified().ok()?.elapsed().ok()
 }
 
-fn parse_status(bytes: &[u8]) -> Option<Status> {
+pub(crate) fn parse_status(bytes: &[u8]) -> Option<Status> {
     let trimmed = std::str::from_utf8(bytes).ok()?.trim();
     match trimmed {
         "running" => Some(Status::Running),

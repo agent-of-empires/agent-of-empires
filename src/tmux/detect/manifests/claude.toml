@@ -4,6 +4,20 @@ id = "claude"
 [input_line]
 prompt = '^\x{276F}'
 
+# The input box: the prompt glyph, and the lines around it that the status slot
+# above the box skips (the horizontal rule is skipped by the engine).
+[input_box]
+prompt = '^\s*\x{276F}'
+chrome = [
+  # A tip hint under a tool result.
+  '^\x{23BF}.*Tip:',
+  '^new task\?',
+  # The mode footer.
+  '(?i)^[\x{23F5}\x{23F8}].*(?: on|shift\+tab)',
+  # Claude's self-update notice, which otherwise hides the completion line.
+  '(?i)^[\x{2714}\x{2713}](?:.*update.*(?:restart|installed)|.*(?:restart|installed).*update)',
+]
+
 # The terminal title Claude publishes over OSC: a braille or half-circle spinner
 # frame while a turn runs, a static glyph when it is over.
 [[rules]]

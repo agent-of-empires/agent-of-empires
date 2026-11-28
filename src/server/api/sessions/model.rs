@@ -74,6 +74,7 @@ pub(super) fn session_response_from_instance_with_plan(
         group_path: row.group_path.to_string(),
         sort_index: inst.sort_index,
         tool: row.tool.to_string(),
+        detect_as: inst.detect_as.clone(),
         command: row.command.to_string(),
         extra_args: inst.extra_args.clone(),
         status: status.wire_str().to_string(),

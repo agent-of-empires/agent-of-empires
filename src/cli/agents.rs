@@ -1,6 +1,35 @@
 //! `agent-of-empires agents` command implementation
 
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use clap::{Args, Subcommand};
+
+#[derive(Subcommand)]
+pub enum AgentsCommand {
+    /// Evaluate a detection manifest over a saved pane capture
+    #[command(hide = true)]
+    Detect(DetectArgs),
+}
+
+#[derive(Args)]
+pub struct DetectArgs {
+    /// Detection manifest (TOML)
+    #[arg(long)]
+    manifest: PathBuf,
+    /// Pane capture to evaluate; ANSI escapes are stripped
+    #[arg(long)]
+    pane: PathBuf,
+    /// Hook status file contents (`idle`, `running`, `waiting`, `error`); its mtime sets the age
+    #[arg(long)]
+    hook: Option<PathBuf>,
+    /// OSC terminal title
+    #[arg(long, default_value = "")]
+    osc_title: String,
+    /// Print the verdict as JSON
+    #[arg(long)]
+    json: bool,
+}
 
 #[tracing::instrument(target = "cli.agents", skip_all)]
 pub fn run() -> Result<()> {
@@ -92,4 +121,61 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Exits 0 when a rule matched, 1 when none did, 2 when an input could not be used.
+#[tracing::instrument(target = "cli.agents", skip_all)]
+pub fn run_detect(args: DetectArgs) -> Result<()> {
+    match detect(&args) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(super::Exit(1).into()),
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            Err(super::Exit(2).into())
+        }
+    }
+}
+
+fn detect(args: &DetectArgs) -> Result<bool> {
+    let read =
+        |path: &PathBuf| std::fs::read(path).with_context(|| format!("reading {}", path.display()));
+    let source = String::from_utf8(read(&args.manifest)?).context("manifest is not UTF-8")?;
+    let pane = String::from_utf8_lossy(&read(&args.pane)?).into_owned();
+    let hook = args
+        .hook
+        .as_ref()
+        .map(|path| -> Result<_> {
+            let status = crate::hooks::parse_status(&read(path)?)
+                .with_context(|| format!("{} holds no hook status", path.display()))?;
+            let age = std::fs::metadata(path)?.modified()?.elapsed().ok();
+            Ok(crate::tmux::detect::HookObservation { status, age })
+        })
+        .transpose()?;
+    let observation = crate::tmux::detect::Observation::new(&args.osc_title, hook, true);
+    let detection = crate::tmux::detect::detect_with_manifest_source(&source, &pane, &observation)?;
+    let status = detection
+        .as_ref()
+        .and_then(|d| d.status)
+        .map(|status| status.as_str());
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "matched": detection.is_some(),
+                "rule": detection.as_ref().map(|d| &d.rule),
+                "status": status,
+                "visible": detection.as_ref().is_some_and(|d| d.visible),
+                "diagnostic": detection.as_ref().and_then(|d| d.diagnostic.as_ref()),
+            })
+        );
+    } else if let Some(d) = &detection {
+        println!(
+            "rule {} -> {}",
+            d.rule,
+            status.unwrap_or("no status change")
+        );
+    } else {
+        println!("no rule matched");
+    }
+    Ok(detection.is_some())
 }
