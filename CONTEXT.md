@@ -133,11 +133,11 @@ An Agent not built in, defined only through settings. Detect-as maps it onto a b
 Agent Client Protocol. The JSON-RPC protocol AoE speaks to an Agent in Structured view. AoE is the client, the ACP adapter is the server.
 
 **ACP adapter**:
-The ACP-speaking program for an Agent, either native or a bundled shim.
+The ACP-speaking program for an Agent: native, a bundled shim, or one a plugin supplies through its `acp` declaration.
 _Avoid_: ACP server, agent (for the adapter process)
 
 **Proxy**:
-A plugin-shipped per-session process between the Worker and an ACP adapter that translates the adapter's own `_meta` into Primitives. It announces itself with a hello on `initialize`.
+A plugin-shipped per-session process between the Worker and an ACP adapter that translates the adapter's own `_meta` into Primitives. A plugin declares it in the `acp` table of an agent integration. It announces itself with a hello on `initialize`.
 
 **Primitive**:
 A generic, versioned `_meta.aoe` annotation core consumes in place of any agent-specific `_meta`.
