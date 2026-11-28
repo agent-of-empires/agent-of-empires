@@ -118,8 +118,21 @@ fn is_horizontal_rule(line: &str) -> bool {
             .all(|c| c == ' ' || ('\u{2500}'..='\u{257F}').contains(&c))
 }
 
+/// The tool whose prompt manifest the footer reads. A wrapper with its own
+/// status rules keeps the wrapper name for status, so fall back to its alias
+/// when that name has no manifest.
 fn footer_tool(row: &crate::daemon::SessionResponse) -> String {
-    crate::tmux::status_rules::detection_tool(&row.profile, &row.tool, &row.detect_as).into_owned()
+    use crate::tmux::status_rules::{detection_tool, effective_detect_as};
+    let tool = detection_tool(&row.profile, &row.tool, &row.detect_as);
+    if crate::tmux::detect::has_manifest(&tool) {
+        return tool.into_owned();
+    }
+    let alias = effective_detect_as(&row.profile, &row.tool, &row.detect_as);
+    if alias.is_empty() {
+        tool.into_owned()
+    } else {
+        alias.into_owned()
+    }
 }
 
 impl super::HomeView {
@@ -233,6 +246,34 @@ mod tests {
         extract_last_prompt(pane, |line| {
             crate::tmux::detect::submitted_prompt("claude", line)
         })
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn footer_falls_back_to_the_alias_when_the_wrapper_has_status_rules() {
+        use crate::session::config::StatusRule;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let mut config = crate::session::Config::default();
+        config
+            .agents
+            .entry("wrapper-with-rules".to_string())
+            .or_default()
+            .status_rules = vec![StatusRule {
+            status: crate::agents::HookStatus::Running,
+            contains: Some("spin".to_string()),
+            regex: None,
+        }];
+        crate::tmux::status_rules::install_from_config("default", &config);
+        let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
+            "id": "s", "tool": "wrapper-with-rules", "detect_as": "claude",
+        }))
+        .unwrap();
+        let tool = footer_tool(&row);
+        assert_eq!(tool, "claude");
+        assert_eq!(
+            crate::tmux::detect::submitted_prompt(&tool, "❯ hello").map(str::trim),
+            Some("hello")
+        );
     }
 
     #[test]
