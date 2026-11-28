@@ -175,6 +175,17 @@ pub(crate) fn local_socket_path() -> anyhow::Result<std::path::PathBuf> {
         .join("api.sock"))
 }
 
+/// `sockaddr_un.sun_path` is 104 bytes on macOS, including the NUL.
+pub(crate) fn ensure_socket_path_fits(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    anyhow::ensure!(
+        path.as_os_str().as_bytes().len() < 104,
+        "Daemon Unix socket path is too long: {}",
+        path.display()
+    );
+    Ok(())
+}
+
 pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     match std::fs::DirBuilder::new().mode(0o700).create(parent) {
@@ -428,6 +439,16 @@ pub(crate) fn request_error(error: reqwest::Error) -> DaemonClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_path_must_leave_room_for_the_nul() {
+        for (len, fits) in [(103, true), (104, false)] {
+            let path = std::path::PathBuf::from("/".repeat(len));
+            assert_eq!(ensure_socket_path_fits(&path).is_ok(), fits, "{len}");
+        }
+        let err = ensure_socket_path_fits(Path::new(&"/a".repeat(60))).unwrap_err();
+        assert!(err.to_string().contains("too long"), "{err}");
+    }
 
     #[tokio::test]
     async fn unix_requests_preserve_host_and_stream_body_data() {

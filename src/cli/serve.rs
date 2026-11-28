@@ -1159,29 +1159,24 @@ enum DaemonProcessIdentity {
     Indeterminate,
 }
 
-fn command_is_aoe_serve(command: &[u8]) -> bool {
-    let args: Vec<&[u8]> = if command.contains(&0) {
-        command
-            .split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty())
-            .collect()
-    } else {
-        command
-            .split(|byte| byte.is_ascii_whitespace())
-            .filter(|arg| !arg.is_empty())
-            .collect()
-    };
-    let Some(executable) = args.first() else {
-        return false;
-    };
-    let basename = executable
-        .rsplit(|byte| *byte == b'/')
-        .next()
-        .unwrap_or(executable);
-    if !matches!(basename, b"aoe" | b"agent-of-empires") {
-        return false;
-    }
+/// NUL-separated when the source is `/proc/<pid>/cmdline`, otherwise `ps` output,
+/// which joins argv with spaces.
+fn split_argv(command: &[u8]) -> Vec<&[u8]> {
+    let nul_delimited = command.contains(&0);
+    command
+        .split(|byte| {
+            if nul_delimited {
+                *byte == 0
+            } else {
+                byte.is_ascii_whitespace()
+            }
+        })
+        .filter(|arg| !arg.is_empty())
+        .collect()
+}
 
+/// Index of the `serve` subcommand once the top-level globals are skipped.
+fn serve_subcommand_index(args: &[&[u8]]) -> Option<usize> {
     // The top-level globals declared on `Cli` in `src/cli/definition.rs`, so a
     // value like `--profile work` is not mistaken for the subcommand.
     // `parser_knows_every_top_level_global` fails if that list changes.
@@ -1191,7 +1186,7 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
             b"-p" | b"--profile" | b"--daemon-url" => {
                 index += 2;
                 if index > args.len() {
-                    return false;
+                    return None;
                 }
             }
             b"--no-autostart" => index += 1,
@@ -1202,11 +1197,53 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
             {
                 index += 1;
             }
-            b"serve" => return true,
-            _ => return false,
+            b"serve" => return Some(index),
+            _ => return None,
         }
     }
-    false
+    None
+}
+
+fn command_is_aoe_serve(command: &[u8]) -> bool {
+    let args = split_argv(command);
+    let Some(executable) = args.first() else {
+        return false;
+    };
+    let basename = executable
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .unwrap_or(executable);
+    matches!(basename, b"aoe" | b"agent-of-empires") && serve_subcommand_index(&args).is_some()
+}
+
+/// Whether `args` is `<any executable> [globals] serve --daemon-child`, the argv
+/// `daemon_child_args` always emits.
+fn renamed_daemon_child_argv(args: &[&[u8]]) -> bool {
+    serve_subcommand_index(args)
+        .is_some_and(|index| args.get(index + 1) == Some(&&b"--daemon-child"[..]))
+}
+
+/// A renamed release binary (`aoe-darwin-arm64`) has no trustworthy name, so it
+/// is the daemon only when `serve.launch` records this PID with an instance id
+/// the live process carries. Absent or mismatched metadata is not evidence.
+fn renamed_daemon_evidence(launch: Option<&ServeLaunch>, pid: u32, instance_is_live: bool) -> bool {
+    launch
+        .is_some_and(|launch| launch.pid == pid && launch.instance_id.is_some() && instance_is_live)
+}
+
+/// `None` when `args` is not a daemon child. Otherwise `Verified` with launch
+/// evidence, else `Indeterminate`, so a stale PID is never signalled and its
+/// launch state is never deleted.
+fn classify_renamed_daemon(pid: u32, args: &[&[u8]]) -> Option<DaemonProcessIdentity> {
+    renamed_daemon_child_argv(args).then(|| {
+        let launch = read_serve_launch().ok();
+        let live = launch.as_ref().is_some_and(|l| instance_is_live(l, pid));
+        if renamed_daemon_evidence(launch.as_ref(), pid, live) {
+            DaemonProcessIdentity::Verified
+        } else {
+            DaemonProcessIdentity::Indeterminate
+        }
+    })
 }
 
 /// Cross-platform check that `pid` belongs to an `aoe serve` process.
@@ -1218,7 +1255,8 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     if std::path::Path::new(&proc_path).exists() {
         return match std::fs::read(&proc_path) {
             Ok(cmdline) if command_is_aoe_serve(&cmdline) => DaemonProcessIdentity::Verified,
-            Ok(_) => DaemonProcessIdentity::Foreign,
+            Ok(cmdline) => classify_renamed_daemon(pid as u32, &split_argv(&cmdline))
+                .unwrap_or(DaemonProcessIdentity::Foreign),
             Err(_) => DaemonProcessIdentity::Indeterminate,
         };
     }
@@ -1236,12 +1274,34 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
             DaemonProcessIdentity::Indeterminate
         }
         Ok(Some(out)) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
-        Ok(Some(out)) if command_mentions_aoe_executable(&out.stdout) => {
-            DaemonProcessIdentity::Indeterminate
-        }
-        Ok(Some(_)) => DaemonProcessIdentity::Foreign,
+        // `ps` flattens argv; macOS has the structured argv for the renamed check.
+        Ok(Some(out)) => match crate::process::process_argv(pid as u32) {
+            Some(argv) => {
+                let args: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+                classify_renamed_daemon(pid as u32, &args)
+                    .or_else(|| {
+                        command_mentions_aoe_executable(&out.stdout)
+                            .then_some(DaemonProcessIdentity::Indeterminate)
+                    })
+                    .unwrap_or(DaemonProcessIdentity::Foreign)
+            }
+            None if ps_line_may_be_aoe(&out.stdout) => DaemonProcessIdentity::Indeterminate,
+            None => DaemonProcessIdentity::Foreign,
+        },
         Ok(None) | Err(_) => DaemonProcessIdentity::Indeterminate,
     }
+}
+
+/// With no structured argv to check, a `ps` line that carries the daemon-child
+/// tail or names an aoe executable is unverifiable, not foreign: `Foreign`
+/// would clear the launch state of a daemon that is still running.
+fn ps_line_may_be_aoe(command: &[u8]) -> bool {
+    const TAIL: &[u8] = b" serve --daemon-child";
+    command_mentions_aoe_executable(command)
+        || command
+            .windows(TAIL.len() + 1)
+            .any(|window| window.starts_with(TAIL) && window[TAIL.len()].is_ascii_whitespace())
+        || command.ends_with(TAIL)
 }
 
 /// Loose companion to `command_is_aoe_serve`, for the `ps` path only. `ps`
@@ -2096,6 +2156,9 @@ async fn start_daemon(
     if let Some(existing) = tokio::task::spawn_blocking(daemon_pid).await? {
         bail!("aoe serve daemon already running (PID {existing}); not starting another");
     }
+    crate::daemon::transport::ensure_socket_path_fits(
+        &crate::daemon::transport::local_socket_path()?,
+    )?;
     let exe = std::env::current_exe()?;
     let instance_id = uuid::Uuid::new_v4().to_string();
     let mut cmd = Command::new(exe);
@@ -3192,6 +3255,72 @@ mod tests {
     }
 
     #[test]
+    fn renamed_binary_is_the_daemon_only_with_launch_evidence() {
+        let argv: &[(&[&[u8]], bool)] = &[
+            (&[b"/x/aoe-darwin-arm64", b"serve", b"--daemon-child"], true),
+            (
+                &[
+                    b"/x/aoe-darwin-arm64",
+                    b"-p",
+                    b"work",
+                    b"serve",
+                    b"--daemon-child",
+                ],
+                true,
+            ),
+            // A path with spaces is still one argument.
+            (
+                &[
+                    b"/Users/me/My Apps/aoe-darwin-arm64",
+                    b"serve",
+                    b"--daemon-child",
+                ],
+                true,
+            ),
+            (&[b"/x/aoe-darwin-arm64", b"serve", b"--daemon"], false),
+            (&[b"/x/aoe-darwin-arm64", b"serve"], false),
+            (
+                &[
+                    b"/x/aoe-darwin-arm64",
+                    b"serve",
+                    b"--daemon",
+                    b"--daemon-child",
+                ],
+                false,
+            ),
+            (&[b"worker", b"serve", b"--daemon-children"], false),
+            (
+                &[b"/usr/bin/worker", b"--label", b"serve --daemon-child"],
+                false,
+            ),
+        ];
+        for (args, expected) in argv {
+            assert_eq!(renamed_daemon_child_argv(args), *expected, "{args:?}");
+        }
+
+        let launch = |pid, instance: Option<&str>| ServeLaunch {
+            pid,
+            instance_id: instance.map(str::to_string),
+            ..sample_launch()
+        };
+        // (launch record, instance is live, evidence)
+        let cases = [
+            (None, true, false),
+            (Some(launch(4242, Some("i"))), false, false),
+            (Some(launch(99, Some("i"))), true, false),
+            (Some(launch(4242, None)), true, false),
+            (Some(launch(4242, Some("i"))), true, true),
+        ];
+        for (record, live, expected) in cases {
+            assert_eq!(
+                renamed_daemon_evidence(record.as_ref(), 4242, live),
+                expected,
+                "{record:?} live {live}"
+            );
+        }
+    }
+
+    #[test]
     fn serve_and_migrate_exclude_each_other_in_both_orders() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serve.lock");
@@ -4159,6 +4288,30 @@ mod tests {
             assert_eq!(
                 command_mentions_aoe_executable(command),
                 expected,
+                "{}",
+                String::from_utf8_lossy(command)
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_argv_is_unverifiable_only_for_aoe_like_ps_lines() {
+        let cases: &[(&[u8], bool)] = &[
+            (
+                b"/Users/me/My Apps/aoe-darwin-arm64 serve --daemon-child --port 1",
+                true,
+            ),
+            (b"/usr/local/bin/aoe serve --daemon-child", true),
+            (b"/x/aoe-darwin-arm64 serve --daemon-child", true),
+            (b"/usr/bin/worker serve --daemon-children", false),
+            (b"/usr/bin/worker serve --daemon-child-x --port 1", false),
+            (b"/usr/bin/vim src/aoe.rs", false),
+            (b"/usr/bin/python3 manage.py runserver", false),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                ps_line_may_be_aoe(command),
+                *expected,
                 "{}",
                 String::from_utf8_lossy(command)
             );
