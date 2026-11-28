@@ -96,8 +96,8 @@ pub(crate) use instance::{
     forget_before_start_resolution, BeforeStartHook, BeforeStartHookError, Releasing,
 };
 pub(crate) use instance::{
-    host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
-    host_hook_post_install_notes,
+    host_hook_agent, host_hook_declared_agent, host_hook_disclosure,
+    host_hook_disclosure_config_with_repo, host_hook_post_install_notes, HostHookDisclosure,
 };
 pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND_STORE_HINT};
 pub use instance::{
@@ -218,7 +218,7 @@ pub(crate) use storage::{
     replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage,
     GroupMovePlan, LaunchConfig, LockedDataFile, NativeStoreUnavailable, ProfileMoveRejected,
     SessionCommitApplied, SessionMutation, SessionStore, StorageFlock, StorageTransition,
-    STORAGE_LOCK_FILENAME,
+    MAX_SYMLINK_HOPS, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
