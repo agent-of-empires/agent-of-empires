@@ -276,17 +276,18 @@ impl EventStore {
         }
     }
 
-    /// Whether the latest `Stopped { rate_limited }` ended a turn nobody
-    /// prompted: the agent worked since the previous terminal event, with no
-    /// user prompt to redeliver.
+    /// Whether the latest park ended a turn nobody prompted: the agent worked
+    /// since the previous terminal event, with no user prompt to redeliver.
+    /// A `RateLimit` anchors it too, for a park interrupted before its stop.
     pub fn rate_limit_interrupted_agent_turn(&self, session_id: &str) -> bool {
         let conn = self.conn();
         let Some(stop_seq) = logged(
             conn.query_row(
                 "SELECT MAX(seq) FROM acp_events
                  WHERE session_id = ?1
-                   AND discriminant = 'Stopped'
-                   AND json_extract(event_json, '$.Stopped.reason') = 'rate_limited'",
+                   AND (discriminant = 'RateLimit'
+                        OR (discriminant = 'Stopped'
+                            AND json_extract(event_json, '$.Stopped.reason') = 'rate_limited'))",
                 params![session_id],
                 |row| row.get::<_, Option<i64>>(0),
             )
@@ -966,6 +967,11 @@ mod tests {
                 false,
             ),
             ("never limited", vec![chunk(), stopped("agent_idle")], false),
+            (
+                "park interrupted before its stop",
+                vec![user_prompt("old"), stopped("end_turn"), chunk(), limit()],
+                true,
+            ),
             (
                 "diff-comments turn",
                 vec![diff_comments(), chunk(), limit(), stopped("rate_limited")],
