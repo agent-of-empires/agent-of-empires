@@ -6415,6 +6415,7 @@ name = "xtask"
 version = "1.26.0"
 dependencies = [
  "agent-of-empires",
+ "anyhow",
  "aoe-plugin-api",
  "clap",
  "clap-markdown",
@@ -6422,9 +6423,11 @@ dependencies = [
  "nix 0.31.3",
  "notify",
  "regex",
+ "semver",
  "serde",
  "tempfile",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

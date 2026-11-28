@@ -14,6 +14,12 @@ Configuration lives in `release-plz.toml`: only `agent-of-empires` is tagged, ve
 
 release-plz force-pushes the release PR on every update, so edits made on its branch are lost. To ship a different version, merge a normal PR that sets the same version in all four workspace `Cargo.toml` files (the root, `aoe-plugin-api`, `aoe-settings-derive` and `xtask`) and in `Cargo.lock`. The version group takes the highest proposed version, so a root-only override loses to child commits. release-plz keeps a version that is already ahead of the last tag.
 
+## Featured plugin pins
+
+The release PR also carries `plugins/featured.toml`. After release-plz updates the PR, the `Update release PR` job checks out its branch, runs `cargo xtask bump-featured-pins`, and pushes a `chore(plugins): pin featured plugin releases` commit when the index changed. The command pins every release above each plugin's newest pinned version: it lists the plugin repository's tags, clones each missing one, and hashes the tree with the same `tree_hash` an install verifies against, so approving the release PR is the review of those new pins. A release whose tree cannot be hashed (a symlink, for example) is reported and skipped, and the pins that did resolve are still committed.
+
+release-plz force-pushes the release PR on every refresh, so that commit is dropped and recreated; a plugin release published after the last refresh is pinned by the next one. Run `cargo xtask bump-featured-pins` locally to see what it would add.
+
 ## Rebuilding an existing tag
 
 Dispatch the release workflow with the existing tag, subject to the same release-environment approval:

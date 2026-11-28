@@ -89,6 +89,10 @@ jobs:
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
+    permissions:
+      contents: read
+      # The kache build cache.
+      id-token: write
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
       - uses: runs-on/action@v2.6.0
@@ -106,3 +110,51 @@ jobs:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+      # release-plz force-pushes the release PR on every refresh, so a pin commit is
+      # dropped and re-added there rather than landing on main. docs/development/releases.md
+      - name: Resolve the release PR branch
+        id: release_pr
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH="$(gh pr list --repo "$GITHUB_REPOSITORY" --label release --state open \
+            --json headRefName \
+            --jq 'map(select(.headRefName | startswith("release-plz-"))) | .[0].headRefName // ""')"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          if [ -z "$BRANCH" ]; then
+            echo "::notice::No open release PR; featured pins are left as they are."
+          fi
+
+      - name: Check out the release PR
+        if: steps.release_pr.outputs.branch != ''
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ steps.release_pr.outputs.branch }}
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - uses: $/.github/actions/kache
+        if: steps.release_pr.outputs.branch != ''
+        with:
+          manifest-key: featured-pins
+
+      # Pins every plugin release published since the newest pinned one, so the
+      # release that ships this commit is what attests to them.
+      - name: Pin featured plugin releases
+        if: steps.release_pr.outputs.branch != ''
+        env:
+          BRANCH: ${{ steps.release_pr.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # One unpinnable upstream release must not hold back the others' pins.
+          cargo xtask bump-featured-pins \
+            || echo "::warning title=Featured pins::Some plugin releases could not be pinned; see this step's log."
+          if git diff --quiet -- plugins/featured.toml; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plugins/featured.toml
+          git commit -m "chore(plugins): pin featured plugin releases"
+          git push origin "HEAD:$BRANCH"
