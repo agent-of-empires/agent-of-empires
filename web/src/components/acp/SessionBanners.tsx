@@ -66,6 +66,7 @@ export function SessionBanners({
   });
   const healthy = !state.startupError && !state.integrationLost && !state.workerStopped && !state.workerRestarting;
   const idle = healthy && !state.turnActive;
+  const errorMessage = state.interactionError?.message ?? state.lastError;
   return (
     <>
       {state.startupError && state.startupCause?.kind === "container_missing" && (
@@ -147,7 +148,7 @@ export function SessionBanners({
           Monitoring a background job
         </ChipBanner>
       )}
-      {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
+      {errorMessage && <InteractionErrorBanner message={errorMessage} onDismiss={dismissError} />}
     </>
   );
 }
@@ -328,8 +329,8 @@ function ChipBanner({
 
 function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
   return (
-    <WarningStrip title="Action did not complete." onDismiss={onDismiss}>
-      {message}
+    <WarningStrip title="Action did not complete" onDismiss={onDismiss}>
+      <span className="block">{message}</span>
     </WarningStrip>
   );
 }

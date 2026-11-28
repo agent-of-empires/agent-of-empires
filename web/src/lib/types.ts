@@ -1,4 +1,4 @@
-import type { RateLimitInfo } from "./acpTypes";
+import type { OperationErrorEvidence, RateLimitInfo } from "./acpTypes";
 import type { AgentProfile } from "./agentProfile";
 import type { SchemaSettings } from "./generated/settingsKeys";
 
@@ -44,6 +44,7 @@ export interface SessionResponse {
   /** Last transition into Idle; unlike `last_accessed_at`, viewing does not bump it. */
   idle_entered_at: string | null;
   last_error: string | null;
+  last_error_evidence?: OperationErrorEvidence | null;
   /** Why the initial prompt was not typed into this terminal session. */
   initial_prompt_error?: string | null;
   /** `agent_folder_not_trusted`, `agent_bypass_not_accepted`, or absent for other causes. */

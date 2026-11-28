@@ -33,10 +33,7 @@ pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 #[notification(method = "_aoe/session_replayed")]
 pub struct SessionReplayed {}
 
-/// Daemon-minted notification written after a local prompt's completion.
-///
-/// The crate handles notifications in order, so the waiter resolves only after
-/// the updates the agent sent before its reply have been applied.
+/// Daemon-minted completion barrier, ordered behind preceding SDK notifications.
 #[derive(
     Debug, Clone, Default, Serialize, Deserialize, agent_client_protocol::JsonRpcNotification,
 )]

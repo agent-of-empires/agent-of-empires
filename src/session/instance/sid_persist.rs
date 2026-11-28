@@ -220,6 +220,15 @@ impl Instance {
             else {
                 return Ok(SidWrite::Failed);
             };
+            if self.lifecycle_reservation_is_owned(
+                LifecycleOperation::Launch,
+                self.lifecycle_generation,
+            ) && !instances[index].lifecycle_reservation_is_owned(
+                LifecycleOperation::Launch,
+                self.lifecycle_generation,
+            ) {
+                return Ok(SidWrite::Skipped);
+            }
             if !expected.matches(&instances[index]) {
                 return Ok(SidWrite::Skipped);
             }
@@ -666,6 +675,40 @@ mod tests {
             .agent_session_id
     }
 
+    #[test]
+    #[serial]
+    fn launch_publication_preserves_a_newer_same_sid_generation() {
+        let profile = "superseded-launch-publication";
+        let mut instance = make_inst(profile, "superseded");
+        instance.agent_session_id = Some(VALID_SID.into());
+        let (_temp, _home, storage) = seeded(profile, &[&instance]);
+        let generation = instance
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        let expected = instance.conversation_state();
+        storage
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == instance.id).unwrap();
+                row.lifecycle_generation += 1;
+                row.lifecycle_reservation = None;
+                row.status = Status::Running;
+                row.resume_probe_failed_sid = Some(VALID_SID.into());
+                Ok(())
+            })
+            .unwrap();
+        let _ = instance.persist_session_id_with_storage(&storage, &expected);
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.lifecycle_generation, generation + 1);
+        assert!(stored.lifecycle_reservation.is_none());
+        assert_eq!(stored.status, Status::Running);
+        assert_eq!(stored.agent_session_id.as_deref(), Some(VALID_SID));
+        assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(VALID_SID));
+        assert_eq!(stored.conversation_state(), expected);
+    }
     #[test]
     #[serial]
     fn fork_publication_advances_finalization_without_overwriting_peer_changes() {

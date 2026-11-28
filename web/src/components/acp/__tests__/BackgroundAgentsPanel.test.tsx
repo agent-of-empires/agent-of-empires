@@ -751,7 +751,7 @@ describe("BackgroundAgentsPanel", () => {
         toolCallId: "t1",
         status: "completed",
         startedAt: "2026-01-01T00:00:10Z",
-        endedAt: new Date().toISOString(),
+        endedAt: "2026-01-01T00:00:15Z",
         prompt: "a very long prompt that the narrow panel would clamp",
         result: "the complete final result text",
         tools: [{ name: "Bash", title: "ls", ok: true }],
@@ -762,7 +762,7 @@ describe("BackgroundAgentsPanel", () => {
         description: "Second one",
         status: "completed",
         startedAt: "2026-01-01T00:00:00Z",
-        endedAt: "2020-01-01",
+        endedAt: "2026-01-01T00:00:05Z",
       }),
     ]);
     const { getByRole, container } = render(<BackgroundAgentsPanel sessionId="s-1" />);

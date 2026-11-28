@@ -48,29 +48,42 @@ fn flattened_error(message: &str) -> Option<(&str, String)> {
 /// the reset and window come from the status text (`refine_from_status`).
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
     now: crate::time::Timestamp,
 ) -> Option<RateLimitInfo> {
-    let kind = err.data.as_ref()?.get("errorKind")?.as_str()?;
+    let Some(data) = &err.data else {
+        return classify_rate_limit_from_message(&err.message, captured, now);
+    };
+    let kind = data.get("errorKind")?.as_str()?;
     let kind = *ACCOUNT_LIMIT_KINDS.iter().find(|k| **k == kind)?;
-    Some(limit_info(err.message.clone(), kind, captured, now))
+    Some(limit_info(
+        super::errors::public_error_message(err),
+        kind,
+        captured,
+        now,
+    ))
 }
 
 /// Fallback for an outer error that kept only the serialized `errorKind`.
-pub(crate) fn classify_rate_limit_from_message(
+fn classify_rate_limit_from_message(
     message: &str,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
     now: crate::time::Timestamp,
 ) -> Option<RateLimitInfo> {
     let (prose, kind) = flattened_error(message)?;
     let kind = *ACCOUNT_LIMIT_KINDS.iter().find(|k| **k == kind)?;
-    Some(limit_info(prose.to_string(), kind, captured, now))
+    Some(limit_info(
+        super::errors::public_error_text(prose, None),
+        kind,
+        captured,
+        now,
+    ))
 }
 
 fn limit_info(
     status: String,
     kind: &str,
-    captured: Option<CapturedReset>,
+    captured: Option<&CapturedReset>,
     now: crate::time::Timestamp,
 ) -> RateLimitInfo {
     // A captured window is a quota window's: a billing error keeps its own kind and takes no reset.
@@ -78,10 +91,8 @@ fn limit_info(
     refine_from_status(
         RateLimitInfo {
             status,
-            resets_at: captured.as_ref().map(|c| c.resets_at),
-            kind: captured
-                .as_ref()
-                .map_or_else(|| kind.to_string(), |c| c.kind()),
+            resets_at: captured.map(|c| c.resets_at),
+            kind: captured.map_or_else(|| kind.to_string(), CapturedReset::kind),
         },
         now,
         Observation::Live,
@@ -571,7 +582,7 @@ mod tests {
             resets_at: utc("2026-11-20T00:00:00Z").unwrap(),
         };
         let info =
-            classify_rate_limit_error(&err(weekly, Some(limit)), Some(captured), now()).unwrap();
+            classify_rate_limit_error(&err(weekly, Some(limit)), Some(&captured), now()).unwrap();
         assert_eq!(info.resets_at, utc("2026-11-20T00:00:00Z"));
         assert_eq!(info.kind, "seven_day_opus");
 
@@ -741,7 +752,7 @@ mod tests {
                 "You've hit your 5-hour limit · resets 6pm (UTC)",
                 Some(json!({ "errorKind": "rate_limit" })),
             ),
-            Some(far),
+            Some(&far),
             now(),
         )
         .unwrap();
@@ -766,7 +777,7 @@ mod tests {
         };
         let billing = classify_rate_limit_error(
             &err("low", Some(json!({ "errorKind": "billing_error" }))),
-            Some(quota),
+            Some(&quota),
             now(),
         )
         .unwrap();
@@ -916,7 +927,7 @@ mod tests {
         assert_eq!(info.resets_at, None);
 
         let info =
-            classify_rate_limit_error(&err("limit", Some(limit)), Some(captured), now()).unwrap();
+            classify_rate_limit_error(&err("limit", Some(limit)), Some(&captured), now()).unwrap();
         assert_eq!(info.resets_at, Some(resets_at));
         assert_eq!(info.kind, "seven_day", "the window names the limit");
 
@@ -940,7 +951,7 @@ mod tests {
                     window: window.into(),
                     resets_at,
                 };
-                let info = classify_rate_limit_from_message(msg, Some(captured), now()).unwrap();
+                let info = classify_rate_limit_from_message(msg, Some(&captured), now()).unwrap();
                 assert_eq!(info.kind, kind);
                 assert_eq!(info.resets_at, Some(resets_at));
             }

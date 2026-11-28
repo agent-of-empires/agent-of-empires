@@ -14,8 +14,8 @@
 // chrome still wins the header, but not the action area: holding cannot
 // express which answer was meant.
 //
-// Buttons stay disabled while a decision is in flight, until the server's
-// broadcast removes the approval; a rejected submit re-enables them.
+// Submitting disables actions until the hook confirms resolution or rejects
+// to permit retry. Confirmed HTTP responses and broadcasts remove the card.
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { AlertTriangle, Check, ChevronDown, MessageCircleQuestion, Shield, X } from "lucide-react";

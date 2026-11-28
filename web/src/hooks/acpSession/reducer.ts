@@ -57,7 +57,7 @@ export type Action =
   | { kind: "prompt_send_rejected"; id: string }
   | { kind: "settle_inflight_prompt"; id: string }
   | { kind: "rollback_optimistic_prompt"; id: string }
-  | { kind: "error"; message: string }
+  | { kind: "error"; message: string; target?: NonNullable<AcpState["interactionError"]>["target"] }
   // A launch the daemon refused and kept the prompt for: shown through the startup banner.
   | { kind: "blocked_launch"; message: string; cause: StartupCause | null; promptId: string }
   /** The prompt's POST ended: a refused launch can no longer arrive for it. */
@@ -274,7 +274,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "lagged_resolved":
       return { ...state, lagged: false };
     case "error":
-      return { ...state, lastError: action.message };
+      return { ...state, interactionError: { message: action.message, target: action.target } };
     case "blocked_launch": {
       // A recovery event that landed while the refused response was in flight outranks it.
       const { [action.promptId]: sentAt, ...promptRecoveries } = state.promptRecoveries;
@@ -292,14 +292,18 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return { ...state, promptRecoveries };
     }
     case "clear_error":
-      return { ...state, lastError: null };
+      return state.interactionError
+        ? { ...state, interactionError: null }
+        : { ...state, lastError: null, lastErrorEvidence: null };
     case "approval_resolved_locally": {
       // Don't wait for the broadcast, which the seq dedupe can swallow (#1821).
       const pendingApprovals = state.pendingApprovals.filter((a) => a.nonce !== action.nonce);
-      const removed = pendingApprovals.length !== state.pendingApprovals.length;
       return {
         ...state,
-        lastError: removed ? null : state.lastError,
+        interactionError:
+          state.interactionError?.target?.kind === "approval" && state.interactionError.target.nonce === action.nonce
+            ? null
+            : state.interactionError,
         pendingApprovals,
         locallyResolved: [...state.locallyResolved, action.nonce],
       };
@@ -307,12 +311,14 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "elicitation_resolved_locally": {
       const card = state.pendingElicitations.find((e) => e.nonce === action.nonce);
       const pendingElicitations = state.pendingElicitations.filter((e) => e.nonce !== action.nonce);
-      const removed = pendingElicitations.length !== state.pendingElicitations.length;
       const answers =
         card && action.resolution.action === "accept" ? summarizeAnswers(card, action.resolution.answers) : [];
       return {
         ...state,
-        lastError: removed ? null : state.lastError,
+        interactionError:
+          state.interactionError?.target?.kind === "elicitation" && state.interactionError.target.nonce === action.nonce
+            ? null
+            : state.interactionError,
         pendingElicitations,
         locallyResolved: [...state.locallyResolved, action.nonce],
         optimisticRows: appendElicitationAnswerRow(state.optimisticRows, action.nonce, answers),
@@ -338,7 +344,6 @@ export function reducer(state: AcpState, action: Action): AcpState {
         startupCause: null,
         // A Retry still running keeps its line.
         retriedError: state.restartInFlight ? state.retriedError : null,
-        lastError: null,
         restartFailure: null,
         inflightPromptIds: state.inflightPromptIds.includes(id)
           ? state.inflightPromptIds

@@ -1935,6 +1935,7 @@ mod tests {
             (Method::POST, "/api/sessions/creation-trust"),
             (Method::POST, "/api/sessions/missing/creation/cancel"),
             (Method::PATCH, "/api/sessions/missing/favorite"),
+            (Method::PATCH, "/api/sessions/by-selector/favorite"),
             (Method::PATCH, "/api/sessions/missing/access"),
             (Method::POST, "/api/sessions/missing/purge/abandon"),
             (Method::POST, "/api/sessions/missing/restart"),
@@ -1978,6 +1979,10 @@ mod tests {
             (Method::POST, "/api/sandbox/image-pull"),
             (Method::POST, "/api/sandbox/image-pull/cancel"),
             (Method::POST, "/api/sandbox/image-dismiss"),
+            (Method::POST, "/api/sandbox/login"),
+            (Method::DELETE, "/api/sandbox/login"),
+            (Method::DELETE, "/api/sandbox/login/missing"),
+            (Method::POST, "/api/sandbox/login/missing/code"),
             (Method::PUT, "/api/sessions/missing/file"),
         ] {
             let mut request = Request::builder()

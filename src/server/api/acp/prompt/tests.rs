@@ -1041,6 +1041,212 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
     assert_eq!(*cmds.lock().expect("cmd log mutex poisoned"), ["prompt"]);
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    for (case, (reason, interaction, late)) in [
+        ("prompt_failed", None, false),
+        ("prompt_failed", Some("approval"), false),
+        ("prompt_failed", Some("elicitation"), false),
+        ("prompt_failed", Some("approval"), true),
+        ("prompt_failed", Some("elicitation"), true),
+        ("prompt_rejected", Some("approval"), true),
+        ("session_reset_failed", None, false),
+        ("startup_error", None, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("q-{case}");
+        let state = structured_state(&id, true).await;
+        let _worker = crate::acp::supervisor::test_support::save_agent_record(&id, "claude", true);
+        let follows = matches!(reason, "prompt_failed" | "prompt_rejected");
+        let commands = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        let first = acp_prompt(
+            State(state.clone()),
+            Path(id.clone()),
+            axum::http::HeaderMap::new(),
+            prompt_req("first explicit request"),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let second = acp_prompt(
+            State(state.clone()),
+            Path(id.clone()),
+            axum::http::HeaderMap::new(),
+            prompt_req("second explicit request"),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            1
+        );
+        let inject = |event: Event| {
+            let seq = state.acp_event_store.highest_seq_checked(&id).unwrap() + 1;
+            state.acp_event_store.record(&id, seq, &event).unwrap();
+            state.acp_control_cache.apply_if_cached(&id, seq, &event);
+            state.acp_supervisor.hydrate_seqs([(id.clone(), seq)]);
+        };
+        let (mut requested, resolved) = match interaction {
+            Some("approval") => {
+                let approval = crate::acp::permissions::build_approval(
+                    crate::acp::state::ToolCall {
+                        prompt: None,
+                        id: "pending-tool".into(),
+                        name: "shell".into(),
+                        kind: "execute".into(),
+                        args_preview: "{}".into(),
+                        started_at: crate::time::Timestamp::now(),
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: Vec::new(),
+                    },
+                    Vec::new(),
+                );
+                let nonce = approval.nonce.clone();
+                (
+                    Some(Event::ApprovalRequested { approval }),
+                    Some(Event::ApprovalResolved {
+                        nonce,
+                        decision: crate::acp::approvals::ApprovalDecision::Allow,
+                    }),
+                )
+            }
+            Some("elicitation") => {
+                let nonce = crate::acp::approvals::Nonce("pending-question".into());
+                (
+                    Some(Event::ElicitationRequested {
+                        elicitation: crate::acp::elicitations::Elicitation {
+                            nonce: nonce.clone(),
+                            message: "Choose".into(),
+                            title: None,
+                            description: None,
+                            tool_call_id: None,
+                            questions: Vec::new(),
+                            requested_at: crate::time::Timestamp::now(),
+                            resolved: None,
+                        },
+                    }),
+                    Some(Event::ElicitationResolved {
+                        nonce,
+                        outcome: crate::acp::elicitations::ElicitationOutcome::Declined,
+                        answers: Vec::new(),
+                    }),
+                )
+            }
+            _ => (None, None),
+        };
+        if !late {
+            if let Some(event) = requested.take() {
+                inject(event);
+            }
+        }
+        if follows {
+            inject(Event::PromptRuntimeError {
+                message: "first request failed".into(),
+                evidence: None,
+            });
+        }
+        if reason == "startup_error" {
+            state
+                .acp_supervisor
+                .publish_startup_error(&id, "transport closed".into());
+        } else {
+            state
+                .acp_supervisor
+                .synthesize_stopped_for_orphan(&id, reason);
+        }
+        if let Some(event) = requested.take() {
+            inject(event);
+        }
+        if let Some(event) = resolved {
+            state.instances.write().await[0].status = crate::session::Status::Error;
+            let control = state.session_service.fold_control_state(&id).await;
+            assert!(
+                !control.accepts_queue_drain(),
+                "{interaction:?}, late={late}"
+            );
+            assert_eq!(
+                control.pending_approvals.len() + control.pending_elicitations.len(),
+                1
+            );
+            state.session_service.drain_queued_prompts_once(&id).await;
+            state.acp_supervisor.test_flush_worker_commands(&id).await;
+            assert_eq!(commands.lock().unwrap().len(), 1);
+            assert_eq!(
+                state
+                    .session_service
+                    .queued_prompts_snapshot(&id)
+                    .await
+                    .len(),
+                1
+            );
+            inject(event);
+        }
+        let control = state.session_service.fold_control_state(&id).await;
+        assert!(!control.turn_active);
+        assert_eq!(control.sidebar_status(), crate::session::Status::Error);
+        if follows {
+            assert_eq!(
+                control.sidebar_phase,
+                crate::acp::state::SidebarPhase::PromptFailed
+            );
+            assert!(
+                control.pending_approvals.is_empty() && control.pending_elicitations.is_empty()
+            );
+        }
+        state.instances.write().await[0].status = crate::session::Status::Error;
+        state.session_service.drain_queued_prompts_once(&id).await;
+        state.acp_supervisor.test_flush_worker_commands(&id).await;
+        assert_eq!(
+            commands.lock().unwrap().len(),
+            if follows { 2 } else { 1 },
+            "{reason}"
+        );
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            usize::from(!follows),
+            "{reason}"
+        );
+        let prompts: Vec<_> = state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                Event::UserPromptSent {
+                    text, synthesized, ..
+                } => {
+                    assert!(!synthesized, "failed work is not redelivered");
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            prompts,
+            if follows {
+                vec!["first explicit request", "second explicit request"]
+            } else {
+                vec!["first explicit request"]
+            }
+        );
+    }
+}
 /// #5401: a queue drain publishes the first row's id as `prompt_id` and the
 /// rest as `merged_prompt_ids`, so the web client settles every optimistic row.
 #[tokio::test]

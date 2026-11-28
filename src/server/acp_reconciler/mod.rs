@@ -640,7 +640,9 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
                 !i.queued_prompts.is_empty()
                     && matches!(
                         i.status,
-                        crate::session::Status::Idle | crate::session::Status::Running
+                        crate::session::Status::Idle
+                            | crate::session::Status::Running
+                            | crate::session::Status::Error
                     )
                     && is_untriaged_structured(i)
             })

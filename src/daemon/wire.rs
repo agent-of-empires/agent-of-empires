@@ -1235,6 +1235,8 @@ pub struct SessionResponse {
     /// `last_accessed_at` but leaves `idle_entered_at` alone.
     pub idle_entered_at: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_evidence: Option<crate::session::OperationErrorEvidence>,
     /// Why the initial prompt was not typed into a terminal session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt_error: Option<String>,
