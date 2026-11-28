@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { fetchAcpAgents, fetchContextPrimer, switchAcpAgent, type AcpAgentInfo } from "../../lib/api";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
-import { effectiveLifecycle } from "../../lib/agentProfiles";
 import { CancelButton, ConfirmButton, Dialog } from "../Dialog";
 import { CHOICE, CHOICE_SELECTED } from "../../lib/surfaces";
 
@@ -211,7 +210,7 @@ export function SwitchAgentModal({
                             {rateLimited ? "current · limit reached" : "(current)"}
                           </span>
                         )}
-                        {effectiveLifecycle(a, a.name).state === "deprecated" && (
+                        {a.lifecycle?.state === "deprecated" && (
                           <span
                             className="ml-2 text-xs text-status-warning"
                             data-testid={`switch-agent-deprecated-${a.name}`}

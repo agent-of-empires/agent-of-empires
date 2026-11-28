@@ -1,5 +1,5 @@
 import type { AgentInfo } from "../../../lib/types";
-import { effectiveLifecycle, type AgentLifecycleInfo } from "../../../lib/agentProfiles";
+import type { AgentLifecycleInfo } from "../../../lib/types";
 import type { WizardData } from "../wizardReducer";
 import { hasFinePointer } from "../../../lib/platform";
 import { CHOICE, CHOICE_SELECTED } from "../../../lib/surfaces";
@@ -19,12 +19,10 @@ function lifecycleWarningText(name: string, lifecycle: Extract<AgentLifecycleInf
 /** The always-visible agent picker grid; the structured-view choice lives in `AgentOptions`. */
 export function AgentPickerEssentials({ data, onChange, agents }: Props) {
   const selectableAgents = agents.filter((agent) => agent.kind === "custom" || agent.installed);
-  // The daemon's /api/agents lifecycle wins; the static profile mirror
-  // covers older daemons and keys the server does not list.
   const selected = agents.find((agent) => agent.name === data.tool);
-  const selectedLifecycle = effectiveLifecycle(selected, selected?.name);
+  const selectedLifecycle = selected?.lifecycle;
   const selectedDeprecated =
-    selected && selectedLifecycle.state === "deprecated"
+    selected && selectedLifecycle?.state === "deprecated"
       ? lifecycleWarningText(selected.name, selectedLifecycle)
       : null;
 
@@ -65,7 +63,7 @@ export function AgentPickerEssentials({ data, onChange, agents }: Props) {
                   Custom
                 </span>
               )}
-              {effectiveLifecycle(agent, agent.name).state === "deprecated" && (
+              {agent.lifecycle?.state === "deprecated" && (
                 <span
                   className="rounded-full px-1.5 py-px text-[10px] uppercase tracking-wide bg-status-warning/15 text-status-warning"
                   data-testid={`wizard-agent-deprecated-badge-${agent.name}`}

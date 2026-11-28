@@ -127,8 +127,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Admit a prompt without storing it, as `publish_user_prompt` does first.
-    pub(crate) fn test_note_admission(&self, session_id: &str) {
-        lock_recover(&self.lifecycle).note_admission(session_id);
+    pub(crate) fn test_note_admission(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::acp::runner_lifecycle::AdmissionGuard> {
+        lock_recover(&self.lifecycle).note_admission(session_id)
     }
 
     /// Occupy a slot with a fake worker already carrying what a real drain

@@ -543,62 +543,87 @@ async fn spawn_fake_connection_inner(
 
 /// A limit that ends an agent-initiated turn must end the connection, or the
 /// drain loop never drops the worker and the reaper skips it as still running
-/// (#4373).
+/// (#4373). The limit is a rejected window, or only the agent's text (#5990).
 #[tokio::test]
 async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
-    let mut fake = spawn_fake_connection("s-limit", |_| Vec::new()).await;
-
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !matches!(
-            fake.event_rx.recv().await.expect("connection remains open"),
-            Event::AcpSessionAssigned { .. }
-        ) {}
-    })
-    .await
-    .expect("session commits");
-
-    // Accounting for a turn nobody prompted, carrying a rejected window.
     let resets_at = crate::time::Timestamp::now().as_unix_secs() + 3600;
-    write_line(
-        &fake.agent_write,
-        &format!(
-            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-limit","update":{{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{{"amount":0.1,"currency":"USD"}},"_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}}}}}}}"#
+    let usage = |meta: &str| {
+        format!(
+            r#"{{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{{"amount":0.1,"currency":"USD"}}{meta}}}"#
+        )
+    };
+    let limit_text = r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"You've hit your 5-hour limit · resets 10pm (America/New_York)"}}"#;
+    // (name, updates, expected RateLimit resets_at and kind)
+    let cases = [
+        (
+            "rejected window",
+            vec![usage(&format!(
+                r#","_meta":{{"_claude/rateLimit":{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{resets_at}}}}}"#
+            ))],
+            Some(resets_at),
+            "five_hour",
         ),
-    )
-    .await;
-
-    // The idle grace is wall-clock, so the deadline covers it with margin.
-    let mut seen = Vec::new();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while let Some(event) = fake.event_rx.recv().await {
-            seen.push(event);
-        }
-    })
-    .await
-    .expect("the connection must end after parking, closing the event channel");
-    tokio::time::timeout(Duration::from_secs(10), fake.connection)
+        (
+            "limit text only",
+            vec![limit_text.to_string(), usage("")],
+            None,
+            "rate_limit",
+        ),
+    ];
+    for (name, updates, want_reset, want_kind) in cases {
+        let mut fake = spawn_fake_connection("s-limit", |_| Vec::new()).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                fake.event_rx.recv().await.expect("connection remains open"),
+                Event::AcpSessionAssigned { .. }
+            ) {}
+        })
         .await
-        .expect("connection task ends")
-        .expect("connection task does not panic");
+        .expect("session commits");
 
-    let limit = seen.iter().position(|e| {
-        matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.as_unix_secs()) == Some(resets_at))
-    });
-    let stopped = seen
-        .iter()
-        .position(|e| matches!(e, Event::Stopped { reason } if reason == "rate_limited"));
-    assert!(
-        limit.is_some() && limit < stopped,
-        "RateLimit then Stopped(rate_limited) expected: {seen:?}"
-    );
-    // The rejected window travels on the event, so a later report for another window of the
-    // same account cannot replace this deadline in the account table.
-    assert!(
-        matches!(&seen[limit.unwrap()], Event::RateLimit { info } if info.kind == "five_hour"),
-        "the event names its window: {seen:?}"
-    );
-    fake.agent.abort();
-    let _ = fake.agent.await;
+        for update in updates {
+            write_line(
+                &fake.agent_write,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-limit","update":{update}}}}}"#
+                ),
+            )
+            .await;
+        }
+
+        // The idle grace is wall-clock, so the deadline covers it with margin.
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(event) = fake.event_rx.recv().await {
+                seen.push(event);
+            }
+        })
+        .await
+        .expect("the connection must end after parking, closing the event channel");
+        tokio::time::timeout(Duration::from_secs(10), fake.connection)
+            .await
+            .expect("connection task ends")
+            .expect("connection task does not panic");
+
+        let limit = seen.iter().position(|e| {
+            matches!(e, Event::RateLimit { info } if info.resets_at.map(|t| t.as_unix_secs()) == want_reset)
+        });
+        let stopped = seen
+            .iter()
+            .position(|e| matches!(e, Event::Stopped { reason } if reason == "rate_limited"));
+        assert!(
+            limit.is_some() && limit < stopped,
+            "{name}: RateLimit then Stopped(rate_limited) expected: {seen:?}"
+        );
+        // The rejected window travels on the event, so a later report for another window of the
+        // same account cannot replace this deadline in the account table.
+        assert!(
+            matches!(&seen[limit.unwrap()], Event::RateLimit { info } if info.kind == want_kind),
+            "{name}: the event names its window: {seen:?}"
+        );
+        fake.agent.abort();
+        let _ = fake.agent.await;
+    }
 }
 
 /// A message typed in another Remote Control client arrives as a live

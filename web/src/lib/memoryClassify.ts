@@ -1,7 +1,8 @@
-// Recognise Claude memory file ops (`~/.claude/projects/<slug>/memory/*.md`) by path, for the MemoryCard.
+// Recognise an agent's memory file ops by the profile's `memory_path_regex`, for the MemoryCard.
 
 import { parseJsonObject, pickFirst, pickStr } from "./acpArgs";
 import type { ToolCall } from "./acpTypes";
+import type { AgentProfile } from "./agentProfile";
 
 export type MemoryVerb = "recalled" | "saved" | "updated";
 
@@ -18,10 +19,25 @@ export interface NotMemory {
   isMemory: false;
 }
 
-/** Requires the full memory directory segment and a `.md` extension. */
-export function isMemoryPath(path: string): boolean {
-  if (!path.endsWith(".md")) return false;
-  return /\/\.claude\/projects\/[^/]+\/memory\//.test(path);
+// Compiled once per profile object; null for no regex or an invalid one.
+const compiled = new WeakMap<AgentProfile, RegExp | null>();
+
+function memoryRegex(profile: AgentProfile): RegExp | null {
+  if (compiled.has(profile)) return compiled.get(profile)!;
+  let re: RegExp | null = null;
+  if (profile.memory_path_regex) {
+    try {
+      re = new RegExp(profile.memory_path_regex);
+    } catch {
+      // An invalid regex means no memory files.
+    }
+  }
+  compiled.set(profile, re);
+  return re;
+}
+
+export function isMemoryPath(path: string, profile: AgentProfile): boolean {
+  return memoryRegex(profile)?.test(path) ?? false;
 }
 
 function basenameOf(path: string): string {
@@ -39,11 +55,11 @@ function verbFor(tool: ToolCall): MemoryVerb | null {
   return null;
 }
 
-export function classifyMemory(tool: ToolCall): MemoryHit | NotMemory {
+export function classifyMemory(tool: ToolCall, profile: AgentProfile): MemoryHit | NotMemory {
   const args = parseJsonObject(tool.args_preview);
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const path = pickFirst(argPath);
-  if (!path || !isMemoryPath(path)) return { isMemory: false };
+  if (!path || !isMemoryPath(path, profile)) return { isMemory: false };
   const verb = verbFor(tool);
   if (!verb) return { isMemory: false };
   const basename = basenameOf(path);

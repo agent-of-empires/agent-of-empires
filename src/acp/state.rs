@@ -149,6 +149,56 @@ impl RateLimitInfo {
             kind: "rate_limit".into(),
         }
     }
+
+    /// The limit an agent-initiated turn reports only as message text, such as
+    /// `You've hit your 5-hour limit · resets 10pm (America/New_York)` (#5990).
+    /// Only a provider quota window or Claude's own notice matches, so a
+    /// context limit or a negated notice never parks. The text is kept
+    /// verbatim as the status; no reset time is read from it.
+    /// Longer text is never a limit sentence.
+    pub const AGENT_TEXT_MAX_CHARS: usize = 200;
+
+    pub fn from_agent_text(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty()
+            || text.contains('\n')
+            || text.chars().count() > Self::AGENT_TEXT_MAX_CHARS
+        {
+            return None;
+        }
+        let lower = text.to_lowercase().replace('\u{2019}', "'");
+        let clause = lower
+            .split(['·', '∙', '|'])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        const WINDOWS: [&str; 8] = [
+            "5-hour",
+            "five-hour",
+            "session",
+            "daily",
+            "weekly",
+            "monthly",
+            "usage",
+            "opus",
+        ];
+        let named_window = clause
+            .strip_prefix("you've hit your")
+            .and_then(|rest| rest.strip_suffix("limit"))
+            .is_some_and(|name| name.split_whitespace().all(|word| WINDOWS.contains(&word)));
+        let matched = named_window
+            || matches!(
+                clause,
+                "usage limit reached"
+                    | "claude usage limit reached"
+                    | "claude ai usage limit reached"
+            );
+        matched.then(|| Self {
+            status: text.to_string(),
+            resets_at: None,
+            kind: "rate_limit".into(),
+        })
+    }
 }
 
 /// A live advisory the agent pushed outside the turn flow (approaching a rate
@@ -1742,6 +1792,37 @@ mod tests {
             s.apply_event(s.last_seq.saturating_add(1), event).unwrap();
         }
         s
+    }
+
+    #[test]
+    fn usage_limit_is_read_only_from_a_lone_limit_sentence() {
+        let cases = [
+            (
+                "You've hit your 5-hour limit · resets 10pm (America/New_York) · out of usage credits",
+                true,
+            ),
+            ("You\u{2019}ve hit your weekly limit ∙ resets Nov 18, 12am", true),
+            ("  You've hit your limit · resets 3pm\n", true),
+            ("You've hit your weekly Opus limit · resets Mon", true),
+            ("Context limit reached", false),
+            ("You've hit your context limit", false),
+            ("You've hit your token limit · try a shorter prompt", false),
+            ("No usage limit reached", false),
+            ("Claude AI usage limit not reached", false),
+            ("Claude AI usage limit reached|1700000000", true),
+            ("You've hit your limit on retries; trying another approach.", false),
+            ("I fixed the rate limit handling.", false),
+            ("You've hit your limit · resets 3pm\n\nThen the build passed.", false),
+            ("", false),
+        ];
+        for (text, limited) in cases {
+            let info = RateLimitInfo::from_agent_text(text);
+            assert_eq!(info.is_some(), limited, "{text:?}");
+            if let Some(info) = info {
+                assert_eq!(info.status, text.trim());
+                assert_eq!(info.resets_at, None);
+            }
+        }
     }
 
     /// The sidebar projection over event sequences, including the ones the old

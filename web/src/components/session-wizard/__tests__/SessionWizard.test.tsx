@@ -81,7 +81,9 @@ const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 beforeEach(() => {
   vi.clearAllMocks();
   // clearAllMocks keeps queued answers, and a test can leave some unread.
-  vi.mocked(fetchProfileAgents).mockReset().mockResolvedValue([]);
+  vi.mocked(fetchProfileAgents)
+    .mockReset()
+    .mockResolvedValue([agent("claude")]);
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
   reviewCreationTrust.mockResolvedValue({
@@ -202,6 +204,10 @@ describe("SessionWizard structured view payload", () => {
     [true, "terminal"],
   ])("opting out=%s sends view %s", async (optOut, view) => {
     renderWizard();
+    // Structured is only offered once the Daemon has reported the agent as ACP-capable.
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "Structured view" })).toHaveProperty("disabled", false),
+    );
     if (optOut) fireEvent.click(screen.getByRole("radio", { name: "Terminal view" }));
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
@@ -245,6 +251,7 @@ describe("SessionWizard structured view payload", () => {
       acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
       sandbox: {},
     } as never);
+    vi.mocked(fetchProfileAgents).mockResolvedValue([agent("opencode")]);
     renderWizard({ path: "/tmp/proj" });
     // The Agent row names opencode once the defaults have applied.
     await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("opencode"));
@@ -278,6 +285,16 @@ describe("SessionWizard structured view payload", () => {
     expect(payload().tool).toBe("claude");
     expect(payload().agent_model).toBeUndefined();
     expect(payload().agent_effort).toBeUndefined();
+  });
+});
+
+describe("SessionWizard last tool memory", () => {
+  it("falls back to claude when the stored tool is not an available agent", async () => {
+    localStorage.setItem("aoe-acp-last-tool", "ghost");
+    renderWizard({ path: "/tmp/proj" });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().tool).toBe("claude");
   });
 });
 
