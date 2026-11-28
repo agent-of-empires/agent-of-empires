@@ -322,7 +322,7 @@ impl AgentRegistry {
 
     /// What a spawn of `name` runs. A built-in row wins, then the user's `agent_acp_cmd` and
     /// `agent_detect_as` base, then a plugin row, so a plugin never shadows a name the user
-    /// configured. Only a row addressed by its own name brings its proxy.
+    /// configured. A plugin row brings its proxy, also when inherited as a base.
     pub fn resolve_spec(
         &self,
         name: &str,
@@ -345,14 +345,8 @@ impl AgentRegistry {
                 })
             });
         }
-        if let Some(spec) = self
-            .inherited_base(name, &session.agent_detect_as)
-            .and_then(|base| self.get(&base))
-        {
-            return Ok(Some(from_registry(spec, None)));
-        }
         Ok(self
-            .resolved(name)
+            .launched_row(name, session)
             .map(|agent| from_registry(&agent.spec, agent.proxy.as_ref())))
     }
 
@@ -795,7 +789,11 @@ mod tests {
                 ("zzzeta".to_string(), "my-zzzeta".to_string()),
             ]
             .into(),
-            agent_detect_as: [("mine".to_string(), "claude".to_string())].into(),
+            agent_detect_as: [
+                ("mine".to_string(), "claude".to_string()),
+                ("wrapper".to_string(), "zeta-acp".to_string()),
+            ]
+            .into(),
             ..Default::default()
         };
         let acp = crate::session::config::AcpConfig::default();
@@ -824,6 +822,7 @@ mod tests {
         for (name, command, from_registry, proxied) in [
             ("zeta-cli", "my-zeta", false, false),
             ("mine", "claude-agent-acp", true, false),
+            ("wrapper", "zzzeta", true, true),
             ("zeta-acp", "zzzeta", true, true),
             ("zzmine", "zzmine", true, true),
             ("claude", "claude-agent-acp", true, false),
