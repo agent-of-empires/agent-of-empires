@@ -1441,7 +1441,14 @@ fn agent_display_name(instance: &crate::session::Instance) -> Option<String> {
         &instance.tool,
         &instance.detect_as,
     );
-    crate::agents::labels_for(&tool).map(|(name, _)| name)
+    let alias = crate::tmux::status_rules::effective_detect_as(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    crate::agents::labels_for(&tool)
+        .or_else(|| crate::agents::labels_for(&alias))
+        .map(|(name, _)| name)
 }
 
 #[cfg(test)]
@@ -1479,6 +1486,31 @@ mod tests {
         assert_eq!(agent_display_name(&wrapper).as_deref(), Some("Codex"));
         wrapper.tool = "unknown-wrapper".to_string();
         assert_eq!(agent_display_name(&wrapper), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wrapper_with_own_status_rules_keeps_its_base_agent_label() {
+        const PROFILE: &str = "push-title-rules";
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let mut config = crate::session::Config::default();
+        config
+            .agents
+            .entry("work-claude".to_string())
+            .or_default()
+            .status_rules = vec![crate::session::config::StatusRule {
+            status: crate::agents::HookStatus::Waiting,
+            contains: Some("approve?".to_string()),
+            regex: None,
+        }];
+        crate::tmux::status_rules::install_from_config(PROFILE, &config);
+
+        let mut wrapper = crate::session::Instance::new("w", "/tmp/push-title-rules");
+        wrapper.source_profile = PROFILE.to_string();
+        wrapper.tool = "work-claude".to_string();
+        wrapper.detect_as = "claude".to_string();
+        let claude = crate::agents::labels_for("claude").unwrap().0;
+        assert_eq!(agent_display_name(&wrapper), Some(claude));
     }
 
     #[test]
