@@ -327,32 +327,21 @@ jobs:
           echo ""
           echo "=== All evaluations passed ==="
 
-  nix-build:
-    name: Nix Build
+  nix-changes:
+    # Decides on a 1 vCPU runner whether the 8 vCPU Nix builds below need to
+    # boot at all; most runs touch no flake file.
+    name: Nix Changes
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
-    timeout-minutes: 45
-    # Builds the default (aoe) crate through crane. Nix Eval only evaluates
-    # derivations, so a flake recipe that compiles nowhere (a bad source filter,
-    # a missing buildInput) passes it but fails here.
-    #
-    # Gated to the flake recipe itself, and deliberately NOT to `src/**`. This is
-    # a ~20 minute compile with no binary cache, so firing it on every Rust PR
-    # would roughly triple the CI critical path. The one code-driven way to break
-    # the build source, adding an embedded asset the Cargo filter drops (#3204),
-    # is covered on every PR by the seconds-long
-    # `scripts/check-nix-embedded-assets.py` step in Nix Eval. Post-merge,
-    # cachix-push.yml builds a Rust package on every push to main matching
-    # `src/**`, `Cargo.*`, the build scripts or an embedded-asset directory
-    # (see its `paths:` list), so wider breakage still surfaces there.
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-changes-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.changes.outputs.build }}
+      web: ${{ steps.changes.outputs.web }}
     steps:
-      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
-      - uses: runs-on/action@v2.6.0
       - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-
       - name: Detect relevant changes
         id: changes
         env:
@@ -375,30 +364,55 @@ jobs:
               BASE="$EVENT_BEFORE"
             fi
           fi
-          # Only the flake recipe: `flake.nix` carries the source filter, the
-          # buildInputs and the package definitions, and `flake.lock` pins
-          # nixpkgs and crane. A change to either can break the build in a way
-          # evaluation cannot see, and neither is touched by an ordinary PR.
-          # A git failure here would leave the pipeline non-zero and skip the
-          # build, so keep the diff simple enough that it cannot fail.
-          if git diff --name-only "$BASE"...HEAD \
-            | grep -E '^(flake\.nix|flake\.lock)$' \
-            >/dev/null; then
-            echo "relevant=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "relevant=false" >> "$GITHUB_OUTPUT"
-          fi
+          # A git failure fails this job, which makes the builds run.
+          files=$(git diff --name-only "$BASE"...HEAD)
+          changed() {
+            if grep -qE "$1" <<<"$files"; then
+              echo true
+            else
+              echo false
+            fi
+          }
+          # `flake.nix` carries the source filter, buildInputs and package
+          # definitions; `flake.lock` pins nixpkgs and crane. Either can break
+          # the build in a way evaluation cannot see.
+          echo "build=$(changed '^(flake\.nix|flake\.lock)$')" >> "$GITHUB_OUTPUT"
+          echo "web=$(changed '^(web/package-lock\.json|flake\.nix|flake\.lock)$')" >> "$GITHUB_OUTPUT"
 
+  nix-build:
+    name: Nix Build
+    needs: nix-changes
+    # Runs if the gate did not succeed, so a broken gate cannot pass this check.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.nix-changes.result != 'success' || needs.nix-changes.outputs.build == 'true') }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
+    timeout-minutes: 45
+    # Builds the default (aoe) crate through crane. Nix Eval only evaluates
+    # derivations, so a flake recipe that compiles nowhere (a bad source filter,
+    # a missing buildInput) passes it but fails here.
+    #
+    # Gated to the flake recipe itself, and deliberately NOT to `src/**`. This is
+    # a ~20 minute compile with no binary cache, so firing it on every Rust PR
+    # would roughly triple the CI critical path. The one code-driven way to break
+    # the build source, adding an embedded asset the Cargo filter drops (#3204),
+    # is covered on every PR by the seconds-long
+    # `scripts/check-nix-embedded-assets.py` step in Nix Eval. Post-merge,
+    # cachix-push.yml builds a Rust package on every push to main matching
+    # `src/**`, `Cargo.*`, the build scripts or an embedded-asset directory
+    # (see its `paths:` list), so wider breakage still surfaces there.
+    steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@v2.6.0
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - uses: $/.github/actions/install-nix
-        if: steps.changes.outputs.relevant == 'true'
-
       - name: Build default package
-        if: steps.changes.outputs.relevant == 'true'
         run: nix build --no-link --print-out-paths -L .#packages.x86_64-linux.default
 
   nix-build-web:
     name: Nix Build Web
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
+    needs: nix-changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.nix-changes.result != 'success' || needs.nix-changes.outputs.web == 'true') }}
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-web-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 30
     # Catches npmDepsHash desync at PR time even if the nix-npm-hash bot
@@ -408,46 +422,9 @@ jobs:
       - uses: runs-on/action@v2.6.0
       - uses: actions/checkout@v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
-
-      - name: Detect relevant changes
-        id: changes
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-          EVENT_BEFORE: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            BASE="origin/$BASE_REF"
-          elif [ "$EVENT_NAME" = "merge_group" ]; then
-            BASE="$QUEUE_BASE_SHA"
-          else
-            # `github.event.before` is the SHA before the push, which
-            # covers multi-commit pushes correctly. Falls back to the
-            # empty tree on the initial-push edge case (`before` is all
-            # zeros, no `HEAD~1` exists yet) so the diff still resolves.
-            if [ -z "$EVENT_BEFORE" ] || [ "$EVENT_BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              BASE=$(git hash-object -t tree /dev/null)
-            else
-              BASE="$EVENT_BEFORE"
-            fi
-          fi
-          if git diff --name-only "$BASE"...HEAD \
-            | grep -E '^(web/package-lock\.json|flake\.nix|flake\.lock)$' \
-            >/dev/null; then
-            echo "relevant=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "relevant=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: $/.github/actions/install-nix
-        if: steps.changes.outputs.relevant == 'true'
-
       - name: Build aoe-web-frontend
-        if: steps.changes.outputs.relevant == 'true'
         # Builds only the npm + vite frontend (validates npmDepsHash
         # as a side effect). Skips the full Rust crate so this job
         # runs in 1-2 min instead of 20-30 min; Cargo Test + Nix Eval
