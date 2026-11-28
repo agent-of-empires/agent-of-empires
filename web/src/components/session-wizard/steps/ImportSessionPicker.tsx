@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState, type Ref } from "react";
 import { listImportableSessions, type ImportableSessionsResult } from "../../../lib/api";
 import { safeGetItem, safeSetItem } from "../../../lib/safeStorage";
 import type { ImportableSession } from "../../../lib/types";
+import { INPUT } from "../../../lib/surfaces";
+import { CHOICE, CHOICE_SELECTED } from "../../../lib/surfaces";
 
 const IMPORT_AGENT_KEY = "aoe.importAgent";
 /** Activity this recent may mean the session is still open in another terminal. */
@@ -92,7 +94,7 @@ export function ImportSessionPicker({
         value={agent}
         onChange={(e) => pickAgent(e.target.value)}
         aria-label="Agent to import from"
-        className="w-full rounded-md border border-surface-700 bg-surface-900 px-3 py-2 text-sm focus-visible:outline-2 focus-visible:outline-brand-600"
+        className={INPUT}
       >
         {agents.map((name) => (
           <option key={name} value={name}>
@@ -172,7 +174,7 @@ function SessionList({
         onChange={(e) => onFilterChange(e.target.value)}
         placeholder="Filter by title or path"
         aria-label="Filter sessions"
-        className="w-full rounded-md border border-surface-700 bg-surface-900 px-3 py-2 text-sm focus-visible:outline-2 focus-visible:outline-brand-600"
+        className={INPUT}
       />
       {hasMissing && (
         <label className="flex items-center gap-2 text-xs text-content-subtle">
@@ -198,15 +200,11 @@ function SessionList({
                 aria-pressed={selected}
                 onClick={() => onChoose(s)}
                 title={s.cwd_exists ? s.cwd : `${s.cwd} (directory no longer exists)`}
-                className={`flex w-full flex-col items-start gap-0.5 rounded-md border px-3 py-2 text-left transition-colors ${
-                  selected ? "border-brand-500 bg-surface-800 ring-1 ring-brand-500" : "border-surface-700"
-                } ${
-                  s.cwd_exists
-                    ? "cursor-pointer hover:border-brand-600 hover:bg-surface-800"
-                    : "cursor-not-allowed opacity-50"
+                className={`${selected ? CHOICE_SELECTED : CHOICE} flex flex-col items-start gap-0.5 ${
+                  s.cwd_exists ? "cursor-pointer" : "cursor-not-allowed opacity-50"
                 }`}
               >
-                <span className="line-clamp-1 text-sm font-medium">
+                <span className="line-clamp-1 text-[15px] md:text-sm font-medium">
                   {s.title || <span className="italic text-content-subtle">(no prompt yet)</span>}
                 </span>
                 <span className="line-clamp-1 text-xs text-content-subtle">{s.cwd}</span>

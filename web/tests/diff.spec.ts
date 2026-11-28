@@ -57,7 +57,8 @@ test.describe("Diff rendering (@pierre/diffs)", () => {
   // while still reporting healthy, leaving the pane blank until a full reload.
   test("still renders the diff when the highlighter worker fails to load", async ({ page }) => {
     await setupDiffSession(page, { files: EXAMPLE_FILES, contents: EXAMPLE_CONTENTS });
-    await page.route("**/assets/worker-*.js", (r) => r.abort());
+    // The service worker fetches hashed assets itself, so only the context sees that request.
+    await page.context().route("**/assets/worker-*.js", (r) => r.abort());
     await openDiffSession(page);
     await openDiffFile(page, "example.ts");
 

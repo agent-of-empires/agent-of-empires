@@ -174,8 +174,8 @@ pub(crate) use types::{
 // Sibling items the submodules reach through `use super::*`.
 use hooks::host_launch_env_prefix;
 pub(crate) use hooks::{
-    host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
-    host_hook_post_install_notes,
+    host_hook_agent, host_hook_declared_agent, host_hook_disclosure,
+    host_hook_disclosure_config_with_repo, host_hook_post_install_notes, HostHookDisclosure,
 };
 use launch_command::{
     append_resume_flags, build_fork_flags, parse_launch_command, shell_stdin_command,
@@ -252,7 +252,7 @@ pub struct PendingInitialTurn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Stable machine-readable form of `error`, for the causes a client can act
-    /// on (`agent_folder_not_trusted`, `agent_bypass_not_accepted`).
+    /// on (`agent_folder_not_trusted`, `agent_bypass_not_accepted`, `input_line_busy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     /// Identifies this turn across reloads, so state kept for one turn never

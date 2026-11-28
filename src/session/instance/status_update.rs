@@ -15,6 +15,24 @@ fn detection_content<'a>(
     fresh.or(reuse.map(|(reused, _)| reused))
 }
 
+/// One capture of `pane` for a readiness read, `lines` deep.
+fn readiness_capture(session: &tmux::Session, pane: &str, lines: usize) -> Option<String> {
+    #[cfg(test)]
+    if tmux::test_helpers::screen_capture_fails(pane) {
+        return None;
+    }
+    session.try_capture_pane_in(pane, lines).ok()
+}
+
+/// The last `height` rows of `capture`, a `capture-pane` of the scrollback and the screen below it.
+fn visible_rows(capture: &str, height: usize) -> &str {
+    let body = capture.strip_suffix('\n').unwrap_or(capture);
+    match body.rmatch_indices('\n').nth(height.saturating_sub(1)) {
+        Some((at, _)) => &capture[at + 1..],
+        None => capture,
+    }
+}
+
 /// What ended a pane, as a sentence the remedy can follow: the adapter's diagnostic when it saw
 /// one, else that the terminal ended.
 fn ended_sentence(diagnostic: Option<&str>) -> String {
@@ -642,10 +660,82 @@ impl Instance {
             .unwrap_or_else(|| session.is_pane_running_shell())
     }
 
+    /// What the agent's input box in `pane` holds, read through its detection manifest. A pane
+    /// that cannot be captured, or an agent with no `[input_line]` table, is `Unknown`.
+    pub(crate) fn input_line_in(&self, session: &tmux::Session, pane: &str) -> tmux::InputLine {
+        let tool = self.input_line_tool();
+        if !tmux::detect::has_input_line(&tool) {
+            return tmux::InputLine::Unknown;
+        }
+        let Ok(capture) = session.try_capture_pane_in(pane, 0) else {
+            return tmux::InputLine::Unknown;
+        };
+        #[cfg(test)]
+        tmux::test_helpers::after_input_captured(pane);
+        tmux::detect::input_line(&tool, &capture)
+    }
+
+    /// What the input box in `capture`, a coloured capture of the agent's pane, holds.
+    pub(crate) fn input_line_of(&self, capture: &str) -> tmux::InputLine {
+        tmux::detect::input_line(&self.input_line_tool(), capture)
+    }
+
+    fn input_line_tool(&self) -> std::borrow::Cow<'_, str> {
+        let alias = tmux::status_rules::effective_detect_as(
+            &self.source_profile,
+            &self.tool,
+            &self.detect_as,
+        );
+        if alias.is_empty() {
+            std::borrow::Cow::Borrowed(&self.tool)
+        } else {
+            alias
+        }
+    }
+
+    /// Polls [`Self::input_line_in`] until the box reads empty. A first read that is `Empty` or
+    /// `Unknown` passes at once, as for an agent with no input-line rule. Once a draft is seen,
+    /// only an empty read that completes before `budget` runs out passes: an unreadable pane
+    /// proves nothing.
+    pub(crate) fn wait_for_input_line(
+        &self,
+        session: &tmux::Session,
+        pane: &str,
+        budget: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        #[cfg(test)]
+        tmux::test_helpers::record_input_wait_deadline(pane, deadline);
+        let mut drafted = false;
+        loop {
+            match self.input_line_in(session, pane) {
+                tmux::InputLine::Empty => return !drafted || std::time::Instant::now() < deadline,
+                tmux::InputLine::Unknown if !drafted => return true,
+                tmux::InputLine::Unknown => {}
+                tmux::InputLine::Draft => {
+                    #[cfg(test)]
+                    if !drafted {
+                        tmux::test_helpers::observe_draft(pane);
+                    }
+                    drafted = true;
+                }
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            std::thread::sleep(left.min(std::time::Duration::from_millis(200)));
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
     /// A status read of this session's pane taken now, through its detection manifest, for
     /// callers outside the poller (`aoe session show`, MCP). `None` when the agent has no
     /// manifest. `reuse` is a capture the caller already took and how many lines it holds; it is
-    /// used when it covers the manifest's scope. Returns the detected status (`None` for an
+    /// used when it covers the manifest's scope. A fresh capture reads `pane` when given, else the
+    /// session's live pane. Returns the detected status (`None` for an
     /// agent-owned viewer, or for a failed capture with nothing to reuse) and the rule that
     /// decided it.
     pub(crate) fn detect_pane_now(
@@ -653,9 +743,13 @@ impl Instance {
         profile: &str,
         session: &tmux::Session,
         reuse: Option<(&str, usize)>,
+        pane: Option<&str>,
     ) -> Option<(Option<Status>, &'static str)> {
-        if let Some((status, reported)) =
-            crate::plugin::agent_integration::owned_status(self, session.is_pane_dead())
+        let dead = match pane {
+            Some(pane) => tmux::utils::is_pane_dead_at(pane),
+            None => session.is_pane_dead(),
+        };
+        if let Some((status, reported)) = crate::plugin::agent_integration::owned_status(self, dead)
         {
             let rule = if reported {
                 crate::plugin::agent_integration::OWNED_RULE
@@ -671,7 +765,11 @@ impl Instance {
         let policy = plan.capture_policy();
         let fresh = match reuse {
             Some((_, lines)) if policy.scope.can_reuse(lines) => None,
-            _ => session.try_capture_pane(policy.scope.lines()).ok(),
+            _ => match pane {
+                Some(pane) => session.try_capture_pane_in(pane, policy.scope.lines()),
+                None => session.try_capture_pane(policy.scope.lines()),
+            }
+            .ok(),
         };
         let Some(content) = detection_content(fresh.as_deref(), reuse) else {
             return Some((None, CAPTURE_FAILED_RULE));
@@ -681,9 +779,12 @@ impl Instance {
                 status,
                 age: crate::hooks::read_hook_status_age(&self.id),
             });
-        let title = tmux::utils::pane_title(session.name()).unwrap_or_default();
-        let owned = !policy.observe_ownership
-            || self.live_pane_owned(session, None, session.is_pane_dead());
+        let title = match pane {
+            Some(pane) => tmux::utils::pane_title_at(pane),
+            None => tmux::utils::pane_title(session.name()),
+        }
+        .unwrap_or_default();
+        let owned = !policy.observe_ownership || self.live_pane_owned(session, None, pane, dead);
         let observation = tmux::Observation::new(&title, hook, owned);
         let clean = tmux::utils::strip_ansi(content);
         let detection = plan.detect(&clean, &observation);
@@ -710,10 +811,62 @@ impl Instance {
         )
     }
 
+    /// [`Self::detect_pane_now`] of `pane` and what its input box holds, both from one capture,
+    /// so a frame change can't pair one screen's status with another's box. A failed capture is
+    /// retried once, and both are read from the one that succeeds. The box is read from the
+    /// capture's visible rows, as [`Self::input_line_in`] reads it: one left in the scrollback is
+    /// no box.
+    pub(crate) fn detect_pane_and_input_line_now(
+        &self,
+        profile: &str,
+        session: &tmux::Session,
+        pane: &str,
+    ) -> (Option<(Option<Status>, &'static str)>, tmux::InputLine) {
+        let alias = tmux::status_rules::effective_detect_as(profile, &self.tool, &self.detect_as);
+        let manifest_tool: &str = if alias.is_empty() { &self.tool } else { &alias };
+        let rules_tool = tmux::status_rules::detection_tool(profile, &self.tool, &self.detect_as);
+        let plan = tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool);
+        let lines = plan
+            .as_ref()
+            .map_or(0, |plan| plan.capture_policy().scope.lines());
+        let Some(capture) = (0..2).find_map(|_| readiness_capture(session, pane, lines)) else {
+            // Without a manifest, or with an integration owning it, the status never reads the
+            // screen, so it is decided as usual; any other status is unreadable.
+            let needs_no_screen = plan.is_none()
+                || crate::plugin::agent_integration::owned_status(
+                    self,
+                    tmux::utils::is_pane_dead_at(pane),
+                )
+                .is_some();
+            let status = if needs_no_screen {
+                self.detect_pane_now(profile, session, None, Some(pane))
+            } else {
+                Some((None, CAPTURE_FAILED_RULE))
+            };
+            return (status, tmux::InputLine::Unknown);
+        };
+        #[cfg(test)]
+        tmux::test_helpers::after_screen_captured(pane);
+        let input = if !tmux::detect::has_input_line(&self.input_line_tool()) {
+            tmux::InputLine::Unknown
+        } else if lines == 0 {
+            self.input_line_of(&capture)
+        } else {
+            tmux::utils::pane_height_at(pane).map_or(tmux::InputLine::Unknown, |height| {
+                self.input_line_of(visible_rows(&capture, height))
+            })
+        };
+        let status = self.detect_pane_now(profile, session, Some((&capture, lines)), Some(pane));
+        (status, input)
+    }
+
+    /// Whether the agent, not a shell it left, owns the session's live pane, or `pane` when
+    /// given. `metadata`, when present, is the poller's read of that pane.
     pub(crate) fn live_pane_owned(
         &self,
         session: &tmux::Session,
         metadata: Option<&tmux::PaneMetadata>,
+        pane: Option<&str>,
         is_dead: bool,
     ) -> bool {
         if is_dead {
@@ -726,7 +879,10 @@ impl Instance {
         let command = match metadata.and_then(|m| m.pane_current_command.as_deref()) {
             Some(command) => command,
             None => {
-                fetched_command = tmux::utils::pane_current_command(session.name());
+                fetched_command = match pane {
+                    Some(pane) => tmux::utils::pane_current_command_at(pane),
+                    None => tmux::utils::pane_current_command(session.name()),
+                };
                 let Some(command) = fetched_command.as_deref() else {
                     return true;
                 };
@@ -736,7 +892,10 @@ impl Instance {
         !tmux::utils::is_shell_command(command)
             || metadata
                 .map(|m| m.pane_start_command_is_protected)
-                .unwrap_or_else(|| tmux::utils::pane_start_command_is_protected(session.name()))
+                .unwrap_or_else(|| match pane {
+                    Some(pane) => tmux::utils::pane_start_command_is_protected_at(pane),
+                    None => tmux::utils::pane_start_command_is_protected(session.name()),
+                })
     }
 
     /// Resolve status from the agent's detection manifest.
@@ -772,7 +931,7 @@ impl Instance {
             None => "",
         };
         let live_owned =
-            !policy.observe_ownership || self.live_pane_owned(session, metadata, is_dead);
+            !policy.observe_ownership || self.live_pane_owned(session, metadata, None, is_dead);
         let observation = tmux::Observation::new(osc_title, hook, live_owned);
         let observation_key = plan.observation_key(&observation);
         let screen_unchanged = skip_capture(
@@ -895,6 +1054,35 @@ mod tests {
         ];
         for (fresh, reuse, want) in cases {
             assert_eq!(detection_content(fresh, reuse), want, "{fresh:?} {reuse:?}");
+        }
+    }
+
+    #[test]
+    fn the_visible_rows_are_the_captures_last() {
+        // (case, capture, height, want)
+        let cases = [
+            (
+                "history-above",
+                "old\nbox\nscreen1\nscreen2\n",
+                2,
+                "screen1\nscreen2\n",
+            ),
+            (
+                "no-trailing-newline",
+                "old\nscreen1\nscreen2",
+                2,
+                "screen1\nscreen2",
+            ),
+            ("shorter-than-height", "screen1\n", 5, "screen1\n"),
+            (
+                "whole-capture",
+                "screen1\nscreen2\n",
+                2,
+                "screen1\nscreen2\n",
+            ),
+        ];
+        for (case, capture, height, want) in cases {
+            assert_eq!(visible_rows(capture, height), want, "{case}");
         }
     }
 
@@ -1339,6 +1527,91 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         false
+    }
+
+    /// A read of a given pane takes that pane's title and death, not the first pane's: a working
+    /// title on another pane doesn't make an idle prompt read as running, and a dead first pane
+    /// doesn't make a live pinned one read as not the agent's.
+    #[test]
+    #[serial_test::serial]
+    fn a_pane_read_takes_that_panes_title() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        // (case, tool, first pane's title, whether the first pane is dead, pinned pane's script
+        // and title, want)
+        let cases = [
+            (
+                "claude-first-pane-titled",
+                "claude",
+                Some("\u{2810} Working"),
+                false,
+                crate::tmux::test_helpers::INPUT_BOX_SCRIPT,
+                None,
+                Status::Idle,
+            ),
+            (
+                "omp-dead-first-pane",
+                "omp",
+                None,
+                true,
+                "exec cat",
+                Some("π \u{280b} Working"),
+                Status::Running,
+            ),
+        ];
+        for (case, tool, first_title, first_dead, script, pinned_title, want) in cases {
+            let mut inst = Instance::new(&format!("aoe_test_pane_read_{tool}"), "/tmp");
+            inst.tool = tool.into();
+            inst.view = crate::session::View::Terminal;
+            let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let _guard = spawn_pane(&session_name, "exec cat");
+            let first = format!("={session_name}:^");
+            if let Some(title) = first_title {
+                let titled = crate::tmux::tmux_command()
+                    .args(["select-pane", "-t", &first, "-T", title])
+                    .status()
+                    .unwrap();
+                assert!(titled.success(), "{case}");
+            }
+            let pinned = crate::tmux::test_helpers::split_pane(&session_name, script);
+            if let Some(title) = pinned_title {
+                let titled = crate::tmux::tmux_command()
+                    .args(["select-pane", "-t", &pinned, "-T", title])
+                    .status()
+                    .unwrap();
+                assert!(titled.success(), "{case}");
+            }
+            if first_dead {
+                let first_id = tmux::utils::first_pane_id(&session_name).expect("first pane");
+                for args in [
+                    vec!["set-option", "-p", "-t", &first_id, "remain-on-exit", "on"],
+                    vec!["send-keys", "-t", &first_id, "C-d"],
+                ] {
+                    let ran = crate::tmux::tmux_command().args(&args).status().unwrap();
+                    assert!(ran.success(), "{case}: {args:?}");
+                }
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !tmux::utils::is_pane_dead_at(&first_id) {
+                    assert!(Instant::now() < deadline, "{case}: the first pane dies");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            } else {
+                assert!(
+                    wait_for_pane(&pinned, "for shortcuts"),
+                    "{case}: the box never painted"
+                );
+            }
+            crate::tmux::refresh_session_cache();
+            let session = tmux::Session::from_name(&session_name);
+
+            let (status, rule) = inst
+                .detect_pane_now(&inst.source_profile, &session, None, Some(&pinned))
+                .expect("the agent has a manifest");
+            assert_eq!(status, Some(want), "{case}: {rule}");
+        }
     }
 
     /// End-to-end regression for #1913 through the real status pipeline.

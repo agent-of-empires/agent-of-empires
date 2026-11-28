@@ -180,14 +180,7 @@ pub(crate) fn hook_command_session_id(
     field: HookIdentityField,
     publisher: Option<&str>,
 ) -> String {
-    // The command is a single-quoted `sh -c` body; a publisher outside this alphabet would need
-    // quoting there, and every built-in agent binary fits it.
-    let publisher = publisher.filter(|name| {
-        !name.is_empty()
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    });
+    let publisher = installable_publisher(publisher);
     match target {
         HookInstallTarget::Host => hook_command_session_id_host(field, publisher),
         HookInstallTarget::Sandbox => {
@@ -210,7 +203,18 @@ pub(crate) fn identity_field_name(field: HookIdentityField) -> &'static str {
 /// event declares no publisher. Named here so the command and the
 /// disclosure cannot drift.
 pub(crate) fn identity_publisher_arg(publisher: Option<&str>) -> String {
-    publisher.map_or_else(String::new, |name| format!(" --agent {name}"))
+    installable_publisher(publisher).map_or_else(String::new, |name| format!(" --agent {name}"))
+}
+
+/// The command is a single-quoted `sh -c` body; a publisher outside this alphabet would need
+/// quoting there and is dropped, as every built-in agent binary fits it.
+fn installable_publisher(publisher: Option<&str>) -> Option<&str> {
+    publisher.filter(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    })
 }
 
 fn hook_command_session_id_host(field: HookIdentityField, publisher: Option<&str>) -> String {
@@ -985,6 +989,18 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn disclosed_publisher_matches_the_installed_command() {
+        for publisher in ["a b", "x'y", "$(id)", ""] {
+            assert_eq!(identity_publisher_arg(Some(publisher)), "", "{publisher:?}");
+        }
+        assert_eq!(
+            identity_publisher_arg(Some("my-agent.1")),
+            " --agent my-agent.1"
+        );
+        assert_eq!(identity_publisher_arg(None), "");
     }
 
     #[test]

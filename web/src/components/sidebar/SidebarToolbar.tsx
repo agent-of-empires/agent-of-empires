@@ -1,14 +1,10 @@
-import { ListFilter } from "lucide-react";
+import type { ReactNode } from "react";
+import { House } from "lucide-react";
+import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import type { SidebarAxis } from "../../lib/sidebarAxis";
+import { SidebarViewMenu } from "./SidebarViewMenu";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
 import { toneTextClass, type PluginFacetSpec, type PluginSortSpec } from "../../lib/pluginUi";
-import { OFFLINE_TITLE } from "../../lib/connectionState";
-import { SidebarAxisPicker } from "../SidebarAxisPicker";
-import { SidebarSortPicker } from "../SidebarSortPicker";
-import { Tooltip } from "../Tooltip";
-import { DISABLED_ICON_BUTTON, TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
-import { StrokeIcon } from "../icons";
-import { SidebarLegend } from "./SidebarLegend";
 
 type PluginSortRef = { pluginId: string; entryId: string };
 
@@ -36,9 +32,9 @@ export function SidebarToolbar({
   onToggleFacets,
   filterOpen,
   onToggleFilter,
-  offline,
-  onNew,
-  onClose,
+  headingAnchored = false,
+  phoneMenu,
+  onHome,
 }: {
   compact: boolean;
   axis: SidebarAxis;
@@ -54,80 +50,63 @@ export function SidebarToolbar({
   onToggleFacets: () => void;
   filterOpen: boolean;
   onToggleFilter: () => void;
-  offline: boolean;
-  onNew: () => void;
-  onClose: () => void;
+  /** The title carries the tour's sidebar step, for a list that fills the screen. */
+  headingAnchored?: boolean;
+  /** The app's ⋯, which a phone's title row carries. */
+  phoneMenu?: ReactNode;
+  /** A phone's drawer titles itself with a Home button, back to the landing page. */
+  onHome?: () => void;
 }) {
   const axisHeading = AXIS_HEADING[axis];
   return (
-    <div className={`${compact ? "px-1" : "px-3"} pt-3 pb-1 flex items-center`}>
+    <div
+      className={`${compact ? "px-1" : "pl-4 pr-2"} pt-2.5 pb-1.5 max-md:pt-3 max-md:pb-2 max-md:pr-3 max-md:sticky max-md:top-0 max-md:z-10 max-md:bg-surface-950 flex items-center`}
+    >
       {compact ? (
         <span className="flex-1" />
       ) : (
         <>
-          <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
+          {/* A phone titles the drawer large, as Claude's app does; wide screens keep a quiet label. */}
+          <span
+            {...(headingAnchored ? tourAnchor(TOUR_ANCHORS.sidebar) : {})}
+            data-testid="sidebar-axis-heading"
+            className={`text-[12px] font-medium text-text-dim max-md:text-[22px] max-md:font-semibold max-md:text-text-primary flex-1 ${
+              onHome ? "max-md:hidden" : ""
+            }`}
+          >
             {axisHeading}
           </span>
-          <SidebarAxisPicker axis={axis} onAxisChange={onAxisChange} />
-          <SidebarSortPicker
+          {onHome && (
+            <span className="md:hidden flex-1 flex">
+              <button
+                type="button"
+                onClick={onHome}
+                data-testid="sidebar-home"
+                className="h-10 pl-3 pr-4 -ml-1 flex items-center gap-2 rounded-full float-control text-[15px] font-semibold text-text-primary cursor-pointer active:scale-95 transition-transform"
+              >
+                <House className="size-[18px]" strokeWidth={1.75} aria-hidden />
+                Home
+              </button>
+            </span>
+          )}
+          <SidebarViewMenu
+            axis={axis}
+            onAxisChange={onAxisChange}
             sortMode={sortMode}
             onSortModeChange={onSortModeChange}
             pluginSorts={pluginSorts}
             pluginSortRef={pluginSortRef}
             onPluginSortChange={onPluginSortChange}
+            filterOpen={filterOpen}
+            onToggleFilter={onToggleFilter}
+            hasFacets={hasFacets}
+            facetsActive={facetsActive}
+            facetOpen={facetOpen}
+            onToggleFacets={onToggleFacets}
           />
-          {hasFacets && (
-            <Tooltip text="Plugin facets">
-              <button
-                onClick={onToggleFacets}
-                aria-haspopup="true"
-                aria-expanded={facetOpen}
-                aria-label="Plugin facet filters"
-                data-testid="sidebar-facet-toggle"
-                className={`relative ${TOOLBAR_BUTTON} ${TOOLBAR_TINT(facetsActive || facetOpen)}`}
-              >
-                <ListFilter className="h-3.5 w-3.5" />
-                {facetsActive && (
-                  <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-brand-500" aria-hidden />
-                )}
-              </button>
-            </Tooltip>
-          )}
-          <Tooltip text="Filter">
-            <button
-              onClick={onToggleFilter}
-              className={`${TOOLBAR_BUTTON} ${TOOLBAR_TINT(filterOpen, "text-text-secondary")}`}
-              aria-label="Filter sessions"
-            >
-              <StrokeIcon size={14} strokeWidth="2">
-                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
-              </StrokeIcon>
-            </button>
-          </Tooltip>
-          <Tooltip text={offline ? OFFLINE_TITLE : "New project session"}>
-            <button
-              onClick={onNew}
-              disabled={offline}
-              className={`w-8 h-8 flex items-center justify-center text-text-muted hover:text-text-secondary hover:bg-surface-800 cursor-pointer rounded-md transition-colors ${DISABLED_ICON_BUTTON}`}
-              aria-label="New project session"
-            >
-              <StrokeIcon size={16} strokeWidth="1.5">
-                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                <line x1="12" y1="11" x2="12" y2="17" />
-                <line x1="9" y1="14" x2="15" y2="14" />
-              </StrokeIcon>
-            </button>
-          </Tooltip>
+          {phoneMenu && <div className="md:hidden ml-2">{phoneMenu}</div>}
         </>
       )}
-      <SidebarLegend />
-      <button
-        onClick={onClose}
-        aria-label="Close sidebar"
-        className="md:hidden w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-800 ml-1"
-      >
-        &times;
-      </button>
     </div>
   );
 }

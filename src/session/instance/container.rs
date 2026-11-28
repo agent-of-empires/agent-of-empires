@@ -442,8 +442,7 @@ impl Instance {
             &self.id,
             &self.container_workdir(),
             self.is_yolo_mode(),
-        );
-        Ok(())
+        )
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
@@ -671,6 +670,19 @@ impl Instance {
                 } else {
                     container_config::place_shadowed_credential_mountpoints(&config);
                     checkpoint()?;
+                    // Revoke before the start: its mounts are the old ones, and a
+                    // failed revocation must stop the reuse before anything runs.
+                    // The workdir comes from `docker inspect`, which needs no running
+                    // container.
+                    self.reconcile_container_workdir(&container);
+                    container_config::ensure_folder_trust_config_for_active_agent(
+                        &self.tool,
+                        Some(command.as_str()),
+                        &profile_config.session,
+                        &self.id,
+                        &self.container_workdir(),
+                        self.is_yolo_mode(),
+                    )?;
                     container.start()?;
                     self.finish_container_reuse(
                         &container,
@@ -720,6 +732,13 @@ impl Instance {
         if let Some(sandbox) = self.sandbox_info.as_mut() {
             sandbox.image = used_image;
         }
+        // No earlier container is left to mount a trust record this launch cannot clear.
+        container_config::discard_staged_declared_trust(
+            &self.tool,
+            Some(command.as_str()),
+            &profile_config.session,
+            &self.id,
+        );
         let mut config = self.build_container_config(&launch_config)?;
         // The profile `spawn_prepared_launch` gives `scope_prefix_for`, so the
         // container lands in its session's slice.

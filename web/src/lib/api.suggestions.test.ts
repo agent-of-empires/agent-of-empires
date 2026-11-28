@@ -4,6 +4,7 @@ import {
   dismissSuggestion,
   fetchSuggestions,
   prepareSuggestion,
+  putSuggestionMapping,
   refreshSuggestions,
   updateSuggestionSource,
 } from "./api";
@@ -36,6 +37,18 @@ describe("suggestion API", () => {
       ],
       ["/api/suggestions/prepare", "POST", JSON.stringify({ provider_id: "gh", id: "1" })],
     ]);
+  });
+
+  it("gives up on a stalled mapping save and says it may have applied", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      throw new DOMException("The operation timed out.", "TimeoutError");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await putSuggestionMapping("gh", "acme/web", ["/w/web"]);
+    expect(result).toMatchObject({ ok: false, stale: false });
+    expect(!result.ok && result.error).toMatch(/timed out.*may have saved/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("flags a 409 as stale and surfaces the server message", async () => {

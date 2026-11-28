@@ -9,6 +9,7 @@ mod file_watch_tests;
 pub(crate) use icons::get_indent;
 mod icons;
 mod input;
+pub(crate) mod keybinds;
 mod last_prompt;
 mod layout;
 mod lifecycle;
@@ -465,6 +466,9 @@ pub struct HomeView {
     /// Input for a row whose mount is still connecting, split at each Enter.
     pub(super) pending_paste_for_structured_view: HashMap<String, PendingStructuredInput>,
     pub(super) pending_attach_after_warning: Option<String>,
+    /// A send refused at delivery, reopened with its text once its refusal is dismissed:
+    /// the session, target, title and message.
+    pub(super) refused_send: Option<(String, live_send::LiveSendTarget, String, String)>,
     pub(super) pending_stop_session: Option<String>,
     /// Target captured when the auxiliary stop confirmation opens.
     pub(super) pending_stop_auxiliary: Option<(String, crate::daemon::StopAuxiliaryBody)>,
@@ -662,6 +666,8 @@ pub struct HomeView {
     pub(super) restart_cooldown_at: std::collections::HashMap<String, std::time::Instant>,
 
     pub(super) tool_configs: HashMap<String, crate::session::config::ToolSessionConfig>,
+    /// Live mode's exit and leader, applied alongside the keymap.
+    live_send_chords: live_send::LiveSendChords,
     pub(super) tool_hotkey_cache: Vec<(
         String,
         crossterm::event::KeyCode,

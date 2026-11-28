@@ -81,7 +81,9 @@ const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 beforeEach(() => {
   vi.clearAllMocks();
   // clearAllMocks keeps queued answers, and a test can leave some unread.
-  vi.mocked(fetchProfileAgents).mockReset().mockResolvedValue([]);
+  vi.mocked(fetchProfileAgents)
+    .mockReset()
+    .mockResolvedValue([agent("claude")]);
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
   reviewCreationTrust.mockResolvedValue({
@@ -202,6 +204,10 @@ describe("SessionWizard structured view payload", () => {
     [true, "terminal"],
   ])("opting out=%s sends view %s", async (optOut, view) => {
     renderWizard();
+    // Structured is only offered once the Daemon has reported the agent as ACP-capable.
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "Structured view" })).toHaveProperty("disabled", false),
+    );
     if (optOut) fireEvent.click(screen.getByRole("radio", { name: "Terminal view" }));
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
@@ -245,6 +251,7 @@ describe("SessionWizard structured view payload", () => {
       acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
       sandbox: {},
     } as never);
+    vi.mocked(fetchProfileAgents).mockResolvedValue([agent("opencode")]);
     renderWizard({ path: "/tmp/proj" });
     // The Agent row names opencode once the defaults have applied.
     await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("opencode"));
@@ -278,6 +285,16 @@ describe("SessionWizard structured view payload", () => {
     expect(payload().tool).toBe("claude");
     expect(payload().agent_model).toBeUndefined();
     expect(payload().agent_effort).toBeUndefined();
+  });
+});
+
+describe("SessionWizard last tool memory", () => {
+  it("falls back to claude when the stored tool is not an available agent", async () => {
+    localStorage.setItem("aoe-acp-last-tool", "ghost");
+    renderWizard({ path: "/tmp/proj" });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().tool).toBe("claude");
   });
 });
 
@@ -2477,6 +2494,20 @@ describe("SessionWizard initial prompt", () => {
 });
 
 describe("SessionWizard suggestion link", () => {
+  it("keeps the prefill it opened with when a later one arrives", async () => {
+    const props = { servedProfile: "default", onClose: vi.fn(), onCreated: vi.fn() };
+    const { rerender } = render(<SessionWizard {...props} prefill={{ path: "/tmp/proj", tool: "claude" }} />);
+    rerender(
+      <SessionWizard
+        {...props}
+        prefill={{ path: "/tmp/other", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } }}
+      />,
+    );
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().suggestion).toBeUndefined();
+  });
+
   it("sends the suggestion reference, and nothing when the prefill has none", async () => {
     renderWizard({ path: "/tmp/proj", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } });
     await launch();
@@ -2529,6 +2560,23 @@ describe("SessionWizard suggestion source", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
     expect(payload()).toMatchObject({ worktree_enabled: true });
+  });
+
+  it("keeps the preset's sandbox over the Project's override", async () => {
+    const prepared = { title: "t", initial_prompt: "p", project: null, sandbox: true } as unknown as SuggestionPrepared;
+    expect(toWizardPrefill(prepared, { label: "G", title: "t", url: "" }).useSandbox).toBe(true);
+    vi.mocked(fetchProjects).mockResolvedValue([
+      { name: "proj", path: "/tmp/proj", scope: "global", pinned: false, overrides: { sandbox_enabled: false } },
+    ] as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", useSandbox: true });
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalled());
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    // Both seeds have resolved; let their state updates commit before looking at the switch.
+    await act(async () => {
+      await Promise.all(vi.mocked(fetchProjects).mock.results.map((r) => r.value));
+      await Promise.all(vi.mocked(fetchSettings).mock.results.map((r) => r.value));
+    });
+    expect(screen.getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("true");
   });
 
   it("drops the preset's worktree when the profile changes", async () => {

@@ -13,6 +13,7 @@ import { toastBus, type ToastApi, type ToastKind } from "../lib/toastBus";
 import { requestOpenSession } from "../lib/sessionRoute";
 import { openPluginLink } from "../lib/pluginCommands";
 import { isAllowedHref } from "../lib/pluginHref";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 interface Toast {
   id: number;
@@ -269,7 +270,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                     e.stopPropagation();
                     if (t.action!.run() !== false) dismiss(t.id);
                   }}
-                  className="shrink-0 font-medium text-text-primary underline-offset-2 hover:underline cursor-pointer"
+                  className={`${BUTTON_INLINE} shrink-0`}
                 >
                   {t.action.label}
                 </button>

@@ -50,6 +50,18 @@ function Strip({ health: value }: { health: SystemHealth }) {
 }
 
 describe("SystemHealthStrip", () => {
+  it("closes the drill-down on a click outside it or Escape", () => {
+    render(<Strip health={health()} />);
+    const open = () => fireEvent.click(screen.getByTitle("System health"));
+    open();
+    expect(screen.getByTestId("system-health-detail")).toBeTruthy();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByTestId("system-health-detail")).toBeNull();
+    open();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByTestId("system-health-detail")).toBeNull();
+  });
+
   it("reports CPU, memory and counts, bands memory by status, and hides the detail until opened", () => {
     render(<Strip health={health()} />);
 

@@ -127,8 +127,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Admit a prompt without storing it, as `publish_user_prompt` does first.
-    pub(crate) fn test_note_admission(&self, session_id: &str) {
-        lock_recover(&self.lifecycle).note_admission(session_id);
+    pub(crate) fn test_note_admission(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::acp::runner_lifecycle::AdmissionGuard> {
+        lock_recover(&self.lifecycle).note_admission(session_id)
     }
 
     /// Occupy a slot with a fake worker already carrying what a real drain
@@ -445,6 +448,7 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
         acp_mode_id: None,
         agent_command_override: None,
         claude_store_pin: None,
+        proxy: None,
     }
 }
 
@@ -478,6 +482,8 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         seed_history_replay: false,
         prior_conversation: false,
         artifact_dir: None,
+        proxy: None,
+        degraded: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,
@@ -822,6 +828,7 @@ impl HeldAttachRunner {
                                 &ControlBody::SessionReady {
                                     acp_session_id: native_id.clone(),
                                     result: serde_json::json!({}),
+                                    adapter_frames: 0,
                                 },
                             )
                             .await

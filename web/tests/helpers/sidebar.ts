@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
-import type { Locator, Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 import { initWorkingRepo } from "./gitFixture";
 import { resolveAoeBinary } from "./aoeServe";
 
@@ -37,22 +37,32 @@ export async function dragSidebarHandle(page: Page, ...xs: number[]) {
   await page.mouse.up();
 }
 
-/** Open the mobile sidebar only if it is closed, then wait for the slide-in to settle. */
+/** Show the phone's session list, in the drawer ☰ opens. */
 export async function openMobileSidebar(page: Page) {
-  const toggle = page.getByRole("button", { name: "Toggle sidebar" });
-  await toggle.waitFor({ state: "visible", timeout: 10_000 });
-  const probe = page.getByTestId("sidebar-session-row").first();
-  await probe.waitFor({ state: "attached", timeout: 10_000 });
-  const initial = await probe.boundingBox();
-  if (!initial || initial.x < 0) await toggle.click();
-  await page.waitForFunction(
-    () => {
-      const r = document.querySelector('[data-testid="sidebar-session-row"]')?.getBoundingClientRect();
-      return !!r && r.x >= 0 && r.width > 0;
-    },
-    null,
-    { timeout: 5_000 },
-  );
+  const menu = page.getByTestId("topbar-menu");
+  const row = page.getByTestId("sidebar-session-row").first();
+  const drawer = page.locator('[role="navigation"][aria-label="Sessions sidebar"]');
+  // Read once its slide settles: a closing drawer stays `visible` until its transition ends.
+  const open = () =>
+    drawer
+      .evaluate(async (el) => {
+        await Promise.all(el.getAnimations().map((a) => a.finished.catch(() => undefined)));
+        return getComputedStyle(el).visibility === "visible";
+      })
+      .catch(() => false);
+  await expect.poll(async () => (await menu.isVisible()) || (await open()), { timeout: 10_000 }).toBe(true);
+  // Already open: ☰ sits under the drawer's scrim, and a second tap would close it.
+  if (!(await open())) await menu.click();
+  await expect(row).toBeVisible({ timeout: 10_000 });
+  // The drawer sits under the page card, which slides aside: wait until a tap on the row reaches the row.
+  await expect
+    .poll(() =>
+      row.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
+      }),
+    )
+    .toBe(true);
 }
 
 /** Session row titles in DOM order, read from the label span so row chips are ignored. */

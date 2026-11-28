@@ -14,25 +14,22 @@ describe("isAcpEligible", () => {
       ["claude", { acp_capable: false, acp_allowed: false }, false],
       ["claude", { acp_capable: true }, true],
       ["claude", { acp_capable: false }, false],
-      ["claude", undefined, true],
-      ["kimi", undefined, true],
-      ["prime-agent", undefined, true],
-      ["some-unknown-tool", undefined, false],
+      ["claude", undefined, false],
       ["claude", { acp_allowed: false }, false],
-      ["claude", { acp_allowed: true }, true],
+      ["claude", { acp_allowed: true }, false],
       // A repository alias can make a Terminal-only agent create-ready.
       ["aider", { acp_capable: false, acp_create_ready: true }, true],
       ["aider", { acp_capable: false, acp_create_ready: true, acp_allowed: false }, false],
       ["aider", { acp_capable: false, acp_create_ready: false }, false],
     ];
     for (const [tool, agent, expected] of cases) {
-      expect(isAcpEligible(tool, agent), `${tool} ${JSON.stringify(agent)}`).toBe(expected);
+      expect(isAcpEligible(agent), `${tool} ${JSON.stringify(agent)}`).toBe(expected);
     }
   });
 
   it("leaves isAcpCapable reporting capability alone, so settings surfaces keep listing a denied agent", () => {
-    expect(isAcpCapable("codex", true)).toBe(true);
-    expect(isAcpEligible("codex", { acp_capable: true, acp_allowed: false })).toBe(false);
+    expect(isAcpCapable(true)).toBe(true);
+    expect(isAcpEligible({ acp_capable: true, acp_allowed: false })).toBe(false);
   });
 });
 
@@ -53,14 +50,19 @@ describe("acpAdapterMissing", () => {
   });
 
   it("leaves Structured view available unless the adapter is missing", () => {
-    expect(structuredAvailable("claude", { acp_create_ready: false }, host)).toBe(false);
-    expect(structuredAvailable("claude", { acp_create_ready: true }, host)).toBe(true);
-    expect(structuredAvailable("aider", { acp_capable: false, acp_create_ready: true }, host)).toBe(true);
-    expect(structuredAvailable("aider", { acp_capable: false }, host)).toBe(false);
-    expect(structuredAvailable("claude", { acp_allowed: false, acp_create_ready: true }, host)).toBe(false);
-    expect(structuredAvailable("claude", { acp_create_ready: false }, { ...host, sandboxEnabled: true })).toBe(true);
+    expect(structuredAvailable({ acp_create_ready: false }, host)).toBe(false);
+    expect(structuredAvailable({ acp_create_ready: true }, host)).toBe(true);
+    expect(structuredAvailable({ acp_capable: false, acp_create_ready: true }, host)).toBe(true);
+    expect(structuredAvailable({ acp_capable: false }, host)).toBe(false);
+    expect(structuredAvailable({ acp_allowed: false, acp_create_ready: true }, host)).toBe(false);
+    expect(structuredAvailable({ acp_capable: true, acp_create_ready: false }, { ...host, sandboxEnabled: true })).toBe(
+      true,
+    );
     expect(
-      structuredAvailable("claude", { acp_create_ready: false }, { ...host, commandOverride: "my-wrapper acp" }),
+      structuredAvailable(
+        { acp_capable: true, acp_create_ready: false },
+        { ...host, commandOverride: "my-wrapper acp" },
+      ),
     ).toBe(true);
   });
 });

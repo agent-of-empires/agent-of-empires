@@ -139,3 +139,22 @@ describe("Tooltip", () => {
     expect(document.querySelector("[role=tooltip]")).toBeNull();
   });
 });
+
+describe("Tooltip held closed by its caller", () => {
+  it("does not resurface a hover that ended while held closed", () => {
+    const view = render(
+      <Tooltip text="View options" open={false}>
+        <button>trigger</button>
+      </Tooltip>,
+    );
+    const trigger = screen.getByText("trigger");
+    fireEvent.mouseEnter(trigger.parentElement!);
+    fireEvent.mouseLeave(trigger.parentElement!);
+    view.rerender(
+      <Tooltip text="View options">
+        <button>trigger</button>
+      </Tooltip>,
+    );
+    expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+});

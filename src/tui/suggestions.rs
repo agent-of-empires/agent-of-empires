@@ -29,6 +29,11 @@ use crate::tui::styles::Theme;
 use crate::tui::worker::Worker;
 
 impl Item {
+    /// Open and not started: what Start, and marking for a batch, act on.
+    fn startable(&self) -> bool {
+        !self.stale && !self.dismissed && self.started_session.is_none()
+    }
+
     /// `(key, name)` of the pane's group: the repo, named by its last
     /// segment, else the resolved Project.
     fn group(&self) -> Option<(&str, &str)> {
@@ -60,6 +65,8 @@ pub(super) struct Start {
     pub source_text: Option<String>,
     /// `None` when no single registered project matched; the dialog asks for one.
     pub path: Option<String>,
+    /// The repo's other mapped Projects, the dialog's extra repos.
+    pub extra_paths: Vec<String>,
     pub title: String,
     pub initial_prompt: String,
     pub tool: String,
@@ -176,6 +183,11 @@ enum Req {
         review_fingerprint: Option<serde_json::Value>,
         origin: Option<Origin>,
     },
+    /// Starts the items with their presets in one daemon call, never approving hooks.
+    StartBatch {
+        items: Vec<ItemKey>,
+        origin: Option<Origin>,
+    },
     /// Turns on `pre_trust_agent_folders` through the daemon's settings API.
     PreTrust {
         origin: Option<Origin>,
@@ -183,6 +195,13 @@ enum Req {
     /// Sets the "Show in the sidebar" pref, which also shows the Home row.
     ShowOnHome {
         shown: bool,
+        origin: Option<Origin>,
+    },
+    /// Turns auto start on or off for one kind of suggestion.
+    AutoStart {
+        provider_id: String,
+        criterion: String,
+        enabled: bool,
         origin: Option<Origin>,
     },
 }
@@ -193,9 +212,11 @@ impl Req {
             Req::Dismiss { origin, .. }
             | Req::Prepare { origin, .. }
             | Req::Start { origin, .. }
+            | Req::StartBatch { origin, .. }
             | Req::Refresh { origin }
             | Req::PreTrust { origin }
-            | Req::ShowOnHome { origin, .. } => origin.as_ref(),
+            | Req::ShowOnHome { origin, .. }
+            | Req::AutoStart { origin, .. } => origin.as_ref(),
             _ => None,
         }
     }
@@ -233,6 +254,8 @@ enum Res {
     Refreshed(Result<(), String>),
     Prepared(Result<Prepared, String>),
     Started(Result<StartAnswer, String>),
+    /// The answer to each item of a batch start, in the order sent.
+    StartedBatch(Result<Vec<(ItemKey, StartAnswer)>, String>),
     PreTrusted(Result<(), String>),
 }
 
@@ -245,6 +268,7 @@ impl Res {
             | Res::Refreshed(Err(e))
             | Res::Prepared(Err(e))
             | Res::Started(Err(e))
+            | Res::StartedBatch(Err(e))
             | Res::PreTrusted(Err(e)) => Some(e),
             _ => None,
         }
@@ -255,6 +279,7 @@ enum ResKind {
     Snapshot,
     Prepare,
     Start,
+    StartBatch,
     Other,
 }
 
@@ -262,9 +287,12 @@ fn failed(req: &Req, message: String) -> Res {
     match req {
         Req::Prepare { .. } => Res::Prepared(Err(message)),
         Req::Start { .. } => Res::Started(Err(message)),
+        Req::StartBatch { .. } => Res::StartedBatch(Err(message)),
         Req::Refresh { .. } => Res::Refreshed(Err(message)),
         Req::PreTrust { .. } => Res::PreTrusted(Err(message)),
-        Req::Load | Req::Dismiss { .. } | Req::ShowOnHome { .. } => Res::Snapshot(Err(message)),
+        Req::Load | Req::Dismiss { .. } | Req::ShowOnHome { .. } | Req::AutoStart { .. } => {
+            Res::Snapshot(Err(message))
+        }
     }
 }
 
@@ -345,6 +373,23 @@ async fn run(req: &Req) -> Res {
                 }
             }
         }
+        Req::AutoStart {
+            provider_id,
+            criterion,
+            enabled,
+            ..
+        } => {
+            let body = serde_json::json!({
+                "expected_profile": expected,
+                "provider_id": provider_id,
+                "criterion": criterion,
+                "enabled": enabled,
+            });
+            match client.set_suggestion_auto_start(&body).await {
+                Ok(()) => Res::Snapshot(load(&client, &daemon).await),
+                Err(e) => Res::Snapshot(Err(format!("Couldn't change auto start: {}", refusal(e)))),
+            }
+        }
         Req::Dismiss {
             provider_id,
             id,
@@ -360,6 +405,27 @@ async fn run(req: &Req) -> Res {
             },
             Err(e) => Res::Snapshot(Err(refusal(e))),
         },
+        Req::StartBatch { items, .. } => {
+            let body = serde_json::json!({
+                "expected_profile": expected,
+                "items": items
+                    .iter()
+                    .map(|(provider_id, id)| serde_json::json!({ "provider_id": provider_id, "id": id }))
+                    .collect::<Vec<_>>(),
+            });
+            Res::StartedBatch(
+                client
+                    .start_suggestions(&body, items.len())
+                    .await
+                    .map(|answers| {
+                        answers
+                            .into_iter()
+                            .map(|a| ((a.provider_id, a.id), start_answer(a.status, &a.body)))
+                            .collect()
+                    })
+                    .map_err(refusal),
+            )
+        }
         Req::Start {
             provider_id,
             id,
@@ -411,13 +477,10 @@ fn spawn_worker() -> Worker<Req, Res> {
     })
 }
 
-/// The empty pane's setup advice for the providers' `enabled` flags.
+/// The empty pane's setup advice for the plugin providers' `enabled` flags.
 /// `offered` says whether the dashboard shows Set up suggestions, which it
 /// does only while a featured plugin offers them.
-fn setup_lines(
-    enabled: &[bool],
-    offered: impl FnOnce() -> bool,
-) -> Option<&'static [&'static str]> {
+fn setup_lines(enabled: &[bool], offered: bool) -> Option<&'static [&'static str]> {
     if enabled.contains(&true) {
         None
     } else if !enabled.is_empty() {
@@ -425,10 +488,15 @@ fn setup_lines(
             "Your suggestion sources are off. Turn one on in the web",
             "dashboard under Settings › Suggestions.",
         ])
-    } else if offered() {
+    } else if offered {
         Some(&[
-            "No suggestion source is installed. To set one up, use",
-            "Set up suggestions on the web dashboard's homepage, or run:",
+            "Nothing suggested yet. In any session, ask the agent:",
+            "",
+            "  Suggest the next sessions worth starting here. Use the",
+            "  suggest_session tool, or run: aoe suggest \"<title>\" --prompt \"<prompt>\"",
+            "",
+            "Suggestions stay until you start or dismiss them. For GitHub issues and",
+            "PRs too, use Set up suggestions on the web dashboard's homepage, or run:",
             "",
             "  aoe plugin install gh:agent-of-empires/plugin-github",
             "",
@@ -436,7 +504,13 @@ fn setup_lines(
         ])
     } else {
         Some(&[
-            "No suggestion source is installed. To set one up, run:",
+            "Nothing suggested yet. In any session, ask the agent:",
+            "",
+            "  Suggest the next sessions worth starting here. Use the",
+            "  suggest_session tool, or run: aoe suggest \"<title>\" --prompt \"<prompt>\"",
+            "",
+            "Suggestions stay until you start or dismiss them. For GitHub issues and",
+            "PRs too, run:",
             "",
             "  aoe plugin install gh:agent-of-empires/plugin-github",
             "",
@@ -491,6 +565,11 @@ fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> 
             .filter(|i| !i.preview.trim().is_empty())
             .map(|i| plain(&i.preview)),
         path: prepared.project.map(|p| p.path),
+        extra_paths: prepared
+            .extra_projects
+            .into_iter()
+            .map(|p| p.path)
+            .collect(),
         title: plain_line(&prepared.title),
         initial_prompt: plain(&prepared.initial_prompt),
         tool: prepared.tool,
@@ -596,6 +675,12 @@ pub(super) enum SuggestionsAction {
     TurnOnPreTrust,
     /// Trash the item's Session, whose prompt was blocked, then start it again.
     TryAgain(ItemKey, String),
+    /// Ask before turning on auto start for a kind; `yolo` says its preset is never auto started.
+    ConfirmAutoStart {
+        provider_id: String,
+        criterion: String,
+        yolo: bool,
+    },
 }
 
 type ItemKey = (String, String);
@@ -623,6 +708,8 @@ pub(super) struct SuggestionsView {
     pub(super) pretrusted: bool,
     /// Another Try again waits for its Trash, so none can start now.
     pub(super) retry_pending: bool,
+    /// Items marked with Space; Enter starts them all.
+    marked: Vec<ItemKey>,
 }
 
 impl SuggestionsView {
@@ -647,6 +734,7 @@ impl SuggestionsView {
             strict: false,
             pretrusted: false,
             retry_pending: false,
+            marked: Vec::new(),
         }
     }
 
@@ -817,6 +905,73 @@ impl SuggestionsView {
             KeyCode::Char('z') => {
                 self.error = block.map(|b| block_note(b).to_string());
             }
+            KeyCode::Char(' ') => {
+                if let Some(block) = block {
+                    self.error = Some(block_note(block).to_string());
+                    return SuggestionsAction::Continue;
+                }
+                let Some(key) = self.selected_key() else {
+                    return SuggestionsAction::Continue;
+                };
+                if !self
+                    .item_at(store, self.selected)
+                    .is_some_and(Item::startable)
+                {
+                    self.notice =
+                        Some("Only an open suggestion that is not started can be marked.".into());
+                } else if let Some(at) = self.marked.iter().position(|k| *k == key) {
+                    self.marked.remove(at);
+                } else {
+                    self.marked.push(key);
+                }
+                self.begin();
+                self.notice = (!self.marked.is_empty())
+                    .then(|| format!("{} marked. Enter starts them.", self.marked.len()));
+            }
+            KeyCode::Char('a') => {
+                if let Some(block) = block {
+                    self.error = Some(block_note(block).to_string());
+                    return SuggestionsAction::Continue;
+                }
+                let Some(item) = self.item_at(store, self.selected) else {
+                    return SuggestionsAction::Continue;
+                };
+                let (provider_id, criterion) = (item.provider_id.clone(), item.criterion.clone());
+                match store.auto_start_on(&provider_id, &criterion) {
+                    None => {
+                        self.notice = Some("This kind has no auto start setting.".into());
+                    }
+                    Some(true) => {
+                        self.begin();
+                        self.notice = Some("Turning auto start off…".into());
+                        store.set_auto_start(provider_id, criterion, false);
+                    }
+                    Some(false) => {
+                        return SuggestionsAction::ConfirmAutoStart {
+                            yolo: item.start.as_ref().is_some_and(|s| s.yolo),
+                            provider_id,
+                            criterion,
+                        };
+                    }
+                }
+            }
+            KeyCode::Enter if !self.marked.is_empty() => {
+                if let Some(block) = block {
+                    self.error = Some(block_note(block).to_string());
+                    return SuggestionsAction::Continue;
+                }
+                let keys: Vec<ItemKey> = std::mem::take(&mut self.marked)
+                    .into_iter()
+                    .filter(|key| store.item(key).is_some_and(Item::startable))
+                    .collect();
+                self.begin();
+                if keys.is_empty() {
+                    self.notice = Some("The marked suggestions can no longer start.".into());
+                } else {
+                    self.notice = Some(format!("Starting {}…", keys.len()));
+                    store.start_batch(keys);
+                }
+            }
             KeyCode::Enter | KeyCode::Char('e' | 'N') => {
                 let review = code != KeyCode::Enter;
                 let another = code == KeyCode::Char('N');
@@ -864,10 +1019,10 @@ impl SuggestionsView {
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(KeyCode::Char('N'))
             }
-            KeyCode::Char(c @ ('E' | 'D' | 'H' | 'R' | 'T' | 'Z')) => {
+            KeyCode::Char(c @ ('E' | 'D' | 'H' | 'R' | 'T' | 'Z' | 'A')) => {
                 Some(KeyCode::Char(c.to_ascii_lowercase()))
             }
-            KeyCode::Char('e' | 'd' | 'h' | 'r' | 't' | 'z' | 'N') => None,
+            KeyCode::Char('e' | 'd' | 'h' | 'r' | 't' | 'z' | 'a' | 'N') => None,
             code => Some(code),
         }
     }
@@ -887,6 +1042,11 @@ impl SuggestionsView {
         store.failed = None;
         self.preparing = Some(key.clone());
         self.prepare_another = another;
+        if another {
+            crate::tui::telemetry::report_feature_use(
+                crate::telemetry::feature_use::FeatureUse::SuggestStartAnother,
+            );
+        }
         store.prepare(key);
     }
 
@@ -970,12 +1130,23 @@ impl SuggestionsView {
                 keys.push(if retry { "↵ try again" } else { "↵ open" }.to_string());
             } else if block.is_none() && !item.stale {
                 let retry = store.failed.as_ref().is_some_and(|(k, _)| *k == key);
-                keys.push(if retry { "↵ try again" } else { "↵ start" }.to_string());
+                keys.push(match (retry, self.marked.len()) {
+                    (_, n) if n > 0 => format!("↵ start {n} marked"),
+                    (true, _) => "↵ try again".to_string(),
+                    _ => "↵ start".to_string(),
+                });
                 keys.push(format!("{} change first", self.key_label('e')));
+            }
+            if block.is_none()
+                && store
+                    .auto_start_on(&item.provider_id, &item.criterion)
+                    .is_some()
+            {
+                keys.push(format!("{} auto start", self.key_label('a')));
             }
             if block.is_none() {
                 if !item.stale {
-                    keys.push(format!("{} new", self.key_label('N')));
+                    keys.push(format!("{} another", self.key_label('N')));
                 }
                 let verb = if item.dismissed { "restore" } else { "dismiss" };
                 keys.push(format!("{} {verb}", self.key_label('z')));
@@ -1008,7 +1179,15 @@ impl SuggestionsView {
             ),
             (
                 self.key_label('N'),
-                "a new session for the item, without its link",
+                "another session for the item, without its link",
+            ),
+            (
+                "Space".to_string(),
+                "mark or unmark; Enter then starts every marked one",
+            ),
+            (
+                self.key_label('a'),
+                "turn auto start on or off for the item's kind",
             ),
             (self.key_label('z'), "dismiss or restore"),
             (self.key_label('d'), dismissed),
@@ -1135,8 +1314,10 @@ impl SuggestionsView {
         theme: &Theme,
         store: &SuggestionsFeed,
         mutation_block: Option<MutationBlock>,
-        focused: bool,
+        // `None` while the pane has the keys; otherwise the key that gives it them.
+        focus_key: Option<&str>,
     ) {
+        let focused = focus_key.is_none();
         frame.render_widget(Clear, area);
         let border = if focused { theme.accent } else { theme.border };
         let block = Block::default()
@@ -1160,10 +1341,12 @@ impl SuggestionsView {
         let detail = self.detail_lines(store, theme, width as usize);
         let mut units = if self.help {
             vec!["any key closes".to_string()]
-        } else if focused {
-            self.row_keys(store, mutation_block)
         } else {
-            vec!["↵ browse".to_string()]
+            match focus_key {
+                None => self.row_keys(store, mutation_block),
+                Some("") => Vec::new(),
+                Some(key) => vec![format!("{key} browse")],
+            }
         };
         let mut footer: Vec<Line> = Vec::new();
         if let Some(error) = &self.error {
@@ -1325,7 +1508,15 @@ impl SuggestionsView {
                 ]));
             }
             let current = index == self.selected;
-            let marker = if current { "  › " } else { "    " };
+            let marker = format!(
+                "{}{}",
+                if self.marked.contains(&item_key) {
+                    "✓ "
+                } else {
+                    "  "
+                },
+                if current { "› " } else { "  " }
+            );
             let state = match (item.dismissed, store.is_recent(&item_key)) {
                 (false, _) => String::new(),
                 (true, true) => format!(" [dismissed, {} to undo]", self.key_label('z')),
@@ -1379,13 +1570,10 @@ impl SuggestionsView {
             .providers_enabled()
             .filter(|_| self.order.is_empty())
             .and_then(|enabled| {
-                setup_lines(&enabled, || {
-                    static OFFERED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-                        crate::plugin::featured::FeaturedIndex::load()
-                            .is_ok_and(|index| index.offers_suggestions())
-                    });
-                    *OFFERED
-                })
+                setup_lines(
+                    &enabled,
+                    store.snapshot.as_ref().is_some_and(|s| s.setup_offered),
+                )
             });
         if let Some(setup) = setup {
             for line in setup {
@@ -1460,15 +1648,14 @@ impl SuggestionsView {
             ));
         }
         let mut parts = vec![item.reason.clone()];
-        // A heading already names the Project.
+        // A heading already names the Project, or says there is none.
+        let named = item
+            .resolved_project
+            .as_ref()
+            .map(|p| p.name.clone())
+            .or_else(|| item.project.clone());
         if !(headed && item.group().is_some()) {
-            parts.push(
-                item.resolved_project
-                    .as_ref()
-                    .map(|p| p.name.clone())
-                    .or_else(|| item.project.clone())
-                    .unwrap_or_else(|| "no project".to_string()),
-            );
+            parts.extend(named.or_else(|| (!headed).then(|| "No project".to_string())));
         }
         if let Some(s) = &item.started_session {
             parts.push(if s.archived {
@@ -1522,6 +1709,16 @@ impl SuggestionsView {
                 Style::default().fg(theme.error),
             )));
         }
+        if let Some(note) = item
+            .auto_note
+            .as_deref()
+            .filter(|_| item.started_session.is_none())
+        {
+            detail.push(Line::from(Span::styled(
+                plain(note),
+                Style::default().fg(theme.dimmed),
+            )));
+        }
         if let Some(line) = store.preset_line(item) {
             detail.push(Line::from(Span::styled(
                 plain(&line),
@@ -1553,14 +1750,35 @@ const FEED_RELOAD: std::time::Duration = std::time::Duration::from_secs(60);
 /// How often the feed reloads while a provider shows "refreshing…".
 const REFRESHING_RELOAD: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Most items the daemon takes in one batch start.
+const MAX_START_BATCH: usize = 25;
+
+/// A set of marked suggestions started through the daemon's batch start.
+struct Batch {
+    pending: Vec<ItemKey>,
+    started: usize,
+    /// Left for a hooks review the user has to read.
+    review: usize,
+    failed: usize,
+    first_failure: Option<String>,
+}
+
+/// What a start answer means for the batch it belongs to.
+pub(super) struct BatchStep {
+    /// The note to leave on the item's row, when it did not start.
+    pub failure: Option<String>,
+    /// The sum-up, once the last answer is in.
+    pub summary: Option<String>,
+}
+
 pub(super) struct FeedPoll {
     pub changed: bool,
     /// The daemon accepted a refresh request.
     pub refreshed: bool,
     /// A prepared suggestion, with its key.
     pub start: Option<(ItemKey, Start)>,
-    /// What the daemon answered to a start, with the item it was for.
-    pub started: Option<(ItemKey, StartAnswer)>,
+    /// What the daemon answered to each start, with the item it was for.
+    pub started: Vec<(ItemKey, StartAnswer)>,
     /// Failure of a user-initiated request; background reloads only log.
     pub error: Option<String>,
     /// The item whose prepare `error` belongs to; `None` for a reload, refresh or dismiss.
@@ -1586,6 +1804,10 @@ pub(super) struct SuggestionsFeed {
     home_in_flight: Option<bool>,
     /// The origin the pre-trust confirmation on screen was opened for.
     held_pre_trust: Option<Origin>,
+    /// The kind and origin the auto start confirmation on screen was opened for.
+    held_auto_start: Option<(String, String, Option<Origin>)>,
+    /// The batch being started: what is still waiting for an answer, and the tally.
+    batch: Option<Batch>,
     /// The last start or prepare that failed, shown on its row in the pane
     /// until the next try.
     pub(super) failed: Option<(ItemKey, String)>,
@@ -1634,6 +1856,8 @@ impl SuggestionsFeed {
             start_key: None,
             held_trust: None,
             held_pre_trust: None,
+            held_auto_start: None,
+            batch: None,
             home_in_flight: None,
             failed: None,
             blocked_prompts: std::collections::HashMap::new(),
@@ -1864,12 +2088,19 @@ impl SuggestionsFeed {
         !self.provider_failures().is_empty()
     }
 
-    /// The prompt Enter sends, as the daemon resolved it, or the plugin's draft.
+    /// The prompt Enter sends, as the daemon resolved it, or the plugin's draft
+    /// when the daemon resolved none. A resolution without a prompt is one the
+    /// daemon refused as too long, so the refusal shows instead of a draft Start would not send.
     fn effective_prompt(&self, item: &Item) -> String {
-        item.start
-            .as_ref()
-            .and_then(|s| s.prompt.clone())
-            .unwrap_or_else(|| item.draft.prompt.clone())
+        match item.start.as_ref() {
+            None => item.draft.prompt.clone(),
+            Some(start) => start.prompt.clone().unwrap_or_else(|| {
+                format!(
+                    "Not sent: the expanded prompt exceeds {} bytes.",
+                    crate::session::MAX_INITIAL_PROMPT_BYTES
+                )
+            }),
+        }
     }
 
     /// "Starts with Claude Code · Structured · worktree", from what Start will create.
@@ -1928,12 +2159,16 @@ impl SuggestionsFeed {
         }
     }
 
-    /// Each provider's `enabled` flag as the daemon reports it; None until a
-    /// snapshot loads.
+    /// Each plugin provider's `enabled` flag as the daemon reports it, without
+    /// the built-in agent provider; None until a snapshot loads.
     pub(super) fn providers_enabled(&self) -> Option<Vec<bool>> {
-        self.snapshot
-            .as_ref()
-            .map(|s| s.providers.iter().map(|p| p.enabled).collect())
+        self.snapshot.as_ref().map(|s| {
+            s.providers
+                .iter()
+                .filter(|p| p.id != crate::plugin::suggestions::AGENT_PROVIDER_ID)
+                .map(|p| p.enabled)
+                .collect()
+        })
     }
 
     /// True while a request is in flight: its answer is not yet processed.
@@ -2002,6 +2237,9 @@ impl SuggestionsFeed {
                         project: Some(PreparedProject {
                             path: "/tmp".into(),
                         }),
+                        extra_projects: vec![PreparedProject {
+                            path: "/tmp/extra".into(),
+                        }],
                         view: Some("terminal".into()),
                         worktree: true,
                         sandbox: false,
@@ -2018,6 +2256,14 @@ impl SuggestionsFeed {
                     let _ = sink.send(format!("start {provider_id}/{id}{approved}"));
                     Res::Started(Ok(started.clone()))
                 }
+                Req::StartBatch { items, .. } => {
+                    let keys: Vec<String> = items.iter().map(|(p, i)| format!("{p}/{i}")).collect();
+                    let _ = sink.send(format!("start-batch {}", keys.join(" ")));
+                    Res::StartedBatch(Ok(items
+                        .into_iter()
+                        .map(|k| (k, started.clone()))
+                        .collect()))
+                }
                 Req::Refresh { .. } => Res::Refreshed(Ok(())),
                 Req::PreTrust { .. } => {
                     let _ = sink.send("pre-trust".into());
@@ -2025,6 +2271,15 @@ impl SuggestionsFeed {
                 }
                 Req::ShowOnHome { shown, .. } => {
                     let _ = sink.send(format!("show on home {shown}"));
+                    Res::Snapshot(parse())
+                }
+                Req::AutoStart {
+                    provider_id,
+                    criterion,
+                    enabled,
+                    ..
+                } => {
+                    let _ = sink.send(format!("auto-start {provider_id}/{criterion} {enabled}"));
                     Res::Snapshot(parse())
                 }
             }
@@ -2082,6 +2337,139 @@ impl SuggestionsFeed {
     /// The daemon's `pre_trust_agent_folders` as of the last load, when it answered.
     pub(super) fn daemon_pre_trust(&self) -> Option<bool> {
         self.snapshot.as_ref()?.pre_trust
+    }
+
+    /// Whether auto start is on for a kind; `None` when the daemon names no such kind
+    /// or the kind cannot auto start.
+    pub(super) fn auto_start_on(&self, provider_id: &str, criterion: &str) -> Option<bool> {
+        if provider_id == crate::plugin::suggestions::AGENT_PROVIDER_ID {
+            return None;
+        }
+        let provider = self
+            .snapshot
+            .as_ref()?
+            .providers
+            .iter()
+            .find(|p| p.id == provider_id)?;
+        let source = provider.sources.iter().find(|s| s.criterion == criterion)?;
+        Some(source.auto_start.is_some())
+    }
+
+    pub(super) fn set_auto_start(&mut self, provider_id: String, criterion: String, enabled: bool) {
+        let origin = self.origin();
+        self.submit(Req::AutoStart {
+            provider_id,
+            criterion,
+            enabled,
+            origin,
+        });
+    }
+
+    /// Binds the auto start confirmation about to open to the list on screen.
+    pub(super) fn hold_auto_start(&mut self, provider_id: String, criterion: String) {
+        self.held_auto_start = Some((provider_id, criterion, self.origin()));
+    }
+
+    /// Turns auto start on for the kind the confirmation was opened for, unless
+    /// the list has changed or gone since.
+    pub(super) fn confirm_auto_start(&mut self) -> Result<(), &'static str> {
+        let Some((provider_id, criterion, held)) = self.held_auto_start.take() else {
+            return Err("Nothing to turn on.");
+        };
+        if held != self.origin() {
+            return Err("The suggestions list changed, so auto start was not turned on.");
+        }
+        self.submit(Req::AutoStart {
+            provider_id,
+            criterion,
+            enabled: true,
+            origin: held,
+        });
+        Ok(())
+    }
+
+    /// Starts every key through the daemon's batch start, each as a one-click start.
+    pub(super) fn start_batch(&mut self, keys: Vec<ItemKey>) {
+        let origin = self.origin();
+        self.failed = None;
+        self.batch = Some(Batch {
+            pending: keys.clone(),
+            started: 0,
+            review: 0,
+            failed: 0,
+            first_failure: None,
+        });
+        for items in keys.chunks(MAX_START_BATCH) {
+            self.submit(Req::StartBatch {
+                items: items.to_vec(),
+                origin: origin.clone(),
+            });
+        }
+    }
+
+    /// Counts the answer for `key` when it belongs to the batch; the caller
+    /// shows the step. `None` for a start that is not part of one.
+    pub(super) fn batch_answer(
+        &mut self,
+        key: &ItemKey,
+        answer: &StartAnswer,
+    ) -> Option<BatchStep> {
+        let batch = self.batch.as_mut()?;
+        batch
+            .pending
+            .remove(batch.pending.iter().position(|k| k == key)?);
+        let failure = match answer {
+            StartAnswer::Started { .. } | StartAnswer::AlreadyStarted(_) => {
+                batch.started += 1;
+                None
+            }
+            StartAnswer::NeedsTrust { .. } | StartAnswer::TrustChanged => {
+                batch.review += 1;
+                Some("Needs a hooks review".to_string())
+            }
+            StartAnswer::NoProject => {
+                batch.failed += 1;
+                let reason = "Its repo is not linked to a Project yet".to_string();
+                batch.first_failure.get_or_insert_with(|| reason.clone());
+                Some(reason)
+            }
+            StartAnswer::Failed(reason) => {
+                batch.failed += 1;
+                batch.first_failure.get_or_insert_with(|| reason.clone());
+                Some(reason.clone())
+            }
+        };
+        let summary = batch.pending.is_empty().then(|| {
+            let mut parts = Vec::new();
+            if batch.started > 0 {
+                parts.push(format!("started {}", batch.started));
+            }
+            if batch.review > 0 {
+                parts.push(format!(
+                    "{} need a hooks review (Enter on each)",
+                    batch.review
+                ));
+            }
+            if batch.failed > 0 {
+                let why = batch
+                    .first_failure
+                    .as_deref()
+                    .map(|f| format!(": {f}"))
+                    .unwrap_or_default();
+                parts.push(format!("{} could not start{why}", batch.failed));
+            }
+            let text = parts.join(", ");
+            let mut chars = text.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+                + "."
+        });
+        if summary.is_some() {
+            self.batch = None;
+        }
+        Some(BatchStep { failure, summary })
     }
 
     /// Binds the pre-trust confirmation about to open to the list on screen;
@@ -2184,7 +2572,7 @@ impl SuggestionsFeed {
             changed: self.expire_recent(),
             refreshed: false,
             start: None,
-            started: None,
+            started: Vec::new(),
             error: None,
             prepare_failed: None,
             pretrusted: false,
@@ -2194,6 +2582,7 @@ impl SuggestionsFeed {
             Err(TryRecvError::Disconnected) if self.busy => {
                 self.busy = false;
                 self.queued.clear();
+                self.batch = None;
                 self.home_in_flight = None;
                 out.error = Some("The suggestions worker stopped".into());
                 return out;
@@ -2208,6 +2597,7 @@ impl SuggestionsFeed {
             Res::Snapshot(_) => ResKind::Snapshot,
             Res::Prepared(_) => ResKind::Prepare,
             Res::Started(_) => ResKind::Start,
+            Res::StartedBatch(_) => ResKind::StartBatch,
             _ => ResKind::Other,
         };
         match res {
@@ -2237,6 +2627,7 @@ impl SuggestionsFeed {
                     self.dismissing.clear();
                     self.restoring.clear();
                     self.held_trust = None;
+                    self.batch = None;
                 }
                 self.settle_dismissals();
                 self.loaded_at = Some(std::time::Instant::now());
@@ -2252,19 +2643,33 @@ impl SuggestionsFeed {
                 }
             }
             Res::Started(Ok(answer)) => match self.start_key.take() {
-                Some(key) => out.started = Some((key, answer)),
+                Some(key) => out.started.push((key, answer)),
                 None => out.error = Some("Profile changed, suggestion not started".into()),
             },
+            Res::StartedBatch(Ok(answers)) => out.started.extend(answers),
             Res::Snapshot(Err(e))
             | Res::Refreshed(Err(e))
             | Res::Prepared(Err(e))
             | Res::Started(Err(e))
+            | Res::StartedBatch(Err(e))
             | Res::PreTrusted(Err(e)) => {
+                if matches!(req_kind, ResKind::StartBatch) {
+                    // None of it started; a later chunk would only be answered with no batch to join.
+                    self.batch = None;
+                    self.queued
+                        .retain(|req| !matches!(req, Req::StartBatch { .. }));
+                }
                 if matches!(req_kind, ResKind::Prepare) {
                     out.prepare_failed = self.prepare_key.take();
                 }
                 if matches!(req_kind, ResKind::Start) {
-                    self.start_key = None;
+                    if let (Some(key), Some(batch)) = (self.start_key.take(), self.batch.as_mut()) {
+                        batch.pending.retain(|k| *k != key);
+                        batch.failed += 1;
+                        if batch.pending.is_empty() {
+                            self.batch = None;
+                        }
+                    }
                 }
                 if let (ResKind::Snapshot, Some((key, dismissed))) = (req_kind, in_flight_dismiss) {
                     // A failed dismiss or restore leaves the undo window as it was.
@@ -2336,6 +2741,8 @@ mod tests {
             mapping_key: None,
             start: None,
             stale: false,
+            criterion: "assigned".into(),
+            auto_note: None,
         }
     }
 
@@ -2365,6 +2772,7 @@ mod tests {
         store.snapshot = Some(Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![Provider {
                 id: "p".into(),
@@ -2374,6 +2782,7 @@ mod tests {
                 updated_at: Some(crate::time::Timestamp::now().as_unix_secs() - 120),
                 refreshing: false,
                 checks: vec![],
+                sources: vec![],
             }],
             items,
             prefs: shown_prefs(),
@@ -2421,7 +2830,7 @@ mod tests {
                     &Theme::default(),
                     &rig.store,
                     block,
-                    true,
+                    None,
                 )
             })
             .unwrap();
@@ -2467,6 +2876,7 @@ mod tests {
             initial_prompt: "final prompt".into(),
             tool: "claude".into(),
             project: project.map(|path| PreparedProject { path: path.into() }),
+            extra_projects: Vec::new(),
             view: None,
             worktree: false,
             sandbox: false,
@@ -2484,6 +2894,7 @@ mod tests {
         let snapshot = Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![Provider {
                 id: "p".into(),
@@ -2493,6 +2904,7 @@ mod tests {
                 updated_at: None,
                 refreshing: false,
                 checks: vec![],
+                sources: vec![],
             }],
             items: vec![it],
             prefs: shown_prefs(),
@@ -2540,6 +2952,7 @@ mod tests {
         rig.store.snapshot = Some(Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![],
             items: vec![
@@ -2653,10 +3066,18 @@ mod tests {
             at("▾ api") < at("▾ No project"),
             "the window scrolled to the last group"
         );
-        let flat = view_with(vec![item("x", None, false)], idle_worker());
         assert!(
-            !render_text(&flat).contains("No project"),
+            !text.to_lowercase().contains("· no project"),
+            "the heading already says so: {text}"
+        );
+        let flat = render_text(&view_with(vec![item("x", None, false)], idle_worker()));
+        assert!(
+            !flat.contains("▾ No project"),
             "no headings without a resolved project"
+        );
+        assert!(
+            flat.contains("reason · No project"),
+            "with no heading the row says it: {flat}"
         );
     }
 
@@ -2776,6 +3197,7 @@ mod tests {
         rig.store.snapshot = Some(Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![],
             items: vec![item("a", None, dismissed)],
@@ -2788,7 +3210,7 @@ mod tests {
             changed: true,
             refreshed: false,
             start: None,
-            started: None,
+            started: Vec::new(),
             error: None,
             prepare_failed: None,
             pretrusted: false,
@@ -2831,6 +3253,7 @@ mod tests {
         let snapshot = |a: bool, b: bool| Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: None,
             providers: vec![],
             items: vec![item("a", None, a), item("b", None, b)],
@@ -2864,7 +3287,7 @@ mod tests {
             changed: false,
             refreshed: false,
             start: None,
-            started: None,
+            started: Vec::new(),
             error: None,
             prepare_failed: None,
             pretrusted: false,
@@ -3028,7 +3451,10 @@ mod tests {
         let item = |id: &str| rig.store.item(&("p".into(), id.into())).unwrap();
         assert_eq!(rig.store.effective_prompt(item("a")), "review PR 42");
         assert!(rig.store.preset_line(item("a")).unwrap().ends_with("yolo"));
-        assert_eq!(rig.store.effective_prompt(item("b")), "do the thing");
+        assert!(rig
+            .store
+            .effective_prompt(item("b"))
+            .starts_with("Not sent: the expanded prompt exceeds"));
         assert!(!rig.store.preset_line(item("b")).unwrap().contains("yolo"));
     }
 
@@ -3553,6 +3979,7 @@ mod tests {
         let published = |profile: &str| Snapshot {
             daemon: None,
             pre_trust: None,
+            setup_offered: false,
             profile: Some(profile.into()),
             providers: vec![],
             items: vec![item("a", None, false)],
@@ -3617,6 +4044,7 @@ mod tests {
                 Res::Snapshot(Ok(Snapshot {
                     daemon: Some("http://b".into()),
                     pre_trust: None,
+                    setup_offered: false,
                     profile: Some("B".into()),
                     providers: Vec::new(),
                     items: vec![item("a", None, false)],
@@ -3698,7 +4126,7 @@ mod tests {
         rig.view.handle_key(ctrl_n, None, &mut rig.store);
         assert!(rig.view.preparing.is_some() && rig.view.prepare_another);
         let text = render_text(&rig);
-        assert!(text.contains("Ctrl+N new"), "{text}");
+        assert!(text.contains("Ctrl+N another"), "{text}");
     }
 
     /// At 80x24 a heading reads apart from its rows, the divider carries the
@@ -3730,7 +4158,7 @@ mod tests {
         let keys = [
             "↵ start",
             "e change first",
-            "N new",
+            "N another",
             "z dismiss",
             "PgDn more",
             "? all keys",
@@ -3760,7 +4188,7 @@ mod tests {
         let text = render_sized(&rig, None, 80, 24);
         for (key, what) in [
             ("E", "change first"),
-            ("Ctrl+N", "a new session"),
+            ("Ctrl+N", "another session"),
             ("T", "turn on pre-trust"),
         ] {
             assert!(
@@ -3808,11 +4236,11 @@ mod tests {
         assert!(!text.contains("Nothing to suggest"), "{text}");
 
         for offered in [true, false] {
-            let lines = setup_lines(&[], || offered).unwrap().join("\n");
+            let lines = setup_lines(&[], offered).unwrap().join("\n");
             assert_eq!(lines.contains("Set up suggestions"), offered, "{lines}");
             assert!(lines.contains("Settings › Suggestions"), "{lines}");
         }
-        assert!(setup_lines(&[false, true], || true).is_none());
+        assert!(setup_lines(&[false, true], true).is_none());
     }
 
     #[test]
@@ -3829,7 +4257,7 @@ mod tests {
 
     #[test]
     fn key_rows_never_split_a_key_from_its_label() {
-        let units: Vec<String> = ["↵ start", "e change first", "N new", "Esc back"]
+        let units: Vec<String> = ["↵ start", "e change first", "N another", "Esc back"]
             .map(str::to_string)
             .to_vec();
         for width in [1, 10, 20, 40] {

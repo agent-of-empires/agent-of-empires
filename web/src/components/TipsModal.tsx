@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { TipDto } from "../lib/api";
+import { BUTTON_PRIMARY, BUTTON_SECONDARY } from "../lib/surfaces";
+import { Dialog } from "./Dialog";
 
 interface Props {
   tips: TipDto[];
@@ -51,37 +53,26 @@ export function TipsModal({ tips, startIndex, enabled, onMarkSeen, onSetEnabled,
   const current = tips[index];
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="tips-modal-title"
-      className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 animate-fade-in"
-      onClick={onClose}
-    >
-      <div
-        className="bg-surface-800 border border-surface-700/50 rounded-lg w-[480px] max-w-[90vw] max-h-[80vh] flex flex-col shadow-2xl animate-slide-up"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-5 py-4 border-b border-surface-700 flex items-center gap-2">
+    <Dialog
+      id="tips-modal"
+      describedBy={false}
+      panelClassName="md:w-[480px] md:max-h-[80vh]"
+      bodyClassName="min-h-[7rem]"
+      onDismiss={onClose}
+      title={
+        <>
           <span aria-hidden="true">💡</span>
-          <h2 id="tips-modal-title" className="text-sm font-semibold text-text-bright">
-            Tip of the day
-          </h2>
-        </div>
-
-        <div className="p-5 overflow-y-auto min-h-[7rem]">
-          {current ? (
-            <>
-              <h3 className="text-sm font-semibold text-text-primary mb-2">{current.title}</h3>
-              <p className="text-sm text-text-secondary">{current.body}</p>
-            </>
-          ) : (
-            <p className="text-sm text-text-dim">No tips right now. Check back after a new release.</p>
-          )}
-        </div>
-
-        <div className="px-5 py-3 border-t border-surface-700 flex items-center justify-between gap-2">
-          <label className="flex items-center gap-2 text-xs text-text-secondary cursor-pointer select-none">
+          <span className="text-text-bright">Tip of the day</span>
+        </>
+      }
+      headerEnd={
+        count > 1 && (
+          <span className="shrink-0 text-[13px] md:text-xs text-text-dim">{`Tip ${index + 1} of ${count}`}</span>
+        )
+      }
+      footer={
+        <>
+          <label className="mr-auto max-md:basis-full max-md:min-h-11 flex items-center gap-2 text-[15px] md:text-xs text-text-secondary cursor-pointer select-none">
             <input
               type="checkbox"
               checked={enabled}
@@ -90,35 +81,26 @@ export function TipsModal({ tips, startIndex, enabled, onMarkSeen, onSetEnabled,
             />
             Show tips on startup
           </label>
-          {count > 1 && <span className="text-xs text-text-dim">{`Tip ${index + 1} of ${count}`}</span>}
-        </div>
-
-        <div className="px-5 py-3 border-t border-surface-700 flex items-center justify-between gap-2">
-          <div className="flex gap-2">
-            <button
-              onClick={() => go(index - 1)}
-              disabled={count <= 1}
-              className="h-8 px-3 rounded-md border border-surface-700/50 text-sm text-text-secondary hover:bg-surface-850 hover:text-text-primary transition-colors duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-default"
-            >
-              Previous
-            </button>
-            <button
-              onClick={() => go(index + 1)}
-              disabled={count <= 1}
-              className="h-8 px-3 rounded-md border border-surface-700/50 text-sm text-text-secondary hover:bg-surface-850 hover:text-text-primary transition-colors duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-default"
-            >
-              Next
-            </button>
-          </div>
-          <button
-            ref={closeRef}
-            onClick={onClose}
-            className="h-8 px-3 rounded-md bg-brand-600 text-sm text-white hover:bg-brand-500 transition-colors duration-150 cursor-pointer"
-          >
+          <button type="button" onClick={() => go(index - 1)} disabled={count <= 1} className={BUTTON_SECONDARY}>
+            Previous
+          </button>
+          <button type="button" onClick={() => go(index + 1)} disabled={count <= 1} className={BUTTON_SECONDARY}>
+            Next
+          </button>
+          <button type="button" ref={closeRef} onClick={onClose} className={BUTTON_PRIMARY}>
             Close
           </button>
-        </div>
-      </div>
-    </div>
+        </>
+      }
+    >
+      {current ? (
+        <>
+          <h3 className="text-[15px] md:text-sm font-semibold text-text-primary mb-2">{current.title}</h3>
+          <p className="text-[15px] md:text-sm text-text-secondary">{current.body}</p>
+        </>
+      ) : (
+        <p className="text-[15px] md:text-sm text-text-dim">No tips right now. Check back after a new release.</p>
+      )}
+    </Dialog>
   );
 }

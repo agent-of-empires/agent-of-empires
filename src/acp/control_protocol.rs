@@ -1,4 +1,4 @@
-//! Control protocol v4 between `aoe serve` and `aoe __acp-runner`, carried
+//! Control protocol v5 between `aoe serve` and `aoe __acp-runner`, carried
 //! over `<id>.control.sock`.
 
 use anyhow::{bail, Result};
@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current wire generation.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
 
 /// Maximum NDJSON frame accepted from the ACP agent.
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -59,7 +59,14 @@ pub enum ControlBody {
     SessionReady {
         acp_session_id: String,
         result: serde_json::Value,
+        /// `_meta.aoe` adapter frames the agent has sent that this connection
+        /// will not receive again: the runner counts every one, and the
+        /// backlog it still holds is replayed after this frame.
+        adapter_frames: u64,
     },
+    /// Adapter frames the runner shed from a full queue. They stay numbered by
+    /// the proxy, so the daemon counts them in the position they held.
+    AdapterFramesShed { count: u64 },
     /// The runner-owned handshake failed (agent incompatible, `session/new`
     /// error, transport failure).
     HandshakeFailed { error: serde_json::Value },
@@ -288,7 +295,9 @@ mod tests {
             ControlBody::SessionReady {
                 acp_session_id: "sess-1".into(),
                 result: serde_json::json!({"sessionId": "sess-1"}),
+                adapter_frames: 0,
             },
+            ControlBody::AdapterFramesShed { count: 3 },
             ControlBody::ResumeSession,
             ControlBody::HandshakeFailed {
                 error: serde_json::json!({"code": -32603, "message": "incompatible"}),

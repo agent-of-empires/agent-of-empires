@@ -4,11 +4,14 @@ import {
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
+  START_BATCH_MAX,
   startSuggestion,
+  startSuggestions,
   trashSession,
   updateSuggestionSource,
   type StartHooksReview,
   type StartOptions,
+  type StartResult,
   type SuggestionResult,
 } from "../lib/api";
 import { useServerDown } from "../lib/connectionState";
@@ -26,6 +29,8 @@ export interface StartFailure {
   retryable: boolean;
 }
 
+type StartKind = Awaited<ReturnType<typeof startSuggestion>>["kind"];
+
 /** A Start paused on the repo's hooks, until the user approves or cancels. */
 export interface HooksReview {
   item: SuggestionItem;
@@ -34,6 +39,8 @@ export interface HooksReview {
 }
 
 const REFRESH_POLL_MS = 2000;
+// ponytail: no push channel for suggestions, so an idle view polls; replace with a Daemon event if one lands.
+const IDLE_POLL_MS = 60_000;
 const UNDO_MS = 10_000;
 export const suggestionKey = (item: SuggestionItem) => `${item.provider_id}:${item.id}`;
 
@@ -82,13 +89,14 @@ export function useSuggestions(
     if (mounted.current) setLoadTick((t) => t + 1);
   }, [apply]);
 
-  // While a provider refreshes, follow it until it answers.
-  const refreshingProvider = !!snapshot && !idleFor?.(snapshot) && snapshot.providers.some((p) => p.refreshing);
+  // Re-read so later provider results show; while a provider refreshes, follow it closely.
+  const following = !!snapshot && !offline && !idleFor?.(snapshot);
+  const delay = snapshot?.providers.some((p) => p.refreshing) ? REFRESH_POLL_MS : IDLE_POLL_MS;
   useEffect(() => {
-    if (!refreshingProvider) return;
-    const timer = setTimeout(() => void load(), REFRESH_POLL_MS);
+    if (!following) return;
+    const timer = setTimeout(() => void load(), delay);
     return () => clearTimeout(timer);
-  }, [refreshingProvider, loadTick, load]);
+  }, [following, delay, loadTick, load]);
 
   useEffect(() => {
     mounted.current = true;
@@ -132,17 +140,30 @@ export function useSuggestions(
   const dropReview = (key: string) => setReviews((q) => q.filter((r) => suggestionKey(r.item) !== key));
 
   // One-click start with the kind's preset. A paused hooks review resumes through `approveHooks`.
-  const start = async (item: SuggestionItem, options: StartOptions = {}) => {
+  // `batch` keeps a start that needs a choice on its row instead of opening the wizard, and
+  // leaves the reload to the caller.
+  const start = async (item: SuggestionItem, options: StartOptions = {}, batch = false): Promise<StartKind> => {
     const key = suggestionKey(item);
     setStarting((s) => (s.includes(key) ? s : [...s, key]));
     setNotice(null);
     const result = await startSuggestion(item.provider_id, item.id, options);
+    return settle(item, result, options, batch);
+  };
+
+  // Shows what the daemon answered for `item`; `start` and `startMany` both end here.
+  const settle = async (
+    item: SuggestionItem,
+    result: StartResult,
+    options: StartOptions,
+    batch: boolean,
+  ): Promise<StartKind> => {
+    const key = suggestionKey(item);
     setStarting((s) => s.filter((k) => k !== key));
     if (!mounted.current) {
       // No row to show the reason on any more.
       if (result.kind === "failed") reportError(result.reason);
       else if (result.kind === "error") reportError(result.error);
-      if (result.kind !== "started") return;
+      if (result.kind !== "started") return result.kind;
     }
     switch (result.kind) {
       case "started": {
@@ -186,13 +207,12 @@ export function useSuggestions(
             ? q.map((r) => (suggestionKey(r.item) === key ? next : r))
             : [...q, next],
         );
-        return;
+        return result.kind;
       }
       case "trust_changed":
         // Repeating without approval returns a fresh review.
         dropReview(key);
-        await start(item, { ...options, approve_hooks: undefined, review_fingerprint: undefined });
-        return;
+        return start(item, { ...options, approve_hooks: undefined, review_fingerprint: undefined }, batch);
       case "failed":
         dropReview(key);
         setFailures((f) => ({
@@ -201,9 +221,20 @@ export function useSuggestions(
         }));
         break;
       case "no_project":
+        if (batch) {
+          setFailures((f) => ({
+            ...f,
+            [key]: {
+              reason: "Its repo is not linked to a Project yet.",
+              hint: "Use Start in\u2026 or Start with changes.",
+              retryable: true,
+            },
+          }));
+          break;
+        }
         // Nothing to link to without a choice, so the wizard's project picker takes over.
         await startWithChanges(item);
-        return;
+        return result.kind;
       case "stale":
         dropReview(key);
         setNotice(STALE_NOTICE);
@@ -217,7 +248,36 @@ export function useSuggestions(
         dropReview(key);
         break;
     }
-    await load();
+    if (!batch) await load();
+    return result.kind;
+  };
+
+  // Starts the items through the daemon's batch start. A failure does not stop the rest;
+  // a hooks review waits in the queue for its turn.
+  const startMany = async (items: SuggestionItem[]) => {
+    const keys = items.map(suggestionKey);
+    setStarting((s) => [...s, ...keys.filter((k) => !s.includes(k))]);
+    setNotice(null);
+    const results: StartResult[] = [];
+    for (let i = 0; i < items.length; i += START_BATCH_MAX) {
+      const chunk = items.slice(i, i + START_BATCH_MAX).map(({ provider_id, id }) => ({ provider_id, id }));
+      results.push(...(await startSuggestions(chunk)));
+    }
+    const tally = { started: 0, review: 0, attention: 0 };
+    for (const [i, item] of items.entries()) {
+      const kind = await settle(item, results[i]!, {}, true);
+      if (kind === "started" || kind === "already_started") tally.started++;
+      else if (kind === "hooks_need_trust") tally.review++;
+      else tally.attention++;
+    }
+    if (mounted.current) await load();
+    const parts = [
+      tally.started && `started ${tally.started}`,
+      tally.review && `${tally.review} waiting for a hooks review`,
+      tally.attention && `${tally.attention} could not start (see the rows)`,
+    ].filter(Boolean);
+    toastBus.handler?.info(`${parts.join(", ").replace(/^./, (c) => c.toUpperCase())}.`);
+    return tally;
   };
 
   // The suggestion stays linked to a live Session, so the blocked one goes to Trash before a fresh Start.
@@ -292,6 +352,7 @@ export function useSuggestions(
     act,
     refresh,
     start,
+    startMany,
     startWithChanges,
     approveHooks,
     retryBlocked,
