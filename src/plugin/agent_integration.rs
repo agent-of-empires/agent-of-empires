@@ -362,19 +362,24 @@ pub(crate) fn declared_agent<'a>(
     })
 }
 
-/// Ready markers from the declaration that owns `tool`'s launch, or `None` when
-/// no active plugin declares the name. `Some` with an empty list is a
-/// declaration whose input box cannot be told from a dialog.
-pub(crate) fn declared_ready_markers(tool: &str) -> Option<Vec<String>> {
-    declared_agent(super::registry(), tool, std::iter::empty()).and_then(|agent| {
-        agent.with_definition(|definition| {
-            definition
-                .ready_markers
-                .iter()
-                .map(|marker| marker.to_string())
-                .collect()
-        })
-    })
+/// The launch command and ready markers the declaration owning `tool` provides,
+/// or `None` when no active plugin declares the name or a configured custom
+/// agent claims it. Empty markers mean the input box cannot be told from a
+/// dialog.
+pub(crate) fn declared_launch<'a>(
+    tool: &str,
+    custom_names: impl IntoIterator<Item = &'a str>,
+) -> Option<(String, Vec<String>)> {
+    let agent = declared_agent(super::registry(), tool, custom_names)?;
+    let command = agent.contribution().command.clone()?;
+    let markers = agent.with_definition(|definition| {
+        definition
+            .ready_markers
+            .iter()
+            .map(|marker| marker.to_string())
+            .collect()
+    })?;
+    Some((command, markers))
 }
 
 /// Whether a character could spoof or rewrite displayed text: control
@@ -2367,11 +2372,21 @@ oneshot_flag = "-p"
         );
 
         // The `aoe add --prompt` gate answers the same way before any row exists.
-        assert!(declared_ready_markers("marker-helper").is_some_and(|markers| !markers.is_empty()));
-        assert!(
-            declared_ready_markers("markerless-helper").is_some_and(|markers| markers.is_empty())
+        let declared = |tool: &str| {
+            declared_launch(tool, std::iter::empty())
+                .map(|(command, markers)| (command, !markers.is_empty()))
+        };
+        assert_eq!(
+            declared("marker-helper"),
+            Some(("marker-helper".to_string(), true))
         );
-        assert_eq!(declared_ready_markers("claude"), None);
+        assert_eq!(
+            declared("markerless-helper"),
+            Some(("markerless-helper".to_string(), false))
+        );
+        assert_eq!(declared("claude"), None);
+        // A configured custom agent of the same name claims the launch.
+        assert_eq!(declared_launch("marker-helper", ["marker-helper"]), None);
 
         // A launch stores the declaration's command, so the delivery guard has
         // to read that as the agent's own program; a wrapper still loses it.
@@ -2389,7 +2404,7 @@ oneshot_flag = "-p"
         })
         .unwrap();
         super::super::reload_registry();
-        assert_eq!(declared_ready_markers("marker-helper"), None);
+        assert_eq!(declared_launch("marker-helper", std::iter::empty()), None);
         assert!(instance("marker-helper").ready_markers().is_empty());
     }
 
