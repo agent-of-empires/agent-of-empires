@@ -314,6 +314,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "aoe-plugin-api"
 version = "1.26.0"
 dependencies = [
+ "regex",
  "semver",
  "serde",
  "serde_json",

@@ -2626,7 +2626,7 @@ impl SessionService {
         let Some(classified) = self.agent_profile(id, None).await else {
             return;
         };
-        let (sub, combined) = queue_drain_batch(&queue, classified.profile);
+        let (sub, combined) = queue_drain_batch(&queue, &classified.profile);
         if classified.profile.is_clear_command(&combined) && control.has_active_background_agent() {
             return;
         }
@@ -2999,17 +2999,19 @@ impl SessionService {
             )
         };
         let agent = match self.acp_supervisor.worker_agent_key(id).await {
-            Some(key)
-                if text
-                    .is_some_and(|t| !crate::acp::agent_profiles::could_be_declared_alias(t)) =>
-            {
-                let profile = crate::acp::agent_profiles::resolve(&key);
-                return Some(Classified {
-                    agent: key,
-                    profile,
-                });
+            Some(key) => {
+                let undeclared = text
+                    .is_some_and(|t| !crate::acp::agent_profiles::could_be_declared_alias(t))
+                    .then(|| crate::acp::agent_profiles::resolve_undeclared(&key))
+                    .flatten();
+                if let Some(profile) = undeclared {
+                    return Some(Classified {
+                        agent: key,
+                        profile,
+                    });
+                }
+                SessionAgent::Worker(key)
             }
-            Some(key) => SessionAgent::Worker(key),
             None => next,
         };
         Some(agent.classify(&source_profile, &project_path).await)
@@ -4678,7 +4680,7 @@ mod tests {
                         },
                         Some(crate::acp::supervisor::Classified {
                             agent: "opencode".into(),
-                            profile: &crate::acp::agent_profiles::OPENCODE,
+                            profile: crate::acp::agent_profiles::OPENCODE.clone(),
                         }),
                     )
                     .await
@@ -4759,7 +4761,7 @@ mod tests {
         let _live = save_agent_record(id, "claude", true);
         let cut_for_bridge = crate::acp::supervisor::Classified {
             agent: "bridge".into(),
-            profile: &crate::acp::agent_profiles::CUSTOM_NEW,
+            profile: crate::acp::agent_profiles::CUSTOM_NEW.clone(),
         };
         let outcome = service
             .send_classified_turn(

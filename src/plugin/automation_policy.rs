@@ -8,6 +8,7 @@ use rusqlite::Connection;
 
 use aoe_plugin_api::acp::ApprovalClass;
 
+use crate::acp::agent_profiles::ResolvedProfile;
 use crate::acp::option_catalog::AgentOptionEntry;
 use crate::acp::state::ConfigOptionCategory;
 use crate::events;
@@ -40,12 +41,12 @@ pub(crate) enum ModeDecision {
 }
 
 pub(crate) fn classify_mode(
-    agent_key: &str,
+    resolved: &ResolvedProfile,
     mode_id: Option<&str>,
     catalog: Option<&AgentOptionEntry>,
 ) -> ModeDecision {
-    let profile = crate::acp::agent_profiles::resolve(agent_key);
-    let reviewed = crate::acp::agent_profiles::is_reviewed(agent_key);
+    let profile = &resolved.profile;
+    let reviewed = resolved.reviewed();
 
     let Some(mode_id) = mode_id else {
         return ModeDecision::Class(if reviewed {
@@ -54,7 +55,7 @@ pub(crate) fn classify_mode(
             ApprovalClass::Unattended
         });
     };
-    if profile.yolo_mode_id == Some(mode_id) {
+    if profile.yolo_mode_id.as_deref() == Some(mode_id) {
         return ModeDecision::Class(ApprovalClass::Unattended);
     }
     if let Some((_, class)) = TRUSTED_MODE_TABLE.iter().find(|(id, _)| *id == mode_id) {
@@ -262,6 +263,8 @@ mod tests {
         use ApprovalClass::*;
         use ModeDecision::*;
         let catalog = catalog_with_modes(&["default", "plan", "acceptEdits", "customMode"]);
+        let registry =
+            std::sync::Arc::new(crate::plugin::PluginRegistry::from_test_plugins(Vec::new()));
 
         // agent, mode, catalog discovered, decision
         let cases = [
@@ -286,7 +289,12 @@ mod tests {
             ("shady-agent", Some("acceptEdits"), false, Class(Unattended)),
         ];
         for (agent, mode, discovered, expected) in cases {
-            let seen = classify_mode(agent, mode, discovered.then_some(&catalog));
+            let resolved = crate::acp::agent_profiles::resolve_for(
+                registry.clone(),
+                agent,
+                std::iter::empty(),
+            );
+            let seen = classify_mode(&resolved, mode, discovered.then_some(&catalog));
             assert_eq!(seen, expected, "{agent} {mode:?} discovered={discovered}");
         }
     }

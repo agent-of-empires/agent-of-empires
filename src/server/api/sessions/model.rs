@@ -39,14 +39,18 @@ pub(super) fn session_response_from_instance_with_plan(
     };
     let row = SessionProjection::new(inst, &inst.source_profile);
     // Same agent resolution as `acp_agent`.
-    let agent_profile = crate::acp::agent_profiles::resolve(
+    let agent_profile = crate::acp::agent_profiles::resolve_for(
+        crate::plugin::registry(),
         inst.agent_name
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or(inst.tool.as_str()),
-    );
+        // No session config here, so a shadowing custom agent is not known.
+        std::iter::empty(),
+    )
+    .profile;
     let agent_profile_wire = crate::acp::agent_profiles::AgentProfileWire::new(
-        agent_profile,
+        &agent_profile,
         agent_profile.probe_fullscreen(probes),
     );
     let timestamp = |value: Option<Timestamp>| value.map(|t| t.to_rfc3339());

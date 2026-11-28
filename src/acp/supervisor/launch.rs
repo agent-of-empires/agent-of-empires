@@ -456,10 +456,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
 
         if req.acp_mode_id.is_some() || req.yolo_mode {
-            let mode_id = req
-                .acp_mode_id
-                .as_deref()
-                .or_else(|| crate::acp::agent_profiles::resolve(&req.agent).yolo_mode_id);
+            let mode_id = req.acp_mode_id.as_deref().or_else(|| {
+                crate::acp::agent_profiles::resolve(&req.agent)
+                    .yolo_mode_id
+                    .as_deref()
+            });
             apply_mode(&client, session_id, mode_id, "spawn").await;
         }
         Ok(())

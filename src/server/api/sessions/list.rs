@@ -149,17 +149,17 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // the constructor. Distinct `(profile, project_path)` pairs resolve once via
     // the shared cache.
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
+        // The key the constructor resolved built-ins with: `agent_name`, else `tool`.
+        let agent_key = inst
+            .agent_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&inst.tool);
         if !resp.acp_capable {
             let cfg = session_cfg_cache.resolve(
                 &inst.source_profile,
                 &inst.repo_config_path().to_string_lossy(),
             );
-            // The key the constructor resolved built-ins with: `agent_name`, else `tool`.
-            let agent_key = inst
-                .agent_name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&inst.tool);
             resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
             resp.acp_can_fork =
                 crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
@@ -175,18 +175,37 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                     explicit: inst.agent_name.clone(),
                 },
             };
-            let profile = match &agent {
-                SessionAgent::Worker(key) if crate::acp::agent_profiles::is_builtin(key) => {
-                    crate::acp::agent_profiles::resolve(key)
+            let builtin = match &agent {
+                SessionAgent::Worker(key) => {
+                    crate::acp::agent_profiles::resolve_builtin_undeclared(key)
                 }
-                _ => {
+                SessionAgent::Next { .. } => None,
+            };
+            let profile = match builtin {
+                Some(profile) => profile,
+                None => {
                     let (session_cfg, default_agent) =
                         session_cfg_cache.profile_config(&inst.source_profile, &inst.project_path);
                     agent.profile_with(&acp_registry, session_cfg, default_agent)
                 }
             };
             resp.agent_profile = crate::acp::agent_profiles::AgentProfileWire::new(
-                profile,
+                &profile,
+                profile.probe_fullscreen(&probes),
+            );
+            resp.claude_fullscreen = inst.tool == "claude" && resp.agent_profile.fullscreen;
+        } else if crate::acp::agent_profiles::resolve_undeclared(agent_key).is_none() {
+            // A terminal row's tool a plugin declares: a custom agent of that name shadows it.
+            let (session_cfg, _) =
+                session_cfg_cache.profile_config(&inst.source_profile, &inst.project_path);
+            let profile = crate::acp::agent_profiles::resolve_for(
+                crate::plugin::registry(),
+                agent_key,
+                crate::acp::agent_profiles::custom_agent_names(session_cfg),
+            )
+            .profile;
+            resp.agent_profile = crate::acp::agent_profiles::AgentProfileWire::new(
+                &profile,
                 profile.probe_fullscreen(&probes),
             );
             resp.claude_fullscreen = inst.tool == "claude" && resp.agent_profile.fullscreen;
@@ -332,6 +351,38 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         }
     }
 
+    // Sessions whose daemon queue holds messages, with what decides why it waits.
+    let queue_probes: Vec<(
+        usize,
+        String,
+        String,
+        std::sync::Arc<crate::acp::agent_profiles::AgentProfile>,
+        bool,
+    )> = scoped_instances
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| inst.is_structured() && !inst.is_archived() && !inst.is_trashed())
+        .filter_map(|(i, inst)| {
+            let first = inst.queued_prompts.first()?;
+            let agent_key = inst.agent_name.as_deref().unwrap_or(&inst.tool);
+            let (session_cfg, _) =
+                session_cfg_cache.profile_config(&inst.source_profile, &inst.project_path);
+            let profile = crate::acp::agent_profiles::resolve_for(
+                crate::plugin::registry(),
+                agent_key,
+                crate::acp::agent_profiles::custom_agent_names(session_cfg),
+            )
+            .profile;
+            Some((
+                i,
+                inst.id.clone(),
+                first.text.clone(),
+                profile,
+                inst.is_idle_dormant(),
+            ))
+        })
+        .collect();
+
     drop(session_cfg_store);
     // Both overlays have run, so the count is final for this request.
     let resolver_misses = state
@@ -344,24 +395,6 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         resolver_misses,
         "list_sessions resolved session config once per unique profile/project pair"
     );
-
-    // Sessions whose daemon queue holds messages, with what decides why it waits.
-    let queue_probes: Vec<(usize, String, String, String, bool)> = scoped_instances
-        .iter()
-        .enumerate()
-        .filter(|(_, inst)| inst.is_structured() && !inst.is_archived() && !inst.is_trashed())
-        .filter_map(|(i, inst)| {
-            let first = inst.queued_prompts.first()?;
-            let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
-            Some((
-                i,
-                inst.id.clone(),
-                first.text.clone(),
-                agent_key,
-                inst.is_idle_dormant(),
-            ))
-        })
-        .collect();
 
     // The park probe touches config files and SQLite, so it runs with the
     // session registry unlocked rather than holding writers behind it.
@@ -424,7 +457,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
 
     // After the park overlay, which is one of its inputs, and unlocked, because the fold
     // takes the registry lock itself.
-    for (i, id, first, agent_key, idle_dormant) in queue_probes {
+    for (i, id, first, profile, idle_dormant) in queue_probes {
         use crate::daemon::AcpWorkerState::{Resuming, Running};
         let worker = crate::acp::dispatch::WorkerLiveness {
             running: matches!(sessions[i].acp_worker_state, Resuming | Running),
@@ -432,7 +465,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             rate_limit_parked: sessions[i].rate_limit.is_some(),
         };
         let control = state.session_service.fold_control_state(&id).await;
-        let solo = crate::acp::agent_profiles::resolve(&agent_key).is_solo_command(&first);
+        let solo = profile.is_solo_command(&first);
         sessions[i].queue_reason = crate::acp::dispatch::queue_hold(&control, worker, solo);
     }
 

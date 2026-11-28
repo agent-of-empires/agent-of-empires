@@ -21,3 +21,5 @@ sha2 = "0.11"
 # Parses and matches the manifest's `aoe_version` host-compatibility range.
 # Direct dep here (not via the host) so this crate stays standalone.
 semver = "1"
+# Compiles the declared memory-path regex during manifest validation.
+regex = "1.10"

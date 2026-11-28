@@ -885,6 +885,261 @@ fn validate_config_dir_var(
     );
 }
 
+fn profile_list_ok(values: &[String], text_ok: impl Fn(&str) -> bool) -> bool {
+    values.len() <= crate::agent_integration::AGENT_PROFILE_LIST_MAX
+        && values.iter().all(|value| {
+            !value.is_empty()
+                && value.len() <= crate::agent_integration::AGENT_PROFILE_STRING_MAX
+                && value.chars().all(declaration_character_ok)
+                && text_ok(value)
+        })
+        && values
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == values.len()
+}
+
+fn slash_alias_ok(alias: &str) -> bool {
+    alias.starts_with('/') && !alias.chars().any(char::is_whitespace)
+}
+
+/// End index of a `{n}`, `{n,}` or `{n,m}` repeat starting at `chars[i] == '{'`.
+fn brace_quantifier(chars: &[char], i: usize) -> Option<usize> {
+    let close = chars[i..].iter().position(|&c| c == '}')? + i;
+    let body: String = chars[i + 1..close].iter().collect();
+    let (lo, hi) = body.split_once(',').unwrap_or((&body, &body));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    (!lo.is_empty() && digits(lo) && digits(hi)).then_some(close)
+}
+
+/// True when any repeat (`*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}`) applies to a group that holds
+/// a quantifier or an alternation: such patterns backtrack catastrophically in the browser's
+/// regex engine.
+fn has_nested_quantifier(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut groups: Vec<bool> = Vec::new();
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            _ if in_class => in_class = chars[i] != ']',
+            '[' => in_class = true,
+            '(' => {
+                groups.push(false);
+                if chars.get(i + 1) == Some(&'?') {
+                    i += 1;
+                }
+            }
+            ')' => {
+                let inner = groups.pop().unwrap_or(false);
+                let repeated = match chars.get(i + 1) {
+                    Some('*' | '+' | '?') => true,
+                    Some('{') => brace_quantifier(&chars, i + 1).is_some(),
+                    _ => false,
+                };
+                if inner && repeated {
+                    return true;
+                }
+                if let Some(parent) = groups.last_mut() {
+                    *parent |= inner;
+                }
+            }
+            '*' | '+' | '?' | '|' => {
+                if let Some(group) = groups.last_mut() {
+                    *group = true;
+                }
+            }
+            '{' => {
+                if let Some(end) = brace_quantifier(&chars, i) {
+                    if let Some(group) = groups.last_mut() {
+                        *group = true;
+                    }
+                    i = end;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Number of quantifiers (`*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}`) in the pattern. A `?` that
+/// makes a quantifier lazy, and the `?` of `(?:`, do not count. Sequential overlapping
+/// quantifiers backtrack polynomially in the browser's regex engine.
+fn quantifier_count(pattern: &str) -> usize {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut count = 0;
+    let mut in_class = false;
+    let mut after_quantifier = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let mut quantifier = false;
+        match chars[i] {
+            '\\' => i += 1,
+            _ if in_class => in_class = chars[i] != ']',
+            '[' => in_class = true,
+            '(' => i += usize::from(chars.get(i + 1) == Some(&'?')),
+            '?' if after_quantifier => {}
+            '*' | '+' | '?' => {
+                count += 1;
+                quantifier = true;
+            }
+            '{' => {
+                if let Some(end) = brace_quantifier(&chars, i) {
+                    count += 1;
+                    quantifier = true;
+                    i = end;
+                }
+            }
+            _ => {}
+        }
+        after_quantifier = quantifier;
+        i += 1;
+    }
+    count
+}
+
+/// True when the pattern uses syntax the Rust `regex` crate accepts but a browser's
+/// `RegExp` rejects or reads differently: every `(?` group but `(?:`, and the escapes `\A`,
+/// `\z`, `\Z`, `\p`, `\P`, `\U`, `\a`, `\<`, `\>`, `\x{`, `\u{` and `\b{`, and inside a
+/// bracket class a nested `[` (POSIX classes) or the set operators `&&`, `--` and `~~`.
+fn has_rust_only_regex_syntax(pattern: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                let next = chars.get(i + 1);
+                let braced = chars.get(i + 2) == Some(&'{');
+                if matches!(
+                    next,
+                    Some('A' | 'z' | 'Z' | 'p' | 'P' | 'U' | 'a' | '<' | '>')
+                ) || (matches!(next, Some('x' | 'u' | 'b')) && braced)
+                {
+                    return true;
+                }
+                i += 1;
+            }
+            _ if in_class => {
+                let c = chars[i];
+                if c == '[' || (matches!(c, '&' | '-' | '~') && chars.get(i + 1) == Some(&c)) {
+                    return true;
+                }
+                in_class = c != ']';
+            }
+            '[' => in_class = true,
+            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) != Some(&':') => {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn validate_agent_profile(
+    i: usize,
+    profile: &crate::agent_integration::AgentProfileDeclaration,
+    check: &mut impl FnMut(bool, String),
+) {
+    use crate::agent_integration::{
+        AGENT_PROFILE_LIST_MAX, AGENT_PROFILE_REGEX_MAX, AGENT_PROFILE_STRING_MAX,
+    };
+    const AGENT_PROFILE_REGEX_QUANTIFIER_MAX: usize = 2;
+    let cards = &profile.card_aliases;
+    let titles = &profile.special_titles;
+    let lists: [(&str, &[String]); 14] = [
+        ("parent_meta_namespaces", &profile.parent_meta_namespaces),
+        ("subagent_tool_names", &profile.subagent_tool_names),
+        ("mcp_prefixes", &profile.mcp_prefixes),
+        ("card_aliases.execute", &cards.execute),
+        ("card_aliases.read", &cards.read),
+        ("card_aliases.edit", &cards.edit),
+        ("card_aliases.delete", &cards.delete),
+        ("card_aliases.search", &cards.search),
+        ("card_aliases.fetch", &cards.fetch),
+        ("card_aliases.think", &cards.think),
+        ("special_titles.skill_names", &titles.skill_names),
+        ("special_titles.schedule_names", &titles.schedule_names),
+        ("special_titles.harness_names", &titles.harness_names),
+        ("special_titles.workflow_names", &titles.workflow_names),
+    ];
+    for (field, values) in lists {
+        check(
+            profile_list_ok(values, |_| true),
+            format!(
+                "agent_integrations[{i}].profile.{field} must hold at most {AGENT_PROFILE_LIST_MAX} \
+                 unique, nonempty printable strings of at most {AGENT_PROFILE_STRING_MAX} bytes"
+            ),
+        );
+    }
+    for (field, values) in [
+        ("clear_aliases", &profile.clear_aliases),
+        ("compact_aliases", &profile.compact_aliases),
+    ] {
+        check(
+            profile_list_ok(values, slash_alias_ok),
+            format!(
+                "agent_integrations[{i}].profile.{field} must hold at most {AGENT_PROFILE_LIST_MAX} \
+                 unique single-token slash commands of at most {AGENT_PROFILE_STRING_MAX} bytes"
+            ),
+        );
+    }
+    if let Some(id) = &profile.yolo_mode_id {
+        check(
+            profile_list_ok(std::slice::from_ref(id), |_| true),
+            format!(
+                "agent_integrations[{i}].profile.yolo_mode_id must be 1..={AGENT_PROFILE_STRING_MAX} \
+                 printable bytes"
+            ),
+        );
+    }
+    if let Some(pattern) = &profile.memory_path_regex {
+        let ok = !pattern.is_empty()
+            && pattern.len() <= AGENT_PROFILE_REGEX_MAX
+            && pattern.chars().all(declaration_character_ok)
+            && regex::RegexBuilder::new(pattern)
+                .size_limit(1 << 20)
+                .build()
+                .is_ok();
+        check(
+            ok,
+            format!(
+                "agent_integrations[{i}].profile.memory_path_regex must be a printable regex of \
+                 1..={AGENT_PROFILE_REGEX_MAX} bytes that compiles"
+            ),
+        );
+        check(
+            !has_nested_quantifier(pattern),
+            format!(
+                "agent_integrations[{i}].profile.memory_path_regex must not repeat a group that \
+                 holds a quantifier or an alternation"
+            ),
+        );
+        check(
+            quantifier_count(pattern) <= AGENT_PROFILE_REGEX_QUANTIFIER_MAX,
+            format!(
+                "agent_integrations[{i}].profile.memory_path_regex must have at most \
+                 {AGENT_PROFILE_REGEX_QUANTIFIER_MAX} quantifiers (`*`, `+`, `?`, `{{n}}`, `{{n,}}`, \
+                 `{{n,m}}`)"
+            ),
+        );
+        check(
+            !has_rust_only_regex_syntax(pattern),
+            format!(
+                "agent_integrations[{i}].profile.memory_path_regex must not use `(?` groups other \
+                 than `(?:`, or Rust-only escapes (`\\A`, `\\z`, `\\Z`, `\\p`, `\\P`, `\\x{{`, \
+                 `\\u{{`), which browsers do not read the same"
+            ),
+        );
+    }
+}
+
 fn declaration_text_ok(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= crate::agent_integration::AGENT_HOOK_STRING_MAX
@@ -1645,6 +1900,17 @@ impl PluginManifest {
                     self.api_version >= 29 || !declared,
                     format!("agent_integrations[{i}].{field} requires api_version >= 29"),
                 );
+            }
+            if let Some(profile) = &integration.profile {
+                check(
+                    integration.command.is_some(),
+                    format!("agent_integrations[{i}].profile requires command"),
+                );
+                check(
+                    self.api_version >= 30,
+                    format!("agent_integrations[{i}].profile requires api_version >= 30"),
+                );
+                validate_agent_profile(i, profile, &mut check);
             }
             for (table, declared) in [
                 ("hooks", integration.hooks.is_some()),

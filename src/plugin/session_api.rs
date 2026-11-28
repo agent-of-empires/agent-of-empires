@@ -165,13 +165,23 @@ async fn capabilities_get() -> Result<Value, DispatchError> {
                 })
                 .unwrap_or_default();
             models.sort_by(|a, b| a.id.cmp(&b.id));
+            // Registry and catalog agents only: no session config, so no custom agents.
+            let resolved = crate::acp::agent_profiles::resolve_for(
+                crate::plugin::registry(),
+                &id,
+                std::iter::empty(),
+            );
             let mut modes: Vec<AcpModeCapability> = entry
                 .map(|e| {
                     choices(e, ConfigOptionCategory::Mode)
                         .map(|choice| AcpModeCapability {
                             id: choice.value.clone(),
                             display_name: choice.name.clone(),
-                            approval_class: match classify_mode(&id, Some(&choice.value), entry) {
+                            approval_class: match classify_mode(
+                                &resolved,
+                                Some(&choice.value),
+                                entry,
+                            ) {
                                 ModeDecision::Class(class) => class,
                                 // Advertised modes always classify; fail
                                 // closed if that invariant ever breaks.
@@ -329,7 +339,25 @@ async fn admit_and_create(
     }
 
     // Host-side approval classification; the plugin cannot self-label.
-    let class = match classify_mode(&req.agent_id, req.mode_id.as_deref(), entry) {
+    // The creation profile's custom agents shadow a plugin's tool of the same name, which then
+    // gets the unreviewed profile.
+    let custom_names = {
+        let profile = deps.profile.clone();
+        tokio::task::spawn_blocking(move || {
+            let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+            crate::acp::agent_profiles::custom_agent_names(&config.session)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| DispatchError::internal(format!("resolve profile config: {e}")))?
+    };
+    let resolved = crate::acp::agent_profiles::resolve_for(
+        crate::plugin::registry(),
+        &req.agent_id,
+        custom_names.iter().map(String::as_str),
+    );
+    let class = match classify_mode(&resolved, req.mode_id.as_deref(), entry) {
         ModeDecision::Class(class) => class,
         ModeDecision::UnknownMode => {
             return Err(DispatchError::with_kind(
