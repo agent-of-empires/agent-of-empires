@@ -586,8 +586,8 @@ pub async fn invoke_plugin_action(
 /// `provider.<name>` worker method with the request body as params and return its result.
 /// The manifest fixes the method, timeout and size caps; see `plugin::provider_call`.
 ///
-/// Read-write only, no elevation, like `invoke_plugin_action`: it mutates no host-managed state
-/// and grants no capability.
+/// Read-write only, no elevation: it mutates no host-managed state and grants no capability.
+/// Unlike `invoke_plugin_action` it does not stamp `origin`, so params may be any JSON value.
 pub async fn invoke_plugin_provider_call(
     State(state): State<std::sync::Arc<AppState>>,
     Path((id, name)): Path<(String, String)>,
@@ -1740,6 +1740,7 @@ while not (p/'finish').exists():
         }
     }
 
+    #[cfg(unix)]
     async fn decode<T: serde::de::DeserializeOwned>(response: Response) -> T {
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
