@@ -5,6 +5,77 @@ use serde::{Deserialize, Serialize};
 
 use crate::SessionScope;
 
+/// Current `AgentProfileWire` shape version. Bump when a field is renamed, removed or retyped.
+pub const WIRE_VERSION: u32 = 1;
+
+/// `SpecialTitles` as sent to clients.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SpecialTitlesWire {
+    pub skill_names: Vec<String>,
+    pub schedule_names: Vec<String>,
+    pub harness_names: Vec<String>,
+    pub workflow_names: Vec<String>,
+}
+
+/// The client-facing agent profile, sent on each session as `agent_profile`.
+/// The fullscreen probe declaration, lifecycle and one-shot banner patterns are not part of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct AgentProfileWire {
+    /// Shape version, see [`WIRE_VERSION`].
+    pub v: u32,
+    pub key: String,
+    pub parent_meta_namespaces: Vec<String>,
+    pub clear_aliases: Vec<String>,
+    pub compact_aliases: Vec<String>,
+    pub clear_requires_driven_reset: bool,
+    pub supports_exit_plan_mode: bool,
+    pub supports_wakeup_tools: bool,
+    pub emits_heartbeat_keepalives: bool,
+    pub yolo_mode_id: Option<String>,
+    pub supports_subagents: bool,
+    pub todos: bool,
+    pub skills: bool,
+    pub legacy_mode_fallback: bool,
+    pub subagent_tool_names: Vec<String>,
+    pub mcp_prefixes: Vec<String>,
+    /// Tool names per card kind; kinds without aliases are absent.
+    pub card_aliases: std::collections::BTreeMap<String, Vec<String>>,
+    pub special_titles: SpecialTitlesWire,
+    pub memory_path_regex: Option<String>,
+    pub mobile_monitor_only: bool,
+    /// Result of the profile's fullscreen probe, evaluated by the daemon.
+    pub fullscreen: bool,
+}
+
+impl Default for AgentProfileWire {
+    fn default() -> Self {
+        Self {
+            v: WIRE_VERSION,
+            key: "default".into(),
+            mcp_prefixes: vec!["mcp__".into()],
+            parent_meta_namespaces: Default::default(),
+            clear_aliases: Default::default(),
+            compact_aliases: Default::default(),
+            clear_requires_driven_reset: Default::default(),
+            supports_exit_plan_mode: Default::default(),
+            supports_wakeup_tools: Default::default(),
+            emits_heartbeat_keepalives: Default::default(),
+            yolo_mode_id: Default::default(),
+            supports_subagents: Default::default(),
+            todos: Default::default(),
+            skills: Default::default(),
+            legacy_mode_fallback: Default::default(),
+            subagent_tool_names: Default::default(),
+            card_aliases: Default::default(),
+            special_titles: Default::default(),
+            memory_path_regex: Default::default(),
+            mobile_monitor_only: Default::default(),
+            fullscreen: Default::default(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct InstallPreviewBody {
     pub source: String,
@@ -1230,7 +1301,7 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt_error: Option<String>,
     /// Machine-readable `initial_prompt_error` cause when one applies:
-    /// `agent_folder_not_trusted` or `agent_bypass_not_accepted`.
+    /// `agent_folder_not_trusted`, `agent_bypass_not_accepted` or `input_line_busy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_prompt_error_code: Option<String>,
     pub branch: Option<String>,
@@ -1482,22 +1553,14 @@ pub struct SessionResponse {
     /// non-preserving pairings.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keeps_context: bool,
-    /// Slash-command aliases that reset the conversation for this session's
-    /// agent (claude `/clear`, codex/opencode `/new`). Server-owned from
-    /// `acp::agent_profiles::resolve(...).clear_aliases` so the composer's `/`
-    /// palette and queued-prompt batching do not mirror the per-agent list.
-    /// Omitted for agents with no clear alias.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub clear_aliases: Vec<String>,
-    /// Slash-command aliases that compact the conversation (claude `/compact`). With the clear
-    /// aliases they're the commands that run as their own turn, which the queued strip names.
-    /// Omitted for agents with no compact alias.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub compact_aliases: Vec<String>,
-    /// True when the session is a Claude Code session AND the user has
-    /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
-    /// `~/.claude/settings.json`). The web client uses this to skip
-    /// scrollback-tracking workarounds that target tmux copy-mode.
+    /// The server-side profile of the agent that classifies this session's
+    /// prompts and tool calls: reset and compact aliases, capability gates, card
+    /// aliases and the evaluated fullscreen setting. Clients read it instead of
+    /// mirroring the per-agent tables.
+    #[serde(default)]
+    pub agent_profile: AgentProfileWire,
+    /// Deprecated: use `agent_profile.fullscreen`. Removed in the next minor release.
+    /// True for a Claude session whose user enabled Claude's fullscreen renderer.
     #[serde(default)]
     pub claude_fullscreen: bool,
     /// Repos in the multi-repo workspace (empty for single-repo sessions).

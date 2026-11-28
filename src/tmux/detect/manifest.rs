@@ -119,7 +119,17 @@ struct RawManifest {
     /// Lines starting the agent's live area (`from_prompt_marker`).
     #[serde(default)]
     prompt_marker: Vec<String>,
+    /// The agent's input box, for [`super::input_line`].
+    #[serde(default)]
+    input_line: Option<RawInputLine>,
     rules: Vec<RawRule>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInputLine {
+    /// Matches the plain text of the row the person types on, from column 0 to where typing starts.
+    prompt: String,
 }
 
 /// A compiled matcher: regexes compiled once, substrings pre-lowered.
@@ -164,6 +174,7 @@ pub(super) struct Manifest {
     markers: std::collections::HashMap<String, Marker>,
     /// Sorted by descending priority, so evaluation stops at the first match.
     pub(super) rules: Vec<Rule>,
+    pub(super) input_line: Option<regex::Regex>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -539,11 +550,23 @@ impl Manifest {
                 ))
             })
             .collect::<anyhow::Result<std::collections::HashMap<_, _>>>()?;
+        let input_line = raw
+            .input_line
+            .map(|line| {
+                regex::Regex::new(&line.prompt).map_err(|e| {
+                    anyhow::anyhow!(
+                        "input_line prompt {:?} is not a valid regex: {e}",
+                        line.prompt
+                    )
+                })
+            })
+            .transpose()?;
         Ok(Self {
             id: raw.id,
             prompt_marker,
             markers,
             rules,
+            input_line,
         })
     }
 

@@ -9,7 +9,7 @@ The Daemon and the Clients must build separately so a Client-only build, first t
 - **One binary, in-process modules.** `aoe` stays a single executable. `serve`, the TUI (bare `aoe`) and the CLI (`aoe <options>`) are in-process modes of it, not external `aoe-<name>` executables found on `PATH`.
 - **Layout `daemon/client` and `daemon/backend`.** Following the thread on #4395, the crates are split by which side of the Daemon API they sit on:
   - `aoe-daemon-client`: the wire types and the HTTP client for the Daemon API. Every Client depends on it. It carries no `session`, `tmux`, `nix` or `axum` dependency and compiles on Windows.
-  - `aoe-daemon-backend`: the Daemon itself (`aoe serve`, API, Supervisor, Workers, tmux ownership). Unix only.
+  - `aoe-daemon-backend`: the Daemon itself (`aoe serve`, API, Supervisor, Workers, Pane lifecycle). Unix only.
   - `aoe-tui`: the TUI Client. Unix only for now.
   - Shared crates are added only when two of the above need the same code, and are named for what they hold.
 - **Client-only selection is a Cargo feature on the thin `aoe` bin package.** Default features `daemon` and `tui` pull in `aoe-daemon-backend` and `aoe-tui`. A Client-only build, such as the Windows CLI, is `--no-default-features`. The library crates carry no such features.
@@ -29,7 +29,7 @@ The Daemon and the Clients must build separately so a Client-only build, first t
 - Wire DTOs own serialization, not backend conversion. `src/server/api/sessions/model.rs` converts a backend Session (`Instance`) and its runtime inputs into `SessionResponse`; the wire type has no inherent backend constructors.
 - `aoe-daemon-client` owns the resolved `DaemonEndpoint`, the REST DTOs and their shared values. `src/daemon/` re-exports the client API and keeps the runtime WebSocket. Host discovery still owns environment reads, local paths, passphrase resolution, cache selection and auto-start.
 - The crate uses reqwest for TCP and a Unix-only Hyper HTTP/1 adapter. The root supplies the Unix peer verifier; Hyper uses the exact stream it verified. Windows builds only TCP and uses the system TLS implementation.
-- Where `session`, `tmux` and `hooks` sit relative to `aoe-daemon-client` is not decided here (see the Not yet specified section of #2734).
+- [ADR 0007](0007-session-tmux-and-agent-hook-placement.md) decides where `session`, `tmux` and `hooks` sit.
 - Explicit `aoe tui` and `aoe web` subcommands are a follow-up.
 - `main.rs` runs migrations for nearly every subcommand. A Client-only build has no local store to migrate, so it skips them and does not depend on `migrations`. Cutting that dependency is part of the CLI `session` edge work.
 - Windows ships the Client-only `aoe`. It needs a C toolchain for the `-sys` crates (`libgit2-sys`, `libsqlite3-sys`, `aws-lc-sys` and others) until those are made optional.

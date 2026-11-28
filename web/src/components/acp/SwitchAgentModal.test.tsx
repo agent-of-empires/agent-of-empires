@@ -51,13 +51,16 @@ beforeEach(() => {
     },
     { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
     { name: "opencode", description: "OpenCode", command: "opencode-acp" },
-    { name: "gemini", description: "Gemini CLI", command: "gemini" },
+    {
+      name: "gemini",
+      description: "Gemini CLI",
+      command: "gemini",
+      lifecycle: { state: "deprecated", since: "2026-06-18", note: "consumer accounts cut off", replacement: null },
+    },
     {
       name: "legacy",
       description: "Legacy backend",
       command: "legacy-acp",
-      // Deprecated server-side only: absent from the static profile
-      // mirror, so the label must come from the endpoint field.
       lifecycle: { state: "deprecated", since: "2026-01-01", note: "upstream shut down", replacement: null },
     },
   ]);
@@ -209,10 +212,8 @@ describe("SwitchAgentModal (rate_limit)", () => {
     expect(confirm?.disabled).toBe(true);
   });
   it("marks deprecated registry targets next to their name", async () => {
-    // gemini is deprecated in the static profile mirror; "legacy" is
-    // deprecated only through the endpoint's lifecycle field. Both get
-    // the label so a rate-limit handoff never silently steers into a
-    // deprecated backend.
+    // The label comes from the endpoint's lifecycle field, so a rate-limit
+    // handoff never silently steers into a deprecated backend.
     const { findByTestId } = mount();
     const geminiBadge = await findByTestId("switch-agent-deprecated-gemini");
     expect(geminiBadge.parentElement?.textContent).toContain("Gemini CLI");

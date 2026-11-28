@@ -2243,7 +2243,13 @@ fn stage_remove_worktrees_and_branches(
         } else if main_worktree_removed {
             match GitWorktree::new(main_repo.clone()) {
                 Ok(git_wt) => {
-                    if let Err(e) = git_wt.delete_branch(&branch) {
+                    if let Ok(Some(path)) = git_wt.live_checkout_for_branch(&branch) {
+                        tracing::debug!(target: "session.delete", branch = %branch, path = %path.display(), "perform_deletion: branch held by a live worktree, keeping it");
+                        messages.push(format!(
+                            "Branch '{branch}' kept; checked out at {}",
+                            path.display()
+                        ));
+                    } else if let Err(e) = git_wt.delete_branch(&branch) {
                         tracing::debug!(target: "session.delete", branch = %branch, error = %e, "perform_deletion: delete_branch returned error");
                         errors.push(format!("Branch: {}", e));
                     } else {
@@ -2300,7 +2306,15 @@ fn stage_remove_worktrees_and_branches(
                 continue;
             }
             if let Ok(git_wt) = GitWorktree::new(main_repo) {
-                if let Err(e) = git_wt.delete_branch(&repo.branch) {
+                if let Ok(Some(path)) = git_wt.live_checkout_for_branch(&repo.branch) {
+                    tracing::debug!(target: "session.delete", branch = %repo.branch, path = %path.display(), "perform_deletion: workspace branch held by a live worktree, keeping it");
+                    messages.push(format!(
+                        "Branch '{}' ({}) kept; checked out at {}",
+                        repo.branch,
+                        repo.name,
+                        path.display()
+                    ));
+                } else if let Err(e) = git_wt.delete_branch(&repo.branch) {
                     errors.push(format!("Branch ({}): {}", repo.name, e));
                 } else {
                     messages.push(format!("Branch '{}' ({}) deleted", repo.branch, repo.name));
@@ -5750,6 +5764,134 @@ mod tests {
                 assert!(!main_repo.join(".git/worktrees/worktree").exists());
                 assert!(!branch_exists(&main_repo, "feature/delete-me"));
             }
+        }
+
+        /// A live worktree the session did not create may hold its branch;
+        /// the purge keeps the branch and succeeds instead of retrying forever.
+        #[test]
+        fn branch_held_by_foreign_live_worktree_is_kept() {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
+            crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap())
+                .unwrap();
+            let (tmp, main_repo, worktree_path, instance) =
+                test_worktree_fixture("feature/held-elsewhere");
+            let foreign = tmp.path().join("foreign");
+            test_git_in(
+                &main_repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--force",
+                    foreign.to_str().unwrap(),
+                    "feature/held-elsewhere",
+                ],
+            );
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            let result = perform_deletion(&request);
+            assert!(
+                result.success,
+                "perform_deletion failed: {:?}",
+                result.errors
+            );
+            assert!(!worktree_path.exists());
+            assert!(foreign.exists());
+            assert!(branch_exists(&main_repo, "feature/held-elsewhere"));
+            assert!(
+                result
+                    .messages
+                    .iter()
+                    .any(|m| m.contains("kept; checked out at")),
+                "messages: {:?}",
+                result.messages
+            );
+        }
+
+        /// The journaled purge of #6093: a foreign live worktree holds the
+        /// branch, recovery finishes and drops the owner, and no pass retries it.
+        #[test]
+        #[serial_test::serial]
+        fn recovery_keeps_branch_held_by_foreign_worktree_and_does_not_retry() {
+            use crate::session::purge_owners::recovery_plans;
+            use std::collections::HashSet;
+
+            let _app_guard = crate::session::test_support::isolate_app_dir();
+            let root = crate::session::get_app_dir().unwrap();
+            crate::session::purge_owners::initialize(&root).unwrap();
+            crate::tmux::tool_retirement::initialize(&root).unwrap();
+            let (tmp, main_repo, worktree_path, instance) =
+                test_worktree_fixture("feature/held-elsewhere");
+            let foreign = tmp.path().join("foreign");
+            test_git_in(
+                &main_repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--force",
+                    foreign.to_str().unwrap(),
+                    "feature/held-elsewhere",
+                ],
+            );
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance: instance.clone(),
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            let profile = instance.source_profile.clone();
+            let storage = Storage::new_unwatched(&profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            // Commit the purge, then drop it before cleanup: the owner stays
+            // persisted, as after a crash.
+            let transaction = match PurgeTransaction::reserve(
+                Storage::open_unwatched(&profile).unwrap(),
+                request,
+                None,
+            )
+            .unwrap()
+            {
+                Ok(transaction) => transaction.run_hooks_with(|_, _| {}),
+                Err(_) => panic!("purge rejected"),
+            };
+            match transaction.begin_irreversible(None) {
+                Ok(committed) => drop(committed),
+                Err(_) => panic!("irreversible purge rejected"),
+            }
+            assert_eq!(recovery_plans().unwrap().len(), 1);
+
+            let committed = recover_committed_purge(&mut HashSet::new())
+                .unwrap()
+                .expect("the persisted owner is recovered");
+            let result = committed.finish(|_, _| Ok(()));
+            assert!(result.success, "recovery must finish: {result:?}");
+
+            assert!(!worktree_path.exists());
+            assert!(foreign.exists());
+            assert!(branch_exists(&main_repo, "feature/held-elsewhere"));
+            assert!(recovery_plans().unwrap().is_empty(), "owner not removed");
+            assert!(
+                recover_committed_purge(&mut HashSet::new())
+                    .unwrap()
+                    .is_none(),
+                "a second pass must have nothing to retry"
+            );
         }
 
         /// `git branch --list` answers on stdout; the module's `git_in`

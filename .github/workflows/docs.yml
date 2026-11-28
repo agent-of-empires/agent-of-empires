@@ -9,8 +9,6 @@ on:
       - 'assets/**'
       - 'scripts/build-site.sh'
       - 'scripts/install.sh'
-      - 'src/**'
-      - 'xtask/**'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -23,35 +21,23 @@ concurrency:
   group: "pages"
   cancel-in-progress: true
 
-env:
-  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
-  # single-tenant, so use every vCPU.
-  CARGO_BUILD_JOBS: default
-
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-docs-build-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Setup Rust
-        uses: ./.github/actions/rust-toolchain
+      - uses: actions/checkout@v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: '22'
 
-      - name: Build xtask
-        run: cargo build -p xtask
-      - name: Generate CLI documentation
-        run: cargo xtask gen-docs
-
+      # docs/cli/reference.md is committed; the required Docs check keeps it current.
       - name: Build site
         run: ./scripts/build-site.sh
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        uses: actions/upload-pages-artifact@v5.0.0
         with:
           path: dist
 
@@ -59,9 +45,9 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-docs-deploy-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
     needs: build
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        uses: actions/deploy-pages@v5.0.1

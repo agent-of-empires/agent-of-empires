@@ -30,8 +30,8 @@
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
     AcpState, AuthStatus, AvailableCommand, ConfigOptionDescriptor, ConfigOptionSwitchFailure,
-    DiffPreview, ModeInfo, PlanStepStatus, SessionNotice, SessionUsage, SubagentRecord,
-    SubagentState,
+    DiffPreview, IntegrationLostReason, ModeInfo, PlanStepStatus, SessionNotice, SessionUsage,
+    SubagentRecord, SubagentState,
 };
 use crate::acp::transcript::{
     patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
@@ -67,6 +67,9 @@ pub struct AcpTranscript {
     /// Agent-pushed advisories for the current turn. The daemon retires them;
     /// dismissal is local to this view, so it never clears another client.
     pub session_notices: Vec<SessionNotice>,
+    /// Why the Agent's plugin integration failed mid-session; the daemon
+    /// clears it when the session resets.
+    pub integration_lost: Option<IntegrationLostReason>,
     /// Id of the agent's currently selected mode. `None` until the agent
     /// advertises one.
     pub current_mode: Option<String>,
@@ -236,6 +239,7 @@ impl AcpTranscript {
             pending_elicitations: Vec::new(),
             status_text: None,
             session_notices: Vec::new(),
+            integration_lost: None,
             current_mode: None,
             available_modes: Vec::new(),
             config_options: Vec::new(),
@@ -410,6 +414,7 @@ impl AcpTranscript {
         }
         self.config_option_switch_failed = state.config_option_switch_failed;
         self.session_notices = state.session_notices;
+        self.integration_lost = state.integration_lost;
         self.current_mode = state.current_mode_id;
         self.auth_status = state.auth_status;
         self.current_plan = state
@@ -590,6 +595,18 @@ mod tests {
             &[],
         );
         assert!(t.auth_status.is_none());
+    }
+
+    #[test]
+    fn reduced_state_carries_integration_lost_and_its_clear() {
+        let mut t = AcpTranscript::new("s-1");
+        let mut lost = reduced(&[]);
+        lost.integration_lost = Some(IntegrationLostReason::ProxyExited);
+        t.apply_reduced_state(1, lost, &[]);
+        assert_eq!(t.integration_lost, Some(IntegrationLostReason::ProxyExited));
+
+        t.apply_reduced_state(2, reduced(&[]), &[]);
+        assert!(t.integration_lost.is_none());
     }
 
     fn approval(nonce: &str) -> Approval {

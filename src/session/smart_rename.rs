@@ -15,12 +15,14 @@
 //! would fail exactly like a manual rename of a running tied session does. The
 //! visible session title is what gains meaning here.
 
+use crate::acp::agent_profiles::{resolve, AgentProfile};
 use crate::agents;
 use crate::session::civilizations::is_default_civ_name;
 use crate::session::config::SessionConfig;
 use aoe_daemon_client::deadlines::{RENAME_DEADLINE, RENAME_ONESHOT_TIMEOUT as ONESHOT_TIMEOUT};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 /// Cap on concurrent smart-rename one-shots across the process. Two slots keep
 /// steady-state throughput on multi-core hosts without letting N stuck
@@ -998,7 +1000,7 @@ fn try_global_slot() -> Option<std::fs::File> {
 fn capture_terminal_context(tmux: &crate::tmux::Session, tool: &str) -> Option<String> {
     let raw = tmux.capture_pane_full().ok()?;
     let cleaned = strip_ansi(&raw);
-    let stripped = strip_agent_banner(&cleaned, tool);
+    let stripped = strip_agent_banner(&cleaned, resolve(tool));
     let trimmed = stripped.trim();
     if !context_looks_usable(trimmed) {
         return None;
@@ -1006,28 +1008,46 @@ fn capture_terminal_context(tmux: &crate::tmux::Session, tool: &str) -> Option<S
     Some(head_tail(trimmed, CONTEXT_HEAD_BYTES, CONTEXT_TAIL_BYTES))
 }
 
+/// The compiled one-shot banner patterns of one profile.
+struct BannerMatcher {
+    gate: Option<regex::Regex>,
+    lines: regex::RegexSet,
+}
+
+/// Compiled once per profile key; a profile's patterns are static.
+fn banner_matcher(profile: &AgentProfile) -> &'static BannerMatcher {
+    static CACHE: LazyLock<Mutex<HashMap<&'static str, &'static BannerMatcher>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    cache.entry(profile.key).or_insert_with(|| {
+        let ci = |pattern: &str| format!("(?i){pattern}");
+        Box::leak(Box::new(BannerMatcher {
+            gate: profile
+                .oneshot_gate
+                .map(|g| regex::Regex::new(&ci(g)).expect("valid oneshot_gate")),
+            lines: regex::RegexSet::new(profile.oneshot_strip_patterns.iter().map(|p| ci(p)))
+                .expect("valid oneshot_strip_patterns"),
+        }))
+    })
+}
+
 /// CLI agents print a startup banner (a welcome box plus "getting started"
 /// tips) on launch. It dominates the pane head, so a first-turn capture ends up
 /// summarizing the banner instead of the task (Claude Code -> "claude code
-/// getting started"). Best-effort: for agents we recognize, drop the leading
-/// run of banner lines. It only acts when the banner's signature marker is
-/// present, and falls back to the original text if stripping would leave nothing
+/// getting started"). Best-effort: for a profile that declares banner patterns,
+/// drop the leading run of banner lines. It only acts when the profile's gate
+/// matches, and falls back to the original text if stripping would leave nothing
 /// substantive, so it can never make the capture worse. The `INSTRUCTION` prose
 /// is the backstop for banners this misses or for other agents.
-fn strip_agent_banner(text: &str, tool: &str) -> String {
-    // Only Claude Code has a verified banner shape to key on. Other agents rely
-    // on the instruction prose; add a case here per agent as needed.
-    if !tool.eq_ignore_ascii_case("claude") {
-        return text.to_string();
-    }
-    // Gate loosely: the startup box names the tool ("Claude Code v2.1.216" in its top border).
-    if !text.to_lowercase().contains("claude code") {
+fn strip_agent_banner(text: &str, profile: &AgentProfile) -> String {
+    let matcher = banner_matcher(profile);
+    if matcher.lines.is_empty() || matcher.gate.as_ref().is_some_and(|g| !g.is_match(text)) {
         return text.to_string();
     }
     let mut in_banner = true;
     let mut kept: Vec<&str> = Vec::new();
     for line in text.lines() {
-        if in_banner && is_claude_banner_line(line) {
+        if in_banner && matcher.lines.is_match(line) {
             continue;
         }
         in_banner = false;
@@ -1041,55 +1061,6 @@ fn strip_agent_banner(text: &str, tool: &str) -> String {
         return text.to_string();
     }
     stripped
-}
-
-/// Whether a line belongs to the Claude Code startup banner. The banner is a
-/// box: its borders are box-drawing glyphs, every body row opens with a vertical
-/// box edge, and its logo uses block-element glyphs, so a structural test
-/// captures the whole box regardless of the (version-dependent) wording inside.
-/// The `MARKERS` cover the notices printed just under the box (MCP-auth warning,
-/// tips, "what's new") before the REPL settles. Blank lines inside the leading
-/// block count so the run isn't cut short by the gaps between sections.
-///
-/// Verified against Claude Code v2.1.216, whose banner is a two-column box
-/// titled `Claude Code v<ver>` with "Welcome back <name>!", an ASCII logo, and a
-/// tips / what's-new column, followed by a `⚠ N MCP servers ...` notice.
-fn is_claude_banner_line(line: &str) -> bool {
-    let t = line.trim();
-    if t.is_empty() {
-        return true;
-    }
-    // Box-drawing (U+2500..=U+257F) borders/edges and block-element (U+2580..=
-    // U+259F) logo glyphs.
-    let is_chrome = |c: char| ('\u{2500}'..='\u{259F}').contains(&c);
-    if t.chars().all(|c| is_chrome(c) || c.is_whitespace()) {
-        return true;
-    }
-    if t.starts_with(|c: char| is_chrome(c) || c == '|') {
-        return true;
-    }
-    let lc = t.to_lowercase();
-    const MARKERS: &[&str] = &[
-        "claude code v",
-        "welcome to claude code",
-        "welcome back",
-        "tips for getting started",
-        "what's new",
-        "/release-notes",
-        "run /mcp",
-        "need authentication",
-        "/help for help",
-    ];
-    if MARKERS.iter().any(|m| lc.contains(m)) {
-        return true;
-    }
-    // Startup notice / tip callouts: ⚠ (U+26A0) and ※ (U+203B).
-    if t.starts_with('\u{26A0}') || t.starts_with('\u{203B}') || lc.starts_with("tip:") {
-        return true;
-    }
-    // Numbered tip: "1...." or "2)...".
-    let mut chars = t.chars();
-    matches!((chars.next(), chars.next()), (Some(d), Some(p)) if d.is_ascii_digit() && (p == '.' || p == ')'))
 }
 
 /// Reject a pane capture that is empty, has no letters, or is dominated by
@@ -2727,7 +2698,7 @@ Patched the race in auth.rs and added a regression test.";
         let lc = INSTRUCTION.to_lowercase();
         assert!(lc.contains("startup banner") && lc.contains("ignore"));
 
-        let stripped = strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, "claude");
+        let stripped = strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, resolve("claude"));
         // The box, its wording, the logo, and the MCP notice are gone.
         assert!(!stripped.contains("Claude Code v"));
         assert!(!stripped.contains("Welcome back"));
@@ -2744,7 +2715,7 @@ Patched the race in auth.rs and added a regression test.";
     fn strip_agent_banner_is_noop_for_other_agents() {
         // A non-claude agent keeps the text verbatim (no verified signature).
         assert_eq!(
-            strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, "codex"),
+            strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, resolve("codex")),
             CLAUDE_BANNER_TRANSCRIPT
         );
     }
@@ -2753,7 +2724,7 @@ Patched the race in auth.rs and added a regression test.";
     fn strip_agent_banner_is_noop_without_claude_code_mention() {
         // Real transcript that never names the tool is untouched, even for claude.
         let plain = "> refactor the payment retry loop\n\nDone: added a backoff and a test.";
-        assert_eq!(strip_agent_banner(plain, "claude"), plain);
+        assert_eq!(strip_agent_banner(plain, resolve("claude")), plain);
     }
 
     #[test]
@@ -2763,7 +2734,7 @@ Patched the race in auth.rs and added a regression test.";
         // actual leading run of chrome, so `in_banner` flips off on line 1.
         let about = "> make the Claude Code onboarding docs clearer\n\n\
 Rewrote the getting-started section and fixed two broken links.";
-        assert_eq!(strip_agent_banner(about, "claude"), about);
+        assert_eq!(strip_agent_banner(about, resolve("claude")), about);
     }
 
     #[test]
@@ -2778,7 +2749,17 @@ Rewrote the getting-started section and fixed two broken links.";
 ╰────────────────────────────────────╯
 
  ⚠ 3 MCP servers need authentication · run /mcp";
-        assert_eq!(strip_agent_banner(banner_only, "claude"), banner_only);
+        assert_eq!(
+            strip_agent_banner(banner_only, resolve("claude")),
+            banner_only
+        );
+    }
+
+    #[test]
+    fn strip_agent_banner_keeps_box_glyphs_after_the_conversation_starts() {
+        let mid = "> explain this diagram\n\n\
+Here is the Claude Code layout:\n╭──────╮\n│ box  │\n╰──────╯\nDone drawing it.";
+        assert_eq!(strip_agent_banner(mid, resolve("claude")), mid);
     }
 
     /// Framing, per-half capping and the prompt bound in one place: these are

@@ -30,7 +30,7 @@ jobs:
       actions: read
     steps:
       - id: meta
-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        uses: dependabot/fetch-metadata@v3.1.0
 
       - name: Require a minor or patch update in a checked ecosystem
         id: eligible
@@ -48,7 +48,7 @@ jobs:
           esac
           echo "ok=true" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         if: steps.eligible.outputs.ok == 'true'
         with:
           ref: ${{ github.event.pull_request.base.sha }}

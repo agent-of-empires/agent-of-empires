@@ -66,78 +66,6 @@ fn run_dev(_args: DevArgs) {
     std::process::exit(1);
 }
 
-#[cfg(unix)]
-fn build_web() -> bool {
-    use std::process::Command;
-    eprintln!("[xtask dev] building aoe --features web...");
-    Command::new("cargo")
-        .args(["build", "--features", "web"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or_else(|e| {
-            eprintln!("[xtask dev] failed to run cargo build: {e}");
-            false
-        })
-}
-
-#[cfg(unix)]
-fn host_is_loopback(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.")
-}
-
-#[cfg(unix)]
-fn child_exited(child: &mut std::process::Child) -> bool {
-    matches!(child.try_wait(), Ok(Some(_)))
-}
-
-#[cfg(unix)]
-fn terminate_group(child: &mut std::process::Child, grace: std::time::Duration) {
-    use nix::sys::signal::{killpg, Signal};
-    use nix::unistd::Pid;
-    use std::time::{Duration, Instant};
-    if child_exited(child) {
-        let _ = child.wait();
-        return;
-    }
-    let pid = Pid::from_raw(child.id() as i32);
-    let _ = killpg(pid, Signal::SIGTERM);
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if child_exited(child) {
-            let _ = child.wait();
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = killpg(pid, Signal::SIGKILL);
-    let _ = child.wait();
-}
-
-#[cfg(unix)]
-fn wait_for_port(port: u16, timeout: std::time::Duration) {
-    use std::net::TcpListener;
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    eprintln!("[xtask dev] port {port} still busy after waiting; respawning anyway");
-}
-
-#[cfg(unix)]
-fn is_watch_relevant(path: &Path) -> bool {
-    if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-        return true;
-    }
-    matches!(
-        path.file_name().and_then(|n| n.to_str()),
-        Some("Cargo.toml") | Some("Cargo.lock")
-    )
-}
-
 /// Each child runs in its own process group so one Ctrl-C tears the whole tree down.
 #[cfg(unix)]
 fn run_dev(args: DevArgs) {
@@ -147,12 +75,25 @@ fn run_dev(args: DevArgs) {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    if !build_web() {
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
+    let target_dir = Path::new(&target_dir);
+    if !build_backend() {
         std::process::exit(1);
     }
 
-    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
-    let bin = Path::new(&target_dir).join("debug").join("aoe");
+    if web_deps_stale(Path::new("web")) {
+        eprintln!("[xtask dev] installing web dependencies (npm --prefix web ci)...");
+        let installed = Command::new("npm")
+            .args(["--prefix", "web", "ci"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !installed {
+            eprintln!("[xtask dev] `npm --prefix web ci` failed; run it directly to see why");
+            std::process::exit(1);
+        }
+    }
+
+    let bin = target_dir.join("debug").join("aoe");
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -312,7 +253,7 @@ fn run_dev(args: DevArgs) {
                 if Instant::now() >= at {
                     rebuild_at = None;
                     eprintln!("[xtask dev] change detected; rebuilding aoe...");
-                    if build_web() {
+                    if build_backend() {
                         if let Some(mut old) = serve.take() {
                             terminate_group(&mut old, Duration::from_secs(2));
                         }
@@ -333,6 +274,95 @@ fn run_dev(args: DevArgs) {
     if let Some(mut child) = serve.take() {
         terminate_group(&mut child, Duration::from_secs(2));
     }
+}
+
+/// Vite serves the dashboard, so `AOE_SKIP_WEB_BUILD` skips the npm bundle
+/// while `web` keeps `aoe.web` registered.
+#[cfg(unix)]
+fn build_backend() -> bool {
+    use std::process::Command;
+    eprintln!(
+        "[xtask dev] building aoe --features web (bundle skipped, Vite serves the dashboard)..."
+    );
+    Command::new("cargo")
+        .args(["build", "--features", "web"])
+        .env("AOE_SKIP_WEB_BUILD", "1")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or_else(|e| {
+            eprintln!("[xtask dev] failed to run cargo build: {e}");
+            false
+        })
+}
+
+/// Same rule as build.rs `maybe_install_web_deps`, which a build without `web` skips.
+#[cfg(unix)]
+fn web_deps_stale(web: &Path) -> bool {
+    let mtime = |path: &Path| path.metadata().and_then(|m| m.modified()).ok();
+    let Some(marker) = mtime(&web.join("node_modules/.package-lock.json")) else {
+        return true;
+    };
+    ["package.json", "package-lock.json"]
+        .iter()
+        .any(|file| mtime(&web.join(file)).is_some_and(|at| at > marker))
+}
+
+#[cfg(unix)]
+fn host_is_loopback(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1") || host.starts_with("127.")
+}
+
+#[cfg(unix)]
+fn child_exited(child: &mut std::process::Child) -> bool {
+    matches!(child.try_wait(), Ok(Some(_)))
+}
+
+#[cfg(unix)]
+fn terminate_group(child: &mut std::process::Child, grace: std::time::Duration) {
+    use nix::sys::signal::{killpg, Signal};
+    use nix::unistd::Pid;
+    use std::time::{Duration, Instant};
+    if child_exited(child) {
+        let _ = child.wait();
+        return;
+    }
+    let pid = Pid::from_raw(child.id() as i32);
+    let _ = killpg(pid, Signal::SIGTERM);
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if child_exited(child) {
+            let _ = child.wait();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = killpg(pid, Signal::SIGKILL);
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn wait_for_port(port: u16, timeout: std::time::Duration) {
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("[xtask dev] port {port} still busy after waiting; respawning anyway");
+}
+
+#[cfg(unix)]
+fn is_watch_relevant(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+        return true;
+    }
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("Cargo.toml") | Some("Cargo.lock")
+    )
 }
 
 fn generate_cli_docs() {
@@ -787,8 +817,42 @@ mod skill_check_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::is_watch_relevant;
+    use super::{is_watch_relevant, web_deps_stale};
     use std::path::Path;
+
+    #[test]
+    fn web_deps_are_stale_when_the_npm_marker_is_missing_or_older() {
+        use std::time::{Duration, SystemTime};
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let new = old + Duration::from_secs(60);
+        // (marker mtime, lockfile mtime, stale)
+        let cases = [
+            (None, old, true),
+            (Some(old), new, true),
+            (Some(new), old, false),
+        ];
+        for (marker, lock, stale) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let touch = |rel: &str, at: SystemTime| {
+                let path = dir.path().join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_modified(at)
+                    .unwrap();
+            };
+            touch("package.json", old);
+            touch("package-lock.json", lock);
+            if let Some(at) = marker {
+                touch("node_modules/.package-lock.json", at);
+            }
+            assert_eq!(
+                web_deps_stale(dir.path()),
+                stale,
+                "marker {marker:?}, lock {lock:?}"
+            );
+        }
+    }
 
     #[test]
     fn only_rust_sources_and_cargo_manifests_trigger_a_rebuild() {

@@ -314,12 +314,11 @@ fn fork_from_selection_keeps_a_custom_structured_parent_structured_under_a_termi
     );
 }
 
-/// Context-menu Snooze mirrors the Attention-gated `h` key: on an active session it opens
+/// Context-menu Snooze mirrors the `h` key: on an active session it opens
 /// the duration picker, on a snoozed one it submits the wake to the daemon.
 #[test]
 #[serial]
 fn test_session_context_menu_snooze_toggle() {
-    use crate::session::config::SortOrder;
     use crate::tui::dialogs::ContextMenuAction;
 
     let mut env = create_test_env_with_groups();
@@ -339,8 +338,6 @@ fn test_session_context_menu_snooze_toggle() {
         .expect("a session should be selected");
 
     // Active row: the menu opens the duration picker, exactly like the `h` key.
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
     env.view.select_session_by_id(&id);
     env.view
         .dispatch_context_menu_action(ContextMenuAction::ToggleSnooze);
@@ -394,7 +391,7 @@ fn test_shift_n_prefills_from_selected_session() {
     for instance in [worktree, ungrouped] {
         env.view.add_instance(instance);
     }
-    env.view.group_by = crate::session::config::GroupByMode::Manual;
+    env.view.group_by = crate::session::config::GroupByMode::Group;
     env.view.flat_items = env.view.build_flat_items();
     env.view.update_selected();
 
@@ -450,7 +447,7 @@ async fn test_rename_selected_group_with_children() {
     let profiles = crate::session::list_profiles().unwrap();
     let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
     apply_published(&mut view, &state).await;
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
@@ -551,7 +548,7 @@ async fn test_rename_group_noop_and_duplicate() {
         "renaming to an existing group should fail"
     );
 
-    env.view.sort_order = crate::session::config::SortOrder::AZ;
+    env.view.sort_order = crate::session::config::SortOrder::Name;
     env.view.group_rename_context = Some(context());
     super::pickers_groups_sort::settle_rename_group(&state, &mut env.view, Some("aaa"), None)
         .await
@@ -593,7 +590,7 @@ async fn test_move_explicit_empty_group_between_profiles() {
     let profiles = crate::session::list_profiles().unwrap();
     let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
     apply_published(&mut view, &state).await;
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.group_rename_context = Some(crate::tui::home::GroupRenameContext {
         old_path: "empty".to_string(),
         old_profile: "alpha".to_string(),

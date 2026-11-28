@@ -1695,6 +1695,28 @@ mod legacy_scope_recovery_tests {
     }
 }
 
+/// Standard system folders directly under $HOME. Several (Downloads, Desktop,
+/// Pictures, Music) are TCC-protected, so opening them prompts. None is ever a
+/// git repo, so the directory browser skips its `.git` probe for them.
+const HOME_SYSTEM_DIRS: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+    "Public",
+    "Library",
+];
+
+pub(super) fn is_tcc_protected_home_dir(
+    parent: &std::path::Path,
+    name: &str,
+    home: Option<&std::path::Path>,
+) -> bool {
+    home.is_some_and(|home| parent == home && HOME_SYSTEM_DIRS.contains(&name))
+}
+
 pub(super) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 

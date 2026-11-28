@@ -51,7 +51,15 @@ describe("AgentPickerEssentials", () => {
     ["gemini", true],
     ["claude", false],
   ])("badges and warns for deprecated agents (%s)", (tool, deprecated) => {
-    renderPicker(tool, [agent("gemini"), claude, agent("custom-tool")]);
+    const gemini = agent("gemini", {
+      lifecycle: {
+        state: "deprecated",
+        since: "2026-06-18",
+        note: "consumer accounts cut off by Google; enterprise/API-key remain valid",
+        replacement: "antigravity",
+      },
+    });
+    renderPicker(tool, [gemini, claude, agent("custom-tool")]);
     expect(!!screen.queryByTestId(`wizard-agent-deprecated-badge-gemini`)).toBe(true);
     expect(screen.queryByTestId("wizard-agent-deprecated-badge-claude")).toBeNull();
     expect(screen.queryByTestId("wizard-agent-deprecated-badge-custom-tool")).toBeNull();
@@ -64,7 +72,7 @@ describe("AgentPickerEssentials", () => {
     }
   });
 
-  it("prefers the server lifecycle over the static mirror", () => {
+  it("badges an agent by the server lifecycle alone", () => {
     renderPicker("self-hosted", [
       agent("self-hosted", {
         lifecycle: { state: "deprecated", since: "2026-01-01", note: "upstream shut down", replacement: null },

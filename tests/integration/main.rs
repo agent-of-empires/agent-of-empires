@@ -66,6 +66,8 @@ mod acp_midturn_resume;
 #[cfg(debug_assertions)]
 mod acp_silent_orphan;
 
+#[cfg(unix)]
+mod acp_proxy_launch;
 #[cfg(debug_assertions)]
 mod acp_runner_control;
 mod acp_runner_orphan;
