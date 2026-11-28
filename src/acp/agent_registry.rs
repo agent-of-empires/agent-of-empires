@@ -194,6 +194,17 @@ impl AgentRegistry {
                 .filter(|(_, _, acp)| acp.id == name || acp.aliases.iter().any(|a| a == name))
                 .count()
         };
+        // Every name the built-in rows answer to, taken before a takeover removes any row.
+        let reserved: std::collections::HashSet<String> = self
+            .agents
+            .values()
+            .flat_map(|builtin| {
+                std::iter::once(&builtin.id)
+                    .chain(&builtin.aliases)
+                    .chain(&builtin.paired_tool)
+                    .cloned()
+            })
+            .collect();
         for (plugin, tool, acp) in &candidates {
             let ambiguous = std::iter::once(&acp.id)
                 .chain(&acp.aliases)
@@ -240,16 +251,13 @@ impl AgentRegistry {
                     continue;
                 }
             };
-            let taken = self.agents.values().find(|existing| {
-                !replaced.contains(&existing.id)
-                    && std::iter::once(&agent.id)
-                        .chain(&agent.aliases)
-                        .any(|name| existing.answers_to(name))
-            });
-            if let Some(existing) = taken {
-                if first_warning(plugin.id(), &agent.id, &format!("collides:{}", existing.id)) {
-                    tracing::warn!(target: "plugin.agents", plugin = plugin.id(), agent = %agent.id, existing = %existing.id,
-                        "plugin ACP agent collides with an existing agent; preserving it");
+            let taken = std::iter::once(&agent.id)
+                .chain(&agent.aliases)
+                .find(|name| reserved.contains(*name) && !replaced.contains(name));
+            if let Some(name) = taken {
+                if first_warning(plugin.id(), &agent.id, &format!("collides:{name}")) {
+                    tracing::warn!(target: "plugin.agents", plugin = plugin.id(), agent = %agent.id, existing = %name,
+                        "plugin ACP agent collides with a built-in name; preserving it");
                 }
                 continue;
             }
@@ -672,6 +680,20 @@ mod tests {
         assert_eq!(registry.resolved("claude-code").unwrap().id, "claude-next");
         assert!(!registry.agents.contains_key("claude"));
         assert!(!registry.agents.contains_key("claude-code"));
+    }
+
+    #[test]
+    fn a_community_plugin_cannot_claim_a_name_a_takeover_freed() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(temp.path(), "acme");
+        let takeover = || acp_plugin("aoe.claude", "claude", "claude-next", &[], &dir);
+        let community = || acp_plugin("acme.helper", "zzhelper", "claude", &[], &dir);
+        for plugins in [vec![takeover(), community()], vec![community(), takeover()]] {
+            let registry = registry_of(plugins);
+            assert_eq!(registry.resolved("claude").unwrap().id, "claude-next");
+            assert!(registry.resolved("zzhelper").is_none());
+            assert!(!registry.agents.contains_key("claude"));
+        }
     }
 
     #[test]
