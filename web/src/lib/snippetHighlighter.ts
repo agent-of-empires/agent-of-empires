@@ -92,6 +92,8 @@ interface SnippetHighlightOpts {
   langHint: string;
   theme: string;
   appearance?: "dark" | "light";
+  /** Insert the result into the shared LRU cache (default true). Pass false for partial streaming chunks. */
+  cache?: boolean;
 }
 
 interface ResolvedSnippetHighlighter {
@@ -144,8 +146,10 @@ export async function highlightSnippet(code: string, opts: SnippetHighlightOpts)
   if (hit !== undefined) return hit;
   const highlighter = await getSharedHighlighter({ themes: [resolved.theme], langs: [resolved.langId] });
   const html = highlighter.codeToHtml(code, { lang: resolved.langId, theme: resolved.theme });
-  highlightCache.set(resolved.key, html);
-  if (highlightCache.size > HIGHLIGHT_CACHE_CAP) highlightCache.delete(highlightCache.keys().next().value!);
+  if (opts.cache !== false) {
+    highlightCache.set(resolved.key, html);
+    if (highlightCache.size > HIGHLIGHT_CACHE_CAP) highlightCache.delete(highlightCache.keys().next().value!);
+  }
   return html;
 }
 

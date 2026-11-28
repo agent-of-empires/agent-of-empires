@@ -167,4 +167,15 @@ describe("highlight cache", () => {
     expect(peekHighlight("fill0", opts)).toBeUndefined();
     expect(peekHighlight("overflow", opts)).toBeDefined();
   });
+
+  it("does not insert or evict entries when cache is false (streaming chunks)", async () => {
+    await highlightSnippet("history-block", opts);
+    for (let i = 0; i < 80; i++) {
+      const partial = `const chunk = ${i};`;
+      const html = await highlightSnippet(partial, { ...opts, cache: false });
+      expect(html).toContain(partial);
+      expect(peekHighlight(partial, opts)).toBeUndefined();
+    }
+    expect(peekHighlight("history-block", opts)).toBeDefined();
+  });
 });

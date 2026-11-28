@@ -383,6 +383,7 @@ export default function App() {
 
   const handleLogout = async () => {
     await logout();
+    clearAcpCache();
     setLoginAuthenticated(false);
   };
 
