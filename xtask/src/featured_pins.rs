@@ -65,6 +65,16 @@ fn bump(path: &Path) -> Result<usize> {
             }
         };
 
+        if let Some((left, right)) = ambiguous_versions(&missing) {
+            failures.push(format!(
+                "{id} ({repository}): tags {left} and {right} name one version"
+            ));
+            continue;
+        }
+
+        // Oldest first, and stop at the first failure: a newer pin would raise
+        // this plugin's newest pinned version past it, so the failed release
+        // would never be retried.
         for (version, tag) in missing {
             match tree_hash_at(&repository, &tag) {
                 Ok(hash) => {
@@ -72,7 +82,10 @@ fn bump(path: &Path) -> Result<usize> {
                     versions.insert(version.to_string(), hash.into());
                     added += 1;
                 }
-                Err(error) => failures.push(format!("{id} ({repository} at {tag}): {error:#}")),
+                Err(error) => {
+                    failures.push(format!("{id} ({repository} at {tag}): {error:#}"));
+                    break;
+                }
             }
         }
         // `insert` gives the last value a trailing space the hand-written rows lack.
@@ -105,6 +118,17 @@ fn releases_to_pin(
     releases.retain(|(version, _)| newest.is_none_or(|newest| version > newest));
     releases.sort_by(|left, right| left.0.cmp(&right.0));
     releases
+}
+
+/// Sorted releases can hold one version twice (`v1.2.3` and `1.2.3`) while the
+/// tags point at different trees, so that version has no unambiguous pin.
+fn ambiguous_versions(releases: &[(semver::Version, String)]) -> Option<(&str, &str)> {
+    releases.windows(2).find_map(|pair| match pair {
+        [(version, left), (next, right)] if version == next => {
+            Some((left.as_str(), right.as_str()))
+        }
+        _ => None,
+    })
 }
 
 fn remote_releases(repository: &str) -> Result<Vec<(semver::Version, String)>> {
@@ -190,7 +214,7 @@ fn repository_url(repository: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{release_version, releases_to_pin};
+    use super::{ambiguous_versions, release_version, releases_to_pin};
 
     fn version(text: &str) -> semver::Version {
         semver::Version::parse(text).expect("test version parses")
@@ -224,6 +248,17 @@ mod tests {
             vec!["v0.1.0", "v0.2.0"],
             "nothing pinned yet"
         );
+    }
+
+    #[test]
+    fn one_version_with_two_tags_is_reported_rather_than_picked() {
+        let releases = vec![
+            (version("1.0.0"), "v1.0.0".to_owned()),
+            (version("1.1.0"), "1.1.0".to_owned()),
+            (version("1.1.0"), "v1.1.0".to_owned()),
+        ];
+        assert_eq!(ambiguous_versions(&releases), Some(("1.1.0", "v1.1.0")));
+        assert_eq!(ambiguous_versions(&releases[..2]), None);
     }
 
     #[test]
