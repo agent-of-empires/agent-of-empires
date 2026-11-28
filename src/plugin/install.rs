@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use aoe_plugin_api::agent_integration::AgentIntegrationContribution;
+use aoe_plugin_api::agent_integration::{AcpDeclaration, AgentIntegrationContribution};
 use aoe_plugin_api::{BuildStep, PluginId, PluginManifest, RuntimeSpec, UiContribution};
 use serde::{Deserialize, Serialize};
 
@@ -888,7 +888,7 @@ async fn prepare_install(
             return Err(PluginAlreadyInstalled { id }.into());
         }
 
-        let capabilities = capability_strings(fetched)?;
+        let capabilities = capability_strings(&fetched.manifest)?;
         let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
         let trust = trust_label(featured_verified, dev);
         let fingerprint = fingerprint(&fetched.tree_hash, fetched.asset_sha256.as_deref(), trust);
@@ -1253,9 +1253,45 @@ fn disclosure_integrations(
             if let Some(command) = &out.command {
                 out.command = Some(super::agent_integration::display_command(command));
             }
+            if let Some(acp) = &mut out.acp {
+                escape_acp(acp);
+            }
             out
         })
         .collect()
+}
+
+/// Display-escape every free-form string of an `acp` declaration, `proxy.command` included.
+fn escape_acp(acp: &mut AcpDeclaration) {
+    use super::agent_integration::display_command as esc;
+    let escape_all = |values: &mut Vec<String>| values.iter_mut().for_each(|v| *v = esc(v));
+    acp.id = esc(&acp.id);
+    acp.display_name = esc(&acp.display_name);
+    acp.proxy.command = esc(&acp.proxy.command);
+    escape_all(&mut acp.aliases);
+    escape_all(&mut acp.env.allowlist);
+    escape_all(&mut acp.env.host_only);
+    acp.env.defaults = std::mem::take(&mut acp.env.defaults)
+        .into_iter()
+        .map(|(key, value)| (esc(&key), esc(&value)))
+        .collect();
+    if let Some(adapter) = &mut acp.adapter {
+        adapter.upstream_package = esc(&adapter.upstream_package);
+        adapter.upstream_pin = esc(&adapter.upstream_pin);
+        adapter.package_dir = esc(&adapter.package_dir);
+    }
+    if let Some(compat) = &mut acp.compat {
+        compat.expected_agent_name = compat.expected_agent_name.as_deref().map(esc);
+        compat.min_version = compat.min_version.as_deref().map(esc);
+        compat.capability_min_versions = std::mem::take(&mut compat.capability_min_versions)
+            .into_iter()
+            .map(|(name, min)| (esc(&name), esc(&min)))
+            .collect();
+    }
+    acp.profile
+        .modes
+        .iter_mut()
+        .for_each(|mode| mode.id = esc(&mode.id));
 }
 
 fn fingerprint(tree_hash: &str, asset_sha256: Option<&str>, trust: &str) -> String {
@@ -1319,7 +1355,7 @@ async fn prepare_update(
         reject_reserved_or_builtin(&fetched.manifest, featured_verified || dev)?;
         reject_incompatible_host(&fetched.manifest)?;
 
-        let capabilities = capability_strings(fetched)?;
+        let capabilities = capability_strings(&fetched.manifest)?;
         let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
         let installed = prior_grant.as_ref().and_then(|_| installed_manifest(id));
         let grant_valid = installed.as_ref().is_some_and(|(manifest, hash)| {
@@ -2161,9 +2197,8 @@ fn verify_featured(featured: &FeaturedIndex, fetched: &FetchedPlugin) -> Result<
     Ok(entry.verifies(&fetched.tree_hash))
 }
 
-fn capability_strings(fetched: &FetchedPlugin) -> Result<Vec<String>> {
-    let unknown: Vec<&str> = fetched
-        .manifest
+fn capability_strings(manifest: &PluginManifest) -> Result<Vec<String>> {
+    let unknown: Vec<&str> = manifest
         .capabilities
         .iter()
         .filter(|c| !c.is_known())
@@ -2175,8 +2210,7 @@ fn capability_strings(fetched: &FetchedPlugin) -> Result<Vec<String>> {
             unknown.join(", ")
         );
     }
-    Ok(fetched
-        .manifest
+    Ok(manifest
         .capabilities
         .iter()
         .map(|c| c.as_str().to_string())
@@ -4834,6 +4868,155 @@ mod tests {
         assert_eq!(disclosed[0].command.as_deref(), Some("x\\u{202e}tail"));
         // The manifest / launch command stays raw.
         assert_eq!(raw.command.as_deref(), Some("x\u{202e}tail"));
+    }
+
+    fn acp_integration() -> AgentIntegrationContribution {
+        use aoe_plugin_api::agent_integration::{
+            AcpAdapter, AcpCompat, AcpEnv, AcpFailurePolicy, AcpProfile, AcpProxy,
+        };
+        AgentIntegrationContribution {
+            tool: "helper".into(),
+            provider_versions: vec![">=1".into()],
+            acp: Some(AcpDeclaration {
+                id: "helper-acp".into(),
+                aliases: Vec::new(),
+                display_name: "Helper".into(),
+                proxy: AcpProxy {
+                    command: "bin/proxy".into(),
+                    protocol_version: 1,
+                    primitive_schema_version: 1,
+                },
+                adapter: Some(AcpAdapter {
+                    upstream_package: "@acme/helper-acp".into(),
+                    upstream_pin: "2.1.0".into(),
+                    package_dir: "adapter".into(),
+                    binary: None,
+                }),
+                env: AcpEnv {
+                    allowlist: vec!["HELPER_KEY".into()],
+                    ..AcpEnv::default()
+                },
+                compat: Some(AcpCompat {
+                    expected_agent_name: Some("@acme/helper-acp".into()),
+                    min_version: Some("2.0.0".into()),
+                    capability_min_versions: Default::default(),
+                }),
+                profile: AcpProfile::default(),
+                failure_policy: AcpFailurePolicy::Refuse,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disclosure_integrations_escapes_the_acp_declaration_for_display() {
+        let mut raw = acp_integration();
+        let acp = raw.acp.as_mut().unwrap();
+        acp.proxy.command = "bin/x\u{202e}proxy".into();
+        acp.display_name = "H\u{1b}elper".into();
+        acp.env.allowlist.push("K\u{202e}".into());
+        acp.adapter.as_mut().unwrap().upstream_pin = "2\u{1b}".into();
+        let disclosed = disclosure_integrations(std::slice::from_ref(&raw));
+        let shown = disclosed[0].acp.as_ref().unwrap();
+        assert_eq!(shown.proxy.command, "bin/x\\u{202e}proxy");
+        assert_eq!(shown.display_name, "H\\u{1b}elper");
+        assert_eq!(shown.env.allowlist[1], "K\\u{202e}");
+        assert_eq!(shown.adapter.as_ref().unwrap().upstream_pin, "2\\u{1b}");
+        assert_eq!(
+            raw.acp.as_ref().unwrap().proxy.command,
+            "bin/x\u{202e}proxy"
+        );
+    }
+
+    /// The whole-struct comparison re-prompts for any change of the `acp` part, and for
+    /// nothing else.
+    #[test]
+    fn acp_declaration_changes_require_consent() {
+        let base = acp_integration();
+        let previous = std::slice::from_ref(&base);
+        let cases: [(&str, fn(&mut AgentIntegrationContribution), bool); 8] = [
+            ("unchanged", |_| {}, false),
+            (
+                "adapter lock",
+                |i| {
+                    i.acp
+                        .as_mut()
+                        .unwrap()
+                        .adapter
+                        .as_mut()
+                        .unwrap()
+                        .upstream_pin = "2.2.0".into()
+                },
+                true,
+            ),
+            (
+                "proxy command",
+                |i| i.acp.as_mut().unwrap().proxy.command = "bin/other".into(),
+                true,
+            ),
+            (
+                "env allowlist",
+                |i| {
+                    i.acp
+                        .as_mut()
+                        .unwrap()
+                        .env
+                        .allowlist
+                        .push("OTHER_KEY".into())
+                },
+                true,
+            ),
+            (
+                "compat",
+                |i| {
+                    i.acp.as_mut().unwrap().compat.as_mut().unwrap().min_version =
+                        Some("1.0.0".into())
+                },
+                true,
+            ),
+            (
+                "provider versions",
+                |i| i.provider_versions = vec![">=2".into()],
+                true,
+            ),
+            (
+                "failure policy",
+                |i| {
+                    i.acp.as_mut().unwrap().failure_policy =
+                        aoe_plugin_api::agent_integration::AcpFailurePolicy::NeutralBoot
+                },
+                true,
+            ),
+            ("acp dropped", |i| i.acp = None, true),
+        ];
+        for (name, change, expected) in cases {
+            let mut next = base.clone();
+            change(&mut next);
+            assert_eq!(
+                agent_integrations_changed(Some(previous), &[next]),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// `acp.agent.provide` is a known capability, and `capability_strings` feeds both the
+    /// install preview and the update preview's added list, so both show it.
+    #[test]
+    fn the_acp_capability_is_listed_in_install_and_update_previews() {
+        let manifest = PluginManifest::from_toml_str(
+            "id = \"acme.helper\"\nname = \"Helper\"\nversion = \"1.0.0\"\napi_version = 30\n\
+             capabilities = [\"acp.agent.provide\"]\n\
+             [[agent_integrations]]\ntool = \"helper\"\n\
+             [agent_integrations.acp]\nid = \"helper-acp\"\ndisplay_name = \"Helper\"\n\
+             failure_policy = \"refuse\"\n\
+             [agent_integrations.acp.proxy]\ncommand = \"bin/proxy\"\n\
+             protocol_version = 1\nprimitive_schema_version = 1\n",
+        )
+        .unwrap();
+        let capabilities = capability_strings(&manifest).unwrap();
+        assert_eq!(capabilities, ["acp.agent.provide"]);
+        assert!(install_needs_consent(&capabilities, &[], &[], &[]));
     }
 
     #[test]

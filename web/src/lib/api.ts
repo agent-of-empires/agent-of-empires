@@ -884,8 +884,21 @@ export interface PluginAgentLaunch {
   };
 }
 
+export interface PluginAcpDeclaration {
+  id: string;
+  aliases?: string[];
+  display_name: string;
+  proxy: { command: string };
+  adapter?: { upstream_package: string; upstream_pin: string };
+  env?: { allowlist?: string[]; host_only?: string[]; defaults?: Record<string, string> };
+  compat?: { expected_agent_name?: string; min_version?: string; capability_min_versions?: Record<string, string> };
+  profile?: { modes?: { id: string; approval_class: string }[] };
+  failure_policy: "neutral_boot" | "refuse";
+}
+
 export interface PluginAgentIntegration {
   tool: string;
+  acp?: PluginAcpDeclaration;
   command?: string;
   provider_versions?: string[];
   replies?: boolean;
