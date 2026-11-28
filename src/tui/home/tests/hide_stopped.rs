@@ -552,8 +552,7 @@ fn a_session_menu_closes_when_its_session_is_hidden() {
     let mut env = env_with_stopped(true);
     press_y(&mut env);
     let id = select_session(&mut env, "util-live");
-    env.view.list_inner_area = ratatui::layout::Rect::new(1, 1, 28, 20);
-    env.view.list_area = ratatui::layout::Rect::new(0, 0, 30, 22);
+    render_geometry(&mut env.view);
     assert!(env
         .view
         .handle_right_click(5, env.view.list_inner_area.y + env.view.cursor as u16));

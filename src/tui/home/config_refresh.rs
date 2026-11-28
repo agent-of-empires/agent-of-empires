@@ -94,10 +94,14 @@ impl HomeView {
         config: crate::session::Config,
         origin: ConfigRefreshOrigin,
     ) {
-        self.default_terminal_mode = match config.sandbox.default_terminal_mode {
+        let default_terminal_mode = match config.sandbox.default_terminal_mode {
             DefaultTerminalMode::Host => TerminalMode::Host,
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
+        if self.default_terminal_mode != default_terminal_mode {
+            self.invalidate_rows();
+            self.default_terminal_mode = default_terminal_mode;
+        }
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.host_tab_title = config.session.host_tab_title;

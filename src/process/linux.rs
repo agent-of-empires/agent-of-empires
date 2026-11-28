@@ -8,8 +8,14 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 
 pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
-    restore_environment_value, terminate_process_group, try_wait_status_hook,
+    restore_environment_value, terminate_process_group, try_wait_group_status,
 };
+
+pub(super) fn reopen_terminal_fd(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    super::unix::open_terminal_path(Path::new(&path))
+}
 
 /// Mount points of this mount namespace; an error when `/proc` is unavailable.
 pub(crate) fn mount_points() -> std::io::Result<std::collections::HashSet<std::path::PathBuf>> {
@@ -1305,6 +1311,43 @@ assert ctypes.get_errno() == errno.EPERM
 
 pub(crate) fn codex_managed_preferences_present() -> bool {
     false
+}
+
+pub(super) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
+{
+    std::env::var_os("WAYLAND_DISPLAY")
+        .map(|_| ("wl-copy", &[] as &'static [&'static str]))
+        .into_iter()
+        .chain([
+            ("xclip", &["-selection", "clipboard"][..]),
+            ("xsel", &["--clipboard", "--input"][..]),
+        ])
+}
+
+pub(super) fn terminal_writable(
+    file: &std::fs::File,
+    remaining: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if remaining.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let mut descriptor = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let milliseconds = remaining
+        .as_millis()
+        .saturating_add(1)
+        .min(i32::MAX as u128) as i32;
+    // SAFETY: poll borrows one valid descriptor until it returns.
+    match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+        0 => Err(std::io::ErrorKind::TimedOut.into()),
+        -1 => Err(std::io::Error::last_os_error()),
+        _ if descriptor.revents & libc::POLLOUT != 0 => Ok(()),
+        _ => Err(std::io::ErrorKind::BrokenPipe.into()),
+    }
 }
 
 struct LegacyRuntimeDirectories {
@@ -2626,9 +2669,27 @@ fn foreign_process_permission_error(error: &std::io::Error, owner: Option<u32>, 
 }
 
 pub(super) fn runner_group_executing(group: u32) -> anyhow::Result<bool> {
+    runner_group_executing_with_deadline(group, None)
+}
+
+pub(super) fn runner_group_executing_before(
+    group: u32,
+    deadline: std::time::Instant,
+) -> anyhow::Result<bool> {
+    runner_group_executing_with_deadline(group, Some(deadline))
+}
+
+fn runner_group_executing_with_deadline(
+    group: u32,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<bool> {
     use std::io::Read as _;
     let mut bytes = [0u8; 1024];
     for entry in fs::read_dir("/proc")? {
+        anyhow::ensure!(
+            deadline.is_none_or(|deadline| std::time::Instant::now() < deadline),
+            "runner group census timed out"
+        );
         let entry = entry?;
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;

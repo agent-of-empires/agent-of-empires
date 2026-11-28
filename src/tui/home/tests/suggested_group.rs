@@ -746,6 +746,7 @@ fn hooks_that_need_trust_show_a_review_and_approving_starts_with_its_fingerprint
         env.view.confirm_dialog.as_ref().unwrap().action(),
         "approve_suggestion_hooks"
     );
+    render_geometry(&mut env.view);
     env.view.handle_key(key(KeyCode::Char('y')), None);
     assert_eq!(
         next_request(&requests),
@@ -1229,9 +1230,15 @@ fn clicking_the_suggested_row_leaves_live_send() {
         leader: None,
     });
 
-    env.view.handle_click(5, click_row);
+    let now = std::time::Instant::now();
+    env.view.acknowledge_rows(Some(env.view.rows_paint()));
+    env.view.handle_click_at(now, 5, click_row);
     assert_eq!(env.view.cursor, idx);
     assert!(env.view.live_send.is_none());
+    assert!(!env.view.suggestions_focused);
+    env.view.acknowledge_rows(Some(env.view.rows_paint()));
+    env.view.handle_click_at(now, 5, click_row);
+    assert!(env.view.suggestions_focused);
 }
 
 #[test]
@@ -1532,6 +1539,7 @@ fn pre_trust_is_refused_when_the_list_changes_under_its_confirmation() {
     let _commands = env.view.session_feed.request_driver_for_test();
     env.view.handle_key(key(KeyCode::Char('t')), None);
     assert!(env.view.confirm_dialog.is_some());
+    render_geometry(&mut env.view);
     let mut other = snapshot(1, &[]);
     other["profile"] = "other".into();
     env.view.suggestions_feed.set_snapshot_for_test(other);

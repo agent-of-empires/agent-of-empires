@@ -329,12 +329,15 @@ fn sandbox_login_link_actions_never_flash_the_link() {
         |_| Err(std::io::Error::other("no browser you could see from here")),
         |u| {
             *copied.borrow_mut() = u.to_string();
-            u.len()
+            "Copy queued; waiting for clipboard output.".into()
         },
     );
     assert_eq!(*copied.borrow(), url);
     let text = env.view.status_flash_text().unwrap().to_string();
-    assert_eq!(text, "no browser here; copied the sign-in link");
+    assert_eq!(
+        text,
+        "no browser here; Copy queued; waiting for clipboard output."
+    );
     assert!(!text.contains("state="));
 }
 

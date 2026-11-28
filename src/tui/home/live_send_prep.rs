@@ -168,7 +168,7 @@ impl HomeView {
         // from the view; it flips the view on a leader `t` swap.
         let view_mode = target.view_mode();
         if self.view_mode != view_mode {
-            self.view_mode = view_mode;
+            self.set_view_mode(view_mode);
             self.preview_scroll_offset = 0;
         }
         // Live mode owns the pane again, so the preview may re-arm the VT pipe.

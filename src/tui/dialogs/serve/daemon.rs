@@ -233,6 +233,7 @@ pub(super) fn run_tailscale_funnel_off(
             .stderr(Stdio::from(capture)),
         std::time::Duration::from_secs(3),
         Some(cancel),
+        crate::process::ProcessGroupCleanup::Always,
     )
     .map_err(|e| format!("could not complete tailscale funnel off: {e}; Funnel state may have changed"))?
     .ok_or_else(|| {

@@ -91,8 +91,10 @@ mod platform {
 
     pub(super) fn terminate_process_group(_: &std::process::Child) {}
 
-    pub(super) fn try_wait_status_hook(
+    pub(super) fn try_wait_group_status(
         child: &mut std::process::Child,
+        _: super::ProcessGroupCleanup,
+        _: Option<&tokio_util::sync::CancellationToken>,
     ) -> std::io::Result<Option<std::process::ExitStatus>> {
         child.try_wait()
     }
@@ -121,6 +123,18 @@ mod platform {
 pub(crate) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
     platform::metadata_identity(metadata)
 }
+
+pub(crate) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
+{
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::clipboard_commands()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        std::iter::empty()
+    }
+}
 pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -132,6 +146,31 @@ pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<s
     }
 }
 
+pub(crate) fn independent_terminal_output() -> std::io::Result<std::fs::File> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix::independent_terminal_output()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bounded terminal output requires Linux or macOS",
+        ))
+    }
+}
+
+pub(crate) fn terminal_writable(file: &std::fs::File, remaining: Duration) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::terminal_writable(file, remaining)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (file, remaining);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
 #[derive(Debug, thiserror::Error)]
 #[error("staging filesystem acquisition cleanup is unproven: {0}")]
 pub(crate) struct StagingAcquisitionUncertain(pub String);
@@ -744,7 +783,10 @@ pub(crate) fn terminate_and_reap_process_group(
 ) -> std::io::Result<()> {
     platform::terminate_process_group(child);
     let grace_deadline = Instant::now() + grace;
-    while !unreaped_group_settled(child.id()) {
+    while Instant::now() < grace_deadline {
+        if unreaped_group_settled(child.id(), grace_deadline) {
+            break;
+        }
         let now = Instant::now();
         if now >= grace_deadline {
             break;
@@ -772,15 +814,18 @@ pub(crate) fn terminate_and_reap_process_group(
 }
 
 /// An unobservable group counts as unsettled, so it waits out the full grace.
-fn unreaped_group_settled(leader: u32) -> bool {
+fn unreaped_group_settled(leader: u32, deadline: Instant) -> bool {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         matches!(unix::child_exited_unreaped(leader), Ok(true))
-            && matches!(runner_group_executing(leader), Ok(false))
+            && matches!(
+                platform::runner_group_executing_before(leader, deadline),
+                Ok(false)
+            )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = leader;
+        let _ = (leader, deadline);
         false
     }
 }
@@ -858,21 +903,28 @@ pub fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
 ) -> std::io::Result<Option<ExitStatus>> {
-    wait_with_timeout_inner(child, timeout, false, false, None)
+    wait_with_timeout_inner(child, timeout, false, None, None)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessGroupCleanup {
+    Always,
+    // Successful clipboard owners may outlive the helper that transfers their data.
+    OnFailure,
 }
 
 fn wait_with_timeout_inner(
     child: &mut Child,
     timeout: Duration,
     kill_process_group: bool,
-    cleanup_on_exit: bool,
+    cleanup: Option<ProcessGroupCleanup>,
     cancel: Option<&CancellationToken>,
 ) -> std::io::Result<Option<ExitStatus>> {
     wait_with_timeout_inner_with_clock(
         child,
         timeout,
         kill_process_group,
-        cleanup_on_exit,
+        cleanup,
         cancel,
         Instant::now,
         std::thread::sleep,
@@ -885,7 +937,7 @@ fn wait_with_timeout_inner_with_clock(
     child: &mut Child,
     timeout: Duration,
     kill_process_group: bool,
-    cleanup_on_exit: bool,
+    cleanup: Option<ProcessGroupCleanup>,
     cancel: Option<&CancellationToken>,
     mut now: impl FnMut() -> Instant,
     mut sleep: impl FnMut(Duration),
@@ -897,8 +949,8 @@ fn wait_with_timeout_inner_with_clock(
     let mut poll = Duration::from_millis(1);
     loop {
         if !termination_requested {
-            let status = if cleanup_on_exit {
-                platform::try_wait_status_hook(child)?
+            let status = if let Some(cleanup) = cleanup {
+                platform::try_wait_group_status(child, cleanup, cancel)?
             } else {
                 child.try_wait()?
             };
@@ -922,7 +974,11 @@ fn wait_with_timeout_inner_with_clock(
                 platform::kill_process_group(child);
             }
             let _ = child.kill();
-            let _ = child.wait();
+            if cleanup == Some(ProcessGroupCleanup::OnFailure) {
+                poll_killed_status_child(child);
+            } else {
+                let _ = child.wait();
+            }
             return Ok(None);
         }
         let wake_at = if kill_process_group && !termination_requested {
@@ -932,6 +988,17 @@ fn wait_with_timeout_inner_with_clock(
         };
         sleep(poll.min(wake_at.saturating_duration_since(now)));
         poll = (poll * 2).min(WAIT_POLL_INTERVAL);
+    }
+}
+
+fn poll_killed_status_child(child: &mut Child) {
+    let deadline = Instant::now() + WAIT_POLL_INTERVAL;
+    while matches!(child.try_wait(), Ok(None)) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(1)));
     }
 }
 
@@ -977,24 +1044,53 @@ pub fn run_with_timeout_process_group(
 
 /// Run a command without capturing output; cancellation terminates and reaps
 /// its process group with the same bounded grace as a timeout.
-/// Remaining process-group members are killed before reaping an exited leader.
+/// The exit policy controls custody of descendants after successful completion.
+/// Clipboard owner transfers also bound the synchronous wait after SIGKILL.
 pub(crate) fn run_status_with_timeout_process_group(
     cmd: &mut Command,
     timeout: Duration,
     cancel: Option<&CancellationToken>,
+    cleanup: ProcessGroupCleanup,
 ) -> std::io::Result<Option<ExitStatus>> {
     if cancel.is_some_and(CancellationToken::is_cancelled) {
         return Ok(None);
     }
     platform::configure_process_group(cmd);
     let mut child = cmd.spawn()?;
-    wait_with_timeout_inner(
+    let result = wait_with_timeout_inner(
         &mut child,
         timeout,
         cfg!(any(target_os = "linux", target_os = "macos")),
-        true,
+        Some(cleanup),
         cancel,
-    )
+    );
+    #[cfg(unix)]
+    if result
+        .as_ref()
+        .is_err_and(|error| error.raw_os_error() == Some(libc::ECHILD))
+    {
+        return result;
+    }
+    if result.is_err() {
+        platform::kill_process_group(&child);
+        let _ = child.kill();
+        poll_killed_status_child(&mut child);
+    }
+    if cleanup == ProcessGroupCleanup::Always && result.is_ok() {
+        return result;
+    }
+    if !matches!(result, Ok(Some(_))) && matches!(child.try_wait(), Ok(None)) {
+        // A killed child may still be in uninterruptible sleep. Shutdown must not join it.
+        if let Err(error) = std::thread::Builder::new()
+            .name("status-child-reaper".into())
+            .spawn(move || {
+                let _ = child.wait();
+            })
+        {
+            tracing::warn!(target: "process.reap", %error, "could not start status child reaper");
+        }
+    }
+    result
 }
 pub(crate) fn run_until_cancelled_process_group(
     cmd: &mut Command,
@@ -1099,12 +1195,12 @@ fn run_with_timeout_inner(
     let mut child = cmd.spawn()?;
 
     let waited = match tail.as_mut() {
-        None => wait_with_timeout_inner(&mut child, timeout, kill_process_group, false, cancel)?,
+        None => wait_with_timeout_inner(&mut child, timeout, kill_process_group, None, cancel)?,
         Some(tail) => wait_with_timeout_inner_with_clock(
             &mut child,
             timeout,
             kill_process_group,
-            false,
+            None,
             cancel,
             Instant::now,
             |pause| {
@@ -3518,6 +3614,145 @@ finally:
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct ProcessGroupFixture {
+        child: Child,
+        group_armed: bool,
+        descendant: Option<CapturedProcess>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl Drop for ProcessGroupFixture {
+        fn drop(&mut self) {
+            if self.group_armed {
+                platform::kill_process_group(&self.child);
+            }
+            // After reaping, only the captured descendant identity remains safe.
+            if let Some(descendant) = &self.descendant {
+                let _ = descendant.signal(libc::SIGKILL);
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn status_group_preserves_only_successful_uncancelled_owner_transfers() {
+        use std::io::BufRead;
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+        for (name, cleanup, cancelled, exit_code, kept) in [
+            (
+                "hook success",
+                ProcessGroupCleanup::Always,
+                false,
+                "0",
+                false,
+            ),
+            (
+                "clipboard success",
+                ProcessGroupCleanup::OnFailure,
+                false,
+                "0",
+                true,
+            ),
+            (
+                "clipboard failure",
+                ProcessGroupCleanup::OnFailure,
+                false,
+                "1",
+                false,
+            ),
+            (
+                "cancel before transfer",
+                ProcessGroupCleanup::OnFailure,
+                true,
+                "0",
+                false,
+            ),
+        ] {
+            let (reader, writer) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                r#"sh -c 'trap "" TERM; printf "%s\n" "$$"; IFS= read -r release <&1' & exit "$1""#,
+                "sh",
+                exit_code,
+            ]).stdin(Stdio::null())
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .stderr(Stdio::null());
+            let mut group = ProcessGroupFixture {
+                child: spawn_process_group(&mut command).unwrap(),
+                group_armed: true,
+                descendant: None,
+            };
+            let mut events = std::io::BufReader::new(reader);
+            let mut ready = String::new();
+            events.read_line(&mut ready).unwrap();
+            let pid = ready.trim().parse().unwrap();
+            let birth = process_birth_identity(pid).unwrap().unwrap();
+            group.descendant = CapturedProcess::capture(pid, &birth).unwrap();
+            assert!(group.descendant.is_some(), "{name}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                // SAFETY: observe this owned leader without releasing its PID.
+                assert_eq!(
+                    unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            group.child.id(),
+                            &mut info,
+                            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                        )
+                    },
+                    0
+                );
+                if unsafe { info.si_pid() } != 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{name}: leader did not finish");
+                std::thread::yield_now();
+            }
+            let cancel = CancellationToken::new();
+            if cancelled {
+                cancel.cancel();
+            }
+            let result = wait_with_timeout_inner(
+                &mut group.child,
+                Duration::from_secs(2),
+                true,
+                Some(cleanup),
+                Some(&cancel),
+            );
+            group.group_armed = false;
+            assert_eq!(
+                result.unwrap().unwrap().code(),
+                Some(exit_code.parse().unwrap()),
+                "{name}"
+            );
+            assert_child_reaped(group.child.id());
+            let descendant = group.descendant.as_ref().unwrap();
+            if kept {
+                assert!(
+                    !descendant.exited().unwrap(),
+                    "{name}: clipboard owner was killed"
+                );
+            } else {
+                while !descendant.exited().unwrap() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{name}: descendant outlived transfer"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+
     /// Freeze logical time for real TERM acknowledgements, so OS scheduling cannot
     /// consume the grace budget whose escalation ordering is under test.
     #[test]
@@ -3527,27 +3762,6 @@ finally:
         use std::io::BufRead;
         use std::os::fd::OwnedFd;
         use std::os::unix::net::UnixStream;
-
-        struct ProcessGroupFixture {
-            child: Child,
-            group_armed: bool,
-            descendant: Option<CapturedProcess>,
-        }
-
-        impl Drop for ProcessGroupFixture {
-            /// Reaping ends the leader's PID reservation. Subsequent cleanup uses
-            /// the captured descendant identity, not the former process-group ID.
-            fn drop(&mut self) {
-                if self.group_armed {
-                    platform::kill_process_group(&self.child);
-                }
-                if let Some(descendant) = &self.descendant {
-                    let _ = descendant.signal(libc::SIGKILL);
-                }
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
-        }
 
         let timeout = Duration::from_secs(2);
         let grace = (timeout / 4).min(PROCESS_GROUP_TERMINATION_GRACE);
@@ -3620,7 +3834,7 @@ finally:
                 &mut group.child,
                 timeout,
                 true,
-                status_hook,
+                status_hook.then_some(ProcessGroupCleanup::Always),
                 status_hook.then_some(&token),
                 || initial.take().unwrap_or_else(|| clock.get()),
                 |duration| {
@@ -3671,45 +3885,6 @@ finally:
                 );
             }
         }
-    }
-
-    #[test]
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn completed_status_hook_does_not_abandon_background_children() {
-        let root = tempfile::tempdir().unwrap();
-        let pid_path = root.path().join("child.pid");
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", r#"sleep 30 & printf %s $! > "$1""#, "sh"])
-            .arg(&pid_path);
-        let result =
-            run_status_with_timeout_process_group(&mut command, Duration::from_secs(2), None)
-                .unwrap();
-        assert!(result.unwrap().success());
-        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
-        // Signalling the group precedes the descendants' exit transition.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let running = loop {
-            let output = Command::new("ps")
-                .args(["-o", "stat=", "-p", &pid.to_string()])
-                .output()
-                .unwrap();
-            let state = String::from_utf8_lossy(&output.stdout);
-            let running = output.status.success()
-                && !state.trim().is_empty()
-                && !state.trim_start().starts_with('Z');
-            if !running || Instant::now() >= deadline {
-                break running;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        if running {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-        assert!(!running, "completed hook left its background child running");
     }
 
     #[test]

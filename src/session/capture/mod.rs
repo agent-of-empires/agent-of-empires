@@ -256,43 +256,69 @@ pub(crate) fn owner_excludes(
 
 /// Runs `cmd` to completion with a deadline and a stdout byte cap, killing it on timeout.
 pub(crate) fn run_with_timeout_limit(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     timeout: Duration,
     label: &str,
     max_stdout_bytes: usize,
 ) -> Result<Vec<u8>> {
+    capture_stdout(
+        cmd,
+        std::time::Instant::now() + timeout,
+        label,
+        max_stdout_bytes,
+        false,
+    )
+}
+
+/// The caller's deadline covers command execution and stdout delivery.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn run_with_deadline_limit(
+    cmd: std::process::Command,
+    deadline: std::time::Instant,
+    label: &str,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>> {
+    capture_stdout(cmd, deadline, label, max_stdout_bytes, true)
+}
+
+fn capture_stdout(
+    mut cmd: std::process::Command,
+    deadline: std::time::Instant,
+    label: &str,
+    max_stdout_bytes: usize,
+    require_complete_stdout: bool,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(std::time::Instant::now() < deadline, "{} timed out", label);
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn '{}'", label))?;
 
-    let stdout_pipe = child.stdout.take();
+    let stdout_pipe = child.stdout.take().expect("piped child stdout");
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let buf = stdout_pipe.map(|reader| {
-            let mut buf = Vec::new();
-            reader
-                .take(max_stdout_bytes.saturating_add(1) as u64)
-                .read_to_end(&mut buf)
-                .ok();
-            buf
-        });
-        let _ = stdout_tx.send(buf);
+        let mut buf = Vec::new();
+        let result = stdout_pipe
+            .take(max_stdout_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut buf);
+        let _ = stdout_tx.send((buf, result));
     });
 
-    let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
+                let now = std::time::Instant::now();
+                if now >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(anyhow::anyhow!("{} timed out", label));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50).min(deadline - now));
             }
             Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(anyhow::anyhow!("Failed to wait on {}: {}", label, error));
             }
         }
@@ -301,11 +327,15 @@ pub(crate) fn run_with_timeout_limit(
     // A grandchild holding the stdout pipe would block the drain forever, so it
     // is bounded by the remaining deadline and the reader thread is left detached.
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let stdout_bytes = stdout_rx
-        .recv_timeout(remaining)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let stdout = stdout_rx.recv_timeout(remaining);
+    let stdout_bytes = if require_complete_stdout {
+        let (bytes, result) = stdout
+            .with_context(|| format!("Failed to collect {} stdout before deadline", label))?;
+        result.with_context(|| format!("Failed to read {} stdout", label))?;
+        bytes
+    } else {
+        stdout.map(|(bytes, _)| bytes).unwrap_or_default()
+    };
     if stdout_bytes.len() > max_stdout_bytes {
         anyhow::bail!("{} exceeded its stdout limit", label);
     }
@@ -471,18 +501,79 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn run_with_timeout_bounds_drain_when_grandchild_holds_pipe() {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", "sleep 10 & printf done"]);
-        let start = Instant::now();
-        let out = run_with_timeout_limit(
-            cmd,
-            Duration::from_millis(500),
-            "grandchild-test",
-            usize::MAX,
-        )
-        .expect("the sh child exits quickly, so a buffer is produced");
-        assert!(start.elapsed() < Duration::from_secs(4));
-        assert!(out.is_empty() || out == b"done");
+    fn deadline_capture_distinguishes_empty_output_from_missing_output() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("launched");
+        let mut expired = std::process::Command::new("sh");
+        expired
+            .args(["-c", "printf launched > \"$1\"", "sh"])
+            .arg(&marker);
+        let error = run_with_deadline_limit(expired, Instant::now(), "expired", 1024).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(
+            !marker.exists(),
+            "an expired budget must not start a command"
+        );
+
+        let mut empty = std::process::Command::new("sh");
+        empty.args(["-c", ":"]);
+        assert!(
+            run_with_timeout_limit(empty, Duration::from_secs(2), "empty", 1024)
+                .unwrap()
+                .is_empty()
+        );
+
+        for strict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let fifo = directory.path().join("release");
+            let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+            let _reader = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap();
+            let mut release = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            let finished = directory.path().join("stdout-closed");
+            let mut command = std::process::Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    "(IFS= read -r release < \"$1\"; exec 1>&-; : > \"$2\") & printf done",
+                    "sh",
+                ])
+                .arg(&fifo)
+                .arg(&finished);
+            let timeout = Duration::from_millis(500);
+            let result = if strict {
+                run_with_deadline_limit(command, Instant::now() + timeout, "held-pipe", 1024)
+            } else {
+                run_with_timeout_limit(command, timeout, "held-pipe", 1024)
+            };
+            writeln!(release, "release").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !finished.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the pipe holder must close stdout"
+                );
+                std::thread::yield_now();
+            }
+            if strict {
+                let error = result.expect_err("missing stdout must not certify an empty census");
+                assert!(
+                    error.to_string().contains("stdout before deadline"),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    result.unwrap().is_empty(),
+                    "legacy capture tolerates a held pipe"
+                );
+            }
+        }
     }
 }

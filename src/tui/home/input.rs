@@ -9,7 +9,7 @@ use super::bindings::{self, ActionId};
 use super::live_send::LiveKey;
 use super::{
     live_send, DragKind, HomeView, NamespaceIntent, PermissionResponseTarget, PreviewSelection,
-    TerminalMode, ViewMode,
+    RowClick, RowClickTarget, TerminalMode, ViewMode,
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
@@ -756,13 +756,14 @@ impl HomeView {
         if recovery_only {
             self.cancel_native_attachment();
             self.exit_live_send_if_active();
-            self.view_mode = if toggle_current
+            let mode = if toggle_current
                 && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
             {
                 ViewMode::Structured
             } else {
                 ViewMode::Tool(tool_name)
             };
+            self.set_view_mode(mode);
             self.preview_scroll_offset = 0;
             self.tool_preview_cache = super::PreviewCache::default();
             return None;
@@ -783,10 +784,10 @@ impl HomeView {
                 // The pending native preparation was bound to the mode being
                 // left, so its lease must not outlive it.
                 self.cancel_native_attachment();
-                self.view_mode = ViewMode::Structured;
+                self.set_view_mode(ViewMode::Structured);
                 return None;
             } else {
-                self.view_mode = ViewMode::Tool(tool_name.clone());
+                self.set_view_mode(ViewMode::Tool(tool_name.clone()));
                 self.preview_scroll_offset = 0;
                 self.tool_preview_cache = super::PreviewCache::default();
             }
@@ -973,6 +974,9 @@ impl HomeView {
     /// events are captured for wheel scroll, and one mechanism has to work on Mosh and
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if self.hit_divider(col, row) {
             self.drag_state = Some(if self.divider_row.is_some() {
                 DragKind::StackedListDivider
@@ -1013,6 +1017,9 @@ impl HomeView {
     /// True when state changed, so the caller redraws. Nothing persists per tick: the
     /// divider saves on release and the preview-select path emits OSC 52 on release.
     pub fn handle_drag_move(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         // The settings scrollbar belongs to the overlay itself.
         if matches!(self.drag_state, Some(DragKind::SettingsScrollbar)) {
             if let Some(view) = &mut self.settings_view {
@@ -1106,6 +1113,9 @@ impl HomeView {
     /// ticker rather than by mouse events, so holding the cursor at an edge scrolls
     /// continuously and grows the selection past a page. Returns whether anything moved.
     pub fn tick_preview_autoscroll(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if !matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
             return false;
         }
@@ -1228,6 +1238,9 @@ impl HomeView {
     /// True when a drag was in progress, so an `Up(Left)` that wasn't part of one causes
     /// no redraw.
     pub fn handle_drag_end(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         let Some(state) = self.drag_state.take() else {
             return false;
         };
@@ -1348,7 +1361,25 @@ impl HomeView {
     /// Drain the text captured on the last render that painted a finalized preview
     /// selection. `Some` exactly once per finalized drag; `App` calls it after the draw.
     pub fn take_preview_copy_text(&mut self) -> Option<String> {
+        if !self.presentation_ready {
+            return None;
+        }
         self.preview_copy_text.take()
+    }
+
+    pub(in crate::tui) fn invalidate_presentation(&mut self) {
+        self.presentation_ready = false;
+        self.presented_rows = None;
+        self.presented_confirmation = None;
+        if let Some(view) = self.structured_preview.as_mut() {
+            view.invalidate_presentation();
+        }
+        self.clear_preview_selection();
+        self.drag_state = None;
+        self.preview_drag_pos = None;
+        self.preview_autoscroll_at = None;
+        self.preview_copy_pending = false;
+        self.preview_copy_text = None;
     }
 
     /// Discard any in-flight preview selection, so interacting with the TUI dismisses the
@@ -1667,6 +1698,7 @@ impl HomeView {
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        let presented_confirmation = self.begin_confirmation_input();
         if self.reconcile_delete_confirmation() {
             return true;
         }
@@ -1712,6 +1744,13 @@ impl HomeView {
             if let Some(result) = dialog.dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation.is_some_and(|token| {
+                            token.dialog == dialog.dialog.presentation_id()
+                        }) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.unified_delete_dialog = None;
                     }
@@ -1842,6 +1881,12 @@ impl HomeView {
                 let action = dialog.action().to_string();
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
                         self.pending_indeterminate_resolution = None;
@@ -1984,6 +2029,12 @@ impl HomeView {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.group_delete_options_dialog = None;
                     }
@@ -2230,6 +2281,7 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        let presented_confirmation = self.begin_confirmation_input();
         // A key is a context change: a pending native attachment was prepared
         // for the session, profile, view and terminal mode in force when it was
         // requested, so reconcile before the keystroke acts on any of them.
@@ -2438,6 +2490,12 @@ impl HomeView {
             if let Some(dialog) = &mut self.confirm_dialog {
                 match dialog.handle_key(key) {
                     DialogResult::Continue => return None,
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return None;
+                    }
                     DialogResult::Cancel => {
                         // User chose not to discard, go back to settings
                         self.confirm_dialog = None;
@@ -2781,6 +2839,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.confirm_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_indeterminate_resolution = None;
@@ -2811,6 +2875,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.unified_delete_dialog {
             match dialog.dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
                 }
@@ -2830,6 +2900,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.group_delete_options_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.group_delete_options_dialog = None;
                 }
@@ -3328,7 +3404,7 @@ impl HomeView {
             }
             KeyCode::Esc if matches!(self.view_mode, ViewMode::Tool(_)) => {
                 self.cancel_native_attachment();
-                self.view_mode = ViewMode::Structured;
+                self.set_view_mode(ViewMode::Structured);
                 return None;
             }
             _ => {}
@@ -3583,7 +3659,7 @@ impl HomeView {
             ActionId::ToolPicker => {
                 if matches!(self.view_mode, ViewMode::Tool(_)) {
                     self.cancel_native_attachment();
-                    self.view_mode = ViewMode::Structured;
+                    self.set_view_mode(ViewMode::Structured);
                 } else if self.has_tool_targets() {
                     self.open_tool_picker();
                 }
@@ -3614,10 +3690,10 @@ impl HomeView {
                 // pending native preparation is bound to the mode it was
                 // prepared for.
                 self.cancel_native_attachment();
-                self.view_mode = match self.view_mode {
+                self.set_view_mode(match self.view_mode {
                     ViewMode::Structured => ViewMode::Terminal,
                     ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
-                };
+                });
                 if matches!(self.view_mode, ViewMode::Terminal) {
                     if let Some(action) = self.maybe_auto_start_live_send() {
                         return Some(action);
@@ -5511,6 +5587,9 @@ impl HomeView {
                 return false;
             }
             if self.hit_list(col, row) {
+                if !self.rows_presented() {
+                    return false;
+                }
                 self.move_cursor(-1);
                 return true;
             }
@@ -5666,8 +5745,9 @@ impl HomeView {
     /// space inside the list opens the empty-sidebar menu, and anywhere else is a no-op so
     /// the caller falls through.
     pub fn handle_right_click(&mut self, col: u16, row: u16) -> bool {
-        // `resolve_row_to_index` already short-circuits while any non-live-send overlay is
-        // open and inside the diff takeover, so no extra gating here.
+        if !self.rows_presented() {
+            return false;
+        }
         let anchor = (col.saturating_add(1), row.saturating_add(1));
         if let Some(idx) = self.resolve_row_to_index(col, row) {
             if self.cursor != idx {
@@ -6200,6 +6280,9 @@ impl HomeView {
     /// Fires only when no overlay is up and the diff view is closed, so a click on an
     /// empty list under a modal doesn't punch through.
     pub fn handle_empty_list_click(&mut self, col: u16, row: u16) -> bool {
+        if !self.rows_presented() {
+            return false;
+        }
         if self.has_non_live_send_overlay() || self.diff_view.is_some() {
             return false;
         }
@@ -6530,102 +6613,86 @@ impl HomeView {
         col: u16,
         row: u16,
     ) -> Option<Action> {
+        if !self.rows_presented() {
+            return None;
+        }
         let abs_idx = self.resolve_row_to_index(col, row)?;
-        // A click in the list gives it the keys back from the suggestions pane.
         self.suggestions_focused = false;
 
-        let is_double_click = matches!(
-            self.last_click,
-            Some((prev_time, _, prev_row))
-                if prev_row == row
-                    && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
-        );
-        self.last_click = Some((now, col, row));
-
-        let item = self.flat_items[abs_idx].clone();
-        if is_double_click {
-            // The first click already selected the row and toggled a group, so the second
-            // only activates a session; re-toggling would undo the first and flicker.
-            //
-            // `cursor` is re-synced to `abs_idx` before activating because anything
-            // between the clicks (an arrow key, a poll-driven re-sort) can move it, and
-            // `activate_selected_session()` reads `selected_session`, which tracks the
-            // cursor rather than the click target.
-            return match item {
-                Item::Session { .. } => {
-                    if self.cursor != abs_idx {
-                        self.cursor = abs_idx;
-                        self.update_selected();
-                    }
-                    self.activate_selected_session()
+        let target = match &self.flat_items[abs_idx] {
+            Item::Session { id, .. } => RowClickTarget::Session(id.clone()),
+            Item::Suggested { .. } => RowClickTarget::Suggested,
+            Item::Group { path, profile, .. } => RowClickTarget::Group {
+                path: path.clone(),
+                profile: profile.clone(),
+            },
+        };
+        let is_double_click = self.last_click.as_ref().is_some_and(|previous| {
+            previous.row == row
+                && previous.target == target
+                && now.duration_since(previous.at) <= DOUBLE_CLICK_THRESHOLD
+        });
+        let action = match &target {
+            RowClickTarget::Group { path, .. } => {
+                if !is_double_click {
+                    self.toggle_group_collapsed(path);
                 }
-                Item::Group { .. } => None,
-                Item::Suggested { .. } => {
-                    if let Some(state) = self.live_send.clone() {
-                        self.exit_live_send_and_restore_sizing(&state);
-                    }
-                    self.cursor = abs_idx;
-                    self.update_selected();
-                    self.focus_suggestions_pane();
-                    None
-                }
-            };
-        }
-
-        match item {
-            Item::Group { path, .. } => {
-                self.toggle_group_collapsed(&path);
                 None
             }
-            Item::Suggested { .. } => {
+            RowClickTarget::Suggested => {
                 if let Some(state) = self.live_send.clone() {
                     self.exit_live_send_and_restore_sizing(&state);
                 }
                 self.cursor = abs_idx;
                 self.update_selected();
+                if is_double_click {
+                    self.focus_suggestions_pane();
+                }
                 None
             }
-            Item::Session { id, .. } => {
-                self.system_health_open = false;
+            RowClickTarget::Session(id) => {
                 if self.cursor != abs_idx {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
-                // Shelved rows select without preparing a pane.
-                let archived = self
-                    .get_instance(&id)
-                    .map(|inst| inst.is_archived() || inst.is_trashed())
-                    .unwrap_or(false);
-                // SelectOnly also leaves any existing live-send target.
-                if archived
-                    || matches!(
-                        self.click_action(&id),
-                        Some(crate::session::ClickAction::SelectOnly)
-                    )
-                {
-                    // Do not leave keystrokes aimed at the previously live row.
-                    if let Some(state) = self.live_send.clone() {
-                        self.exit_live_send_and_restore_sizing(&state);
-                    }
-                    None
-                } else if self.structured_view_selected(&id) {
-                    // The live form of a structured row is its native view, which
-                    // only Enter or the live-send chord opens: a click selects it.
-                    // A relay aimed at another session ends, so keystrokes follow
-                    // the selection instead of reaching the row left behind.
-                    if self
-                        .live_send
-                        .as_ref()
-                        .is_some_and(|state| state.session_id != id)
-                    {
-                        self.exit_live_send_if_active();
-                    }
-                    None
+                if is_double_click {
+                    self.activate_selected_session()
                 } else {
-                    self.start_live_send()
+                    self.system_health_open = false;
+                    let shelved = self
+                        .get_instance(id)
+                        .is_some_and(|inst| inst.is_archived() || inst.is_trashed());
+                    if shelved
+                        || matches!(
+                            self.click_action(id),
+                            Some(crate::session::ClickAction::SelectOnly)
+                        )
+                    {
+                        if let Some(state) = self.live_send.clone() {
+                            self.exit_live_send_and_restore_sizing(&state);
+                        }
+                        None
+                    } else if self.structured_view_selected(id) {
+                        if self
+                            .live_send
+                            .as_ref()
+                            .is_some_and(|state| state.session_id != id.as_str())
+                        {
+                            self.exit_live_send_if_active();
+                        }
+                        None
+                    } else {
+                        self.start_live_send()
+                    }
                 }
             }
-        }
+        };
+        self.last_click = Some(RowClick {
+            at: now,
+            row,
+            target,
+        });
+        action
     }
 
     /// A double-click on the preview pane produces the same `Action` a sidebar
@@ -6935,6 +7002,9 @@ impl HomeView {
                 return false;
             }
             if self.hit_list(col, row) {
+                if !self.rows_presented() {
+                    return false;
+                }
                 self.move_cursor(1);
                 return true;
             }

@@ -60,3 +60,96 @@ The first nightly appears after the next scheduled run, or `gh workflow run nigh
 
 - **ClawHub** (`contrib/openclaw-skill/`) is published automatically by `release.yml` on every release. Its frontmatter must carry no top-level `version:`; ClawHub's `_meta.json` and the `--version` flag are the source of truth.
 - **Hermes** (`contrib/hermes-skill/`) is PR-based and published by hand, so the in-repo copy is the source of truth and the hub copy drifts until you re-publish. Its frontmatter must carry a `version:`. Bump it, then run `hermes skills publish contrib/hermes-skill --to github --repo NousResearch/hermes-agent` (needs the `hermes` CLI and a GitHub token with fork permissions). Cadence is on change, not every release.
+
+## Experimental terminal dependency
+
+The Crossterm patch is an experiment in [draft PR #5593](https://github.com/agent-of-empires/agent-of-empires/pull/5593),
+not an approved fork or supported-release commitment.
+The Unix Mio reader and wake socket track [Crossterm #1179 at `e409fa05`](https://github.com/crossterm-rs/crossterm/pull/1179/commits/e409fa05aa9e7d446d773a1ad3f78f2c8db319c2).
+The 0.29 import layout and the draft's test probes are local adaptations. The
+prototype also includes filtered-event preservation and `EventStream` delivery
+changes that are not part of upstream #1179.
+Keep the PR draft until maintainers choose an official dependency that satisfies
+the required behavior, redesign the affected change without the patch, or approve
+a separate temporary exception. An exception must name a willing owner, exact
+scope, expiry date or release, security obligations, and removal trigger.
+Upstream silence does not create or renew a maintenance commitment.
+
+`vendor/crossterm` comes from the published
+[`crossterm-0.29.0.crate`](https://static.crates.io/crates/crossterm/crossterm-0.29.0.crate)
+archive, SHA-256
+`d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b`.
+Its recorded upstream commit is
+`36d95b26a26e64b0f8c12edfe11f410a6d56a812` at repository root.
+Download and verify that archive, extract it separately, then inspect the delta:
+
+```sh
+diff -ruN --exclude=Cargo.lock --exclude=target \
+  "$temporary/crossterm-0.29.0" vendor/crossterm
+```
+
+The local delta is the Unix Mio consumer and its regression tests, standalone
+workspace metadata, test-only dependencies, and removal of unnecessary closure
+parentheses in `src/terminal/sys/unix.rs` (warning-only), filtered-event
+conservation, and EventStream error/waker delivery. Parser behavior, optional
+backends, and published feature choices remain intact. Saved controls retain
+their order. Each TTY readiness permits one read; incomplete input retains its
+parser bytes while polling the remaining deadline. EOF and hard read errors
+reach the stream once, then end that stream. Its worker wakes the latest task.
+Readiness is reevaluated through the existing registration and poll. This does
+not eliminate every race with a concurrent competing input consumer.
+
+Preserve the complete MIT notices while this source is present. When selecting
+an official replacement, verify the relevant behavior rather than requiring the
+same implementation. Remove the path patch, vendor tree, vendor-only CI/helper,
+packaging references, and notices needed only by that source in the same cutover.
+Abandoning the experiment or reaching an unrenewed exception deadline also
+requires removal; do not make retirement depend solely on an upstream merge.
+
+For experimental validation on Linux and native macOS:
+
+```sh
+python3 .github/scripts/test-vendored-crossterm.py
+CARGO_BUILD_JOBS=1 cargo test --manifest-path vendor/crossterm/Cargo.toml \
+  --locked --lib --features event-stream -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo test --lib tui::terminal_output
+CARGO_BUILD_JOBS=1 cargo test --lib child_handoff_restores_real_raw_input_before_blocked_screen_controls
+```
+
+The CI helper seeds the fork's ignored lockfile from the project lock, rejects
+production dependency drift or a libc/use-dev-tty backend switch, and requires all
+21 real-consumer regressions, plus the Linux-only PTY-master EIO case, to execute.
+The standalone suite is not covered by root workspace tests. A forced ordering
+of an actual fetched batch establishes a conditional consumer contract, not the
+original macOS event order. The blocking stale cases verify completed
+private-alias consumption, not end-to-end App handoff.
+Root terminal checks and native kqueue coverage are still required.
+
+Coverage is 16 real PTY controls plus two real Unix stream socketpair full-buffer
+controls on both Linux and macOS. The latter retain the complete 1025-byte prequeue,
+one actual 1024-byte read, and original one-byte tail. Their writer stays open
+through the final zero-time poll. These two cases do **not** prove a 1024-byte
+terminal read on Darwin; the other 16 cases retain their real terminal-mode checks.
+Additional cases cover incomplete CSI timeout and cancellation with later
+completion, socket EOF, Linux PTY-master EIO, skipped-event conservation, and
+latest-task error delivery. Native macOS validation remains required.
+
+The prototype release archives carry `LICENSE`, `THIRD_PARTY_NOTICES.md`, and all of `licenses/`.
+Both prototype Nix packages include the patch's notice and install complete notices under
+`$out/share/licenses/aoe`. Crane dependency builds restore real vendor sources and
+original manifests after generating workspace stubs, using vendor-only copy
+inputs so application edits do not invalidate the dependency cache. Dependency
+metadata and Cargo vendoring come from the original manifest and lock, not dummy
+sources. These packaging changes are not release approval. An approved temporary
+exception would also require checking `nix build`, `nix build .#aoe-with-web`,
+installed notices, and a generated release archive.
+
+Before release, evaluate both configured packages and the development shell for
+every system advertised by the Nix CI matrix with
+`--option allow-import-from-derivation false`; evaluation must not realize foreign
+generated sources.
+
+To inspect the experiment, use a Git checkout and project lockfile
+(`cargo install --path . --locked`). Ordinary registry packaging strips patches
+and nested packages; it does not reproduce this draft. Neither route establishes
+a supported distribution of the experimental patch.

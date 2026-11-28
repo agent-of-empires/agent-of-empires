@@ -11611,15 +11611,12 @@ async fn concurrent_starts_of_one_suggestion_create_one_session() {
 #[serial_test::serial]
 async fn a_dropped_suggestion_create_frees_its_link() {
     let (_guards, state) = suggestion_state().await;
-    let release = create::panic_hook::arm("drop-link");
+    let gate = create::panic_hook::arm("drop-link");
     let first = tokio::spawn({
         let state = state.clone();
         async move { post_create(&state, linked_body("dropped", Some("drop-link"))).await }
     });
-    wait_for("the create to be registered", || {
-        state.create_progress.snapshot("drop-link", None).is_some()
-    })
-    .await;
+    gate.wait_until_entered().await;
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
     let host = state.plugin_host.clone().unwrap();
@@ -11641,7 +11638,7 @@ async fn a_dropped_suggestion_create_frees_its_link() {
             .is_some_and(|id| !id.is_empty()),
         "the 409 names the Session being created: {starting}"
     );
-    release.notify_one();
+    gate.release();
     wait_for("the failed create to free its link", || linked() == 0).await;
     let (status, retry) = post_create(&state, linked_body("retry", None)).await;
     assert_eq!(status, axum::http::StatusCode::CREATED, "{retry}");
@@ -12592,19 +12589,16 @@ async fn a_dropped_panicking_create_is_replayed_to_its_retry() {
         "view": "structured", "profile": "test", "idempotency_key": "drop-panic",
     });
 
-    let release = create::panic_hook::arm("drop-panic");
+    let gate = create::panic_hook::arm("drop-panic");
     let (_logs, log) = crate::server::test_helpers::capture_logs();
     let first = tokio::spawn({
         let (state, body) = (state.clone(), body.clone());
         async move { post_create(&state, body).await }
     });
-    wait_for("the create to be registered", || {
-        state.create_progress.snapshot("drop-panic", None).is_some()
-    })
-    .await;
+    gate.wait_until_entered().await;
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
-    release.notify_one();
+    gate.release();
 
     let (status, failed) = post_create(&state, body).await;
     assert_eq!(

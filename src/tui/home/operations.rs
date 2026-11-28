@@ -850,6 +850,14 @@ impl HomeView {
             self.flash_status("Select a session under Trash to restore it");
             return;
         };
+        if self
+            .instances
+            .get(&id)
+            .is_some_and(|row| row.has_pending_trash())
+        {
+            self.flash_status("Retry Trash first");
+            return;
+        }
         if let Err(error) = self
             .session_feed
             .submit_request(id, crate::tui::session_feed::SessionRequest::Restore)
