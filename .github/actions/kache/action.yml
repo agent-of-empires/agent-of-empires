@@ -1,10 +1,11 @@
 name: Kache build cache
 description: >
   Wraps rustc with kache backed by the shared S3 bucket. main pushes write
-  `artifacts/`; same-repo PRs read it and write `artifacts-pr/`. Only RunsOn
-  (EC2, us-east-1) jobs use the remote: GitHub-hosted runners, including
-  macOS, fork PRs and the RUNS_ON_DISABLED fallback, read from outside AWS
-  and pay S3 egress, so they build without one. A calling RunsOn job needs
+  `artifacts/`; same-repo PRs read it and write `artifacts-pr/`. Only
+  self-hosted runners (RunsOn, EC2 us-east-1 today) use the remote:
+  GitHub-hosted runners read from outside AWS and pay S3 egress, so they
+  build without one, as do fork PRs and every job while the
+  RUNS_ON_DISABLED killswitch is on. A calling self-hosted job needs
   `id-token: write`.
 
 inputs:
