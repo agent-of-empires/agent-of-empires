@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 mod claude;
 mod codex;
+mod container_env;
 mod gemini;
 mod hermes;
 mod kimi;
@@ -32,6 +33,7 @@ pub(crate) use codex::{
     codex_poll_fn_sandboxed_store, codex_rollout_records_container_cwd, codex_rollout_records_cwd,
     CodexRolloutScanLimit,
 };
+pub(crate) use container_env::{container_exec_command, read_container_environment};
 pub(crate) use gemini::{
     gemini_poll_fn_sandboxed_store, parse_gemini_session_json, project_hash,
     GEMINI_SCAN_MAX_CANDIDATES, GEMINI_SESSION_MAX_BYTES,

@@ -1,5 +1,5 @@
-//! Session-id capture for Oh My Pi (`omp`): resolving a capture plan,
-//! gating the launch marker, and recording the launch generation.
+//! Oh My Pi (`omp`) launch instrumentation: resolving a capture plan, gating
+//! the launch marker, and recording the launch generation.
 
 use super::*;
 
@@ -186,6 +186,7 @@ impl Instance {
     /// Capture is safe only for the built-in OMP command and a transparent,
     /// parseable argv. Benign arguments remain supported; store-selecting
     /// flags are interpreted by the capture resolver.
+    #[cfg(test)]
     pub(super) fn omp_capture_options(&self) -> Option<OmpCliCaptureOptions> {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
             return None;
@@ -222,166 +223,6 @@ impl Instance {
             launch_marker,
             container_runtime,
         })
-    }
-
-    /// Reconstruct metadata only for a legacy pane which predates launch
-    /// snapshots. New launches transport their already-resolved plan directly
-    /// into `finalize_launch` and never call this method.
-    fn resolve_legacy_omp_capture_metadata(
-        &self,
-        options: &OmpCliCaptureOptions,
-        launched_at_ms: u64,
-    ) -> Option<OmpCaptureMetadata> {
-        if launched_at_ms == 0 || self.is_sandboxed() {
-            return None;
-        }
-        let layout = resolve_omp_store_layout(
-            &self.resolved_host_environment(),
-            &self.project_path,
-            options,
-        )
-        .ok()?;
-        Some(OmpCaptureMetadata {
-            layout,
-            launched_at_ms,
-            launch_id: format!("legacy-{}-{launched_at_ms}", self.id),
-            launch_marker: String::new(),
-            routing_fingerprint: String::new(),
-            container_runtime: None,
-        })
-    }
-
-    /// Load typed launch metadata directly from tmux. A pane carrying the
-    /// regular bootstrap generation is modern; if its hidden metadata is
-    /// absent, capture stays disabled instead of being legacy-migrated.
-    pub(super) fn omp_capture_metadata(
-        &self,
-        session_name: &str,
-        options: &OmpCliCaptureOptions,
-        launched_at_ms: Option<u64>,
-    ) -> Option<OmpCaptureMetadata> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct LegacyLayout {
-            sessions: PathBuf,
-            terminal_sessions: PathBuf,
-            kind: OmpStoreKind,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct LegacyMetadata {
-            layout: LegacyLayout,
-            launched_at_ms: u64,
-        }
-
-        let bootstrap_generation =
-            || crate::tmux::env::get_env(session_name, crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY);
-        if let Some(encoded) = crate::tmux::env::get_hidden_env(
-            session_name,
-            crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
-        ) {
-            if let Ok(mut metadata) = serde_json::from_str::<OmpCaptureMetadata>(&encoded) {
-                if metadata.launch_id.trim().is_empty() {
-                    if bootstrap_generation().is_some() || self.omp_capture_generation.is_some() {
-                        return None;
-                    }
-                    metadata.launch_id = format!("legacy-{}-{}", self.id, metadata.launched_at_ms);
-                    let encoded = serde_json::to_string(&metadata).ok()?;
-                    crate::tmux::env::set_hidden_env(
-                        session_name,
-                        crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
-                        &encoded,
-                    )
-                    .ok()?;
-                }
-                if validate_omp_capture_metadata(&metadata).is_err() {
-                    return None;
-                }
-                let ready_generation = || {
-                    crate::tmux::env::get_hidden_env(
-                        session_name,
-                        crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
-                    )
-                };
-                match bootstrap_generation() {
-                    Some(pane_generation)
-                        if pane_generation == metadata.launch_id
-                            && self.omp_capture_generation.as_deref()
-                                == Some(metadata.launch_id.as_str())
-                            && ready_generation().as_deref()
-                                == Some(metadata.launch_id.as_str()) => {}
-                    Some(_) => return None,
-                    None if !metadata.launch_marker.is_empty()
-                        || self.omp_capture_generation.is_some() =>
-                    {
-                        return None;
-                    }
-                    None => {}
-                }
-                return Some(metadata);
-            }
-
-            let legacy: LegacyMetadata = serde_json::from_str(&encoded).ok()?;
-            if legacy.launched_at_ms == 0
-                || !legacy.layout.sessions.is_absolute()
-                || !legacy.layout.terminal_sessions.is_absolute()
-                || bootstrap_generation().is_some()
-                || self.omp_capture_generation.is_some()
-            {
-                return None;
-            }
-            let managed_sessions = legacy.layout.terminal_sessions.parent()?.join("sessions");
-            let metadata = OmpCaptureMetadata {
-                layout: crate::session::capture::OmpStoreLayout {
-                    sessions: legacy.layout.sessions,
-                    managed_sessions,
-                    terminal_sessions: legacy.layout.terminal_sessions,
-                    kind: legacy.layout.kind,
-                },
-                launched_at_ms: legacy.launched_at_ms,
-                launch_id: format!("legacy-{}-{}", self.id, legacy.launched_at_ms),
-                launch_marker: String::new(),
-                routing_fingerprint: String::new(),
-                container_runtime: None,
-            };
-            let encoded = serde_json::to_string(&metadata).ok()?;
-            crate::tmux::env::set_hidden_env(
-                session_name,
-                crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
-                &encoded,
-            )
-            .ok()?;
-            return Some(metadata);
-        }
-
-        if bootstrap_generation().is_some() || self.omp_capture_generation.is_some() {
-            return None;
-        }
-        let legacy_watermark_ms = launched_at_ms.or_else(|| {
-            crate::tmux::Session::from_name(session_name)
-                .created_at_ms()
-                .ok()
-        })?;
-        let metadata = self.resolve_legacy_omp_capture_metadata(options, legacy_watermark_ms)?;
-        if bootstrap_generation().is_some()
-            || self.omp_capture_generation.is_some()
-            || crate::tmux::env::get_hidden_env(
-                session_name,
-                crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
-            )
-            .is_some()
-        {
-            return None;
-        }
-        let encoded = serde_json::to_string(&metadata).ok()?;
-        crate::tmux::env::set_hidden_env(
-            session_name,
-            crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
-            &encoded,
-        )
-        .ok()?;
-        Some(metadata)
     }
 
     /// Publish the capture plan's generation, or mint a tombstone generation
@@ -455,48 +296,11 @@ impl Instance {
         );
         Ok(false)
     }
-
-    /// Last-chance exact-pane OMP capture while the old pane still exists.
-    pub(super) fn capture_omp_before_restart(
-        &mut self,
-        storage: &dyn crate::session::SessionStore,
-    ) -> Result<()> {
-        if self.source_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp)
-            || (self.is_sandboxed() && self.omp_capture_generation.is_none())
-        {
-            return Ok(());
-        }
-        let Some(observation) = self.try_retroactive_capture_in(CaptureStorage::Scoped(storage))?
-        else {
-            return Ok(());
-        };
-        let commit = super::sid_persist::persist_session_with_storage(
-            storage,
-            &self.id,
-            &observation,
-            &self.conversation_state(),
-        );
-        match commit.outcome {
-            SidWrite::Applied => {
-                self.apply_conversation_observation(&observation);
-                self.resume_probe_failed_sid = commit.failed_sid;
-            }
-            // Nothing was written in any of these arms: a peer wrote between
-            // capture and CAS, a peer durably owns the sid, or the row pins
-            // another conversation. Reloading converges on all three.
-            SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
-                self.reconcile_from_store(storage)?;
-            }
-            SidWrite::Failed => {}
-        }
-        Ok(())
-    }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::capture::resolve_omp_store_layout_with_environment;
+    use crate::session::capture::{resolve_omp_store_layout_with_environment, OmpStoreKind};
     use crate::session::instance::launch_command::wrap_command_ignore_suspend;
     use crate::session::instance::test_helpers::*;
 

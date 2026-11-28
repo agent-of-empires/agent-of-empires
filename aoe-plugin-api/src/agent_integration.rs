@@ -306,12 +306,23 @@ pub enum AgentCaptureBackend {
     Claude,
     OpenCode,
     Codex,
+    /// The plugin's agent-side extension writes the conversation id into the
+    /// session's hook sidecar, so the host parses no provider format.
+    ExtensionSidecar,
     Gemini,
     Hermes,
     Kimi,
     Pi,
     PrimeAgent,
     Omp,
+}
+
+impl AgentCaptureBackend {
+    /// Whether this backend captures one pane's conversation, which a resume
+    /// needs published in a pane-scoped context.
+    pub fn captures_pane(self) -> bool {
+        matches!(self, Self::Omp | Self::ExtensionSidecar)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +409,10 @@ pub struct AgentIntegrationSnapshot {
     pub provider_version: String,
     pub provider_session_id: String,
     pub writer_pid: u32,
+    /// The launch that wrote a sandboxed report, copied from `AOE_SESSION_SOURCE`.
+    /// The host ignores a sandboxed report whose value is not the active launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
     pub revision: u64,
     pub status: AgentIntegrationStatus,
     /// Function-key names sent only to wake the provider extension after a user reply.

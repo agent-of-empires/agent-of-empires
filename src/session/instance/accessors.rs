@@ -541,6 +541,20 @@ impl Instance {
         let Some(active) = &self.active_execution else {
             return self.resolved_session_support();
         };
+        // A launch the declaration captured through the hook sidecar is described
+        // by that declaration, even where the tool name also carries a built-in
+        // capture: a declaration for `omp` hides the bundled definition from
+        // listings, so resolution took the declared path and recording the
+        // bundled one here would leave the sidecar unread. A launch that captured
+        // any other way keeps the backend it ran under.
+        let hook_sidecar_launch = active.binding.agent == self.tool
+            && matches!(active.capture, Some(CaptureContext::Hooks(_)));
+        if let Some(declared) = hook_sidecar_launch
+            .then(|| self.declared_session_support(active.container.is_some()))
+            .flatten()
+        {
+            return Some(declared);
+        }
         let Some(native) = crate::agents::native_definition(&active.binding.agent) else {
             if active.binding.agent != self.tool {
                 return None;

@@ -803,6 +803,8 @@ pub struct UpdateConsent {
     pub ui: Vec<UiView>,
     pub build_steps: Vec<String>,
     pub agent_integrations: Vec<AgentIntegrationContribution>,
+    /// Where a sandboxed provider's reports are read, as the container sees it.
+    pub sandbox_report_dir: String,
     pub runtime_change: Option<String>,
     pub trust_downgrade: bool,
     pub fingerprint: String,
@@ -862,6 +864,8 @@ pub struct InstallConsent {
     pub ui: Vec<UiView>,
     pub build_steps: Vec<String>,
     pub agent_integrations: Vec<AgentIntegrationContribution>,
+    /// Where a sandboxed provider's reports are read, as the container sees it.
+    pub sandbox_report_dir: String,
     pub fingerprint: String,
 }
 
@@ -1154,6 +1158,7 @@ pub async fn preview_install(input: &str, dev: bool) -> Result<InstallConsent> {
             .map(|s| s.command.join(" "))
             .collect(),
         agent_integrations: disclosure_integrations(&p.fetched.manifest.agent_integrations),
+        sandbox_report_dir: crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER.to_string(),
         fingerprint: p.fingerprint,
     };
     p.fetched.cleanup().await?;
@@ -1656,6 +1661,7 @@ fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
             .map(|s| s.command.join(" "))
             .collect(),
         agent_integrations: disclosure_integrations(&p.fetched.manifest.agent_integrations),
+        sandbox_report_dir: crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER.to_string(),
         runtime_change: p.runtime_change.clone(),
         trust_downgrade: p.trust_downgrade,
         fingerprint: p.fingerprint.clone(),

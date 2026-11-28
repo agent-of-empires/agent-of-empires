@@ -467,6 +467,9 @@ impl NativeAgent {
                     aoe_plugin_api::agent_integration::AgentCaptureBackend::Omp => {
                         Some(crate::agents::SessionCaptureBackend::Omp)
                     }
+                    aoe_plugin_api::agent_integration::AgentCaptureBackend::ExtensionSidecar => {
+                        Some(crate::agents::SessionCaptureBackend::ExtensionSidecar)
+                    }
                     _ => None,
                 }),
         }
@@ -1428,12 +1431,15 @@ impl NativeLaunchInputs {
 
     fn hook_capture_context(&self, instance_id: &str) -> Result<Option<CaptureContext>> {
         let leaf = crate::hooks::session_id_leaf(Some(&self.launch_id))?;
-        let directory = if self.container.is_some() {
-            PathBuf::from(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER).join(instance_id)
+        // A container reaches this directory through the launch's bind mount,
+        // whose target is the container-side base; the host base is a different
+        // path the mount does not create.
+        let base = if self.container.is_some() {
+            PathBuf::from(crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
         } else {
-            crate::hooks::hook_base_path().join(instance_id)
+            crate::hooks::hook_base_path()
         };
-        let path = self.canonical_path(&directory.join(leaf.as_ref()))?;
+        let path = self.canonical_path(&base.join(instance_id).join(leaf.as_ref()))?;
         let location = self.physical_location(&path);
         Ok((location.filesystem == "host").then_some(CaptureContext::Hooks(location.path)))
     }
@@ -2106,11 +2112,18 @@ impl Instance {
         let mut pi_transcript_path = None;
         let mut namespace_arguments = Vec::new();
         let mut store_override = None;
-        let omp_backend = agent
+        let capture_backend = agent
             .session_support
             .and_then(|support| support.capture)
-            .is_some_and(|capture| capture.backend == crate::agents::SessionCaptureBackend::Omp);
-        let mut roots = if omp_backend {
+            .map(|capture| capture.backend);
+        let omp_backend = capture_backend == Some(crate::agents::SessionCaptureBackend::Omp);
+        // A declared sidecar has no conversation store of its own: the provider's
+        // extension publishes identity through the hook directory. It therefore
+        // skips the per-agent namespace dispatch, which has no entry for a
+        // plugin-provided tool.
+        let sidecar_backend =
+            capture_backend == Some(crate::agents::SessionCaptureBackend::ExtensionSidecar);
+        let mut roots = if omp_backend || sidecar_backend {
             Vec::new()
         } else {
             match agent.name {
@@ -2617,6 +2630,9 @@ impl Instance {
             inputs.cwd.clone()
         };
         let cwd = inputs.physical_location(&cwd);
+        // With no store, the binding still needs a filesystem domain, and the
+        // working directory the pane runs in is the one the sidecar describes.
+        let filesystem = filesystem.or_else(|| sidecar_backend.then(|| cwd.filesystem.clone()));
         let capture = if agent
             .session_support
             .as_ref()
@@ -2824,35 +2840,40 @@ impl Instance {
         })
     }
 
-    /// Whether two executions describe one context.
-    ///
     /// Host paths compare by local filesystem identity. Paths in every other
     /// filesystem domain compare as pure lexical paths.
+    pub(super) fn paths_match(
+        left: &std::path::Path,
+        right: &std::path::Path,
+        filesystem: &str,
+    ) -> bool {
+        if left == right {
+            return true;
+        }
+        let identity = |path: &std::path::Path| {
+            if filesystem == "host" {
+                crate::session::capture::canonicalize_allowing_missing_leaf(path)
+                    .unwrap_or_else(|| crate::git::template::lexical_normalize(path))
+            } else {
+                crate::git::template::lexical_normalize(path)
+            }
+        };
+        identity(left) == identity(right)
+    }
+
+    /// Whether two executions describe one context.
     pub(super) fn execution_identity_matches(
         left: &ExecutionBinding,
         right: &ExecutionBinding,
     ) -> bool {
-        fn paths_match(left: &std::path::Path, right: &std::path::Path, filesystem: &str) -> bool {
-            if left == right {
-                return true;
-            }
-            let identity = |path: &std::path::Path| {
-                if filesystem == "host" {
-                    crate::session::capture::canonicalize_allowing_missing_leaf(path)
-                        .unwrap_or_else(|| crate::git::template::lexical_normalize(path))
-                } else {
-                    crate::git::template::lexical_normalize(path)
-                }
-            };
-            identity(left) == identity(right)
-        }
-        fn locations_match(left: &[ExecutionLocation], right: &[ExecutionLocation]) -> bool {
+        let paths_match = Self::paths_match;
+        let locations_match = |left: &[ExecutionLocation], right: &[ExecutionLocation]| {
             left.len() == right.len()
                 && left.iter().zip(right).all(|(left, right)| {
                     left.filesystem == right.filesystem
                         && paths_match(&left.path, &right.path, &left.filesystem)
                 })
-        }
+        };
         left.agent == right.agent
             && left.filesystem == right.filesystem
             && left.cwd_filesystem == right.cwd_filesystem
@@ -2884,12 +2905,37 @@ impl Instance {
             .context("conversation provenance is unknown; use aoe session set-session-id with an explicitly configured execution identity and store before resuming or forking")?;
         anyhow::ensure!(binding.is_known() || binding.is_unattributed() || (!explicit && binding.provenance == ConversationProvenance::Preallocated),
             "conversation has not been observed or explicitly asserted; a preallocated ID is not a forkable conversation");
+        // A fork pins the launch to the parent's own transcript directory, so that
+        // one store is derived from the binding rather than compared to it. The
+        // rest of the execution must still describe the same context.
+        let forking_into_the_parent_store = matches!(
+            &self.resume_intent,
+            ResumeIntent::Fork { from } if from == sid
+        ) && binding
+            .transcript_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .is_some_and(|directory| {
+                execution.stores.len() == 1
+                    && Self::paths_match(&execution.stores[0], directory, &execution.filesystem)
+                    && binding.execution.as_ref().is_some_and(|bound| {
+                        bound.agent == execution.agent
+                            && bound.filesystem == execution.filesystem
+                            && bound.cwd_filesystem == execution.cwd_filesystem
+                            && Self::paths_match(
+                                &bound.cwd,
+                                &execution.cwd,
+                                &execution.cwd_filesystem,
+                            )
+                    })
+            });
         // Default may adopt a known ID after a context move when agent and filesystem agree.
         anyhow::ensure!(
-            binding
-                .execution
-                .as_ref()
-                .is_some_and(|bound| Self::execution_identity_matches(bound, execution))
+            forking_into_the_parent_store
+                || binding
+                    .execution
+                    .as_ref()
+                    .is_some_and(|bound| Self::execution_identity_matches(bound, execution))
                 || !binding.is_known()
                 || (matches!(self.resume_intent, ResumeIntent::Default)
                     && binding.is_known()
@@ -2946,22 +2992,27 @@ enum ManagedArgumentPolicy {
 
 fn managed_argument_policy(agent: &AgentDef<'_>) -> ManagedArgumentPolicy {
     use crate::agents::SessionCaptureBackend::{
-        Claude, Codex, Gemini, Hermes, HookSidecar, Kimi, Omp, OpenCode, Pi, PrimeAgent,
+        Claude, Codex, ExtensionSidecar, Gemini, Hermes, HookSidecar, Kimi, Omp, OpenCode, Pi,
+        PrimeAgent,
     };
     let backend = agent
         .session_support
         .and_then(|support| support.capture)
         .map(|capture| capture.backend);
-    if let Some(backend) = backend {
-        return match backend {
-            Omp => ManagedArgumentPolicy::Omp,
-            Pi => ManagedArgumentPolicy::Pi,
-            PrimeAgent => ManagedArgumentPolicy::Prime,
-            Codex => ManagedArgumentPolicy::Codex,
-            OpenCode => ManagedArgumentPolicy::OpenCode,
-            Claude => ManagedArgumentPolicy::Claude,
-            Gemini | HookSidecar | Hermes | Kimi => ManagedArgumentPolicy::Generic,
-        };
+    let backend_policy = match backend {
+        Some(Omp) => Some(ManagedArgumentPolicy::Omp),
+        Some(Pi) => Some(ManagedArgumentPolicy::Pi),
+        Some(PrimeAgent) => Some(ManagedArgumentPolicy::Prime),
+        Some(Codex) => Some(ManagedArgumentPolicy::Codex),
+        Some(OpenCode) => Some(ManagedArgumentPolicy::OpenCode),
+        Some(Claude) => Some(ManagedArgumentPolicy::Claude),
+        Some(Gemini | HookSidecar | Hermes | Kimi) => Some(ManagedArgumentPolicy::Generic),
+        // A plugin-declared agent has no core argv table; the tool-name fallback
+        // below still recognizes a tool core knows.
+        Some(ExtensionSidecar) | None => None,
+    };
+    if let Some(policy) = backend_policy {
+        return policy;
     }
     match agent.name {
         "omp" => ManagedArgumentPolicy::Omp,
@@ -2990,15 +3041,20 @@ fn resume_contract(
                 .map(|capture| capture.backend),
         )
     };
-    if let Some(agent) = crate::agents::native_definition(&execution.agent) {
-        return contract(agent);
+    let builtin = crate::agents::native_definition(&execution.agent);
+    // A declaration that speaks for this pane's tool is what launched it, so it
+    // names the backend even where a retained built-in identity still answers: a
+    // declared sidecar has no store for the built-in reader to consult. A launch
+    // the declaration captured through the hook sidecar records no stores, so a
+    // binding that has them launched under the built-in reader and keeps it.
+    if execution.agent == own_tool {
+        if let Some(declared) =
+            declared.filter(|_| builtin.is_none() || execution.stores.is_empty())
+        {
+            return declared.with_definition(contract).unwrap_or((false, None));
+        }
     }
-    if execution.agent != own_tool {
-        return (false, None);
-    }
-    declared
-        .and_then(|declared| declared.with_definition(contract))
-        .unwrap_or((false, None))
+    builtin.map_or((false, None), contract)
 }
 
 pub(super) fn validate_managed_arguments(
@@ -4202,6 +4258,43 @@ mod tests {
         assert!(!instance.launch_invokes_resolved_agent_directly(agent));
     }
 
+    /// An extension-sidecar declaration for `tool`, as `plugin-omp` will publish.
+    fn declared_sidecar_fixture(tool: &str) -> crate::plugin::agent_integration::DeclaredAgent {
+        let manifest: aoe_plugin_api::PluginManifest = toml::from_str(&format!(
+            r#"
+id = "acme.sidecar"
+name = "Sidecar"
+version = "1.0.0"
+api_version = 29
+[[agent_integrations]]
+tool = "{tool}"
+command = "{tool}"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+[agent_integrations.launch.capture]
+backend = "extension_sidecar"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+"#
+        ))
+        .unwrap();
+        let registry = std::sync::Arc::new(crate::plugin::PluginRegistry::from_test_plugins(vec![
+            crate::plugin::LoadedPlugin {
+                manifest,
+                enabled: true,
+                trust: aoe_plugin_api::TrustLevel::Community,
+                validation: crate::plugin::registry::ValidationState::Local,
+                source: None,
+                dir: None,
+                manifest_hash: String::new(),
+                granted: true,
+            },
+        ]));
+        crate::plugin::agent_integration::declared_agent(registry, tool, std::iter::empty())
+            .unwrap()
+    }
+
     /// An OMP-backed declaration whose tool label matches no built-in agent.
     fn declared_omp_fixture() -> crate::plugin::agent_integration::DeclaredAgent {
         let manifest: aoe_plugin_api::PluginManifest = toml::from_str(
@@ -4245,28 +4338,59 @@ sandbox = "unsupported"
 
     #[test]
     fn declared_binding_answers_to_its_own_declaration() {
-        let binding = |agent: &str| ExecutionBinding {
+        let binding = |agent: &str, stores: &[&str]| ExecutionBinding {
             agent: agent.into(),
-            stores: vec![std::path::PathBuf::from("/tmp/store")],
+            stores: stores.iter().map(std::path::PathBuf::from).collect(),
             configuration: Vec::new(),
             cwd: std::path::PathBuf::from("/tmp"),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
             exported_default_store: None,
         };
+        let store = &["/tmp/store"];
         let omp = Some(crate::agents::SessionCaptureBackend::Omp);
         let declared = declared_omp_fixture();
         assert_eq!(
-            resume_contract(&binding("example-helper"), "example-helper", Some(declared)),
+            resume_contract(
+                &binding("example-helper", store),
+                "example-helper",
+                Some(declared)
+            ),
             (true, omp)
         );
         // The bundled identity answers even while a declaration hides it from
         // listings, so recovery does not depend on which plugin provides OMP.
-        assert_eq!(resume_contract(&binding("omp"), "omp", None), (true, omp));
+        assert_eq!(
+            resume_contract(&binding("omp", store), "omp", None),
+            (true, omp)
+        );
+        // A sidecar launch records no store, so it answers with the
+        // declaration's backend: there is nothing for the built-in reader.
+        assert_eq!(
+            resume_contract(
+                &binding("omp", &[]),
+                "omp",
+                Some(declared_sidecar_fixture("omp"))
+            ),
+            (
+                true,
+                Some(crate::agents::SessionCaptureBackend::ExtensionSidecar)
+            )
+        );
+        // A store-bearing binding launched under the built-in reader keeps it
+        // when the declaration appears later.
+        assert_eq!(
+            resume_contract(
+                &binding("omp", store),
+                "omp",
+                Some(declared_sidecar_fixture("omp"))
+            ),
+            (true, omp)
+        );
         // Another tool's binding never inherits this pane's declaration.
         assert_eq!(
             resume_contract(
-                &binding("other-helper"),
+                &binding("other-helper", store),
                 "example-helper",
                 Some(declared_omp_fixture())
             ),
@@ -4274,7 +4398,7 @@ sandbox = "unsupported"
         );
         assert_eq!(
             resume_contract(
-                &binding("claude"),
+                &binding("claude", store),
                 "example-helper",
                 Some(declared_omp_fixture())
             ),
@@ -4320,6 +4444,198 @@ sandbox = "unsupported"
                 assert!(validate_managed_arguments(agent, &words).is_err());
             })
             .unwrap();
+    }
+
+    /// Installs a sidecar-backed declaration for `tool`.
+    fn install_declared_sidecar_plugin(tool: &str) {
+        let manifest = &format!(
+            r#"
+id = "acme.sidecar"
+name = "Sidecar"
+version = "1.0.0"
+api_version = 29
+[[agent_integrations]]
+tool = "{tool}"
+command = "{tool}"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+[agent_integrations.launch.capture]
+backend = "extension_sidecar"
+host = "pane_scoped"
+sandbox = "pane_scoped"
+"#
+        );
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.sidecar");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.sidecar".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: crate::time::Timestamp::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_generic_declared_sidecar_binds_hook_capture_without_a_store() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "example-helper",
+            "#!/bin/sh\nexit 0\n",
+        );
+        install_declared_sidecar_plugin("example-helper");
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = Instance::new("declared-sidecar", project.to_str().unwrap());
+        instance.tool = "example-helper".into();
+        instance.command = "example-helper".into();
+
+        // The host has no namespace for a plugin tool, so resolution must not
+        // reach the per-agent store dispatch that refuses one.
+        let execution = instance
+            .resolve_native_execution(None)
+            .expect("a generic sidecar declaration resolves without a store");
+        assert!(execution.binding.stores.is_empty());
+        assert_eq!(execution.binding.filesystem, "host");
+        let Some(CaptureContext::Hooks(source)) = execution.capture else {
+            panic!("the sidecar declaration must own hook capture");
+        };
+        assert_eq!(
+            source.file_name().and_then(|name| name.to_str()),
+            Some(format!("session_id.{}", execution.inputs.launch_id).as_str())
+        );
+        // Recovery reads the same backend, so an id binds without the transcript
+        // a built-in OMP reader would demand.
+        let bound = instance
+            .asserted_resume_binding("2f6a1f9c-0d7a-4d0e-9b58-2c4b3f1e5a11", None)
+            .expect("a declared sidecar binds an id without a store");
+        assert_eq!(bound.session_id, "2f6a1f9c-0d7a-4d0e-9b58-2c4b3f1e5a11");
+    }
+
+    /// Recovery resolves the declaration when no launch is recorded, so an OMP
+    /// sidecar binds an id without the transcript it has no store for.
+    #[test]
+    #[serial_test::serial]
+    fn a_declared_omp_sidecar_binds_without_an_active_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp",
+            "#!/bin/sh\nexit 0\n",
+        );
+        install_declared_sidecar_plugin("omp");
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = Instance::new("omp-sidecar-recovery", project.to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp".into();
+        assert!(instance.active_execution.is_none());
+
+        let bound = instance
+            .asserted_resume_binding("2f6a1f9c-0d7a-4d0e-9b58-2c4b3f1e5a11", None)
+            .expect("a declared OMP sidecar binds an id without a store");
+        assert_eq!(bound.session_id, "2f6a1f9c-0d7a-4d0e-9b58-2c4b3f1e5a11");
+        assert!(bound
+            .execution
+            .is_some_and(|execution| execution.stores.is_empty()));
+    }
+
+    /// A declaration for `omp` hides the bundled definition from listings, so
+    /// the launch resolves through the declaration and publishes through the hook
+    /// sidecar. Capture must follow that launch, not the tool name's built-in
+    /// reader, or an OMP session with the plugin installed stops capturing.
+    #[test]
+    #[serial_test::serial]
+    fn an_omp_sidecar_launch_captures_through_its_declaration() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp",
+            "#!/bin/sh\nexit 0\n",
+        );
+        install_declared_sidecar_plugin("omp");
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut instance = Instance::new("omp-sidecar-launch", project.to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp".into();
+
+        let execution = instance
+            .resolve_native_execution(None)
+            .expect("a declared OMP sidecar resolves");
+        assert_eq!(execution.binding.agent, "omp");
+        assert!(execution.binding.stores.is_empty());
+        assert!(
+            matches!(execution.capture, Some(CaptureContext::Hooks(_))),
+            "the declaration publishes through the hook sidecar"
+        );
+        instance.active_execution = Some(ActiveExecution {
+            launch_id: execution.inputs.launch_id.clone(),
+            binding: execution.binding.clone(),
+            capture: execution.capture.clone(),
+            container: None,
+        });
+        assert_eq!(
+            instance
+                .source_session_support()
+                .map(|(capture, context)| (capture.backend, context)),
+            Some((
+                crate::agents::SessionCaptureBackend::ExtensionSidecar,
+                crate::agents::SessionCaptureContext::PaneScoped
+            ))
+        );
+        assert!(instance.capture_reads_hook_sidecar());
+
+        // A launch the same tool ran under its built-in reader keeps that reader.
+        instance.active_execution.as_mut().unwrap().capture = None;
+        assert_eq!(
+            instance
+                .source_session_support()
+                .map(|(capture, _)| capture.backend),
+            Some(crate::agents::SessionCaptureBackend::Omp)
+        );
     }
 
     /// Installs an OMP-backed declaration for `example-helper` in the isolated

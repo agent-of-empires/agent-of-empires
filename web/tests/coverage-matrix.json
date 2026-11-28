@@ -42,7 +42,7 @@
         "web/src/components/settings/PluginUpdateConsentModal.tsx",
         "web/src/components/settings/agentIntegrationDetails.ts"
       ],
-      "notes": "Install and update consent expose agent launch, detection and reply declarations as text with control and format characters made visible, including the declared Enter delay so a timing-only change is visible."
+      "notes": "Install and update consent expose agent launch, detection, sandbox report location and reply declarations as text with control and format characters made visible, including the declared Enter delay so a timing-only change is visible."
     },
     {
       "id": "settings.plugin-agent-consent-browser",

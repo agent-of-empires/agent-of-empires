@@ -298,10 +298,6 @@ impl AdaptiveInterval {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SessionIdGuard {
     Unguarded,
-    /// Pre-launch-marker compat path: OMP sessions captured before the launch marker generation
-    /// existed carry no generation to CAS against, so they persist unguarded.
-    OmpLegacy,
-    OmpGeneration(String),
     /// Read from a per-instance sidecar the agent itself wrote (Pi's extension), so the observation
     /// names this pane rather than being inferred from a store. The transcript path published
     /// beside the id is part of it, so a path written after the id is reported too.
@@ -372,26 +368,6 @@ impl SessionIdObservation {
         }
     }
 
-    pub(crate) fn omp_legacy(sid: String) -> Self {
-        Self {
-            sid,
-            guard: SessionIdGuard::OmpLegacy,
-            execution: None,
-            claim: ConversationClaim::Identified,
-            transcript_path: None,
-            pi_session_path: None,
-        }
-    }
-    pub(crate) fn omp(sid: String, generation: String) -> Self {
-        Self {
-            sid,
-            guard: SessionIdGuard::OmpGeneration(generation),
-            execution: None,
-            claim: ConversationClaim::Identified,
-            transcript_path: None,
-            pi_session_path: None,
-        }
-    }
     pub(crate) fn conversation_binding(&self) -> Option<crate::session::ConversationBinding> {
         self.execution.as_ref()?;
         self.source()
@@ -402,13 +378,6 @@ impl SessionIdObservation {
                 transcript_path: self.transcript_path.clone(),
             })
     }
-    pub(crate) fn confirms_omp_pin(&self, intent: &crate::session::ResumeIntent) -> bool {
-        self.execution.is_some()
-            && self.source().is_some()
-            && matches!(&self.guard, SessionIdGuard::OmpGeneration(_))
-            && matches!(intent, crate::session::ResumeIntent::Use(pinned) if pinned == &self.sid)
-    }
-
     pub(crate) fn conversation_key(&self) -> Option<crate::session::instance::ConversationKey<'_>> {
         self.source().map(|source| source.key(&self.sid))
     }
@@ -787,16 +756,6 @@ impl SessionPoller {
         self.result_tx
             .send((instance_id.to_owned(), observation))
             .expect("inject_test_observation: result channel disconnected");
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inject_test_omp_legacy_update(&self, instance_id: &str, session_id: &str) {
-        self.result_tx
-            .send((
-                instance_id.to_string(),
-                SessionIdObservation::omp_legacy(session_id.to_string()),
-            ))
-            .expect("inject_test_omp_legacy_update: result channel disconnected");
     }
 
     pub(crate) fn retry_last_observation(&self) {

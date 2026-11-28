@@ -26,13 +26,11 @@ use crate::session::poller::SessionPoller;
 use crate::tmux;
 
 use crate::session::capture::{
-    capture_omp_session_id, codex_poll_fn_sandboxed_store, gemini_poll_fn_sandboxed_store,
-    generate_session_uuid, hermes_poll_fn_sandboxed_store, is_valid_session_id,
-    kimi_poll_fn_sandboxed_store, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
-    omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed, reject_omp_secret_args,
-    resolve_omp_store_layout, try_capture_omp_session_id_in_container,
-    validate_omp_capture_metadata, validated_session_id, OmpCaptureMetadata, OmpCapturePlan,
-    OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
+    codex_poll_fn_sandboxed_store, gemini_poll_fn_sandboxed_store, generate_session_uuid,
+    hermes_poll_fn_sandboxed_store, is_valid_session_id, kimi_poll_fn_sandboxed_store,
+    omp_host_routing_environment, omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed,
+    reject_omp_secret_args, validated_session_id, OmpCaptureMetadata, OmpCapturePlan,
+    OmpCliCaptureOptions, PrimeRootPublication,
 };
 mod accessors;
 pub(crate) use accessors::generate_id;

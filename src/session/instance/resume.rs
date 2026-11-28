@@ -461,8 +461,7 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
     ) -> Result<()> {
-        self.stop_and_flush_poller_lifecycle_locked(storage)?;
-        self.capture_omp_before_restart(storage)
+        self.stop_and_flush_poller_lifecycle_locked(storage)
     }
 
     pub(crate) fn discard_reserved_restart_container(
@@ -489,9 +488,7 @@ impl Instance {
             lifecycle_lock,
         } = reservation;
         if restart {
-            let capture = self
-                .stop_and_flush_poller_lifecycle_locked(storage)
-                .and_then(|()| self.capture_omp_before_restart(storage));
+            let capture = self.stop_and_flush_poller_lifecycle_locked(storage);
             if let Err(error) = capture {
                 self.fail_reserved_launch(storage, generation, &error, false);
                 return Err(error);

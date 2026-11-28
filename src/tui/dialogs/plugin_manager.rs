@@ -2395,6 +2395,7 @@ mod mouse_tests {
                         ui: vec![],
                         build_steps: vec![],
                         agent_integrations: vec![],
+                        sandbox_report_dir: crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER.into(),
                         runtime_change: None,
                         trust_downgrade: false,
                         fingerprint: "reviewed".into(),
@@ -2559,6 +2560,7 @@ mod mouse_tests {
                         ..Default::default()
                     },
                 ],
+                sandbox_report_dir: crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER.into(),
                 fingerprint: "fingerprint".into(),
             },
         )));

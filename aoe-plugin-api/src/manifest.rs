@@ -1012,8 +1012,8 @@ fn validate_agent_declaration(
     check: &mut impl FnMut(bool, String),
 ) {
     use crate::agent_integration::{
-        AgentCaptureBackend, AgentCaptureContext, AgentKeyDeclaration, AgentResumeDeclaration,
-        AgentYoloDeclaration, SESSION_ID_TIMEOUT_MS_MAX, SESSION_ID_TIMEOUT_MS_MIN,
+        AgentCaptureContext, AgentKeyDeclaration, AgentResumeDeclaration, AgentYoloDeclaration,
+        SESSION_ID_TIMEOUT_MS_MAX, SESSION_ID_TIMEOUT_MS_MIN,
     };
     if let Some(session_id) = &integration.session_id {
         check(
@@ -1155,11 +1155,11 @@ fn validate_agent_declaration(
             );
             check(
                 launch.capture.as_ref().is_some_and(|capture| {
-                    capture.backend == AgentCaptureBackend::Omp
+                    capture.backend.captures_pane()
                         && (capture.host == AgentCaptureContext::PaneScoped
                             || capture.sandbox == AgentCaptureContext::PaneScoped)
                 }),
-                format!("agent_integrations[{i}].launch.resume requires OMP capture in a pane-scoped context"),
+                format!("agent_integrations[{i}].launch.resume requires pane-scoped capture"),
             );
         }
         if let Some(capture) = &launch.capture {
@@ -1168,7 +1168,7 @@ fn validate_agent_declaration(
                 format!("agent_integrations[{i}].launch.capture requires resume"),
             );
             check(
-                capture.backend == AgentCaptureBackend::Omp
+                capture.backend.captures_pane()
                     && matches!(
                         capture.host,
                         AgentCaptureContext::PaneScoped | AgentCaptureContext::Unsupported
@@ -1619,6 +1619,20 @@ impl PluginManifest {
                 self.api_version >= 22 || integration.session_id.is_none(),
                 format!("agent_integrations[{i}].session_id requires api_version >= 22"),
             );
+            check(
+                self.api_version >= 29
+                    || integration
+                        .launch
+                        .as_ref()
+                        .and_then(|launch| launch.capture.as_ref())
+                        .is_none_or(|capture| {
+                            capture.backend
+                                != crate::agent_integration::AgentCaptureBackend::ExtensionSidecar
+                        }),
+                format!(
+                    "agent_integrations[{i}].launch.capture.backend = \"extension_sidecar\" requires api_version >= 29"
+                ),
+            );
             for (table, declared) in [
                 ("hooks", integration.hooks.is_some()),
                 ("trust", integration.trust.is_some()),
@@ -2029,6 +2043,28 @@ mod tests {
     use super::*;
 
     const HEAD: &str = "id = \"a.b\"\nname = \"B\"\nversion = \"1.0.0\"\napi_version = ";
+
+    #[test]
+    fn extension_sidecar_capture_requires_api_29() {
+        let manifest = |api_version: u32| {
+            format!(
+                "id = \"acme.sidecar\"\nname = \"Sidecar\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\
+                 [[agent_integrations]]\ntool = \"helper\"\ncommand = \"helper\"\n\
+                 [agent_integrations.launch.resume]\nkind = \"flag\"\nflag = \"--continue\"\n\
+                 [agent_integrations.launch.capture]\nbackend = \"extension_sidecar\"\nhost = \"pane_scoped\"\nsandbox = \"pane_scoped\"\n"
+            )
+        };
+        // The hooks and trust gates already took 28, and a host at 28 cannot
+        // decode this backend, so sidecar capture moves past them instead of
+        // sharing their version.
+        for version in [26, 27, 28] {
+            let error = PluginManifest::from_toml_str(&manifest(version))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("requires api_version >= 29"), "{error}");
+        }
+        assert!(PluginManifest::from_toml_str(&manifest(29)).is_ok());
+    }
 
     fn object_list_toml(api_version: u32) -> String {
         format!(

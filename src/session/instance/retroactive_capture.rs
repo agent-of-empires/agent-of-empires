@@ -63,71 +63,15 @@ impl Instance {
                 None,
             ),
             crate::agents::SessionCaptureBackend::Pi => self.pi_published_conversation(true),
-            crate::agents::SessionCaptureBackend::Omp => {
-                let Some(tmux_session_name) = self.tmux_env_session_name().or_else(|| {
-                    self.tmux_session()
-                        .ok()
-                        .map(|session| session.name().to_string())
-                }) else {
-                    return Ok(None);
-                };
-                let metadata = if let Some(active) = &self.active_execution {
-                    let Some(CaptureContext::Omp(metadata)) = &active.capture else {
-                        return Ok(None);
-                    };
-                    metadata.clone()
-                } else {
-                    let Some(options) = self.omp_capture_options() else {
-                        return Ok(None);
-                    };
-                    let Some(metadata) =
-                        self.omp_capture_metadata(&tmux_session_name, &options, None)
-                    else {
-                        return Ok(None);
-                    };
-                    metadata
-                };
-                let container_name = self
-                    .active_execution
-                    .as_ref()
-                    .and_then(|active| {
-                        active
-                            .container
-                            .as_ref()
-                            .map(|container| container.id.as_str())
-                    })
-                    .or_else(|| {
-                        self.sandbox_info
-                            .as_ref()
-                            .filter(|sandbox| sandbox.enabled)
-                            .map(|sandbox| sandbox.container_name.as_str())
-                    });
-                if let Some(container_name) = container_name {
-                    try_capture_omp_session_id_in_container(
-                        container_name,
-                        &metadata,
-                        &exclusion,
-                        Some(&metadata.launch_marker),
-                        self.active_execution.as_ref(),
-                    )
-                    .ok()
-                } else {
-                    capture_omp_session_id(
-                        &metadata,
-                        &exclusion,
-                        &tmux_session_name,
-                        self.active_execution.as_ref(),
-                    )
-                    .ok()
-                }
-            }
             // Sidecar publishers returned above.
             crate::agents::SessionCaptureBackend::Claude
+            | crate::agents::SessionCaptureBackend::ExtensionSidecar
             | crate::agents::SessionCaptureBackend::HookSidecar
             | crate::agents::SessionCaptureBackend::Codex
             | crate::agents::SessionCaptureBackend::Gemini
             | crate::agents::SessionCaptureBackend::Hermes
             | crate::agents::SessionCaptureBackend::Kimi
+            | crate::agents::SessionCaptureBackend::Omp
             | crate::agents::SessionCaptureBackend::PrimeAgent
             | crate::agents::SessionCaptureBackend::OpenCode => None,
         };

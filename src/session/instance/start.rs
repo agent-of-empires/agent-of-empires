@@ -720,6 +720,13 @@ impl Instance {
         self.capture_poller.clear();
         if !self.is_sandboxed() {
             self.with_hook_agent(|this, agent| this.install_agent_status_hooks(agent));
+            // A plugin-declared tool's extension ships with the plugin, so core
+            // installs no hook file that would mark it launched.
+            if self.resolved_capture_backend()
+                == Some(crate::agents::SessionCaptureBackend::ExtensionSidecar)
+            {
+                self.identity_publisher_launched = true;
+            }
         }
         self.report_store_override(prepared.execution.as_ref());
         let canonicalized = prepared.canonical_conversation.is_some();

@@ -124,52 +124,6 @@ pub(crate) fn persist_session_to_storage(
 }
 
 impl Instance {
-    /// Consume an explicit OMP resume pin only after the matching launch
-    /// reports the already-durable sid. All three facts are checked under the
-    /// storage flock so a concurrent re-pin or relaunch cannot be consumed.
-    pub(crate) fn persist_omp_pin_confirmation(
-        storage: &dyn crate::session::SessionStore,
-        instance_id: &str,
-        session_id: &str,
-        generation: &str,
-    ) -> Result<CaptureCommit> {
-        if !is_valid_session_id(session_id) {
-            return Ok(CaptureCommit::unapplied(SidWrite::Failed));
-        }
-        storage.update(|instances, _groups| {
-            let Some(instance) = instances
-                .iter_mut()
-                .find(|instance| instance.id == instance_id)
-            else {
-                return Err(LifecycleReservationError::Superseded.into());
-            };
-            let intent_matches = matches!(
-                &instance.resume_intent,
-                ResumeIntent::Use(pinned) if pinned == session_id
-            );
-            if instance.agent_session_id.as_deref() != Some(session_id)
-                || !intent_matches
-                || instance.omp_capture_generation.as_deref() != Some(generation)
-            {
-                tracing::warn!(target: "session.store",
-                    instance = %instance_id,
-                    sid = %session_id,
-                    generation = %generation,
-                    disk_sid = ?instance.agent_session_id,
-                    disk_intent = ?instance.resume_intent,
-                    disk_generation = ?instance.omp_capture_generation,
-                    "OMP pin confirmation CAS mismatch"
-                );
-                return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
-            }
-            instance.resume_intent = ResumeIntent::Default;
-            Ok(CaptureCommit {
-                outcome: SidWrite::Applied,
-                failed_sid: instance.resume_probe_failed_sid.clone(),
-            })
-        })
-    }
-
     pub(super) fn persist_session_id_with_storage(
         &mut self,
         storage: &dyn crate::session::SessionStore,
@@ -192,19 +146,6 @@ impl Instance {
             ResumeIntent::Cleared | ResumeIntent::Fork { .. }
         ) || matches!(self.resume_intent, ResumeIntent::Use(_))
             && self.launch_has_session_publisher();
-        // OMP seeds its poller with the in-memory sid. Keeping the pin there
-        // would suppress the first equal observation, which is the launch's
-        // confirmation. Leave the durable sid intact but make this launch's
-        // generation report it back through the guarded sync path.
-        let await_omp_pin_confirmation = matches!(
-            (&expected_prior_intent, new_sid.as_deref()),
-            (ResumeIntent::Use(pinned), Some(sid)) if pinned == sid
-        ) && self.resolved_capture_backend()
-            == Some(crate::agents::SessionCaptureBackend::Omp)
-            && self
-                .omp_capture_generation
-                .as_deref()
-                .is_some_and(|generation| !generation.starts_with("tombstone-"));
 
         let instance_id = self.id.clone();
         let new_sid_for_closure = new_sid.clone();
@@ -356,9 +297,6 @@ impl Instance {
                         }
                     }
                 }
-                if await_omp_pin_confirmation {
-                    self.set_agent_conversation(None, None, None);
-                }
                 SidPersistOutcome::Published
             }
             Ok(SidWrite::Skipped)
@@ -368,13 +306,6 @@ impl Instance {
                     Some(disk) => {
                         self.adopt_conversation_state(disk.conversation_state());
                         self.resume_probe_failed_sid = disk.resume_probe_failed_sid;
-                        let disk_still_awaits_confirmation = matches!(
-                            (&self.resume_intent, self.agent_session_id.as_deref()),
-                            (ResumeIntent::Use(pinned), Some(sid)) if pinned == sid
-                        );
-                        if await_omp_pin_confirmation && disk_still_awaits_confirmation {
-                            self.set_agent_conversation(None, None, None);
-                        }
                         SidPersistOutcome::Published
                     }
                     None => {
@@ -490,7 +421,6 @@ pub(crate) fn persist_session_with_storage(
     observation: &crate::session::poller::SessionIdObservation,
     expected: &ConversationState,
 ) -> CaptureCommit {
-    use crate::session::poller::SessionIdGuard;
     let session_id = observation.sid.as_str();
     if !is_valid_session_id(session_id) {
         return CaptureCommit::unapplied(SidWrite::Failed);
@@ -511,17 +441,6 @@ pub(crate) fn persist_session_with_storage(
             || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
         {
             return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
-        }
-        match &observation.guard {
-            SessionIdGuard::OmpGeneration(generation)
-                if instance.omp_capture_generation.as_ref() != Some(generation) =>
-            {
-                return Ok(CaptureCommit::unapplied(SidWrite::Skipped))
-            }
-            SessionIdGuard::OmpLegacy if instance.omp_capture_generation.is_some() => {
-                return Ok(CaptureCommit::unapplied(SidWrite::Skipped))
-            }
-            _ => {}
         }
         // A pin to another conversation is a deliberate refusal, not a race:
         // report it distinctly so teardown can proceed without touching the
@@ -559,18 +478,10 @@ pub(crate) fn persist_session_with_storage(
                     )
                 }))
         });
-        // Read before the conflict verdict: a pin confirmation is not a fresh
-        // claim, so it keeps the retryable outcome instead of becoming one.
-        let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
         if conflict {
             // A peer durably owns this sid, so the publication is a conflict to
-            // retry rather than a divergence to abandon. A pin confirmation is
-            // exempt: the row armed the pin and must be able to re-prove it.
-            return Ok(CaptureCommit::unapplied(if confirms_pin {
-                SidWrite::Skipped
-            } else {
-                SidWrite::OwnershipConflict
-            }));
+            // retry rather than a divergence to abandon.
+            return Ok(CaptureCommit::unapplied(SidWrite::OwnershipConflict));
         }
         let pi_session_path = instance.observed_pi_session_path(observation);
         let instance = &mut instances[index];
@@ -581,10 +492,6 @@ pub(crate) fn persist_session_with_storage(
         instance.set_agent_conversation(Some(session_id.into()), binding, pi_session_path);
         if new_conversation {
             instance.resume_probe_failed_sid = None;
-        }
-        if confirms_pin {
-            instance.resume_intent = ResumeIntent::Default;
-            instance.resume_binding = None;
         }
         Ok(CaptureCommit {
             outcome: SidWrite::Applied,
@@ -899,64 +806,6 @@ mod tests {
                 .outcome,
             SidWrite::Applied,
             "the pin must still accept its own conversation"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn omp_pin_confirmation_keeps_retrying_an_ownership_conflict() {
-        use crate::session::instance::ActiveExecution;
-        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
-
-        let profile = "sid-omp-pin-conflict";
-        let generation = "019342ab-1234-7def-8901-999999999999";
-        let source = ExecutionBinding {
-            agent: "omp".into(),
-            stores: vec!["/tmp/omp-store".into()],
-            configuration: Vec::new(),
-            exported_default_store: Some(false),
-            cwd: "/tmp/x".into(),
-            cwd_filesystem: "host".into(),
-            filesystem: "host".into(),
-        };
-        let conversation = ConversationBinding {
-            session_id: VALID_SID.into(),
-            execution: Some(source.clone()),
-            provenance: ConversationProvenance::Observed,
-            transcript_path: None,
-        };
-        let mut owner = make_inst(profile, "owner");
-        owner.set_agent_conversation(Some(VALID_SID.into()), Some(conversation.clone()), None);
-        let mut claimant = make_inst(profile, "pin-confirmation");
-        claimant.tool = "omp".into();
-        claimant.agent_session_id = Some(VALID_SID.into());
-        claimant.agent_session_binding = Some(conversation.clone());
-        claimant.resume_intent = ResumeIntent::Use(VALID_SID.into());
-        claimant.resume_binding = Some(conversation);
-        claimant.omp_capture_generation = Some(generation.into());
-        claimant.active_execution = Some(ActiveExecution {
-            launch_id: generation.into(),
-            binding: source.clone(),
-            capture: None,
-            container: None,
-        });
-        let (_temp, _home, storage) = seeded(profile, &[&owner, &claimant]);
-        let mut observed =
-            crate::session::poller::SessionIdObservation::omp(VALID_SID.into(), generation.into());
-        observed.execution = claimant.active_execution.clone();
-        observed.scope_to(source);
-        assert!(observed.confirms_omp_pin(&claimant.resume_intent));
-
-        assert_eq!(
-            persist_session_with_storage(
-                &storage,
-                &claimant.id,
-                &observed,
-                &claimant.conversation_state(),
-            )
-            .outcome,
-            SidWrite::Skipped,
-            "an unproven pin must remain retryable"
         );
     }
 
@@ -1618,20 +1467,6 @@ mod tests {
                 disk[0].omp_capture_generation.as_deref(),
                 Some(old_generation)
             );
-            assert_eq!(
-                persist_session_to_storage(
-                    profile,
-                    &inst.id,
-                    &crate::session::poller::SessionIdObservation::omp(
-                        "019342ab-1234-7def-8901-abcdef012349".into(),
-                        old_generation.into(),
-                    ),
-                    &inst.conversation_state(),
-                    &FileWatchService::noop(),
-                )
-                .outcome,
-                SidWrite::Skipped
-            );
         }
 
         #[test]
@@ -1640,10 +1475,8 @@ mod tests {
             let temp = tempdir().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
             let profile = "omp-restart-final-flush";
-            let generation = "omp-restart-generation";
             let sid = "019342ab-1234-7def-8901-abcdef012348";
             let mut inst = omp_inst(profile, "omp-restart-flush");
-            inst.omp_capture_generation = Some(generation.to_string());
             inst.status = Status::Stopped;
             seed(profile, &[&inst]);
 
@@ -1656,9 +1489,9 @@ mod tests {
             );
             poller.inject_test_observation(
                 &inst.id,
-                crate::session::poller::SessionIdObservation::omp(
+                crate::session::poller::SessionIdObservation::instance_sidecar(
                     sid.to_owned(),
-                    generation.to_owned(),
+                    None,
                 ),
             );
             inst.capture_poller
@@ -1775,69 +1608,6 @@ mod tests {
             assert!(metadata.layout.terminal_sessions.is_absolute());
             assert!(metadata.layout.managed_sessions.is_absolute());
             assert_eq!(metadata.launch_id, plan.launch_id);
-        }
-
-        #[test]
-        #[serial]
-        fn only_a_generationless_omp_pane_backfills_legacy_metadata() {
-            if no_tmux() {
-                return;
-            }
-            let temp = tempdir().unwrap();
-            let _home_guard = crate::session::test_support::isolate_home(temp.path());
-
-            let mut inst = omp_inst("omp-legacy-metadata", "legacy-omp");
-            inst.agent_session_id = Some(VALID_SID.to_string());
-            let tmux = TmuxSession::create(&inst.id, &inst.title);
-            let meta_key = crate::tmux::env::AOE_OMP_CAPTURE_META_KEY;
-            assert!(hidden_env(tmux.name(), meta_key).is_none());
-
-            let expected_launch = crate::tmux::Session::from_name(tmux.name())
-                .created_at_ms()
-                .unwrap();
-            let options = inst.omp_capture_options().unwrap();
-            let metadata = inst
-                .omp_capture_metadata(tmux.name(), &options, None)
-                .expect("legacy pane should migrate");
-            assert_eq!(metadata.launched_at_ms, expected_launch);
-            assert_eq!(
-                metadata.launch_id,
-                format!("legacy-{}-{expected_launch}", inst.id)
-            );
-            assert!(metadata.layout.managed_sessions.is_absolute());
-            let persisted: crate::session::capture::OmpCaptureMetadata =
-                serde_json::from_str(&hidden_env(tmux.name(), meta_key).expect("backfilled"))
-                    .unwrap();
-            assert_eq!(
-                serde_json::to_value(persisted).unwrap(),
-                serde_json::to_value(metadata).unwrap()
-            );
-            inst.omp_capture_generation = Some("modern-generation".to_string());
-            assert!(inst
-                .omp_capture_metadata(tmux.name(), &options, None)
-                .is_none());
-
-            // A current pane missing its hidden launch snapshot fails closed.
-            let mut modern = omp_inst("omp-modern-missing-metadata", "modern-omp");
-            let generation = "modern-launch-generation";
-            modern.omp_capture_generation = Some(generation.to_string());
-            let tmux = TmuxSession::create(&modern.id, &modern.title);
-            let status = crate::tmux::tmux_command()
-                .args([
-                    "set-environment",
-                    "-t",
-                    tmux.name(),
-                    crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
-                    generation,
-                ])
-                .status()
-                .unwrap();
-            assert!(status.success());
-            let options = modern.omp_capture_options().unwrap();
-            assert!(modern
-                .omp_capture_metadata(tmux.name(), &options, None)
-                .is_none());
-            assert!(hidden_env(tmux.name(), meta_key).is_none());
         }
 
         #[test]

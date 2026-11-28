@@ -1,4 +1,11 @@
-//! Native OMP fork dispatch through `omp --fork`, child capture, and restart.
+//! Native OMP fork dispatch through `omp --fork`, with the parent binding a
+//! declared plugin publishes rather than a capture of the pane.
+//!
+//! Core no longer reads an OMP conversation out of the pane, so the parent row
+//! here carries the binding the plugin sidecar would publish. What this file
+//! still covers is the fork launch itself: the one-shot intent becomes
+//! `omp --resume <parent> --fork` pinned to the parent's session directory, and
+//! a restart does not fork again.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -12,13 +19,12 @@ use crate::harness::{
 };
 
 const PARENT_ID: &str = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
-const CHILD_A_ID: &str = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
-const CHILD_B_ID: &str = "019342ab-1234-7def-8901-cccccccccccc";
+const CHILD_ID: &str = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
 
 /// A fake `omp` that keeps the store contract AoE relies on: a fresh launch
 /// creates a session, `--fork <id>` copies that session from `--session-dir`
-/// into a new one there, and `--resume <id>` reopens it. Each launch points the
-/// pane's terminal breadcrumb at its session and records its argv.
+/// into a new one there, and `--resume <id>` reopens it. Each launch records
+/// its argv.
 fn install_fake_omp(h: &mut TuiTestHarness, project: &Path) {
     let bin = h.install_path_command("omp");
     install_path_preserving_test_shell(h, &bin);
@@ -46,7 +52,7 @@ else
   parent=
   if [ -n "$fork" ]; then
     parent=$(ls "$dir"/*_"$fork".jsonl)
-    if ls "$dir"/*_CHILD_A.jsonl >/dev/null 2>&1; then sid=CHILD_B; else sid=CHILD_A; fi
+    sid=CHILD
   else
     sid=PARENT
   fi
@@ -64,11 +70,9 @@ terminal_id=$(printf '%s' "${tty_path#/dev/}" | tr '/' '-')
 printf '%s\n%s\n' CWD "$file" > "$store/terminal-sessions/$terminal_id"
 mv "$launches/$$.tmp" "$launches/$$.argv"
 exec sleep 300
-"#
-    .replace("CHILD_A", CHILD_A_ID)
-    .replace("CHILD_B", CHILD_B_ID)
-    .replace("PARENT", PARENT_ID)
-    .replace("CWD", project.to_str().expect("UTF-8 project path"));
+"#.replace("CHILD", CHILD_ID)
+        .replace("PARENT", PARENT_ID)
+        .replace("CWD", project.to_str().expect("UTF-8 project path"));
     write_executable(&bin.join("omp"), &script);
 }
 
@@ -103,37 +107,47 @@ fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
         .map(|pair| pair[1].as_str())
 }
 
-/// Wait until the row titled `title` holds a captured binding for `id`, and
-/// return that binding's transcript path.
-fn wait_for_binding(h: &TuiTestHarness, title: &str, id: &str) -> PathBuf {
-    wait_until(Duration::from_secs(15), Duration::from_millis(100), || {
-        let sessions = h.read_sessions();
-        let row = session_by_title(&sessions, title);
-        let binding = &row["agent_session_binding"];
-        match (
-            row["agent_session_id"].as_str(),
-            binding["transcript_path"].as_str(),
-        ) {
-            (Some(actual), Some(path)) if actual == id && binding["session_id"] == id => {
-                Ok(PathBuf::from(path))
-            }
-            _ => Err(format!("{title} has not captured {id}: {row}")),
-        }
-    })
+fn wait_for_file(path: &Path) {
+    wait_until(Duration::from_secs(15), Duration::from_millis(50), || {
+        path.is_file()
+            .then_some(())
+            .ok_or_else(|| format!("{} was never written", path.display()))
+    });
 }
 
-fn body(transcript: &Path) -> Vec<String> {
-    std::fs::read_to_string(transcript)
-        .unwrap()
-        .lines()
-        .skip(2)
-        .map(str::to_owned)
-        .collect()
+/// Publish the binding a declared OMP plugin's sidecar writes for `sid`: the
+/// conversation id, the execution the launch recorded, and its transcript.
+fn publish_parent_binding(h: &TuiTestHarness, title: &str, sid: &str, transcript: &Path) {
+    let transcript = std::fs::canonicalize(transcript).expect("canonical transcript path");
+    let mut sessions = h.read_sessions();
+    let row = sessions
+        .as_array_mut()
+        .expect("sessions file is an array")
+        .iter_mut()
+        .find(|row| row["title"].as_str() == Some(title))
+        .expect("parent row exists");
+    let execution = row["active_execution"]["binding"].clone();
+    assert!(
+        !execution.is_null(),
+        "the parent launch must record the execution its binding belongs to"
+    );
+    row["agent_session_id"] = serde_json::json!(sid);
+    row["agent_session_binding"] = serde_json::json!({
+        "session_id": sid,
+        "execution": execution,
+        "provenance": "observed",
+        "transcript_path": transcript,
+    });
+    std::fs::write(
+        h.sessions_path(),
+        serde_json::to_string_pretty(&sessions).unwrap(),
+    )
+    .expect("write sessions.json");
 }
 
 #[test]
 #[parallel]
-fn omp_fork_captures_each_child_and_restarts_without_reforking() {
+fn omp_fork_dispatches_the_native_flag_and_does_not_fork_again_on_restart() {
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("omp_fork_restart");
     let project = h.project_path();
@@ -148,64 +162,58 @@ fn omp_fork_captures_each_child_and_restarts_without_reforking() {
         "OmpParent",
     ]);
     h.run_cli_ok(&["session", "start", "OmpParent"]);
-    let parent_transcript = wait_for_binding(&h, "OmpParent", PARENT_ID);
-    let parent_bytes = std::fs::read(&parent_transcript).unwrap();
-    let parent_binding =
-        session_by_title(&h.read_sessions(), "OmpParent")["agent_session_binding"].clone();
-
     let mut seen = BTreeSet::new();
     next_launch(&h, &mut seen);
-    let mut child_transcripts = Vec::new();
-    for (title, id) in [("OmpChildA", CHILD_A_ID), ("OmpChildB", CHILD_B_ID)] {
-        h.run_cli_ok(&[
-            "add",
-            project.to_str().unwrap(),
-            "-t",
-            title,
-            "--fork-from",
-            "OmpParent",
-        ]);
-        let sessions = h.read_sessions();
-        let child = session_by_title(&sessions, title);
-        assert_eq!(child["tool"], "omp");
-        assert_eq!(child["resume_intent"]["kind"], "Fork");
 
-        h.run_cli_ok(&["session", "start", title]);
-        let fork = &next_launch(&h, &mut seen);
-        assert_eq!(flag_value(fork, "--fork"), Some(PARENT_ID));
-        assert_eq!(
-            std::fs::canonicalize(flag_value(fork, "--session-dir").unwrap()).unwrap(),
-            std::fs::canonicalize(parent_transcript.parent().unwrap()).unwrap(),
-            "the fork must be pinned to the parent's session directory"
-        );
-        assert_eq!(flag_value(fork, "--resume"), None);
+    let parent_transcript = h
+        .home_path()
+        .join(".omp/agent/sessions/home-project")
+        .join(format!("2026-08-05T00-00-00-000Z_{PARENT_ID}.jsonl"));
+    wait_for_file(&parent_transcript);
+    publish_parent_binding(&h, "OmpParent", PARENT_ID, &parent_transcript);
+    let published =
+        session_by_title(&h.read_sessions(), "OmpParent")["agent_session_binding"].clone();
 
-        let child_transcript = wait_for_binding(&h, title, id);
-        assert_ne!(child_transcript, parent_transcript);
-        assert_eq!(body(&child_transcript), body(&parent_transcript));
-        assert!(
-            session_by_title(&h.read_sessions(), title)
-                .get("resume_intent")
-                .is_none(),
-            "the one-shot fork intent must be consumed"
-        );
-        child_transcripts.push(child_transcript);
-    }
-
-    h.run_cli_ok(&["session", "stop", "OmpChildA"]);
-    h.run_cli_ok(&["session", "start", "OmpChildA"]);
-    let resume = &next_launch(&h, &mut seen);
-    assert_eq!(flag_value(resume, "--resume"), Some(CHILD_A_ID));
-    assert_eq!(flag_value(resume, "--fork"), None);
-    assert_eq!(
-        wait_for_binding(&h, "OmpChildA", CHILD_A_ID),
-        child_transcripts[0]
-    );
-
+    h.run_cli_ok(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "OmpChild",
+        "--fork-from",
+        "OmpParent",
+    ]);
     let sessions = h.read_sessions();
+    let child = session_by_title(&sessions, "OmpChild");
+    assert_eq!(child["tool"], "omp");
+    assert_eq!(child["resume_intent"]["kind"], "Fork");
+
+    h.run_cli_ok(&["session", "start", "OmpChild"]);
+    let fork = &next_launch(&h, &mut seen);
+    assert_eq!(flag_value(fork, "--fork"), Some(PARENT_ID));
     assert_eq!(
-        session_by_title(&sessions, "OmpParent")["agent_session_binding"],
-        parent_binding
+        std::fs::canonicalize(flag_value(fork, "--session-dir").unwrap()).unwrap(),
+        std::fs::canonicalize(parent_transcript.parent().unwrap()).unwrap(),
+        "the fork must be pinned to the parent's session directory"
     );
-    assert_eq!(std::fs::read(&parent_transcript).unwrap(), parent_bytes);
+    assert!(
+        session_by_title(&h.read_sessions(), "OmpChild")
+            .get("resume_intent")
+            .is_none(),
+        "the one-shot fork intent must be consumed"
+    );
+
+    h.run_cli_ok(&["session", "stop", "OmpChild"]);
+    h.run_cli_ok(&["session", "start", "OmpChild"]);
+    let restart = &next_launch(&h, &mut seen);
+    assert_eq!(
+        flag_value(restart, "--fork"),
+        None,
+        "a restarted child must not fork the parent again"
+    );
+
+    assert_eq!(
+        session_by_title(&h.read_sessions(), "OmpParent")["agent_session_binding"],
+        published,
+        "the fork must leave the parent's binding alone"
+    );
 }

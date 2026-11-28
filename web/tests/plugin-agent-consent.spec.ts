@@ -9,7 +9,13 @@ const agent = {
   detection: { mode: "native_only" },
   reply_fallback: { allow: [{ kind: "literal", value: "y" }], deny: [{ kind: "named", value: "Escape" }] },
 };
-const common = { ui: [], agent_integrations: [agent], build_steps: [], fingerprint: "tree" };
+const common = {
+  ui: [],
+  agent_integrations: [agent],
+  build_steps: [],
+  sandbox_report_dir: "/tmp/aoe-hooks",
+  fingerprint: "tree",
+};
 
 test("install and update show safe agent declarations before approval", async ({ page }) => {
   await mockStaticApis(page);

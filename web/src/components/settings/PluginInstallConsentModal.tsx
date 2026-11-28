@@ -66,7 +66,7 @@ export function PluginInstallConsentModal({ consent, busy, error, onApprove, onC
                 <div>
                   {displayAgentText(agent.tool)}: {displayAgentText(agent.command ?? "No launch command declared")}
                 </div>
-                {agentIntegrationDetails(agent).map((detail, index) => (
+                {agentIntegrationDetails(agent, consent.sandbox_report_dir).map((detail, index) => (
                   <div key={index} className="pl-4">
                     {detail}
                   </div>

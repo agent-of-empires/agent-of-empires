@@ -113,6 +113,9 @@ pub enum SessionCaptureBackend {
     OpenCode,
     Codex,
     Gemini,
+    /// The agent's own plugin-installed extension publishes the conversation
+    /// id into the hook sidecar; no core provider adapter is involved.
+    ExtensionSidecar,
     HookSidecar,
     Pi,
     Hermes,
@@ -129,7 +132,7 @@ pub(crate) enum SessionIdentityPublisher {
 impl SessionCaptureBackend {
     pub(crate) const fn identity_publisher(self) -> Option<SessionIdentityPublisher> {
         match self {
-            Self::Pi => Some(SessionIdentityPublisher::Extension),
+            Self::Pi | Self::ExtensionSidecar => Some(SessionIdentityPublisher::Extension),
             _ => None,
         }
     }
@@ -169,7 +172,9 @@ impl SessionCaptureSpec {
     /// managed-store scan, so they read the sidecar only when `PaneScoped`.
     pub(crate) fn reads_hook_sidecar(&self, context: SessionCaptureContext) -> bool {
         match self.backend {
-            SessionCaptureBackend::Claude | SessionCaptureBackend::HookSidecar => true,
+            SessionCaptureBackend::Claude
+            | SessionCaptureBackend::HookSidecar
+            | SessionCaptureBackend::ExtensionSidecar => true,
             SessionCaptureBackend::Codex | SessionCaptureBackend::Hermes => {
                 context == SessionCaptureContext::PaneScoped
             }

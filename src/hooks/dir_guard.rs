@@ -28,9 +28,9 @@ use std::os::fd::AsRawFd;
 
 use anyhow::{anyhow, bail, Context, Result};
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, renameat, OFlag};
+use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
 use nix::libc;
-use nix::sys::stat::{fchmod, fstat, mkdirat, Mode};
+use nix::sys::stat::{fchmod, fstat, fstatat, mkdirat, Mode};
 use nix::unistd::{geteuid, mkdir, unlinkat, UnlinkatFlags};
 
 // Path resolution.
@@ -583,53 +583,31 @@ fn walk_and_unlink_entries(dir_fd: &OwnedFd) -> Result<()> {
                 continue;
             }
         };
-        // Re-validate before removing: O_NOFOLLOW rejects a symlink leaf with
-        // ELOOP, and anything but a regular file is hostile or stale.
-        match openat(
-            dir_fd,
-            name_str,
-            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(child_fd) => {
-                let st = match fstat(&child_fd) {
-                    Ok(st) => st,
-                    Err(e) => {
-                        tracing::warn!(target: "hooks.guard",
-                            "fstat entry {name_str}: {e}; skipping");
-                        continue;
-                    }
-                };
-                if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
-                    tracing::warn!(target: "hooks.guard",
-                        "non-regular entry {name_str} (mode {:o}) inside {}; \
-                         skipping. The instance dir will be left non-empty; \
-                         remove manually if it matters.",
-                        st.st_mode,
-                        hook_base_path().display());
-                    continue;
-                }
-                // Regular file under a uid-checked parent: safe to unlink.
-                drop(child_fd);
-                if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
-                    tracing::warn!(target: "hooks.guard",
-                        "unlinkat {name_str}: {e}");
-                }
-            }
-            Err(Errno::ELOOP) => {
-                // Symlink at leaf: unlink it without following.
-                if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
-                    tracing::warn!(target: "hooks.guard",
-                        "unlinkat symlink {name_str}: {e}");
-                }
-            }
-            Err(Errno::ENOENT) => {
-                // Raced: another writer already removed it.
-            }
+        // `fstatat` with no open: a writable mount lets a provider leave a FIFO
+        // with no writer, and opening it for read would block the cleanup
+        // forever. Only a directory is refused; everything else is unlinked
+        // without ever being opened.
+        let st = match fstatat(dir_fd.as_fd(), name_str, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
+            Err(Errno::ENOENT) => continue,
             Err(e) => {
                 tracing::warn!(target: "hooks.guard",
-                    "openat entry {name_str}: {e}; skipping");
+                    "fstatat entry {name_str}: {e}; skipping");
+                continue;
             }
+        };
+        if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            tracing::warn!(target: "hooks.guard",
+                "directory entry {name_str} (mode {:o}) inside {}; \
+                 skipping. The instance dir will be left non-empty; \
+                 remove manually if it matters.",
+                st.st_mode,
+                hook_base_path().display());
+            continue;
+        }
+        if let Err(e) = unlinkat(dir_fd, name_str, UnlinkatFlags::NoRemoveDir) {
+            tracing::warn!(target: "hooks.guard",
+                "unlinkat {name_str}: {e}");
         }
     }
     Ok(())
@@ -898,6 +876,20 @@ mod tests {
             "keep",
             "decoy directory contents must be intact"
         );
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn cleanup_unlinks_a_fifo_without_opening_it() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let _ = open_instance_dir("cleanup_fifo").unwrap();
+        let instance = base.join("cleanup_fifo");
+        // A writable mount lets a provider leave a FIFO with no writer; opening
+        // it for read would block cleanup forever.
+        nix::unistd::mkfifo(&instance.join("report.pipe"), Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+
+        remove_instance_dir("cleanup_fifo").unwrap();
+        assert!(!instance.exists(), "a FIFO must not block cleanup");
     }
 
     #[test]
