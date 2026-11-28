@@ -99,6 +99,44 @@ test.describe("Mobile session view tabs (#1452)", () => {
     await expect(drawer).toBeHidden();
   });
 
+  test("the header's ⋯ menu stays inside the viewport for a long branch name (#6136)", async ({ page }) => {
+    const handle = await mockTerminalApis(page, {
+      sessionFields: { branch: "feat/lifecycle-primitives-for-background-tasks-workflows-and-wakeups" },
+    });
+    await openLiveSession(page, handle, { mobile: true, settings: null });
+    const viewport = page.viewportSize()!;
+    await page.locator("header").getByRole("button", { name: "More options" }).click();
+    await expect(page.getByRole("menuitem", { name: /Copy branch/ })).toBeVisible();
+
+    const items = page.getByRole("menu").locator('[role^="menuitem"]');
+    // The item box and the icon and label inside it, since a child can overflow a box that fits.
+    const boxes = await items.evaluateAll((els) =>
+      els.flatMap((el) =>
+        [el, ...el.querySelectorAll("svg, span")].map((part) => {
+          const r = part.getBoundingClientRect();
+          return { label: `${el.textContent} <${part.tagName.toLowerCase()}>`, left: r.left, right: r.right };
+        }),
+      ),
+    );
+    for (const box of boxes) {
+      expect.soft(box.left, `${box.label} left edge`).toBeGreaterThanOrEqual(0);
+      expect
+        .soft(box.right, `${box.label} right edge (viewport ${viewport.width})`)
+        .toBeLessThanOrEqual(viewport.width);
+    }
+    // The branch line is clipped to the capped width, not left to widen the menu.
+    const detail = page.getByRole("menu").getByText("feat/lifecycle-primitives", { exact: false });
+    expect(await detail.evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+    const menu = await page.getByRole("menu").boundingBox();
+    expect.soft(menu!.x, "menu left edge").toBeGreaterThanOrEqual(0);
+    expect
+      .soft(menu!.x + menu!.width, `menu right edge (viewport ${viewport.width})`)
+      .toBeLessThanOrEqual(viewport.width);
+    expect
+      .soft(menu!.y + menu!.height, `menu bottom (viewport ${viewport.height})`)
+      .toBeLessThanOrEqual(viewport.height);
+  });
+
   test("the Session card follows a drawer drag, springs back from a short one, and a longer one opens", async ({
     page,
   }) => {

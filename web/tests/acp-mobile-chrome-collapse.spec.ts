@@ -57,6 +57,48 @@ test.describe("mobile conversation chrome collapse", () => {
     await expect.poll(() => mock.promptBodies.map((b) => b.text)).toContain("still typing");
   });
 
+  // #6136: with a long branch the open menu stays inside the viewport (it floats over the composer by design) and its last item is reachable.
+  test("the header's ⋯ menu stays on screen and scrolls Sign out into view for a long branch (#6136)", async ({
+    page,
+  }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-menu",
+      initialEvents: [agentMessageChunk("hello from the agent")],
+      sessionFields: { branch: "feat/lifecycle-primitives-for-background-tasks-workflows-and-wakeups" },
+    });
+    // Registered after the mock so it wins; "Sign out" renders only when login is required.
+    await page.route("**/api/login/status*", (r) =>
+      r.fulfill({ json: { required: true, authenticated: true, elevated: true, elevated_until_secs: 600 } }),
+    );
+    await openStructuredSession(page, mock);
+    await waitForComposerConnected(page);
+
+    await page.locator("header").getByRole("button", { name: "More options" }).click();
+    const menu = page.getByRole("menu");
+    await expect(menu).toBeVisible();
+
+    const viewport = page.viewportSize()!;
+    const menuBox = (await menu.boundingBox())!;
+    expect
+      .soft(menuBox.y + menuBox.height, `menu bottom (viewport ${viewport.height})`)
+      .toBeLessThanOrEqual(viewport.height);
+    expect.soft(menuBox.x, "menu left edge").toBeGreaterThanOrEqual(0);
+    expect
+      .soft(menuBox.x + menuBox.width, `menu right edge (viewport ${viewport.width})`)
+      .toBeLessThanOrEqual(viewport.width);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+
+    const signOut = menu.getByRole("menuitem", { name: "Sign out" });
+    await signOut.scrollIntoViewIfNeeded();
+    await expect(signOut).toBeVisible();
+    const itemBox = (await signOut.boundingBox())!;
+    expect.soft(itemBox.y, "Sign out top").toBeGreaterThanOrEqual(0);
+    expect
+      .soft(itemBox.y + itemBox.height, `Sign out bottom (viewport ${viewport.height})`)
+      .toBeLessThanOrEqual(viewport.height);
+    expect.soft(itemBox.x + itemBox.width, "Sign out right edge").toBeLessThanOrEqual(viewport.width);
+  });
+
   // The handles overlay content, so their hit area must equal the painted tab; a larger wrapper once ate the update banner's dismiss taps.
   test("the handle's clickable area is the tab you can see, so it intercepts nothing around it", async ({ page }) => {
     const mock = await mockAcpSession(page, {
