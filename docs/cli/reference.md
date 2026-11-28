@@ -258,6 +258,9 @@ List supported agents and their install status
 
 **Usage:** `aoe agents`
 
+###### **Subcommands:**
+
+
 
 
 ## `aoe init`
