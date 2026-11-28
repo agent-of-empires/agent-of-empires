@@ -125,7 +125,7 @@ impl SpawnConfig {
 
 /// Request-sourced keys may not redirect infrastructure the operator env
 /// controls or hook the dynamic linker. Provider auth keys are allowed.
-pub(super) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
+pub(crate) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
     const INFRA_KEYS: &[&str] = &["PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM"];
     if key.is_empty() {
         Some("empty key")

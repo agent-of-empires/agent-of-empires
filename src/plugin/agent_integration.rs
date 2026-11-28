@@ -135,6 +135,24 @@ fn launch_declaration_applies(
     true
 }
 
+/// Whether `entry`'s `acp` part of an active `plugin` may provide its tool's ACP agent.
+/// Built-in tool names stay reserved; a bundled fallback's own name is open only to a
+/// reserved-namespace plugin, as for launch declarations.
+pub(crate) fn acp_declaration_applies(
+    plugin: &super::LoadedPlugin,
+    entry: &AgentIntegrationContribution,
+) -> bool {
+    let reserved = if super::bundled_agents::contains(&entry.tool) {
+        (!plugin.manifest.id.is_reserved_namespace()).then_some(entry.tool.as_str())
+    } else {
+        reserved_builtin(&entry.tool)
+    };
+    if let Some(builtin) = reserved {
+        warn_reserved(plugin.id(), &entry.tool, builtin);
+    }
+    reserved.is_none()
+}
+
 /// An active plugin-provided agent that does not collide with a built-in or custom agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginAgent<'a> {

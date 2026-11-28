@@ -1,6 +1,7 @@
 //! Named agent registry: maps an agent name (e.g. `claude`, `aoe-agent`) to a spawn command.
 
-use super::install_hints::{env_allowlist_for, install_hint_for, AOE_AGENT_BINARY};
+use super::install_hints::{install_hint_for, AOE_AGENT_BINARY};
+use super::resolved_agent::ResolvedAcpAgent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -36,12 +37,23 @@ impl AgentSpec {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentRegistry {
-    pub agents: HashMap<String, AgentSpec>,
+    pub agents: HashMap<String, ResolvedAcpAgent>,
 }
 
 impl AgentRegistry {
-    /// One entry per tool with a published ACP server, plus the built-in agent.
+    /// One entry per tool with a published ACP server, plus the built-in agent, plus the
+    /// approved plugins' ACP agents from one snapshot of the plugin registry.
     pub fn with_defaults() -> Self {
+        Self::with_snapshot(&crate::plugin::registry())
+    }
+
+    pub fn with_snapshot(plugins: &crate::plugin::PluginRegistry) -> Self {
+        let mut registry = Self::builtin();
+        registry.merge_plugin_agents(plugins);
+        registry
+    }
+
+    fn builtin() -> Self {
         let claude_install = install_hint_for("claude-agent-acp").unwrap_or("(see project docs)");
         let claude_description =
             format!("Anthropic Claude via the official ACP adapter ({claude_install})");
@@ -114,27 +126,120 @@ impl AgentRegistry {
         let agents = defaults
             .into_iter()
             .map(|(name, command, args, description)| {
-                let keys = env_allowlist_for(command);
-                let spec = AgentSpec {
-                    command: command.into(),
-                    args: args.iter().map(|a| a.to_string()).collect(),
-                    description: description.into(),
-                    env_allowlist: (!keys.is_empty())
-                        .then(|| keys.iter().map(|s| s.to_string()).collect()),
-                };
-                (name.to_string(), spec)
+                (
+                    name.to_string(),
+                    ResolvedAcpAgent::builtin(name, command, args, description),
+                )
             })
             .collect();
         Self { agents }
     }
 
+    /// Add each active plugin's `acp` declaration that passes the same gate as plugin launch
+    /// declarations. Plugin-vs-plugin name collisions drop both sides. A takeover of a bundled
+    /// tool replaces the built-in rows paired to it; any other built-in id or alias wins.
+    fn merge_plugin_agents(&mut self, plugins: &crate::plugin::PluginRegistry) {
+        use crate::plugin::agent_integration::acp_declaration_applies;
+        let candidates: Vec<_> = plugins
+            .active()
+            .flat_map(|plugin| {
+                plugin
+                    .manifest
+                    .agent_integrations
+                    .iter()
+                    .filter(move |entry| {
+                        entry.acp.is_some() && acp_declaration_applies(plugin, entry)
+                    })
+                    .map(move |entry| (plugin, entry))
+            })
+            .filter_map(|(plugin, entry)| Some((plugin, entry.tool.as_str(), entry.acp.as_ref()?)))
+            .collect();
+        let claims = |name: &str| {
+            candidates
+                .iter()
+                .filter(|(_, _, acp)| acp.id == name || acp.aliases.iter().any(|a| a == name))
+                .count()
+        };
+        for (plugin, tool, acp) in &candidates {
+            let ambiguous = std::iter::once(&acp.id)
+                .chain(&acp.aliases)
+                .any(|name| claims(name) > 1)
+                || candidates
+                    .iter()
+                    .filter(|(_, other, _)| other == tool)
+                    .count()
+                    > 1;
+            if ambiguous {
+                tracing::warn!(target: "plugin.agents", plugin = plugin.id(), %tool, agent = %acp.id,
+                    "ACP agent id, alias or tool is claimed by more than one plugin; ignoring it");
+                continue;
+            }
+            let agent = match ResolvedAcpAgent::from_plugin(
+                plugin.id(),
+                plugin.dir.as_deref(),
+                tool,
+                acp,
+            ) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    tracing::warn!(target: "plugin.agents", plugin = plugin.id(), %tool, agent = %acp.id, %error,
+                        "plugin ACP agent cannot be resolved; ignoring it");
+                    continue;
+                }
+            };
+            let replaced: Vec<String> = if crate::plugin::bundled_agents::contains(tool) {
+                self.agents
+                    .values()
+                    .filter(|builtin| builtin.paired_tool.as_deref() == Some(*tool))
+                    .map(|builtin| builtin.id.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let taken = self.agents.values().find(|existing| {
+                !replaced.contains(&existing.id)
+                    && std::iter::once(&agent.id)
+                        .chain(&agent.aliases)
+                        .any(|name| existing.answers_to(name))
+            });
+            if let Some(existing) = taken {
+                tracing::warn!(target: "plugin.agents", plugin = plugin.id(), agent = %agent.id, existing = %existing.id,
+                    "plugin ACP agent collides with an existing agent; preserving it");
+                continue;
+            }
+            for id in replaced {
+                self.agents.remove(&id);
+            }
+            self.agents.insert(agent.id.clone(), agent);
+        }
+    }
+
+    pub fn resolved(&self, name: &str) -> Option<&ResolvedAcpAgent> {
+        self.agents
+            .get(name)
+            .or_else(|| self.agents.values().find(|agent| agent.answers_to(name)))
+    }
+
     pub fn get(&self, name: &str) -> Option<&AgentSpec> {
-        self.agents.get(name)
+        self.resolved(name).map(|agent| &agent.spec)
+    }
+
+    /// The agent paired to `tool`: the one whose id is the tool's own name when several are.
+    pub fn paired_agent(&self, tool: &str) -> Option<&ResolvedAcpAgent> {
+        self.agents
+            .values()
+            .filter(|agent| agent.paired_tool.as_deref() == Some(tool))
+            .min_by_key(|agent| (agent.id != tool, agent.id.as_str()))
+    }
+
+    /// The agent a structured session of `tool` runs: its paired agent, else one named `tool`.
+    pub fn for_tool(&self, tool: &str) -> Option<&ResolvedAcpAgent> {
+        self.paired_agent(tool).or_else(|| self.resolved(tool))
     }
 
     /// Entries sorted by name.
     pub fn list(&self) -> Vec<(&String, &AgentSpec)> {
-        let mut entries: Vec<_> = self.agents.iter().collect();
+        let mut entries: Vec<_> = self.agents.iter().map(|(n, a)| (n, &a.spec)).collect();
         entries.sort_by_key(|(n, _)| n.as_str());
         entries
     }
@@ -187,8 +292,8 @@ pub fn display_name_for(agent: &str) -> Option<&'static str> {
 }
 
 /// The agent a structured-view session of `tool` spawns as: an explicit
-/// override, the tool's own registry entry or custom command, an inherited
-/// base, then (except for `claude`) the configured default agent.
+/// override, the agent paired to the tool, the tool's own registry entry or
+/// custom command, an inherited base, then the configured default agent.
 pub fn pick_acp_agent_name(
     registry: &AgentRegistry,
     session: &crate::session::config::SessionConfig,
@@ -219,17 +324,16 @@ pub(crate) fn pick_acp_agent_name_with_default(
         .agent_acp_cmd
         .get(tool)
         .is_some_and(|cmd| AgentSpec::from_acp_cmd(tool, cmd).is_ok());
+    if let Some(agent) = registry.paired_agent(tool) {
+        return agent.id.clone();
+    }
     if registry.get(tool).is_some() || custom_cmd {
         return tool.to_string();
     }
     if let Some(base) = inherited_acp_base(tool, &session.agent_detect_as) {
         return base;
     }
-    if tool == "claude" {
-        "claude".into()
-    } else {
-        default_agent.to_string()
-    }
+    default_agent.to_string()
 }
 
 /// The model pinned for the agent `tool` spawns as, if any.
@@ -251,9 +355,205 @@ pub fn pinned_model_for_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::install_hints::env_allowlist_for;
 
     fn strings(keys: &[&str]) -> Vec<String> {
         keys.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn acp_plugin(
+        plugin_id: &str,
+        tool: &str,
+        acp_id: &str,
+        aliases: &[&str],
+        dir: &std::path::Path,
+    ) -> crate::plugin::LoadedPlugin {
+        let aliases = aliases
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>();
+        let manifest = format!(
+            "id = \"{plugin_id}\"\nname = \"Acp\"\nversion = \"1.0.0\"\napi_version = 30\n\
+             capabilities = [\"acp.agent.provide\"]\n\
+             [[agent_integrations]]\ntool = \"{tool}\"\n\
+             [agent_integrations.acp]\nid = \"{acp_id}\"\naliases = [{}]\n\
+             display_name = \"Acp\"\nfailure_policy = \"refuse\"\n\
+             [agent_integrations.acp.proxy]\ncommand = \"bin/proxy\"\n\
+             protocol_version = 1\nprimitive_schema_version = 1\n\
+             [agent_integrations.acp.env]\nallowlist = [\"ZZ_KEY\", \"LD_PRELOAD\"]\n",
+            aliases.join(", ")
+        );
+        crate::plugin::LoadedPlugin {
+            manifest: toml::from_str(&manifest).unwrap(),
+            enabled: true,
+            trust: aoe_plugin_api::TrustLevel::Community,
+            validation: crate::plugin::registry::ValidationState::Local,
+            source: None,
+            dir: Some(dir.to_path_buf()),
+            manifest_hash: String::new(),
+            granted: true,
+        }
+    }
+
+    fn plugin_dir(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/proxy"), "").unwrap();
+        dir
+    }
+
+    fn registry_of(plugins: Vec<crate::plugin::LoadedPlugin>) -> AgentRegistry {
+        AgentRegistry::with_snapshot(&crate::plugin::PluginRegistry::from_test_plugins(plugins))
+    }
+
+    #[test]
+    fn builtin_rows_pair_to_their_tool_and_claude_code_to_claude() {
+        let registry = registry_of(Vec::new());
+        let paired = |id: &str| registry.resolved(id).unwrap().paired_tool.clone();
+        assert_eq!(paired("claude").as_deref(), Some("claude"));
+        assert_eq!(paired("claude-code").as_deref(), Some("claude"));
+        assert_eq!(paired("codex").as_deref(), Some("codex"));
+        assert_eq!(paired("aoe-agent"), None);
+        assert_eq!(registry.paired_agent("claude").unwrap().id, "claude");
+        assert_eq!(registry.agents.len(), 11);
+    }
+
+    #[test]
+    fn plugin_acp_agent_resolves_by_id_and_alias_and_pairs_to_its_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(temp.path(), "acme");
+        let registry = registry_of(vec![acp_plugin(
+            "acme.zeta",
+            "zzzeta",
+            "zeta-acp",
+            &["zeta-cli"],
+            &dir,
+        )]);
+
+        let agent = registry.paired_agent("zzzeta").unwrap();
+        assert_eq!(agent.id, "zeta-acp");
+        assert_eq!(
+            agent.source,
+            crate::acp::resolved_agent::AcpAgentSource::Plugin {
+                plugin_id: "acme.zeta".into()
+            }
+        );
+        assert_eq!(registry.resolved("zeta-cli").unwrap().id, "zeta-acp");
+        assert!(registry
+            .get("zeta-acp")
+            .unwrap()
+            .command
+            .ends_with("acme/bin/proxy"));
+        assert_eq!(agent.env.allowlist, ["ZZ_KEY"]);
+        assert_eq!(registry.agents.len(), 12);
+    }
+
+    #[test]
+    fn plugin_agents_cannot_displace_builtins_without_the_reserved_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(temp.path(), "acme");
+        // A plugin tool that is a built-in name, and an id that is a built-in id.
+        let registry = registry_of(vec![
+            acp_plugin("acme.one", "claude", "claude-next", &[], &dir),
+            acp_plugin("acme.two", "opencode", "oc-next", &[], &dir),
+            acp_plugin("aoe.three", "opencode", "oc-three", &[], &dir),
+            acp_plugin("acme.four", "zzfour", "codex", &[], &dir),
+            acp_plugin("acme.five", "zzfive", "five", &["claude-code"], &dir),
+        ]);
+        assert_eq!(registry.agents.len(), 11);
+        assert_eq!(registry.paired_agent("claude").unwrap().id, "claude");
+        assert_eq!(registry.paired_agent("opencode").unwrap().id, "opencode");
+        assert!(registry.paired_agent("zzfive").is_none());
+        assert_eq!(registry.get("codex").unwrap().command, "codex-acp");
+
+        let registry = registry_of(vec![acp_plugin(
+            "aoe.claude",
+            "claude",
+            "claude-next",
+            &["claude-code"],
+            &dir,
+        )]);
+        assert_eq!(registry.paired_agent("claude").unwrap().id, "claude-next");
+        assert_eq!(registry.resolved("claude-code").unwrap().id, "claude-next");
+        assert!(!registry.agents.contains_key("claude"));
+        assert_eq!(registry.agents.len(), 10);
+    }
+
+    #[test]
+    fn plugin_vs_plugin_collisions_drop_both_sides() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(temp.path(), "acme");
+        for (a, b) in [
+            (("zza", "same", &[][..]), ("zzb", "same", &[][..])),
+            (
+                ("zza", "one", &["shared"][..]),
+                ("zzb", "two", &["shared"][..]),
+            ),
+            (("zza", "one", &[][..]), ("zza", "two", &[][..])),
+        ] {
+            let registry = registry_of(vec![
+                acp_plugin("acme.a", a.0, a.1, a.2, &dir),
+                acp_plugin("acme.b", b.0, b.1, b.2, &dir),
+                acp_plugin("acme.c", "zzc", "ok", &[], &dir),
+            ]);
+            assert_eq!(registry.agents.len(), 12, "{a:?} {b:?}");
+            assert!(registry.get("ok").is_some());
+        }
+    }
+
+    #[test]
+    fn unapproved_or_unresolvable_plugin_agents_are_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(temp.path(), "acme");
+        let mut disabled = acp_plugin("acme.off", "zzoff", "off", &[], &dir);
+        disabled.enabled = false;
+        let mut ungranted = acp_plugin("acme.ungranted", "zzun", "ungranted", &[], &dir);
+        ungranted.granted = false;
+        let mut no_dir = acp_plugin("acme.nodir", "zznd", "nodir", &[], &dir);
+        no_dir.dir = None;
+        let mut missing = acp_plugin("acme.missing", "zzms", "missing", &[], &dir);
+        missing.dir = Some(temp.path().join("nowhere"));
+        let registry = registry_of(vec![disabled, ungranted, no_dir, missing]);
+        assert_eq!(registry.agents.len(), 11);
+
+        #[cfg(unix)]
+        {
+            let outside = temp.path().join("outside");
+            std::fs::write(&outside, "").unwrap();
+            let escape = plugin_dir(temp.path(), "escape");
+            std::fs::remove_file(escape.join("bin/proxy")).unwrap();
+            std::os::unix::fs::symlink(&outside, escape.join("bin/proxy")).unwrap();
+            let registry = registry_of(vec![acp_plugin("acme.esc", "zzesc", "esc", &[], &escape)]);
+            assert!(registry.get("esc").is_none());
+        }
+    }
+
+    #[test]
+    fn pick_follows_the_paired_agent_of_a_plugin_tool() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = plugin_dir(temp.path(), "acme");
+        let registry = registry_of(vec![acp_plugin(
+            "acme.zeta",
+            "zzzeta",
+            "zeta-acp",
+            &[],
+            &dir,
+        )]);
+        let session = crate::session::config::SessionConfig::default();
+        let acp = crate::session::config::AcpConfig::default();
+        let default = acp.resolved_default_agent().to_string();
+        for (tool, explicit, want) in [
+            ("zzzeta", None, "zeta-acp"),
+            ("zzzeta", Some("gemini"), "gemini"),
+            ("claude", None, "claude"),
+            ("unknown", None, default.as_str()),
+        ] {
+            assert_eq!(
+                pick_acp_agent_name(&registry, &session, &acp, tool, explicit),
+                want,
+                "{tool} / {explicit:?}"
+            );
+        }
     }
 
     #[test]

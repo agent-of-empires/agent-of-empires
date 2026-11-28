@@ -1340,7 +1340,7 @@ pub mod structured {
     /// would make every tool look capable.
     pub fn tool_acp_capable(tool: &str, config: &crate::session::Config) -> bool {
         crate::acp::agent_registry::AgentRegistry::with_defaults()
-            .get(tool)
+            .for_tool(tool)
             .is_some()
             || config
                 .session
@@ -1453,8 +1453,8 @@ pub mod structured {
             return Ok(());
         }
         let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
-        let (mut spec, spec_from_registry) = match registry.get(agent) {
-            Some(spec) => (spec.clone(), true),
+        let (mut spec, spec_from_registry) = match registry.for_tool(agent) {
+            Some(resolved) => (resolved.spec.clone(), true),
             None => match config.session.agent_acp_cmd.get(agent) {
                 Some(cmd) => (
                     crate::acp::AgentSpec::from_acp_cmd(agent, cmd).map_err(|e| {

@@ -345,7 +345,8 @@ pub async fn list_agents(
                 .then(|| acp_registry.get(integration.tool))
                 .flatten();
             let (acp_command, acp_args) = acp_command_fields(adapter, data_dir.as_deref());
-            let acp_capable = adapter.is_some();
+            let acp_capable =
+                adapter.is_some() || acp_registry.paired_agent(integration.tool).is_some();
             let launch = registry
                 .get(integration.plugin)
                 .and_then(|owner| {
@@ -4219,7 +4220,8 @@ mod tests {
 id = "aoe.takeover"
 name = "Takeover"
 version = "1.0.0"
-api_version = 29
+api_version = 30
+capabilities = ["acp.agent.provide"]
 
 [[agent_integrations]]
 tool = "omp"
@@ -4237,9 +4239,22 @@ command = "zzzeta"
 [[agent_integrations]]
 tool = "zzplain"
 command = "zzplain"
+
+[[agent_integrations]]
+tool = "zzacp"
+command = "zzacp"
+[agent_integrations.acp]
+id = "zzacp-agent"
+display_name = "Zacp"
+failure_policy = "refuse"
+[agent_integrations.acp.proxy]
+command = "bin/proxy"
+protocol_version = 1
+primitive_schema_version = 1
 "#;
         let dir = crate::plugin::plugins_dir().unwrap().join("aoe.takeover");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/proxy"), "").unwrap();
         std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
         crate::session::update_config(|config| {
             config.plugins.insert(
@@ -4251,7 +4266,7 @@ command = "zzplain"
                         manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
                             manifest.as_bytes(),
                         ),
-                        capabilities: Vec::new(),
+                        capabilities: vec!["acp.agent.provide".into()],
                         granted_at: crate::time::Timestamp::now(),
                     }),
                     ..Default::default()
@@ -4268,6 +4283,13 @@ command = "zzplain"
         else {
             panic!("list_agents failed");
         };
+
+        let acp_row = agents
+            .iter()
+            .find(|agent| agent.name == "zzacp")
+            .expect("the plugin row is listed");
+        assert!(acp_row.acp_capable, "a paired plugin ACP agent is capable");
+        assert!(acp_row.acp_command.is_none());
 
         let takeover = agents
             .iter()

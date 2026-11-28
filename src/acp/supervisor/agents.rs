@@ -59,6 +59,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(name) = explicit_override.filter(|name| !name.is_empty()) {
             return name.to_string();
         }
+        if let Some(agent) = self.registry.lock().await.paired_agent(tool) {
+            return agent.id.clone();
+        }
         if self.registry_has_agent(tool).await
             || self
                 .custom_agent_has_acp_cmd(tool, profile, project_path)
@@ -71,9 +74,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
         {
             return base;
-        }
-        if tool == "claude" {
-            return "claude".into();
         }
         with_resolved_config(profile, project_path, |cfg| {
             cfg.acp.resolved_default_agent().to_string()
