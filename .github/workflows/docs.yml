@@ -30,7 +30,7 @@ env:
 
 jobs:
   build:
-    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-docs-build-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-docs-build-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
       - uses: runs-on/action@v2.6.0
@@ -61,7 +61,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-docs-deploy-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64', github.run_id, github.run_attempt) }}
+    runs-on: ${{ vars.RUNS_ON_DISABLED == 'true' && 'ubuntu-latest' || format('runs-on={0}-docs-deploy-{1}/runner=1cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=125mbs', github.run_id, github.run_attempt) }}
     needs: build
     steps:
       - name: Deploy to GitHub Pages

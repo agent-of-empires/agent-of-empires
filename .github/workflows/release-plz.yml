@@ -29,7 +29,7 @@ jobs:
       github.event.pull_request.merged &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'release-plz-')
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-release-plz-tag-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-release-plz-tag-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     permissions:
       contents: read
       actions: write
@@ -84,7 +84,7 @@ jobs:
       github.event_name != 'pull_request' &&
       github.ref == 'refs/heads/main' &&
       !(github.event_name == 'push' && contains(toJSON(github.event.commits.*.message), 'chore: release v'))
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-release-plz-pr-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-release-plz-pr-{1}/runner=2cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     # Never cancel: a cancelled run can leave the release PR half-updated.
     concurrency:
       group: release-plz-${{ github.ref }}
