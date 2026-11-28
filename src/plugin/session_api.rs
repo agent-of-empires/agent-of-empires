@@ -134,7 +134,8 @@ pub(crate) async fn dispatch(
 /// into the stable public DTO. Pure reads; never launches an agent.
 async fn capabilities_get(profile: &str) -> Result<Value, DispatchError> {
     let catalog = load_catalog().await;
-    let (registry, session) = registry_and_session(profile).await?;
+    let (registry, config) = registry_and_config(profile, None).await?;
+    let session = &config.session;
     let mut ids: Vec<String> = registry
         .list()
         .into_iter()
@@ -177,7 +178,7 @@ async fn capabilities_get(profile: &str) -> Result<Value, DispatchError> {
                                 Some(&choice.value),
                                 entry,
                                 &registry,
-                                &session,
+                                session,
                             ) {
                                 ModeDecision::Class(class) => class,
                                 // Advertised modes always classify; fail
@@ -272,23 +273,23 @@ fn choices(
         .flat_map(|opt| opt.options.iter())
 }
 
-/// A fresh registry and the serving profile's session config, which together decide the
-/// adapter an agent name launches. Reads files, so off the runtime thread.
-async fn registry_and_session(
+/// A fresh registry and the config a spawn reads (the profile's, plus the repository's when
+/// `project_path` names one), which together decide the adapter an agent name launches.
+/// Reads files, so off the runtime thread.
+async fn registry_and_config(
     profile: &str,
-) -> Result<
-    (
-        crate::acp::AgentRegistry,
-        crate::session::config::SessionConfig,
-    ),
-    DispatchError,
-> {
+    project_path: Option<&str>,
+) -> Result<(crate::acp::AgentRegistry, crate::session::config::Config), DispatchError> {
     let profile = profile.to_string();
+    let project_path = project_path.map(std::path::PathBuf::from);
     tokio::task::spawn_blocking(move || {
-        (
-            crate::acp::AgentRegistry::with_defaults(),
-            crate::session::config::profile_config::resolve_config_or_warn(&profile).session,
-        )
+        let config = match &project_path {
+            Some(path) => crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile, path,
+            ),
+            None => crate::session::config::profile_config::resolve_config_or_warn(&profile),
+        };
+        (crate::acp::AgentRegistry::with_defaults(), config)
     })
     .await
     .map_err(|e| DispatchError::internal(format!("resolve profile config: {e}")))
@@ -344,8 +345,13 @@ async fn admit_and_create(
     let catalog = load_catalog().await;
     let entry = catalog.agents.get(&req.agent_id);
 
+    let primary = req
+        .project_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
     // Agent must be a registry agent or one the catalog has observed.
-    let (registry, session) = registry_and_session(&deps.profile).await?;
+    let (registry, config) = registry_and_config(&deps.profile, primary).await?;
     let known_agent = registry.get(&req.agent_id).is_some() || entry.is_some();
     if !known_agent {
         return Err(DispatchError::with_kind(
@@ -361,7 +367,7 @@ async fn admit_and_create(
         req.mode_id.as_deref(),
         entry,
         &registry,
-        &session,
+        &config.session,
     ) {
         ModeDecision::Class(class) => class,
         ModeDecision::UnknownMode => {
@@ -406,25 +412,14 @@ async fn admit_and_create(
     // Refuse a model off the profile pin at the creation boundary instead of
     // recording it as the session's choice and silently launching the pin at
     // spawn. The pin is keyed by the agent the session spawns as, see
-    // `pinned_model_for_tool`. Config resolution reads files; keep it off the
-    // runtime thread like the canonicalization below.
+    // `pinned_model_for_tool`.
     let requested_model = req
         .model_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
     if let Some(model) = requested_model {
-        let profile = deps.profile.clone();
-        let agent_id = req.agent_id.clone();
-        let pinned = tokio::task::spawn_blocking(move || {
-            crate::acp::pinned_model_for_tool(
-                &crate::session::config::profile_config::resolve_config_or_warn(&profile),
-                &agent_id,
-                None,
-            )
-        })
-        .await
-        .map_err(|e| DispatchError::internal(format!("resolve profile config: {e}")))?;
+        let pinned = crate::acp::pinned_model_for_tool(&config, &req.agent_id, None);
         if let Some(pinned) = pinned.filter(|pinned| pinned != model) {
             return Err(DispatchError {
                 code: codes::INVALID_PARAMS,
@@ -468,11 +463,6 @@ async fn admit_and_create(
     // are extra repos. Canonicalize immediately before the trust-checked spawn;
     // a dangling path is the caller's error. Repo trust itself is enforced
     // inside the service, fail-closed for plugin callers.
-    let primary = req
-        .project_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty());
     let (project_path, extra_repo_paths, scratch) = match primary {
         None => {
             // A scratch session has no repo, so extra repos are meaningless and
@@ -1322,6 +1312,28 @@ mod tests {
     use super::*;
     use crate::plugin::automation_policy::AutomationPolicy;
     use crate::session::{Instance, Status};
+
+    #[tokio::test]
+    async fn registry_and_config_reads_the_repo_redirect_a_spawn_follows() {
+        let app = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let repo = tempfile::tempdir().unwrap();
+        let dir = repo.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[session.agent_detect_as]\nzeta = \"claude\"\n",
+        )
+        .unwrap();
+        let path = repo.path().to_str().unwrap();
+
+        let (registry, config) = registry_and_config("default", Some(path)).await.unwrap();
+        let row = registry.launched_row("zeta", &config.session);
+        assert_eq!(row.map(|row| row.id.as_str()), Some("claude"));
+
+        let (registry, config) = registry_and_config("default", None).await.unwrap();
+        assert!(registry.launched_row("zeta", &config.session).is_none());
+    }
 
     fn ctx_with(caps: &[&str]) -> PluginRpcContext {
         PluginRpcContext {
