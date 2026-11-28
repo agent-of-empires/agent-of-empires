@@ -2009,6 +2009,10 @@ impl PluginManifest {
                     format!("provider_calls name {name:?} must match [a-z0-9_.-]+"),
                 );
                 check(
+                    !matches!(name.as_str(), "." | ".."),
+                    format!("provider_calls name {name:?} is a dot segment and cannot be routed"),
+                );
+                check(
                     !name.starts_with(PROVIDER_CALL_METHOD_PREFIX),
                     format!("provider_calls name {name:?} must not start with \"provider.\""),
                 );
@@ -2223,6 +2227,16 @@ mod tests {
                 "uppercase name",
                 provider_calls_toml(29, caps, &call("name = \"Foo\"\n")),
                 "[a-z0-9_.-]+",
+            ),
+            (
+                "dot segment",
+                provider_calls_toml(29, caps, &call("name = \".\"\n")),
+                "dot segment",
+            ),
+            (
+                "double dot segment",
+                provider_calls_toml(29, caps, &call("name = \"..\"\n")),
+                "dot segment",
             ),
             (
                 "reserved prefix",
