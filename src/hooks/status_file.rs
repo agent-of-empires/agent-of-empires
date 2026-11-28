@@ -49,6 +49,31 @@ pub fn read_hook_status(instance_id: &str) -> Option<Status> {
     parse_status(&bytes)
 }
 
+/// Only a status emitted for this launch and conversation can establish readiness.
+pub(crate) fn read_hook_status_for_launch(
+    instance_id: &str,
+    source: &str,
+    session_id: &str,
+) -> Option<Status> {
+    dir_guard::validate_session_source(source).ok()?;
+    if !crate::session::capture::is_valid_session_id(session_id) {
+        return None;
+    }
+    let mut leaf = [0; 43];
+    leaf[..7].copy_from_slice(b"status.");
+    leaf[7..].copy_from_slice(source.as_bytes());
+    let leaf = std::str::from_utf8(&leaf).ok()?;
+    let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+    let bytes = dir_guard::read_file_at(
+        dir.as_fd(),
+        leaf,
+        crate::session::capture::MAX_SESSION_ID_LEN + 1 + STATUS_FILE_READ_CAP,
+    )
+    .ok()??;
+    let (observed_session, status) = std::str::from_utf8(&bytes).ok()?.split_once('|')?;
+    (observed_session == session_id).then(|| parse_status(status.as_bytes()))?
+}
+
 /// Time since the hook status file was last written, i.e. how long the current
 /// value has been standing.
 ///

@@ -130,6 +130,7 @@ impl Instance {
                 // derive.
                 self.status = pending;
                 self.last_error.clear();
+                self.last_error_evidence = None;
             }
         }
         if let Some(prev) = baseline {
@@ -167,6 +168,7 @@ impl Instance {
     pub(crate) fn clear_stale_tmux_error(&mut self) {
         if reports_tmux_session_gone(&self.last_error) {
             self.last_error.clear();
+            self.last_error_evidence = None;
         }
     }
 
@@ -177,6 +179,10 @@ impl Instance {
             self.last_error.set(message.to_string());
         }
         self.last_error_check = Some(std::time::Instant::now());
+        self.record_terminal_error(
+            ErrorEvidenceSource::TmuxObservation,
+            RuntimeEvidence::Unknown,
+        );
     }
 
     /// Explain a pane failure from what the pane last printed, keeping any explanation already
@@ -197,6 +203,38 @@ impl Instance {
         if let Some(pane_content) = pane_content.filter(|_| self.last_error.is_none()) {
             self.last_error
                 .set(summarize_error_from_pane(&pane_content));
+        }
+    }
+
+    pub(super) fn record_terminal_error(
+        &mut self,
+        source: ErrorEvidenceSource,
+        runtime: RuntimeEvidence,
+    ) {
+        let mut evidence = OperationErrorEvidence::new(source, ErrorOperation::TerminalObservation);
+        evidence.runtime = runtime;
+        evidence.generation = Some(ErrorEvidenceGeneration::TerminalLifecycle(
+            self.lifecycle_generation,
+        ));
+        if source == ErrorEvidenceSource::TmuxObservation {
+            if runtime == RuntimeEvidence::Unknown {
+                evidence.origin = Some(ErrorOrigin::TmuxObservation);
+            }
+            evidence.blocking_scope = Some(ErrorBlockingScope::Runtime);
+        }
+        self.last_error_evidence = Some(evidence);
+    }
+
+    fn observed_pane_runtime(
+        metadata: Option<&tmux::PaneMetadata>,
+        is_dead: bool,
+    ) -> RuntimeEvidence {
+        if is_dead {
+            RuntimeEvidence::PaneExited { exit_code: None }
+        } else if metadata.and_then(|metadata| metadata.pane_pid).is_some() {
+            RuntimeEvidence::PaneAlive
+        } else {
+            RuntimeEvidence::Unknown
         }
     }
 
@@ -533,6 +571,10 @@ impl Instance {
         if is_dead && hook.is_some() {
             self.status = Status::Error;
             self.explain_error_from_pane(&session, metadata, true);
+            self.record_terminal_error(
+                ErrorEvidenceSource::TmuxObservation,
+                Self::observed_pane_runtime(metadata, true),
+            );
             return;
         }
 
@@ -565,8 +607,13 @@ impl Instance {
                 // An Error keeps its explanation, as the manifest path does.
                 if hook.status == Status::Error {
                     self.explain_error_from_pane(&session, metadata, false);
+                    self.record_terminal_error(
+                        ErrorEvidenceSource::TerminalText,
+                        Self::observed_pane_runtime(metadata, is_dead),
+                    );
                 } else {
                     self.last_error.clear();
+                    self.last_error_evidence = None;
                 }
                 return;
             }
@@ -633,8 +680,13 @@ impl Instance {
                 self.last_error
                     .set(summarize_error_from_pane(&pane_content));
             }
+            self.record_terminal_error(
+                ErrorEvidenceSource::TerminalText,
+                Self::observed_pane_runtime(metadata, is_dead),
+            );
         } else {
             self.last_error.clear();
+            self.last_error_evidence = None;
         }
     }
 
@@ -984,8 +1036,13 @@ impl Instance {
                         diagnostic.unwrap_or_else(|| summarize_error_from_pane(&pane_content)),
                     );
                 }
+                self.record_terminal_error(
+                    ErrorEvidenceSource::TerminalText,
+                    Self::observed_pane_runtime(metadata, is_dead),
+                );
             } else {
                 self.last_error.clear();
+                self.last_error_evidence = None;
             }
         }
         self.detection.activity = activity;
@@ -2674,6 +2731,53 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn hooked_pane_death_replaces_live_error_evidence_on_public_session_response() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("hooked-pane-error", "/tmp/hooked-pane-error");
+        inst.tool = "settl".into();
+        inst.status = Status::Running;
+        inst.agent_session_id = Some("native-history".into());
+        inst.lifecycle_generation = 7;
+        inst.last_error.set("earlier operation failed");
+        inst.record_terminal_error(
+            ErrorEvidenceSource::TerminalText,
+            RuntimeEvidence::PaneAlive,
+        );
+        write_hook_status(&inst.id, "running");
+        let name = tmux::Session::generate_name(&inst.id, &inst.title);
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[&name]);
+        let mut metadata = agent_pane_metadata("settl", None);
+        metadata.pane_dead = true;
+        inst.update_status_with_metadata_inner(Some(&metadata), Some(&name));
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.last_error.as_deref(), Some("earlier operation failed"));
+        assert_eq!(inst.agent_session_id.as_deref(), Some("native-history"));
+        let response = crate::server::api::sessions::session_response_from_instance(&inst);
+        let public: crate::daemon::SessionResponse =
+            serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
+        let evidence = public
+            .last_error_evidence
+            .expect("runtime evidence crosses the session wire");
+        assert_eq!(
+            evidence.runtime,
+            RuntimeEvidence::PaneExited { exit_code: None }
+        );
+        assert_eq!(evidence.source, ErrorEvidenceSource::TmuxObservation);
+        assert_eq!(evidence.origin, None);
+        assert_eq!(evidence.retryable, None);
+        assert_eq!(
+            evidence.generation,
+            Some(ErrorEvidenceGeneration::TerminalLifecycle(7))
+        );
+        let stored = serde_json::to_value(&inst).unwrap();
+        assert!(stored.get("last_error").is_none());
+        assert!(stored.get("last_error_evidence").is_none());
+    }
+
     /// A turn's running and idle frames can share tmux's activity second.
     #[test]
     #[serial_test::serial]
@@ -2879,6 +2983,13 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             let cache = crate::tmux::SessionCacheGuard::capture();
             cache.force_present(&[session_name.as_str()]);
             let mut metadata = live_pane_metadata(&session_name, "omp", None);
+            metadata.pane_pid = tmux::Session::from_name(&session_name).get_pane_pid();
+            assert!(
+                metadata.pane_pid.is_some(),
+                "the live pane has positive process evidence"
+            );
+            inst.agent_session_id = Some("durable-history".into());
+            inst.lifecycle_generation = 4;
             metadata.pane_title = Some(String::new());
 
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
@@ -2893,6 +3004,17 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 Some(message),
                 "footer_rows={footer_rows}, caption={caption:?}"
             );
+            let evidence = inst.last_error_evidence.expect("terminal error metadata");
+            assert_eq!(evidence.source, ErrorEvidenceSource::TerminalText);
+            assert_eq!(evidence.runtime, RuntimeEvidence::PaneAlive);
+            assert_eq!(
+                evidence.generation,
+                Some(ErrorEvidenceGeneration::TerminalLifecycle(4))
+            );
+            assert_eq!(evidence.origin, None);
+            assert_eq!(evidence.retryable, None);
+            assert_eq!(inst.agent_session_id.as_deref(), Some("durable-history"));
+            assert!(inst.resume_probe_failed_sid.is_none());
             inst.last_error
                 .set("Earlier failure remains latched".to_owned());
             inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
@@ -2911,16 +3033,19 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             eprintln!("skipping: tmux not available");
             return;
         }
-        for (current, expected) in [
+        for (current, expected, footer_rows) in [
             (
                 " ⠋ Auto server compaction…\n pi > model\n╰─",
                 Status::Running,
+                11,
             ),
             (
                 "╭─ Tool approval ─────╮\n│ ❯ Approve │\n│   Deny │\n\
                  │ up/down navigate enter select esc cancel │\n╰─────────────────────╯",
                 Status::Waiting,
+                11,
             ),
+            ("Retrying (1/3) in 2s…", Status::Running, 0),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let pane_file = dir.path().join("pane.txt");
@@ -2930,7 +3055,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                     "--------------------\n Provider request denied\n\
                      Dismissed when you send your next message.\n--------------------\n\n\
                      {current}\n{}PLUGIN_READY\n",
-                    "PLUGIN\n".repeat(11)
+                    "PLUGIN\n".repeat(footer_rows)
                 ),
             )
             .unwrap();
@@ -2955,6 +3080,10 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 
             assert_eq!(inst.status, expected, "{current}");
             assert_eq!(inst.last_error.as_deref(), None, "{current}");
+            assert!(
+                inst.last_error_evidence.is_none(),
+                "new activity retires heuristic error evidence"
+            );
         }
     }
 
@@ -3131,5 +3260,12 @@ HISTORY_READY",
             Status::Error,
             "death outranks a protected wrapper and title"
         );
+        let evidence = inst.last_error_evidence.expect("dead-pane observation");
+        assert_eq!(
+            evidence.runtime,
+            RuntimeEvidence::PaneExited { exit_code: None }
+        );
+        assert_eq!(evidence.origin, None, "exit is not a crash diagnosis");
+        assert_eq!(evidence.retryable, None);
     }
 }

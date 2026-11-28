@@ -344,6 +344,7 @@ fn spawn_resume_idle_watchdog(
 ) {
     let grace_ms = resume_idle_grace().as_millis() as i64;
     let interval = resume_idle_check_interval();
+    let adopted_turn = shared.terminal_claim.current_turn();
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -372,19 +373,28 @@ fn spawn_resume_idle_watchdog(
             let now = now_ms();
             let idle_ms = now - shared.last_event_at.load(Ordering::Relaxed);
             if resume_idle_expired(idle_ms, grace_ms, &shared.aoe.leases, now) {
-                if shared.terminal_claim.claim() {
-                    info!(
-                        target: "acp.protocol",
-                        session = %shared.session_label,
-                        idle_ms,
-                        "resume-idle watchdog: synthesizing Stopped for orphaned in-flight turn"
-                    );
-                    shared
-                        .emit(Event::Stopped {
+                let Ok(permit) = shared.event_tx.reserve().await else {
+                    return;
+                };
+                shared.terminal_claim.claim_and_publish(
+                    adopted_turn,
+                    || {
+                        !shared.prompt_sent_since_attach.load(Ordering::Relaxed)
+                            && shared.adopted_turn_active.load(Ordering::Relaxed)
+                            && !shared.first_event_after_attach.load(Ordering::Relaxed)
+                    },
+                    || {
+                        info!(
+                            target: "acp.protocol",
+                            session = %shared.session_label,
+                            idle_ms,
+                            "resume-idle watchdog: synthesizing Stopped for orphaned in-flight turn"
+                        );
+                        permit.send(Event::Stopped {
                             reason: "reattach_idle".into(),
-                        })
-                        .await;
-                }
+                        });
+                    },
+                );
                 return;
             }
         }
@@ -408,7 +418,7 @@ impl Session {
     {
         let ingress = &self.shared.ingress;
         let generation = {
-            let _guard = ingress.fence.lock().await;
+            let _guard = ingress.fence.write().await;
             ingress.begin()
         };
         match self.control.as_ref() {
@@ -572,7 +582,7 @@ impl Session {
             // before the request rather than on its reply.
             {
                 let ingress = &self.shared.ingress;
-                let _guard = ingress.fence.lock().await;
+                let _guard = ingress.fence.write().await;
                 ingress.finish(Some(SessionId::from(stored.clone())))?;
             }
             let req = LoadSessionRequest::new(stored.clone(), self.agent_cwd.clone())
@@ -622,7 +632,7 @@ impl Session {
                     );
                     {
                         let ingress = &self.shared.ingress;
-                        let _guard = ingress.fence.lock().await;
+                        let _guard = ingress.fence.write().await;
                         ingress.finish(None)?;
                     }
                     self.shared

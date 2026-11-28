@@ -249,8 +249,6 @@ typescript = ["dep:ts-rs"]
 [dev-dependencies]
 serial_test = "4.0"
 jsonschema = { version = "0.59.0", default-features = false }
-syn = { version = "3.0", features = ["full", "visit"] }
-proc-macro2 = { version = "1.0", features = ["span-locations"] }
 # Integration tests are separate crates and don't inherit the normal
 # `serde_json` dependency; the acp-runner orphan test parses a worker
 # registry record to mutate its pid structurally.

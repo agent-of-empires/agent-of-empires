@@ -14,7 +14,7 @@ use crate::acp::dispatch::PromptDispatch;
 use crate::daemon::{CreateSessionBody, SessionResponse};
 use crate::server::api::sessions::{
     capture_terminal_output, create_session_with, send_terminal_message, CaptureError,
-    CreateOrigin, SendKeysError, SendPane,
+    CheckedSendPane, CreateOrigin, SendKeysError, SendPane,
 };
 use crate::server::api::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 use crate::server::session_service::{SendTurnError, SessionCaller};
@@ -618,7 +618,7 @@ impl McpServer {
         id: &str,
         text: String,
         readiness: PaneReadiness,
-        checked_pane: Option<String>,
+        checked_pane: Option<CheckedSendPane>,
     ) -> PromptOutcome {
         match readiness {
             PaneReadiness::Waiting => (
@@ -658,6 +658,9 @@ impl McpServer {
                 ),
                 None,
             ),
+            PaneReadiness::AtPrompt if checked_pane.is_none() => {
+                (false, PromptDelivery::NotRunning, None, None)
+            }
             PaneReadiness::Gone => (false, PromptDelivery::NotRunning, None, None),
             // A session that just failed to start is not restarted behind the caller's back.
             PaneReadiness::AtPrompt => match send_terminal_message(
@@ -709,7 +712,10 @@ impl McpServer {
     /// (`NoPromptRule`) is not refused. A session with no pane to check is refused as not
     /// running, so `send` never types into a pane that appeared after the check. Otherwise
     /// answers the pane it checked, for the send.
-    async fn terminal_pane_refusal(&self, id: &str) -> Result<String, Box<CallToolResult>> {
+    async fn terminal_pane_refusal(
+        &self,
+        id: &str,
+    ) -> Result<CheckedSendPane, Box<CallToolResult>> {
         let instance = self
             .state
             .instances
@@ -821,7 +827,7 @@ enum PaneReadiness {
 async fn wait_for_input_prompt(
     state: &std::sync::Arc<crate::server::AppState>,
     id: &str,
-) -> (PaneReadiness, Option<String>) {
+) -> (PaneReadiness, Option<CheckedSendPane>) {
     let deadline = tokio::time::Instant::now() + PROMPT_READY_TIMEOUT;
     loop {
         let instance = state
@@ -848,7 +854,7 @@ async fn wait_for_input_prompt(
 /// One fresh capture of the agent's pane, decided by its detection manifest, as `aoe session
 /// show` reads it, and the pane it read, so the send types into that one. A stopped session is
 /// `Gone` before any capture, whose failure would read as `Unreadable`.
-fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<String>) {
+fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<CheckedSendPane>) {
     if matches!(
         instance.status,
         Status::Error | Status::Stopped | Status::Deleting
@@ -858,30 +864,39 @@ fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<String>) {
     let Ok(session) = instance.tmux_session() else {
         return (PaneReadiness::Gone, None);
     };
-    if !session.exists() || session.is_pane_dead() {
+    if !session.exists() {
         return (PaneReadiness::Gone, None);
     }
-    let pane = session
-        .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
-        .ok();
-    readiness_in(instance, &session, pane)
+    let deadline = crate::tmux::TmuxCommandDeadline::new();
+    let Ok(pane) = session.live_pane_target_with_deadline(&deadline) else {
+        return (PaneReadiness::Unreadable, None);
+    };
+    match CheckedSendPane::capture(instance, session.name(), &pane, &deadline) {
+        Ok(Some(checked)) => {
+            let (readiness, _) =
+                readiness_in(instance, &checked.session(), Some(checked.pane_id()));
+            (readiness, Some(checked))
+        }
+        Ok(None) => (PaneReadiness::Gone, None),
+        Err(_) => (PaneReadiness::Unreadable, None),
+    }
 }
 
 /// [`pane_readiness`] of the pane its lookup found. Without one nothing is captured: the
 /// session's default target may be another pane than the one a send would type into.
-fn readiness_in(
+fn readiness_in<'pane>(
     instance: &Instance,
     session: &crate::tmux::Session,
-    pane: Option<String>,
-) -> (PaneReadiness, Option<String>) {
+    pane: Option<&'pane str>,
+) -> (PaneReadiness, Option<&'pane str>) {
     let Some(pane) = pane else {
         return (PaneReadiness::Unreadable, None);
     };
     let (detected, input_line) =
-        instance.detect_pane_and_input_line_now(&instance.source_profile, session, &pane);
+        instance.detect_pane_and_input_line_now(&instance.source_profile, session, pane);
     let readiness = readiness_of(detected, input_line);
     #[cfg(test)]
-    crate::tmux::test_helpers::after_input_check(&pane);
+    crate::tmux::test_helpers::after_input_check(pane);
     (readiness, Some(pane))
 }
 
@@ -1130,6 +1145,11 @@ async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
         SendKeysError::Transient(status) => {
             tool_error("busy", format!("The session is {status:?}; try again"))
         }
+        SendKeysError::Preparation { detail, .. }
+            if detail["error"] == "terminal_input_unavailable" =>
+        {
+            tool_error("send_failed", "Terminal send failed")
+        }
         SendKeysError::Preparation { response, .. } => {
             let status = response.status();
             match axum::body::to_bytes(response.into_body(), usize::MAX).await {
@@ -1230,13 +1250,17 @@ mod tests {
             }
             let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let checked = pane_readiness(&instance)
+                .1
+                .expect("the draft pane is observed");
+            assert_eq!(checked.pane_id(), pane);
 
             let (sent, _, _, code) = McpServer::new(state)
                 .deliver_terminal_prompt(
                     &instance.id,
                     "typed-by-create".into(),
                     readiness,
-                    Some(pane.clone()),
+                    Some(checked),
                 )
                 .await;
             assert!(!sent, "{case}");
@@ -1289,10 +1313,10 @@ mod tests {
 
         // (case, the lookup's pane, readiness; the send gets the looked-up pane back)
         for (case, looked_up, want) in [
-            ("looked-up", Some(pane.clone()), PaneReadiness::AtPrompt),
+            ("looked-up", Some(pane.as_str()), PaneReadiness::AtPrompt),
             ("lookup-failed", None, PaneReadiness::Unreadable),
         ] {
-            let (readiness, checked) = readiness_in(&instance, &session, looked_up.clone());
+            let (readiness, checked) = readiness_in(&instance, &session, looked_up);
             assert_eq!(readiness, want, "{case}");
             assert_eq!(checked, looked_up, "{case}");
         }
@@ -1408,9 +1432,9 @@ mod tests {
                     }
                 });
             }
-            let (readiness, checked) = readiness_in(&instance, &session, Some(pane.clone()));
+            let (readiness, checked) = readiness_in(&instance, &session, Some(&pane));
             assert_eq!(readiness, want, "{case}");
-            assert_eq!(checked, Some(pane), "{case}");
+            assert_eq!(checked, Some(pane.as_str()), "{case}");
         }
     }
 

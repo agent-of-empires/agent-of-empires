@@ -88,6 +88,7 @@ function toPersistedState(state: AcpState, durable: (id: string) => boolean): Ac
     state.restartInFlight ||
     state.restartStoppedSent ||
     state.restartFailure !== null ||
+    state.interactionError ||
     state.retriedError !== null
       ? {
           ...state,
@@ -96,6 +97,7 @@ function toPersistedState(state: AcpState, durable: (id: string) => boolean): Ac
           restartInFlight: false,
           restartStoppedSent: false,
           restartFailure: null,
+          interactionError: null,
           retriedError: null,
         }
       : state;

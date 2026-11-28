@@ -1116,42 +1116,39 @@ impl SessionService {
     /// stay hidden under the operator's own keystrokes. Only the marker and recency change,
     /// and only while the canonical row is still ignored and startable, so the write happens
     /// once rather than per keystroke.
-    pub(crate) async fn touch_after_direct_input(&self, id: &str) -> anyhow::Result<()> {
-        // The snapshot lags a peer's commit, so an already-ignored row is the only case
-        // that needs no store read here; anything else asks the canonical store.
-        if !self
-            .instances
-            .read()
-            .await
-            .iter()
-            .any(|row| row.id == id && row.is_ignored())
-            && !self.is_ignored_on_disk(id).await?
-        {
-            return Ok(());
-        }
+    pub(crate) async fn touch_after_direct_input(
+        &self,
+        id: String,
+        expected: crate::daemon::NativePreparationIdentity,
+    ) -> anyhow::Result<()> {
         let state = self.native_state()?;
-        let profile = self
-            .instances
-            .read()
-            .await
-            .iter()
-            .find(|row| row.id == id)
-            .map(|row| row.source_profile.clone())
-            .ok_or(crate::session::SessionGone)?;
-        let id = id.to_owned();
+        let _namespace = state.profile_namespace.read().await;
+        let state = state.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             use crate::session::SessionStore;
-            let native = super::session_store::NativeSessionStore::open(state, &profile, None)?;
+            let native =
+                super::session_store::NativeSessionStore::open(state, &expected.profile, None)?;
+            if !expected.matches_source(native.storage()) {
+                return Ok(());
+            }
+            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
             let store: &dyn SessionStore = &native;
+            if !store
+                .load()?
+                .iter()
+                .any(|row| row.id == id && expected.matches(row) && row.is_ignored())
+            {
+                return Ok(());
+            }
             store.update(|rows, _| {
-                if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-                    if row.is_ignored() {
-                        row.touch_after_input();
-                    }
+                if let Some(row) = rows
+                    .iter_mut()
+                    .find(|row| row.id == id && expected.matches(row) && row.is_ignored())
+                {
+                    row.touch_after_input();
                 }
                 Ok(())
-            })?;
-            Ok(())
+            })
         })
         .await?
     }
@@ -1595,11 +1592,11 @@ impl SessionService {
                     return Ok(false);
                 }
             }
-            let pane = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&target)?
-                .ok_or_else(|| anyhow::anyhow!("the agent is no longer running"))?;
-            // The waits ran before these guards; what is on screen now decides.
-            // Check, capture and type address the pane the process check saw.
-            let tmux = target.tmux_session()?;
+            let (name, physical) =
+                crate::server::api::sessions::ready_agent_target_for_automatic_input(&target)?
+                    .ok_or_else(|| anyhow::anyhow!("the agent is no longer running"))?;
+            let pane = physical.identity.pane_id.clone();
+            let tmux = crate::tmux::Session::from_observation(&name, physical);
             if !pane_accepts_automatic_input(&target, &tmux, &pane)? {
                 return Ok(false);
             }
@@ -2597,7 +2594,9 @@ impl SessionService {
                 || inst.is_trashed()
                 || !matches!(
                     inst.status,
-                    crate::session::Status::Idle | crate::session::Status::Running
+                    crate::session::Status::Idle
+                        | crate::session::Status::Running
+                        | crate::session::Status::Error
                 )
             {
                 return;
@@ -3246,11 +3245,12 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         budget.as_secs()
     );
     // A person's draft is "not yet" too, until the budget runs out.
-    if let Some(pane) =
-        crate::server::api::sessions::ready_agent_pane_for_automatic_input(instance)?
+    if let Some((name, physical)) =
+        crate::server::api::sessions::ready_agent_target_for_automatic_input(instance)?
     {
+        let tmux = crate::tmux::Session::from_observation(&name, Arc::clone(&physical));
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if !instance.wait_for_input_line(&tmux, &pane, remaining) {
+        if !instance.wait_for_input_line(&tmux, &physical.identity.pane_id, remaining) {
             return Err(TerminalPromptBlocker::InputLineBusy.into());
         }
     }
@@ -5407,6 +5407,16 @@ mod tests {
             .expect("capture pane")
     }
 
+    async fn wait_for_pane_text(pane: &crate::tmux::test_helpers::TmuxTestSession, expected: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !pane_text(pane).contains(expected) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("pane did not receive {expected:?}: {}", pane_text(pane)));
+    }
+
     /// Claude Code 2.1.326 first-run folder-trust dialog, as `capture-pane -p -e` returns it.
     const TRUST_DIALOG_CAPTURE: &str = concat!(
         "\x1b[39m \x1b[1m\x1b[38;5;220mAccessing\x1b[0m \x1b[1m\x1b[38;5;220mworkspace:\x1b[0m\n",
@@ -5965,10 +5975,14 @@ mod tests {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let inst = terminal_turn_instance("sess-pane", "term-pane", "unused");
         let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
-        let tmux = crate::tmux::Session::from_name(pane.name());
-        let pane_id = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&inst)
-            .unwrap()
-            .expect("agent pane");
+        let target = crate::tmux::test_helpers::only_pane_id(pane.name());
+        crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
+        let (name, physical) =
+            crate::server::api::sessions::ready_agent_target_for_automatic_input(&inst)
+                .unwrap()
+                .expect("agent pane");
+        let pane_id = physical.identity.pane_id.clone();
+        let tmux = crate::tmux::Session::from_observation(&name, physical);
         let tmux_ok = |args: &[&str]| {
             let out = crate::tmux::tmux_command().args(args).output().unwrap();
             assert!(out.status.success(), "{args:?}");
@@ -6197,6 +6211,27 @@ mod tests {
             let inst = terminal_turn_instance(&id, &format!("term-{case}"), "must-not-be-typed");
             let pane =
                 (!script.is_empty()).then(|| start_terminal_pane(&inst, script, remain_on_exit));
+            if let Some(pane) = &pane {
+                let target = crate::tmux::test_helpers::only_pane_id(pane.name());
+                if remain_on_exit {
+                    crate::tmux::test_helpers::wait_for_pane_dead(&target);
+                } else {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        while !pane_text(pane).contains("login banner, nothing is running here")
+                            || !crate::tmux::utils::is_shell_command(
+                                &crate::tmux::test_helpers::pane_field(
+                                    &target,
+                                    "#{pane_current_command}",
+                                ),
+                            )
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the login shell is observable");
+                }
+            }
             let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
                 .session_service
                 .clone();
@@ -6538,7 +6573,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-term-super", "term-super", "initial-turn-A");
+        let mut inst = terminal_turn_instance("sess-term-super", "term-super", "initial-turn-A");
+        inst.source_profile = "default".into();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &inst.source_profile,
             vec![inst.clone()],
@@ -6569,10 +6605,10 @@ mod tests {
         assert!(text.contains("user-message-B"), "{text}");
         assert!(!text.contains("initial-turn-A"), "{text}");
         assert!(pending_turn(&service, "sess-term-super").await.is_none());
+        assert!(disk_turn("default", "sess-term-super").is_none());
     }
 
-    /// The supersession clear queues blocking work of its own, so a send must
-    /// not hold the only blocking slot while it waits for that clear.
+    /// A send must settle supersession without waiting for a second blocking slot.
     #[test]
     #[serial_test::serial]
     fn a_terminal_send_clears_the_pending_turn_with_one_blocking_slot() {
@@ -6587,7 +6623,8 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let _app_dir = crate::session::test_support::isolate_app_dir();
-            let inst = terminal_turn_instance("sess-one-slot", "one-slot", "initial-turn-A");
+            let mut inst = terminal_turn_instance("sess-one-slot", "one-slot", "initial-turn-A");
+            inst.source_profile = "default".into();
             crate::server::test_support::seed_instances_on_disk_for_test(
                 &inst.source_profile,
                 vec![inst.clone()],
@@ -6612,6 +6649,7 @@ mod tests {
             .expect("the send finished instead of waiting on the blocking pool");
             assert!(sent.is_ok());
             assert!(pending_turn(&service, "sess-one-slot").await.is_none());
+            assert!(disk_turn("default", "sess-one-slot").is_none());
         });
     }
 
@@ -6624,7 +6662,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-cancel-ns", "cancel-ns", "initial-turn-A");
+        let mut inst = terminal_turn_instance("sess-cancel-ns", "cancel-ns", "initial-turn-A");
+        inst.source_profile = "default".into();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &inst.source_profile,
             vec![inst.clone()],
@@ -6634,8 +6673,8 @@ mod tests {
         let service = state.session_service.clone();
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
 
-        // The clear after the typed text waits on this gate.
-        let gate = service.disk_reload_guard().await;
+        use crate::server::api::sessions::terminal_custody::{Boundary, Gate};
+        let mut acknowledged = Gate::install("sess-cancel-ns", Boundary::SendAcknowledged);
         let sender = {
             let service = service.clone();
             tokio::spawn(async move {
@@ -6650,24 +6689,38 @@ mod tests {
                 .await
             })
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !pane_text(&pane).contains("user-message-B") {
-            assert!(std::time::Instant::now() < deadline, "{}", pane_text(&pane));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        acknowledged.entered().await;
         sender.abort();
-        let _ = sender.await;
+        assert!(matches!(sender.await, Err(error) if error.is_cancelled()));
 
         assert!(
             state.profile_namespace.try_write().is_err(),
             "the detached send released the profile namespace"
         );
-        drop(gate);
-        while state.profile_namespace.try_write().is_err() {
-            assert!(std::time::Instant::now() < deadline, "send never finished");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        assert!(
+            service
+                .try_prompt_submission("sess-cancel-ns")
+                .await
+                .is_none(),
+            "the detached send released the submission gate"
+        );
+        assert!(pending_turn(&service, "sess-cancel-ns").await.is_some());
+        acknowledged.release();
+        let _namespace = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            state.profile_namespace.write(),
+        )
+        .await
+        .expect("detached send never released the profile namespace");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !pane_text(&pane).contains("user-message-B") {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the pane never displayed the acknowledged message");
         assert!(pending_turn(&service, "sess-cancel-ns").await.is_none());
+        assert!(disk_turn("default", "sess-cancel-ns").is_none());
     }
 
     /// The automatic drain holds the profile namespace through delivery and the
@@ -6679,7 +6732,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-drain-ns", "drain-ns", "run-the-nightly-task");
+        let mut inst = terminal_turn_instance("sess-drain-ns", "drain-ns", "run-the-nightly-task");
+        inst.source_profile = "default".into();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &inst.source_profile,
             vec![inst.clone()],
@@ -6749,7 +6803,8 @@ mod tests {
             return;
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        let inst = terminal_turn_instance("sess-disk-arch", "disk-arch", "after-unarchive");
+        let mut inst = terminal_turn_instance("sess-disk-arch", "disk-arch", "after-unarchive");
+        inst.source_profile = "default".into();
         let mut archived = inst.clone();
         archived.archive();
         crate::server::test_support::seed_instances_on_disk_for_test(
@@ -6777,7 +6832,7 @@ mod tests {
         service
             .drain_terminal_initial_turn_within("sess-disk-arch", std::time::Duration::from_secs(3))
             .await;
-        assert!(pane_text(&pane).contains("after-unarchive"));
+        wait_for_pane_text(&pane, "after-unarchive").await;
     }
 
     /// A trashed session receives nothing and records no delivery error, so
@@ -6790,6 +6845,7 @@ mod tests {
         }
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut trashed = terminal_turn_instance("sess-trash", "term-trash", "after-restore");
+        trashed.source_profile = "default".into();
         trashed.trash();
         crate::server::test_support::seed_instances_on_disk_for_test(
             &trashed.source_profile,
@@ -6819,7 +6875,7 @@ mod tests {
         service
             .drain_terminal_initial_turn_within("sess-trash", std::time::Duration::from_secs(3))
             .await;
-        assert!(pane_text(&pane).contains("after-restore"));
+        wait_for_pane_text(&pane, "after-restore").await;
     }
 
     /// A relaunch another process wrote to disk after the launch was probed
@@ -7490,6 +7546,11 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![managed.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let service = state.session_service.clone();
+        let bound = crate::session::Storage::open_reference("default").unwrap();
+        let expected = crate::daemon::NativePreparationIdentity::from_instance(
+            &managed,
+            bound.bound_profile_identity().unwrap(),
+        );
 
         // A peer commits the ignore; this daemon's snapshot still shows the row live.
         let mut ignored = managed;
@@ -7498,7 +7559,7 @@ mod tests {
         assert!(!state.instances.read().await[0].is_ignored());
 
         service
-            .touch_after_direct_input("peer-typed")
+            .touch_after_direct_input("peer-typed".into(), expected)
             .await
             .unwrap();
 
@@ -7532,11 +7593,16 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+            let bound = crate::session::Storage::open_reference("default").unwrap();
+            let expected = crate::daemon::NativePreparationIdentity::from_instance(
+                &row,
+                bound.bound_profile_identity().unwrap(),
+            );
             let state = crate::server::test_support::build_test_app_state(vec![row]);
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             state
                 .session_service
-                .touch_after_direct_input(id)
+                .touch_after_direct_input(id.into(), expected)
                 .await
                 .unwrap();
 
