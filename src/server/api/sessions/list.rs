@@ -1474,8 +1474,6 @@ mod workspace_ordering_tests {
             next_wakeup_reason: None,
             monitor_active: false,
             monitor_description: None,
-            favorited: false,
-            favorited_at: None,
             urgent: false,
             pinned_at: None,
             archived_at: None,

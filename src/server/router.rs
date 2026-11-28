@@ -150,10 +150,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
         .route(
-            "/api/sessions/{id}/favorite",
-            patch(api::update_session_favorite).layer(read_only.clone()),
-        )
-        .route(
             "/api/sessions/{id}/ignored",
             patch(api::update_session_ignored).layer(read_only.clone()),
         )

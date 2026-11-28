@@ -174,22 +174,16 @@ fn load_custom_theme(path: &std::path::Path) -> Option<Theme> {
     }
 }
 
-/// A theme TOML that omits `unread` or `favorite` should inherit that theme's own
-/// `accent`, not Empire's. The container `#[serde(default)]` seeds omitted fields
+/// A theme TOML that omits `unread` should inherit that theme's own `accent`, not
+/// Empire's. The container `#[serde(default)]` seeds omitted fields
 /// from Empire and serde cannot tell an omission from an explicit match, so detect
 /// the omission from the raw table.
 fn fill_from_accent(content: &str, mut theme: Theme) -> Theme {
     let Ok(table) = content.parse::<toml::Table>() else {
         return theme;
     };
-    let accent = theme.accent;
-    for (key, field) in [
-        ("unread", &mut theme.unread),
-        ("favorite", &mut theme.favorite),
-    ] {
-        if !table.contains_key(key) {
-            *field = accent;
-        }
+    if !table.contains_key("unread") {
+        theme.unread = theme.accent;
     }
     theme
 }
@@ -283,17 +277,12 @@ mod tests {
         let accent = Color::Rgb(0x7a, 0xa2, 0xf7);
         let red = Color::Rgb(0xff, 0x00, 0x00);
         let base = "background = \"#1a1b26\"\naccent = \"#7aa2f7\"\n";
-        for (extra, unread, favorite) in [
-            ("", accent, accent),
-            ("unread = \"#ff0000\"\n", red, accent),
-            ("favorite = \"#ff0000\"\n", accent, red),
-        ] {
+        for (extra, unread) in [("", accent), ("unread = \"#ff0000\"\n", red)] {
             let toml_str = format!("{base}{extra}");
             let theme: Theme = toml::from_str(&toml_str).unwrap();
             let theme = fill_from_accent(&toml_str, theme);
             assert_eq!(theme.accent, accent);
             assert_eq!(theme.unread, unread, "{toml_str}");
-            assert_eq!(theme.favorite, favorite, "{toml_str}");
         }
     }
 

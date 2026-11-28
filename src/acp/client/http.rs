@@ -2802,7 +2802,7 @@ mod tests {
         let token = "b".repeat(64);
         let _phrase =
             crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
-        let mut row = crate::session::Instance::new("Original", "/tmp/isolated-favorite");
+        let mut row = crate::session::Instance::new("Original", "/tmp/isolated-pin");
         row.source_profile = "main".into();
         let storage = crate::session::Storage::new_unwatched("main").unwrap();
         storage
@@ -2852,29 +2852,29 @@ mod tests {
             "one login, then the cached session"
         );
         client.passphrase_session.invalidate(&client.endpoint);
-        use crate::daemon::{DaemonClientError, SessionLookupError, UpdateFavoriteBody};
+        use crate::daemon::{DaemonClientError, SessionLookupError, UpdatePinBody};
         let (daemon, _, before) = client.runtime_mutation_client().await.unwrap();
-        let selection = |selector: &str, select_favorited| UpdateFavoriteBody::Scoped {
+        let selection = |selector: &str, select_pinned| UpdatePinBody::Scoped {
             profile: "main".into(),
             selector: selector.into(),
-            select_favorited,
+            select_pinned,
         };
         assert!(matches!(
             daemon
-                .set_favorite_by_selector(&selection("Original", true), &before)
+                .set_pin_by_selector(&selection("Original", true), &before)
                 .await,
-            Err(DaemonClientError::FavoriteSelection(
+            Err(DaemonClientError::PinSelection(
                 SessionLookupError::NotFound
             ))
         ));
-        for favorited in [true, false, false] {
+        for pinned in [true, false, false] {
             let (_, before) = daemon.runtime_info_with_cursor().await.unwrap();
             let outcome = daemon
-                .set_favorite_by_selector(&selection("Renamed on disk", favorited), &before)
+                .set_pin_by_selector(&selection("Renamed on disk", pinned), &before)
                 .await
                 .unwrap();
             assert_eq!(outcome.title, "Renamed on disk");
-            assert_eq!(storage.load().unwrap()[0].is_favorited(), favorited);
+            assert_eq!(storage.load().unwrap()[0].is_pinned(), pinned);
         }
         state.shutdown.cancel();
         server.await.unwrap();

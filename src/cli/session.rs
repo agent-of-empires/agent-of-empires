@@ -80,14 +80,14 @@ pub enum SessionCommands {
     /// Wake a snoozed session immediately
     Unsnooze(SessionIdArgs),
 
-    /// Mark a session as a favorite. With `session.favorites_first` on (the
-    /// default), favorited rows pin to the top of their sibling scope under the
-    /// Name and Newest first sorts and show a `✦` in the session list gutter;
-    /// Custom keeps the order you arranged. A snoozed favorite keeps its place.
-    Favorite(SessionIdArgs),
+    /// Pin a session to the top of its header in the session list and the web
+    /// dashboard, under every sort, with the sessions sharing its worktree. Pinning
+    /// cancels archive, ignore and snooze; archiving, ignoring or snoozing it clears
+    /// the pin.
+    Pin(SessionIdArgs),
 
-    /// Clear the favorite flag on a session.
-    Unfavorite(SessionIdArgs),
+    /// Unpin a session
+    Unpin(SessionIdArgs),
 
     /// Archive a session: move it to the Archived section and tear down its
     /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
@@ -406,8 +406,8 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::SetBase(args) => set_base(profile, args).await,
         SessionCommands::Snooze(args) => snooze_session(profile, args).await,
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
-        SessionCommands::Favorite(args) => set_favorite(profile, args, true).await,
-        SessionCommands::Unfavorite(args) => set_favorite(profile, args, false).await,
+        SessionCommands::Pin(args) => set_pin(profile, args, true).await,
+        SessionCommands::Unpin(args) => set_pin(profile, args, false).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => {
             mark_session(profile, args, "Unarchived", Instance::unarchive).await
@@ -421,12 +421,12 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
     }
 }
 
-async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Result<()> {
+async fn set_pin(profile: &str, args: SessionIdArgs, pinned: bool) -> Result<()> {
     use crate::acp::client::{
         daemon_manager::require_local_read_daemon, discovery::discover_env, HttpClient,
     };
     use crate::daemon::{
-        DaemonClientError, RuntimeHealth, UpdateFavoriteBody, RUNTIME_PROTOCOL_VERSION,
+        DaemonClientError, RuntimeHealth, UpdatePinBody, RUNTIME_PROTOCOL_VERSION,
     };
 
     anyhow::ensure!(
@@ -449,18 +449,15 @@ async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Re
         "Daemon runtime is not ready"
     );
     let selector = args.identifier;
-    let body = UpdateFavoriteBody::Scoped {
+    let body = UpdatePinBody::Scoped {
         profile: profile.into(),
         selector,
-        select_favorited: favorited,
+        select_pinned: pinned,
     };
-    let result = client.set_favorite_by_selector(&body, &baseline).await;
+    let result = client.set_pin_by_selector(&body, &baseline).await;
     let outcome = match (result, body) {
         (Ok(outcome), _) => outcome,
-        (
-            Err(DaemonClientError::FavoriteSelection(error)),
-            UpdateFavoriteBody::Scoped { selector, .. },
-        ) => {
+        (Err(DaemonClientError::PinSelection(error)), UpdatePinBody::Scoped { selector, .. }) => {
             return Err(error.for_cli(&selector));
         }
         (
@@ -479,16 +476,12 @@ async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Re
             _,
         ) => {
             return Err(anyhow::Error::new(error).context(
-                "Favorite outcome may be unknown; check the session before running the command again",
+                "Pin outcome may be unknown; check the session before running the command again",
             ));
         }
         (Err(error), _) => bail!("{}", super::terminal_text(&error.to_string())),
     };
-    let verb = if favorited {
-        "Favorited"
-    } else {
-        "Unfavorited"
-    };
+    let verb = if pinned { "Pinned" } else { "Unpinned" };
     println!("{verb}: {}", super::terminal_text(&outcome.title));
     Ok(())
 }

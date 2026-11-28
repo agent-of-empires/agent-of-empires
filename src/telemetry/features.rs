@@ -17,7 +17,6 @@ pub fn active_features(config: &Config) -> BTreeMap<String, bool> {
             matches!(config.updates.update_check_mode, UpdateCheckMode::Auto),
         ),
         ("sounds", config.sound.enabled),
-        ("favorites_first", s.favorites_first),
         ("unread_indicator", s.unread_indicator),
         ("diagnostics_pane", s.show_diagnostics_pane),
         ("tips", s.show_tips),
@@ -78,14 +77,12 @@ mod tests {
         let mut config = Config::default();
         config.worktree.enabled = true;
         config.updates.update_check_mode = UpdateCheckMode::Auto;
-        config.session.favorites_first = true;
         config.session.auto_stop_idle_secs = 0;
 
         let features = active_features(&config);
         assert_eq!(features.get("worktree"), Some(&true));
         assert_eq!(features.get("auto_update"), Some(&true));
         assert_eq!(features.get("sandbox"), Some(&false));
-        assert_eq!(features.get("favorites_first"), Some(&true));
         assert_eq!(features.get("auto_stop_idle"), Some(&false));
     }
 

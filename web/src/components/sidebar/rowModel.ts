@@ -99,7 +99,6 @@ export function deriveRowModel(
       { status, idle_entered_at: best.idleEnteredAt, dormant: best.dormant },
       idleDecayWindowMs,
     ),
-    isFavorited: sessions.some((s) => s.favorited),
     isPinned,
     isArchived,
     effectivePinned: effectivePinnedOf(optimistic, isPinned),

@@ -111,8 +111,6 @@ pub(super) fn session_response_from_instance_with_plan(
             && outside_repository_cached(&inst.project_path),
         scratch: inst.scratch,
         created_without_setup: inst.created_without_setup,
-        favorited: inst.is_favorited(),
-        favorited_at: inst.favorited_at.map(|t| t.to_rfc3339()),
         urgent: inst.is_urgent(),
         pinned_at: timestamp(row.pinned_at),
         archived_at: timestamp(row.archived_at),

@@ -47,7 +47,6 @@ export function session(over: Partial<SessionResponse> = {}): SessionResponse {
     branch: null,
     main_repo_path: null,
     is_sandboxed: false,
-    favorited: false,
     scratch: false,
     has_managed_worktree: false,
     has_terminal: true,

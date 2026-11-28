@@ -607,7 +607,6 @@ pub(crate) async fn start_server(
     let config = crate::session::config::profile_config::resolve_config_or_warn(profile);
     // Feed the unread-feature gate from this daemon's resolved config.
     crate::session::set_unread_enabled(config.session.unread_indicator);
-    crate::session::set_favorites_first(config.session.favorites_first);
 
     // Login sessions persist across daemon restarts by default so signed-in devices are not
     // re-prompted for the passphrase on every bounce.

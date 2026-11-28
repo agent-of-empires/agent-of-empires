@@ -33,7 +33,6 @@ export function makeSession(over: Partial<SessionResponse> = {}): SessionRespons
     branch: null,
     main_repo_path: null,
     is_sandboxed: false,
-    favorited: false,
     has_managed_worktree: false,
     has_terminal: true,
     profile: "default",

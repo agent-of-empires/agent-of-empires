@@ -857,26 +857,21 @@ pub enum PurgeOutcome {
     },
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct UpdatePinBody {
-    pub pinned: bool,
-}
-
 #[derive(Serialize)]
 #[serde(untagged)]
-pub enum UpdateFavoriteBody {
+pub enum UpdatePinBody {
     Scoped {
         profile: String,
         selector: String,
         // A distinct value key makes older Daemons reject the scoped request.
-        select_favorited: bool,
+        select_pinned: bool,
     },
     Unscoped {
-        favorited: bool,
+        pinned: bool,
     },
 }
 
-impl<'de> Deserialize<'de> for UpdateFavoriteBody {
+impl<'de> Deserialize<'de> for UpdatePinBody {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // Keep the scoped form map-only, but allow legacy clients' extra fields.
         #[derive(Deserialize)]
@@ -885,13 +880,13 @@ impl<'de> Deserialize<'de> for UpdateFavoriteBody {
             Request {
                 profile: String,
                 selector: String,
-                select_favorited: bool,
+                select_pinned: bool,
             },
         }
 
         #[derive(Deserialize)]
         struct Legacy {
-            favorited: bool,
+            pinned: bool,
             #[serde(
                 default,
                 rename = "profile",
@@ -906,15 +901,15 @@ impl<'de> Deserialize<'de> for UpdateFavoriteBody {
             _selector: (),
             #[serde(
                 default,
-                rename = "select_favorited",
+                rename = "select_pinned",
                 deserialize_with = "reject_selector_field"
             )]
-            _select_favorited: (),
+            _select_pinned: (),
         }
 
         fn reject_selector_field<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
             Err(serde::de::Error::custom(
-                "selector field in legacy favorite request",
+                "selector field in legacy pin request",
             ))
         }
 
@@ -929,18 +924,18 @@ impl<'de> Deserialize<'de> for UpdateFavoriteBody {
             Request::Scoped(Scoped::Request {
                 profile,
                 selector,
-                select_favorited,
+                select_pinned,
             }) => Self::Scoped {
                 profile,
                 selector,
-                select_favorited,
+                select_pinned,
             },
-            Request::Legacy(Legacy { favorited, .. }) => Self::Unscoped { favorited },
+            Request::Legacy(Legacy { pinned, .. }) => Self::Unscoped { pinned },
         })
     }
 }
 
-pub(crate) const FAVORITE_BY_SELECTOR: &str = "by-selector";
+pub(crate) const PIN_BY_SELECTOR: &str = "by-selector";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -954,7 +949,7 @@ pub enum SessionLookupError {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct FavoriteOutcome {
+pub(crate) struct PinOutcome {
     pub title: String,
 }
 
@@ -1359,14 +1354,6 @@ pub struct SessionResponse {
     /// Created with its `on_create` hooks skipped, so their setup never ran.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub created_without_setup: bool,
-    /// True when the session is marked as a user favorite. Mirrors
-    /// `Instance::is_favorited()`; surfaced so the web sidebar can pin
-    /// favorited rows and render the `*` marker without re-implementing
-    /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
-    #[serde(default)]
-    pub favorited: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub favorited_at: Option<String>,
     /// True when the agent has flagged this session as urgent via the
     /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
@@ -1376,11 +1363,9 @@ pub struct SessionResponse {
     /// claws back to the top. See #1640.
     #[serde(default)]
     pub urgent: bool,
-    /// RFC3339 timestamp at which the session was web-pinned, or omitted
-    /// when not pinned. Distinct from `favorited`: favorite is the TUI
-    /// within-tier attention-sort signal, while pin is the hard
-    /// top-of-sort surfacing primitive used by the web sidebar. The
-    /// client derives a "pinned" boolean as `pinned_at != null`; no
+    /// RFC3339 timestamp at which the session was pinned, or omitted when
+    /// not pinned. Every Client lifts a pinned row to the top of its header.
+    /// The client derives a "pinned" boolean as `pinned_at != null`; no
     /// separate boolean field is exposed (the timestamp itself is the
     /// source of truth, matching `archived_at` and `snoozed_until`). See
     /// #1581.

@@ -621,7 +621,6 @@ impl HomeView {
             for (raw, current) in [
                 (row.trashed_at.as_deref(), &mut instance.trashed_at),
                 (row.archived_at.as_deref(), &mut instance.archived_at),
-                (row.favorited_at.as_deref(), &mut instance.favorited_at),
                 (row.snoozed_until.as_deref(), &mut instance.snoozed_until),
                 (row.pinned_at.as_deref(), &mut instance.pinned_at),
                 (

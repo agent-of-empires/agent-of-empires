@@ -60,18 +60,6 @@ describe("SessionRow chips", () => {
     expect(screen.queryByRole("link", { name: /Created without setup/ })).toBeNull();
   });
 
-  it("keeps favorite identity distinct from pin in normal and compact rows", () => {
-    for (const compact of [false, true]) {
-      const { rerenderRow } = renderRow(ws({ favorited: true, pinned_at: null }), { compact });
-      expect(label("Favorited")?.textContent).toBe("✦");
-      expect(label("Pinned")).toBeNull();
-      rerenderRow(ws({ favorited: false, pinned_at: null }));
-      expect(label("Favorited")).toBeNull();
-      expect(label("Pinned")).toBeNull();
-      cleanup();
-    }
-  });
-
   it("shows the snooze remaining time and the payload rate-limit park", () => {
     renderRow(ws({ snoozed_until: inMinutes(90) }));
     expect(label("Snoozed")!.textContent).toMatch(/1h/);
@@ -468,10 +456,10 @@ describe("SessionRow keyboard navigation", () => {
 
 describe("SessionRow mark tooltips", () => {
   it("explains marks with tooltips, not title, and describes the focused row with its glyph", () => {
-    renderRow(ws({ status: "Waiting", favorited: true, pinned_at: PAST }));
+    renderRow(ws({ status: "Waiting", pinned_at: PAST }));
     const row = testId("sidebar-session-row")!;
     expect(row.hasAttribute("title")).toBe(false);
-    for (const id of ["sidebar-status-glyph", "sidebar-pinned-mark", "sidebar-favorite-mark"]) {
+    for (const id of ["sidebar-status-glyph", "sidebar-pinned-mark"]) {
       expect(testId(id)!.closest("[title]"), id).toBeNull();
     }
 

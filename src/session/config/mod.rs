@@ -1921,27 +1921,6 @@ pub struct SessionConfig {
     )]
     pub unread_indicator: bool,
 
-    /// Pin favorited sessions to the top of their sibling scope under the Name
-    /// and Newest first sorts of the TUI session list; Custom keeps the order the user arranged. A
-    /// group holding a favorited session is pinned the same way. When off, the
-    /// favorite key is inert.
-    ///
-    /// Governs the TUI list only. The web dashboard has its own pin control.
-    ///
-    /// `global_only`: read through a single process-wide flag
-    /// (`crate::session::favorites_first`) on the sort hot path, so a
-    /// per-profile override could not be honored. Same reasoning as
-    /// `unread_indicator`.
-    #[serde(default = "default_true")]
-    #[setting(
-        label = "Favorites first",
-        widget = "toggle",
-        category = "Interaction",
-        global_only,
-        summary = "Favorited Sessions sort to the top of their Group. The Web dashboard uses Pin instead."
-    )]
-    pub favorites_first: bool,
-
     /// Show occasional discovery tips: the `💡` badge in the footer, the
     /// browsable tips overlay, and the one-time earned pop. Turn this off to
     /// hide the badge and stop tips from popping; seen/earned state still lives
@@ -2360,7 +2339,6 @@ impl Default for SessionConfig {
             click_action: ClickAction::default(),
             confirm_before_quit: true,
             unread_indicator: true,
-            favorites_first: true,
             show_tips: true,
             show_shortcut_bar: true,
             preview_link_prefixes: Vec::new(),

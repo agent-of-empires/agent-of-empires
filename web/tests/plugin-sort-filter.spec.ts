@@ -15,8 +15,7 @@ interface MockSession {
   created_at: string;
 }
 
-const sessionResponse = (s: MockSession) =>
-  baseSession({ project_path: "/tmp/repo", favorited: false, urgent: false, ...s });
+const sessionResponse = (s: MockSession) => baseSession({ project_path: "/tmp/repo", urgent: false, ...s });
 
 // A row-column with a sort scalar, a status facet token, plus the global
 // sort-key and filter-facet that reference them, for one session.

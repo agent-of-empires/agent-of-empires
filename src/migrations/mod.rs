@@ -78,6 +78,7 @@ mod v066_retire_agent_update_fields;
 mod v067_retire_restart_wake;
 mod v068_shared_sidebar_view;
 mod v069_shared_custom_order;
+mod v070_favorite_to_pin;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -118,7 +119,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 69;
+const CURRENT_VERSION: u32 = 70;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -350,6 +351,7 @@ const MIGRATIONS: &[Migration] = &[
     (67, "retire_restart_wake", v067_retire_restart_wake::run),
     (68, "shared_sidebar_view", v068_shared_sidebar_view::run),
     (69, "shared_custom_order", v069_shared_custom_order::run),
+    (70, "favorite_to_pin", v070_favorite_to_pin::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -583,7 +585,8 @@ fn run_explicit_recovery(
         recovery::reconcile_repaired_components()?;
         // Not in the helper: registered v046 calls it, and an upgrade must reach v060 in order.
         v060_terminal_handoff_outcome::run()?;
-        v069_shared_custom_order::recover()
+        v069_shared_custom_order::recover()?;
+        v070_favorite_to_pin::recover()
     })?;
     legacy_scope_recovery::run_under_exclusion(transaction, serve)
 }

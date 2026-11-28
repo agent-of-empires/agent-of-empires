@@ -1217,7 +1217,7 @@ mod tests {
                             )
                         } else {
                             (&native as &dyn SessionStore).update(|rows, _| {
-                                rows[0].favorite();
+                                rows[0].pin();
                                 Ok(())
                             })
                         };

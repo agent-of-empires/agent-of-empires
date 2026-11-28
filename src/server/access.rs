@@ -390,7 +390,6 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("PATCH", "/api/sessions/{id}/archive"),
     ("PATCH", "/api/sessions/{id}/access"),
     ("PATCH", "/api/sessions/{id}/diff-base"),
-    ("PATCH", "/api/sessions/{id}/favorite"),
     ("PATCH", "/api/sessions/{id}/group"),
     ("PATCH", "/api/sessions/{id}/ignored"),
     ("POST", "/api/sessions/{id}/reclaim-ownership"),

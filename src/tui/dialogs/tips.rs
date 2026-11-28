@@ -195,7 +195,7 @@ impl TipsDialog {
             ("{group}", ActionId::GroupBy),
             ("{archive}", ActionId::ToggleArchive),
             ("{snooze}", ActionId::ToggleSnooze),
-            ("{favorite}", ActionId::ToggleFavorite),
+            ("{pin}", ActionId::TogglePin),
             ("{serve}", ActionId::Serve),
             ("{tool_session}", ActionId::ToolPicker),
         ];
@@ -574,7 +574,7 @@ mod tests {
     fn tip_bodies_substitute_the_live_keybindings() {
         let dialog = dialog(vec![]);
         let body = "{toggle_view} {diff} {settings} {help} {sort} {group} {archive} \
-                    {snooze} {favorite} {serve} {tool_session}";
+                    {snooze} {pin} {serve} {tool_session}";
         let resolved = dialog.resolve_body(body);
         assert!(
             !resolved.contains('{'),

@@ -140,7 +140,6 @@ export function SidebarLegend({
             <ul className="mt-1 border-t border-surface-700/50 pt-1">
               <Row mark={<span className="text-status-unread">●</span>} meaning={MARK_MEANING.unread} />
               <Row mark={<Pin className="inline h-3 w-3 -rotate-45 text-brand-400" />} meaning={MARK_MEANING.pinned} />
-              <Row mark={<span className="text-favorite">✦</span>} meaning={MARK_MEANING.favorite} />
               <Row mark={<span className="text-[10px] text-text-dim">◆</span>} meaning={MARK_MEANING.pinnedProject} />
               <Row mark={<span className="text-[10px] text-text-dim">◇</span>} meaning={MARK_MEANING.project} />
               <Row

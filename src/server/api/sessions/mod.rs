@@ -17,9 +17,9 @@ use crate::daemon::{
     CleanupDefaults, ContextResumeAvailability, ContextResumeIndeterminateReason,
     ContextResumeUnavailableReason, CreateSessionBody, DeleteSessionBody, ListSessionsQuery,
     PendingApproval, PlanSummary, PurgeOutcome, ReclaimOwnershipBody, SessionResponse,
-    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateDiffBaseBody, UpdateFavoriteBody,
-    UpdateGroupBody, UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
-    UpdateUnreadBody, WorkspaceRepoSummary,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateDiffBaseBody, UpdateGroupBody,
+    UpdateIgnoredBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    WorkspaceRepoSummary,
 };
 
 use crate::git::error::GitError;

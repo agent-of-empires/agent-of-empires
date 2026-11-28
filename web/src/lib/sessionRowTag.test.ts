@@ -22,7 +22,6 @@ function session(overrides: Partial<SessionResponse> = {}): SessionResponse {
     main_repo_path: null,
     is_sandboxed: false,
     scratch: false,
-    favorited: false,
     has_managed_worktree: false,
     has_terminal: true,
     profile: "default",

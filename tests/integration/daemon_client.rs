@@ -47,7 +47,6 @@ fn structured_success() -> String {
             "created_at": "2026-01-01T00:00:00Z",
             "is_sandboxed": false,
             "scratch": false,
-            "favorited": false,
             "urgent": false,
             "has_managed_worktree": true,
             "has_cleanable_worktree": true,
