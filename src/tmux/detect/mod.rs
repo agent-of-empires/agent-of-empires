@@ -290,6 +290,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn input_box_geometry_comes_from_the_manifest() {
+        let source = r#"
+id = "t"
+[input_box]
+prompt = '^\s*>\s'
+chrome = ['^\[hint\]']
+
+[[rules]]
+id = "status_slot"
+state = "running"
+priority = 20
+region = "last_non_empty_above_prompt_box"
+contains = ["working"]
+
+[[rules]]
+id = "box_draft"
+state = "waiting"
+priority = 10
+region = "prompt_box_body"
+contains = ["draft"]
+"#;
+        let winner = |pane: &str| {
+            detect_with_manifest_source(source, pane, &Observation::new("", None, true))
+                .expect("manifest compiles")
+                .map(|d| d.rule)
+        };
+        for (name, pane, expected) in [
+            // The configured chrome line above the box is skipped to reach the status slot.
+            (
+                "chrome skipped",
+                "working on it\n[hint] press ? for help\n> typing",
+                Some("status_slot"),
+            ),
+            ("box body", "all quiet\n> my draft", Some("box_draft")),
+            // `❯` is not this manifest's prompt, so there is no box and no status slot.
+            ("foreign glyph", "working on it\n❯ my draft", None),
+        ] {
+            assert_eq!(winner(pane).as_deref(), expected, "{name}");
+        }
+    }
+
+    #[test]
     fn manifests_compile() {
         for (agent, source, adapter) in MANIFEST_SOURCES {
             Manifest::parse(source, adapter.evidence_names)
