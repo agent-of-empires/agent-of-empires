@@ -1,5 +1,7 @@
 //! xtask: development tasks for agent-of-empires.
 
+mod featured_pins;
+
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -25,6 +27,8 @@ enum Commands {
     GenMetaSchema,
     /// Check that contrib skill files reference valid CLI commands
     CheckSkill,
+    /// Pin featured plugin releases newer than the newest pinned version
+    BumpFeaturedPins,
     /// Run the web dashboard backend and Vite dev server together (Ctrl-C stops both)
     Dev(DevArgs),
 }
@@ -56,6 +60,7 @@ fn main() {
         Commands::GenLiveWire => generate_live_wire(),
         Commands::GenMetaSchema => generate_meta_schema(),
         Commands::CheckSkill => check_skill(),
+        Commands::BumpFeaturedPins => featured_pins::run(),
         Commands::Dev(dev) => run_dev(dev),
     }
 }

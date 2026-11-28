@@ -72,7 +72,9 @@ workflows:
     '.github/workflows/release-plz.yml':
         - 'actions/cache@v6.1.0'
         - 'actions/checkout@v7.0.1'
+        - 'aws-actions/configure-aws-credentials@v6.3.0'
         - 'dtolnay/rust-toolchain@master'
+        - 'kunobi-ninja/kache-action@v1'
         - 'release-plz/action@v0.5.148'
         - 'runs-on/action@v2.6.0'
     '.github/workflows/release.yml':
