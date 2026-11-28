@@ -476,12 +476,12 @@ fn send_keys_enter_delay_requires_api_22_and_caps_at_two_seconds() {
 }
 
 #[test]
-fn ready_markers_require_api_28_and_reject_unusable_text() {
+fn ready_markers_require_api_29_and_reject_unusable_text() {
     let declaration = "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
                        [agent_integrations.launch]\n\
                        ready_markers = [\"ask anything\"]\n";
 
-    let parsed = parse(28, declaration);
+    let parsed = parse(29, declaration);
     let markers = &parsed.agent_integrations[0]
         .launch
         .as_ref()
@@ -499,18 +499,18 @@ fn ready_markers_require_api_28_and_reject_unusable_text() {
         markers
     );
 
-    let errors = invalid(27, declaration);
+    let errors = invalid(28, declaration);
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("ready_markers requires api_version >= 28")),
+            .any(|error| error.contains("ready_markers requires api_version >= 29")),
         "{errors:?}"
     );
 
     // Empty and blank markers cannot identify an input box, and no marker may
     // carry control or format characters onto the screen the host matches.
     for marker in ["\"\"", "\"  \"", "\"ask\\u001b[2J\""] {
-        let errors = invalid(28, &declaration.replace("\"ask anything\"", marker));
+        let errors = invalid(29, &declaration.replace("\"ask anything\"", marker));
         assert!(
             errors
                 .iter()
@@ -521,7 +521,7 @@ fn ready_markers_require_api_28_and_reject_unusable_text() {
 
     let too_many: Vec<String> = (0..17).map(|i| format!("\"m{i}\"")).collect();
     let errors = invalid(
-        28,
+        29,
         &declaration.replace("[\"ask anything\"]", &format!("[{}]", too_many.join(", "))),
     );
     assert!(
@@ -534,11 +534,11 @@ fn ready_markers_require_api_28_and_reject_unusable_text() {
     // The length cap counts characters, so a 128-character marker of multi-byte
     // screen text fits and one character over does not.
     parse(
-        28,
+        29,
         &declaration.replace("\"ask anything\"", &format!("\"{}\"", "é".repeat(128))),
     );
     let errors = invalid(
-        28,
+        29,
         &declaration.replace("\"ask anything\"", &format!("\"{}\"", "é".repeat(129))),
     );
     assert!(
@@ -548,7 +548,7 @@ fn ready_markers_require_api_28_and_reject_unusable_text() {
         "{errors:?}"
     );
 
-    // An empty list declares nothing, so it stays valid before API 28.
+    // An empty list declares nothing, so it stays valid before API 29.
     parse(21, &declaration.replace("[\"ask anything\"]", "[]"));
 }
 

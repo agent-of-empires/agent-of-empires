@@ -2302,7 +2302,7 @@ sandbox = "unsupported"
 id = "acme.marker"
 name = "Marker"
 version = "1.0.0"
-api_version = 28
+api_version = 29
 
 [[agent_integrations]]
 tool = "marker-helper"
@@ -2318,7 +2318,7 @@ ready_markers = ["Ask anything", "type a message"]
 id = "acme.markerless"
 name = "Markerless"
 version = "1.0.0"
-api_version = 28
+api_version = 29
 
 [[agent_integrations]]
 tool = "markerless-helper"

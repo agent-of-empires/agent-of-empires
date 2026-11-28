@@ -1666,9 +1666,9 @@ impl PluginManifest {
                 .is_some_and(|launch| !launch.ready_markers.is_empty())
             {
                 check(
-                    self.api_version >= 28,
+                    self.api_version >= 29,
                     format!(
-                        "agent_integrations[{i}].launch.ready_markers requires api_version >= 28"
+                        "agent_integrations[{i}].launch.ready_markers requires api_version >= 29"
                     ),
                 );
             }
