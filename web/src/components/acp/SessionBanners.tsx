@@ -4,6 +4,7 @@ import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { nativeInputAvailable, type AcpConnectionUnavailability, type AcpState } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
 import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
+import { IntegrationLostBanner } from "./IntegrationLostBanner";
 import { ContainerGoneBanner, type NewSessionLike } from "./ContainerGoneBanner";
 import { BUTTON_SECONDARY_SM, BUTTON_WARNING_SM } from "../../lib/surfaces";
 import { Spinner } from "../Dialog";
@@ -59,9 +60,6 @@ export function SessionBanners({
   // A prior current input receipt changes the diagnostic, never today's control authority.
   const startupDiagnosticOnly = nativeReady || state.sessionAssigned;
   const reason = state.integrationLost;
-  const integrationError = reason
-    ? `Agent integration lost: ${reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")}`
-    : null;
   const startupError = state.startupError;
   const variant = reason
     ? "none"
@@ -83,7 +81,6 @@ export function SessionBanners({
   const errorMessage = state.interactionError?.message ?? state.lastError;
   return (
     <>
-      {integrationError && <InteractionErrorBanner title="Structured view diagnostic" message={integrationError} />}
       {state.startupError && !startupDiagnosticOnly && state.startupCause?.kind === "container_missing" && (
         <ContainerGoneBanner
           sessionId={sessionId}
@@ -113,6 +110,7 @@ export function SessionBanners({
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
+      {reason && <IntegrationLostBanner reason={reason} />}
       {startupError && startupDiagnosticOnly && (
         <InteractionErrorBanner message={startupError} onDismiss={dismissError} />
       )}
@@ -379,17 +377,9 @@ function ChipBanner({
   );
 }
 
-function InteractionErrorBanner({
-  title = "Action did not complete",
-  message,
-  onDismiss,
-}: {
-  title?: string;
-  message: string;
-  onDismiss?: () => void;
-}) {
+function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
   return (
-    <WarningStrip title={title} onDismiss={onDismiss}>
+    <WarningStrip title="Action did not complete" onDismiss={onDismiss}>
       <span className="block">{message}</span>
     </WarningStrip>
   );

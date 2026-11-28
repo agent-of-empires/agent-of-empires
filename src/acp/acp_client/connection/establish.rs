@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use super::super::spawn::ProxySpec;
 use super::command_loop::Session;
 use super::notifications::{now_ms, Shared};
 use super::ReadyTx;
@@ -97,6 +98,7 @@ pub(super) struct EstablishCtx {
     pub(super) ready_tx: Arc<ReadyTx>,
     pub(super) mode: ConnectMode,
     pub(super) expected_agent: ExpectedAgent,
+    pub(super) proxy: Option<ProxySpec>,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) default_effort: Option<String>,
     pub(super) default_model_config: BTreeMap<String, String>,
@@ -106,6 +108,68 @@ pub(super) struct EstablishCtx {
     pub(super) agent_cwd: PathBuf,
     pub(super) cmd_rx: mpsc::Receiver<ClientCmd>,
     pub(super) lifecycle_rx: mpsc::Receiver<LifecycleEnvelope>,
+}
+
+/// Whether the agent is proxied, or why its hello is unacceptable. A launched
+/// proxy must send a hello naming its own plugin and fronting a compatible
+/// adapter; with none launched, a hello is accepted as announced.
+fn proxy_verdict(expected: Option<&ProxySpec>, init: &InitializeResponse) -> Result<bool, String> {
+    let hello = init
+        .meta
+        .as_ref()
+        .map(aoe_meta::ProxyHello::from_meta)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    let Some(spec) = expected else {
+        return Ok(hello.is_some());
+    };
+    let hello = hello.ok_or("the launched proxy sent no hello")?;
+    if hello.plugin_id != spec.plugin_id {
+        return Err(format!(
+            "hello names plugin `{}` but `{}` was launched",
+            hello.plugin_id, spec.plugin_id
+        ));
+    }
+    spec.compat.check(init.agent_info.as_ref())?;
+    Ok(true)
+}
+
+/// Whether the agent is proxied, or the typed refusal. The proxy verdict comes
+/// first so its failure policy sees every hello failure, even when the adapter
+/// would also fail the generic compatibility check.
+fn vet_initialize(
+    expected_agent: ExpectedAgent,
+    proxy: Option<&ProxySpec>,
+    init: &InitializeResponse,
+    label: &str,
+) -> Result<bool, IncompatibleAgentError> {
+    let proxied = proxy_verdict(proxy, init).map_err(|reason| {
+        warn!(
+            target: "acp.protocol",
+            session = %label,
+            error = %reason,
+            "proxy hello rejected; refusing to enter session"
+        );
+        let detail = StartupErrorDetail::InvalidProxyHello { reason };
+        let message = detail.user_message();
+        IncompatibleAgentError { detail, message }
+    })?;
+    agent_compat::validate(expected_agent, init).map_err(|err| {
+        let message = err.user_message();
+        warn!(
+            target: "acp.protocol",
+            session = %label,
+            kind = err.kind(),
+            message = %message,
+            "agent compatibility check failed; refusing to enter session"
+        );
+        IncompatibleAgentError {
+            detail: StartupErrorDetail::from(&err),
+            message,
+        }
+    })?;
+    Ok(proxied)
 }
 
 /// `Ok(None)` when the agent failed the compatibility check; the typed error
@@ -144,53 +208,19 @@ pub(super) async fn establish(
 
     // The supervisor mirrors the typed error into events; a clean return
     // keeps the outer cleanup from adding a generic startup error.
-    if let Err(err) = agent_compat::validate(ctx.expected_agent, &init) {
-        let message = err.user_message();
-        warn!(
-            target: "acp.protocol",
-            session = %label,
-            kind = err.kind(),
-            message = %message,
-            "agent compatibility check failed; refusing to enter session"
-        );
-        let detail = StartupErrorDetail::from(&err);
-        if let Some(tx) = ctx.ready_tx.lock().await.take() {
-            let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(
-                IncompatibleAgentError { detail, message },
-            ))));
-        }
-        return Ok(None);
-    }
-
-    // A proxy announces itself on the initialize response; any other agent
-    // has no hello and is not held to the `_meta.aoe` contract.
-    let proxied = match init
-        .meta
-        .as_ref()
-        .map(aoe_meta::ProxyHello::from_meta)
-        .transpose()
-    {
-        Ok(hello) => hello.flatten().is_some(),
-        Err(err) => {
-            warn!(
-                target: "acp.protocol",
-                session = %label,
-                error = %err,
-                "proxy hello rejected; refusing to enter session"
-            );
-            let detail = StartupErrorDetail::InvalidProxyHello {
-                reason: err.to_string(),
-            };
-            let message = detail.user_message();
+    let proxied = match vet_initialize(ctx.expected_agent, ctx.proxy.as_ref(), &init, &label) {
+        Ok(proxied) => proxied,
+        Err(error) => {
             if let Some(tx) = ctx.ready_tx.lock().await.take() {
-                let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(
-                    IncompatibleAgentError { detail, message },
-                ))));
+                let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(error))));
             }
             return Ok(None);
         }
     };
     shared.aoe.begin_connection(proxied);
+    if let Some(control) = ctx.control.as_ref().filter(|_| proxied) {
+        control.mark_proxied();
+    }
 
     // Return initialized ownership before any bootstrap replay can fill the
     // public queue. Session establishment still owns its own readiness gate.
@@ -201,8 +231,10 @@ pub(super) async fn establish(
             .lock()
             .expect("connection admission lock");
         let readiness = match shared.connection_state.loss() {
-            Some(observation) => Err(AcpError::ConnectionUnavailable(observation)),
-            None => Ok(()),
+            Some(observation) if !super::direct_proxy_exited(&shared) => {
+                Err(AcpError::ConnectionUnavailable(observation))
+            }
+            _ => Ok(()),
         };
         let _ = tx.send(readiness);
     }
@@ -862,6 +894,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::acp_client::ProxyFailurePolicy;
 
     #[test]
     fn a_silent_lease_holds_the_resume_idle_stop_until_it_expires() {
@@ -909,5 +942,42 @@ mod tests {
                 "stored={stored} load={load} prior={prior}"
             );
         }
+    }
+
+    #[test]
+    fn a_response_failing_both_checks_reports_the_proxy_hello() {
+        let init = |meta: &str, protocol: u32| -> InitializeResponse {
+            serde_json::from_str(&format!(
+                r#"{{"protocolVersion":{protocol},"agentCapabilities":{{}}{meta}}}"#
+            ))
+            .unwrap()
+        };
+        let wrong_plugin = r#","_meta":{"aoe":{"proxy":{"plugin_id":"q","protocol_version":1,"primitive_schema_version":1}}}"#;
+        let spec = ProxySpec {
+            plugin_id: "p".into(),
+            command: "proxy".into(),
+            args: vec![],
+            failure_policy: ProxyFailurePolicy::NeutralBoot,
+            display_name: "P".into(),
+            compat: Default::default(),
+        };
+        // Protocol 0 fails the adapter check; the wrong plugin fails the hello.
+        let both = vet_initialize(
+            ExpectedAgent::Gemini,
+            Some(&spec),
+            &init(wrong_plugin, 0),
+            "s",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            both.detail,
+            StartupErrorDetail::InvalidProxyHello { .. }
+        ));
+        let adapter_only =
+            vet_initialize(ExpectedAgent::Gemini, None, &init("", 0), "s").unwrap_err();
+        assert!(!matches!(
+            adapter_only.detail,
+            StartupErrorDetail::InvalidProxyHello { .. }
+        ));
     }
 }

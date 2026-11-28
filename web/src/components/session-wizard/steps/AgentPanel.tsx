@@ -19,7 +19,7 @@ interface Props {
 /** Agent choice, instructions and launch-command knobs behind the wizard's Agent row. */
 export function AgentPanel({ data, onChange, agents, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const selectedAgent = agents.find((a) => a.name === data.tool);
-  const willUseStructuredView = structuredAvailable(data.tool, selectedAgent, data) && data.useStructuredView;
+  const willUseStructuredView = structuredAvailable(selectedAgent, data) && data.useStructuredView;
   const resolvedCommand = resolveLaunchCommand({
     tool: data.tool,
     useStructuredView: willUseStructuredView,

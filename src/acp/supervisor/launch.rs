@@ -16,11 +16,13 @@ use super::{
     ResumeReservation, ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError,
     WorkerHandle, WorkerKind,
 };
-use crate::acp::acp_client::{AcpClient, AcpError, SpawnConfig};
+use crate::acp::acp_client::{AcpClient, AcpError, ProxyFailurePolicy, SpawnConfig};
 use crate::acp::agent_policy::AgentPolicy;
 use crate::acp::mcp_config::PluginCredentials;
-use crate::acp::runner_lifecycle::{AdmitError, InstallError, Lease, RunnerIdentity};
-use crate::acp::state::{AcpSessionId, Event};
+use crate::acp::runner_lifecycle::{
+    AdmitError, InstallError, Lease, LifecycleTable, ProcessControl, RunnerIdentity,
+};
+use crate::acp::state::{AcpSessionId, Event, StartupErrorDetail, PROXY_DEGRADED_NOTICE_KEY};
 use crate::process::worker_registry;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
 use crate::session::mcp::mcp_model::{McpProvenance, ResolvedMcpServer};
@@ -598,7 +600,26 @@ impl<S: BroadcastSink> Supervisor<S> {
                 None
             }
         });
-        let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.to_string())).await;
+        // The client observes the Lease cancellation during its handshake.
+        // Retain its result so retirement can still delete adapter-side state.
+        let mut launched =
+            (self.launcher)(config.clone(), AcpSessionId(session_id.to_string())).await;
+        if let Err(err) = &launched {
+            if let Some(name) = neutral_boot_fallback(
+                &self.lifecycle,
+                &*self.process_control,
+                &lease,
+                &config,
+                err,
+            )
+            .await
+            {
+                config.proxy = None;
+                config.degraded = Some(name);
+                launched =
+                    (self.launcher)(config.clone(), AcpSessionId(session_id.to_string())).await;
+            }
+        }
         let mut client = match launched {
             Ok(c) => c,
             Err(err) => {
@@ -631,7 +652,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         SupervisorError::Acp(err)
                     });
                 }
-                if matches!(err, AcpError::IncompatibleAgent(_)) {
+                if blames_adapter_binary(&err) {
                     self.mark_incompatible_binary(session_id, &config.spec.command);
                 }
                 let deferred =
@@ -934,6 +955,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                 seed_history_replay,
                 prior_conversation: req.prior_conversation,
                 artifact_dir: crate::session::artifacts::session_artifact_dir(&req.session_id).ok(),
+                proxy: req.proxy.clone(),
+                degraded: None,
                 wrapper_substitution,
                 generation,
                 claude_store_pin,
@@ -1097,6 +1120,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             inbound,
             context_reset,
         );
+        let degraded_notice = match &kind {
+            WorkerKind::Runner { spawn_config } => {
+                spawn_config.degraded.as_deref().map(proxy_degraded_notice)
+            }
+            _ => None,
+        };
         workers.insert(
             session_id.to_string(),
             WorkerHandle {
@@ -1109,6 +1138,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                 lease: lease.clone(),
             },
         );
+        if let Some(notice) = degraded_notice {
+            self.publish_next(session_id, &notice);
+        }
         drop(workers);
         if respawn {
             lock_recover(&self.respawned_in_place).insert(session_id.to_owned());
@@ -1538,6 +1570,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                 Some(reservation.registry_deadline),
                 Some(reservation.lease().clone()),
                 claude_home,
+                record.proxy.clone(),
+                record.degraded.is_some(),
             ),
         )
         .await;
@@ -1590,6 +1624,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             super::ConstructionFinish::new(WorkerKind::Attached, context_reset, None, false),
         )
         .await?;
+        if let Some(name) = &record.degraded {
+            self.publish_next(&session_id, &proxy_degraded_notice(name));
+        }
         info!(
             target: "acp.supervisor",
             session = %session_id,
@@ -1598,6 +1635,72 @@ impl<S: BroadcastSink> Supervisor<S> {
             "reattached to existing structured view worker"
         );
         Ok(())
+    }
+}
+
+/// Whether a launch failure comes from a proxy that never produced a valid hello. A launch
+/// that returned an error never reached `session/new` or `session/load`.
+fn is_proxy_failure(err: &AcpError) -> bool {
+    match err {
+        AcpError::IncompatibleAgent(error) => {
+            matches!(error.detail, StartupErrorDetail::InvalidProxyHello { .. })
+        }
+        AcpError::Spawn(_)
+        | AcpError::Transport(_)
+        | AcpError::Protocol(_)
+        | AcpError::AgentExited => true,
+        _ => false,
+    }
+}
+
+/// Whether a launch failure is the adapter binary's incompatibility; a proxy's invalid hello is not.
+pub(super) fn blames_adapter_binary(err: &AcpError) -> bool {
+    match err {
+        AcpError::IncompatibleAgent(error) => {
+            !matches!(error.detail, StartupErrorDetail::InvalidProxyHello { .. })
+        }
+        _ => false,
+    }
+}
+
+/// Retire a `neutral_boot` proxy's failed runner so the launch can run once more without
+/// it. `Some` names the dropped proxy; `None` leaves the failure to the ordinary path.
+pub(super) async fn neutral_boot_fallback(
+    lifecycle: &std::sync::Mutex<LifecycleTable>,
+    process_control: &dyn ProcessControl,
+    lease: &Lease,
+    config: &SpawnConfig,
+    err: &AcpError,
+) -> Option<String> {
+    let proxy = config
+        .proxy
+        .as_ref()
+        .filter(|proxy| proxy.failure_policy == ProxyFailurePolicy::NeutralBoot)?;
+    if !is_proxy_failure(err) || lock_recover(lifecycle).cancel_requested(lease).is_some() {
+        return None;
+    }
+    warn!(
+        target: "acp.supervisor",
+        session = %lease.session_id(),
+        plugin = %proxy.plugin_id,
+        error = %err,
+        "plugin proxy failed before a valid hello; relaunching without it"
+    );
+    let settled = super::teardown::tear_down_lease(process_control, lease, false).await;
+    if settled != crate::acp::runner_lifecycle::Settlement::Proven {
+        return None;
+    }
+    lease.release_torn_down_runner();
+    Some(proxy.display_name.clone())
+}
+
+/// Keyed, so every re-assertion replaces the same notice.
+pub(super) fn proxy_degraded_notice(display_name: &str) -> Event {
+    Event::SessionNotice {
+        severity: "warning".into(),
+        title: format!("{display_name} features unavailable"),
+        description: Some("The plugin proxy failed to start; the agent runs without it.".into()),
+        key: Some(PROXY_DEGRADED_NOTICE_KEY.into()),
     }
 }
 
@@ -6152,5 +6255,258 @@ time.sleep(60)
             );
             assert!(worker_registry::is_record_live(&replacement.record));
         }
+    }
+
+    fn proxy_spec(policy: ProxyFailurePolicy) -> crate::acp::acp_client::ProxySpec {
+        crate::acp::acp_client::ProxySpec {
+            plugin_id: "fake".into(),
+            command: "/bin/proxy".into(),
+            args: Vec::new(),
+            failure_policy: policy,
+            display_name: "Fake".into(),
+            compat: Default::default(),
+        }
+    }
+
+    fn bad_hello() -> AcpError {
+        let detail = StartupErrorDetail::InvalidProxyHello {
+            reason: "no hello".into(),
+        };
+        AcpError::IncompatibleAgent(Box::new(crate::acp::acp_client::IncompatibleAgentError {
+            message: detail.user_message(),
+            detail,
+        }))
+    }
+
+    /// Failed launches own a runner (pid 4400 + launch number), as a real one does by the
+    /// time its hello fails; `signals_at_launch` holds the signals sent before each launch.
+    #[derive(Default)]
+    struct ProxyHarness {
+        control: Arc<FakeProcessControl>,
+        signals_at_launch: Arc<std::sync::Mutex<Vec<Vec<(u32, &'static str)>>>>,
+    }
+
+    impl ProxyHarness {
+        /// Spawn `session` with a proxy under `policy`; each launch pops its outcome from
+        /// `outcomes`, and every config the launcher sees is recorded.
+        async fn spawn(
+            &self,
+            session: &str,
+            policy: ProxyFailurePolicy,
+            outcomes: Vec<Result<(), AcpError>>,
+        ) -> (Result<(), SupervisorError>, Vec<SpawnConfig>, Vec<Event>) {
+            let (_home, _tmp) = isolate_home();
+            let (sink, store, _rx, _store_tmp) = channel_sink();
+            let seen: Arc<std::sync::Mutex<Vec<SpawnConfig>>> = Default::default();
+            let outcomes = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                outcomes,
+            )));
+            let launcher: super::super::Launcher = {
+                let seen = seen.clone();
+                let control = self.control.clone();
+                let signals_at_launch = self.signals_at_launch.clone();
+                Arc::new(move |config: SpawnConfig, session_id| {
+                    let launch = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(config.clone());
+                        seen.len() as u32
+                    };
+                    signals_at_launch.lock().unwrap().push(control.signals());
+                    let outcome = outcomes.lock().unwrap().pop_front().expect("outcome");
+                    let control = control.clone();
+                    Box::pin(async move {
+                        if let Err(err) = outcome {
+                            let pid = 4400 + launch;
+                            let lease = config
+                                .launch_lease
+                                .as_ref()
+                                .expect("supervisor retains its producer lease");
+                            lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
+                            assert!(
+                                lease.record_runner(attested_test_identity(pid, config.generation))
+                            );
+                            save_attested_test_record(&session_id.0, pid, config.generation);
+                            control.alive(pid);
+                            return Err(err);
+                        }
+                        save_record(&session_id.0, 4345, config.generation);
+                        let (client, _tx) = AcpClient::fake_for_test(session_id);
+                        Ok(client.with_runner_pid(4345))
+                    })
+                })
+            };
+            self.control.alive(4345);
+            let sup = Supervisor::new(sink)
+                .with_process_control(self.control.clone())
+                .with_launcher(launcher);
+            let mut request = spawn_request(session);
+            request.proxy = Some(proxy_spec(policy));
+            let result = sup
+                .spawn(
+                    request,
+                    crate::process::worker_registry::ResumeAuthority::Explicit,
+                )
+                .await;
+            let events = store
+                .replay_from(session, 0)
+                .into_iter()
+                .map(|(_, event)| event)
+                .collect();
+            let _ = sup.shutdown(session).await;
+            let configs = seen.lock().unwrap().clone();
+            (result, configs, events)
+        }
+    }
+
+    async fn spawn_with_proxy(
+        session: &str,
+        policy: ProxyFailurePolicy,
+        outcomes: Vec<Result<(), AcpError>>,
+    ) -> (Result<(), SupervisorError>, Vec<SpawnConfig>, Vec<Event>) {
+        ProxyHarness::default()
+            .spawn(session, policy, outcomes)
+            .await
+    }
+
+    fn degraded_notices(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::SessionNotice { title, key, .. }
+                    if key.as_deref() == Some(PROXY_DEGRADED_NOTICE_KEY) =>
+                {
+                    Some(title.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn refuse_fails_the_start_with_the_hello_error_and_never_relaunches() {
+        let (result, configs, events) = spawn_with_proxy(
+            "s-refuse",
+            ProxyFailurePolicy::Refuse,
+            vec![Err(bad_hello())],
+        )
+        .await;
+        match result {
+            Err(SupervisorError::Acp(AcpError::IncompatibleAgent(error))) => assert!(matches!(
+                error.detail,
+                StartupErrorDetail::InvalidProxyHello { .. }
+            )),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(configs.len(), 1);
+        assert!(degraded_notices(&events).is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn neutral_boot_relaunches_once_raw_and_posts_a_notice() {
+        let harness = ProxyHarness::default();
+        let (result, configs, events) = harness
+            .spawn(
+                "s-neutral",
+                ProxyFailurePolicy::NeutralBoot,
+                vec![Err(bad_hello()), Ok(())],
+            )
+            .await;
+        result.expect("the raw relaunch succeeds");
+        assert_eq!(configs.len(), 2);
+        assert!(configs[0].proxy.is_some() && configs[0].degraded.is_none());
+        assert!(configs[1].proxy.is_none());
+        assert_eq!(configs[1].degraded.as_deref(), Some("Fake"));
+        assert_eq!(degraded_notices(&events), ["Fake features unavailable"]);
+        let at_launch = harness.signals_at_launch.lock().unwrap();
+        assert!(at_launch[0].is_empty());
+        assert!(
+            at_launch[1].iter().any(|(pid, _)| *pid == 4401),
+            "the failed proxy runner is retired before the raw relaunch: {:?}",
+            at_launch[1]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn neutral_boot_does_not_relaunch_over_a_runner_it_cannot_retire() {
+        let harness = ProxyHarness::default();
+        harness.control.immortal(4401);
+        let (result, configs, events) = harness
+            .spawn(
+                "s-neutral-stuck",
+                ProxyFailurePolicy::NeutralBoot,
+                vec![Err(bad_hello()), Ok(())],
+            )
+            .await;
+        assert!(matches!(result, Err(SupervisorError::Acp(_))));
+        assert_eq!(configs.len(), 1, "an unsettled runner blocks the relaunch");
+        assert!(degraded_notices(&events).is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn neutral_boot_falls_back_at_most_once() {
+        let (result, configs, events) = spawn_with_proxy(
+            "s-neutral-twice",
+            ProxyFailurePolicy::NeutralBoot,
+            vec![Err(bad_hello()), Err(bad_hello())],
+        )
+        .await;
+        assert!(matches!(result, Err(SupervisorError::Acp(_))));
+        assert_eq!(configs.len(), 2);
+        assert!(degraded_notices(&events).is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn neutral_boot_ignores_failures_the_proxy_did_not_cause() {
+        let (result, configs, _) = spawn_with_proxy(
+            "s-neutral-path",
+            ProxyFailurePolicy::NeutralBoot,
+            vec![Err(AcpError::ProjectPathMissing {
+                path: "/gone".into(),
+            })],
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SupervisorError::Acp(AcpError::ProjectPathMissing { .. }))
+        ));
+        assert_eq!(configs.len(), 1);
+
+        let (result, configs, events) = spawn_with_proxy(
+            "s-neutral-config",
+            ProxyFailurePolicy::NeutralBoot,
+            vec![Err(AcpError::ProxyLaunchConfig("disk full".into()))],
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(SupervisorError::Acp(AcpError::ProxyLaunchConfig(_)))
+        ));
+        assert_eq!(
+            configs.len(),
+            1,
+            "a config write failure is not the proxy's"
+        );
+        assert!(degraded_notices(&events).is_empty());
+    }
+
+    #[test]
+    fn a_proxy_hello_fault_does_not_blame_the_adapter_binary() {
+        assert!(!blames_adapter_binary(&bad_hello()));
+        let detail = StartupErrorDetail::MissingAgentInfo {
+            expected_package: "claude-agent-acp".into(),
+            install_command: "npm i".into(),
+            auto_install: false,
+        };
+        let adapter =
+            AcpError::IncompatibleAgent(Box::new(crate::acp::acp_client::IncompatibleAgentError {
+                message: detail.user_message(),
+                detail,
+            }));
+        assert!(blames_adapter_binary(&adapter));
     }
 }

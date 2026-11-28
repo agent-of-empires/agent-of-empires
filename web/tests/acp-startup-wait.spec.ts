@@ -161,7 +161,6 @@ test("a running Session assigned only before the replay tail shows no startup li
   const mock = await mockAcpSession(page, {
     title: "story-assigned-before-tail",
     workerState: "running",
-    sessionFields: { clear_aliases: ["/clear"], compact_aliases: ["/compact"] },
     initialEvents: [
       { AcpSessionAssigned: { acp_session_id: "acp-after-new" } },
       { PromptCapabilities: { image: true, audio: false, embedded_context: true, steering: true } },

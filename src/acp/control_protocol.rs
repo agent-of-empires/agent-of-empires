@@ -158,7 +158,14 @@ pub enum ControlBody {
         acp_session_id: String,
         result: serde_json::Value,
         native_channel: NativeChannelAvailability,
+        /// `_meta.aoe` adapter frames the agent has sent that this connection
+        /// will not receive again: the runner counts every one, and the
+        /// backlog it still holds is replayed after this frame.
+        adapter_frames: u64,
     },
+    /// Adapter frames the runner shed from a full queue. They stay numbered by
+    /// the proxy, so the daemon counts them in the position they held.
+    AdapterFramesShed { count: u64 },
     /// The runner-owned handshake failed (agent incompatible, `session/new`
     /// error, transport failure).
     HandshakeFailed {
@@ -400,7 +407,9 @@ mod tests {
                 acp_session_id: "sess-1".into(),
                 result: serde_json::json!({"sessionId": "sess-1"}),
                 native_channel: crate::acp::control_protocol::NativeChannelAvailability::Available,
+                adapter_frames: 0,
             },
+            ControlBody::AdapterFramesShed { count: 3 },
             ControlBody::ResumeSession,
             ControlBody::HandshakeFailed {
                 method: "initialize".into(),

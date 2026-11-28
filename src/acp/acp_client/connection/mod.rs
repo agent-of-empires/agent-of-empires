@@ -14,11 +14,29 @@ mod subagents;
 #[cfg(test)]
 mod tests;
 
+use super::commands::{ClientCmd, ConnectMode};
+use super::control::DaemonControlClient;
+use super::errors::{acp_internal_error, AcpError};
+use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
+use super::pending::PendingResponders;
+use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
+use super::rate_limit::{captured_rate_limit_reset, classify_rate_limit_error};
+use super::session_identity::{
+    spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress,
+    SessionIngressNotification,
+};
+use super::spawn::ProxySpec;
+use super::terminal_handlers::{
+    handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
+    handle_wait_for_terminal_exit,
+};
+use super::{SessionResources, SessionState};
 use crate::acp::agent_compat::ExpectedAgent;
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::control_protocol::PromptCompletedMarker;
 use crate::acp::state::{
-    AcpConnectionCause, AcpConnectionPhase, AcpConnectionSource, AcpConnectionUnavailability, Event,
+    AcpConnectionCause, AcpConnectionPhase, AcpConnectionSource, AcpConnectionUnavailability,
+    Event, IntegrationLostReason,
 };
 use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
@@ -31,30 +49,13 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::{ConnectionTo, Responder};
 use agent_client_protocol::{Agent, ByteStreams, Client};
+use notifications::Shared;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{error, info, warn};
-
-use super::commands::{ClientCmd, ConnectMode};
-use super::control::DaemonControlClient;
-use super::errors::{acp_internal_error, AcpError};
-use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
-use super::pending::PendingResponders;
-use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
-use super::rate_limit::{captured_rate_limit_reset, classify_rate_limit_error};
-use super::session_identity::{
-    spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress,
-    SessionIngressNotification,
-};
-use super::terminal_handlers::{
-    handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
-    handle_wait_for_terminal_exit,
-};
-use super::{SessionResources, SessionState};
-use notifications::Shared;
 
 /// After a cancel, declare the adapter unresponsive if no prompt response
 /// arrives. A transport-wedge defense even for adapters that cancel promptly.
@@ -269,6 +270,7 @@ pub(super) struct ConnectionParams {
     pub(super) ready_tx: oneshot::Sender<Result<(), AcpError>>,
     pub(super) profile: &'static AgentProfile,
     pub(super) expected_agent: ExpectedAgent,
+    pub(super) proxy: Option<ProxySpec>,
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
     pub(super) default_model_config: std::collections::BTreeMap<String, String>,
@@ -481,6 +483,7 @@ pub(super) async fn run_connection_task<W, R>(
         ready_tx,
         profile,
         expected_agent,
+        proxy,
         source_profile,
         default_effort,
         default_model_config,
@@ -534,8 +537,7 @@ pub(super) async fn run_connection_task<W, R>(
         .v1()
         .name("aoe-acp")
         .on_close({
-            let control = control.clone();
-            let shared = shared.clone();
+            let (control, shared) = (control.clone(), shared.clone());
             move |_connection| async move {
                 shared
                     .connection_state
@@ -609,6 +611,11 @@ pub(super) async fn run_connection_task<W, R>(
                                 shared
                                     .handle_ingress_marker(PendingIngress::Auth(status))
                                     .await?;
+                                return Ok(());
+                            }
+                            SessionIngressNotification::AdapterFramesShed(count) => {
+                                shared.ingress.skip_adapter_frames(count);
+                                shared.settle_discarded().await;
                                 return Ok(());
                             }
                             SessionIngressNotification::Update(params) => params,
@@ -788,6 +795,7 @@ pub(super) async fn run_connection_task<W, R>(
         ready_tx: ready_tx.clone(),
         mode,
         expected_agent,
+        proxy,
         mcp_servers,
         default_effort,
         default_model_config,
@@ -845,14 +853,19 @@ pub(super) async fn run_connection_task<W, R>(
                 && !foreground_cancellation.is_cancelled()
             {
                 if let Some(observation) = foreground_state.loss() {
-                    if let Some(tx) = foreground_ready.lock().await.take() {
-                        let _ = tx.send(Err(AcpError::ConnectionUnavailable(observation)));
+                    let proxy_exited = direct_proxy_exited(&foreground_shared);
+                    if !proxy_exited {
+                        if let Some(tx) = foreground_ready.lock().await.take() {
+                            let _ = tx.send(Err(AcpError::ConnectionUnavailable(observation)));
+                        }
                     }
                     // Earlier responses and buffered markers get their
                     // ordered boundary before the failed establish unwinds.
                     foreground_state.wait_ordered_unavailable().await;
                     foreground_shared.finish_unavailable_ingress().await;
-                    foreground_shared.publish_connection_unavailable().await;
+                    if !proxy_exited {
+                        foreground_shared.publish_connection_unavailable().await;
+                    }
                     if observation.source == AcpConnectionSource::Native
                         && !foreground_state.sdk_is_closing()
                     {
@@ -880,8 +893,10 @@ pub(super) async fn run_connection_task<W, R>(
         biased;
         result = &mut connection => result,
         observation = connection_state.wait_unavailable() => {
-            if let Some(tx) = ready_tx.lock().await.take() {
-                let _ = tx.send(Err(AcpError::ConnectionUnavailable(observation)));
+            if !direct_proxy_exited(&shared) {
+                if let Some(tx) = ready_tx.lock().await.take() {
+                    let _ = tx.send(Err(AcpError::ConnectionUnavailable(observation)));
+                }
             }
             // Install owned-unavailable state even if foreground event/replay
             // backpressure prevented its early handshake reply.
@@ -949,6 +964,10 @@ pub(super) async fn run_connection_task<W, R>(
     }
 }
 
+fn direct_proxy_exited(shared: &Shared) -> bool {
+    shared.control.is_none() && shared.connection_state.sdk_is_closing() && shared.aoe.is_proxied()
+}
+
 async fn report_connection_error(
     e: &agent_client_protocol::Error,
     shared: &Shared,
@@ -963,6 +982,20 @@ async fn report_connection_error(
         "ACP connection task ended with error: {:?}", e
     );
     if control_lost {
+        return;
+    }
+    if direct_proxy_exited(shared) {
+        // A validated proxy already owns this launch. Losing it must not turn
+        // into a launch failure that could retry with the raw agent.
+        if let Some(tx) = ready_tx.lock().await.take() {
+            let _ = tx.send(Ok(()));
+        }
+        shared.finish_unavailable_ingress().await;
+        let _ = event_tx
+            .send(Event::IntegrationLost {
+                reason: IntegrationLostReason::ProxyExited,
+            })
+            .await;
         return;
     }
     if shared.connection_state.loss().is_none()
@@ -988,7 +1021,8 @@ async fn report_connection_error(
     let now = crate::time::Timestamp::now();
     let captured = captured_rate_limit_reset(&shared.rate_limit_rejections, now);
     let rate_limit = classify_rate_limit_error(e, captured.as_ref(), now);
-    if let Some(tx) = ready_tx.lock().await.take() {
+    let pending_ready = ready_tx.lock().await.take();
+    if let Some(tx) = pending_ready {
         // A handshake-time limit fails the spawn as rate-limited so the
         // supervisor parks instead of burning respawn budget (#3514).
         let err = match rate_limit {

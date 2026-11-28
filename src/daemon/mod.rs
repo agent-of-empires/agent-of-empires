@@ -2350,7 +2350,6 @@ mod tests {
         for status in [200, 202] {
             let row = crate::server::api::sessions::session_response_from_instance(
                 &crate::session::Instance::new("named", "/tmp/named"),
-                false,
             );
             let app = axum::Router::new().route(
                 "/api/sessions/{id}/smart-rename",

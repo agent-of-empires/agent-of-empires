@@ -219,6 +219,11 @@ impl Session {
             shared.terminal_claim.begin_turn();
             shared.between_prompt.reset_for_prompt();
             clear_captured_rejections(&shared.rate_limit_rejections);
+            shared
+                .agent_turn_text
+                .lock()
+                .expect("agent turn text mutex poisoned")
+                .disqualify();
             *shared.cancel_deadline.lock().unwrap() = None;
             info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
             // Bump the epoch before sending so envelopes from a handler parked on

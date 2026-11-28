@@ -3,6 +3,7 @@
 //! a matcher; the highest matching priority wins. The hook file is a rule too.
 
 mod adapter;
+mod input_line;
 mod manifest;
 mod omp;
 mod region;
@@ -13,6 +14,7 @@ use std::sync::LazyLock;
 use crate::session::Status;
 use adapter::Adapter;
 pub use adapter::{CapturePolicy, CaptureScope};
+pub use input_line::InputLine;
 pub use manifest::HookObservation;
 use manifest::Manifest;
 use region::Rows;
@@ -184,6 +186,19 @@ pub(super) fn plain_capture_policy() -> CapturePolicy {
 
 pub fn has_manifest(agent: &str) -> bool {
     detector(agent).is_some()
+}
+
+pub fn has_input_line(agent: &str) -> bool {
+    detector(agent).is_some_and(|d| d.manifest.input_line.is_some())
+}
+
+/// What a coloured capture shows on the agent's input line; `Unknown` for an agent whose
+/// manifest has no `[input_line]` table.
+pub fn input_line(agent: &str, capture: &str) -> InputLine {
+    match detector(agent).and_then(|d| d.manifest.input_line.as_ref()) {
+        Some(prompt) => input_line::classify(prompt, capture),
+        None => InputLine::Unknown,
+    }
 }
 
 /// Evaluate an agent manifest over an ANSI-stripped capture.

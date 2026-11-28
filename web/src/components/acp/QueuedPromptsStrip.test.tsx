@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import { profileFor } from "../../lib/__tests__/agentProfileFixtures";
 import type { QueuedPrompt } from "../../lib/acpTypes";
 import { QueuedPromptsStrip } from "./PromptStrips";
 import type { QueuedReason } from "./queuedReason";
@@ -14,14 +15,6 @@ afterEach(() => {
 function mk(id: string, text: string): QueuedPrompt {
   return { id, text, queuedAt: "2026-05-21T00:00:00.000Z" };
 }
-
-// Server-owned clear aliases per agent, as `SessionResponse.clear_aliases` resolves them.
-const SERVER_CLEAR_ALIASES: Record<string, string[]> = {
-  claude: ["/clear"],
-  codex: ["/new"],
-  gemini: [],
-};
-const SERVER_COMPACT_ALIASES: Record<string, string[]> = { claude: ["/compact"] };
 
 const IDLE: QueuedReason = { label: "Queued", reason: null, action: "send", soloAction: "send" };
 
@@ -38,8 +31,9 @@ function renderWithProfile(
     blockedReason?: string;
   } = {},
 ) {
+  const profile = profileFor(toolKey);
   return render(
-    <AgentProfileProvider toolKey={toolKey} clearAliases={SERVER_CLEAR_ALIASES[toolKey] ?? []}>
+    <AgentProfileProvider profile={profile}>
       <QueuedPromptsStrip
         queued={queued}
         onRemove={() => {}}
@@ -50,7 +44,7 @@ function renderWithProfile(
         onStartAndSend={opts.onStartAndSend}
         onStopTurn={opts.onStopTurn}
         reason={opts.reason ?? IDLE}
-        soloAliases={[...(SERVER_CLEAR_ALIASES[toolKey] ?? []), ...(SERVER_COMPACT_ALIASES[toolKey] ?? [])]}
+        soloAliases={[...profile.clear_aliases, ...profile.compact_aliases]}
         agent={opts.agent ?? "Claude Code"}
         blockedReason={opts.blockedReason}
       />

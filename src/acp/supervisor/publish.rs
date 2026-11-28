@@ -164,6 +164,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         reason: &str,
         expected_seq: u64,
     ) -> bool {
+        self.publish_if_seq(
+            session_id,
+            &Event::Stopped {
+                reason: reason.to_string(),
+            },
+            expected_seq,
+        )
+    }
+
+    /// [`Self::publish_stopped_if_seq`] for any event. True only once the
+    /// event is stored.
+    pub fn publish_if_seq(&self, session_id: &str, event: &Event, expected_seq: u64) -> bool {
         let counter = super::session_seq(&self.next_seqs, session_id);
         let persisted = super::sink::blocking_io(|| {
             let mut last = super::lock_recover(&counter);
@@ -171,20 +183,13 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return None;
             }
             *last = last.saturating_add(1);
-            Some(self.sink.queue_persisted(
-                session_id,
-                *last,
-                &Event::Stopped {
-                    reason: reason.to_string(),
-                },
-            ))
+            Some(self.sink.queue_persisted(session_id, *last, event))
         });
         let Some(persisted) = persisted else {
             return false;
         };
         // A failed save is already broadcast as an AgentStartupError.
-        persisted.wait();
-        true
+        persisted.wait()
     }
 
     pub fn publish_agent_switched(
@@ -277,7 +282,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             classified_as,
         } = prompt;
         // Before any await or store, so an idle stop cannot claim the worker in between.
-        super::lock_recover(&self.lifecycle).note_admission(session_id);
+        let _admission = super::lock_recover(&self.lifecycle).note_admission(session_id);
         let profile = match classified_as {
             Some(profile) => profile,
             None => self.profile_for_session(session_id, &text).await,
@@ -344,7 +349,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         comments: Vec<crate::acp::state::DiffComment>,
         assembled_markdown: String,
     ) {
-        super::lock_recover(&self.lifecycle).note_admission(session_id);
+        let _admission = super::lock_recover(&self.lifecycle).note_admission(session_id);
         self.publish_next(
             session_id,
             &Event::UserDiffCommentsPrompt {
@@ -765,6 +770,20 @@ mod tests {
 
         sup.forget_session("s-1").unwrap();
         assert_eq!(publish_with_next_seq(&sup.next_seqs, "s-1", |seq| seq), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_if_seq_is_false_when_the_save_fails() {
+        struct FailingSink;
+        impl BroadcastSink for FailingSink {
+            fn publish(&self, _: &str, _: u64, _: &Event) {}
+            fn publish_persisted(&self, _: &str, _: u64, _: &Event) -> bool {
+                false
+            }
+        }
+        let sup = Supervisor::new(std::sync::Arc::new(FailingSink));
+        sup.hydrate_seqs([("s-1".to_string(), 7)]);
+        assert!(!sup.publish_stopped_if_seq("s-1", "rate_limited", 7));
     }
 
     #[tokio::test]

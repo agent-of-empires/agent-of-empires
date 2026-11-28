@@ -195,7 +195,21 @@ pub async fn spawn_runner_with_shim(
     session_id: &str,
     env: &[(&str, String)],
 ) -> (PathBuf, RunnerGuard) {
-    let node = shim_node().expect("shim prerequisite");
+    let shim = [
+        shim_node().expect("shim prerequisite").to_str().unwrap(),
+        shim_path().to_str().unwrap(),
+    ]
+    .map(String::from);
+    spawn_runner(session_id, env, &shim).await
+}
+
+/// As [`spawn_runner_with_shim`], with `agent_argv` as everything after `--`.
+#[cfg(debug_assertions)]
+pub async fn spawn_runner(
+    session_id: &str,
+    env: &[(&str, String)],
+    agent_argv: &[String],
+) -> (PathBuf, RunnerGuard) {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let xdg = temp.path().join("xdg");
@@ -222,9 +236,8 @@ pub async fn spawn_runner_with_shim(
         "--cwd",
         home.to_str().unwrap(),
         "--",
-        node.to_str().unwrap(),
-        shim_path().to_str().unwrap(),
     ])
+    .args(agent_argv)
     .env("HOME", &home)
     .env("XDG_CONFIG_HOME", &xdg)
     .kill_on_drop(true);
@@ -431,7 +444,7 @@ async fn expect_frame(
 }
 
 #[cfg(debug_assertions)]
-/// Dropping this kills the runner, which takes the shim with it.
+/// Dropping this kills the runner, which takes its agent with it.
 pub struct RunnerGuard {
     _child: tokio::process::Child,
     _env: EnvGuard,
@@ -462,4 +475,163 @@ pub fn wait_for_port(port: u16, deadline: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     false
+}
+
+#[cfg(debug_assertions)]
+mod tests {
+    use super::*;
+    use agent_of_empires::acp::control_protocol::{self, ControlBody, CONTROL_PROTOCOL_VERSION};
+    use tokio::net::UnixListener;
+
+    enum Peer {
+        Completes,
+        Stalls,
+        OpensWith(ControlBody),
+    }
+
+    async fn fake_runner(listener: UnixListener, peer: Peer) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let hello = ControlBody::Hello {
+            control_protocol_version: CONTROL_PROTOCOL_VERSION,
+            session_id: "s".into(),
+        };
+        let notify = ControlBody::Notify {
+            method: "session/update".into(),
+            params: serde_json::json!({}),
+        };
+        let mut script = match peer {
+            Peer::Stalls => return std::future::pending().await,
+            Peer::OpensWith(frame) => vec![(0, frame)],
+            // (frames to read first, frame to send)
+            Peer::Completes => vec![
+                (0, hello),
+                (2, notify.clone()),
+                (
+                    0,
+                    ControlBody::Initialized {
+                        result: serde_json::json!({}),
+                    },
+                ),
+                (1, notify),
+                (
+                    0,
+                    ControlBody::SessionReady {
+                        acp_session_id: "acp".into(),
+                        result: serde_json::json!({}),
+                        native_channel: control_protocol::NativeChannelAvailability::Available,
+                        adapter_frames: 0,
+                    },
+                ),
+            ],
+        };
+        for (reads, frame) in script.drain(..) {
+            for _ in 0..reads {
+                control_protocol::read_frame(&mut stream)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            control_protocol::write_frame(&mut stream, &frame)
+                .await
+                .unwrap();
+        }
+        // Hold the connection open, as a runner does.
+        std::future::pending::<()>().await;
+    }
+
+    async fn bootstrap(
+        control: &Path,
+        within: Duration,
+        exited: impl FnMut() -> Option<String>,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + within;
+        let bootstrap = bootstrap_runner(
+            control,
+            deadline,
+            exited,
+            "session/new",
+            serde_json::json!({}),
+        );
+        // A regression that loses the deadline fails here instead of hanging the suite.
+        tokio::time::timeout(within + Duration::from_secs(5), bootstrap)
+            .await
+            .expect("bootstrap overran its own deadline")
+    }
+
+    #[tokio::test]
+    async fn bootstrap_waits_for_a_runner_that_listens_after_creating_its_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = temp.path().join("c.sock");
+        // A socket file nobody listens on refuses connections, as a runner
+        // between bind and listen does.
+        drop(std::os::unix::net::UnixListener::bind(&control).unwrap());
+        let mut checks = 0;
+        let exited = || {
+            checks += 1;
+            // Listen only after at least one connect attempt was refused.
+            if checks == 2 {
+                std::fs::remove_file(&control).unwrap();
+                let listener = UnixListener::bind(&control).unwrap();
+                tokio::spawn(fake_runner(listener, Peer::Completes));
+            }
+            None
+        };
+        bootstrap(&control, Duration::from_secs(10), exited)
+            .await
+            .unwrap();
+        assert!(checks >= 2, "{checks}");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_failures_name_their_stage() {
+        // (runner, budget, error starts with)
+        let cases = [
+            // Exits before it ever binds.
+            (
+                None,
+                Duration::from_secs(10),
+                "the runner exited (exit status: 3)",
+            ),
+            // Connected, then never says Hello: the budget covers the handshake too.
+            (
+                Some(Peer::Stalls),
+                Duration::from_millis(300),
+                "timed out waiting for Hello",
+            ),
+            // A protocol error fails at once rather than at the deadline.
+            (
+                Some(Peer::OpensWith(ControlBody::Initialized {
+                    result: serde_json::json!({}),
+                })),
+                Duration::from_secs(10),
+                "expected Hello, got Some(Initialized",
+            ),
+            // A runner says Hello before anything else, notifications included.
+            (
+                Some(Peer::OpensWith(ControlBody::Notify {
+                    method: "session/update".into(),
+                    params: serde_json::json!({}),
+                })),
+                Duration::from_secs(10),
+                "expected Hello, got Some(Notify",
+            ),
+        ];
+        for (peer, within, want) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let control = temp.path().join("c.sock");
+            let has_peer = peer.is_some();
+            let runner = peer
+                .map(|peer| tokio::spawn(fake_runner(UnixListener::bind(&control).unwrap(), peer)));
+            let mut checks = 0;
+            let exited = || {
+                checks += 1;
+                (!has_peer && checks == 2).then(|| "exit status: 3".to_string())
+            };
+            let error = bootstrap(&control, within, exited).await.unwrap_err();
+            assert!(error.starts_with(want), "{want}: {error}");
+            if let Some(runner) = runner {
+                runner.abort();
+            }
+        }
+    }
 }

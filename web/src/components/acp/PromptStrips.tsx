@@ -4,7 +4,7 @@ import { AlertTriangle, Check, Clock, Info, Paperclip, RotateCcw, SendHorizontal
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import type { QueuedPrompt, RejectedPrompt, SessionNotice } from "../../lib/acpTypes";
 import { useAcpPrefs } from "../../lib/acpPrefs";
-import { isClearAlias } from "../../lib/agentProfiles";
+import { isClearAlias } from "../../lib/agentProfile";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import type { QueuedAction, QueuedReason } from "./queuedReason";
 import { TRANSCRIPT_COLUMN } from "./transcriptColumn";

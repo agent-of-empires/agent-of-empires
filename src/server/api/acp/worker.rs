@@ -1164,6 +1164,7 @@ pub async fn switch_acp_agent(
         prior_conversation: false,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
         claude_store_pin: None,
+        proxy: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };
     if let Some(resp) = refuse_if_stored_row_shelved(&state, &instance).await {

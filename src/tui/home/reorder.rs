@@ -1,6 +1,6 @@
 //! Manual row ordering for the home list: move the cursor's session within its group, or its
 //! group among the group's siblings. Only meaningful under [`SortOrder::Custom`] and
-//! [`GroupByMode::Manual`], where the rows carry the user's own grouping and nothing
+//! [`GroupByMode::Group`], where the rows carry the user's own grouping and nothing
 //! recomputes their order behind them.
 
 use super::*;
@@ -13,11 +13,11 @@ impl HomeView {
     /// list is not showing.
     pub(super) fn move_row_at_cursor(&mut self, delta: isize) -> anyhow::Result<()> {
         if self.sort_order != SortOrder::Custom {
-            self.flash_status("Press o for the Custom sort to arrange rows by hand");
+            self.flash_status("Pick the Custom sort (o) to arrange rows by hand");
             return Ok(());
         }
-        if self.group_by != GroupByMode::Manual {
-            self.flash_status("Rows are arranged by hand in Manual grouping only (g)");
+        if self.group_by != GroupByMode::Group {
+            self.flash_status("Rows are arranged by hand under Groups only (g)");
             return Ok(());
         }
         if let Some(path) = self.selected_group.clone() {
@@ -221,7 +221,7 @@ mod tests {
         .unwrap();
         apply_published(&mut view, &state).await;
         view.sort_order = SortOrder::Custom;
-        view.group_by = GroupByMode::Manual;
+        view.group_by = GroupByMode::Group;
         view.flat_items = view.build_flat_items();
         if group {
             view.cursor = view

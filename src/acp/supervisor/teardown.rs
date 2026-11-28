@@ -1437,7 +1437,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         fence: &StopFence<'_>,
     ) -> Result<Option<Lease>, SupervisorError> {
         // Native revision/reload happens before either global map is acquired.
-        let _native = if let Some(observed) = fence.observed {
+        let _native = if let (Some(observed), Some(stamp)) = (fence.observed, fence.dormancy_stamp)
+        {
             let scope = observed
                 .native_scope()
                 .ok()
@@ -1447,8 +1448,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 scope
                     .fence
                     .try_lock_observation_matching(|row| {
-                        row.idle_dormant_since == fence.dormancy_stamp
-                            && row.idle_dormant_since.is_some()
+                        row.idle_dormant_since == Some(stamp)
                             && row.queued_prompts.is_empty()
                             && row.ensure_startable().is_ok()
                             && row.is_structured()
@@ -1499,10 +1499,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
         if let Some(observed) = fence.observed {
             let current = lifecycle.running(session_id).map(|(lease, _)| lease);
-            let activity = super::try_activity_seq(&self.next_seqs, session_id)
-                .ok_or(SupervisorError::RegistryBusy)?;
+            let activity_changed = if let Some(expected) = fence.activity_seq {
+                super::try_activity_seq(&self.next_seqs, session_id)
+                    .ok_or(SupervisorError::RegistryBusy)?
+                    != expected
+            } else {
+                false
+            };
             if current.as_ref() != Some(observed)
-                || fence.activity_seq != Some(activity)
+                || activity_changed
                 || fence.admissions != Some(observed.admissions())
                 || registry
                     .stop()
@@ -2012,6 +2017,28 @@ impl<S: BroadcastSink> Supervisor<S> {
             expected,
             fence,
             true,
+        )
+        .await
+    }
+
+    /// Stop the observed epoch of a worker whose turn ended on a usage limit;
+    /// its closing `Stopped` is `rate_limited`, so the park stands.
+    pub(crate) async fn shutdown_rate_limited(
+        &self,
+        session_id: &str,
+        observed: (&Lease, u64),
+    ) -> Result<(), SupervisorError> {
+        self.shutdown_with_reason(
+            session_id,
+            "rate_limited",
+            false,
+            None,
+            StopFence {
+                observed: Some(observed.0),
+                admissions: Some(observed.1),
+                preserve_restart: true,
+                ..StopFence::default()
+            },
         )
         .await
     }

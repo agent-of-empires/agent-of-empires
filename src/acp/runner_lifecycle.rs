@@ -159,6 +159,8 @@ struct Construction {
     admissions: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     child_wait_completed: tokio::sync::watch::Sender<Option<bool>>,
+    /// Admitted prompts whose publication has not settled yet.
+    unsettled_admissions: std::sync::atomic::AtomicU64,
     /// A rate limit rejecting this launch belongs to its caller, which reads it from the error.
     defers_rate_limit_rejection: std::sync::atomic::AtomicBool,
 }
@@ -190,6 +192,7 @@ impl Default for Construction {
             #[cfg(test)]
             child_wait_completed: tokio::sync::watch::channel(None).0,
             defers_rate_limit_rejection: std::sync::atomic::AtomicBool::new(false),
+            unsettled_admissions: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -218,6 +221,17 @@ pub(crate) struct AdapterRetirementRoute {
     pub(crate) retired: std::sync::atomic::AtomicBool,
 }
 
+/// Holds an admission unsettled until its prompt's publication ends.
+pub(crate) struct AdmissionGuard(Arc<Construction>);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.0
+            .unsettled_admissions
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 impl Lease {
     pub(crate) fn constructor_finished(&self) -> bool {
         self.construction
@@ -244,6 +258,16 @@ impl Lease {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Whether an admitted prompt is still being published. Read after
+    /// [`Self::admissions`]: an admission that count missed fails a stop
+    /// observed with it, and one it saw is either settled or reported here.
+    pub(crate) fn has_unsettled_admission(&self) -> bool {
+        self.construction
+            .unsettled_admissions
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
     #[cfg(test)]
     pub(crate) fn test_backdate_idle_baseline(&self, ms: i64) {
         self.construction
@@ -254,6 +278,16 @@ impl Lease {
     #[cfg(test)]
     pub(crate) fn test_child_wait_completed(&self) -> tokio::sync::watch::Receiver<Option<bool>> {
         self.construction.child_wait_completed.subscribe()
+    }
+    /// The closing `Stopped` reason a stop asked for, published or not.
+    #[cfg(test)]
+    pub(crate) fn test_stop_reason(&self) -> Option<String> {
+        self.construction
+            .stop_completion
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|debt| debt.reason.clone())
     }
 
     /// An attach observes the original runner until installation or an explicit stop.
@@ -454,6 +488,20 @@ impl Lease {
             #[cfg(test)]
             let _ = wait_completed.send_replace(Some(outcome.is_ok()));
         });
+    }
+
+    /// Forget a runner this construction already tore down, so it can launch another.
+    pub(crate) fn release_torn_down_runner(&self) {
+        *self
+            .construction
+            .runner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        *self
+            .construction
+            .spawn_attestor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     pub(crate) async fn attest_runner(&self) -> bool {
@@ -1578,18 +1626,22 @@ impl LifecycleTable {
 
     /// Count a prompt against the running epoch and restart its idle clock,
     /// since the prompt is not stored yet. Under the table lock so an idle
-    /// stop's check cannot interleave with it.
-    pub(crate) fn note_admission(&self, session_id: &str) {
-        if let Some((lease, _)) = self.running(session_id) {
-            lease.construction.idle_baseline_ms.fetch_max(
-                crate::time::Timestamp::now().as_millis(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            lease
-                .construction
-                .admissions
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        }
+    /// stop's check cannot interleave with it. Hold the guard until the
+    /// publication settles.
+    pub(crate) fn note_admission(&self, session_id: &str) -> Option<AdmissionGuard> {
+        let (lease, _) = self.running(session_id)?;
+        let construction = &lease.construction;
+        construction.idle_baseline_ms.fetch_max(
+            crate::time::Timestamp::now().as_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        construction
+            .unsettled_admissions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        construction
+            .admissions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(AdmissionGuard(Arc::clone(construction)))
     }
 
     pub fn phase(&self, session_id: &str) -> WorkerPhase {

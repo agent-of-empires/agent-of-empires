@@ -74,6 +74,7 @@ impl Runner {
                             acp_session_id: "native".into(),
                             result: serde_json::json!({}),
                             native_channel: control_protocol::NativeChannelAvailability::Available,
+                            adapter_frames: 0,
                         }),
                         ControlBody::Prompt { .. } => {
                             Some(ControlBody::PromptStarted { prompt_req_id: 7 })
@@ -114,6 +115,8 @@ impl Runner {
             None,
             None,
             None,
+            None,
+            false,
         )
         .await
         .unwrap();

@@ -470,11 +470,14 @@ fn absent_terminal_and_group_hints_follow_keybind_overrides() {
         assert!(!screen.contains("Press T"), "{keys:?}:\n{screen}");
 
         env.view.group_by = crate::session::config::GroupByMode::Project;
-        let (_, body) = env.view.automatic_group_hint().expect("automatic grouping");
+        let (_, body) = env
+            .view
+            .automatic_group_hint("repo")
+            .expect("automatic grouping");
         let want = if keys.is_empty() {
-            "Pick Manual grouping to manage groups."
+            "Pick the Groups grouping to manage groups."
         } else {
-            "Press F3 and pick Manual to manage groups."
+            "Press F3 and pick Groups to manage groups."
         };
         assert!(body.ends_with(want), "{keys:?}: {body}");
     }
