@@ -95,6 +95,20 @@ pub enum PluginCommands {
     },
     /// List installed external plugins that have an update available
     Outdated,
+    /// Call a provider method the plugin's manifest declares and print its JSON result
+    Call {
+        /// Plugin id
+        id: String,
+        /// Declared `provider_calls` name
+        name: String,
+        /// Request params as a JSON value
+        #[arg(long, default_value = "{}", value_parser = parse_params)]
+        params: serde_json::Value,
+    },
+}
+
+fn parse_params(raw: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))
 }
 
 pub async fn run(command: PluginCommands) -> Result<()> {
@@ -128,6 +142,14 @@ pub async fn run(command: PluginCommands) -> Result<()> {
         PluginCommands::Hash { path } => run_hash(&path),
         PluginCommands::Discover { query } => run_discover(query.as_deref()).await,
         PluginCommands::Outdated => run_outdated().await,
+        PluginCommands::Call { id, name, params } => {
+            let endpoint = crate::acp::client::require_daemon().await?;
+            let result = HttpClient::new(endpoint)?
+                .call_plugin_provider(&id, &name, &params)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
     }
 }
 

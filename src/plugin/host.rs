@@ -3211,6 +3211,96 @@ rl.on('line', (line) => {
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
+    async fn provider_calls_reach_a_real_worker_and_report_timeout_and_crash() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+            ("HOME", temp.path().to_path_buf()),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        // Replies to the first request, echoing its envelope id.
+        let echo = r##"["sh", "-c", 'read line; id=${line#*\"id\":\"}; id=${id%%\"*}; echo "{\"jsonrpc\":\"2.0\",\"id\":\"$id\",\"result\":{\"ok\":true}}"; sleep 60']"##;
+        install_worker("acme.echo", echo);
+        let received = temp.path().join("silent-received");
+        install_worker(
+            "acme.silent",
+            &toml::Value::Array(
+                [
+                    "sh",
+                    "-c",
+                    "read line; touch \"$1\"; sleep 60",
+                    "sh",
+                    received.to_str().unwrap(),
+                ]
+                .map(|arg| toml::Value::String(arg.into()))
+                .into(),
+            )
+            .to_string(),
+        );
+        install_worker("acme.quitter", r#"["sh", "-c", "read line; exit 0"]"#);
+        let registry = crate::plugin::reload_registry();
+        let host = PluginHost::new(
+            &temp.path().join("host"),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        host.start(&registry).await;
+
+        let declared = |id: &str, timeout_ms: u64| {
+            aoe_plugin_api::PluginManifest::from_toml_str(&format!(
+                "id = \"{id}\"\nname = \"P\"\nversion = \"1.0.0\"\napi_version = 29\n\
+                 capabilities = [\"runtime.worker\"]\n\n\
+                 [runtime]\nkind = \"command\"\ncommand = [\"bin/w\"]\n\n\
+                 [[provider_calls]]\nname = \"status\"\ntimeout_ms = {timeout_ms}\n"
+            ))
+            .unwrap()
+        };
+        let call = |id: &'static str, timeout_ms: u64| {
+            let manifest = declared(id, timeout_ms);
+            let hash = registry.get(id).unwrap().manifest_hash.clone();
+            let host = host.clone();
+            async move {
+                crate::plugin::provider_call::call(
+                    &*host,
+                    id,
+                    Some((&manifest, &hash)),
+                    "status",
+                    json!({}),
+                )
+                .await
+            }
+        };
+
+        assert_eq!(
+            call("acme.echo", 10_000).await.unwrap(),
+            json!({"ok": true})
+        );
+        let silent = tokio::spawn(call("acme.silent", 2_000));
+        wait_until("the silent worker to receive the request", || async {
+            received.exists()
+        })
+        .await;
+        assert!(matches!(
+            silent.await.unwrap(),
+            Err(crate::plugin::provider_call::ProviderCallError::Worker(
+                WorkerRequestError::Timeout
+            ))
+        ));
+        assert!(matches!(
+            call("acme.quitter", 10_000).await,
+            Err(crate::plugin::provider_call::ProviderCallError::Worker(
+                WorkerRequestError::WorkerGone
+            ))
+        ));
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
     async fn request_worker_fails_promptly_when_the_worker_is_torn_down() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = crate::plugin::ReloadRegistryOnDrop;

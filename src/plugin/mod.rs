@@ -27,6 +27,7 @@ pub mod host_api;
 pub mod mcp_rewrite;
 pub mod mcp_serve;
 pub mod protocol;
+pub mod provider_call;
 pub mod sandbox;
 pub mod session_api;
 pub mod suggestions;

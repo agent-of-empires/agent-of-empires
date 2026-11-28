@@ -60,6 +60,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin hash`↴](#aoe-plugin-hash)
 * [`aoe plugin discover`↴](#aoe-plugin-discover)
 * [`aoe plugin outdated`↴](#aoe-plugin-outdated)
+* [`aoe plugin call`↴](#aoe-plugin-call)
 * [`aoe profile`↴](#aoe-profile)
 * [`aoe profile list`↴](#aoe-profile-list)
 * [`aoe profile create`↴](#aoe-profile-create)
@@ -936,6 +937,7 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
 * `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
 * `outdated` — List installed external plugins that have an update available
+* `call` — Call a provider method the plugin's manifest declares and print its JSON result
 
 
 
@@ -1081,6 +1083,25 @@ Search GitHub's `aoe-plugin` topic for installable plugins
 List installed external plugins that have an update available
 
 **Usage:** `aoe plugin outdated`
+
+
+
+## `aoe plugin call`
+
+Call a provider method the plugin's manifest declares and print its JSON result
+
+**Usage:** `aoe plugin call [OPTIONS] <ID> <NAME>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
+* `<NAME>` — Declared `provider_calls` name
+
+###### **Options:**
+
+* `--params <PARAMS>` — Request params as a JSON value
+
+  Default value: `{}`
 
 
 

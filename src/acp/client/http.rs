@@ -555,6 +555,47 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/plugins/{id}/provider-calls/{name}`: the plugin worker's reply to its declared
+    /// `provider.<name>` method.
+    pub async fn call_plugin_provider(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, HttpError> {
+        let path = format!(
+            "/api/plugins/{}/provider-calls/{}",
+            path_segment(plugin_id)?,
+            path_segment(name)?
+        );
+        // The daemon enforces the declared timeout; this only outlasts the longest one.
+        let transport =
+            std::time::Duration::from_millis(aoe_plugin_api::PROVIDER_CALL_MAX_TIMEOUT_MS)
+                + std::time::Duration::from_secs(10);
+        let url = format!("{}{path}", self.endpoint.base_url);
+        let res = self
+            .execute_elevated(|| self.http.post(&url).json(params).timeout(transport))
+            .await?;
+        if !res.status().is_success() {
+            let error = status_error(&res, None, false);
+            let code = match &error {
+                HttpError::Server { body, .. } if !body.is_empty() => Some(body.clone()),
+                _ => None,
+            };
+            return Err(match (brief_server_error(error, res).await, code) {
+                (HttpError::Server { status, body }, Some(code)) if body != code => {
+                    HttpError::Server {
+                        status,
+                        body: format!("{code}: {body}"),
+                    }
+                }
+                (error, _) => error,
+            });
+        }
+        let text = res.text().await?;
+        serde_json::from_str(&text).map_err(|_| HttpError::Transport)
+    }
+
     /// `POST /api/plugins/{id}/worker/restart`: the daemon reloads plugins from
     /// disk and replaces this plugin's worker after its tree changed.
     pub async fn restart_plugin_worker(&self, plugin_id: &str) -> Result<(), HttpError> {
@@ -1923,6 +1964,40 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(
             matches!(error, HttpError::Server { status, .. } if status == StatusCode::CONFLICT)
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn plugin_provider_call_error_keeps_the_error_code_and_message() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let app = Router::new().route(
+            "/api/plugins/{id}/provider-calls/{name}",
+            post(|| async {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    [(crate::daemon::ERROR_CODE_HEADER, "provider_worker_gone")],
+                    axum::Json(serde_json::json!({"message": "worker exited"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(endpoint(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            Some("fixture-token"),
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error = client
+            .call_plugin_provider("acme.gate", "status", &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HttpError::Server { status, body }
+                if *status == StatusCode::BAD_GATEWAY
+                    && body == "provider_worker_gone: worker exited"),
+            "{error:?}"
         );
         server.abort();
         let _ = server.await;
