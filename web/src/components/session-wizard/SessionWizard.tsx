@@ -127,6 +127,7 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     // A name-only wizard's path is derived server-side, so it is never seeded.
     path: !nameOnly && lastProject.startsWith("/") ? lastProject : "",
     tool: loadLastUsedTool(),
+    baseTool: loadLastUsedTool(),
     customInstruction: safeGetItem(LAST_USED_INSTRUCTION_KEY) ?? "",
   };
   if (!prefill) return base;
@@ -135,6 +136,7 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     // A prefill without a path (group-only) keeps the remembered project; a tab-only one opens the picker.
     path: prefill.scratch ? "" : prefill.path || (prefill.initialTab ? "" : base.path),
     tool: prefill.tool || base.tool,
+    baseTool: prefill.tool || base.tool,
     // A prefilled agent is a choice for this session; the project's own must not replace it.
     toolDirty: !!prefill.tool,
     yoloMode: prefill.yoloMode ?? false,

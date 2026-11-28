@@ -1002,11 +1002,12 @@ impl NewSessionDialog {
                 .as_ref()
                 .and_then(|o| o.default_tool.as_deref())
                 .or(config.session.default_tool.as_deref());
-            if let Some(index) =
-                tool.and_then(|tool| self.available_tools.iter().position(|t| t == tool))
-            {
-                self.select_tool_index(index);
-            }
+            // No resolvable default falls back the way construction does, rather than keeping the
+            // agent of the project this path replaced.
+            let index = tool
+                .and_then(|tool| self.available_tools.iter().position(|t| t == tool))
+                .unwrap_or(0);
+            self.select_tool_index(index);
         }
         let host_only = self.selected_tool_host_only();
         if !self.worktree_dirty {
@@ -1771,14 +1772,13 @@ impl NewSessionDialog {
                 self.refresh_path_agent_config(&config);
                 // The project's agent leaves with the project; a hand-picked one stays.
                 if !self.tool_dirty {
-                    if let Some(index) = config
+                    let index = config
                         .session
                         .default_tool
                         .as_deref()
                         .and_then(|tool| self.available_tools.iter().position(|t| t == tool))
-                    {
-                        self.select_tool_index(index);
-                    }
+                        .unwrap_or(0);
+                    self.select_tool_index(index);
                 }
                 self.seed_sandbox(&config, None);
             } else {

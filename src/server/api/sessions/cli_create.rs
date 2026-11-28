@@ -147,8 +147,11 @@ fn resolve_host_creation(
         )?
     };
     // A project's own agent outranks the profile default for sessions started in
-    // it. An explicit `--tool` and a fork's agent still win over both.
-    if !body.scratch {
+    // it. An explicit `--tool` and a fork's agent still win over both, so an
+    // unreadable registry must not refuse a request whose agent is already decided.
+    let needs_project_agent =
+        body.tool.trim().is_empty() && options.command.is_none() && inherited_tool.is_none();
+    if !body.scratch && needs_project_agent {
         if let Some(tool) = crate::session::projects::default_tool_override(
             profile,
             std::path::Path::new(&body.path),
@@ -585,6 +588,36 @@ provider_versions = ["^18"]
         };
         assert_eq!(created(&repo), "project-agent");
         assert_eq!(created(home.path()), "profile-agent");
+    }
+
+    /// A request that already names its agent does not need the project registry,
+    /// so an unreadable one must not refuse it.
+    #[test]
+    #[serial_test::serial]
+    fn an_explicit_tool_does_not_depend_on_the_project_registry() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        crate::session::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("explicit-agent".into(), "true".into());
+        })
+        .unwrap();
+        std::fs::write(
+            crate::session::get_app_dir().unwrap().join("projects.json"),
+            "{ not json",
+        )
+        .unwrap();
+
+        let body: CreateSessionBody =
+            serde_json::from_value(serde_json::json!({ "path": repo, "tool": "explicit-agent" }))
+                .unwrap();
+        let (body, _) = resolve_host_creation(body, Default::default(), None, "default")
+            .expect("an explicit tool needs no registry");
+        assert_eq!(body.tool, "explicit-agent");
     }
 
     /// A takeover hides `omp` from listings, but a configured wrapper detected
