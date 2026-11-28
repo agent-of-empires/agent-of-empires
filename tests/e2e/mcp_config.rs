@@ -3,8 +3,9 @@
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use serial_test::parallel;
+use std::net::Ipv4Addr;
 
-use crate::harness::{app_dir_in, TuiTestHarness};
+use crate::harness::{app_dir_in, bind_saved_port, TuiTestHarness};
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Runtime::new()
@@ -423,6 +424,39 @@ fn configured_read_acquisition_preserves_profiles_and_one_owner() {
     }
 }
 
+#[test]
+#[parallel]
+fn cli_and_tui_autostart_reuse_the_saved_port() {
+    crate::harness::require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("saved_autostart_port");
+    h.remove_env("AOE_SERVE_PORT");
+    h.remove_env("AOE_SERVE_PASSPHRASE");
+    h.remove_env("AOE_CITYHALL_MODE");
+    h.append_config("[web]\nmcp_enabled = true");
+    h.append_config("[serve]\nfunnel_port = \"8443\"");
+    h.stop_daemon_on_drop();
+    let saved_port = bind_saved_port(Ipv4Addr::LOCALHOST)
+        .local_addr()
+        .unwrap()
+        .port();
+    let app = app_dir_in(h.home_path());
+    std::fs::write(app.join("serve.last_port"), saved_port.to_string()).unwrap();
+
+    h.run_cli_ok(&["profile", "list"]);
+    let launch: Value =
+        serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+    assert_eq!(launch["port"], saved_port);
+    assert_mcp_connects(&h);
+
+    h.run_cli_ok(&["serve", "--stop"]);
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    let launch: Value =
+        serde_json::from_slice(&std::fs::read(app.join("serve.launch")).unwrap()).unwrap();
+    assert_eq!(launch["port"], saved_port);
+    assert_mcp_connects(&h);
+}
+
 /// Keep the port occupied through both failures; private recovery requires an
 /// explicit request before repaired TCP acquisition may expose MCP again.
 #[test]
@@ -435,7 +469,10 @@ fn configured_autostart_reports_tcp_bind_failure_without_private_fallback() {
     let port = if cfg!(debug_assertions) { 8081 } else { 8080 };
     let occupied = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
     let mut h = TuiTestHarness::new_in_tmp("configured_tcp_bind_failure");
+    h.remove_env("AOE_SERVE_PORT");
     h.append_config("[web]\nmcp_enabled = true");
+    h.append_config(&format!("[serve]\nport = {port}"));
+    std::fs::write(app_dir_in(h.home_path()).join("serve.last_port"), "49152").unwrap();
     h.stop_daemon_on_drop();
     h.run_cli_err(&["serve", "--daemon"]);
     h.run_cli_err(&["profile", "list"]);
@@ -589,10 +626,12 @@ fn configured_mcp_respects_disabled_web_across_acquisition_and_reconnect() {
         return;
     }
     let mut h = TuiTestHarness::new_in_tmp("configured_disabled_web");
+    h.remove_env("AOE_SERVE_PORT");
     h.append_config("[web]\nmcp_enabled = true");
+    let port = crate::harness::pick_free_port();
+    h.append_config(&format!("[serve]\nport = {port}"));
     h.stop_daemon_on_drop();
     let app = app_dir_in(h.home_path());
-    let port = if cfg!(debug_assertions) { 8081 } else { 8080 };
     let assert_private = |h: &TuiTestHarness| {
         assert!(h
             .run_cli_ok(&["--no-autostart", "profile", "list"])

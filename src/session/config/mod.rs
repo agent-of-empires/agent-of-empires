@@ -2957,19 +2957,31 @@ impl FunnelPort {
 impl ServeConfig {
     /// Read only `[serve]`, so an error in another section cannot block `aoe serve`.
     pub(crate) fn load() -> Result<Self> {
-        match Config::load_raw_table() {
-            Ok(table) => Self::from_table(&table),
-            Err(e) => {
-                tracing::warn!(target: "session.store", "Failed to read config, using default [serve]: {e}");
-                Ok(Self::default())
-            }
-        }
+        Self::from_table(&Self::load_table())
+    }
+
+    /// Loads the configured port or calls the fallback when the key is absent.
+    pub(crate) fn load_port(fallback: impl FnOnce() -> u16) -> Result<u16> {
+        let table = Self::load_table();
+        let config = Self::from_table(&table)?;
+        let configured = table
+            .get("serve")
+            .and_then(|serve| serve.get("port"))
+            .map(|_| config.port);
+        Ok(configured.unwrap_or_else(fallback))
     }
 
     /// Like [`ServeConfig::load`], but propagates read and parse errors, for callers that act on
     /// the result destructively. An absent config.toml still yields the defaults.
     pub(crate) fn load_strict() -> Result<Self> {
         Self::from_table(&Config::load_raw_table()?)
+    }
+
+    fn load_table() -> toml::Table {
+        Config::load_raw_table().unwrap_or_else(|error| {
+            tracing::warn!(target: "session.store", "Failed to read config, using default [serve]: {error}");
+            toml::Table::new()
+        })
     }
 
     fn from_table(table: &toml::Table) -> Result<Self> {
