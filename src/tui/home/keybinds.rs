@@ -13,7 +13,7 @@ use crossterm::event::KeyCode;
 
 use super::bindings::{
     action_by_name, chord_from_parts, default_chords, format_chord, palette_id, parse_chord,
-    ActionId, Binding, Chord, BINDINGS,
+    ActionId, Binding, Chord, BINDINGS, CONFIRM_CANCEL_PULL,
 };
 
 /// Accepted overrides, keyed by action.
@@ -205,6 +205,13 @@ fn fixed_conflict(id: ActionId, c: &Chord, reserved: &Reserved) -> Option<String
         return Some(format!(
             "{key}: quit takes a key without Ctrl, Alt or Shift"
         ));
+    }
+    // Every press would reopen the prompt that key confirms, so the cancel couldn't be confirmed.
+    if id == ActionId::CancelImagePull
+        && c.code == CONFIRM_CANCEL_PULL
+        && !(c.ctrl || c.alt || c.shift)
+    {
+        return Some(format!("{key} confirms the cancel, so it can't open it"));
     }
     if is_live_action(id) {
         let typing = matches!(
@@ -429,6 +436,8 @@ mod tests {
                 &["C-x"],
                 "Ctrl+X is bound to dismiss-update-banner",
             ),
+            ("delete", &["C-e"], "Ctrl+E is bound to cancel-image-pull"),
+            ("cancel-image-pull", &["y"], "y confirms the cancel"),
             (
                 "delete",
                 &["C-l"],
@@ -467,6 +476,17 @@ mod tests {
                 assert!(!km.is_overridden(id), "{name}");
             }
         }
+        // Strict mode binds no other action to y, so only the confirm rule refuses it there.
+        let (km, warnings) = build(
+            &entries(&[("cancel-image-pull", &["y"])]),
+            true,
+            &reserved(),
+        );
+        assert!(
+            matches!(warnings.as_slice(), [w] if w.reason.contains("y confirms the cancel")),
+            "strict: {warnings:?}"
+        );
+        assert!(!km.is_overridden(ActionId::CancelImagePull));
     }
 
     #[test]
@@ -517,7 +537,7 @@ mod tests {
         use crossterm::event::{KeyEvent, KeyModifiers};
         let (km, warnings) = build(
             &entries(&[
-                ("delete", &["C-e"]),
+                ("delete", &["C-f"]),
                 ("restart", &[]),
                 ("activate", &["C-Enter"]),
             ]),
@@ -534,7 +554,7 @@ mod tests {
         };
         for (key, want) in [
             (
-                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
                 Some(ActionId::Delete),
             ),
             (KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), None),
@@ -547,7 +567,7 @@ mod tests {
         ] {
             assert_eq!(resolve_in(&km, &key, false, &ctx), want, "{key:?}");
         }
-        assert_eq!(label_in(&km, ActionId::Delete, true), "Ctrl+E");
+        assert_eq!(label_in(&km, ActionId::Delete, true), "Ctrl+F");
         assert_eq!(label_in(&km, ActionId::Restart, false), "");
     }
 }

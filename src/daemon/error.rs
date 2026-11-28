@@ -44,6 +44,8 @@ pub enum ApiErrorCode {
     WorkingDirMissing,
     /// A worktree checkout named a branch that exists neither locally nor on a remote.
     BranchNotFound,
+    /// A sandbox image request named an image no profile configures.
+    UnknownImage,
     AgentHooksNotApproved,
     SmartRenameSkipped,
     SmartRenameFailed,
@@ -57,6 +59,10 @@ pub enum ApiErrorCode {
     AccountSwapUnavailable,
     ModelPinned,
     UnknownAgent,
+    /// A sandbox image cancel named a pull that has ended; another pull of the image runs.
+    PullReplaced,
+    /// `sandbox.allow_image_pull` is off, so the Daemon won't pull a sandbox image for a client.
+    PullDisabled,
     TerminalSwitchRefused(TerminalSwitchReason),
 }
 
@@ -95,6 +101,7 @@ impl ApiErrorCode {
             Self::OutcomeUnconfirmed => "outcome_unconfirmed",
             Self::WorkingDirMissing => "working_dir_missing",
             Self::BranchNotFound => "branch_not_found",
+            Self::UnknownImage => "unknown_image",
             Self::AgentHooksNotApproved => "agent_hooks_not_approved",
             Self::SmartRenameSkipped => "smart_rename_skipped",
             Self::SmartRenameFailed => "smart_rename_failed",
@@ -107,6 +114,8 @@ impl ApiErrorCode {
             Self::AccountSwapUnavailable => "account_swap_unavailable",
             Self::ModelPinned => "model_pinned",
             Self::UnknownAgent => "unknown_agent",
+            Self::PullReplaced => "pull_replaced",
+            Self::PullDisabled => "pull_disabled",
             Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
@@ -117,7 +126,8 @@ impl ApiErrorCode {
             | Self::ElevationRequired
             | Self::AccessPolicyDenied
             | Self::LocalPluginSourceRequired
-            | Self::CityhallMode => StatusCode::FORBIDDEN,
+            | Self::CityhallMode
+            | Self::PullDisabled => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
             | Self::TrashIncomplete
             | Self::LifecycleSuperseded
@@ -142,12 +152,14 @@ impl ApiErrorCode {
             | Self::SessionArchived
             | Self::SessionTrashed
             | Self::AccountSwapUnavailable
-            | Self::ModelPinned => StatusCode::CONFLICT,
+            | Self::ModelPinned
+            | Self::PullReplaced => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed
             | Self::WorkingDirMissing
             | Self::BranchNotFound
+            | Self::UnknownImage
             | Self::UnknownAgent => StatusCode::BAD_REQUEST,
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
             Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
@@ -223,6 +235,7 @@ impl ApiErrorCode {
             b"create_hook_failed" => Self::CreateHookFailed,
             b"working_dir_missing" => Self::WorkingDirMissing,
             b"branch_not_found" => Self::BranchNotFound,
+            b"unknown_image" => Self::UnknownImage,
             b"smart_rename_skipped" => Self::SmartRenameSkipped,
             b"smart_rename_failed" => Self::SmartRenameFailed,
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
@@ -234,6 +247,8 @@ impl ApiErrorCode {
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
             b"model_pinned" => Self::ModelPinned,
             b"unknown_agent" => Self::UnknownAgent,
+            b"pull_replaced" => Self::PullReplaced,
+            b"pull_disabled" => Self::PullDisabled,
             other => Self::TerminalSwitchRefused(
                 TerminalSwitchReason::ALL
                     .into_iter()
@@ -386,6 +401,13 @@ mod tests {
             ),
             (StatusCode::CONFLICT, "branch_not_found", false, None),
             (
+                StatusCode::BAD_REQUEST,
+                "unknown_image",
+                false,
+                Some(ApiErrorCode::UnknownImage),
+            ),
+            (StatusCode::NOT_FOUND, "unknown_image", false, None),
+            (
                 StatusCode::CONFLICT,
                 "group_not_empty",
                 false,
@@ -419,6 +441,20 @@ mod tests {
                 Some(ApiErrorCode::ModelPinned),
             ),
             (StatusCode::BAD_REQUEST, "model_pinned", false, None),
+            (
+                StatusCode::CONFLICT,
+                "pull_replaced",
+                false,
+                Some(ApiErrorCode::PullReplaced),
+            ),
+            (StatusCode::BAD_REQUEST, "pull_replaced", false, None),
+            (
+                StatusCode::FORBIDDEN,
+                "pull_disabled",
+                false,
+                Some(ApiErrorCode::PullDisabled),
+            ),
+            (StatusCode::CONFLICT, "pull_disabled", false, None),
             (
                 StatusCode::BAD_REQUEST,
                 "unknown_agent",

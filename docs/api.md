@@ -793,11 +793,13 @@ When `profile` is omitted, creation uses the server's selected profile or the co
 
 ## Sandbox image
 
-These endpoints back the dashboard's sandbox image banner (see
-[Available images](guides/sandbox.md#available-images)). They act only on a
-configured image: the global or a profile's `sandbox.default_image`. Any other
-image is refused with `400 unknown_image`, and an omitted one means the global
-`sandbox.default_image`. Images are checked and pulled with the configured
+These endpoints back the dashboard's sandbox image banner and the TUI's pull
+line (see [Available images](guides/sandbox.md#available-images)). They act only
+on a configured image: the global or a profile's `sandbox.default_image`. Any
+other image is refused with `400 unknown_image`, and an omitted one means the
+global `sandbox.default_image`. `unknown_image`, `pull_replaced` and the pull
+gate's three refusals set `AoE-Error-Code` to their code, so a client tells them
+apart without reading the body. Images are checked and pulled with the configured
 `container_runtime`. When the configuration can't be read, every endpoint except
 `image-dismiss` answers `500 config_unreadable` rather than fall back to defaults.
 
@@ -809,8 +811,9 @@ body. `POST /api/sessions` applies the same gate to
 [`pull_latest_image`](#post-apisessions).
 
 Both take an optional body: none for the global default image, or JSON
-`{"image": "<configured image>"}` sent as `application/json`. Any other body,
-including `{}`, gets `400 invalid_body`. A JSON body naming an image that isn't
+`{"image": "<configured image>"}` sent as `application/json`. A cancel may also
+send `flight`, with or without `image`. Any other body, including `{}`, gets
+`400 invalid_body`. A JSON body naming an image that isn't
 configured gets `400 unknown_image`.
 
 ### GET /api/sandbox/image-status
@@ -832,6 +835,7 @@ expires.
   "checks_enabled": true,
   "sandbox_in_use": true,
   "pull": { "state": "running", "phase": "downloading", "layers_done": 2, "layers_known": 5 },
+  "flight": 1764006000000000,
   "pull_blocked": null,
   "pull_command": "docker pull ghcr.io/acme/sandbox:latest",
   "runtime": "Docker"
@@ -846,6 +850,7 @@ expires.
 | `checks_enabled` | `false` when `[updates] update_check_mode` is `off`. `state` is then `unknown` with `checks_off`, and no registry is asked |
 | `sandbox_in_use` | `sandbox.enabled_by_default` is on, or a sandboxed session exists |
 | `pull` | The image's pull, below |
+| `flight` | Only while `pull` is `running`: that pull's id, read with `pull`, for a cancel to name. A Daemon restart doesn't reuse an id |
 | `pull_blocked` | `read_only`, `cityhall` or `disabled` when the pull gate refuses, otherwise `null` |
 | `pull_command` | Always present: the runtime's pull command for the image, to run on the host when `pull_blocked` is set |
 | `runtime` | `Docker`, `Podman` or `Apple Container` |
@@ -858,7 +863,9 @@ expires.
   (`downloading`, then `unpacking`), `layers_done` and `layers_known`. Only
   Docker reports them; Podman and Apple Container report a bare
   `{"state": "running"}`.
-- `done`.
+- `done`, with `digest` when the runtime reports one: the image's repo digest
+  after the pull, comparable with `remote_digest`, so a client can tell which
+  update it installed. Apple Container reports none.
 - `cancelled`: ended by `image-pull/cancel`.
 - `failed`, with `reason` (`timeout`, `network`, `disk_space`, `auth` or
   `other`), `message` (the wording both clients show) and `error` (the
@@ -876,8 +883,10 @@ pull runs per image. It answers `202` straight away, and progress is read from
 `image-status`:
 
 ```json
-{ "image": "ghcr.io/acme/sandbox:latest", "pull": { "state": "running" } }
+{ "image": "ghcr.io/acme/sandbox:latest", "pull": { "state": "running" }, "flight": 1764006000000000 }
 ```
+
+`flight` is the id of the pull it started or joined, as in `image-status`.
 
 A pull started here keeps running when the page closes or a create waiting on it
 leaves. It ends when it finishes, is cancelled, or reaches the runtime's
@@ -896,6 +905,11 @@ waiter, waits up to 5 s for it to end, then answers `200`:
 if the pull ended another way first, and `running` if it hasn't ended within
 5 s. With no pull running it answers the current state, so a repeat is
 harmless.
+
+With `"flight": <id>` from `image-status` or `image-pull`, only that pull is
+cancelled. If another pull of the image is running instead, nothing is
+cancelled and the answer is `409 pull_replaced`. Without `flight`, whatever pull
+is running is cancelled.
 
 A create waiting on the cancelled pull fails with `400`:
 `sandbox_image_update_failed` for a `pull_latest_image` pull, or

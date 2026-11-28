@@ -255,8 +255,14 @@ fn update_bar_renders_sandbox_image_banner() {
         terminal
             .draw(|f| {
                 let area = f.area();
-                let bar =
-                    UpdateBar::pick(None, None, Some(&update_info), Some(&image_update), false);
+                let bar = UpdateBar::pick(
+                    None,
+                    None,
+                    None,
+                    Some(&update_info),
+                    Some(&image_update),
+                    false,
+                );
                 env.view.render(f, area, &theme, bar);
             })
             .unwrap();
@@ -2071,4 +2077,110 @@ fn update_bar_live_line_shows_no_dismiss_hint() {
         .collect();
     assert!(out.contains("moving the sandbox store"), "{out}");
     assert!(!out.contains("dismiss"), "{out}");
+}
+
+/// A hidden running pull keeps its progress on the key line: with the shortcut bar shown, even
+/// when other must-show hints fill it, in Live send (beside its exit hint), and with the bar
+/// hidden, where the row is kept for it.
+#[test]
+#[serial]
+fn a_hidden_pull_shows_its_progress_on_every_key_line() {
+    use crate::containers::pull_progress::ProgressSnapshot;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = load_theme("empire");
+    // (case, width, shortcut bar shown, in Live send, Live send title)
+    for (case, width, bar, live, title) in [
+        ("shortcut bar", 100, true, false, ""),
+        // Other priority-0 hints wider than the row still leave the badge its room.
+        ("paste, search and other TUIs", 40, true, false, ""),
+        ("Live send", 100, true, true, "live send"),
+        // Too narrow for the leader hint, which gives way to the badge and exit chord.
+        ("Live send, narrow", 54, true, true, "live send"),
+        // A title wide enough to fill the row still leaves the badge its room.
+        (
+            "Live send, long title",
+            100,
+            true,
+            true,
+            &*"long ".repeat(30),
+        ),
+        ("bar hidden", 100, false, false, ""),
+    ] {
+        let mut env = create_test_env_empty();
+        env.view.show_shortcut_bar = bar;
+        if width < 100 {
+            env.view.active_tui_count = 3;
+            env.view.pending_paste = Some("a buffered paste".into());
+            env.view.search_matches = vec![0];
+        }
+        if live {
+            env.view.enter_live_send_for_test();
+            let state = env.view.live_send.as_mut().unwrap();
+            state.title = title.into();
+            state.leader =
+                super::super::live_send::parse_chord(super::super::live_send::DEFAULT_LEADER);
+        }
+        env.view.hidden_pull = Some(ProgressSnapshot {
+            layers_done: Some(3),
+            layers_known: Some(7),
+            ..ProgressSnapshot::default()
+        });
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let last = (0..buf.area.width)
+            .map(|x| buf[(x, buf.area.height - 1)].symbol())
+            .collect::<String>();
+        assert!(last.contains("Image 3/7"), "{case}: {last:?}");
+        if live {
+            assert!(
+                last.contains("to exit"),
+                "{case} lost its exit hint: {last:?}"
+            );
+            assert_eq!(
+                last.contains("menu"),
+                width == 100,
+                "{case}: the leader hint: {last:?}"
+            );
+        }
+    }
+}
+
+/// Live send's optional hints give way in order where even an empty title can't fit: the leader
+/// hint first, then the scroll indicator, so the exit chord and pull badge stay.
+#[test]
+fn live_send_drops_its_leader_hint_then_its_scroll_indicator() {
+    use super::super::render::live_hints_fit;
+    // (case, width, kept, scroll, leader, (scroll kept, leader kept))
+    for (case, width, kept, scroll, leader, want) in [
+        ("all fit", 70, 40, 8, 12, (true, true)),
+        ("all fit exactly", 60, 40, 8, 12, (true, true)),
+        ("no room for the leader hint", 59, 40, 8, 12, (true, false)),
+        (
+            "no room for the scroll indicator",
+            47,
+            40,
+            8,
+            12,
+            (false, false),
+        ),
+        (
+            "no scroll indicator: the leader hint fits",
+            52,
+            40,
+            0,
+            12,
+            (true, true),
+        ),
+    ] {
+        assert_eq!(live_hints_fit(width, kept, scroll, leader), want, "{case}");
+    }
 }

@@ -462,6 +462,8 @@ pub struct HomeView {
     pub(super) pending_stop_auxiliary: Option<(String, crate::daemon::StopAuxiliaryBody)>,
     pending_legacy_tool_preparation: Option<panes::PendingLegacyToolPreparation>,
     pub(super) pending_image_pull: Option<String>,
+    /// A running sandbox image pull whose line Ctrl+X hid; the key line keeps its progress.
+    pub(crate) hidden_pull: Option<crate::containers::pull_progress::ProgressSnapshot>,
     /// Checkbox keys the last submitted confirm dialog had checked.
     pub(super) confirm_checked: Vec<&'static str>,
     pub(super) pending_switch_view_session: Option<String>,
@@ -563,6 +565,8 @@ pub struct HomeView {
 
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
     pub(super) default_terminal_mode: TerminalMode,
+    /// `sandbox.enabled_by_default`: with it on, new sessions use a sandbox.
+    pub(in crate::tui) sandbox_by_default: bool,
 
     pub(super) idle_decay_window: std::time::Duration,
 

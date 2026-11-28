@@ -31,6 +31,7 @@ impl HomeView {
             DefaultTerminalMode::Container => TerminalMode::Container,
         };
         let strict_hotkeys = resolved.session.strict_hotkeys;
+        let sandbox_by_default = resolved.sandbox.enabled_by_default;
         let confirm_before_quit = resolved.session.confirm_before_quit;
         let host_tab_title = resolved.session.host_tab_title;
         let idle_decay_window =
@@ -225,6 +226,7 @@ impl HomeView {
             pending_stop_auxiliary: None,
             pending_legacy_tool_preparation: None,
             pending_image_pull: None,
+            hidden_pull: None,
             confirm_checked: Vec::new(),
             pending_switch_view_session: None,
             structured_preview: None,
@@ -297,6 +299,7 @@ impl HomeView {
             manual_unread_hold: None,
             terminal_modes: HashMap::new(),
             default_terminal_mode,
+            sandbox_by_default,
             strict_hotkeys,
             confirm_before_quit,
             host_tab_title,

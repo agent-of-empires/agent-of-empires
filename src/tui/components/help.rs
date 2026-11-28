@@ -657,4 +657,27 @@ mod tests {
         render_to_buffer(200, 60, &mut scroll);
         assert_eq!(scroll, 0);
     }
+
+    /// The overlay lists an action's `[keybinds]` override, not its shipped key.
+    #[test]
+    fn help_follows_a_keybinds_override() {
+        use crate::tui::home::keybinds;
+        let config = crate::session::Config {
+            keybinds: [("cancel-image-pull".to_string(), vec!["F8".to_string()])].into(),
+            ..Default::default()
+        };
+        let (keymap, warnings) = keybinds::from_config(&config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        keybinds::install(keymap);
+        for strict in [false, true] {
+            let keys: Vec<String> = shortcuts(strict, false)
+                .into_iter()
+                .flat_map(|(_, rows)| rows)
+                .filter(|(_, desc)| desc == "Cancel sandbox image download")
+                .map(|(key, _)| key)
+                .collect();
+            assert_eq!(keys, ["F8"], "strict={strict}");
+        }
+        keybinds::install(keybinds::Keymap::default());
+    }
 }

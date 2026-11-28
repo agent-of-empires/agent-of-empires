@@ -70,6 +70,19 @@ impl HomeView {
         self.target_pane_is_warm(session_id, &self.pending_send_target)
     }
 
+    /// Live send as entered, with no session or send worker behind it.
+    #[cfg(test)]
+    pub(in crate::tui) fn enter_live_send_for_test(&mut self) {
+        self.live_send = Some(live_send::LiveSendState {
+            session_id: "live-send-test".into(),
+            title: "live send".into(),
+            tmux_name: "aoe_test_live_send".into(),
+            target: live_send::LiveSendTarget::Agent,
+            exit_chords: live_send::parse_chord_list(live_send::DEFAULT_EXIT_CHORD),
+            leader: None,
+        });
+    }
+
     /// Size to boot a cold/dead pane at on live-send entry: the visible
     /// preview output rect when known, else the full terminal. Seeding the boot
     /// here avoids an initial reflow; any post-toast geometry change is queued

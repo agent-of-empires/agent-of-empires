@@ -10389,7 +10389,9 @@ fn a_create_cancelled_during_its_container_setup_pull_reads_as_cancelled() {
                 cancel.cancel();
             }
             if shared {
-                runtime.cancel_pull(IMAGE, Duration::from_secs(5));
+                runtime
+                    .cancel_pull(IMAGE, None, Duration::from_secs(5))
+                    .unwrap();
             } else {
                 until("the create's cancel didn't end its setup", &|| {
                     create.is_finished()

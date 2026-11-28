@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 // Tokio's, so tests can drive overlapping checks on a paused clock.
 use tokio::time::Instant;
 
-use super::{api_error, cityhall_block, read_only_block};
+use super::{api_error, api_error_with_code_header, cityhall_block, read_only_block};
 use crate::containers::image_pull::PullState;
 use crate::containers::image_update::{self, ImageCheck};
 use crate::containers::ContainerRuntime;
+use crate::daemon::ApiErrorCode;
 use crate::server::AppState;
 use crate::session::ContainerRuntimeName;
 
@@ -250,9 +251,8 @@ fn resolve_image(
         Some(image) if configured.images.iter().any(|i| i == image.trim()) => {
             Ok(image.trim().to_string())
         }
-        Some(_) => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "unknown_image",
+        Some(_) => Err(api_error_with_code_header(
+            ApiErrorCode::UnknownImage,
             "Only a configured sandbox image can be checked or pulled",
         )),
     }
@@ -272,9 +272,8 @@ fn pull_blocked(state: &AppState, configured: &Configured) -> Option<&'static st
 }
 
 fn pull_disabled() -> Response {
-    api_error(
-        StatusCode::FORBIDDEN,
-        "pull_disabled",
+    api_error_with_code_header(
+        ApiErrorCode::PullDisabled,
         "Pulling sandbox images from the web is off. Enable sandbox.allow_image_pull (Settings, local only).",
     )
 }
@@ -344,6 +343,9 @@ pub struct ImageStatusResponse {
     /// `sandbox.enabled_by_default`, or a sandboxed Session exists. The banner shows only then.
     sandbox_in_use: bool,
     pull: PullState,
+    /// The running pull's id, read with `pull`, for a cancel to name it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flight: Option<u64>,
     /// `read_only`, `cityhall` or `disabled` when the dashboard can't pull; `pull_command` is
     /// then what to run instead.
     pull_blocked: Option<&'static str>,
@@ -385,8 +387,10 @@ pub async fn sandbox_image_status(
             .await
             .iter()
             .any(|i| i.is_sandboxed());
+    let (pull, flight) = runtime.pull_state_and_flight(&image);
     Json(ImageStatusResponse {
-        pull: runtime.pull_state(&image),
+        pull,
+        flight,
         pull_blocked: pull_blocked(&state, &configured),
         pull_command: runtime.pull_command(&image),
         runtime: runtime.display_name(),
@@ -402,16 +406,20 @@ pub async fn sandbox_image_status(
 #[derive(Deserialize)]
 pub struct ImagePullBody {
     image: Option<String>,
+    /// A cancel's flight, from `image-status` or the pull's reply.
+    flight: Option<u64>,
 }
 
-/// No body pulls the default image; any other body must be a JSON `{image}`. A `Json` extractor
-/// can't tell an empty body from one sent without a JSON content type.
+/// No body names the default image; any other body must be a JSON `{image}`, and a cancel may
+/// add or send only `flight`. A `Json` extractor can't tell an empty body from one sent without
+/// a JSON content type.
 fn requested_image(
     headers: &axum::http::HeaderMap,
     body: &[u8],
-) -> Result<Option<String>, Response> {
+    takes_flight: bool,
+) -> Result<(Option<String>, Option<u64>), Response> {
     if body.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
     // Media types are case-insensitive, and parameters such as `charset` follow a `;`.
     let is_json = headers
@@ -419,23 +427,34 @@ fn requested_image(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(';').next())
         .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"));
-    // A body that names no image is malformed, not a request for the default.
+    // A body that names neither is malformed, not a request for the default.
     match serde_json::from_slice::<ImagePullBody>(body) {
-        Ok(ImagePullBody { image: Some(image) }) if is_json => Ok(Some(image)),
+        Ok(ImagePullBody { image, flight })
+            if is_json
+                && (takes_flight || flight.is_none())
+                && (image.is_some() || flight.is_some()) =>
+        {
+            Ok((image, flight))
+        }
         _ => Err(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_body",
-            "Expected no body, or a JSON body like {\"image\": \"<configured image>\"}",
+            if takes_flight {
+                "Expected no body, or a JSON body like {\"image\": \"<configured image>\", \"flight\": <id>}"
+            } else {
+                "Expected no body, or a JSON body like {\"image\": \"<configured image>\"}"
+            },
         )),
     }
 }
 
-/// The image a pull or cancel request names, once the dashboard may pull it.
+/// The image a pull or cancel request names, and a cancel's flight, once the dashboard may pull.
 async fn pull_request(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     body: &[u8],
-) -> Result<(Configured, String), Response> {
+    takes_flight: bool,
+) -> Result<(Configured, String, Option<u64>), Response> {
     if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
         return Err(resp);
     }
@@ -443,9 +462,9 @@ async fn pull_request(
     if pull_blocked(state, &configured).is_some() {
         return Err(pull_disabled());
     }
-    let requested = requested_image(headers, body)?;
+    let (requested, flight) = requested_image(headers, body, takes_flight)?;
     let image = resolve_image(&configured, requested.as_deref(), None)?;
-    Ok((configured, image))
+    Ok((configured, image, flight))
 }
 
 /// `POST /api/sandbox/image-pull`: starts at most one pull per image and returns at once;
@@ -455,7 +474,7 @@ pub async fn sandbox_image_pull(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (configured, image) = match pull_request(&state, &headers, &body).await {
+    let (configured, image, _) = match pull_request(&state, &headers, &body, false).await {
         Ok(request) => request,
         Err(resp) => return resp,
     };
@@ -465,10 +484,12 @@ pub async fn sandbox_image_pull(
     // Joined under the map's lock, so two POSTs can't both add a waiter to one pull. Matched by
     // flight, so an entry left by a cancelled pull doesn't stand in for the next one.
     let running = runtime.running_pull_id(&image);
+    let mut flight = running;
     if running.is_none() || waiters.get(&key) != running.as_ref() {
         // Registered now, so the next status read already sees it running.
         let waiter = runtime.join_pull(&image);
         let id = waiter.flight_id();
+        flight = Some(id);
         waiters.insert(key.clone(), id);
         tokio::task::spawn_blocking(move || {
             // A pull the dashboard asked for is never cancelled by a create that joined it.
@@ -486,7 +507,11 @@ pub async fn sandbox_image_pull(
     drop(waiters);
     (
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "image": image, "pull": PullState::Running(Default::default()) })),
+        Json(serde_json::json!({
+            "image": image,
+            "pull": PullState::Running(Default::default()),
+            "flight": flight,
+        })),
     )
         .into_response()
 }
@@ -494,26 +519,36 @@ pub async fn sandbox_image_pull(
 /// How long a Cancel waits for the killed pull to end; the kill itself takes at most 250 ms.
 const CANCEL_BACKSTOP: Duration = Duration::from_secs(5);
 
-/// `POST /api/sandbox/image-pull/cancel`, with the same body as image-pull: cancels the
-/// image's running pull for every waiter and answers with the state it ended in. With no pull
-/// running it answers the current state, so a repeat is harmless.
+/// `POST /api/sandbox/image-pull/cancel`, with image-pull's body plus an optional `flight`:
+/// cancels the image's running pull for every waiter and answers with the state it ended in.
+/// With `flight`, a different pull running is refused with `409 pull_replaced`, so a cancel
+/// can't stop a pull that replaced the one the client saw. With no pull running it answers the
+/// current state, so a repeat is harmless.
 pub async fn sandbox_image_cancel(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (configured, image) = match pull_request(&state, &headers, &body).await {
+    let (configured, image, flight) = match pull_request(&state, &headers, &body, true).await {
         Ok(request) => request,
         Err(resp) => return resp,
     };
     let runtime = ContainerRuntime::from(configured.runtime);
     let cancelled = tokio::task::spawn_blocking({
         let image = image.clone();
-        move || runtime.cancel_pull(&image, CANCEL_BACKSTOP)
+        move || runtime.cancel_pull(&image, flight, CANCEL_BACKSTOP)
     })
     .await;
-    let pull =
-        cancelled.unwrap_or_else(|_| ContainerRuntime::from(configured.runtime).pull_state(&image));
+    let pull = match cancelled {
+        Ok(Ok(pull)) => pull,
+        Ok(Err(crate::containers::image_pull::Replaced)) => {
+            return api_error_with_code_header(
+                ApiErrorCode::PullReplaced,
+                "That download already ended and another one is running, so nothing was cancelled",
+            );
+        }
+        Err(_) => ContainerRuntime::from(configured.runtime).pull_state(&image),
+    };
     Json(serde_json::json!({ "image": image, "pull": pull })).into_response()
 }
 
@@ -529,8 +564,8 @@ fn is_sha256_digest(digest: &str) -> bool {
     })
 }
 
-/// `POST /api/sandbox/image-dismiss`: snoozes the banner for this remote digest. The TUI reads
-/// and writes the same `app_state.dismissed_image_digest`.
+/// `POST /api/sandbox/image-dismiss`: snoozes the update for this remote digest, for the
+/// dashboard and the TUI alike.
 pub async fn sandbox_image_dismiss(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ImageDismissBody>, JsonRejection>,
@@ -811,29 +846,46 @@ mod tests {
             headers
         };
         let image = br#"{"image":"ghcr.io/x/y:1"}"#;
-        // (headers, body, requested image, or None for invalid_body)
-        let cases: [(axum::http::HeaderMap, &[u8], Option<Option<&str>>); 10] = [
-            (none(), b"", Some(None)),
-            (json_type(), b"", Some(None)),
-            (json_type(), image, Some(Some("ghcr.io/x/y:1"))),
+        let named = br#"{"image":"ghcr.io/x/y:1","flight":7}"#;
+        let flight_only = br#"{"flight":7}"#;
+        let pulled = Some("ghcr.io/x/y:1");
+        // (headers, body, a cancel's body, requested image and flight, or None for invalid_body)
+        type Want = Option<(Option<&'static str>, Option<u64>)>;
+        let cases: [(axum::http::HeaderMap, &[u8], bool, Want); 15] = [
+            (none(), b"", false, Some((None, None))),
+            (json_type(), b"", false, Some((None, None))),
+            (json_type(), image, false, Some((pulled, None))),
             (
                 typed("Application/JSON; charset=utf-8"),
                 image,
-                Some(Some("ghcr.io/x/y:1")),
+                false,
+                Some((pulled, None)),
             ),
             // A configured image sent without a JSON content type must not pull the default.
-            (none(), image, None),
-            (typed("application/json-extra"), image, None),
-            (json_type(), b"{not json", None),
+            (none(), image, false, None),
+            (typed("application/json-extra"), image, false, None),
+            (json_type(), b"{not json", false, None),
             // A body naming no image is malformed, not a request for the default.
-            (json_type(), b"{}", None),
-            (json_type(), br#"{"image":null}"#, None),
-            (typed("text/plain"), image, None),
+            (json_type(), b"{}", false, None),
+            (json_type(), br#"{"image":null}"#, false, None),
+            (typed("text/plain"), image, false, None),
+            // Only a cancel names a flight, with its image or for the default one.
+            (json_type(), named, true, Some((pulled, Some(7)))),
+            (json_type(), flight_only, true, Some((None, Some(7)))),
+            (json_type(), image, true, Some((pulled, None))),
+            (json_type(), named, false, None),
+            (json_type(), b"{}", true, None),
         ];
-        for (headers, body, want) in cases {
-            let got = requested_image(&headers, body);
+        for (headers, body, takes_flight, want) in cases {
+            let got = requested_image(&headers, body, takes_flight);
             match want {
-                Some(image) => assert_eq!(got.ok().flatten().as_deref(), image, "{body:?}"),
+                Some((image, flight)) => {
+                    let Ok((got_image, got_flight)) = got else {
+                        panic!("{body:?} was refused");
+                    };
+                    assert_eq!(got_image.as_deref(), image, "{body:?}");
+                    assert_eq!(got_flight, flight, "{body:?}");
+                }
                 None => assert_eq!(
                     got.err().map(|r| r.status()),
                     Some(StatusCode::BAD_REQUEST),
@@ -942,8 +994,8 @@ mod tests {
         assert_eq!(json(post().await).await.0, StatusCode::ACCEPTED);
         let stale = DASHBOARD_WAITERS.lock().unwrap_or_else(|e| e.into_inner())[&key];
         assert_eq!(
-            image_pull::cancel(&pull_key, Duration::from_secs(10)),
-            PullState::Cancelled
+            image_pull::cancel(&pull_key, None, Duration::from_secs(10)),
+            Ok(PullState::Cancelled)
         );
         drop(first);
         // Once the cancelled pull's dashboard task has cleaned up, put its entry back: the
@@ -982,6 +1034,112 @@ mod tests {
             .unwrap();
     }
 
+    /// image-status and image-pull name the running flight, and a cancel naming an earlier one
+    /// is refused with `409 pull_replaced`, leaving the pull that replaced it running.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_cancel_naming_an_ended_flight_is_refused_and_leaves_the_new_pull() {
+        use crate::containers::image_pull;
+        const IMAGE: &str = "aoe-test/cancel-flight:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = Some(IMAGE.into());
+        })
+        .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
+        let pull_key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        let status = || {
+            let state = state.clone();
+            async move {
+                let resp = sandbox_image_status(
+                    State(state),
+                    Query(ImageStatusQuery {
+                        image: None,
+                        profile: None,
+                        fresh: false,
+                    }),
+                )
+                .await;
+                json(resp).await.1
+            }
+        };
+        let status_flight = || async { status().await["flight"].as_u64() };
+        let cancel = |flight: u64| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            let body = serde_json::json!({ "image": IMAGE, "flight": flight }).to_string();
+            sandbox_image_cancel(State(state.clone()), headers, body.into())
+        };
+
+        let first = image_pull::join_with(pull_key.clone(), |pull| {
+            pull.installed(Some("sha256:first".into()));
+            Ok(())
+        });
+        let stale = first.flight_id();
+        first
+            .wait(&tokio_util::sync::CancellationToken::new())
+            .unwrap();
+        assert_eq!(status_flight().await, None, "an ended pull has no flight");
+        assert_eq!(
+            status().await["pull"],
+            serde_json::json!({ "state": "done", "digest": "sha256:first" }),
+            "a Done doesn't name what it installed"
+        );
+        let second = image_pull::join_with(pull_key.clone(), |pull| {
+            while !pull.kill.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(crate::containers::error::DockerError::Cancelled(
+                "pull".into(),
+            ))
+        });
+        let current = second.flight_id();
+        assert_eq!(status_flight().await, Some(current));
+        let (code, body) = json(
+            sandbox_image_pull(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::new(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(
+            body["flight"].as_u64(),
+            Some(current),
+            "image-pull joined it"
+        );
+
+        let resp = cancel(stale).await;
+        assert_eq!(
+            resp.headers()
+                .get(crate::daemon::ERROR_CODE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("pull_replaced")
+        );
+        let (code, body) = json(resp).await;
+        assert_eq!(
+            (code, body["error"].as_str()),
+            (StatusCode::CONFLICT, Some("pull_replaced"))
+        );
+        assert_eq!(status_flight().await, Some(current), "the new pull runs on");
+
+        let (code, body) = json(cancel(current).await).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(body["pull"]["state"], "cancelled");
+        drop(second);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn cancel_is_gated_like_a_pull_and_answers_the_state_the_pull_ended_in() {
@@ -1004,6 +1162,10 @@ mod tests {
             )
         };
         let pull_of = |body: serde_json::Value| body["pull"].clone();
+        // The TUI reads these bodies back as `PullState`.
+        let decoded = |pull: serde_json::Value| {
+            serde_json::from_value::<image_pull::PullState>(pull).expect("a PullState")
+        };
         let status = || {
             let state = state.clone();
             async move {
@@ -1044,11 +1206,13 @@ mod tests {
         let (code, body) = json(cancel(state.clone()).await).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["image"], IMAGE);
+        let pull = pull_of(body);
         assert_eq!(
-            pull_of(body),
+            pull,
             serde_json::json!({"state": "idle"}),
             "nothing to cancel"
         );
+        assert_eq!(decoded(pull), image_pull::PullState::Idle);
 
         let runtime = ContainerRuntime::from(ContainerRuntimeName::default());
         let pull_key = image_pull::PullKey {
@@ -1073,22 +1237,36 @@ mod tests {
                 "pull".into(),
             ))
         });
+        let pull = status().await;
         assert_eq!(
-            status().await,
+            pull,
             serde_json::json!({"state": "running"}),
             "no counts before a line parses"
+        );
+        assert_eq!(
+            decoded(pull),
+            image_pull::PullState::Running(Default::default())
         );
         release.send(()).unwrap();
         reported
             .recv_timeout(Duration::from_secs(10))
             .expect("the pull reports");
+        let pull = status().await;
         assert_eq!(
-            status().await,
+            pull,
             serde_json::json!({
                 "state": "running",
                 "phase": "downloading",
                 "layers_done": 1,
                 "layers_known": 2,
+            })
+        );
+        assert_eq!(
+            decoded(pull),
+            image_pull::PullState::Running(crate::containers::pull_progress::ProgressSnapshot {
+                phase: Some(crate::containers::pull_progress::PullPhase::Downloading),
+                layers_done: Some(1),
+                layers_known: Some(2),
             })
         );
 
@@ -1099,7 +1277,9 @@ mod tests {
             running.wait(&tokio_util::sync::CancellationToken::new()),
             Err(crate::containers::error::DockerError::PullCancelled(_))
         ));
-        assert_eq!(status().await, serde_json::json!({"state": "cancelled"}));
+        let pull = status().await;
+        assert_eq!(pull, serde_json::json!({"state": "cancelled"}));
+        assert_eq!(decoded(pull), image_pull::PullState::Cancelled);
         let (code, body) = json(cancel(state.clone()).await).await;
         assert_eq!(
             (code, pull_of(body)),
@@ -1107,8 +1287,36 @@ mod tests {
             "a repeat answers the same"
         );
 
+        let failed = image_pull::join_with(pull_key.clone(), |_| {
+            Err(crate::containers::error::DockerError::ImagePullFailed {
+                runtime: "docker",
+                image: IMAGE.into(),
+                detail: "dial tcp: lookup registry".into(),
+                reason: image_pull::PullFailureReason::Network,
+            })
+        });
+        assert!(failed
+            .wait(&tokio_util::sync::CancellationToken::new())
+            .is_err());
+        assert_eq!(
+            decoded(status().await),
+            image_pull::PullState::Failed {
+                reason: image_pull::PullFailureReason::Network,
+                message: image_pull::PullFailureReason::Network.user_text(),
+                error: format!("docker couldn't pull image {IMAGE}: dial tcp: lookup registry"),
+            }
+        );
+
         crate::session::update_config(|c| c.sandbox.allow_image_pull = false).unwrap();
-        let (code, body) = json(cancel(state.clone()).await).await;
+        let resp = cancel(state.clone()).await;
+        assert_eq!(
+            resp.headers()
+                .get(crate::daemon::ERROR_CODE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("pull_disabled"),
+            "a pull_disabled refusal didn't set the code header"
+        );
+        let (code, body) = json(resp).await;
         assert_eq!(
             (code, body["error"].as_str()),
             (StatusCode::FORBIDDEN, Some("pull_disabled"))
@@ -1223,7 +1431,15 @@ mod tests {
                 axum::body::Bytes::new(),
             )
         };
-        let (code, body) = json(pull(state.clone()).await).await;
+        let resp = pull(state.clone()).await;
+        assert_eq!(
+            resp.headers()
+                .get(crate::daemon::ERROR_CODE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("pull_disabled"),
+            "a pull_disabled refusal didn't set the code header"
+        );
+        let (code, body) = json(resp).await;
         assert_eq!(
             (code, body["error"].as_str()),
             (StatusCode::FORBIDDEN, Some("pull_disabled"))
@@ -1262,7 +1478,6 @@ mod tests {
         }
         let (code, _) = json(dismiss(state.clone(), &digest).await).await;
         assert_eq!(code, StatusCode::OK);
-        // The TUI reads the same field.
         assert_eq!(
             crate::session::Config::load_or_warn()
                 .app_state

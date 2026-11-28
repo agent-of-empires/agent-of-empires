@@ -833,6 +833,18 @@ fn format_snooze_remaining(delta: crate::time::Duration) -> String {
 /// one of left padding.
 const LAST_ACTIVITY_SLOT: usize = 6;
 
+/// Which of Live send's optional hints, `(scroll indicator, leader hint)`, fit beside the pieces
+/// it always draws (`kept`: chip, exit chord, pull badge). The title takes what is left; where
+/// even an empty title can't fit, the leader hint goes first, then the scroll indicator.
+pub(super) fn live_hints_fit(
+    width: usize,
+    kept: usize,
+    scroll: usize,
+    leader: usize,
+) -> (bool, bool) {
+    (kept + scroll <= width, kept + scroll + leader <= width)
+}
+
 /// Trailing gap between the activity slot (or terminal-mode badge) and the pane's right
 /// border, one cell, matching the breathing room other widgets leave around the border.
 const LAST_ACTIVITY_RIGHT_MARGIN: usize = 1;
@@ -1176,7 +1188,8 @@ impl HomeView {
         // Keep temporary feedback and the leader menu available with the bar hidden.
         let has_status_bar = self.show_shortcut_bar
             || self.status_flash_text().is_some()
-            || (self.live_send.is_some() && self.live_send_pending_leader);
+            || (self.live_send.is_some() && self.live_send_pending_leader)
+            || self.hidden_pull.is_some();
         let has_update_bar = update_bar.is_some();
         let mut constraints = vec![Constraint::Min(0)];
         if last_prompt.is_some() {
@@ -4318,6 +4331,18 @@ impl HomeView {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
+    /// A hidden running pull's progress, for the end of the key line.
+    fn hidden_pull_badge(&self, theme: &Theme) -> Option<Span<'static>> {
+        let snapshot = self.hidden_pull.as_ref()?;
+        let spinner = spinners::dots()
+            .set_interval(Duration::from_millis(220))
+            .current_frame();
+        Some(Span::styled(
+            super::update_bar::hidden_pull_badge(snapshot, spinner),
+            Style::default().fg(theme.accent).bold(),
+        ))
+    }
+
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // The bar is on screen from here, so a queued flash can start counting.
         self.arm_status_flash();
@@ -4362,6 +4387,13 @@ impl HomeView {
             return;
         }
         if !self.show_shortcut_bar && !(self.live_send.is_some() && self.live_send_pending_leader) {
+            // With the bar hidden, the row is kept only for a hidden pull's progress.
+            if let Some(badge) = self.hidden_pull_badge(theme) {
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![Span::raw(" "), badge])),
+                    area,
+                );
+            }
             return;
         }
         // The leader menu can temporarily restore the hidden shortcut row.
@@ -4426,7 +4458,7 @@ impl HomeView {
             let suffix = " to exit ";
             // Compact reminder that the leader opens the command menu, so the palette
             // and sidebar toggle are discoverable. Empty when the leader is disabled.
-            let leader_hint = if flash_ctrl_c {
+            let mut leader_hint = if flash_ctrl_c {
                 String::new()
             } else {
                 state
@@ -4442,7 +4474,7 @@ impl HomeView {
             // Pull `captured_lines` from whichever cache is on screen: the Agent cache
             // would show a stale `[offset/max]` in Terminal/Tool live mode. Hidden while
             // the Ctrl+C flash needs the room.
-            let scroll = if flash_ctrl_c {
+            let mut scroll = if flash_ctrl_c {
                 String::new()
             } else {
                 format_scroll_indicator(
@@ -4459,14 +4491,27 @@ impl HomeView {
             } else {
                 ""
             };
-            // Spaces between chip, title and chord. The title gets what is left after
-            // the fixed pieces, reserved last so the exit chord never falls off.
-            let fixed_width = unicode_width::UnicodeWidthStr::width(chip)
+            let badge = self.hidden_pull_badge(theme);
+            let kept_width = badge.as_ref().map_or(0, |badge| 2 + badge.width())
+                + unicode_width::UnicodeWidthStr::width(chip)
                 + 1 // single space after the chip
                 + 2 // double space before the chord
                 + unicode_width::UnicodeWidthStr::width(flash)
                 + unicode_width::UnicodeWidthStr::width(chord.as_str())
-                + unicode_width::UnicodeWidthStr::width(suffix)
+                + unicode_width::UnicodeWidthStr::width(suffix);
+            let (keep_scroll, keep_leader) = live_hints_fit(
+                area.width as usize,
+                kept_width,
+                unicode_width::UnicodeWidthStr::width(scroll.as_str()),
+                unicode_width::UnicodeWidthStr::width(leader_hint.as_str()),
+            );
+            if !keep_leader {
+                leader_hint.clear();
+            }
+            if !keep_scroll {
+                scroll.clear();
+            }
+            let fixed_width = kept_width
                 + unicode_width::UnicodeWidthStr::width(leader_hint.as_str())
                 + unicode_width::UnicodeWidthStr::width(scroll.as_str());
             let title_budget = (area.width as usize).saturating_sub(fixed_width);
@@ -4499,6 +4544,10 @@ impl HomeView {
                     leader_hint,
                     Style::default().fg(theme.dimmed).italic(),
                 ));
+            }
+            if let Some(badge) = badge {
+                spans.push(Span::raw("  "));
+                spans.push(badge);
             }
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
@@ -4815,6 +4864,11 @@ impl HomeView {
             index
         });
 
+        let pull_badge = self.hidden_pull_badge(theme).map(|badge| {
+            groups.push((0, None, vec![badge]));
+            groups.len() - 1
+        });
+
         // Pack shortcuts and optional Tips by priority within the runtime status boundary.
         // Widths and separators use display cells, matching the painted click rectangles.
         let mut widths: Vec<usize> = groups
@@ -4825,8 +4879,15 @@ impl HomeView {
         let avail = (area.width as usize).saturating_sub(1);
 
         let mut order: Vec<usize> = (0..groups.len()).collect();
-        // The running server status packs before other priority-0 groups, so it is the last to drop.
-        order.sort_by_key(|&i| (groups[i].0, Some(i) != serving_status));
+        // A hidden pull's badge, its only progress, then the running server status pack before
+        // other priority-0 groups, so they are the last to drop.
+        order.sort_by_key(|&i| {
+            (
+                groups[i].0,
+                Some(i) != pull_badge,
+                Some(i) != serving_status,
+            )
+        });
 
         let mut keep = vec![false; groups.len()];
         let mut used = 0usize;
@@ -4934,7 +4995,31 @@ impl HomeView {
         let dismiss_key =
             super::bindings::label(ActionId::DismissUpdateBanner, self.strict_hotkeys);
         let text = match bar {
+            UpdateBar::CancelPrompt => format!(
+                " Press y within {} s to cancel the download. To keep going, press any other key.",
+                crate::tui::image_pull::CANCEL_CONFIRM_TTL.as_secs()
+            ),
             UpdateBar::Status(s) => format!(" {s}  [{dismiss_key}] dismiss"),
+            UpdateBar::Pull(line) => {
+                use super::update_bar::PullTone;
+                let color = match line.tone() {
+                    PullTone::Brand => theme.accent,
+                    PullTone::Success => theme.running,
+                    PullTone::Error => theme.error,
+                    PullTone::Plain => theme.text,
+                };
+                let spinner = spinners::dots()
+                    .set_interval(Duration::from_millis(220))
+                    .current_frame();
+                let text = line.text(area.width, self.strict_hotkeys, spinner);
+                let bar = Paragraph::new(Line::from(Span::styled(
+                    text,
+                    Style::default().fg(color).bold(),
+                )))
+                .style(Style::default().bg(theme.selection));
+                frame.render_widget(bar, area);
+                return;
+            }
             UpdateBar::Live(s) => format!(" {s}"),
             // Reassure users (#2220) that updating never tears down running sessions.
             // Kept after the keys so the action hints stay visible on narrow terminals.

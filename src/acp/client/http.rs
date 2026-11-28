@@ -150,6 +150,52 @@ pub enum HttpError {
     Daemon(#[from] crate::daemon::DaemonClientError),
 }
 
+/// `GET /api/sandbox/image-status`, the fields a client reads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SandboxImageStatus {
+    pub image: String,
+    #[serde(flatten)]
+    pub state: SandboxImageAvailability,
+    pub dismissed: bool,
+    pub checks_enabled: bool,
+    pub sandbox_in_use: bool,
+    pub pull: crate::containers::image_pull::PullState,
+    /// The running pull's id, which a cancel names; absent from a Daemon that has none.
+    #[serde(default)]
+    pub flight: Option<u64>,
+    /// Why this Daemon won't pull; `pull_command` is then what to run instead.
+    pub pull_blocked: Option<String>,
+    pub pull_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SandboxImageAvailability {
+    Available {
+        remote_digest: String,
+    },
+    Current,
+    Unknown {
+        reason: String,
+    },
+    CheckFailed {
+        error: String,
+    },
+    /// A state a newer Daemon reports that this client doesn't know. Not `Unknown`, which is
+    /// the Daemon's own "no answer from the check".
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// What `image-pull` and `image-pull/cancel` answer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SandboxPullReply {
+    pub pull: crate::containers::image_pull::PullState,
+    /// The pull this request started or joined.
+    #[serde(default)]
+    pub flight: Option<u64>,
+}
+
 impl From<reqwest::Error> for HttpError {
     fn from(_: reqwest::Error) -> Self {
         Self::Transport
@@ -502,6 +548,77 @@ impl HttpClient {
         let res = self.execute(self.http.get(&url)).await?;
         let res = check_global_status(res)?;
         Ok(crate::daemon::decode_json::<UiSnapshot>(res).await?)
+    }
+
+    /// `GET /api/sandbox/image-status` for the configured image. `fresh` skips the cached
+    /// registry check.
+    /// `image` empty: the Daemon's configured default.
+    pub async fn sandbox_image_status(
+        &self,
+        fresh: bool,
+        image: &str,
+    ) -> Result<SandboxImageStatus, HttpError> {
+        let url = format!("{}/api/sandbox/image-status", self.endpoint.base_url);
+        let mut request = self.http.get(&url).query(&[("fresh", fresh)]);
+        if !image.is_empty() {
+            request = request.query(&[("image", image)]);
+        }
+        let res = self.execute(request).await?;
+        let res = check_global_status(res)?;
+        Ok(crate::daemon::decode_json(res).await?)
+    }
+
+    /// `POST /api/sandbox/image-pull`: starts `image`'s pull, or joins it; empty is the
+    /// Daemon's configured default.
+    pub async fn sandbox_image_pull(&self, image: &str) -> Result<SandboxPullReply, HttpError> {
+        self.sandbox_pull_request("/api/sandbox/image-pull", image, None)
+            .await
+    }
+
+    /// `POST /api/sandbox/image-pull/cancel`: the state `image`'s cancelled pull ended in. With
+    /// `flight`, the Daemon refuses (`409 pull_replaced`) if another pull has replaced it.
+    pub async fn sandbox_image_cancel(
+        &self,
+        image: &str,
+        flight: Option<u64>,
+    ) -> Result<SandboxPullReply, HttpError> {
+        self.sandbox_pull_request("/api/sandbox/image-pull/cancel", image, flight)
+            .await
+    }
+
+    /// `POST /api/sandbox/image-dismiss`: the Daemon keeps the dismissal, and its image status
+    /// then reports the update as dismissed.
+    pub async fn sandbox_image_dismiss(&self, digest: &str) -> Result<(), HttpError> {
+        let url = format!("{}/api/sandbox/image-dismiss", self.endpoint.base_url);
+        let request = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "digest": digest }));
+        check_global_status(self.execute(request).await?)?;
+        Ok(())
+    }
+
+    async fn sandbox_pull_request(
+        &self,
+        path: &str,
+        image: &str,
+        flight: Option<u64>,
+    ) -> Result<SandboxPullReply, HttpError> {
+        let url = format!("{}{path}", self.endpoint.base_url);
+        let mut request = self.http.post(&url);
+        let mut body = serde_json::Map::new();
+        if !image.is_empty() {
+            body.insert("image".into(), image.into());
+        }
+        if let Some(flight) = flight {
+            body.insert("flight".into(), flight.into());
+        }
+        if !body.is_empty() {
+            request = request.json(&body);
+        }
+        let res = self.execute(request).await?;
+        let res = check_global_status(res)?;
+        Ok(crate::daemon::decode_json::<SandboxPullReply>(res).await?)
     }
 
     /// `GET /api/plugins/commands`. The daemon's active plugin commands with
@@ -2994,5 +3111,208 @@ mod tests {
             body,
             &serde_json::json!({"config_id": "reasoning_effort", "value": "high"})
         );
+    }
+
+    /// The three sandbox image calls against the real router, naming the watched image after the
+    /// machine default moved on. A stand-in flight is the pull, so no runtime is run.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_image_status_pull_and_cancel_round_trip() {
+        use crate::containers::image_pull::{self, PullState};
+        use crate::server::test_support;
+        const IMAGE: &str = "aoe-test/http-client-pull:latest";
+        const OTHER: &str = "aoe-test/http-client-other:latest";
+        let _app = crate::session::test_support::isolate_app_dir();
+        crate::session::update_config(|c| {
+            c.updates.update_check_mode = crate::session::config::UpdateCheckMode::Off;
+            c.sandbox.allow_image_pull = true;
+            c.sandbox.default_image = Some(IMAGE.into());
+        })
+        .unwrap();
+        let serve = |state: std::sync::Arc<crate::server::AppState>| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = test_support::build_router_for_test(state.clone());
+            let shutdown = state.shutdown.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+                .unwrap();
+            });
+            (HttpClient::new(endpoint(&base, None)).unwrap(), server)
+        };
+
+        let state = test_support::build_test_app_state(Vec::new());
+        let (client, server) = serve(state.clone()).await;
+        let status = client.sandbox_image_status(false, "").await.unwrap();
+        assert_eq!(status.image, IMAGE);
+        assert_eq!(status.pull, PullState::Idle);
+        assert_eq!(status.pull_blocked, None);
+        assert!(
+            status.pull_command.contains(IMAGE),
+            "{}",
+            status.pull_command
+        );
+
+        let runtime = crate::containers::ContainerRuntime::from(
+            crate::session::ContainerRuntimeName::default(),
+        );
+        let key = image_pull::PullKey {
+            runtime: runtime.display_name(),
+            image: IMAGE.into(),
+        };
+        // Ends by itself at the deadline, so a broken cancel fails the test instead of leaving
+        // the router's waiter blocked through the runtime's shutdown.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let flight = image_pull::join_with(key, move |pull| {
+            while !pull.kill.is_cancelled() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(crate::containers::error::DockerError::Cancelled(
+                "pull".into(),
+            ))
+        });
+        let id = flight.flight_id();
+        let started = client.sandbox_image_pull("").await.unwrap();
+        assert_eq!(started.pull, PullState::Running(Default::default()));
+        assert_eq!(
+            started.flight,
+            Some(id),
+            "the reply names the pull it joined"
+        );
+        // The default moves on; a profile still uses the watched image, so it stays configured.
+        crate::session::create_profile("work").unwrap();
+        crate::session::update_profile_config("work", |p| {
+            p.overrides.insert(
+                "sandbox".into(),
+                serde_json::json!({ "default_image": IMAGE }),
+            );
+            Ok(())
+        })
+        .unwrap();
+        crate::session::update_config(|c| c.sandbox.default_image = Some(OTHER.into())).unwrap();
+        assert_eq!(
+            client.sandbox_image_status(false, "").await.unwrap().pull,
+            PullState::Idle,
+            "the default image isn't pulling"
+        );
+        let status = client.sandbox_image_status(false, IMAGE).await.unwrap();
+        assert!(matches!(status.pull, PullState::Running(_)));
+        assert_eq!(status.flight, Some(id));
+        // A cancel naming another flight is refused, and this pull runs on.
+        assert!(matches!(
+            client.sandbox_image_cancel(IMAGE, Some(id + 1)).await,
+            Err(HttpError::Server { status, ref body })
+                if status == reqwest::StatusCode::CONFLICT && body == "pull_replaced"
+        ));
+        assert_eq!(
+            client
+                .sandbox_image_cancel(IMAGE, Some(id))
+                .await
+                .unwrap()
+                .pull,
+            PullState::Cancelled
+        );
+        assert!(matches!(
+            client.sandbox_image_pull("aoe-test/not-configured:latest").await,
+            Err(HttpError::Server { status, ref body })
+                if status == reqwest::StatusCode::BAD_REQUEST && body.contains("unknown_image")
+        ));
+        assert!(flight
+            .wait(&tokio_util::sync::CancellationToken::new())
+            .is_err());
+        state.shutdown.cancel();
+        server.await.unwrap();
+
+        let read_only =
+            test_support::build_test_app_state_configured(Vec::new(), |s| s.read_only = true);
+        let (client, server) = serve(read_only.clone()).await;
+        assert_eq!(
+            client
+                .sandbox_image_status(false, "")
+                .await
+                .unwrap()
+                .pull_blocked
+                .as_deref(),
+            Some("read_only")
+        );
+        assert!(matches!(
+            client.sandbox_image_pull("").await,
+            Err(HttpError::ReadOnly)
+        ));
+        read_only.shutdown.cancel();
+        server.await.unwrap();
+    }
+
+    /// A newer Daemon's values in `image-status` decode to each enum's catch-all, so one new
+    /// variant can't fail the whole poll.
+    #[test]
+    fn a_newer_daemons_image_status_values_decode() {
+        use crate::containers::image_pull::{PullFailureReason, PullState};
+        use crate::containers::pull_progress::{ProgressSnapshot, PullPhase};
+        let status = |state: &str, pull: serde_json::Value| {
+            serde_json::from_value::<SandboxImageStatus>(serde_json::json!({
+                "image": "ghcr.io/example/sandbox:latest",
+                "state": state,
+                "dismissed": false,
+                "checks_enabled": true,
+                "sandbox_in_use": true,
+                "pull": pull,
+                "flight": null,
+                "pull_blocked": null,
+                "pull_command": "docker pull ghcr.io/example/sandbox:latest",
+            }))
+        };
+        let idle = serde_json::json!({ "state": "idle" });
+        for (label, state, pull, want_state, want_pull) in [
+            (
+                "SandboxImageAvailability",
+                "stale",
+                idle.clone(),
+                SandboxImageAvailability::Unrecognized,
+                PullState::Idle,
+            ),
+            (
+                "PullState",
+                "current",
+                serde_json::json!({ "state": "verifying" }),
+                SandboxImageAvailability::Current,
+                PullState::Unknown,
+            ),
+            (
+                "PullPhase",
+                "current",
+                serde_json::json!({ "state": "running", "phase": "verifying", "layers_done": 1, "layers_known": 2 }),
+                SandboxImageAvailability::Current,
+                PullState::Running(ProgressSnapshot {
+                    phase: Some(PullPhase::Unknown),
+                    layers_done: Some(1),
+                    layers_known: Some(2),
+                }),
+            ),
+            (
+                "PullFailureReason",
+                "current",
+                serde_json::json!({ "state": "failed", "reason": "quota", "message": "m", "error": "e" }),
+                SandboxImageAvailability::Current,
+                PullState::Failed {
+                    reason: PullFailureReason::Other,
+                    message: "m".into(),
+                    error: "e".into(),
+                },
+            ),
+        ] {
+            let status = status(state, pull)
+                .unwrap_or_else(|e| panic!("{label}: a newer Daemon's value failed the poll: {e}"));
+            assert_eq!(
+                (status.state, status.pull),
+                (want_state, want_pull),
+                "{label}"
+            );
+        }
     }
 }
