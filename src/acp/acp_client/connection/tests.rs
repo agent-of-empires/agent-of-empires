@@ -1342,7 +1342,7 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
 const GOOD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":2}}}"#;
 const BAD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":9,"primitive_schema_version":2}}}"#;
 
-const HELLO_WITH_INFO: &str = r#","agentInfo":{"name":"claude-x","version":"1.2.0"},"_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}"#;
+const HELLO_WITH_INFO: &str = r#","agentInfo":{"name":"claude-x","version":"1.2.0"},"_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":2}}}"#;
 
 fn proxy_spec(compat: ProxyCompat) -> ProxySpec {
     ProxySpec {
@@ -1360,7 +1360,7 @@ fn proxy_spec(compat: ProxyCompat) -> ProxySpec {
 /// proxy a hello is accepted as announced.
 #[tokio::test]
 async fn launched_proxy_hello_is_held_to_its_spec() {
-    let other_plugin = r#","_meta":{"aoe":{"proxy":{"plugin_id":"q","protocol_version":1,"primitive_schema_version":1}}}"#;
+    let other_plugin = r#","_meta":{"aoe":{"proxy":{"plugin_id":"q","protocol_version":1,"primitive_schema_version":2}}}"#;
     let compat = |names: &[&str], req: Option<&str>| ProxyCompat {
         agent_names: names.iter().map(|n| n.to_string()).collect(),
         version_req: req.map(|r| r.parse().unwrap()),
@@ -1499,8 +1499,8 @@ async fn shed_adapter_frames_credit_in_stream_order() {
     ready.expect("valid hello accepted");
     let shed = r#"{"jsonrpc":"2.0","method":"_aoe/adapter_frames_shed","params":{"count":1}}"#;
     let frames = [
-        tool_call_frame("h3", r#"{"v":1,"key":"k3","after_adapter_sequence":3}"#),
-        tool_call_frame("h2", r#"{"v":1,"key":"k2","after_adapter_sequence":2}"#),
+        tool_call_frame("h3", r#"{"v":2,"key":"k3","after_adapter_sequence":3}"#),
+        tool_call_frame("h2", r#"{"v":2,"key":"k2","after_adapter_sequence":2}"#),
         tool_call_frame("a1", ""),
         tool_call_frame("a2", ""),
         shed.to_string(),
