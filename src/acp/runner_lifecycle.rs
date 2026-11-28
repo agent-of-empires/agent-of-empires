@@ -156,6 +156,8 @@ struct Construction {
     idle_baseline_ms: std::sync::atomic::AtomicI64,
     /// Prompts admitted to this epoch; an idle stop observed before one is void.
     admissions: std::sync::atomic::AtomicU64,
+    /// Admitted prompts whose publication has not settled yet.
+    unsettled_admissions: std::sync::atomic::AtomicU64,
     /// A rate limit rejecting this launch belongs to its caller, which reads it from the error.
     defers_rate_limit_rejection: std::sync::atomic::AtomicBool,
 }
@@ -182,6 +184,7 @@ impl Default for Construction {
                 crate::time::Timestamp::now().as_millis(),
             ),
             admissions: std::sync::atomic::AtomicU64::new(0),
+            unsettled_admissions: std::sync::atomic::AtomicU64::new(0),
             defers_rate_limit_rejection: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -211,6 +214,17 @@ pub(crate) struct AdapterRetirementRoute {
     pub(crate) retired: std::sync::atomic::AtomicBool,
 }
 
+/// Holds an admission unsettled until its prompt's publication ends.
+pub(crate) struct AdmissionGuard(Arc<Construction>);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.0
+            .unsettled_admissions
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 impl Lease {
     /// When this epoch was admitted or last became running, in ms since the Unix epoch.
     pub(crate) fn idle_baseline_ms(&self) -> i64 {
@@ -225,11 +239,32 @@ impl Lease {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Whether an admitted prompt is still being published. Read after
+    /// [`Self::admissions`]: an admission that count missed fails a stop
+    /// observed with it, and one it saw is either settled or reported here.
+    pub(crate) fn has_unsettled_admission(&self) -> bool {
+        self.construction
+            .unsettled_admissions
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
     #[cfg(test)]
     pub(crate) fn test_backdate_idle_baseline(&self, ms: i64) {
         self.construction
             .idle_baseline_ms
             .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The closing `Stopped` reason a stop asked for, published or not.
+    #[cfg(test)]
+    pub(crate) fn test_stop_reason(&self) -> Option<String> {
+        self.construction
+            .stop_completion
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|debt| debt.reason.clone())
     }
 
     /// An attach observes the original runner until installation or an explicit stop.
@@ -1463,18 +1498,22 @@ impl LifecycleTable {
 
     /// Count a prompt against the running epoch and restart its idle clock,
     /// since the prompt is not stored yet. Under the table lock so an idle
-    /// stop's check cannot interleave with it.
-    pub(crate) fn note_admission(&self, session_id: &str) {
-        if let Some((lease, _)) = self.running(session_id) {
-            lease.construction.idle_baseline_ms.fetch_max(
-                crate::time::Timestamp::now().as_millis(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            lease
-                .construction
-                .admissions
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        }
+    /// stop's check cannot interleave with it. Hold the guard until the
+    /// publication settles.
+    pub(crate) fn note_admission(&self, session_id: &str) -> Option<AdmissionGuard> {
+        let (lease, _) = self.running(session_id)?;
+        let construction = &lease.construction;
+        construction.idle_baseline_ms.fetch_max(
+            crate::time::Timestamp::now().as_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        construction
+            .unsettled_admissions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        construction
+            .admissions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Some(AdmissionGuard(Arc::clone(construction)))
     }
 
     pub fn phase(&self, session_id: &str) -> WorkerPhase {

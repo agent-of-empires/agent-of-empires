@@ -2181,31 +2181,38 @@ impl HomeView {
                 } else {
                     data.command_override.clone()
                 };
-                if let Some(hook_agent) =
-                    crate::session::host_hook_agent(&tool_name, &command, &resolved_config.session)
-                {
-                    let config = crate::session::config::load_config().ok().flatten();
-                    let hooks_enabled = resolved_config.session.agent_status_hooks;
-                    let acknowledged = config
-                        .as_ref()
-                        .map(|c| c.app_state.has_acknowledged_agent_hooks)
-                        .unwrap_or(false);
-
-                    // A sandboxed session stages its hooks in its own container
-                    // config and the launch gate never asks, so asking here
-                    // would consent to a write that cannot happen.
-                    if !data.sandbox
+                let config = crate::session::config::load_config().ok().flatten();
+                let hooks_enabled = resolved_config.session.agent_status_hooks;
+                let acknowledged = config
+                    .as_ref()
+                    .map(|c| c.app_state.has_acknowledged_agent_hooks)
+                    .unwrap_or(false);
+                // A sandboxed session stages its hooks in its own container
+                // config and the launch gate never asks, so asking here
+                // would consent to a write that cannot happen.
+                let dialog_for = |hook_agent: &crate::agents::AgentDef| {
+                    (!data.sandbox
                         && crate::agents::hook_install_required(hook_agent, hooks_enabled)
-                        && !acknowledged
-                    {
-                        self.hooks_install_dialog = Some(HooksInstallDialog::new(
-                            &tool_name,
-                            hook_agent,
-                            &resolved_config,
-                        ));
-                        self.pending_hooks_install_data = Some(data);
-                        return None;
-                    }
+                        && !acknowledged)
+                        .then(|| HooksInstallDialog::new(&tool_name, hook_agent, &resolved_config))
+                };
+                let dialog = match crate::session::host_hook_declared_agent(
+                    &tool_name,
+                    &command,
+                    &resolved_config.session,
+                ) {
+                    Some(declared) => declared.with_definition(dialog_for).flatten(),
+                    None => crate::session::host_hook_agent(
+                        &tool_name,
+                        &command,
+                        &resolved_config.session,
+                    )
+                    .and_then(dialog_for),
+                };
+                if let Some(dialog) = dialog {
+                    self.hooks_install_dialog = Some(dialog);
+                    self.pending_hooks_install_data = Some(data);
+                    return None;
                 }
 
                 self.maybe_confirm_volume_ignores_globs(data)

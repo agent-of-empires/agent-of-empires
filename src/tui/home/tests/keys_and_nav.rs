@@ -741,7 +741,6 @@ fn native_unread_respects_visits_and_canonical_feedback() {
             .map(|(id, unread)| {
                 let mut row = crate::server::api::sessions::session_response_from_instance(
                     env.view.get_instance(id).unwrap(),
-                    false,
                 );
                 row.status = "Idle".into();
                 row.view = crate::session::View::Terminal;
