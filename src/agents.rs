@@ -1620,7 +1620,7 @@ pub fn effective_status_map(
     agent_name: &str,
 ) -> anyhow::Result<BTreeMap<String, HookStatus>> {
     let overrides = configured_status_map(config, agent_name);
-    let Some(agent) = get_agent(agent_name) else {
+    let Some(agent) = get_agent(agent_name).or_else(|| native_definition(agent_name)) else {
         if let Some(map) = overrides {
             return Ok(map.clone());
         }
@@ -1906,6 +1906,38 @@ mod tests {
         assert!(get_agent("omp").is_none());
         assert_eq!(terminal_tool_for_acp_agent("omp"), Some("omp"));
         assert_eq!(terminal_tool_for_acp_agent("not-a-tool"), None);
+    }
+
+    /// The native defaults and user overrides survive a plugin taking `claude` over.
+    #[test]
+    #[serial_test::serial]
+    fn effective_status_map_keeps_native_defaults_after_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_agent_plugin(
+            "aoe.claude",
+            "id = \"aoe.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
+             command = \"claude-next\"\n[agent_integrations.launch]\noneshot_flag = \"-p\"\n",
+        );
+        assert!(get_agent("claude").is_none());
+
+        let defaults = default_status_map_for_agent(native_definition("claude").unwrap());
+        let mut config = crate::session::config::Config::default();
+        assert_eq!(effective_status_map(&config, "claude").unwrap(), defaults);
+
+        let event = defaults.keys().next().unwrap().clone();
+        config
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert(event.clone(), HookStatus::Waiting);
+        let merged = effective_status_map(&config, "claude").unwrap();
+        assert_eq!(merged[&event], HookStatus::Waiting);
+        assert_eq!(merged.len(), defaults.len());
     }
 
     #[cfg(unix)]
