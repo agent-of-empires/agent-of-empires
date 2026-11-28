@@ -421,23 +421,23 @@ fn snapshot_carries_feature_uses_and_prefs() {
     use agent_of_empires::session::config::{update_app_state, SortOrder};
     use agent_of_empires::telemetry::feature_use::{self, FeatureUse};
     let _tmp = opted_in();
-    update_app_state(|state| state.sort_order = Some(SortOrder::Attention)).expect("save");
+    update_app_state(|state| state.sort_order = Some(SortOrder::Name)).expect("save");
     assert!(feature_use::record_name(
-        FeatureUse::from(SortOrder::Attention).as_str()
+        FeatureUse::from(SortOrder::Name).as_str()
     ));
-    assert!(feature_use::record_name("sort_attention"));
+    assert!(feature_use::record_name("sort_az"));
     assert!(!feature_use::record_name("not_a_feature"));
 
     let uses = feature_use::snapshot();
-    assert_eq!(uses["sort_attention"], 2);
+    assert_eq!(uses["sort_az"], 2);
     assert!(!uses.contains_key("not_a_feature"));
     assert_eq!(
-        build_snapshot(Surface::Tui, &[]).prefs["tui_sort_order"],
-        "attention"
+        build_snapshot(Surface::Tui, &[]).prefs["sidebar_sort"],
+        "name"
     );
 
     feature_use::clear_reported(&uses);
-    assert_eq!(feature_use::snapshot()["sort_attention"], 0);
+    assert_eq!(feature_use::snapshot()["sort_az"], 0);
 }
 
 /// #1885: the serve snapshot carries the coarse deployment mode from its closed

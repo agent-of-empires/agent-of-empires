@@ -69,12 +69,11 @@ pub use fork::{ForkDenied, ForkParentRef, ForkSeed};
 pub(crate) use groups::is_live_favorite;
 pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
-    archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
-    flatten_tree_all_profiles, is_archived_section_path, is_synthetic_project_header,
-    is_trash_section_path, is_within_archived_section, is_within_trash_section,
-    project_group_display_name, Group, GroupTree, Item, ARCHIVED_SECTION_NAME,
-    ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
-    TRASH_SECTION_PATH,
+    archived_project_sub_path, flatten_tree, flatten_tree_all_profiles, is_archived_section_path,
+    is_synthetic_project_header, is_trash_section_path, is_within_archived_section,
+    is_within_trash_section, project_group_display_name, Group, GroupTree, Item,
+    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH,
+    TRASH_SECTION_NAME, TRASH_SECTION_PATH,
 };
 #[cfg(test)]
 pub(crate) use instance::before_start_slot_waiters;
@@ -98,8 +97,8 @@ pub(crate) use instance::{
     forget_before_start_resolution, BeforeStartHook, BeforeStartHookError, Releasing,
 };
 pub(crate) use instance::{
-    host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
-    host_hook_post_install_notes,
+    host_hook_agent, host_hook_declared_agent, host_hook_disclosure,
+    host_hook_disclosure_config_with_repo, host_hook_post_install_notes, HostHookDisclosure,
 };
 pub(crate) use instance::{reports_tmux_session_gone, resolved_agent_for, UNBOUND_STORE_HINT};
 pub use instance::{
@@ -145,8 +144,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// The TUI refreshes it via [`set_unread_enabled`] on startup and whenever
 /// config is re-applied, so a runtime settings change takes effect without a
 /// restart. Defaults to `true` so the feature is on out of the box before the
-/// first config apply. Read on the hot Attention-sort path, hence a plain
-/// atomic load rather than threading the flag through every sort helper.
+/// first config apply. Read on the hot render path, hence a plain atomic load
+/// rather than threading the flag through every caller.
 static UNREAD_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Whether the unread-session indicator feature is enabled.
@@ -165,8 +164,7 @@ pub fn set_unread_enabled(on: bool) {
 /// threaded through the sort helpers.
 static FAVORITES_FIRST: AtomicBool = AtomicBool::new(true);
 
-/// Whether favorited rows pin to the top of their sibling scope outside the
-/// Attention sort.
+/// Whether favorited rows pin to the top of their sibling scope under the Name and Newest first sorts.
 pub fn favorites_first() -> bool {
     FAVORITES_FIRST.load(Ordering::Relaxed)
 }
@@ -220,7 +218,7 @@ pub(crate) use storage::{
     replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage,
     GroupMovePlan, LaunchConfig, LifecycleRelease, LockedDataFile, NativeStoreUnavailable,
     ProfileMoveRejected, SessionCommitApplied, SessionMutation, SessionStore, StorageFlock,
-    StorageTransition, STORAGE_LOCK_FILENAME,
+    StorageTransition, MAX_SYMLINK_HOPS, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

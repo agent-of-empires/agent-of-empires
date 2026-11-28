@@ -35,6 +35,10 @@ const MAX_CHILDREN: usize = 256;
 // Only the daemon control reader writes this synthetic transport field.
 pub(super) const CONTROL_FRAME_BYTES_FIELD: &str = "__aoe_control_frame_bytes";
 
+// Shares the adapter stream: a forged marker only misorders that adapter's own
+// transcript, within the adapter's trust domain.
+pub(super) const ADAPTER_FRAMES_SHED_METHOD: &str = "_aoe/adapter_frames_shed";
+
 /// Every agent-side notification the connection admits, on one handler.
 ///
 /// The SDK renders its whole handler chain per inbound message
@@ -53,6 +57,9 @@ pub(super) enum SessionIngressNotification {
     /// `_auth/status_update`: the agent's own identity. Connection-scoped, so
     /// it carries no session id and never passes the ingress fence (#4241).
     AuthStatus(AuthStatus),
+    /// Runner-shed adapter frames, injected where they were dropped so their
+    /// numbers credit in stream order.
+    AdapterFramesShed(u64),
 }
 
 /// Params of `_auth/status_update`. Unknown fields, including the upstream
@@ -69,6 +76,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             || SessionReplayed::matches_method(method)
             || PromptCompletedMarker::matches_method(method)
             || method == AUTH_STATUS_UPDATE_METHOD
+            || method == ADAPTER_FRAMES_SHED_METHOD
     }
 
     fn method(&self) -> &str {
@@ -77,6 +85,7 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::Replayed(marker) => marker.method(),
             Self::PromptCompleted(marker) => marker.method(),
             Self::AuthStatus(_) => AUTH_STATUS_UPDATE_METHOD,
+            Self::AdapterFramesShed(_) => ADAPTER_FRAMES_SHED_METHOD,
         }
     }
 
@@ -87,6 +96,9 @@ impl JsonRpcMessage for SessionIngressNotification {
             Self::PromptCompleted(marker) => marker.to_untyped_message(),
             Self::AuthStatus(status) => {
                 UntypedMessage::new(self.method(), serde_json::json!({ "authStatus": status }))
+            }
+            Self::AdapterFramesShed(count) => {
+                UntypedMessage::new(self.method(), serde_json::json!({ "count": count }))
             }
         }
     }
@@ -108,6 +120,12 @@ impl JsonRpcMessage for SessionIngressNotification {
         if method == AUTH_STATUS_UPDATE_METHOD {
             let parsed: AuthStatusParams = serde_json::from_value(params.clone())?;
             return Ok(Self::AuthStatus(parsed.auth_status));
+        }
+        if method == ADAPTER_FRAMES_SHED_METHOD {
+            let count = params["count"]
+                .as_u64()
+                .ok_or_else(agent_client_protocol::Error::invalid_params)?;
+            return Ok(Self::AdapterFramesShed(count));
         }
         if !SessionNotification::matches_method(method) {
             return Err(agent_client_protocol::Error::method_not_found());
@@ -348,7 +366,7 @@ impl SessionIngress {
                 discarded += 1;
             }
         }
-        state.discarded_adapter_frames += discarded;
+        state.discarded_adapter_frames = state.discarded_adapter_frames.saturating_add(discarded);
         state.current = id;
         state.children = children;
         drop(state);
@@ -413,7 +431,7 @@ impl SessionIngress {
             && !state.children.contains_key(&notification.session_id)
         {
             if is_adapter_frame(&notification) {
-                state.discarded_adapter_frames += 1;
+                state.discarded_adapter_frames = state.discarded_adapter_frames.saturating_add(1);
             }
             return Ok(None);
         }
@@ -424,6 +442,13 @@ impl SessionIngress {
         } = &mut *state;
         register_child(children, current.as_ref(), &notification);
         Ok(Some(notification))
+    }
+
+    /// Frames the runner numbered before this connection received any: they
+    /// count like frames dropped here, ahead of every frame that follows.
+    pub(super) fn skip_adapter_frames(&self, n: u64) {
+        let mut state = self.state.lock().unwrap();
+        state.discarded_adapter_frames = state.discarded_adapter_frames.saturating_add(n);
     }
 
     /// The adapter frames dropped since the last call.
@@ -675,6 +700,14 @@ mod tests {
         assert!(ingress.route(notif("old"), None).unwrap().is_none());
         assert_eq!(ingress.take_discarded_adapter_frames(), 1);
         assert_eq!(ingress.take_discarded_adapter_frames(), 0, "drained");
+    }
+
+    #[test]
+    fn runner_reported_adapter_frames_add_to_dropped_ones() {
+        let ingress = SessionIngress::new(Some(SessionId::from("cur".to_string())));
+        ingress.skip_adapter_frames(2);
+        assert!(ingress.route(notif("other"), None).unwrap().is_none());
+        assert_eq!(ingress.take_discarded_adapter_frames(), 3);
     }
 
     #[test]

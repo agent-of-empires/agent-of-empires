@@ -103,7 +103,7 @@ fn daemon_status_ignores_an_unknown_session_id() {
 }
 
 fn daemon_row(instance: &Instance, status: &str) -> crate::daemon::SessionResponse {
-    let mut row = crate::server::api::sessions::session_response_from_instance(instance, false);
+    let mut row = crate::server::api::sessions::session_response_from_instance(instance);
     row.status = status.into();
     row.last_error = None;
     row.pane_dead_observed = false;
@@ -130,9 +130,7 @@ pub(super) fn daemon_snapshot(view: &HomeView, id: &str, status: &str) -> Sessio
     sessions.extend(
         view.instances()
             .filter(|instance| instance.id != id)
-            .map(|instance| {
-                crate::server::api::sessions::session_response_from_instance(instance, false)
-            }),
+            .map(crate::server::api::sessions::session_response_from_instance),
     );
     SessionFeedResult::Snapshot(Arc::new(fixture_snapshot(
         sessions,
@@ -962,8 +960,10 @@ fn terminal_rows_take_status_and_observations_from_the_daemon_only() {
 #[test]
 #[serial]
 fn canonical_favorite_reorder_keeps_cursor_on_selected_session() {
+    let original = crate::session::favorites_first();
+    crate::session::set_favorites_first(true);
     let mut env = create_test_env_with_sessions(2);
-    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    env.view.sort_order = crate::session::config::SortOrder::Name;
     for instance in env.view.instances.values_mut() {
         instance.status = Status::Stopped;
     }
@@ -1017,6 +1017,7 @@ fn canonical_favorite_reorder_keeps_cursor_on_selected_session() {
         env.view.selected_session.as_deref(),
         Some(selected.as_str())
     );
+    crate::session::set_favorites_first(original);
 }
 
 /// A published result is applied exactly once: a tick with no new publication
@@ -1690,7 +1691,7 @@ fn canonical_row(
     overrides: serde_json::Value,
 ) -> crate::daemon::SessionResponse {
     let mut value = serde_json::to_value(
-        crate::server::api::sessions::session_response_from_instance(instance, false),
+        crate::server::api::sessions::session_response_from_instance(instance),
     )
     .unwrap();
     let object = value.as_object_mut().expect("an object row");

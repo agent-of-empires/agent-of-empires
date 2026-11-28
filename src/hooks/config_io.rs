@@ -85,6 +85,49 @@ pub(super) fn write_json(path: &Path, value: &Value) -> Result<()> {
     write_file(path, serde_json::to_string_pretty(value)?.as_bytes())
 }
 
+/// Where a write to `path` lands: a symlink chain is followed even when it dangles,
+/// then the nearest existing ancestor is resolved, so an alias of a directory or of
+/// a file not created yet is seen before the installer creates it.
+pub(super) fn resolved(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..crate::session::MAX_SYMLINK_HOPS {
+        let is_link = std::fs::symlink_metadata(&current)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        let Some(link) = is_link.then(|| std::fs::read_link(&current).ok()).flatten() else {
+            break;
+        };
+        current = current.parent().map_or(link.clone(), |dir| dir.join(&link));
+    }
+    // Existing components are resolved one by one; the ones that do not exist yet are
+    // kept aside, and a `..` cancels the last of them, as `create_dir_all` would create
+    // it and step back. A `..` with none left steps out of the resolved ancestor.
+    let mut existing = PathBuf::new();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    for component in current.components() {
+        match component {
+            std::path::Component::Normal(name) if missing.is_empty() => {
+                let next = existing.join(name);
+                existing = if std::fs::symlink_metadata(&next).is_err() {
+                    missing.push(name.to_owned());
+                    existing
+                } else {
+                    std::fs::canonicalize(&next).unwrap_or(next)
+                };
+            }
+            std::path::Component::Normal(name) => missing.push(name.to_owned()),
+            std::path::Component::ParentDir => {
+                if missing.pop().is_none() {
+                    existing.pop();
+                }
+            }
+            std::path::Component::CurDir => {}
+            root => existing.push(root),
+        }
+    }
+    existing.extend(missing);
+    existing
+}
+
 /// Parses a JSON config, treating malformed content as empty so a torn file
 /// cannot block a launch.
 pub(super) fn parse_json_or_empty(content: Option<String>, path: &Path) -> Value {

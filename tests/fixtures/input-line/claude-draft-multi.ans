@@ -1,0 +1,40 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.328[39m
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mOpus 5.5 · API Usage Billing[39m
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m/tmp/proj[39m
+
+[38;5;220m⚠[39m [38;5;220mRemote managed settings failed to load (authentication rejected (401)) · no remote policy applied[38;5;246m · /status for [39m
+  [38;5;246mdetails[39m
+
+[38;5;174m▎[39m [1mAuto mode is now Claude Code's default permission mode.[0m
+[38;5;174m▎[39m [38;5;246mAuto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and [39m
+[38;5;174m▎[39m [38;5;246mprompt injection before executing, runs the ones it assesses as lower-risk, and blocks the rest.[39m
+[38;5;174m▎[39m [38;5;246m]8;id=awvmy8;https://code.claude.com/docs/en/permission-modes\https://code.claude.com/docs/en/permission-modes[39m]8;;\
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ line one
+  line two[7m [0m
+[38;5;244m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on[39m

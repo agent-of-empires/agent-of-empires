@@ -103,7 +103,7 @@ impl HomeView {
     }
 
     /// Selects the Session a suggestion was started as, expanding the Archived
-    /// or Trash section and the project or org subgroup it sits in. The reason
+    /// or Trash section and the repository subgroup it sits in. The reason
     /// when it cannot be shown (including another profile's).
     pub(super) fn try_open_linked_session(&mut self, id: &str) -> Result<(), String> {
         let Some(row) = self.session_feed.applied_session(id) else {
@@ -123,10 +123,7 @@ impl HomeView {
             self.trashed_section_collapsed,
             self.archived_section_collapsed,
         );
-        let subgroups = (
-            self.project_group_collapsed.clone(),
-            self.org_group_collapsed.clone(),
-        );
+        let subgroups = self.project_group_collapsed.clone();
         if trashed {
             self.trashed_section_collapsed = false;
         } else if archived {
@@ -142,27 +139,19 @@ impl HomeView {
             self.trashed_section_collapsed,
             self.archived_section_collapsed,
         ) = sections;
-        (self.project_group_collapsed, self.org_group_collapsed) = subgroups;
+        self.project_group_collapsed = subgroups;
         self.rebuild_flat_items();
         Err("That session could not be shown".into())
     }
 
-    /// Expands the archived Project or Org subgroup holding session `id`.
+    /// Expands the archived Repository subgroup holding session `id`.
     fn expand_archived_subgroup(&mut self, id: &str) {
         let Some(inst) = self.get_instance(id) else {
             return;
         };
-        match self.group_by {
-            GroupByMode::Project => {
-                let path =
-                    crate::session::archived_project_sub_path(&super::project_group_key(inst));
-                self.project_group_collapsed.insert(path, false);
-            }
-            GroupByMode::Org => {
-                let path = crate::session::archived_project_sub_path(&self.org_group_key(inst));
-                self.org_group_collapsed.insert(path, false);
-            }
-            _ => {}
+        if self.group_by == GroupByMode::Project {
+            let path = crate::session::archived_project_sub_path(&super::project_group_key(inst));
+            self.project_group_collapsed.insert(path, false);
         }
     }
 
