@@ -342,10 +342,11 @@ export function WorkspaceSidebar(props: Props) {
     props.onOpenPalette?.();
   };
 
-  // Reveal immediately so it can receive focus; delay hiding until the card slides back.
+  // A phone lists sessions as Muse does, in a drawer under the page, which slides aside to uncover it and hides once
+  // it has slid back. It runs the full height on a solid colour, which iOS 26 extends under its bars.
   const phoneClass = props.drawer
-    ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 ${
-        open ? "" : `max-md:invisible max-md:transition-[visibility] ${DRAWER_MOTION}`
+    ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 max-md:transition-[visibility] ${DRAWER_MOTION} ${
+        open ? "" : "max-md:invisible"
       }`
     : "max-md:hidden";
   return (
