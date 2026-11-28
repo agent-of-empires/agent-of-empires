@@ -829,6 +829,17 @@ impl Instance {
             .unwrap_or(&self.project_path)
     }
 
+    /// The sidebar workspace this session belongs to, which the shared Custom order stores:
+    /// `repoPath::branch`, or `repoPath::__session__::id` without a worktree. Mirrors the
+    /// Daemon's `workspace_id_for_session` and the dashboard's `useWorkspaces`.
+    pub fn workspace_id(&self) -> String {
+        let repo = self.repo_path().trim_end_matches('/');
+        match &self.worktree_info {
+            Some(worktree) => format!("{repo}::{}", worktree.branch),
+            None => format!("{repo}::__session__::{}", self.id),
+        }
+    }
+
     pub fn is_yolo_mode(&self) -> bool {
         self.yolo_mode
             || (!self.is_structured()

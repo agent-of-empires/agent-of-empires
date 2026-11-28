@@ -3721,6 +3721,11 @@ impl HomeView {
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
+            ActionId::UndoOrderChange => {
+                if let Err(e) = self.undo_order_change() {
+                    self.info_dialog = Some(InfoDialog::new("Order not restored", &e.to_string()));
+                }
+            }
             ActionId::RestoreTrash => self.restore_selected_from_trash(),
             ActionId::RetryTrash => self.retry_selected_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
@@ -5166,9 +5171,11 @@ impl HomeView {
     pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
         if new_order != self.sort_order {
             crate::tui::telemetry::report_feature_use(new_order.into());
+        } else {
+            self.sort_changes += 1;
         }
         self.show_sidebar_view(self.group_by, new_order);
-        self.save_sidebar_view(crate::daemon::SidebarViewPatch {
+        let _ = self.save_sidebar_view(crate::daemon::SidebarViewPatch {
             sort: Some(new_order),
             ..Default::default()
         });
@@ -5177,13 +5184,16 @@ impl HomeView {
     pub(super) fn apply_group_by(&mut self, new_mode: GroupByMode) {
         crate::tui::telemetry::report_feature_use(new_mode.into());
         self.show_sidebar_view(new_mode, self.sort_order);
-        self.save_sidebar_view(crate::daemon::SidebarViewPatch {
+        let _ = self.save_sidebar_view(crate::daemon::SidebarViewPatch {
             group_by: Some(new_mode),
             ..Default::default()
         });
     }
 
     pub(super) fn show_sidebar_view(&mut self, group_by: GroupByMode, sort_order: SortOrder) {
+        if sort_order != self.sort_order {
+            self.sort_changes += 1;
+        }
         self.group_by = group_by;
         self.sort_order = sort_order;
         if self.search_active && !self.search_query.value().is_empty() {
@@ -5200,8 +5210,12 @@ impl HomeView {
 
     /// The Daemon owns the choice: a connected one that refuses the write at once keeps its
     /// value, while an offline view keeps the pick.
-    fn save_sidebar_view(&mut self, patch: crate::daemon::SidebarViewPatch) {
-        if let Err(error) = self.session_feed.submit_sidebar_view(patch) {
+    pub(super) fn save_sidebar_view(
+        &mut self,
+        patch: crate::daemon::SidebarViewPatch,
+    ) -> anyhow::Result<()> {
+        let result = self.session_feed.submit_sidebar_view(patch);
+        if let Err(error) = &result {
             self.flash_status(format!("Grouping and sort not saved: {error}"));
             if !matches!(
                 self.session_feed.mutation_block(),
@@ -5210,6 +5224,7 @@ impl HomeView {
                 self.converge_sidebar_view();
             }
         }
+        result
     }
 
     /// Show the applied snapshot's grouping and sort once no pick is on its way. With no

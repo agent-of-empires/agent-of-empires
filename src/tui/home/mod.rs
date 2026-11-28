@@ -183,15 +183,15 @@ pub(super) enum NamespaceIntent {
     Plain,
     ProfileCreated(String),
     ProfileDeleted(String),
+    /// `switch` turns the sort to Custom once a move under Name or Newest first commits
+    /// the order on screen with it.
     ReorderSession {
         id: String,
-        profile: String,
-        source_group: String,
-        delta: isize,
-        crossing: bool,
-        continuation_destination: Option<String>,
+        switch: Option<reorder::OrderChange>,
     },
-    ReorderGroup,
+    ReorderGroup {
+        switch: Option<reorder::OrderChange>,
+    },
 }
 
 pub(super) enum CreationConfirmation {
@@ -298,9 +298,20 @@ pub struct HomeView {
     /// The runtime publishes a merged view of it (unknown workspaces
     /// appended), so this is what detects a peer's reorder.
     observed_workspace_ordering: Vec<String>,
+    /// Repository paths in the shared Custom order of the Repository headers.
+    repository_order: Vec<String>,
     /// The Daemon's grouping and sort as of the last applied snapshot. Cleared on reconnect,
     /// so the new connection's first value is adopted.
     pub(in crate::tui) observed_sidebar_view: Option<crate::session::config::SidebarView>,
+    /// An order write that offers Undo once it commits.
+    pending_order_change: Option<reorder::OrderChange>,
+    /// What "Undo switch to Custom" writes back.
+    order_undo: Option<reorder::UndoPoint>,
+    /// The sort an Undo is writing back, kept until that write settles.
+    sort_restore: Option<reorder::SortRestore>,
+    /// Bumped by each sort shown or picked, so a move can tell a sort picked since it began
+    /// even when the value came back.
+    sort_changes: u64,
     session_feed_reload_retry_at: Option<std::time::Instant>,
     session_feed_failed_cursor: Option<crate::daemon::RuntimeCursor>,
     canonical_metadata_lag: Option<CanonicalMetadataLagState>,

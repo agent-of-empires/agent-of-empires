@@ -799,7 +799,9 @@ fn default_replay_events() -> u32 {
 }
 
 /// Session list sort order. No order reacts to session state, so rows hold still.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SortOrder {
     /// The order the user arranged. Rows never moved sit on top, newest first.
@@ -830,7 +832,9 @@ impl SortOrder {
 }
 
 /// Session list grouping mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupByMode {
     /// Repository headers, with the user's Groups nested inside each.
@@ -870,7 +874,9 @@ where
 
 /// The one grouping and sort the Daemon owns. Clients read it from the runtime snapshot
 /// and change it through `PATCH /api/sidebar-view`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct SidebarView {
     pub group_by: GroupByMode,
     pub sort: SortOrder,

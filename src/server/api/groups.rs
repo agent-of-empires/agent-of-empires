@@ -58,6 +58,16 @@ fn check_structured(row: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// CityHall reorders the groups under `parent` only when every session in them is
+/// structured.
+fn check_siblings_structured(rows: &[Instance], parent: &str) -> Result<()> {
+    rows.iter()
+        .filter(|row| {
+            row.group_path != parent && (parent.is_empty() || belongs(&row.group_path, parent))
+        })
+        .try_for_each(check_structured)
+}
+
 fn check_row(row: &Instance, cityhall: bool) -> Result<()> {
     if cityhall {
         check_structured(row)?;
@@ -704,6 +714,32 @@ pub async fn reorder(
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
+    if let crate::daemon::ReorderBody::Session {
+        freeze: Some(freeze),
+        ..
+    }
+    | crate::daemon::ReorderBody::Group {
+        freeze: Some(freeze),
+        ..
+    } = &body
+    {
+        if let Some(refused) = super::sessions::oversized_order(&freeze.order) {
+            return refused;
+        }
+    }
+    if let crate::daemon::ReorderBody::Session {
+        headers: Some(list),
+        ..
+    }
+    | crate::daemon::ReorderBody::Group {
+        siblings: Some(list),
+        ..
+    } = &body
+    {
+        if let Some(refused) = super::sessions::oversized_order(list) {
+            return refused;
+        }
+    }
     match &body {
         crate::daemon::ReorderBody::Group { group, .. } => {
             if let Err(response) = validate_location(group) {
@@ -713,9 +749,20 @@ pub async fn reorder(
         crate::daemon::ReorderBody::Session {
             source_group,
             destination,
+            headers,
             ..
         } => {
-            for path in std::iter::once(source_group).chain(destination.iter()) {
+            // A Client older than the shared order sent in-group moves this way.
+            if destination.is_none() && headers.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "message": "A move within a group rewrites the shared order through PUT /api/workspace-ordering"
+                    })),
+                )
+                    .into_response();
+            }
+            for path in std::iter::once(source_group).chain(destination) {
                 if !path.is_empty()
                     && (crate::session::is_synthetic_project_header(path)
                         || super::validate_display_label(path, "group").is_err())
@@ -758,7 +805,9 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
         .iter()
         .any(|entry| &entry.name == profile);
     let reordered_group = match &body {
-        ReorderBody::Group { group, direction } => Some((
+        ReorderBody::Group {
+            group, direction, ..
+        } => Some((
             group.profile.clone(),
             group.path.clone(),
             format!("{direction:?}"),
@@ -780,10 +829,60 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
                 ReorderBody::Group { .. } => None,
             };
             let mut outcome = ReorderOutcome::Stale;
-            (&store as &dyn SessionStore).update(|rows, groups| {
+            let mut placement = None;
+            let committed = (&store as &dyn SessionStore).update(|rows, groups| {
+                let freeze = match &body {
+                    ReorderBody::Session { freeze, .. } | ReorderBody::Group { freeze, .. } => {
+                        freeze.as_ref()
+                    }
+                };
+                if freeze.is_some_and(|freeze| {
+                    let metadata = worker_state.canonical_metadata.blocking_read();
+                    freeze.base.order != metadata.workspace_ordering
+                        || freeze.base.repositories != metadata.repository_order
+                        || !freeze
+                            .groups
+                            .iter()
+                            .eq(groups.iter().map(|group| &group.path))
+                }) {
+                    return Ok(());
+                }
                 outcome = apply_canonical_reorder(rows, groups, &body, worker_state.cityhall_mode)?;
+                // CityHall may regroup a row but not rewrite the shared order, which it
+                // denies through `PUT /api/workspace-ordering`.
+                if worker_state.cityhall_mode || !matches!(outcome, ReorderOutcome::Moved { .. }) {
+                    return Ok(());
+                }
+                let frozen = freeze.map(|freeze| freeze.order.clone());
+                placement = match &body {
+                    ReorderBody::Session {
+                        destination: None, ..
+                    }
+                    | ReorderBody::Group { .. } => frozen.map(OrderPlacement::Frozen),
+                    ReorderBody::Session {
+                        id,
+                        source_group,
+                        destination,
+                        direction,
+                        ..
+                    } => carried_placement(
+                        rows,
+                        id,
+                        destination.as_deref().unwrap_or(source_group),
+                        *direction,
+                        frozen,
+                    ),
+                };
                 Ok(())
-            })?;
+            });
+            committed?;
+            // The shared order follows the committed membership, so an interrupted or failed
+            // order write leaves the move made with its row's rank unplaced, never a rank
+            // placed for a move that did not land.
+            if let Some(placement) = placement {
+                let _publication = worker_state.publication.blocking_write();
+                placement.commit(&worker_state)?;
+            }
             Ok(outcome)
         })
         .await
@@ -809,6 +908,146 @@ async fn reorder_owned(state: Arc<AppState>, body: crate::daemon::ReorderBody) -
     }
 }
 
+/// The shared order write a moved reorder makes once its membership commits.
+enum OrderPlacement {
+    /// The order a move under Name or Newest first showed.
+    Frozen(Vec<String>),
+    /// The carried workspace at the edge of the destination it entered, in the stored order
+    /// or `frozen`.
+    Carry {
+        moved: String,
+        peers: Vec<String>,
+        direction: crate::daemon::MoveDirection,
+        frozen: Option<Vec<String>>,
+    },
+}
+
+/// Where a carried session's workspace goes, so the shared Custom order ranks it at the edge
+/// of `destination` it entered from. Sessions sharing the workspace move with it. `rows` are
+/// the carried profile's rows with the move applied.
+fn carried_placement(
+    rows: &[Instance],
+    id: &str,
+    destination: &str,
+    direction: crate::daemon::MoveDirection,
+    frozen: Option<Vec<String>>,
+) -> Option<OrderPlacement> {
+    let moved = rows
+        .iter()
+        .find(|row| row.id == id)
+        .map(|row| row.workspace_id())?;
+    let peers: Vec<String> = rows
+        .iter()
+        .filter(|row| row.group_path == destination && !row.is_archived() && !row.is_trashed())
+        .map(|row| row.workspace_id())
+        .filter(|workspace| *workspace != moved)
+        .collect();
+    if peers.is_empty() && frozen.is_none() {
+        return None;
+    }
+    Some(OrderPlacement::Carry {
+        moved,
+        peers,
+        direction,
+        frozen,
+    })
+}
+
+impl OrderPlacement {
+    /// Write the placement. The caller holds the publication guard.
+    fn commit(self, state: &AppState) -> Result<()> {
+        let (moved, peers, direction, frozen) = match self {
+            OrderPlacement::Frozen(order) => return commit_workspace_order(state, |_| Some(order)),
+            OrderPlacement::Carry {
+                moved,
+                peers,
+                direction,
+                frozen,
+            } => (moved, peers, direction, frozen),
+        };
+        let created: Vec<_> = state
+            .instances
+            .blocking_read()
+            .iter()
+            .map(|row| (row.workspace_id(), Some(row.created_at)))
+            .collect();
+        let live = created
+            .iter()
+            .map(|(workspace, _)| workspace.clone())
+            .collect();
+        commit_workspace_order(state, |stored| {
+            let order = frozen.unwrap_or_else(|| {
+                // Only the destination's rows are placed; other unplaced rows stay newest first.
+                let placed: std::collections::HashSet<&str> =
+                    stored.iter().map(String::as_str).collect();
+                let mut order = super::sessions::merge_workspace_ordering(created, stored);
+                order.retain(|w| placed.contains(w.as_str()) || *w == moved || peers.contains(w));
+                order
+            });
+            let order =
+                place_at_entering_edge(order.clone(), &moved, &peers, direction).unwrap_or(order);
+            // Within what a Client's rewrite of the full order keeps, so that one drops nothing.
+            let bounded = super::sessions::bounded_live_order(live, order);
+            if bounded.is_none() {
+                tracing::warn!(target: "session.sync", workspace = %moved, "carried row left unplaced: the shared order is full");
+            }
+            bounded
+        })
+    }
+}
+
+/// Replace the stored row order with `next(stored)`, or keep it on None. A failed write
+/// degrades the runtime, since the stored order is then unknown.
+fn commit_workspace_order(
+    state: &AppState,
+    next: impl FnOnce(&[String]) -> Option<Vec<String>>,
+) -> Result<()> {
+    let committed = crate::session::update_workspace_ordering(|ordering| {
+        if let Some(order) = next(&ordering.order) {
+            ordering.order = order;
+        }
+        Ok(())
+    });
+    let (_, ordering) = match committed {
+        Ok(committed) => committed,
+        Err(error) => {
+            *state.canonical_health.blocking_write() = RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: Vec::new(),
+            };
+            state.runtime.request_publish();
+            return Err(error);
+        }
+    };
+    state.canonical_metadata.blocking_write().workspace_ordering = ordering.order;
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// `order` with `moved` at the edge of the `peers` workspaces a carry enters from: before
+/// the first moving down, after the last moving up.
+pub(crate) fn place_at_entering_edge(
+    mut order: Vec<String>,
+    moved: &str,
+    peers: &[String],
+    direction: crate::daemon::MoveDirection,
+) -> Option<Vec<String>> {
+    order.retain(|workspace| workspace != moved);
+    let mut ranks = order
+        .iter()
+        .enumerate()
+        .filter(|(_, workspace)| peers.contains(workspace))
+        .map(|(at, _)| at);
+    let at = match direction {
+        crate::daemon::MoveDirection::Down => ranks.next()?,
+        crate::daemon::MoveDirection::Up => ranks.next_back()? + 1,
+    };
+    order.insert(at, moved.to_owned());
+    Some(order)
+}
+
 fn apply_canonical_reorder(
     rows: &mut [Instance],
     groups: &mut Vec<crate::session::Group>,
@@ -817,25 +1056,30 @@ fn apply_canonical_reorder(
 ) -> Result<crate::daemon::ReorderOutcome> {
     use crate::daemon::{MoveDirection, ReorderBody, ReorderOutcome};
     match body {
-        ReorderBody::Group { group, direction } => {
+        ReorderBody::Group {
+            group,
+            direction,
+            siblings,
+            ..
+        } => {
             if cityhall {
-                let parent = group.path.rsplit_once('/').map_or("", |(parent, _)| parent);
-                for row in rows.iter().filter(|row| {
-                    row.group_path != parent
-                        && (parent.is_empty() || belongs(&row.group_path, parent))
-                }) {
-                    check_structured(row)?;
-                }
+                check_siblings_structured(
+                    rows,
+                    group.path.rsplit_once('/').map_or("", |(parent, _)| parent),
+                )?;
             }
             let mut tree = GroupTree::new_with_groups(rows, groups);
             if !tree.group_exists(&group.path) {
                 return Ok(ReorderOutcome::Stale);
             }
+            if let Some(siblings) = siblings {
+                tree.arrange_siblings(&group.path, siblings);
+            }
             let delta = match direction {
                 MoveDirection::Up => -1,
                 MoveDirection::Down => 1,
             };
-            if !tree.move_group(&group.path, delta) {
+            if !tree.move_group(&group.path, delta, siblings.as_deref()) {
                 return Ok(ReorderOutcome::AtEdge);
             }
             *groups = tree.get_all_groups();
@@ -845,8 +1089,9 @@ fn apply_canonical_reorder(
             id,
             profile,
             source_group,
-            direction,
             destination,
+            headers,
+            ..
         } => {
             let Some(anchor) = rows.iter().position(|row| {
                 &row.id == id
@@ -858,9 +1103,9 @@ fn apply_canonical_reorder(
                 return Ok(ReorderOutcome::Stale);
             };
             check_row(&rows[anchor], cityhall)?;
-            let group = destination.as_ref().unwrap_or(source_group);
-            if let Some(destination) = destination {
-                if destination == source_group
+            // In place, the move commits only the header and row orders it carries.
+            if destination.as_ref().is_some_and(|destination| {
+                destination == source_group
                     || !(destination.is_empty()
                         || groups.iter().any(|group| &group.path == destination)
                         || rows.iter().any(|row| {
@@ -869,118 +1114,79 @@ fn apply_canonical_reorder(
                                 && !row.is_archived()
                                 && !row.is_trashed()
                         }))
-                {
-                    return Ok(ReorderOutcome::Stale);
+            }) {
+                return Ok(ReorderOutcome::Stale);
+            }
+            if let Some(headers) = headers {
+                let mut sets: std::collections::BTreeMap<Option<&str>, Vec<String>> =
+                    Default::default();
+                for header in headers {
+                    let parent = header.rsplit_once('/').map(|(head, _)| head);
+                    sets.entry(parent).or_default().push(header.clone());
                 }
-            }
-            let mut order: Vec<usize> = rows
-                .iter()
-                .enumerate()
-                .filter(|(index, row)| {
-                    &row.source_profile == profile
-                        && &row.group_path == group
-                        && !row.is_archived()
-                        && !row.is_trashed()
-                        && (destination.is_none() || *index != anchor)
-                })
-                .map(|(index, _)| index)
-                .collect();
-            if cityhall {
-                for index in &order {
-                    check_structured(&rows[*index])?;
-                }
-            }
-            order.sort_by_key(|index| rows[*index].custom_order_key());
-            if destination.is_some() {
-                match direction {
-                    MoveDirection::Up => order.push(anchor),
-                    MoveDirection::Down => order.insert(0, anchor),
-                }
-            } else {
-                let at = order
-                    .iter()
-                    .position(|index| *index == anchor)
-                    .expect("current anchor is in its authoritative sibling set");
-                let to = match direction {
-                    MoveDirection::Up => at.checked_sub(1),
-                    MoveDirection::Down => at.checked_add(1).filter(|to| *to < order.len()),
-                };
-                let Some(to) = to else {
-                    return Ok(ReorderOutcome::AtEdge);
-                };
-                order.swap(at, to);
-            }
-            // Reject overflow before writing any row; no lossy usize -> u32 cast.
-            if let Some(last) = order.len().checked_sub(1) {
-                u32::try_from(last)?;
-            }
-            for (position, index) in order.into_iter().enumerate() {
-                rows[index].sort_index = Some(position as u32);
-            }
-            if let Some(destination) = destination {
-                rows[anchor].group_path = destination.clone();
-                // Reveal only explicit persisted ancestors; implicit paths are synthesized
-                // from the newly committed row by the normal GroupTree projection.
-                for group in groups.iter_mut() {
-                    if !group.path.is_empty() && belongs(destination, &group.path) {
-                        group.collapsed = false;
+                if cityhall {
+                    for parent in sets.keys() {
+                        check_siblings_structured(rows, parent.unwrap_or_default())?;
                     }
                 }
-                Ok(ReorderOutcome::Moved {
-                    destination: Some(GroupLocation {
-                        profile: profile.clone(),
-                        path: destination.clone(),
-                    }),
-                })
-            } else {
-                Ok(ReorderOutcome::Moved { destination: None })
+                let mut tree = GroupTree::new_with_groups(rows, groups);
+                for set in sets.values() {
+                    tree.arrange_siblings(&set[0], set);
+                }
+                *groups = tree.get_all_groups();
             }
+            let Some(destination) = destination else {
+                return Ok(ReorderOutcome::Moved { destination: None });
+            };
+            rows[anchor].group_path = destination.clone();
+            // Reveal only explicit persisted ancestors; implicit paths are synthesized
+            // from the newly committed row by the normal GroupTree projection.
+            for group in groups.iter_mut() {
+                if !group.path.is_empty() && belongs(destination, &group.path) {
+                    group.collapsed = false;
+                }
+            }
+            Ok(ReorderOutcome::Moved {
+                destination: Some(GroupLocation {
+                    profile: profile.clone(),
+                    path: destination.clone(),
+                }),
+            })
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::daemon::{MoveDirection, ReorderBody, ReorderOutcome};
+    use super::place_at_entering_edge;
+    use crate::daemon::MoveDirection::{Down, Up};
 
-    /// A session move steps through the siblings in the order the TUI shows them under Custom,
-    /// where a row never moved sits above the placed ones.
     #[test]
-    fn session_move_follows_the_displayed_custom_order() {
-        let cases = [
-            ("a", MoveDirection::Down, true, ["c", "b", "a"]),
-            ("c", MoveDirection::Down, true, ["a", "c", "b"]),
-            ("c", MoveDirection::Up, false, ["c", "a", "b"]),
-        ];
-        for (moved, direction, expect_moved, expected) in cases {
-            let mut rows: Vec<Instance> = [("a", Some(0)), ("b", Some(1)), ("c", None)]
-                .into_iter()
-                .map(|(id, sort_index)| {
-                    let mut row = Instance::new(id, "/tmp/x");
-                    row.id = id.into();
-                    row.source_profile = "p".into();
-                    row.sort_index = sort_index;
-                    row
-                })
-                .collect();
-            let body = ReorderBody::Session {
-                id: moved.into(),
-                profile: "p".into(),
-                source_group: String::new(),
-                direction,
-                destination: None,
-            };
-            let outcome =
-                apply_canonical_reorder(&mut rows, &mut Vec::new(), &body, false).unwrap();
+    fn carried_workspace_lands_at_the_entering_edge() {
+        let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (order, peers, direction, expected) in [
+            (
+                &["m", "a", "p", "b", "q"][..],
+                &["p", "q"][..],
+                Down,
+                Some(&["a", "m", "p", "b", "q"][..]),
+            ),
+            (
+                &["m", "a", "p", "b", "q", "c"],
+                &["p", "q"],
+                Up,
+                Some(&["a", "p", "b", "q", "m", "c"]),
+            ),
+            (&["p", "m", "q"], &["q", "p"], Down, Some(&["m", "p", "q"])),
+            (&["p", "m", "q"], &["p", "q"], Up, Some(&["p", "q", "m"])),
+            (&["a", "m"], &["m"], Down, None),
+            (&["a", "m"], &[], Up, None),
+        ] {
             assert_eq!(
-                matches!(outcome, ReorderOutcome::Moved { .. }),
-                expect_moved,
-                "{moved} {direction:?}: {outcome:?}"
+                place_at_entering_edge(list(order), "m", &list(peers), direction),
+                expected.map(list),
+                "{order:?} into {peers:?} moving {direction:?}"
             );
-            rows.sort_by_key(|row| row.custom_order_key());
-            let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
-            assert_eq!(ids, expected, "{moved} {direction:?}");
         }
     }
 }

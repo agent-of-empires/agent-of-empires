@@ -62,6 +62,7 @@ pub enum ActionId {
     ToggleFavorite,
     MoveRowUp,
     MoveRowDown,
+    UndoOrderChange,
     JumpPrevFinished,
     JumpNextFinished,
     ToggleSnooze,
@@ -286,9 +287,6 @@ pub enum Context {
     /// off, the binding is removed from dispatch so the key isn't swallowed by
     /// a dead action; help and the command palette skip it separately.
     UnreadEnabled,
-    /// Rows can be arranged by hand. Under a computed sort the action still resolves, so
-    /// the keys are not silently swallowed by cursor movement: it explains itself instead.
-    CustomSortable,
     /// Preview scrolling is available for live-send and visible retained history.
     PreviewScroll,
     /// `App` dispatches the chord before the home view, so it never resolves here and the
@@ -359,7 +357,6 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
-        Context::CustomSortable => true,
         Context::PreviewScroll => ctx.preview_scroll,
         Context::AppOnly => false,
     }
@@ -650,10 +647,10 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::MoveRowUp,
         non_strict: &[ctrl_code(KeyCode::Up)],
         strict: &[ctrl_code(KeyCode::Up)],
-        context: Context::CustomSortable,
+        context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "Move row up (Custom sort)",
+            desc: "Move row up (switches to Custom)",
         }),
         palette: Some(PaletteMeta {
             title: "Move row up",
@@ -665,10 +662,10 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::MoveRowDown,
         non_strict: &[ctrl_code(KeyCode::Down)],
         strict: &[ctrl_code(KeyCode::Down)],
-        context: Context::CustomSortable,
+        context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "Move row down (Custom sort)",
+            desc: "Move row down (switches to Custom)",
         }),
         palette: Some(PaletteMeta {
             title: "Move row down",
@@ -1382,6 +1379,18 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::UndoOrderChange,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Undo switch to Custom",
+            keywords: &["sort", "order", "custom", "undo"],
+            group: PaletteGroup::Actions,
+        }),
+    },
+    Binding {
         id: ActionId::EmptyTrash,
         non_strict: &[],
         strict: &[],
@@ -1513,6 +1522,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleFavorite => "favorite",
         ActionId::MoveRowUp => "move-row-up",
         ActionId::MoveRowDown => "move-row-down",
+        ActionId::UndoOrderChange => "undo-order-change",
         ActionId::JumpPrevFinished => "previous-finished",
         ActionId::JumpNextFinished => "next-finished",
         ActionId::ToggleSnooze => "snooze",

@@ -77,6 +77,11 @@ impl HomeView {
             active_profile,
             instances: Self::build_instances_map(all_instances),
             observed_sidebar_view: None,
+            pending_order_change: None,
+            order_undo: None,
+            sort_restore: None,
+            sort_changes: 0,
+            repository_order: Vec::new(),
             observed_workspace_ordering: crate::session::load_workspace_ordering()
                 .map(|ordering| ordering.order)
                 .unwrap_or_default(),

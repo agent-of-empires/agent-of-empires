@@ -265,8 +265,9 @@ impl GroupTree {
 
     /// Move `path` one slot toward the start (`delta < 0`) or end (`delta > 0`) among the
     /// groups sharing its parent, which is the order `get_all_groups` and therefore
-    /// `groups.json` preserve. Returns false when it is already at that end, or unknown.
-    pub fn move_group(&mut self, path: &str, delta: isize) -> bool {
+    /// `groups.json` preserve. With `shown`, only the siblings it names count, so hidden
+    /// ones keep their slots. Returns false when it is already at that end, or unknown.
+    pub fn move_group(&mut self, path: &str, delta: isize, shown: Option<&[String]>) -> bool {
         let parent = |p: &str| p.rsplit_once('/').map(|(head, _)| head.to_string());
         let Some(anchor_parent) = self.groups_by_path.get(path).map(|_| parent(path)) else {
             return false;
@@ -275,7 +276,10 @@ impl GroupTree {
             .insertion_order
             .iter()
             .enumerate()
-            .filter(|(_, p)| parent(p) == anchor_parent)
+            .filter(|(_, p)| {
+                parent(p) == anchor_parent
+                    && (*p == path || shown.is_none_or(|shown| shown.contains(p)))
+            })
             .map(|(idx, _)| idx)
             .collect();
         let Some(at) = siblings
@@ -290,6 +294,33 @@ impl GroupTree {
         self.insertion_order.swap(siblings[at], siblings[target]);
         self.rebuild_tree();
         true
+    }
+
+    /// Put `path` and its siblings named in `shown` in that order, each in one of the
+    /// slots they held. Entries that are not siblings are ignored.
+    pub fn arrange_siblings(&mut self, path: &str, shown: &[String]) {
+        let parent = |p: &str| p.rsplit_once('/').map(|(head, _)| head.to_string());
+        let anchor_parent = parent(path);
+        let mut wanted: Vec<&String> = Vec::new();
+        for entry in shown {
+            if self.groups_by_path.contains_key(entry)
+                && parent(entry) == anchor_parent
+                && !wanted.contains(&entry)
+            {
+                wanted.push(entry);
+            }
+        }
+        let slots: Vec<usize> = self
+            .insertion_order
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| wanted.contains(p))
+            .map(|(idx, _)| idx)
+            .collect();
+        for (slot, entry) in slots.into_iter().zip(wanted) {
+            self.insertion_order[slot] = entry.clone();
+        }
+        self.rebuild_tree();
     }
 
     pub fn get_all_groups(&self) -> Vec<Group> {
@@ -980,19 +1011,24 @@ mod tests {
         };
         assert_eq!(paths(&tree), ["alpha", "beta", "gamma", "beta/nested"]);
 
-        assert!(tree.move_group("gamma", -1));
+        assert!(tree.move_group("gamma", -1, None));
         assert_eq!(paths(&tree), ["alpha", "gamma", "beta", "beta/nested"]);
 
         assert!(
-            !tree.move_group("alpha", -1),
+            !tree.move_group("alpha", -1, None),
             "already first among its siblings"
         );
         assert!(
-            !tree.move_group("beta/nested", 1),
+            !tree.move_group("beta/nested", 1, None),
             "only child of its parent"
         );
-        assert!(!tree.move_group("missing", 1));
+        assert!(!tree.move_group("missing", 1, None));
         assert_eq!(paths(&tree), ["alpha", "gamma", "beta", "beta/nested"]);
+
+        // Only the shown siblings count: alpha passes beta, and the hidden gamma stays.
+        let shown = ["alpha".to_string(), "beta".to_string()];
+        assert!(tree.move_group("alpha", 1, Some(&shown)));
+        assert_eq!(paths(&tree), ["beta", "gamma", "alpha", "beta/nested"]);
     }
 
     #[test]

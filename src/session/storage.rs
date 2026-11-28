@@ -1613,17 +1613,16 @@ impl ProfileFiles {
     }
 }
 
-// Cross-device-syncable sidebar ordering. Workspaces are a client
-// construct (a group of sessions keyed on `repoPath::branch` or
-// `repoPath::__session__::session_id`), so the server treats the entries
-// here as opaque strings. The list is a partial order: workspace ids not
-// in the list fall back to the default newest-first ordering. Persisted
-// globally (not per-profile) because the sidebar shows sessions across
-// all profiles and a per-profile file would fragment the user's layout.
-// See #1169.
+/// The Custom sort every Client shares (#1169, #5896). `order` holds workspace ids
+/// (`repoPath::branch`, or `repoPath::__session__::id` for a session without a worktree);
+/// `repositories` holds repository paths for the Repository headers. Both are partial:
+/// entries never moved sit on top, newest first. Global, not per profile, because the
+/// sidebar shows every profile at once.
 #[derive(serde::Deserialize, serde::Serialize, Default)]
 pub struct WorkspaceOrdering {
     pub order: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -5600,6 +5599,7 @@ mod tests {
 
         let order = |items: &[&str]| WorkspaceOrdering {
             order: items.iter().map(|s| s.to_string()).collect(),
+            repositories: Vec::new(),
         };
         let initial = order(&[
             "/repo/a::main",

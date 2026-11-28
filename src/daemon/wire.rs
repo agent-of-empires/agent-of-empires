@@ -318,6 +318,42 @@ pub struct MoveGroupBody {
     pub source: GroupLocation,
     pub target: GroupLocation,
 }
+/// Replace the shared Custom order of rows (workspace ids), of Repository headers
+/// (repository paths), or both; an absent list keeps its value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceOrderingPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repositories: Option<Vec<String>>,
+    /// The stored orders this replacement was built from. When either differs from the
+    /// stored one, the write is refused with 409 so it cannot undo a peer's change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<WorkspaceOrderingBase>,
+}
+
+/// The row order a move under Name or Newest first shows, which it commits as the shared
+/// Custom order with the move. The move is refused as stale once `base` or `groups` no
+/// longer matches what is stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenOrder {
+    pub order: Vec<String>,
+    pub base: WorkspaceOrderingBase,
+    /// The profile's stored group paths, in stored order, which `headers` or `siblings`
+    /// replace.
+    pub groups: Vec<String>,
+}
+
+/// The stored row and Repository header orders, as published in a runtime snapshot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceOrderingBase {
+    pub order: Vec<String>,
+    pub repositories: Vec<String>,
+}
+
 /// Change the shared grouping, the sort, or both; an absent field keeps its value.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -401,16 +437,36 @@ pub enum MoveDirection {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum ReorderBody {
+    /// Carry a session into a neighbouring group, at the edge it enters from: moving
+    /// `Down` it lands before the group's first row, `Up` after its last. A move within one
+    /// group rewrites the shared order instead (`PUT /api/workspace-ordering`), or, to keep
+    /// the headers on screen, omits `destination`.
     Session {
         id: String,
         profile: String,
         source_group: String,
-        direction: MoveDirection,
+        /// Omitted, the row stays and the move commits only `headers`, which it then
+        /// requires (a body with neither is refused with 400), and `freeze`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
+        direction: MoveDirection,
+        /// Every header path in the order the Client shows them, which the stored group
+        /// order then keeps. Omitted, the stored order stays.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        headers: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        freeze: Option<FrozenOrder>,
     },
     Group {
         group: GroupLocation,
         direction: MoveDirection,
+        /// The group's sibling paths in the order the Client shows them, which the move
+        /// starts from and the stored order then keeps. Omitted, it starts from the stored
+        /// order.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        siblings: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        freeze: Option<FrozenOrder>,
     },
 }
 
@@ -1610,6 +1666,12 @@ pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     #[serde(default)]
     pub workspace_ordering: Vec<String>,
+    /// Repository paths in the shared Custom order of the Repository headers.
+    #[serde(default)]
+    pub repository_order: Vec<String>,
+    /// The grouping and sort every Client shows.
+    #[serde(default)]
+    pub sidebar_view: crate::session::config::SidebarView,
     /// Trashed rows in the whole snapshot, whatever the scope filtered out.
     #[serde(default)]
     pub trashed_count: usize,

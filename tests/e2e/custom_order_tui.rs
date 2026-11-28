@@ -81,7 +81,11 @@ fn test_tui_custom_sort_reorders_and_persists() {
     let before = order_on_screen(&h);
     assert_eq!(before.len(), 2, "both sessions on screen: {before:?}");
 
-    // Home selects the group header; Down selects its first session.
+    // Under Groups, Home selects the `work` header and Down its first session.
+    h.send_keys("g");
+    h.wait_for(" Group By ");
+    h.send_keys("g");
+    h.wait_for_absent(" Group By ", Duration::from_secs(10));
     h.send_keys("Home");
     h.send_keys("Down");
     h.send_keys("C-Down");
@@ -98,18 +102,45 @@ fn test_tui_custom_sort_reorders_and_persists() {
     h.wait_for("beta-two");
     wait_for_order(&h, &moved);
 
-    // Both siblings received their new indices.
-    let rows: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(h.sessions_path()).expect("read sessions.json"),
+    // The move landed in the one Custom order every Client shares.
+    let ordering: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            crate::harness::app_dir_in(h.home_path()).join("workspace-ordering.json"),
+        )
+        .expect("read workspace-ordering.json"),
     )
-    .expect("parse sessions.json");
-    let index_of = |title: &str| -> Option<u64> {
-        rows.as_array()?
-            .iter()
-            .find(|r| r["title"] == title)?
-            .get("sort_index")?
-            .as_u64()
+    .expect("parse workspace-ordering.json");
+    assert_eq!(
+        ordering["order"].as_array().map(Vec::len),
+        Some(2),
+        "both rows placed: {ordering}"
+    );
+    // Keyed as `Instance::workspace_id` writes them.
+    let sessions = h.read_sessions();
+    let workspace = |title: &str| {
+        let row = sessions
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["title"] == title))
+            .unwrap_or_else(|| panic!("{title} in sessions.json: {sessions}"));
+        let text = |value: &serde_json::Value| value.as_str().expect("string").to_owned();
+        match row.get("worktree_info").filter(|w| !w.is_null()) {
+            Some(worktree) => format!(
+                "{}::{}",
+                text(&worktree["main_repo_path"]).trim_end_matches('/'),
+                text(&worktree["branch"])
+            ),
+            None => format!(
+                "{}::__session__::{}",
+                text(&row["project_path"]).trim_end_matches('/'),
+                text(&row["id"])
+            ),
+        }
     };
-    assert_eq!(index_of(&moved[0]), Some(0), "moved row stored first");
-    assert_eq!(index_of(&moved[1]), Some(1), "its sibling stored second");
+    let expected: Vec<serde_json::Value> =
+        moved.iter().map(|title| workspace(title).into()).collect();
+    assert_eq!(
+        ordering["order"].as_array(),
+        Some(&expected),
+        "the moved order was saved"
+    );
 }

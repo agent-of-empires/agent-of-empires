@@ -540,6 +540,8 @@ impl serde::Serialize for SessionsView {
         struct Envelope<'a> {
             sessions: ScopedSessions<'a>,
             workspace_ordering: &'a [String],
+            repository_order: &'a [String],
+            sidebar_view: crate::session::config::SidebarView,
             trashed_count: usize,
         }
         let rows = &self.snapshot.value.contents.sessions;
@@ -549,6 +551,8 @@ impl serde::Serialize for SessionsView {
                 filter: &self.filter,
             },
             workspace_ordering: &self.snapshot.value.contents.workspace_ordering,
+            repository_order: &self.snapshot.value.contents.repository_order,
+            sidebar_view: self.snapshot.value.contents.sidebar_view,
             trashed_count: rows.iter().filter(|row| row.trashed_at.is_some()).count(),
         }
         .serialize(serializer)
@@ -631,42 +635,143 @@ fn workspace_id_for_session(s: &SessionResponse) -> String {
     }
 }
 
-// Unknown workspaces precede the manual order, newest first.
 pub(crate) fn compute_merged_ordering(
     sessions: &[SessionResponse],
     current_order: &[String],
 ) -> Vec<String> {
+    merge_workspace_ordering(
+        sessions.iter().map(|session| {
+            (
+                workspace_id_for_session(session),
+                crate::time::Timestamp::parse_rfc3339(&session.created_at).ok(),
+            )
+        }),
+        current_order,
+    )
+}
+
+/// Unknown workspaces precede the manual order, newest session first; ties keep the later
+/// newest row first. `rows` yields each session's workspace and creation time.
+pub(crate) fn merge_workspace_ordering(
+    rows: impl IntoIterator<Item = (String, Option<crate::time::Timestamp>)>,
+    current_order: &[String],
+) -> Vec<String> {
     let known: std::collections::HashSet<&str> = current_order.iter().map(String::as_str).collect();
-    let mut new_ids = indexmap::IndexSet::new();
-    for session in sessions {
-        let id = workspace_id_for_session(session);
-        if !known.contains(id.as_str()) {
-            new_ids.insert(id);
+    let mut new_ids: std::collections::HashMap<String, (Option<crate::time::Timestamp>, usize)> =
+        std::collections::HashMap::new();
+    for (at, (id, created)) in rows.into_iter().enumerate() {
+        if known.contains(id.as_str()) {
+            continue;
+        }
+        let newest = new_ids.entry(id).or_insert((created, at));
+        if created >= newest.0 {
+            *newest = (created, at);
         }
     }
+    let mut new_ids: Vec<_> = new_ids.into_iter().collect();
+    new_ids.sort_by_key(|(_, newest)| std::cmp::Reverse(*newest));
     new_ids
         .into_iter()
-        .rev()
+        .map(|(id, _)| id)
         .chain(current_order.iter().cloned())
         .collect()
 }
 
-const MAX_ORDER_ENTRIES: usize = 4096;
-const MAX_ORDER_ENTRY_LEN: usize = 1024;
+/// Each session's place in the shared Custom order: its workspace's index in `ordering`.
+pub(crate) fn rank_by_workspace(sessions: &mut [SessionResponse], ordering: &[String]) {
+    let mut rank: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+    // A repeated id keeps its first place, the one a Client's move starts from.
+    for (at, id) in ordering.iter().enumerate() {
+        rank.entry(id.as_str())
+            .or_insert_with(|| u32::try_from(at).unwrap_or(u32::MAX));
+    }
+    for session in sessions {
+        session.sort_index = rank
+            .get(workspace_id_for_session(session).as_str())
+            .copied();
+    }
+}
 
-#[derive(Deserialize)]
-pub struct UpdateWorkspaceOrderingBody {
-    pub order: Vec<String>,
+const MAX_ORDER_ENTRIES: usize = 4096;
+pub(crate) const MAX_ORDER_ENTRY_LEN: usize = 1024;
+
+/// `order` without repeats or workspaces no session in `sessions` belongs to, and within
+/// what `PUT /api/workspace-ordering` accepts, so rewriting the full order never grows it.
+pub(crate) fn writable_workspace_order(
+    sessions: &[SessionResponse],
+    order: Vec<String>,
+) -> Vec<String> {
+    writable_live_order(
+        sessions.iter().map(workspace_id_for_session).collect(),
+        order,
+    )
+}
+
+/// `order` without repeats or workspaces outside `live`, within what the endpoint accepts.
+pub(crate) fn writable_live_order(
+    mut live: std::collections::HashSet<String>,
+    mut order: Vec<String>,
+) -> Vec<String> {
+    order.retain(|id| live.remove(id));
+    writable_repository_order(order)
+}
+
+/// `order` without repeats, workspaces outside `live` or entries the endpoint refuses, or
+/// None when it is still longer than the endpoint accepts, so no placement is cut.
+pub(crate) fn bounded_live_order(
+    mut live: std::collections::HashSet<String>,
+    mut order: Vec<String>,
+) -> Option<Vec<String>> {
+    order.retain(|id| id.len() <= MAX_ORDER_ENTRY_LEN && live.remove(id));
+    (order.len() <= MAX_ORDER_ENTRIES).then_some(order)
+}
+
+/// `order` with entries the endpoint refuses dropped and cut to the length it accepts.
+pub(crate) fn writable_repository_order(mut order: Vec<String>) -> Vec<String> {
+    order.retain(|entry| entry.len() <= MAX_ORDER_ENTRY_LEN);
+    order.truncate(MAX_ORDER_ENTRIES);
+    order
+}
+
+/// The 413 response for an order longer, or with an entry longer, than a write accepts.
+pub(crate) fn oversized_order(list: &[String]) -> Option<axum::response::Response> {
+    let message = if list.len() > MAX_ORDER_ENTRIES {
+        format!(
+            "order has {} entries, max is {}",
+            list.len(),
+            MAX_ORDER_ENTRIES
+        )
+    } else {
+        let bad = list.iter().find(|e| e.len() > MAX_ORDER_ENTRY_LEN)?;
+        format!(
+            "order entry is {} bytes, max is {}",
+            bad.len(),
+            MAX_ORDER_ENTRY_LEN
+        )
+    };
+    Some(
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({ "message": message })),
+        )
+            .into_response(),
+    )
 }
 
 #[derive(serde::Serialize)]
 struct WorkspaceOrderingResponse<'a> {
     order: &'a [String],
+    repositories: &'a [String],
 }
 
+/// Replace the shared Custom order of the rows, of the Repository headers, or both; an
+/// omitted list keeps its value. An empty list clears it back to newest first.
 pub async fn update_workspace_ordering(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<UpdateWorkspaceOrderingBody>, axum::extract::rejection::JsonRejection>,
+    body: Result<
+        Json<crate::daemon::WorkspaceOrderingPatch>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> impl IntoResponse {
     if state.read_only {
         return crate::server::api::read_only_response();
@@ -676,23 +781,12 @@ pub async fn update_workspace_ordering(
         Err(rej) => return rej.into_response(),
     };
 
-    if body.order.len() > MAX_ORDER_ENTRIES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "message": format!("order has {} entries, max is {}", body.order.len(), MAX_ORDER_ENTRIES)
-            })),
-        )
-            .into_response();
-    }
-    if let Some(bad) = body.order.iter().find(|e| e.len() > MAX_ORDER_ENTRY_LEN) {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "message": format!("order entry is {} bytes, max is {}", bad.len(), MAX_ORDER_ENTRY_LEN)
-            })),
-        )
-            .into_response();
+    if let Some(refused) = [&body.order, &body.repositories]
+        .into_iter()
+        .flatten()
+        .find_map(|list| oversized_order(list))
+    {
+        return refused;
     }
     // A request dropped while it waits for the guards leaves nothing behind; once it holds
     // them, the spawned commit owns them through reconciliation.
@@ -700,7 +794,7 @@ pub async fn update_workspace_ordering(
     let publication = state.publication.clone().write_owned().await;
     match tokio::spawn(commit_workspace_ordering(
         state,
-        body.order,
+        body,
         namespace,
         publication,
     ))
@@ -715,16 +809,35 @@ pub async fn update_workspace_ordering(
 /// release its guards before the canonical metadata catches up with the disk.
 async fn commit_workspace_ordering(
     state: Arc<AppState>,
-    order: Vec<String>,
+    body: crate::daemon::WorkspaceOrderingPatch,
     namespace: tokio::sync::OwnedRwLockReadGuard<()>,
     publication: tokio::sync::OwnedRwLockWriteGuard<()>,
 ) -> axum::response::Response {
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    if let Some(base) = &body.base {
+        let metadata = state.canonical_metadata.read().await;
+        if base.order != metadata.workspace_ordering
+            || base.repositories != metadata.repository_order
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "message": "The order changed elsewhere; try again on the refreshed list"
+                })),
+            )
+                .into_response();
+        }
+    }
     let result = tokio::task::spawn_blocking(move || {
         crate::session::update_workspace_ordering(move |ordering| {
-            ordering.order = order;
+            if let Some(order) = body.order {
+                ordering.order = order;
+            }
+            if let Some(repositories) = body.repositories {
+                ordering.repositories = repositories;
+            }
             Ok(())
         })
     })
@@ -747,7 +860,11 @@ async fn commit_workspace_ordering(
                 .into_response();
         }
     };
-    state.canonical_metadata.write().await.workspace_ordering = ordering.order;
+    {
+        let mut metadata = state.canonical_metadata.write().await;
+        metadata.workspace_ordering = ordering.order;
+        metadata.repository_order = ordering.repositories;
+    }
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -762,6 +879,7 @@ async fn commit_workspace_ordering(
         &snapshot.value.cursor,
         Json(WorkspaceOrderingResponse {
             order: &snapshot.value.contents.workspace_ordering,
+            repositories: &snapshot.value.contents.repository_order,
         }),
     )
 }
@@ -1053,9 +1171,9 @@ mod sidebar_view_tests {
         let write = tokio::spawn(update_sidebar_view(State(state.clone()), Ok(Json(patch))));
         let ordering = tokio::spawn(update_workspace_ordering(
             State(state.clone()),
-            Ok(Json(UpdateWorkspaceOrderingBody {
-                order: vec!["w".into()],
-            })),
+            Ok(Json(
+                serde_json::from_value(serde_json::json!({ "order": ["w"] })).unwrap(),
+            )),
         ));
         tokio::task::yield_now().await;
         write.abort();
@@ -1389,6 +1507,120 @@ mod workspace_ordering_tests {
         Ok(())
     }
 
+    /// The snapshot ranks each row by its workspace's place in the shared order, unplaced
+    /// workspaces first; a write that names only the repositories keeps the row order.
+    #[tokio::test]
+    #[serial]
+    async fn the_shared_order_ranks_snapshot_rows_and_a_partial_write_keeps_the_rest(
+    ) -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let rows: Vec<Instance> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|name| Instance::new(name, &format!("/repo/{name}")))
+            .collect();
+        let workspace =
+            |at: usize| format!("/repo/{}::__session__::{}", rows[at].title, rows[at].id);
+        let placed = vec![workspace(1), workspace(0)];
+        let state = crate::server::test_support::build_test_app_state(rows.clone());
+        let put = |patch: crate::daemon::WorkspaceOrderingPatch| {
+            let state = state.clone();
+            async move {
+                let response = update_workspace_ordering(State(state), Ok(Json(patch)))
+                    .await
+                    .into_response();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        put(crate::daemon::WorkspaceOrderingPatch {
+            order: Some(placed.clone()),
+            ..Default::default()
+        })
+        .await;
+        let response = put(crate::daemon::WorkspaceOrderingPatch {
+            repositories: Some(vec!["/repo/b".into(), "/repo/a".into()]),
+            ..Default::default()
+        })
+        .await;
+
+        assert_eq!(crate::session::load_workspace_ordering()?.order, placed);
+        assert_eq!(
+            response["repositories"],
+            serde_json::json!(["/repo/b", "/repo/a"])
+        );
+        let snapshot = state.runtime.publish(&state).await?.value.clone();
+        assert_eq!(snapshot.contents.repository_order, ["/repo/b", "/repo/a"]);
+        assert_eq!(
+            response["order"],
+            serde_json::json!(snapshot.contents.workspace_ordering)
+        );
+        let rank = |at: usize| {
+            snapshot
+                .contents
+                .sessions
+                .iter()
+                .find(|session| session.id == rows[at].id)
+                .and_then(|session| session.sort_index)
+        };
+        // d and c are unplaced, newest first; then the persisted b, a.
+        for (at, expected) in [(3, 0), (2, 1), (1, 2), (0, 3)] {
+            assert_eq!(rank(at), Some(expected), "{}", rows[at].title);
+        }
+        assert_eq!(snapshot.contents.placed_workspaces, placed);
+
+        // A write built on an order since replaced is refused; one on the stored order lands.
+        for (base, expected) in [
+            (Vec::new(), StatusCode::CONFLICT),
+            (placed.clone(), StatusCode::OK),
+        ] {
+            let patch = crate::daemon::WorkspaceOrderingPatch {
+                order: Some(Vec::new()),
+                repositories: None,
+                base: Some(crate::daemon::WorkspaceOrderingBase {
+                    order: base,
+                    repositories: vec!["/repo/b".into(), "/repo/a".into()],
+                }),
+            };
+            let response = update_workspace_ordering(State(state.clone()), Ok(Json(patch)))
+                .await
+                .into_response();
+            assert_eq!(response.status(), expected);
+        }
+        assert!(crate::session::load_workspace_ordering()?.order.is_empty());
+        Ok(())
+    }
+
+    /// A repeated id ranks at its first place, and a full-order write drops repeats and
+    /// workspaces no session has.
+    #[test]
+    fn a_repeated_or_stale_workspace_neither_ranks_twice_nor_is_written_back() {
+        let mut sessions = vec![
+            mock_response("s1", "/repo/a", Some("main")),
+            mock_response("s2", "/repo/b", Some("main")),
+        ];
+        let order: Vec<String> = [
+            "/repo/a::main",
+            "/repo/gone::x",
+            "/repo/b::main",
+            "/repo/a::main",
+        ]
+        .map(String::from)
+        .into();
+        rank_by_workspace(&mut sessions, &order);
+        assert_eq!(
+            sessions.iter().map(|s| s.sort_index).collect::<Vec<_>>(),
+            [Some(0), Some(2)]
+        );
+        assert_eq!(
+            writable_workspace_order(&sessions, order),
+            ["/repo/a::main", "/repo/b::main"]
+        );
+    }
+
     #[test]
     fn compute_merged_ordering_prepends_unknowns_newest_first_once() {
         let known = |id: &str, path: &str, branch: &str| mock_response(id, path, Some(branch));
@@ -1425,6 +1657,33 @@ mod workspace_ordering_tests {
                 vec!["/repo/x::main", "/repo/y::dev"],
             ),
         ];
+        let created = |id: &str, path: &str, at: &str| SessionResponse {
+            created_at: at.to_string(),
+            ..mock_response(id, path, Some("main"))
+        };
+        // Storage order is not creation order, e.g. an older row in a later-loaded profile;
+        // second precision and sub-second precision compare as times, not strings.
+        let cases = cases.into_iter().chain([
+            (
+                vec![
+                    created("s1", "/repo/new", "2026-01-03T00:00:00.5+00:00"),
+                    created("s2", "/repo/old", "2026-01-01T00:00:00+00:00"),
+                    created("s3", "/repo/mid", "2026-01-03T00:00:00+00:00"),
+                ],
+                vec![],
+                vec!["/repo/new::main", "/repo/mid::main", "/repo/old::main"],
+            ),
+            (
+                // A tie goes to the workspace whose newest row comes later.
+                vec![
+                    created("s1", "/repo/a", "2026-01-01T10:00:00Z"),
+                    created("s2", "/repo/b", "2026-01-01T11:00:00Z"),
+                    created("s3", "/repo/a", "2026-01-01T11:00:00Z"),
+                ],
+                vec![],
+                vec!["/repo/a::main", "/repo/b::main"],
+            ),
+        ]);
         for (sessions, existing, expected) in cases {
             assert_eq!(compute_merged_ordering(&sessions, &existing), expected);
         }
