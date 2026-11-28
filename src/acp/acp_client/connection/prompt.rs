@@ -209,6 +209,11 @@ impl Session {
         shared.terminal_claim.begin_turn();
         shared.between_prompt.reset_for_prompt();
         clear_captured_rejections(&shared.rate_limit_rejections);
+        shared
+            .agent_turn_text
+            .lock()
+            .expect("agent turn text mutex poisoned")
+            .disqualify();
         *shared.cancel_deadline.lock().unwrap() = None;
         info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
         // Bump the epoch before sending so envelopes from a handler parked on
@@ -441,14 +446,13 @@ impl Session {
         let shared = &self.shared;
         match result {
             Err(error) => {
-                let captured = captured_rate_limit_reset(
-                    &shared.rate_limit_rejections,
-                    crate::time::Timestamp::now(),
-                );
+                let now = crate::time::Timestamp::now();
+                let captured = captured_rate_limit_reset(&shared.rate_limit_rejections, now);
                 // A marker only in the text used to park through the
                 // connection error path, which a rejection no longer takes.
-                return classify_rate_limit_error(error, captured.clone())
-                    .or_else(|| classify_rate_limit_from_message(&error.to_string(), captured));
+                return classify_rate_limit_error(error, captured.clone(), now).or_else(|| {
+                    classify_rate_limit_from_message(&error.to_string(), captured, now)
+                });
             }
             Ok(response) if matches!(response.stop_reason, StopReason::Cancelled) => return None,
             Ok(_) => {}

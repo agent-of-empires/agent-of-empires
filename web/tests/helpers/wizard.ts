@@ -12,7 +12,13 @@ export async function openWizard(page: Page) {
   // Navigation/body actionability can precede AppContent mounting past the
   // login-status gate. Match the scratch-shortcut readiness guard before
   // sending a one-shot key event that would otherwise be lost during startup.
-  await expect(page.getByRole("button", { name: /New session/ }).first()).toBeVisible();
+  // A phone's drawer holds a New session too, hidden until ☰ opens it.
+  await expect(
+    page
+      .getByRole("button", { name: /New session/ })
+      .filter({ visible: true })
+      .first(),
+  ).toBeVisible();
   // Blur rather than click the body: a centre click lands on the empty dashboard's New session card,
   // which opens the wizard early and the "n" then types into its autofocused search.
   await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
@@ -66,7 +72,14 @@ export async function launch(page: Page) {
     .click();
 }
 
-export const CLAUDE_AGENT = { name: "claude", binary: "claude", host_only: false, installed: true, install_hint: "" };
+export const CLAUDE_AGENT = {
+  name: "claude",
+  binary: "claude",
+  host_only: false,
+  installed: true,
+  install_hint: "",
+  acp_capable: true,
+};
 
 export const CREATION_TRUST_FINGERPRINT = {
   project_path: "/tmp/example",

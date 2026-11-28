@@ -4,6 +4,7 @@
 // Single source of truth: docs/ contains the canonical markdown.
 // This script strips the # Title line, rewrites relative links for the
 // website URL scheme, and prepends Astro frontmatter.
+// It also writes raw markdown copies, llms.txt and llms-full.txt to public/.
 //
 // Generated files are .gitignored; do NOT edit them by hand.
 
@@ -14,6 +15,8 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..", "..");
 const PAGES_DIR = join(__dirname, "..", "src", "pages");
+const PUBLIC_DIR = join(__dirname, "..", "public");
+const SITE = "https://www.agent-of-empires.com";
 
 // All pages to sync. "source" is relative to repo root, "dest" is relative
 // to website/src/pages/. Layout path is computed from dest depth.
@@ -125,6 +128,13 @@ const PAGES = [
       "Launch a session in a fresh scratch directory under ~/.agent-of-empires/scratch/ with no project path. The directory is removed when the session is deleted.",
   },
   {
+    source: "docs/guides/suggested-sessions.md",
+    dest: "guides/suggested-sessions.md",
+    title: "Suggested Sessions",
+    description:
+      "Start sessions from suggestions published by plugins, in the web dashboard or the TUI: set up, start, dismiss, templates and project mapping.",
+  },
+  {
     source: "docs/guides/live-mode.md",
     dest: "guides/live-mode.md",
     title: "Live Mode",
@@ -134,18 +144,18 @@ const PAGES = [
 
   // --- Docs pages (docs/ → pages/docs/) ---
   {
-    source: "docs/plugins.md",
-    dest: "docs/plugins.md",
-    title: "Plugins",
-    description:
-      "Enable, disable, install, and update plugins from the CLI, TUI, or web dashboard; capability approvals, bundled plugins, and writing your own.",
-  },
-  {
     source: "docs/index.md",
     dest: "docs/index.md",
     title: "Agent of Empires",
     description:
       "Terminal session manager for AI coding agents on Linux and macOS, built on tmux and written in Rust.",
+  },
+  {
+    source: "docs/plugins.md",
+    dest: "docs/plugins.md",
+    title: "Plugins",
+    description:
+      "Enable, disable, install, and update plugins from the CLI, TUI, or web dashboard; capability approvals, bundled plugins, and writing your own.",
   },
   {
     source: "docs/installation.md",
@@ -301,6 +311,8 @@ function pageUrl(dest) {
 
 // Every synced docs path → website URL, used for link rewriting.
 const URL_MAP = Object.fromEntries(PAGES.map((p) => [p.source, pageUrl(p.dest)]));
+// Website URL → raw markdown copy, so llms.txt readers stay on markdown.
+const MD_URL_MAP = Object.fromEntries(PAGES.map((p) => [pageUrl(p.dest), `/${p.dest}`]));
 
 const GITHUB_BASE =
   "https://github.com/agent-of-empires/agent-of-empires/blob/main/";
@@ -381,6 +393,7 @@ function escapeYaml(str) {
 
 console.log("Syncing docs to website...");
 
+const fullDocs = [];
 for (const page of PAGES) {
   const sourcePath = join(ROOT, page.source);
   let content = readFileSync(sourcePath, "utf8");
@@ -408,8 +421,43 @@ for (const page of PAGES) {
   mkdirSync(dirname(destPath), { recursive: true });
   writeFileSync(destPath, frontmatter + content);
 
+  const mdContent = content
+    .replace(/\]\((\/[^)#\s]*)/g, (m, url) =>
+      MD_URL_MAP[url] ? `](${MD_URL_MAP[url]}` : m,
+    )
+    .replace(/href="(\/[^"#]*)/g, (m, url) =>
+      MD_URL_MAP[url] ? `href="${MD_URL_MAP[url]}` : m,
+    );
+  const markdown = `# ${page.title}\n\n${mdContent.trim()}\n`;
+  const publicPath = join(PUBLIC_DIR, page.dest);
+  mkdirSync(dirname(publicPath), { recursive: true });
+  writeFileSync(publicPath, markdown);
+  fullDocs.push(markdown);
+
   console.log(`  ${page.source} -> ${page.dest}`);
 }
+
+const llmsSection = (heading, prefix) =>
+  [
+    `## ${heading}`,
+    "",
+    ...PAGES.filter((p) => p.dest.startsWith(prefix)).map(
+      (p) => `- [${p.title}](${SITE}/${p.dest}): ${p.description}`,
+    ),
+  ].join("\n");
+const llmsTxt = [
+  "# Agent of Empires",
+  "",
+  "> A session manager for AI coding agents on Linux and macOS. It runs agents in tmux, isolates them with git worktrees and container sandboxes, and controls them from a TUI, CLI, or web dashboard.",
+  "",
+  llmsSection("Docs", "docs/"),
+  "",
+  llmsSection("Guides", "guides/"),
+  "",
+].join("\n");
+writeFileSync(join(PUBLIC_DIR, "llms.txt"), llmsTxt);
+writeFileSync(join(PUBLIC_DIR, "llms-full.txt"), fullDocs.join("\n"));
+console.log("  llms.txt, llms-full.txt");
 
 // Verify every synced page appears in docsNav.ts
 const navPath = join(__dirname, "..", "src", "data", "docsNav.ts");

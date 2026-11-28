@@ -27,6 +27,198 @@ pub struct AgentIntegrationContribution {
     /// Requires API 22 and a host that implements the capture protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<AgentSessionIdDeclaration>,
+    /// Requires API 28: where and which status hooks the host installs for the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<AgentHooksDeclaration>,
+    /// Requires API 28: the folder-trust record the host writes before launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<AgentTrustDeclaration>,
+}
+
+/// Hook events the host knows how to install into a JSON settings file.
+pub const AGENT_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "PreToolUse",
+    "PostToolUse",
+    "UserPromptSubmit",
+    "Stop",
+    "StopFailure",
+    "Notification",
+    "ElicitationResult",
+    "PermissionRequest",
+    "BeforeTool",
+    "BeforeAgent",
+    "AfterAgent",
+];
+
+pub const AGENT_HOOK_EVENTS_MAX: usize = 32;
+pub const AGENT_HOOK_PATH_MAX: usize = 256;
+pub const AGENT_HOOK_STRING_MAX: usize = 256;
+pub const AGENT_TRUST_POINTER_SEGMENTS_MAX: usize = 8;
+
+/// Status hooks installed into the agent's JSON settings file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHooksDeclaration {
+    /// Settings file relative to the home directory, such as `.claude/settings.json`.
+    pub settings_rel_path: String,
+    /// Environment variable that relocates the settings directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir_env_var: Option<String>,
+    pub format: AgentHookFormat,
+    pub events: Vec<AgentHookEventDeclaration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHookFormat {
+    JsonSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHookStatus {
+    Running,
+    Waiting,
+    Idle,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHookIdentityField {
+    SessionId,
+    ConversationIdOrSessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHookEventDeclaration {
+    /// One of [`AGENT_HOOK_EVENTS`].
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<AgentHookStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_field: Option<AgentHookIdentityField>,
+    /// Tools that block on the user for their whole run; the hook writes `waiting` for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTrustLocation {
+    /// The agent's config directory, else the home directory.
+    ConfigDirOrHome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTrustSandbox {
+    Always,
+    YoloOnly,
+}
+
+/// A literal leaf written at the pointer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AgentTrustValue {
+    Bool(bool),
+    String(String),
+}
+
+/// One leaf written into a JSON file, such as `/projects/{path}/hasTrustDialogAccepted`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTrustDeclaration {
+    /// A single file name inside the location.
+    pub file: String,
+    pub location: AgentTrustLocation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir_env_var: Option<String>,
+    /// Absolute pointer with exactly one `{path}` segment that receives the project path as one key.
+    pub pointer: String,
+    pub value: AgentTrustValue,
+    pub sandbox: AgentTrustSandbox,
+}
+
+/// A container directory a declared config-dir variable may name: absolute and
+/// normalized, away from the home directory itself and the host-provided mounts.
+pub fn container_dir_ok(dir: &str) -> bool {
+    const RESERVED: [&str; 6] = [
+        "/workspace",
+        "/aoe",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/tmp/aoe-hooks",
+    ];
+    let Some(rest) = dir.strip_prefix('/') else {
+        return false;
+    };
+    dir.len() <= AGENT_HOOK_PATH_MAX
+        && dir != "/root"
+        && !rest.is_empty()
+        && rest.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.contains([':', ',', '\\'])
+                && part.chars().all(|c| !c.is_control())
+        })
+        && !RESERVED
+            .iter()
+            .any(|reserved| dir == *reserved || dir.starts_with(&format!("{reserved}/")))
+}
+
+impl AgentIntegrationContribution {
+    /// The directory a declared config-dir variable names in the container, else `default`.
+    fn container_config_dir(&self, var: Option<&str>, default: String) -> String {
+        var.and_then(|var| self.launch.as_ref()?.container_env.get(var))
+            .map_or(default, |dir| dir.trim_end_matches('/').to_string())
+    }
+
+    /// Where a sandbox sees the declared hooks file, else `None`.
+    pub fn container_hooks_file(&self) -> Option<String> {
+        let hooks = self.hooks.as_ref()?;
+        let (dir, leaf) = hooks.settings_rel_path.rsplit_once('/')?;
+        let dir =
+            self.container_config_dir(hooks.config_dir_env_var.as_deref(), format!("/root/{dir}"));
+        Some(format!("{dir}/{leaf}"))
+    }
+
+    /// Where a sandbox sees the declared trust file, else `None`.
+    pub fn container_trust_file(&self) -> Option<String> {
+        let trust = self.trust.as_ref()?;
+        let dir =
+            self.container_config_dir(trust.config_dir_env_var.as_deref(), "/root".to_string());
+        Some(format!("{dir}/{}", trust.file))
+    }
+}
+
+/// The pointer's segments, or `None` unless it is a valid trust pointer.
+pub fn parse_trust_pointer(pointer: &str) -> Option<Vec<&str>> {
+    let rest = pointer.strip_prefix('/')?;
+    let segments: Vec<&str> = rest.split('/').collect();
+    let valid = segments.len() <= AGENT_TRUST_POINTER_SEGMENTS_MAX
+        && segments.iter().all(|segment| {
+            !segment.is_empty()
+                && segment.len() <= AGENT_HOOK_STRING_MAX
+                && (*segment == "{path}"
+                    || (!segment.contains(['{', '}', '~'])
+                        && segment.chars().all(|c| !c.is_control())))
+        })
+        && segments
+            .iter()
+            .filter(|segment| **segment == "{path}")
+            .count()
+            == 1
+        && segments
+            .iter()
+            .all(|segment| segment.parse::<usize>().is_err());
+    valid.then_some(segments)
 }
 
 /// Session-id capture owned by the plugin worker.
@@ -217,6 +409,10 @@ pub struct AgentIntegrationSnapshot {
     pub provider_version: String,
     pub provider_session_id: String,
     pub writer_pid: u32,
+    /// The launch that wrote a sandboxed report, copied from `AOE_SESSION_SOURCE`.
+    /// The host ignores a sandboxed report whose value is not the active launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
     pub revision: u64,
     pub status: AgentIntegrationStatus,
     /// Function-key names sent only to wake the provider extension after a user reply.

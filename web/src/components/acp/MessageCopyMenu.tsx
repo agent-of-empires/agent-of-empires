@@ -1,13 +1,13 @@
 import { useAuiState } from "@assistant-ui/react";
 import { ChevronDown, Files } from "lucide-react";
-import { useCallback, useId, useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 
+import { DropdownMenu, MenuItem } from "../ContextMenu";
+import { moveMenuFocus } from "../menuFocus";
 import { useOutsideDismiss } from "../useOutsideDismiss";
 import { CopyIconState, CopyMarkdownButton } from "./CopyMarkdownButton";
 import { messageToMarkdown, type MessagePart } from "./messageMarkdown";
 import { COMPACT_COPY_BUTTON_CLASS, useCopy } from "./useCopy";
-
-const MENU_ITEM_CLASS = "block w-full px-3 py-1.5 text-left text-xs text-text-secondary hover:bg-surface-700";
 
 /**
  * The message's footer row. The icon copies the whole message's text; with tool calls present, the chevron
@@ -19,48 +19,33 @@ export function MessageCopyMenu() {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-  const openAt = useRef<"first" | "last">("first");
+  const [openAt, setOpenAt] = useState<"first" | "last">("first");
   const menuId = useId();
   useOutsideDismiss(open, [ref], () => setOpen(false));
 
   // The menu-button pattern: focus moves into the menu when it opens, arrows move within it, and Escape or a
   // selection puts focus back on the trigger. A click elsewhere dismisses without taking focus back.
-  const items = () => [...(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]:not(:disabled)') ?? [])];
-  const focusItem = (index: number) => {
-    const list = items();
-    list[(index + list.length) % list.length]?.focus();
-  };
   const close = () => {
     setOpen(false);
     triggerRef.current?.focus();
   };
-  // Stable, so it runs once when the menu mounts and not on every render while it is open.
-  const mountMenu = useCallback((el: HTMLDivElement | null) => {
-    menuRef.current = el;
-    const list = el?.querySelectorAll<HTMLElement>('[role="menuitem"]:not(:disabled)');
-    if (list?.length) list[openAt.current === "last" ? list.length - 1 : 0]?.focus();
-  }, []);
   const onTriggerKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
-      openAt.current = e.key === "ArrowDown" ? "first" : "last";
+      setOpenAt(e.key === "ArrowDown" ? "first" : "last");
       setOpen(true);
     } else if (e.key === "Escape" && open) {
       close();
     }
   };
-  const onMenuKeyDown = (e: React.KeyboardEvent) => {
-    const at = items().indexOf(document.activeElement as HTMLElement);
-    const move: Record<string, number> = { ArrowDown: at + 1, ArrowUp: at - 1, Home: 0, End: -1 };
-    if (e.key in move) {
-      e.preventDefault();
-      focusItem(move[e.key]!);
-    } else if (e.key === "Escape") {
+  const onMenuKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Escape") {
       e.preventDefault();
       close();
     } else if (e.key === "Tab") {
       setOpen(false);
+    } else {
+      moveMenuFocus(e);
     }
   };
 
@@ -101,7 +86,7 @@ export function MessageCopyMenu() {
               aria-expanded={open}
               aria-controls={open ? menuId : undefined}
               onClick={() => {
-                openAt.current = "first";
+                setOpenAt("first");
                 setOpen((o) => !o);
               }}
               onKeyDown={onTriggerKeyDown}
@@ -110,40 +95,35 @@ export function MessageCopyMenu() {
               <ChevronDown className="h-3 w-3" />
             </button>
             {open && (
-              <div
-                ref={mountMenu}
+              <DropdownMenu
                 id={menuId}
-                role="menu"
-                aria-labelledby={`${menuId}-trigger`}
+                labelledBy={`${menuId}-trigger`}
+                initialFocus={openAt}
                 onKeyDown={onMenuKeyDown}
-                className="absolute right-0 top-full z-20 mt-1 min-w-[10rem] rounded-md border border-surface-700/50 bg-surface-800 py-1 shadow-xl"
+                className="absolute right-0 top-full z-20 mt-1 min-w-[11rem]"
               >
-                <button
-                  type="button"
+                <MenuItem
                   role="menuitem"
                   tabIndex={-1}
                   disabled={!hasText}
-                  className={`${MENU_ITEM_CLASS} disabled:opacity-40`}
                   onClick={() => {
                     close();
                     copyMarkdown(false);
                   }}
                 >
                   Copy text
-                </button>
-                <button
-                  type="button"
+                </MenuItem>
+                <MenuItem
                   role="menuitem"
                   tabIndex={-1}
-                  className={MENU_ITEM_CLASS}
                   onClick={() => {
                     close();
                     copyMarkdown(true);
                   }}
                 >
                   Copy with tool calls
-                </button>
-              </div>
+                </MenuItem>
+              </DropdownMenu>
             )}
           </>
         )}

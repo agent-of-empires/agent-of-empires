@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { CopyMarkdownButton } from "../../acp/CopyMarkdownButton";
+import { USER_REPLY_ITEM, UserReplyCard } from "../../acp/UserReplyCard";
 import { CommentMarkdown } from "./CommentMarkdown";
 import { buildDiffCommentsPrompt, compareComments, type DiffCommentsCardPayload } from "./buildPrompt";
 import type { DiffComment } from "./types";
@@ -20,16 +20,12 @@ export function DiffCommentsUserCard({ payload }: Props) {
     [comments, intro, outro, isMultiRepo],
   );
   return (
-    <div className="w-full max-w-3xl rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-4 py-3 text-sm">
-      <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-wider text-text-dim">
-        <span className="rounded bg-brand-600/15 px-1.5 py-0.5 font-mono text-brand-300">diff review</span>
-        <span>
-          {comments.length} comment{comments.length === 1 ? "" : "s"}
-        </span>
-        <span className="ml-auto">
-          <CopyMarkdownButton compact source={sentPrompt} label="Copy prompt" />
-        </span>
-      </div>
+    <UserReplyCard
+      tag="diff review"
+      summary={`${comments.length} comment${comments.length === 1 ? "" : "s"}`}
+      copySource={sentPrompt}
+      copyLabel="Copy prompt"
+    >
       {intro && (
         <div className="mb-3 border-l-2 border-surface-700 pl-3 text-text-secondary">
           <CommentMarkdown text={intro} />
@@ -37,7 +33,7 @@ export function DiffCommentsUserCard({ payload }: Props) {
       )}
       <ul className="flex flex-col gap-3">
         {sorted.map((c) => (
-          <li key={c.id} className="rounded-lg border border-surface-700/60 bg-surface-900/60">
+          <li key={c.id} className={USER_REPLY_ITEM}>
             <CommentHeader comment={c} isMultiRepo={isMultiRepo} />
             <HighlightedSnippet code={c.capturedSnippet} language={c.language} filePath={c.filePath} />
             <div className="px-3 py-2 text-text-primary">
@@ -51,7 +47,7 @@ export function DiffCommentsUserCard({ payload }: Props) {
           <CommentMarkdown text={outro} />
         </div>
       )}
-    </div>
+    </UserReplyCard>
   );
 }
 

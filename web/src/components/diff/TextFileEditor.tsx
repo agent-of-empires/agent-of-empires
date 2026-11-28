@@ -1,6 +1,7 @@
 import { useContext, useEffect, useRef, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import { BackButton } from "./viewerChrome";
+import { BUTTON_PRIMARY_SM, BUTTON_SECONDARY_SM } from "../../lib/surfaces";
 import { getSessionFile, saveSessionFile, type SessionFileResponse } from "../../lib/api";
 import { writeClipboard } from "../../lib/clipboard";
 import {
@@ -25,8 +26,7 @@ interface Props {
   onSaved(): void;
 }
 
-const button =
-  "min-h-8 px-2 py-1 text-xs rounded-md border border-surface-700/50 text-text-secondary hover:bg-surface-800 disabled:opacity-40 cursor-pointer";
+const button = BUTTON_SECONDARY_SM;
 
 export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel, onSaved }: Props) {
   const normalized = original.content.replace(/\r\n|\r/g, "\n");
@@ -127,7 +127,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
 
   return (
     <div className="flex-1 min-h-0 flex flex-col" data-file-editor>
-      <div className="flex gap-2 items-center px-3 py-2 border-b border-surface-700/20 shrink-0">
+      <div className="flex gap-2 items-center px-3 py-2 border-b border-surface-700/50 shrink-0">
         {onBack && (
           <BackButton
             label="Files"
@@ -144,7 +144,7 @@ export function TextFileEditor({ sessionId, filePath, original, onBack, onCancel
           Cancel
         </button>
         <button
-          className={`${button} bg-brand-600 text-text-on-brand hover:bg-brand-500 disabled:hover:bg-brand-600`}
+          className={BUTTON_PRIMARY_SM}
           disabled={!dirty || saving || changed || !!editDisabledReason}
           onClick={() => void save()}
           title="Save (Ctrl/Cmd+S)"

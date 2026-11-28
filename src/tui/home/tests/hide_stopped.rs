@@ -42,7 +42,7 @@ fn session_titles(view: &HomeView) -> Vec<String> {
         .iter()
         .filter_map(|item| match item {
             Item::Session { id, .. } => view.get_instance(id).map(|i| i.title.clone()),
-            Item::Group { .. } => None,
+            _ => None,
         })
         .collect()
 }
@@ -127,32 +127,103 @@ fn project_grouping_hides_by_its_own_groups() {
     assert!(header_text(&env.view, "loose").contains("loose (0/1)"));
 }
 
-/// Status grouping derives its groups from each session's status, so hiding stopped keeps an
-/// empty Stopped header that still counts its rows, and a session in no manual group is not exempt.
+/// `session.hide_snoozed_with_stopped` folds snoozed sessions into the rows `y` hides; a session
+/// in no manual group stays visible either way.
 #[test]
 #[serial]
-fn status_grouping_hides_stopped_sessions_and_keeps_the_header() {
-    let mut env = env_with_stopped(false);
-    env.view.apply_group_by(GroupByMode::Status);
-    assert!(header_text(&env.view, "Stopped").contains("Stopped (5)"));
-    assert!(header_text(&env.view, "Idle").contains("Idle (1)"));
-
-    press_y(&mut env);
-    assert_eq!(session_titles(&env.view), vec!["util-live".to_string()]);
-    assert!(
-        header_text(&env.view, "Stopped").contains("Stopped (0/5)"),
-        "a status whose sessions are all hidden keeps its header"
+fn the_setting_hides_snoozed_sessions_with_stopped_ones() {
+    let mut snoozed = with_status(
+        instance_in("util-snoozed", "/tmp/util", "util"),
+        Status::Waiting,
+    );
+    snoozed.snooze(30);
+    let mut loose = with_status(
+        Instance::new("loose-snoozed", "/tmp/loose"),
+        Status::Waiting,
+    );
+    loose.snooze(30);
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            with_status(instance_in("util-live", "/tmp/util", "util"), Status::Idle),
+            with_status(
+                instance_in("util-stopped", "/tmp/util", "util"),
+                Status::Stopped,
+            ),
+            snoozed,
+            loose,
+        ],
+        true,
     );
 
     press_y(&mut env);
-    assert!(header_text(&env.view, "Stopped").contains("Stopped (5)"));
+    let shown = session_titles(&env.view);
+    assert!(shown.contains(&"util-snoozed".to_string()), "{shown:?}");
+    assert!(!shown.contains(&"util-stopped".to_string()), "{shown:?}");
+    assert!(header_text(&env.view, "util").contains("util (2/3)"));
+
+    env.view.hide_snoozed_with_stopped = true;
+    env.view.rebuild_flat_items();
+    let shown = session_titles(&env.view);
+    assert!(!shown.contains(&"util-snoozed".to_string()), "{shown:?}");
+    assert!(
+        shown.contains(&"loose-snoozed".to_string()),
+        "a session in no group is never hidden: {shown:?}"
+    );
+    assert!(header_text(&env.view, "util").contains("util (1/3)"));
 }
 
-/// Attention sort lists sessions without groups, and archived sessions keep their own section,
-/// so neither loses a row.
+/// Editing `session.hide_snoozed_with_stopped` while `y` is on re-filters the list on the next
+/// config refresh, in both directions.
 #[test]
 #[serial]
-fn attention_sort_and_the_archived_section_hide_nothing() {
+fn a_config_refresh_applies_the_setting_while_stopped_sessions_are_hidden() {
+    let mut snoozed = with_status(
+        instance_in("util-snoozed", "/tmp/util", "util"),
+        Status::Waiting,
+    );
+    snoozed.snooze(30);
+    let mut env = seeded_env(
+        test_home(),
+        &[
+            with_status(instance_in("util-live", "/tmp/util", "util"), Status::Idle),
+            with_status(
+                instance_in("util-stopped", "/tmp/util", "util"),
+                Status::Stopped,
+            ),
+            snoozed,
+        ],
+        true,
+    );
+
+    press_y(&mut env);
+    assert!(
+        session_titles(&env.view).contains(&"util-snoozed".to_string()),
+        "the setting is still off"
+    );
+
+    fn set(view: &mut HomeView, on: bool) {
+        crate::session::update_config(|config| {
+            config.session.hide_snoozed_with_stopped = on;
+        })
+        .unwrap();
+        view.refresh_from_config(ConfigRefreshOrigin::Interactive);
+    }
+
+    set(&mut env.view, true);
+    assert!(env.view.hide_snoozed_with_stopped);
+    assert_eq!(session_titles(&env.view), vec!["util-live".to_string()]);
+    assert!(header_text(&env.view, "util").contains("util (1/3)"));
+
+    set(&mut env.view, false);
+    assert!(session_titles(&env.view).contains(&"util-snoozed".to_string()));
+    assert!(header_text(&env.view, "util").contains("util (2/3)"));
+}
+
+/// Archived sessions keep their own section, so hiding stopped never drops one.
+#[test]
+#[serial]
+fn the_archived_section_hides_nothing() {
     let mut archived = with_status(
         instance_in("util-archived", "/tmp/util", "util"),
         Status::Stopped,
@@ -179,13 +250,6 @@ fn attention_sort_and_the_archived_section_hide_nothing() {
     assert!(
         shown.contains(&"util-archived".to_string()),
         "the Archived section is not a group to hide in: {shown:?}"
-    );
-
-    env.view.apply_sort_order(SortOrder::Attention);
-    let shown = session_titles(&env.view);
-    assert!(
-        shown.contains(&"util-stopped".to_string()),
-        "Attention sort has no groups: {shown:?}"
     );
 }
 
@@ -244,7 +308,7 @@ fn the_selection_finds_its_own_header_when_rows_above_it_also_drop_out() {
         true,
     );
     // Alphabetical, so hiding a group's only live session cannot also reorder the headers.
-    env.view.apply_sort_order(SortOrder::AZ);
+    env.view.apply_sort_order(SortOrder::Name);
     press_y(&mut env);
     let selected = select_session(&mut env, "second-live");
     let upper_live = env
@@ -425,7 +489,7 @@ fn each_profile_counts_its_own_copy_of_a_group() {
         ],
     );
     let mut view = test_view(None);
-    view.group_by = GroupByMode::Manual;
+    view.group_by = GroupByMode::Group;
     view.rebuild_flat_items();
     view.update_selected();
     view.handle_key(key(KeyCode::Char('y')), None);
@@ -531,28 +595,6 @@ fn live_send_to_terminal(env: &mut TestEnv, id: &str) {
     env.view.live_send = Some(state);
 }
 
-/// Live-send on a stopped session's terminal ends when a sort change (as the sort picker
-/// submits it) moves the list out of Attention and the filter hides the session.
-#[test]
-#[serial]
-fn live_send_ends_when_a_sort_change_hides_its_session() {
-    let mut env = env_with_stopped(true);
-    env.view.apply_sort_order(SortOrder::Attention);
-    press_y(&mut env);
-    let id = select_session(&mut env, "util-stopped-a");
-    live_send_to_terminal(&mut env, &id);
-    env.view.rebuild_flat_items();
-    assert!(
-        env.view.live_send.is_some(),
-        "shown under Attention, so still live"
-    );
-
-    env.view.apply_sort_order(SortOrder::AZ);
-
-    assert!(!session_titles(&env.view).contains(&"util-stopped-a".to_string()));
-    assert!(env.view.live_send.is_none());
-}
-
 /// Live-send on an ungrouped stopped session ends when a grouping change (as the group picker
 /// submits it) puts the session in a group the filter hides it from.
 #[test]
@@ -577,67 +619,30 @@ fn live_send_ends_when_a_grouping_change_hides_its_session() {
 fn cursor_row_session(view: &HomeView) -> Option<String> {
     match view.flat_items.get(view.cursor)? {
         Item::Session { id, .. } => Some(id.clone()),
-        Item::Group { .. } => None,
+        _ => None,
     }
 }
 
-/// A sort or grouping change can start hiding the selected session. The selection moves to
-/// that session's own group header, never to whichever session now sits at its old index.
+/// A grouping change can start hiding the selected session. The selection moves to that
+/// session's own group header, never to whichever session now sits at its old index.
 #[test]
 #[serial]
-fn a_projection_change_that_hides_the_selection_selects_its_own_header() {
-    type Change = fn(&mut HomeView);
-    let cases: [(&str, &str, Change, Change); 2] = [
-        (
-            "sort",
-            "util-stopped-a",
-            |view| view.apply_sort_order(SortOrder::Attention),
-            |view| view.apply_sort_order(SortOrder::AZ),
-        ),
-        (
-            "grouping",
-            "loose-stopped",
-            |_| {},
-            |view| view.apply_group_by(GroupByMode::Project),
-        ),
-    ];
-    for (case, title, before, change) in cases {
-        let mut env = env_with_stopped(true);
-        before(&mut env.view);
-        press_y(&mut env);
-        let id = select_session(&mut env, title);
-        assert_eq!(
-            env.view.selected_session.as_deref(),
-            Some(id.as_str()),
-            "{case}"
-        );
+fn a_grouping_change_that_hides_the_selection_selects_its_own_header() {
+    let mut env = env_with_stopped(true);
+    press_y(&mut env);
+    let id = select_session(&mut env, "loose-stopped");
+    assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
 
-        change(&mut env.view);
+    env.view.apply_group_by(GroupByMode::Project);
 
-        assert!(
-            !session_titles(&env.view).contains(&title.to_string()),
-            "{case}: hidden"
-        );
-        assert_eq!(
-            env.view.selected_session, None,
-            "{case}: no other session selected"
-        );
-        let header = match env.view.group_by {
-            GroupByMode::Project => {
-                super::super::rows::project_group_key(env.view.get_instance(&id).unwrap())
-            }
-            _ => env.view.get_instance(&id).unwrap().group_path.clone(),
-        };
-        assert!(
-            matches!(&env.view.flat_items[env.view.cursor], Item::Group { path, .. } if *path == header),
-            "{case}: cursor on its own {header} header"
-        );
-        assert_eq!(
-            env.view.selected_group.as_deref(),
-            Some(header.as_str()),
-            "{case}"
-        );
-    }
+    assert!(!session_titles(&env.view).contains(&"loose-stopped".to_string()));
+    assert_eq!(env.view.selected_session, None, "no other session selected");
+    let header = super::super::rows::project_group_key(env.view.get_instance(&id).unwrap());
+    assert!(
+        matches!(&env.view.flat_items[env.view.cursor], Item::Group { path, .. } if *path == header),
+        "cursor on its own {header} header"
+    );
+    assert_eq!(env.view.selected_group.as_deref(), Some(header.as_str()));
 }
 
 /// `w` passes over an unread session the filter hides: selecting it would leave the preview and

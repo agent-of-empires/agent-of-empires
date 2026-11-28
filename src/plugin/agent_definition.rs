@@ -1,14 +1,16 @@
 //! Borrowed host metadata projected from the validated declaration format.
 
 use aoe_plugin_api::agent_integration::{
-    AgentCaptureBackend, AgentCaptureContext, AgentIntegrationContribution, AgentKeyDeclaration,
+    AgentCaptureBackend, AgentCaptureContext, AgentHookEventDeclaration, AgentHookFormat,
+    AgentHookIdentityField, AgentHookStatus, AgentIntegrationContribution, AgentKeyDeclaration,
     AgentResumeDeclaration, AgentYoloDeclaration,
 };
 
 use crate::agents::{
-    AgentDef, AgentLifecycle, DetectionMethod, ForkStrategy, KeyToken, PermissionResponse,
-    ResumeStrategy, SessionCaptureBackend, SessionCaptureContext, SessionCaptureSpec,
-    SessionSupport, YoloMode,
+    AgentDef, AgentHookConfig, AgentLifecycle, DetectionMethod, ForkStrategy, HookEvent,
+    HookFormat, HookIdentityField, HookStatus, KeyToken, PermissionResponse, ResumeStrategy,
+    SessionCaptureBackend, SessionCaptureContext, SessionCaptureSpec, SessionSupport, ToolNames,
+    YoloMode,
 };
 
 /// Reference arrays owned separately from the declaration, without leaking a registry snapshot.
@@ -18,6 +20,27 @@ pub(super) struct DefinitionData<'a> {
     allow: Vec<KeyToken<'a>>,
     always: Option<Vec<KeyToken<'a>>>,
     deny: Vec<KeyToken<'a>>,
+    hook_events: Vec<HookEvent<'a>>,
+}
+
+fn hook_event(event: &AgentHookEventDeclaration) -> HookEvent<'_> {
+    HookEvent {
+        name: &event.event,
+        matcher: event.matcher.as_deref(),
+        status: event.status.map(|status| match status {
+            AgentHookStatus::Running => HookStatus::Running,
+            AgentHookStatus::Waiting => HookStatus::Waiting,
+            AgentHookStatus::Idle => HookStatus::Idle,
+            AgentHookStatus::Error => HookStatus::Error,
+        }),
+        identity_field: event.identity_field.map(|field| match field {
+            AgentHookIdentityField::SessionId => HookIdentityField::SessionId,
+            AgentHookIdentityField::ConversationIdOrSessionId => {
+                HookIdentityField::ConversationIdOrSessionId
+            }
+        }),
+        waiting_tools: ToolNames::Declared(&event.waiting_tools),
+    }
 }
 
 impl<'a> DefinitionData<'a> {
@@ -58,6 +81,11 @@ impl<'a> DefinitionData<'a> {
                 .reply_fallback
                 .as_ref()
                 .map_or_else(Vec::new, |reply| reply.deny.iter().map(key).collect()),
+            hook_events: entry
+                .hooks
+                .iter()
+                .flat_map(|hooks| hooks.events.iter().map(hook_event))
+                .collect(),
         }
     }
 
@@ -131,10 +159,20 @@ impl<'a> DefinitionData<'a> {
                 crate::tmux::status_detection::detect_hook_only_status
             },
             container_env: &self.environment,
-            hook_config: None,
+            hook_config: entry.hooks.as_ref().map(|hooks| AgentHookConfig {
+                settings_rel_path: &hooks.settings_rel_path,
+                config_dir_env_var: hooks.config_dir_env_var.as_deref(),
+                events: &self.hook_events,
+                strict: true,
+                format: match hooks.format {
+                    AgentHookFormat::JsonSettings => HookFormat::JsonSettings,
+                },
+            }),
+            trust: entry.trust.as_ref(),
             sidecar_hooks: None,
             session_support: support,
             fork_strategy: ForkStrategy::Unsupported,
+            fork_host_only: false,
             host_only: launch.host_only,
             send_keys_enter_delay_ms: launch.send_keys_enter_delay_ms.unwrap_or(0),
             ready_markers: &[],
@@ -146,5 +184,87 @@ impl<'a> DefinitionData<'a> {
             }),
             lifecycle: AgentLifecycle::Active,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors the built-in Claude table in `src/agents.rs`.
+    const CLAUDE_SHAPED_HOOKS: &str = r#"
+[agent_integrations.hooks]
+settings_rel_path = ".claude/settings.json"
+config_dir_env_var = "CLAUDE_CONFIG_DIR"
+format = "json_settings"
+
+[[agent_integrations.hooks.events]]
+event = "SessionStart"
+identity_field = "session_id"
+[[agent_integrations.hooks.events]]
+event = "PreToolUse"
+status = "running"
+waiting_tools = ["AskUserQuestion"]
+[[agent_integrations.hooks.events]]
+event = "PostToolUse"
+matcher = "AskUserQuestion"
+status = "running"
+[[agent_integrations.hooks.events]]
+event = "UserPromptSubmit"
+status = "running"
+identity_field = "session_id"
+[[agent_integrations.hooks.events]]
+event = "Stop"
+status = "idle"
+[[agent_integrations.hooks.events]]
+event = "StopFailure"
+status = "idle"
+[[agent_integrations.hooks.events]]
+event = "Notification"
+matcher = "permission_prompt|elicitation_dialog|agent_needs_input"
+status = "waiting"
+[[agent_integrations.hooks.events]]
+event = "Notification"
+matcher = "idle_prompt|agent_completed"
+status = "idle"
+[[agent_integrations.hooks.events]]
+event = "ElicitationResult"
+status = "running"
+"#;
+
+    #[test]
+    #[serial_test::serial]
+    fn declared_claude_shaped_hooks_install_byte_identical_to_the_built_in() {
+        let app = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let manifest = aoe_plugin_api::PluginManifest::from_toml_str(&format!(
+            "id = \"acme.claude-shaped\"\nname = \"Claude shaped\"\nversion = \"1.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             command = \"claude\"\n\
+             [agent_integrations.launch.container_env]\nCLAUDE_CONFIG_DIR = \"/root/.claude\"\n\
+             {CLAUDE_SHAPED_HOOKS}"
+        ))
+        .unwrap();
+        let entry = &manifest.agent_integrations[0];
+        let data = DefinitionData::new(entry);
+        let declared = data.definition(entry, false).unwrap();
+        let built_in = crate::agents::get_agent("claude").unwrap();
+        let config = crate::session::config::Config::default();
+
+        let dir = tempfile::tempdir().unwrap();
+        let [from_declared, from_built_in] = ["declared.json", "built-in.json"].map(|name| {
+            let path = dir.path().join(name);
+            let agent = if name == "declared.json" {
+                &declared
+            } else {
+                built_in
+            };
+            let events = crate::agents::resolved_hook_events(agent, &config).unwrap();
+            crate::hooks::install_hooks(&path, &events, crate::hooks::HookInstallTarget::Host)
+                .unwrap();
+            std::fs::read(path).unwrap()
+        });
+        assert!(!from_built_in.is_empty());
+        assert_eq!(from_declared, from_built_in);
     }
 }

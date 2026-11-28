@@ -1,7 +1,7 @@
 import { Fragment, type ReactNode } from "react";
 
 import type { DockLocation } from "../lib/panes";
-import { Dock, type PaneDisplay } from "./Dock";
+import { Dock, type DockControls, type PaneDisplay } from "./Dock";
 
 /** One rendered group: its persisted index, its visible tabs, and the active one. */
 export interface DockGroupView {
@@ -10,7 +10,7 @@ export interface DockGroupView {
   active: string | null;
 }
 
-interface Props {
+interface Props extends DockControls {
   location: DockLocation;
   groups: DockGroupView[];
   descriptorFor: (id: string) => PaneDisplay;
@@ -18,7 +18,6 @@ interface Props {
   onActivate: (id: string) => void;
   onClose: (id: string) => void;
   onMove: (id: string, dock: DockLocation) => void;
-  onNewTerminal?: () => void;
 }
 
 /** Lays a dock's groups out along its split axis: the tall right column stacks groups top to bottom (flex column),
@@ -31,18 +30,16 @@ export function DockGroups({
   onActivate,
   onClose,
   onMove,
-  onNewTerminal,
+  ...controls
 }: Props) {
   if (groups.length === 0) return null;
   const axis = location === "right" ? "flex-col" : "flex-row";
-  const divider = location === "right" ? "border-t" : "border-l";
   return (
-    <div className={`flex ${axis} min-h-0 min-w-0 flex-1 overflow-hidden`}>
-      {groups.map((g, i) => (
+    <div className={`flex ${axis} gap-2 min-h-0 min-w-0 flex-1 overflow-hidden`}>
+      {groups.map((g) => (
         <Fragment key={g.group}>
-          <div
-            className={`flex min-h-0 min-w-0 flex-1 overflow-hidden ${i > 0 ? `${divider} border-surface-700/40` : ""}`}
-          >
+          {/* Each group is a card on the canvas (see DESIGN.md). */}
+          <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden rounded-xl border border-surface-700/45 bg-surface-900 shadow-md">
             <Dock
               location={location}
               groupIndex={g.group}
@@ -53,7 +50,7 @@ export function DockGroups({
               onActivate={onActivate}
               onClose={onClose}
               onMove={onMove}
-              onNewTerminal={onNewTerminal}
+              {...controls}
             />
           </div>
         </Fragment>

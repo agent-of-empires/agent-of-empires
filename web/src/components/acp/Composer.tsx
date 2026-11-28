@@ -2,6 +2,7 @@
 // `/` command trigger popovers, attachments, queue recall, and draft persistence.
 
 import { ComposerPrimitive } from "@assistant-ui/react";
+import { MENU } from "../../lib/surfaces";
 import { unstable_defaultDirectiveFormatter as defaultDirectiveFormatter } from "@assistant-ui/core";
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { AtSign, Paperclip, Pencil, Slash } from "lucide-react";
@@ -63,6 +64,7 @@ import {
 } from "./useComposerHooks";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
 import { useProviderSwitch } from "./useProviderSwitch";
+import { TRANSCRIPT_COLUMN } from "./transcriptColumn";
 
 interface Props {
   /** False for a hidden or covered retained view: it takes no focus requests. */
@@ -108,8 +110,7 @@ interface Props {
   editQueuedPrompt: (id: string, text: string) => void;
 }
 
-const POPOVER_CLASS =
-  "absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl";
+const POPOVER_CLASS = `absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden ${MENU} !py-0`;
 
 export function Composer(props: Props) {
   const { sessionId, turnActive, connected, promptCapabilities, queuedPrompts } = props;
@@ -212,7 +213,7 @@ export function Composer(props: Props) {
       <div
         data-session-composer
         {...tourAnchor(TOUR_ANCHORS.composer)}
-        className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl"
+        className={TRANSCRIPT_COLUMN}
         onDragOver={(e) => {
           if (Array.from(e.dataTransfer?.types ?? []).includes("Files")) e.preventDefault();
         }}

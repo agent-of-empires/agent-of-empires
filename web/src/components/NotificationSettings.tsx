@@ -1,4 +1,6 @@
 import { usePushSubscription } from "../hooks/usePushSubscription";
+import { CARD, CAPTION } from "../lib/surfaces";
+
 import { installHint } from "../lib/platform";
 import { deniedGuidance, type PushHealth } from "../lib/pushHealth";
 import { INSTALL_STEPS } from "../lib/tourSteps";
@@ -17,49 +19,50 @@ export function NotificationSettings() {
     state.kind === "loading";
 
   return (
-    <section className="rounded-lg border border-surface-700/50 bg-surface-900 p-4">
-      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-3">Notifications</h3>
+    <section>
+      <h3 className={CAPTION}>This device</h3>
+      <div className={`${CARD} py-4`}>
+        <StatusRow state={state} />
+        <HealthRow health={health} />
 
-      <StatusRow state={state} />
-      <HealthRow health={health} />
-
-      <div className="mt-4 flex flex-wrap gap-2">
-        {(state.kind === "off" || state.kind === "denied" || state.kind === "error") && (
-          <button
-            onClick={enable}
-            disabled={isBusy}
-            className="px-3 py-2 rounded-md bg-brand-600 hover:bg-brand-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium text-surface-950 transition-colors"
-          >
-            {isBusy ? "Working..." : "Enable notifications"}
-          </button>
-        )}
-        {state.kind === "enabled" && (
-          <>
-            <button
-              onClick={sendTest}
-              className="px-3 py-2 rounded-md bg-surface-700 hover:bg-surface-700/70 text-sm font-medium text-text-primary transition-colors"
-            >
-              Send test notification
-            </button>
+        <div className="mt-4 flex flex-wrap gap-2">
+          {(state.kind === "off" || state.kind === "denied" || state.kind === "error") && (
             <button
               onClick={enable}
-              title="Re-register this device. Use after changing the server port or hostname so notifications open the right URL."
-              className="px-3 py-2 rounded-md border border-surface-700 hover:bg-surface-700/40 text-sm font-medium text-text-secondary transition-colors"
+              disabled={isBusy}
+              className="px-3 py-2 rounded-md bg-brand-600 hover:bg-brand-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium text-surface-950 transition-colors"
             >
-              Re-subscribe
+              {isBusy ? "Working..." : "Enable notifications"}
             </button>
-            <button
-              onClick={disable}
-              className="px-3 py-2 rounded-md border border-surface-700 hover:bg-surface-700/40 text-sm font-medium text-text-secondary transition-colors"
-            >
-              Turn off
-            </button>
-          </>
-        )}
-      </div>
+          )}
+          {state.kind === "enabled" && (
+            <>
+              <button
+                onClick={sendTest}
+                className="px-3 py-2 rounded-md bg-surface-700 hover:bg-surface-700/70 text-sm font-medium text-text-primary transition-colors"
+              >
+                Send test notification
+              </button>
+              <button
+                onClick={enable}
+                title="Re-register this device. Use after changing the server port or hostname so notifications open the right URL."
+                className="px-3 py-2 rounded-md border border-surface-700 hover:bg-surface-700/40 text-sm font-medium text-text-secondary transition-colors"
+              >
+                Re-subscribe
+              </button>
+              <button
+                onClick={disable}
+                className="px-3 py-2 rounded-md border border-surface-700 hover:bg-surface-700/40 text-sm font-medium text-text-secondary transition-colors"
+              >
+                Turn off
+              </button>
+            </>
+          )}
+        </div>
 
-      {/* The install banner's × promises these steps here, so the platform decides them, not the push state. */}
-      {(hint === "ios" || hint === "other") && <InstallHelp hint={hint} />}
+        {/* The install banner's × promises these steps here, so the platform decides them, not the push state. */}
+        {(hint === "ios" || hint === "other") && <InstallHelp hint={hint} />}
+      </div>
     </section>
   );
 }

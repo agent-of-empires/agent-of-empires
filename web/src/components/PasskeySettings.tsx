@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+import { CAPTION } from "../lib/surfaces";
+
 import { fetchPasskeys, passkeysSupported, registerPasskey, removePasskey, type PasskeyInfo } from "../lib/api";
 
 export function PasskeySettings() {
@@ -43,14 +45,14 @@ export function PasskeySettings() {
 
   return (
     <div className="mt-8">
-      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">Passkeys</h3>
+      <h3 className={CAPTION}>Passkeys</h3>
       {loadFailed && (
         <div className="flex items-center gap-3 mb-3">
           <p className="font-body text-[13px] text-status-error">Could not load passkeys</p>
           <button
             type="button"
             onClick={load}
-            className="font-mono text-[11px] uppercase tracking-wider text-text-secondary border border-surface-700 rounded px-2 py-1 hover:bg-surface-700/30"
+            className="text-[13px] font-medium text-text-secondary border border-surface-700 rounded-lg px-2 py-1 hover:bg-surface-700/30"
           >
             Retry
           </button>
@@ -69,7 +71,7 @@ export function PasskeySettings() {
             type="button"
             onClick={() => onRemove(p.credential_id)}
             disabled={busy}
-            className="shrink-0 font-mono text-[11px] uppercase tracking-wider text-status-error border border-status-error/40 rounded px-2 py-1 hover:bg-status-error/10 disabled:opacity-50"
+            className="shrink-0 text-[13px] font-medium text-status-error border border-status-error/40 rounded px-2 py-1 hover:bg-status-error/10 disabled:opacity-50"
           >
             Remove
           </button>
@@ -90,7 +92,7 @@ export function PasskeySettings() {
             type="button"
             onClick={onAdd}
             disabled={busy}
-            className="shrink-0 font-mono text-[11px] uppercase tracking-wider text-text-secondary border border-surface-700 rounded px-3 py-1.5 hover:bg-surface-700/30 disabled:opacity-50"
+            className="shrink-0 text-[13px] font-medium text-text-secondary border border-surface-700 rounded-lg px-3 py-1.5 hover:bg-surface-700/30 disabled:opacity-50"
           >
             {busy ? "Waiting..." : "Add a passkey for this device"}
           </button>

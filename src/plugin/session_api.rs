@@ -29,7 +29,7 @@ use crate::plugin::automation_policy::{
 };
 use crate::plugin::host_api::{DispatchError, PluginRpcContext};
 use crate::plugin::protocol::codes;
-use crate::server::api::sessions::{send_terminal_message, SendKeysError};
+use crate::server::api::sessions::{send_terminal_message, SendKeysError, SendPane};
 use crate::server::session_service::{
     CreateIdempotencyProbe, IdempotencyConflict, PromptTouch, SendTurnError, SendTurnRequest,
     SessionCaller, SessionService,
@@ -532,6 +532,7 @@ async fn admit_and_create(
         profile: deps.profile.clone(),
         created_by_plugin: None,
         plugin_create_idempotency: None,
+        suggestion: None,
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
         pending_initial_turn: req
@@ -547,6 +548,7 @@ async fn admit_and_create(
         import_acp_session_id: None,
         import_binding: None,
         fork_seed: None,
+        session_id: None,
         progress: None,
         cli: None,
     };
@@ -960,6 +962,7 @@ async fn deliver_message(
         req.message.clone(),
         true,
         true,
+        SendPane::LIVE,
     )
     .await
     .map_err(|error| map_terminal_error(error.error))?;
@@ -1219,6 +1222,11 @@ fn map_terminal_error(e: SendKeysError) -> DispatchError {
             "ignored",
             "the session is ignored because another session manages it",
         ),
+        SendKeysError::InputLineBusy => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "input_line_busy",
+            "the agent's input box holds text someone has not sent; retry once it is sent or cleared",
+        ),
         SendKeysError::Tmux(error) => {
             tracing::warn!(target: "plugin.host", %error, "plugin terminal send failed");
             DispatchError::internal("terminal send failed")
@@ -1289,6 +1297,7 @@ mod tests {
             ui_contributions: std::collections::HashSet::new(),
             deep_link_pages: Default::default(),
             ui_generation: 1,
+            suggestions_spec: None,
         }
     }
 
@@ -2086,6 +2095,7 @@ mod tests {
                 "session_trashed",
             ),
             (SendKeysError::NotRunning, "session_not_running"),
+            (SendKeysError::InputLineBusy, "input_line_busy"),
             (
                 SendKeysError::Transient(Status::Starting),
                 "session_transient",

@@ -224,6 +224,7 @@ fn integration_snapshot(
         provider_version: "1.0.0".to_string(),
         provider_session_id: "provider-session".to_string(),
         writer_pid: std::process::id(),
+        launch_id: None,
         revision: 1,
         status: AgentIntegrationStatus::Waiting,
         reply_keys: vec!["F12".to_string()],

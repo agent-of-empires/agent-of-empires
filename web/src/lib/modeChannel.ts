@@ -2,7 +2,7 @@
 
 import type { AcpState, ConfigOptionDescriptor, SessionMode } from "./acpTypes";
 
-/** Only used when the profile sets `capabilities.legacyModeFallback`. */
+/** Only used when the profile sets `legacy_mode_fallback`. */
 export const LEGACY_MODES: ReadonlyArray<{
   id: string;
   legacyId: SessionMode;

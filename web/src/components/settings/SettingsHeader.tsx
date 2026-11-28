@@ -1,3 +1,6 @@
+import { ChevronLeft } from "lucide-react";
+import { createPortal } from "react-dom";
+import { useHeaderPageSlot } from "../../lib/headerSlot";
 import { SettingsSearch } from "./SettingsSearch";
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import type { SettingsSearchHit } from "./settingsSearchIndex";
@@ -9,11 +12,30 @@ interface Props {
   schema: SettingsFieldDescriptor[];
   schemaLoading: boolean;
   onSearchJump: (hit: SettingsSearchHit) => void;
-  /** Set on a tab page: mobile Back returns to the section list instead of closing. */
+  /** Set on a tab page: a phone's back returns to the section list instead of closing. */
   onBackToList?: () => void;
+  /** The open section's name, which a phone's header titles its page with. */
+  sectionLabel: string;
 }
 
-// On mobile the search wraps onto its own row.
+function SaveState({ saving, saveError }: Pick<Props, "saving" | "saveError">) {
+  return (
+    <>
+      {saving && <span className="text-[12px] text-text-dim shrink-0">Saving…</span>}
+      {saveError && (
+        <span data-testid="settings-header-save-error" className="text-[12px] text-status-error truncate min-w-0">
+          {saveError}
+        </span>
+      )}
+    </>
+  );
+}
+
+/**
+ * A phone heads Settings as it heads the session list: a round back button beside a large title, and on the
+ * section list a search pill under it. A wide screen has no row of its own: the app header shows Back and the
+ * title, and this puts the save state and search in its middle.
+ */
 export function SettingsHeader({
   onClose,
   saving,
@@ -22,34 +44,39 @@ export function SettingsHeader({
   schemaLoading,
   onSearchJump,
   onBackToList,
+  sectionLabel,
 }: Props) {
+  const slot = useHeaderPageSlot();
+  if (slot) {
+    return createPortal(
+      <>
+        <SaveState saving={saving} saveError={saveError} />
+        <div className="flex-1 min-w-0 max-w-sm">
+          <SettingsSearch schema={schema} loading={schemaLoading} onJump={onSearchJump} />
+        </div>
+      </>,
+      slot,
+    );
+  }
   return (
     <div
       data-testid="settings-header"
-      className="bg-surface-850 border-b border-surface-700 shrink-0 flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 md:flex-nowrap md:h-12 md:py-0"
+      className="shrink-0 bg-surface-900 flex flex-wrap items-center gap-x-3 gap-y-3 px-4 pt-3 pb-3"
     >
-      {onBackToList && (
-        <button onClick={onBackToList} className="md:hidden text-brand-500 cursor-pointer text-sm shrink-0">
-          &larr; All settings
-        </button>
-      )}
       <button
-        onClick={onClose}
-        className={`text-brand-500 cursor-pointer text-sm shrink-0 ${onBackToList ? "hidden md:inline" : ""}`}
+        type="button"
+        onClick={onBackToList ?? onClose}
+        aria-label={onBackToList ? "All settings" : "Back"}
+        className="w-10 h-10 shrink-0 flex items-center justify-center rounded-full float-control text-text-secondary cursor-pointer active:scale-95 transition-transform"
       >
-        &larr; Back
+        <ChevronLeft className="size-5" strokeWidth={1.75} aria-hidden />
       </button>
-      <span className="text-xs font-mono text-text-bright shrink-0">Settings</span>
-      {saving && <span className="text-[11px] font-mono text-text-dim shrink-0">Saving...</span>}
-      {saveError && (
-        <span
-          data-testid="settings-header-save-error"
-          className="text-[11px] font-mono text-status-error truncate min-w-0"
-        >
-          {saveError}
-        </span>
-      )}
-      <div className="basis-full md:basis-auto md:flex-1 md:min-w-0 md:max-w-sm md:ml-auto">
+      <h1 className="min-w-0 truncate text-[22px] font-semibold text-text-primary">
+        {onBackToList ? sectionLabel : "Settings"}
+      </h1>
+      <SaveState saving={saving} saveError={saveError} />
+      {/* The list's search takes its own row under the title; a section page drops it. */}
+      <div className={`basis-full ${onBackToList ? "hidden" : ""}`}>
         <SettingsSearch schema={schema} loading={schemaLoading} onJump={onSearchJump} />
       </div>
     </div>

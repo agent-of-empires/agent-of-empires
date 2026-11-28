@@ -18,7 +18,6 @@ import {
   Pin,
   Play,
   Plus,
-  RefreshCw,
   ScrollText,
   SquareTerminal,
   Sparkles,
@@ -34,7 +33,8 @@ import type { NotifyPreset, RowModel } from "./rowModel";
 import type { SessionAction } from "./sessionActionTargets";
 import type { RowBulkApi } from "./types";
 
-const icon = (Icon: typeof Pin, className = "") => <Icon className={`h-3.5 w-3.5 shrink-0 ${className}`.trim()} />;
+// MenuItem sizes its icon; `className` only turns or tints one.
+const icon = (Icon: typeof Pin, className?: string) => <Icon className={className} />;
 const PinIcon = () => icon(Pin, "-rotate-45");
 
 /** Count-labelled triage for a multi-selection; single-row actions are absent here. */
@@ -75,7 +75,7 @@ export function BulkTriageMenuItems({
                 type="button"
                 data-testid="sidebar-context-menu-bulk-snooze"
                 onClick={act(() => api.snooze(buckets.snoozable, preset.minutes))}
-                className="rounded-md px-1 py-1.5 max-md:py-2.5 text-xs text-text-secondary hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
+                className="rounded-lg px-1 py-1.5 max-md:py-2.5 text-[12px] max-md:text-[13px] text-text-secondary hover:bg-surface-700/60 hover:text-text-primary cursor-pointer transition-colors"
               >
                 {preset.label}
               </button>
@@ -106,7 +106,6 @@ export interface SingleRowActions {
   openOwnWindow?: (sessionId: string) => void;
   stop: (sessionId: string) => void;
   start: (sessionId: string) => void;
-  restartUpdate: (sessionId: string) => void;
   recreateContainer: (sessionId: string) => void;
   notify: (preset: NotifyPreset) => void;
   pin: () => void;
@@ -147,8 +146,8 @@ function QuickAction({
       onClick={onClick}
       data-testid={testId}
       aria-pressed={pressed}
-      className={`flex flex-1 min-w-0 flex-col items-center gap-1 rounded-md px-1 py-2 text-[11px] hover:text-text-primary cursor-pointer transition-colors ${
-        pressed ? "bg-brand-600/20 text-text-primary" : "text-text-secondary hover:bg-surface-700/50"
+      className={`flex flex-1 min-w-0 flex-col items-center gap-1 rounded-lg px-1 py-2 max-md:py-2.5 text-[11px] max-md:text-[12px] hover:text-text-primary cursor-pointer transition-colors ${
+        pressed ? "bg-brand-600/20 text-text-primary" : "text-text-secondary hover:bg-surface-700/60"
       }`}
     >
       {glyph}
@@ -336,12 +335,6 @@ export function SingleRowMenuItems({
           ),
         ],
         [
-          item("restartUpdate", {
-            label: "Restart to update",
-            detail: "Keeps the conversation",
-            testId: "sidebar-context-menu-restart-update",
-            glyph: icon(RefreshCw, "text-brand-400"),
-          }),
           item("stop", { label: "Stop", testId: "sidebar-context-menu-stop", glyph: icon(CircleStop) }),
           item("start", { label: "Start", testId: "sidebar-context-menu-start", glyph: icon(Play) }),
           item("switchView", {
@@ -388,7 +381,7 @@ export function SingleRowMenuItems({
             <div
               role="group"
               aria-label="Notify"
-              className="flex flex-1 rounded-md border border-surface-700 bg-surface-900 p-0.5"
+              className="flex flex-1 rounded-lg border border-surface-700/60 bg-surface-900 p-0.5"
             >
               {NOTIFY_OPTIONS.map(({ preset, label }) => (
                 <button
@@ -397,7 +390,7 @@ export function SingleRowMenuItems({
                   onClick={() => a.notify(preset)}
                   data-testid={`sidebar-context-menu-notify-${preset}`}
                   aria-pressed={model.notifyPreset === preset}
-                  className={`flex-1 rounded px-2 py-1 max-md:py-2 text-xs cursor-pointer transition-colors ${
+                  className={`flex-1 rounded-md px-2 py-1 max-md:py-2 text-[12px] cursor-pointer transition-colors ${
                     model.notifyPreset === preset
                       ? "bg-brand-600/20 text-text-primary"
                       : "text-text-secondary hover:text-text-primary"
@@ -412,13 +405,7 @@ export function SingleRowMenuItems({
         [extraItems && <Fragment key="plugin">{extraItems}</Fragment>],
         [
           write && (
-            <MenuItem
-              key="trash"
-              onClick={a.remove}
-              testId="sidebar-context-menu-delete"
-              icon={icon(Trash2)}
-              className="text-status-error hover:bg-status-error/10"
-            >
+            <MenuItem key="trash" onClick={a.remove} testId="sidebar-context-menu-delete" icon={icon(Trash2)} danger>
               Move to Trash…
             </MenuItem>
           ),
@@ -493,13 +480,9 @@ function TargetedItem({
             onClick={() => onRun(s.id)}
             testId={`${testId}-target`}
             indent
-            className="text-text-primary hover:bg-surface-700/50"
+            trailing={`${targetDetail(s)}${clashes(s) ? ` #${s.id.slice(0, 8)}` : ""}`}
           >
-            <span className="truncate">{titleOf(s)}</span>
-            <span className="ml-2 shrink-0 text-xs">
-              {targetDetail(s)}
-              {clashes(s) && ` #${s.id.slice(0, 8)}`}
-            </span>
+            <span className="text-text-primary">{titleOf(s)}</span>
           </MenuItem>
         ))}
       </div>

@@ -114,7 +114,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
             if (e.key === "Escape") setRenaming(false);
           }}
           data-testid="sidebar-rename-input"
-          className="w-full bg-surface-900 border border-brand-600 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
+          className="w-full bg-surface-900 border border-brand-600 rounded px-2 py-1 text-[17px] md:text-[14px] font-mono text-text-primary focus:outline-none"
         />
       </div>
     );
@@ -138,6 +138,13 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
       });
   // Only a recorded error's first line is a detail; the glyph's aria-label doesn't carry it.
   const errorLine = tooltip.detail;
+  // A phone row reads in two lines, as Claude's app lists sessions: what is happening, then where.
+  const phoneStatusLine = [
+    attention ? model.attentionHint.charAt(0).toUpperCase() + model.attentionHint.slice(1) : model.status,
+    model.branchLabel,
+  ]
+    .filter(Boolean)
+    .join(" · ");
   const navigationSessionId = navigationSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
 
@@ -173,8 +180,8 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         }}
         {...longPress.handlers}
         data-selected={isSelected || undefined}
-        className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
-          compact ? (indented ? "pl-3 pr-1" : "px-2") : indented ? "pl-6 pr-3" : "px-3"
+        className={`block w-full max-md:w-auto max-md:mx-2 text-left py-1.5 max-md:py-2.5 rounded-md max-md:rounded-2xl cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
+          compact ? (indented ? "pl-3 pr-1" : "px-2") : indented ? "pl-5 pr-2" : "px-2.5"
         } ${sessionRowChromeClass(isActive, isSelected)} ${isDeleting ? "opacity-50 pointer-events-none" : ""} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500`}
       >
         {isSelected && <span className="sr-only">Selected</span>}
@@ -235,7 +242,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           )}
           <div className="min-w-0 flex-1">
             <span
-              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic" : ""}`}
+              className={`flex items-center gap-1.5 text-[17px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic" : ""}`}
             >
               {!compact && model.effectivePinned && (
                 <Tooltip text={meaningText(MARK_MEANING.pinned)}>
@@ -267,6 +274,14 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 />
               )}
             </span>
+            {!compact && phoneStatusLine && (
+              <span
+                data-testid="sidebar-row-status-line"
+                className="md:hidden mt-0.5 block truncate text-[15px] text-text-dim"
+              >
+                {phoneStatusLine}
+              </span>
+            )}
             {!compact && <RowSubRows first={model.firstSession} />}
           </div>
         </div>

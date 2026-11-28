@@ -13,7 +13,13 @@ afterAll(() => server.close());
 it("a superseded theme pick neither rolls back the newer pick nor reports an error", async () => {
   const pending: Record<string, () => void> = {};
   server.use(
-    http.get("*/api/themes", () => HttpResponse.json(["empire", "dracula", "nord"])),
+    http.get("*/api/themes", () =>
+      HttpResponse.json([
+        { name: "empire", label: "empire" },
+        { name: "dracula", label: "dracula" },
+        { name: "nord", label: "nord" },
+      ]),
+    ),
     http.patch("*/api/theme", async ({ request }) => {
       const { name } = (await request.json()) as { name: string };
       await new Promise<void>((resolve) => (pending[name] = resolve));
@@ -44,7 +50,13 @@ it("a superseded theme pick neither rolls back the newer pick nor reports an err
 it("a late failure from an earlier pick of the same theme doesn't undo the newer one", async () => {
   const held: (() => void)[] = [];
   server.use(
-    http.get("*/api/themes", () => HttpResponse.json(["empire", "dracula", "nord"])),
+    http.get("*/api/themes", () =>
+      HttpResponse.json([
+        { name: "empire", label: "empire" },
+        { name: "dracula", label: "dracula" },
+        { name: "nord", label: "nord" },
+      ]),
+    ),
     http.patch("*/api/theme", async () => {
       await new Promise<void>((resolve) => held.push(resolve));
       return HttpResponse.json({ ok: true });
@@ -78,7 +90,13 @@ it("a failed pick rolls back to the last saved theme, not to an unsaved earlier 
   document.documentElement.dataset.theme = "empire";
   let releaseFirst: (() => void) | undefined;
   server.use(
-    http.get("*/api/themes", () => HttpResponse.json(["empire", "dracula", "nord"])),
+    http.get("*/api/themes", () =>
+      HttpResponse.json([
+        { name: "empire", label: "empire" },
+        { name: "dracula", label: "dracula" },
+        { name: "nord", label: "nord" },
+      ]),
+    ),
     http.patch("*/api/theme", async ({ request }) => {
       const { name } = (await request.json()) as { name: string };
       if (name === "dracula") await new Promise<void>((resolve) => (releaseFirst = resolve));

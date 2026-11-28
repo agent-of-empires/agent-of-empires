@@ -105,9 +105,10 @@ impl McpServer {
             return Json(WhoAmI { session: None });
         };
         let instances = self.state.instances.read().await;
-        let session = instances.iter().find(|inst| inst.id == id).map(|inst| {
-            session_response_from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-        });
+        let session = instances
+            .iter()
+            .find(|inst| inst.id == id)
+            .map(session_response_from_instance);
         Json(WhoAmI { session })
     }
 }
@@ -164,13 +165,19 @@ pub(super) fn service(
     StreamableHttpService::new(
         move || Ok(McpServer::new(state.clone())),
         Arc::default(),
-        // `rmcp` reads the body itself, so the router's `DefaultBodyLimit` does not apply.
-        StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
-            .with_json_response(true)
-            .disable_allowed_hosts()
-            .with_max_request_body_bytes(1024 * 1024),
+        stateless_config(),
     )
+}
+
+/// Stateless JSON replies; host and origin checks belong to the router's middleware.
+/// Shared with the plugin endpoints: options only `/mcp` needs go on [`service`], not here.
+pub(super) fn stateless_config() -> StreamableHttpServerConfig {
+    // `rmcp` reads the body itself, so the router's `DefaultBodyLimit` does not apply.
+    StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .disable_allowed_hosts()
+        .with_max_request_body_bytes(1024 * 1024)
 }
 
 #[cfg(test)]

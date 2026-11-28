@@ -859,6 +859,9 @@ impl SettingsView {
                     theme,
                 );
             }
+            FieldValue::ReadOnly(value) => {
+                self.render_text_field(canvas, value_area, value, index, is_selected, theme);
+            }
             FieldValue::SectionHeader => {
                 // Handled by the early return at the top of `render_field`.
             }
@@ -1766,6 +1769,183 @@ mod status_message_tests {
         assert!(
             !border_row.chars().any(|c| c.is_ascii_alphabetic()),
             "field text must not overwrite the panel's bottom border, got {border_row:?}"
+        );
+    }
+
+    /// A field taller than the panel opens at its label, j/k scroll through it line
+    /// by line before moving to the next field, and editing reveals its value.
+    #[test]
+    #[serial]
+    fn keyboard_reaches_all_of_a_field_taller_than_the_panel() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_temp, _guard, mut view) = fresh_view();
+        view.fields = vec![
+            bool_field("FieldA", "alpha"),
+            bool_field("FieldB", &"word ".repeat(40)),
+            bool_field("FieldC", "charlie"),
+        ];
+        view.focus = super::super::SettingsFocus::Fields;
+        view.selected_field = 0;
+        view.fields_scroll_offset = 0;
+        view.fields_content_width = 20;
+        view.fields_viewport_height = 4;
+        let b_top = view.field_height(&view.fields[0], 0) + 1;
+        let b_height = view.field_height(&view.fields[1], 1);
+        assert!(b_height > 4, "FieldB must overflow the panel");
+        let press = |view: &mut super::super::SettingsView, code| {
+            view.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(view.selected_field, 1);
+        assert_eq!(view.fields_scroll_offset, b_top, "opens at the label");
+        for _ in 0..b_height - 4 {
+            press(&mut view, KeyCode::Char('j'));
+            assert_eq!(view.selected_field, 1, "scrolls within the field first");
+        }
+        assert_eq!(view.fields_scroll_offset, b_top + b_height - 4);
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(view.selected_field, 2);
+
+        press(&mut view, KeyCode::Char('k'));
+        assert_eq!(view.selected_field, 1);
+        assert_eq!(view.fields_scroll_offset, b_top);
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(view.fields_scroll_offset, b_top + 1);
+        press(&mut view, KeyCode::Char('k'));
+        assert_eq!(view.fields_scroll_offset, b_top, "k scrolls back up");
+        press(&mut view, KeyCode::Char('k'));
+        assert_eq!(view.selected_field, 0);
+
+        // After the wheel moves the view off the selected field, one key reveals it.
+        for (offset, code) in [
+            (0, KeyCode::Char('j')),
+            (b_top + b_height + 1, KeyCode::Char('k')),
+        ] {
+            view.selected_field = 1;
+            view.fields_scroll_offset = offset;
+            press(&mut view, code);
+            assert_eq!(view.selected_field, 1, "{code:?}");
+            assert_eq!(view.fields_scroll_offset, b_top, "{code:?}");
+        }
+
+        // Editing the tall field brings its value row, below the description, into view.
+        view.fields[1].value = FieldValue::Text("VALUE".to_string());
+        view.selected_field = 1;
+        for offset in [b_top, b_top + b_height + 2] {
+            view.editing_input = None;
+            view.fields_scroll_offset = offset;
+            press(&mut view, KeyCode::Enter);
+            assert!(view.editing_input.is_some());
+            let value_row = b_top + b_height - 1;
+            let offset_now = view.fields_scroll_offset;
+            assert!(
+                offset_now <= value_row && value_row < offset_now + 4,
+                "from {offset}: offset {offset_now}"
+            );
+        }
+    }
+
+    /// A panel with no rows for fields, before the first render or under a
+    /// warning banner that fills it, must not trap the selection on one field.
+    #[test]
+    #[serial]
+    fn empty_field_panel_still_moves_the_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_temp, _guard, mut view) = fresh_view();
+        view.fields = vec![
+            bool_field("FieldA", "alpha"),
+            bool_field("FieldB", &"word ".repeat(40)),
+        ];
+        view.focus = super::super::SettingsFocus::Fields;
+        view.selected_field = 0;
+        view.fields_viewport_height = 0;
+        let press = |view: &mut super::super::SettingsView, code| {
+            view.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+
+        press(&mut view, KeyCode::Char('j'));
+        assert_eq!(view.selected_field, 1, "j moves on with no rows to scroll");
+        press(&mut view, KeyCode::Char('k'));
+        assert_eq!(view.selected_field, 0);
+    }
+
+    /// A list editor taller than the panel keeps its header and selected item in
+    /// view, and closing it leaves the collapsed field on screen.
+    #[test]
+    #[serial]
+    fn tall_list_editor_keeps_its_cursor_in_view() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (_temp, _guard, mut view) = fresh_view();
+        let items: Vec<String> = (0..12).map(|i| format!("item{i}")).collect();
+        view.fields = vec![SettingField {
+            value: FieldValue::List(items),
+            ..bool_field("Things", &"word ".repeat(12))
+        }];
+        view.focus = super::super::SettingsFocus::Fields;
+        view.selected_field = 0;
+        view.fields_content_width = 20;
+        view.fields_viewport_height = 4;
+        let header = 1 + view.description_height(&view.fields[0].description);
+        // The view starts below the collapsed field, as after a wheel scroll.
+        view.fields_scroll_offset = header + 1;
+        let press = |view: &mut super::super::SettingsView, code| {
+            view.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        let cursor_visible = |view: &super::super::SettingsView| {
+            let selected = view.list_edit_state.as_ref().unwrap().selected_index as u16;
+            let offset = view.fields_scroll_offset;
+            let row = header + 1 + selected;
+            offset <= row && row < offset + view.fields_viewport_height
+        };
+
+        press(&mut view, KeyCode::Enter);
+        assert!(view.list_edit_state.is_some());
+        assert_eq!(
+            view.fields_scroll_offset, header,
+            "the header opens in view"
+        );
+        assert!(cursor_visible(&view));
+        for _ in 0..8 {
+            press(&mut view, KeyCode::Char('j'));
+            assert!(
+                cursor_visible(&view),
+                "offset {}",
+                view.fields_scroll_offset
+            );
+        }
+        // Cancelling an add prompt, which sits below the list, returns to the item.
+        press(&mut view, KeyCode::Char('a'));
+        press(&mut view, KeyCode::Esc);
+        assert!(!view.list_edit_state.as_ref().unwrap().adding_new);
+        assert!(
+            cursor_visible(&view),
+            "offset {}",
+            view.fields_scroll_offset
+        );
+        press(&mut view, KeyCode::Esc);
+        assert!(view.list_edit_state.is_none());
+        let height = view.field_height(&view.fields[0], 0);
+        assert_eq!(
+            view.fields_scroll_offset, 0,
+            "a sole field returns to the top"
+        );
+
+        // With a long field below the list keeping the offset valid, Esc still
+        // brings the collapsed list back into view.
+        view.fields.push(bool_field("Below", &"word ".repeat(60)));
+        press(&mut view, KeyCode::Enter);
+        for _ in 0..8 {
+            press(&mut view, KeyCode::Char('j'));
+        }
+        assert!(
+            view.fields_scroll_offset > height,
+            "the cursor scrolled past"
+        );
+        press(&mut view, KeyCode::Esc);
+        assert_eq!(
+            view.fields_scroll_offset, 0,
+            "the collapsed list is back in view at its label"
         );
     }
 

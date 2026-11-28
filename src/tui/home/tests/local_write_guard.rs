@@ -128,7 +128,9 @@ async fn local_unapplied_readonly_and_lost_authority_never_write_rows_or_groups(
                         .is_err(),
                     "{mode}"
                 ),
-                "trash" => view.trash_session_by_id(&row.id),
+                "trash" => {
+                    view.trash_session_by_id(&row.id);
+                }
                 _ => unreachable!(),
             }
             if let Some(driver) = session.as_mut() {

@@ -12,7 +12,8 @@ import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { isNewSessionStarting, notRunningCopy } from "./startupWait";
-import { AgentProfileProvider, useClearAliases, useCompactAliases } from "../../lib/agentProfileContext";
+import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
+import type { AgentProfile } from "../../lib/agentProfile";
 import { queuedReason } from "./queuedReason";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
@@ -35,6 +36,7 @@ import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { SystemNotices } from "./SystemNotices";
+import { TRANSCRIPT_COLUMN } from "./transcriptColumn";
 import { AssistantMessage, UserMessage } from "./ThreadMessages";
 import { UsageLimitSection } from "./UsageLimitBanner";
 import { ToolExpansionProvider } from "./ToolExpansion";
@@ -63,16 +65,15 @@ interface Props {
   agentDefaultsHref?: string | null;
   /** Opens a Settings link in the app. */
   onOpenSettings?: (href: string) => void;
-  /** Session `tool` registry key; selects the AgentProfile. */
+  /** Session `tool` registry key. */
   tool: string | null | undefined;
+  /** The session's `agent_profile`; the default profile when an older daemon omits it. */
+  agentProfile?: AgentProfile;
   /** Resolved ACP agent key; the switch-agent modal's fallback before any `AgentSwitched`. */
   acpAgent: string | null;
   /** `hasStartedBefore(session)`. */
   startedBefore?: boolean;
   acpProvider: string | null;
-  /** Server-owned conversation-reset slash aliases (`/clear`, `/new`). */
-  clearAliases?: readonly string[];
-  compactAliases?: readonly string[];
   /** Start this Session, for a queued row's "Start and send". */
   onStartSession?: () => void;
   archivedAt: string | null;
@@ -112,9 +113,7 @@ export function StructuredView(props: Props) {
   const {
     sessionId,
     acpWorkerState,
-    tool,
-    clearAliases,
-    compactAliases,
+    agentProfile,
     archivedAt,
     snoozedUntil,
     queuedCount,
@@ -125,7 +124,7 @@ export function StructuredView(props: Props) {
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
     <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
-      <AgentProfileProvider toolKey={tool} clearAliases={clearAliases} compactAliases={compactAliases}>
+      <AgentProfileProvider profile={agentProfile}>
         <ToolDisplayModeProvider density={toolDensity}>
           <ToolExpansionProvider>
             <AcpRuntime
@@ -181,7 +180,7 @@ export function StructuredViewRoot({ active = true, children }: { active?: boole
   return (
     <div
       data-testid="structured-view-root"
-      className="acp-conversation-scope flex h-full flex-col bg-surface-900 text-text-primary"
+      className="acp-conversation-scope flex h-full flex-col bg-surface-900 text-text-primary max-md:[&:has(>[data-phone-banners]:empty)_[data-phone-transcript]]:pt-[calc(var(--phone-overlay-top,0px)+1.5rem)]"
       style={
         {
           ...structuredViewRootStyle(active ? keyboardHeight : 0),
@@ -265,49 +264,52 @@ function AcpChrome({
   }
   return (
     <StructuredViewRoot active={view.active}>
-      {view.selected !== false && (
-        <AttentionChime
+      {/* A phone's header floats over the transcript; banners stay clear of it, and the transcript scrolls under. */}
+      <div data-phone-banners className="max-md:mt-[var(--phone-overlay-top,0px)] max-md:empty:mt-0">
+        {view.selected !== false && (
+          <AttentionChime
+            sessionId={sessionId}
+            approvals={state.pendingApprovals.length}
+            elicitations={state.pendingElicitations.length}
+          />
+        )}
+        <PlanStrip plan={state.plan} />
+
+        {(status !== "open" || state.lagged || exhaustedWithoutLimit || ctx.reconnecting) && (
+          <SystemNotices
+            status={status}
+            lagged={state.lagged}
+            rateLimitRetriesExhausted={exhaustedWithoutLimit}
+            hasEverOpened={ctx.hasEverOpened}
+            replayedWhileDown={ctx.replayedWhileDown}
+            reconnecting={ctx.reconnecting}
+            retryCount={ctx.retryCount}
+            maxRetries={ctx.maxRetries}
+            manualReconnect={ctx.manualReconnect}
+            newSessionStarting={startingAgent !== null}
+          />
+        )}
+
+        <SessionBanners
           sessionId={sessionId}
-          approvals={state.pendingApprovals.length}
-          elicitations={state.pendingElicitations.length}
+          tool={view.tool}
+          state={state}
+          acpWorkerState={acpWorkerState}
+          trashedAt={view.trashedAt}
+          archivedAt={view.archivedAt}
+          snoozedUntil={view.snoozedUntil}
+          onRestore={view.onRestore}
+          onSwitchToTerminal={view.onSwitchToTerminal}
+          dismissError={ctx.dismissError}
+          startingAgent={startingAgent}
+          canRestart={!!view.canRestartAgent}
+          onRestarted={ctx.markRestartStarted}
+          onRestartFailed={ctx.markRestartFailed}
+          recreateContainerTitle={view.recreateContainerTitle}
+          recreateContainerBlock={view.recreateContainerBlock}
+          newSession={view.newSessionLike}
         />
-      )}
-      <PlanStrip plan={state.plan} />
-
-      {(status !== "open" || state.lagged || exhaustedWithoutLimit || ctx.reconnecting) && (
-        <SystemNotices
-          status={status}
-          lagged={state.lagged}
-          rateLimitRetriesExhausted={exhaustedWithoutLimit}
-          hasEverOpened={ctx.hasEverOpened}
-          replayedWhileDown={ctx.replayedWhileDown}
-          reconnecting={ctx.reconnecting}
-          retryCount={ctx.retryCount}
-          retryCountdown={ctx.retryCountdown}
-          maxRetries={ctx.maxRetries}
-          manualReconnect={ctx.manualReconnect}
-          newSessionStarting={startingAgent !== null}
-        />
-      )}
-
-      <SessionBanners
-        sessionId={sessionId}
-        state={state}
-        acpWorkerState={acpWorkerState}
-        trashedAt={view.trashedAt}
-        archivedAt={view.archivedAt}
-        snoozedUntil={view.snoozedUntil}
-        onRestore={view.onRestore}
-        onSwitchToTerminal={view.onSwitchToTerminal}
-        dismissError={ctx.dismissError}
-        startingAgent={startingAgent}
-        canRestart={!!view.canRestartAgent}
-        onRestarted={ctx.markRestartStarted}
-        onRestartFailed={ctx.markRestartFailed}
-        recreateContainerTitle={view.recreateContainerTitle}
-        recreateContainerBlock={view.recreateContainerBlock}
-        newSession={view.newSessionLike}
-      />
+      </div>
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
         <div className="relative flex min-h-0 flex-1 flex-col">
@@ -318,7 +320,7 @@ function AcpChrome({
             tabIndex={0}
             className="flex-1 overflow-x-hidden overflow-y-auto [overflow-anchor:none]"
           >
-            <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
+            <div ref={messagesContentRef} data-phone-transcript className={`${TRANSCRIPT_COLUMN} px-4 py-6`}>
               {!readOnly && (
                 <ThreadPrimitive.Empty>
                   <EmptyState onPick={ctx.sendPrompt} notRunning={notRunning} />
@@ -456,8 +458,7 @@ function ComposerDock({
     acpWorkerState === "running" && status !== "open" && !state.workerStopped && !state.workerRestarting;
   const agentName = useAgentDisplayNames();
   const signInAgent = state.agent ?? acpAgent ?? view.tool;
-  const clearAliases = useClearAliases();
-  const compactAliases = useCompactAliases();
+  const { clear_aliases: clearAliases, compact_aliases: compactAliases } = useAgentProfile();
   // The Daemon's solo commands: they run as their own turn, never steered into one.
   const soloAliases = useMemo(() => [...clearAliases, ...compactAliases], [clearAliases, compactAliases]);
   const { agentDefaultsHref, onOpenSettings } = view;
@@ -527,7 +528,9 @@ function ComposerDock({
         rejected={state.rejectedPrompts}
         onRetry={ctx.retryRejectedPrompt}
         onDismiss={ctx.dismissRejectedPrompt}
-        disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
+        disabled={
+          state.workerRestarting || state.workerStopped || Boolean(state.startupError) || Boolean(state.integrationLost)
+        }
       />
 
       <SessionNoticesStrip notices={visibleSessionNotices(state)} onDismiss={ctx.dismissSessionNotice} />
@@ -559,7 +562,6 @@ function ComposerDock({
 
       {collapsible && (
         <ChromeCollapseHandle
-          edge="bottom"
           collapsed={collapsed}
           onToggle={onToggleCollapsed}
           collapseLabel="Collapse message composer"

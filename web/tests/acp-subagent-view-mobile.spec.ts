@@ -1,4 +1,5 @@
 import { test, expect } from "./helpers/mockedTest";
+import { pickPhoneView } from "./helpers/phoneViews";
 import { devices } from "@playwright/test";
 import { backgroundAgentLaunched, mockAcpSession, openStructuredSession, stopped } from "./helpers/acpMock";
 
@@ -22,8 +23,8 @@ test.describe("mobile sub-agent view", () => {
     });
     await openStructuredSession(page, mock);
 
-    await page.getByRole("button", { name: "Toggle panels" }).click();
-    await page.getByText("Background", { exact: true }).first().click();
+    await pickPhoneView(page, "More panes…");
+    await page.getByTestId("mobile-right-panel-pick-agents").click();
     await page
       .getByRole("button", { name: /agent number/ })
       .first()

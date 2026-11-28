@@ -1,34 +1,19 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fakeAudio, installFakeAudioContext, playedSounds, soundBytes } from "./__tests__/fakeAudioContext";
 
 const fetchSettings = vi.fn();
-const fetchSounds = vi.fn();
-const fetchSoundBlob = vi.fn();
+const fetchSound = vi.fn();
 
 vi.mock("./api", () => ({
   fetchSettings: (...args: unknown[]) => fetchSettings(...args),
-  fetchSounds: (...args: unknown[]) => fetchSounds(...args),
-  fetchSoundBlob: (...args: unknown[]) => fetchSoundBlob(...args),
+  fetchSound: (...args: unknown[]) => fetchSound(...args),
 }));
 
-import { clearSoundCache, playSoundFor } from "./soundPlayer";
+import { clearSoundCache, onSoundBlocked, playSoundFor } from "./soundPlayer";
 
 const ENABLED = { enabled: true, browser_enabled: true, browser_volume: 1 };
-
-let played: string[] = [];
-
-class FakeAudio {
-  volume = 1;
-  src: string;
-  constructor(src: string) {
-    this.src = src;
-  }
-  play() {
-    played.push(this.src);
-    return Promise.resolve();
-  }
-}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -38,19 +23,21 @@ function deferred<T>() {
 
 describe("playSoundFor", () => {
   beforeEach(() => {
-    played = [];
+    installFakeAudioContext();
     fetchSettings.mockReset().mockResolvedValue({ sound: ENABLED });
-    fetchSounds.mockReset().mockResolvedValue(["x.wav"]);
-    fetchSoundBlob.mockReset().mockImplementation(async (name: string) => new Blob([name]));
-    vi.stubGlobal("Audio", FakeAudio);
-    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:fake");
-    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    fetchSound.mockReset().mockImplementation(async (event: string) => soundBytes(event));
     clearSoundCache();
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("plays the built-in sound for the event", async () => {
+    expect(await playSoundFor("error")).toBe(true);
+    expect(fetchSound).toHaveBeenCalledWith("error");
+    expect(playedSounds()).toEqual(["error"]);
   });
 
   it.each([
@@ -83,51 +70,54 @@ describe("playSoundFor", () => {
   it("plays under hidden_tab only while the tab is hidden, and at the browser volume", async () => {
     fetchSettings.mockResolvedValue({ sound: { ...ENABLED, browser_scope: "hidden_tab", browser_volume: 0.4 } });
     const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
-    const volumes: number[] = [];
-    vi.stubGlobal(
-      "Audio",
-      class extends FakeAudio {
-        play() {
-          volumes.push(this.volume);
-          return super.play();
-        }
-      },
-    );
     expect(await playSoundFor("idle")).toBe(true);
-    expect(volumes).toEqual([0.4]);
     hidden.mockReturnValue(false);
     expect(await playSoundFor("idle")).toBe(false);
+    expect(fakeAudio.played).toEqual([{ sound: "idle", gain: 0.4 }]);
   });
 
-  it("retries discovery after an empty or failed sound list", async () => {
-    fetchSounds.mockResolvedValueOnce([]);
+  it.each([
+    [1.5, 1.5],
+    [undefined, 1],
+  ])("plays volume %s at gain %s", async (volume, gain) => {
+    fetchSettings.mockResolvedValue({ sound: { ...ENABLED, browser_volume: volume } });
+    expect(await playSoundFor("idle")).toBe(true);
+    expect(fakeAudio.played).toEqual([{ sound: "idle", gain }]);
+  });
+
+  it("loads a sound once, and again after a failed load", async () => {
+    fetchSound.mockResolvedValueOnce(null);
     expect(await playSoundFor("idle")).toBe(false);
     expect(await playSoundFor("idle")).toBe(true);
-    expect(fetchSounds).toHaveBeenCalledTimes(2);
     expect(await playSoundFor("idle")).toBe(true);
-    expect(fetchSounds).toHaveBeenCalledTimes(2);
-    expect(played).toHaveLength(2);
+    expect(fetchSound).toHaveBeenCalledTimes(2);
+    expect(playedSounds()).toEqual(["idle", "idle"]);
   });
 
-  it("plays nothing when settings are saved while discovery is in flight", async () => {
-    const discovery = deferred<string[]>();
-    fetchSounds.mockReturnValueOnce(discovery.promise);
-    const first = playSoundFor("idle");
-    await vi.waitFor(() => expect(fetchSounds).toHaveBeenCalledTimes(1));
+  it("stays silent until the page is interacted with, and says so once", async () => {
+    fakeAudio.state = "suspended";
+    fakeAudio.resumable = false;
+    const blocked = vi.fn();
+    const stop = onSoundBlocked(blocked);
+    expect(await playSoundFor("idle")).toBe(false);
+    expect(await playSoundFor("waiting")).toBe(false);
+    expect(blocked).toHaveBeenCalledTimes(1);
+    stop();
 
-    fetchSettings.mockResolvedValue({ sound: { ...ENABLED, browser_enabled: false } });
-    clearSoundCache();
-    discovery.resolve(["x.wav"]);
-
-    expect(await first).toBe(false);
-    expect(fetchSoundBlob).not.toHaveBeenCalled();
-    expect(played).toHaveLength(0);
-
-    // The stale list was not published, so re-enabling asks again.
-    fetchSettings.mockResolvedValue({ sound: ENABLED });
-    clearSoundCache();
+    // A gesture resumes the context, so the next sound plays.
+    fakeAudio.resumable = true;
+    window.dispatchEvent(new Event("pointerdown"));
+    await vi.waitFor(() => expect(fakeAudio.state).toBe("running"));
     expect(await playSoundFor("idle")).toBe(true);
-    expect(fetchSounds).toHaveBeenCalledTimes(2);
+    expect(playedSounds()).toEqual(["idle"]);
+
+    // The system suspends it again; the next gesture, not a later sound, resumes it.
+    fakeAudio.state = "suspended";
+    window.dispatchEvent(new Event("pointerdown"));
+    await vi.waitFor(() => expect(fakeAudio.state).toBe("running"));
+    fakeAudio.resumable = false;
+    expect(await playSoundFor("idle")).toBe(true);
+    expect(playedSounds()).toEqual(["idle", "idle"]);
   });
 
   it("plays nothing when settings are saved while they are loading", async () => {
@@ -140,21 +130,20 @@ describe("playSoundFor", () => {
     settings.resolve({ sound: ENABLED });
 
     expect(await first).toBe(false);
-    expect(fetchSoundBlob).not.toHaveBeenCalled();
-    expect(played).toHaveLength(0);
+    expect(fetchSound).not.toHaveBeenCalled();
+    expect(playedSounds()).toEqual([]);
   });
 
-  it("plays nothing when settings are saved while the sound file is loading", async () => {
-    const blob = deferred<Blob>();
-    fetchSoundBlob.mockReturnValueOnce(blob.promise);
+  it("plays nothing when settings are saved while the sound is loading", async () => {
+    const bytes = deferred<ArrayBuffer>();
+    fetchSound.mockReturnValueOnce(bytes.promise);
     const first = playSoundFor("idle");
-    await vi.waitFor(() => expect(fetchSoundBlob).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(fetchSound).toHaveBeenCalledTimes(1));
 
     clearSoundCache();
-    blob.resolve(new Blob(["x"]));
+    bytes.resolve(soundBytes("idle"));
 
     expect(await first).toBe(false);
-    expect(URL.createObjectURL).not.toHaveBeenCalled();
-    expect(played).toHaveLength(0);
+    expect(playedSounds()).toEqual([]);
   });
 });

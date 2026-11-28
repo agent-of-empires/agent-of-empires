@@ -1,6 +1,6 @@
 //! Manual row ordering for the home list: move the cursor's session within its group, or its
 //! group among the group's siblings. Only meaningful under [`SortOrder::Custom`] and
-//! [`GroupByMode::Manual`], where the rows carry the user's own grouping and nothing
+//! [`GroupByMode::Group`], where the rows carry the user's own grouping and nothing
 //! recomputes their order behind them.
 
 use super::*;
@@ -13,11 +13,11 @@ impl HomeView {
     /// list is not showing.
     pub(super) fn move_row_at_cursor(&mut self, delta: isize) -> anyhow::Result<()> {
         if self.sort_order != SortOrder::Custom {
-            self.flash_status("Press o for the Custom sort to arrange rows by hand");
+            self.flash_status("Pick the Custom sort (o) to arrange rows by hand");
             return Ok(());
         }
-        if self.group_by != GroupByMode::Manual {
-            self.flash_status("Rows are arranged by hand in Manual grouping only (g)");
+        if self.group_by != GroupByMode::Group {
+            self.flash_status("Rows are arranged by hand under Groups only (g)");
             return Ok(());
         }
         if let Some(path) = self.selected_group.clone() {
@@ -25,7 +25,11 @@ impl HomeView {
         } else if let Some(id) = self.selected_session.clone() {
             if self.hide_stopped_in_groups {
                 // A session move renumbers every sibling in the store, the hidden ones too.
-                self.flash_status("Show stopped sessions (y) to move sessions by hand");
+                self.flash_status(if self.hide_snoozed_with_stopped {
+                    "Show stopped and snoozed (y) to move by hand"
+                } else {
+                    "Show stopped sessions (y) to move sessions by hand"
+                });
                 return Ok(());
             }
             self.move_session_row(&id, delta)?;
@@ -125,6 +129,7 @@ impl HomeView {
                     }
                     _ => continue,
                 },
+                Item::Suggested { .. } => continue,
             };
             if crate::session::is_within_archived_section(path)
                 || crate::session::is_within_trash_section(path)
@@ -216,7 +221,7 @@ mod tests {
         .unwrap();
         apply_published(&mut view, &state).await;
         view.sort_order = SortOrder::Custom;
-        view.group_by = GroupByMode::Manual;
+        view.group_by = GroupByMode::Group;
         view.flat_items = view.build_flat_items();
         if group {
             view.cursor = view

@@ -2030,6 +2030,30 @@ pub(crate) fn effective_launch_command(profile: &str, tool: &str, session_comman
         .launch_command_for(tool)
 }
 
+/// The refusal of a launch of `tool` under `profile` that waits on `target`, and so the
+/// recovery that releases it: it runs under the launch's profile (`-p`, unless that is the
+/// default one the CLI uses anyway), and names the launch's own command (`--command`) only
+/// when `--tool` alone reaches another file than `target` and the command is what leads to
+/// it. `session_command` is the launch's own command for the tool, if it has one.
+pub(crate) fn login_required_for(
+    profile: &str,
+    tool: &str,
+    session_command: Option<&str>,
+    target: &LoginTarget,
+) -> crate::session::SandboxLoginRequired {
+    let reaches = |command: Option<&str>| {
+        login_target_with_command(profile, tool, command)
+            .is_some_and(|t| t.credential == target.credential)
+    };
+    let command = session_command.filter(|_| !reaches(None) && reaches(session_command));
+    crate::session::SandboxLoginRequired {
+        tool: tool.to_string(),
+        credential: target.credential.clone(),
+        profile: Some(profile.to_string()),
+        command: command.map(str::to_string),
+    }
+}
+
 /// The tool a login without `--tool` is for: the profile's default tool when it has a sandbox
 /// login, else the only agent that declares one. `None` when neither picks one.
 pub(crate) fn default_login_tool(profile: &str) -> Option<String> {
@@ -2333,10 +2357,72 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
     instance_id: &str,
     container_workspace_path: &str,
     is_yolo_mode: bool,
-) {
+) -> Result<()> {
     let Some(home) = dirs::home_dir() else {
-        return;
+        return Ok(());
     };
+
+    if let Some(trust) = declared_sandbox_agent(tool, command, session_config)
+        .and_then(|declared| declared.contribution().trust.clone())
+    {
+        let applies = crate::hooks::declared_trust_applies_in_sandbox(&trust, is_yolo_mode);
+        // A file name declared by an earlier launch stays staged, and a running
+        // container may still mount it.
+        if let Ok(stage) = crate::hooks::declared_sandbox_dir(instance_id) {
+            let home = stage.join("home");
+            blank_staged_tree(&home, Some(&home.join(&trust.file))).map_err(|e| {
+                e.context(format!(
+                    "cannot revoke the staged sandbox trust left under a previous file name for {tool}; refusing to reuse the container; make the files writable or remove the session's container and relaunch"
+                ))
+            })?;
+        }
+        let result = crate::hooks::declared_sandbox_dir(instance_id).and_then(|stage| {
+            let file = stage.join("home").join(&trust.file);
+            if !applies {
+                // A record staged by an earlier launch must not outlive it. A running
+                // container keeps its file mount on the old inode, so the file is
+                // blanked in place rather than unlinked.
+                return blank_staged_file(&file);
+            }
+            std::fs::create_dir_all(file.parent().expect("staged under home"))?;
+            // Bind-mounted into the container, which can plant a link here, and kept on
+            // one inode, which a reused container may still mount.
+            // The sidecar is never mounted. A changed declaration blanks the file first,
+            // so the entry an earlier one wrote does not outlive it; the sidecar is
+            // written last, so a crash blanks again on the next launch.
+            let marker = stage.join("trust-applied.json");
+            let applied = serde_json::json!([
+                &trust.file,
+                &trust.pointer,
+                &trust.value,
+                container_workspace_path
+            ])
+            .to_string();
+            if std::fs::read_to_string(&marker).ok().as_deref() != Some(applied.as_str()) {
+                blank_staged_file(&file)?;
+            }
+            crate::hooks::write_declared_trust_in_place(&file, &trust, container_workspace_path)?;
+            Ok(std::fs::write(&marker, applied)?)
+        });
+        // A running container may still mount the old record, so a launch that
+        // could not update it must not go on to reuse that container.
+        return result.map_err(|e| {
+            let action = if applies { "update" } else { "revoke" };
+            e.context(format!(
+                "cannot {action} the staged sandbox trust file for {tool}; refusing to reuse the container; make the file writable or remove the session's container and relaunch"
+            ))
+        });
+    }
+
+    // A declaration dropped since an earlier launch leaves its record staged, and a
+    // running container may still mount it.
+    if let Ok(stage) = crate::hooks::declared_sandbox_dir(instance_id) {
+        blank_staged_tree(&stage.join("home"), None).map_err(|e| {
+            e.context(format!(
+                "cannot revoke the staged sandbox trust left by a removed declaration for {tool}; refusing to reuse the container; make the files writable or remove the session's container and relaunch"
+            ))
+        })?;
+    }
 
     let active_agent = resolve_active_agent(tool, command, session_config);
     let config_tool = active_agent.map_or(tool, |agent| agent.name);
@@ -2382,6 +2468,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
             );
         }
     }
+    Ok(())
 }
 
 pub(crate) fn resolve_active_agent(
@@ -2828,6 +2915,281 @@ pub(crate) fn stranded_named_ignore_volumes(
 }
 
 /// Reject managed agent paths that would bypass the sandbox's private mounts.
+/// Binds the session's host hook directory into the container, so sandbox hooks
+/// can report. `None` when the directory is unavailable and pane detection takes over.
+fn mount_hook_status_dir(
+    instance_id: &str,
+    volumes: &mut Vec<VolumeMount>,
+) -> Result<Option<(PathBuf, String)>> {
+    crate::session::validate_instance_id(instance_id).map_err(|e| {
+        anyhow::anyhow!("refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}")
+    })?;
+    match crate::hooks::ensure_instance_dir_path(instance_id) {
+        Ok(hook_dir) => {
+            let container_hook_path = format!(
+                "{}/{instance_id}",
+                crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+            );
+            volumes.push(VolumeMount {
+                host_path: hook_dir.to_string_lossy().to_string(),
+                container_path: container_hook_path.clone(),
+                read_only: false,
+            });
+            Ok(Some((hook_dir, container_hook_path)))
+        }
+        Err(e) => {
+            tracing::warn!(target: "session.profile",
+                "Hook directory unavailable, skipping bind-mount; \
+                 agent boots without status hooks (pane detection takes over): {e:#}");
+            Ok(None)
+        }
+    }
+}
+
+/// The active plugin declaration that runs `tool` in a sandbox when no built-in or
+/// bundled agent covers it.
+fn declared_sandbox_agent(
+    tool: &str,
+    command: Option<&str>,
+    session_config: &super::SessionConfig,
+) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+    if crate::agents::get_agent(tool).is_some()
+        || session_config
+            .agent_command_override
+            .get(tool)
+            .is_some_and(|command| !command.trim().is_empty())
+    {
+        return None;
+    }
+    crate::plugin::agent_integration::declared_agent(
+        crate::plugin::registry(),
+        tool,
+        session_config
+            .custom_agents
+            .iter()
+            .filter(|(_, command)| !command.trim().is_empty())
+            .map(|(name, _)| name.as_str()),
+    )
+    .filter(|agent| {
+        command.is_none_or(|command| agent.contribution().command.as_deref() == Some(command))
+    })
+}
+
+/// The config directory a declared sandbox mounts: the directory its declared
+/// environment variable names in the container, else `rel` under the container
+/// home. `None` when the declared directory is unsafe.
+fn declared_container_dir(
+    entry: &aoe_plugin_api::agent_integration::AgentIntegrationContribution,
+    env_var: Option<&str>,
+    rel: &Path,
+) -> Option<String> {
+    match env_var {
+        Some(var) => entry
+            .launch
+            .as_ref()?
+            .container_env
+            .get(var)
+            .filter(|dir| aoe_plugin_api::agent_integration::container_dir_ok(dir))
+            .cloned(),
+        None => {
+            let dir = Path::new(CONTAINER_HOME).join(rel).display().to_string();
+            let dir = dir.trim_end_matches('/').to_string();
+            // An empty `rel` is the home directory itself, which only a file mount uses.
+            (rel.as_os_str().is_empty()
+                || aoe_plugin_api::agent_integration::container_dir_ok(&dir))
+            .then_some(dir)
+        }
+    }
+}
+
+/// Whether binding at `target` would shadow, or be shadowed by, a bound mount.
+fn overlaps_bound_mount(target: &str, bound: &[VolumeMount]) -> bool {
+    bound.iter().any(|volume| {
+        let (target, other) = (Path::new(target), Path::new(&volume.container_path));
+        target.starts_with(other) || other.starts_with(target)
+    })
+}
+
+/// What a plugin-declared sandbox mounts, staged per session outside the host
+/// config because the agent has no `AGENT_CONFIG_MOUNTS` entry: its hooks file in
+/// one directory and its trust file in another.
+struct DeclaredSandboxMounts {
+    volumes: Vec<VolumeMount>,
+    identity_publisher: Option<(PathBuf, String)>,
+    identity_output: Option<(PathBuf, String)>,
+}
+
+fn stage_declared_sandbox(
+    declared: &crate::plugin::agent_integration::DeclaredAgent,
+    instance_id: &str,
+    profile_config: &super::Config,
+    bound: &[VolumeMount],
+    yolo: bool,
+) -> Result<DeclaredSandboxMounts> {
+    let entry = declared.contribution();
+    let stage = crate::hooks::declared_sandbox_dir(instance_id)?;
+    let mut mounts = DeclaredSandboxMounts {
+        volumes: Vec::new(),
+        identity_publisher: None,
+        identity_output: None,
+    };
+    // A failure here must not cost the trust mount below.
+    if let Some(hooks) = &entry.hooks {
+        let staged = (|| -> Result<()> {
+            let status_hooks_enabled = profile_config.session.agent_status_hooks;
+            let events = declared
+                .with_definition(|agent| {
+                    crate::agents::resolved_hook_events(agent, profile_config).map(|mut events| {
+                        if !status_hooks_enabled {
+                            events.retain(|event| event.identity_field.is_some());
+                            for event in &mut events {
+                                event.status = None;
+                            }
+                        }
+                        events
+                    })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let settings = Path::new(&hooks.settings_rel_path);
+            let (Some(rel_dir), Some(leaf)) = (settings.parent(), settings.file_name()) else {
+                anyhow::bail!(
+                    "declared settings path {} has no directory",
+                    settings.display()
+                );
+            };
+            let config_dir = stage.join("config");
+            std::fs::create_dir_all(&config_dir)?;
+            let settings_file = config_dir.join(leaf);
+            crate::hooks::install_declared_hooks(
+                &settings_file,
+                &events,
+                crate::hooks::HookInstallTarget::Sandbox,
+            )?;
+            if settings_file.is_file() {
+                let container_dir =
+                    declared_container_dir(entry, hooks.config_dir_env_var.as_deref(), rel_dir)
+                        .filter(|dir| !overlaps_bound_mount(dir, bound))
+                        .with_context(|| {
+                            "the declared container directory is unsafe or overlaps a mount"
+                        })?;
+                if !events.is_empty() {
+                    mounts.identity_output =
+                        mount_hook_status_dir(instance_id, &mut mounts.volumes)?;
+                    if events.iter().any(|event| event.identity_field.is_some()) {
+                        mounts.identity_publisher = Some((
+                            settings_file.clone(),
+                            format!("{container_dir}/{}", leaf.to_string_lossy()),
+                        ));
+                    }
+                }
+                mounts.volumes.push(VolumeMount {
+                    host_path: config_dir.to_string_lossy().to_string(),
+                    container_path: container_dir,
+                    read_only: false,
+                });
+            }
+            Ok(())
+        })();
+        if let Err(e) = staged {
+            tracing::warn!(target: "session.profile",
+                "Failed to stage sandbox hooks for {}: {e:#}", entry.tool);
+        }
+    }
+    if let Some(trust) = &entry.trust {
+        let file = stage.join("home").join(&trust.file);
+        if file.is_file() && crate::hooks::declared_trust_applies_in_sandbox(trust, yolo) {
+            // Validation refuses a shared file; a file mount over the staged hooks
+            // file would hide it, so it is skipped here too.
+            let target =
+                declared_container_dir(entry, trust.config_dir_env_var.as_deref(), Path::new(""))
+                    .map(|dir| format!("{dir}/{}", trust.file))
+                    .filter(|target| {
+                        !overlaps_bound_mount(target, bound)
+                            && !entry
+                                .container_hooks_file()
+                                .is_some_and(|hooks| Path::new(&hooks).starts_with(target))
+                    });
+            match target {
+                Some(container_path) => mounts.volumes.push(VolumeMount {
+                    host_path: file.to_string_lossy().to_string(),
+                    container_path,
+                    read_only: false,
+                }),
+                None => tracing::warn!(target: "session.profile",
+                    "Not mounting the declared trust file for {}: its container directory is unsafe or overlaps a mount",
+                    entry.tool),
+            }
+        }
+    }
+    Ok(mounts)
+}
+
+/// Drops the staged declared trust file before a container is created, so one that
+/// [`blank_staged_file`] cannot clear never blocks the reuse of a container that does
+/// not mount it. The caller guarantees no earlier container is left to mount it.
+pub(crate) fn discard_staged_declared_trust(
+    tool: &str,
+    command: Option<&str>,
+    session_config: &super::SessionConfig,
+    instance_id: &str,
+) {
+    let Some(trust) = declared_sandbox_agent(tool, command, session_config)
+        .and_then(|declared| declared.contribution().trust.clone())
+    else {
+        return;
+    };
+    let result =
+        crate::hooks::declared_sandbox_dir(instance_id).and_then(
+            |stage| match std::fs::remove_file(stage.join("home").join(&trust.file)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            },
+        );
+    if let Err(e) = result {
+        tracing::warn!(target: "session.profile",
+            "Failed to discard the staged sandbox trust file for {tool}: {e:#}");
+    }
+}
+
+/// Blanks a staged file to `{}` through the same inode. A link, FIFO or hardlinked file
+/// is refused, not replaced: a reused container may still mount the old inode.
+fn blank_staged_file(file: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => {
+            use std::io::Write;
+            let mut open = crate::hooks::open_regular_for_write(file)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "staged trust file {} is not a lone regular file; remove the session's container and relaunch",
+                    file.display()
+                )
+            })?;
+            open.set_len(0)?;
+            open.write_all(b"{}")
+                .with_context(|| format!("blanking {}", file.display()))
+        }
+    }
+}
+
+/// Blanks every file under `dir` except `keep`, never following a symlink.
+fn blank_staged_tree(dir: &Path, keep: Option<&Path>) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        entries => entries.with_context(|| format!("reading {}", dir.display()))?,
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let kind = std::fs::symlink_metadata(&path)?.file_type();
+        if kind.is_dir() {
+            blank_staged_tree(&path, keep)?;
+        } else if !kind.is_symlink() && keep != Some(path.as_path()) {
+            blank_staged_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_managed_container_environment(
     environment: &[EnvEntry],
     active_agent: Option<&crate::agents::AgentDef<'_>>,
@@ -2887,29 +3249,11 @@ pub(crate) fn build_container_config(
     let project_path = Path::new(project_path_str);
     let profile_config = &launch_config.profile;
     let profile_session_config = &profile_config.session;
-    let plugin_agent = if crate::agents::get_agent(agent_selection.tool).is_none()
-        && !profile_session_config
-            .agent_command_override
-            .get(agent_selection.tool)
-            .is_some_and(|command| !command.trim().is_empty())
-    {
-        crate::plugin::agent_integration::declared_agent(
-            crate::plugin::registry(),
-            agent_selection.tool,
-            profile_session_config
-                .custom_agents
-                .iter()
-                .filter(|(_, command)| !command.trim().is_empty())
-                .map(|(name, _)| name.as_str()),
-        )
-        .filter(|agent| {
-            agent_selection
-                .command
-                .is_none_or(|command| agent.contribution().command.as_deref() == Some(command))
-        })
-    } else {
-        None
-    };
+    let plugin_agent = declared_sandbox_agent(
+        agent_selection.tool,
+        agent_selection.command,
+        profile_session_config,
+    );
     let active_agent = if plugin_agent.is_none() {
         resolve_active_agent(
             agent_selection.tool,
@@ -3010,6 +3354,10 @@ pub(crate) fn build_container_config(
             value: crate::session::artifacts::CONTAINER_ARTIFACT_DIR.to_string(),
         });
     }
+
+    // Mounted whether or not a plugin serves MCP yet: mounts are fixed at container creation.
+    #[cfg(target_os = "linux")]
+    volumes.extend(crate::server::plugin_mcp_socket::sandbox_volume());
 
     let gitconfig = home.join(".gitconfig");
     if gitconfig.exists() {
@@ -3240,31 +3588,7 @@ pub(crate) fn build_container_config(
             // generic hook_config path below cannot emit; they install through
             // their SidecarHooks installer at the sandbox config subpath.
             if status_hooks_enabled || identity_hooks_required {
-                crate::session::validate_instance_id(instance_id).map_err(|e| {
-                    anyhow::anyhow!(
-                        "refusing to mount hook directory: AOE_INSTANCE_ID failed validation: {e}"
-                    )
-                })?;
-                match crate::hooks::ensure_instance_dir_path(instance_id) {
-                    Ok(hook_dir) => {
-                        let container_hook_path = format!(
-                            "{}/{instance_id}",
-                            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
-                        );
-                        identity_output_path =
-                            Some((hook_dir.clone(), container_hook_path.clone()));
-                        volumes.push(VolumeMount {
-                            host_path: hook_dir.to_string_lossy().to_string(),
-                            container_path: container_hook_path,
-                            read_only: false,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "session.profile",
-                            "Hook directory unavailable, skipping bind-mount; \
-                             agent boots without status hooks (pane detection takes over): {e:#}");
-                    }
-                }
+                identity_output_path = mount_hook_status_dir(instance_id, &mut volumes)?;
             }
 
             if let Some(sidecar) = &agent.sidecar_hooks {
@@ -3449,14 +3773,37 @@ pub(crate) fn build_container_config(
     }
 
     // The agent registry distinguishes approval gates from startup-only trust prompts.
-    ensure_folder_trust_config_for_active_agent(
+    // A new container mounts only what applies, so a failed revocation is not fatal here.
+    if let Err(e) = ensure_folder_trust_config_for_active_agent(
         agent_selection.tool,
         agent_selection.command,
         profile_session_config,
         instance_id,
         &workspace_path,
         yolo.enabled,
-    );
+    ) {
+        tracing::warn!(target: "session.profile", "{e:#}");
+    }
+    if let Some(declared) = &plugin_agent {
+        match stage_declared_sandbox(
+            declared,
+            instance_id,
+            profile_config,
+            &volumes,
+            yolo.enabled,
+        ) {
+            Ok(staged) => {
+                volumes.extend(staged.volumes);
+                identity_output_path = identity_output_path.or(staged.identity_output);
+                if let Some(path) = staged.identity_publisher {
+                    identity_publisher_installed = true;
+                    identity_publisher_path = Some(path);
+                }
+            }
+            Err(e) => tracing::warn!(target: "session.profile",
+                "Failed to stage sandbox config for {}: {e:#}", agent_selection.tool),
+        }
+    }
 
     // Add extra_volumes from config (host:container format)
     // Also collect container paths to filter conflicting volume_ignores later
@@ -3807,6 +4154,49 @@ mod tests {
                 self.profile,
             )
         }
+    }
+
+    /// Every sandbox mounts the plugin socket directory read-only at a fixed path, so a plugin
+    /// installed later still reaches running containers.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial]
+    fn every_sandbox_mounts_the_plugin_mcp_socket_dir_read_only() {
+        use crate::server::plugin_mcp_socket::{CONTAINER_DIR, FORWARDER_FILE};
+
+        let _home = IsolatedHome::new();
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let config = Build::new("claude")
+            .instance("pluginmcpmount01")
+            .run(project_dir.path())
+            .unwrap();
+
+        let mounts: Vec<_> = config
+            .volumes
+            .iter()
+            .filter(|v| v.container_path == CONTAINER_DIR)
+            .collect();
+        let [mount] = mounts.as_slice() else {
+            panic!("one plugin MCP mount expected: {:?}", config.volumes);
+        };
+        assert!(mount.read_only);
+        let host = std::path::Path::new(&mount.host_path);
+        assert_eq!(
+            host,
+            std::fs::canonicalize(crate::session::get_app_dir().unwrap())
+                .unwrap()
+                .join("plugin-mcp"),
+            "the real path under the app dir"
+        );
+        assert!(
+            host.is_dir(),
+            "the mounted directory exists before any daemon"
+        );
+        assert!(
+            !host.join(FORWARDER_FILE).exists(),
+            "only a daemon that binds the socket writes the forwarder"
+        );
     }
 
     #[test]
@@ -7373,6 +7763,760 @@ codex-work = "{}"
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
+    const DECLARED_SANDBOX_PLUGIN: &str = r#"
+id = "acme.declared-sandbox"
+name = "Declared sandbox"
+version = "1.0.0"
+api_version = 28
+
+[[agent_integrations]]
+tool = "example-helper"
+command = "example-helper"
+
+[agent_integrations.launch.container_env]
+EXAMPLE_CONFIG_DIR = "/opt/example"
+
+[agent_integrations.hooks]
+settings_rel_path = ".example/settings.json"
+config_dir_env_var = "EXAMPLE_CONFIG_DIR"
+format = "json_settings"
+
+[[agent_integrations.hooks.events]]
+event = "Stop"
+status = "idle"
+
+[agent_integrations.trust]
+file = ".example.json"
+location = "config_dir_or_home"
+pointer = "/projects/{path}/trusted"
+value = true
+sandbox = "SANDBOX"
+"#;
+
+    // A plugin-declared agent has no config mount; its sandbox hooks and trust
+    // are staged per session and bound only when the launch state allows them.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn declared_agent_sandbox_stages_hooks_and_trust_through_the_launch() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        };
+        let launch = |instance: &str, yolo: bool| {
+            build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("example-helper", Some("example-helper")),
+                SandboxYolo { enabled: yolo },
+                instance,
+                None,
+                "",
+            )
+            .unwrap()
+        };
+        let mount_of = |config: &ContainerConfig, container: &str| {
+            config
+                .volumes
+                .iter()
+                .find(|volume| volume.container_path == container)
+                .map(|volume| PathBuf::from(&volume.host_path))
+        };
+
+        for (sandbox, yolo, trusted) in [
+            ("always", false, true),
+            ("always", true, true),
+            ("yolo_only", false, false),
+            ("yolo_only", true, true),
+        ] {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", sandbox),
+            );
+            let instance = format!("declared-{sandbox}-{yolo}");
+            let config = launch(&instance, yolo);
+
+            let hooks = mount_of(&config, "/opt/example").expect("hooks directory is bound");
+            let settings = fs::read_to_string(hooks.join("settings.json")).unwrap();
+            assert!(settings.contains("\"Stop\""), "{settings}");
+            assert!(
+                mount_of(
+                    &config,
+                    &format!("{}/{instance}", crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER)
+                )
+                .is_some(),
+                "status directory is bound for the hooks"
+            );
+
+            let trust = mount_of(&config, "/root/.example.json");
+            assert_eq!(trust.is_some(), trusted, "{sandbox} yolo={yolo}");
+            if let Some(trust) = trust {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(trust).unwrap()).unwrap();
+                assert_eq!(
+                    parsed["projects"][config.working_dir.as_str()]["trusted"],
+                    true
+                );
+            }
+        }
+
+        // A later launch without Yolo drops a record an earlier Yolo launch staged.
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        assert!(mount_of(&launch("declared-flip", true), "/root/.example.json").is_some());
+        let staged = crate::hooks::declared_sandbox_dir("declared-flip")
+            .unwrap()
+            .join("home/.example.json");
+        let inode = |path: &Path| std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap());
+        let mounted_inode = inode(&staged);
+        assert!(mount_of(&launch("declared-flip", false), "/root/.example.json").is_none());
+        // A running container keeps its mount on the old inode, so the record is
+        // blanked in place, not unlinked.
+        assert_eq!(inode(&staged), mounted_inode);
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "{}");
+
+        // A link planted in the staged directory is discarded on create, never followed.
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "always"),
+        );
+        let outside = temp_home.path().join("host-secret");
+        fs::write(&outside, "{}").unwrap();
+        let stage = crate::hooks::declared_sandbox_dir("declared-link").unwrap();
+        fs::create_dir_all(stage.join("home")).unwrap();
+        std::os::unix::fs::symlink(&outside, stage.join("home/.example.json")).unwrap();
+        discard_staged_declared_trust(
+            "example-helper",
+            Some("example-helper"),
+            &super::super::SessionConfig::default(),
+            "declared-link",
+        );
+        let config = launch("declared-link", false);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "{}");
+        let staged = mount_of(&config, "/root/.example.json").unwrap();
+        assert!(!fs::symlink_metadata(staged)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // A staged settings file that is not JSON is left alone and not bound.
+        let stage = crate::hooks::declared_sandbox_dir("declared-torn").unwrap();
+        fs::create_dir_all(stage.join("config")).unwrap();
+        fs::write(stage.join("config/settings.json"), "{not json").unwrap();
+        let config = launch("declared-torn", false);
+        assert_eq!(
+            fs::read_to_string(stage.join("config/settings.json")).unwrap(),
+            "{not json"
+        );
+        assert!(mount_of(&config, "/opt/example").is_none());
+        assert!(mount_of(&config, "/root/.example.json").is_some());
+
+        // Stale staged content that cleanup could not remove never blocks the next launch.
+        let stage = crate::hooks::declared_sandbox_dir("declared-stale").unwrap();
+        let locked = stage.join("config/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("stale"), "x").unwrap();
+        let mode = |mode| {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&locked, fs::Permissions::from_mode(mode))
+        };
+        mode(0o500).unwrap();
+        crate::hooks::cleanup_hook_status_dir("declared-stale");
+        if !locked.exists() {
+            // A privileged process removes even a read-only directory, so no stale
+            // content survived and recovery would go unexercised.
+            eprintln!("cleanup removed the stale content; recovery not exercised");
+            return;
+        }
+        let config = launch("declared-stale", false);
+        mode(0o700).ok();
+        assert!(mount_of(&config, "/opt/example").is_some());
+        assert!(mount_of(&config, "/root/.example.json").is_some());
+    }
+
+    // A reused container may still mount the old trust file, so a launch that
+    // cannot blank a revoked record refuses instead of carrying on.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn an_unrevocable_declared_trust_file_refuses_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        let stage = crate::hooks::declared_sandbox_dir("declared-revoke").unwrap();
+        let file = stage.join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, r#"{"projects":{}}"#).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        let revoke = |yolo: bool| {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-revoke",
+                "/workspace/project",
+                yolo,
+            )
+        };
+
+        // A privileged process can write a read-only file, so nothing is proven there.
+        if fs::OpenOptions::new().write(true).open(&file).is_ok() {
+            eprintln!("the file is writable (privileged); revocation failure not exercised");
+            return;
+        }
+        let error = revoke(false).expect_err("a revocation that failed is an error");
+        assert!(
+            format!("{error:#}").contains("refusing to reuse the container"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            r#"{"projects":{}}"#,
+            "the record is untouched"
+        );
+        // Trust that still applies is not a revocation, so nothing is refused.
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        revoke(true).unwrap();
+    }
+
+    // A new container mounts only what applies, so a staged record that cannot be
+    // blanked must not make every later reuse of that container refuse.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_discarded_trust_file_no_longer_blocks_reuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        let stage = crate::hooks::declared_sandbox_dir("declared-discard").unwrap();
+        let file = stage.join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, r#"{"projects":{}}"#).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+        if fs::OpenOptions::new().write(true).open(&file).is_ok() {
+            eprintln!("the file is writable (privileged); revocation failure not exercised");
+            return;
+        }
+        let session = super::super::SessionConfig::default();
+        let revoke = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &session,
+                "declared-discard",
+                "/workspace/project",
+                false,
+            )
+        };
+        revoke().expect_err("the record cannot be blanked");
+
+        discard_staged_declared_trust(
+            "example-helper",
+            Some("example-helper"),
+            &session,
+            "declared-discard",
+        );
+
+        assert!(!file.exists());
+        revoke().unwrap();
+    }
+
+    // A running container mounts the staged trust file by inode, so a changed record
+    // is written through that inode rather than replacing it.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_changed_declared_trust_record_keeps_the_mounted_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let install = |value: &str| {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN
+                    .replace("SANDBOX", "always")
+                    .replace("value = true", &format!("value = {value}")),
+            )
+        };
+        let launch = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-inode",
+                "/workspace/project",
+                false,
+            )
+            .unwrap()
+        };
+        let file = crate::hooks::declared_sandbox_dir("declared-inode")
+            .unwrap()
+            .join("home/.example.json");
+
+        install("true");
+        launch();
+        let mounted = fs::metadata(&file).unwrap().ino();
+        assert!(fs::read_to_string(&file).unwrap().contains("true"));
+
+        install("false");
+        launch();
+
+        assert_eq!(fs::metadata(&file).unwrap().ino(), mounted);
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(record["projects"]["/workspace/project"]["trusted"], false);
+    }
+
+    // A staged trust file the container replaced with a FIFO must neither hang the
+    // revocation nor be replaced, since a reused container may still mount it.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn revoking_staged_trust_refuses_a_planted_fifo() {
+        use std::os::unix::fs::FileTypeExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        let file = crate::hooks::declared_sandbox_dir("declared-fifo")
+            .unwrap()
+            .join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&file).status();
+        if !made.is_ok_and(|status| status.success()) {
+            eprintln!("mkfifo is unavailable; FIFO revocation not exercised");
+            return;
+        }
+
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-fifo",
+                "/workspace/project",
+                false,
+            ));
+        });
+
+        result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("revocation hung on the FIFO")
+            .expect_err("a FIFO cannot be blanked in place");
+        assert!(fs::symlink_metadata(&file).unwrap().file_type().is_fifo());
+    }
+
+    // A hardlink planted at the staged path must neither carry the blank to its target
+    // nor be replaced, since a reused container may still mount the staged inode.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn revoking_staged_trust_leaves_a_hardlink_target_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "yolo_only"),
+        );
+        let file = crate::hooks::declared_sandbox_dir("declared-hardlink")
+            .unwrap()
+            .join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let other = temp_home.path().join("other");
+        fs::write(&other, "precious").unwrap();
+        fs::hard_link(&other, &file).unwrap();
+        let mounted = fs::metadata(&file).unwrap().ino();
+
+        ensure_folder_trust_config_for_active_agent(
+            "example-helper",
+            Some("example-helper"),
+            &super::super::SessionConfig::default(),
+            "declared-hardlink",
+            "/workspace/project",
+            false,
+        )
+        .expect_err("a hardlinked file cannot be blanked in place");
+
+        assert_eq!(fs::read_to_string(&other).unwrap(), "precious");
+        assert_eq!(fs::metadata(&file).unwrap().ino(), mounted);
+    }
+
+    // A reused container mounts the staged file by inode: a refresh and a revoke both
+    // reach it through that inode.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn refresh_then_revoke_reach_the_mounted_staged_file() {
+        use std::io::{Read, Seek};
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let install = |sandbox: &str, value: &str| {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN
+                    .replace("SANDBOX", sandbox)
+                    .replace("value = true", &format!("value = {value}")),
+            )
+        };
+        let ensure = |yolo: bool| {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-held",
+                "/workspace/project",
+                yolo,
+            )
+        };
+        let file = crate::hooks::declared_sandbox_dir("declared-held")
+            .unwrap()
+            .join("home/.example.json");
+
+        install("yolo_only", "true");
+        ensure(true).unwrap();
+        let mut mount = fs::File::open(&file).unwrap();
+        let inode = fs::metadata(&file).unwrap().ino();
+        let mut held = || {
+            let mut text = String::new();
+            mount.rewind().unwrap();
+            mount.read_to_string(&mut text).unwrap();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+
+        install("yolo_only", "false");
+        ensure(true).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().ino(), inode);
+        assert_eq!(held()["projects"]["/workspace/project"]["trusted"], false);
+
+        ensure(false).unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().ino(), inode);
+        assert_eq!(held(), serde_json::json!({}));
+    }
+
+    // A changed declaration retires the entry the earlier one wrote, through the
+    // mounted inode; an unchanged one leaves the agent's own content alone.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_changed_declaration_retires_the_previous_staged_entry() {
+        use std::io::{Read, Seek};
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let install = |leaf: &str| {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN
+                    .replace("SANDBOX", "always")
+                    .replace("/trusted", &format!("/{leaf}")),
+            )
+        };
+        let ensure = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-retire",
+                "/workspace/project",
+                false,
+            )
+        };
+        let file = crate::hooks::declared_sandbox_dir("declared-retire")
+            .unwrap()
+            .join("home/.example.json");
+        let add_agent_json = || {
+            let mut record: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+            record["agent"] = serde_json::json!("own");
+            fs::write(&file, record.to_string()).unwrap();
+        };
+
+        install("trusted");
+        ensure().unwrap();
+        add_agent_json();
+        install("trusted");
+        ensure().unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(record["agent"], "own", "an unchanged declaration merges");
+
+        let mut mount = fs::File::open(&file).unwrap();
+        let inode = fs::metadata(&file).unwrap().ino();
+        install("ok");
+        ensure().unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().ino(), inode);
+        let mut text = String::new();
+        mount.rewind().unwrap();
+        mount.read_to_string(&mut text).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(record.get("agent").is_none(), "{record}");
+        assert!(record["projects"]["/workspace/project"]
+            .get("trusted")
+            .is_none());
+        assert_eq!(record["projects"]["/workspace/project"]["ok"], true);
+    }
+
+    // A changed declaration cannot retire the old entry in a hardlinked file, so
+    // reuse refuses.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_changed_declaration_refuses_a_hardlinked_staged_file() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "always"),
+        );
+        let stage = crate::hooks::declared_sandbox_dir("declared-retire-link").unwrap();
+        let file = stage.join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let other = temp_home.path().join("other");
+        fs::write(&other, r#"{"old":true}"#).unwrap();
+        fs::hard_link(&other, &file).unwrap();
+        fs::write(stage.join("trust-applied.json"), "[\"stale\"]").unwrap();
+
+        ensure_folder_trust_config_for_active_agent(
+            "example-helper",
+            Some("example-helper"),
+            &super::super::SessionConfig::default(),
+            "declared-retire-link",
+            "/workspace/project",
+            false,
+        )
+        .expect_err("a hardlinked file cannot be blanked in place");
+
+        assert_eq!(fs::read_to_string(&other).unwrap(), r#"{"old":true}"#);
+        assert_eq!(fs::read_to_string(&file).unwrap(), r#"{"old":true}"#);
+    }
+
+    // A hardlinked staged file cannot be updated in place, so reuse refuses.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn refreshing_staged_trust_refuses_a_hardlinked_file() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-sandbox",
+            &DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "always"),
+        );
+        let file = crate::hooks::declared_sandbox_dir("declared-refresh-link")
+            .unwrap()
+            .join("home/.example.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let other = temp_home.path().join("other");
+        fs::write(&other, r#"{"old":true}"#).unwrap();
+        fs::hard_link(&other, &file).unwrap();
+
+        let error = ensure_folder_trust_config_for_active_agent(
+            "example-helper",
+            Some("example-helper"),
+            &super::super::SessionConfig::default(),
+            "declared-refresh-link",
+            "/workspace/project",
+            false,
+        )
+        .expect_err("a hardlinked file cannot be updated in place");
+
+        assert!(
+            format!("{error:#}").contains("refusing to reuse the container"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_to_string(&other).unwrap(), r#"{"old":true}"#);
+        assert_eq!(fs::read_to_string(&file).unwrap(), r#"{"old":true}"#);
+    }
+
+    // Dropping a plugin's trust declaration must revoke the record it staged, in
+    // place, since an earlier container may still mount it.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_dropped_declaration_revokes_its_staged_trust() {
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let plugin = DECLARED_SANDBOX_PLUGIN.replace("SANDBOX", "always");
+        let launch = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-dropped",
+                "/workspace/project",
+                false,
+            )
+            .unwrap()
+        };
+        let file = crate::hooks::declared_sandbox_dir("declared-dropped")
+            .unwrap()
+            .join("home/.example.json");
+
+        crate::session::test_support::install_agent_plugin("acme.declared-sandbox", &plugin);
+        launch();
+        let mounted = fs::metadata(&file).unwrap().ino();
+        assert!(fs::read_to_string(&file).unwrap().contains("trusted"));
+
+        let without_trust = plugin
+            .split("[agent_integrations.trust]")
+            .next()
+            .unwrap()
+            .to_string();
+        crate::session::test_support::install_agent_plugin("acme.declared-sandbox", &without_trust);
+        launch();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{}");
+        assert_eq!(fs::metadata(&file).unwrap().ino(), mounted);
+    }
+
+    // Renaming the declared trust file must blank the record staged under the old name,
+    // in place, since an earlier container may still mount it.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_renamed_trust_file_revokes_the_previous_record() {
+        use std::os::unix::fs::MetadataExt;
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let launch = || {
+            ensure_folder_trust_config_for_active_agent(
+                "example-helper",
+                Some("example-helper"),
+                &super::super::SessionConfig::default(),
+                "declared-renamed",
+                "/workspace/project",
+                false,
+            )
+            .unwrap()
+        };
+        let home = crate::hooks::declared_sandbox_dir("declared-renamed")
+            .unwrap()
+            .join("home");
+        let install = |name: &str| {
+            crate::session::test_support::install_agent_plugin(
+                "acme.declared-sandbox",
+                &DECLARED_SANDBOX_PLUGIN
+                    .replace("SANDBOX", "always")
+                    .replace(".example.json", name),
+            )
+        };
+
+        install(".a.json");
+        launch();
+        let old = home.join(".a.json");
+        let mounted = fs::metadata(&old).unwrap().ino();
+        assert!(fs::read_to_string(&old).unwrap().contains("trusted"));
+
+        install(".b.json");
+        launch();
+
+        assert_eq!(fs::read_to_string(&old).unwrap(), "{}");
+        assert_eq!(fs::metadata(&old).unwrap().ino(), mounted);
+        assert!(fs::read_to_string(home.join(".b.json"))
+            .unwrap()
+            .contains("trusted"));
+    }
+
+    #[test]
+    fn declared_container_dirs_are_checked_again_at_use() {
+        let mut entry = aoe_plugin_api::agent_integration::AgentIntegrationContribution::default();
+        for (dir, ok) in [
+            ("/opt/example", true),
+            ("/", false),
+            ("/root", false),
+            ("/workspace/project", false),
+            ("/opt/../etc", false),
+            ("/opt/a:b", false),
+            ("relative", false),
+        ] {
+            let launch = entry.launch.get_or_insert_with(Default::default);
+            launch.container_env.clear();
+            launch
+                .container_env
+                .insert("EXAMPLE_CONFIG_DIR".into(), dir.into());
+            assert_eq!(
+                declared_container_dir(&entry, Some("EXAMPLE_CONFIG_DIR"), Path::new("x"))
+                    .is_some(),
+                ok,
+                "{dir}"
+            );
+        }
+        assert_eq!(
+            declared_container_dir(&entry, None, Path::new(".example")).as_deref(),
+            Some("/root/.example")
+        );
+        assert_eq!(
+            declared_container_dir(&entry, None, Path::new("")).as_deref(),
+            Some("/root"),
+            "a trust file under the home directory stays allowed"
+        );
+        for rel in [".example:invalid", ".a,b", ".a/../b"] {
+            assert!(
+                declared_container_dir(&entry, None, Path::new(rel)).is_none(),
+                "{rel}"
+            );
+        }
+        let bound = [VolumeMount {
+            host_path: "/h".into(),
+            container_path: "/opt/example/sub".into(),
+            read_only: false,
+        }];
+        assert!(overlaps_bound_mount("/opt/example", &bound));
+        assert!(overlaps_bound_mount("/opt/example/sub/x", &bound));
+        assert!(!overlaps_bound_mount("/opt/other", &bound));
+    }
+
     // The wholesale folder-trust disable is only safe against a config AoE
     // stages for one container. In a config dir the user named (and also runs
     // on the host) it would outlive the session, so that arm trusts one path.
@@ -7481,7 +8625,8 @@ codex-work = "{}"
                 &instance_id,
                 "/workspace/project",
                 true,
-            );
+            )
+            .unwrap();
             let restored = read();
             assert_eq!(
                 restored.pointer(host_key),
@@ -8062,7 +9207,7 @@ codex-work = "{}"
 id = "acme.sidecar"
 name = "Sidecar"
 version = "1.0.0"
-api_version = 25
+api_version = 28
 
 [[agent_integrations]]
 tool = "sidecario"

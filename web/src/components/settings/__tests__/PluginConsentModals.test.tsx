@@ -25,6 +25,7 @@ const install: PluginInstallConsent = {
   ui: [],
   agent_integrations: [integration],
   build_steps: [],
+  sandbox_report_dir: "/tmp/aoe-hooks",
   fingerprint: "abc",
 };
 const update: PluginUpdateConsent = {
@@ -38,6 +39,7 @@ const update: PluginUpdateConsent = {
   ui: [],
   agent_integrations: [integration],
   build_steps: [],
+  sandbox_report_dir: "/tmp/aoe-hooks",
   runtime_change: null,
   trust_downgrade: false,
   fingerprint: "abc",

@@ -17,8 +17,8 @@ pub(super) const TERMINAL_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 const TERMINAL_REPAIR_GRACE_SECS: u32 = 60;
 
 /// Publishes the `Stopped` an agent-initiated turn never got, inferred from the
-/// adapter's end-of-turn marker being latest, never from silence alone. It
-/// only appends the event; it never stops or restarts a worker.
+/// adapter's end-of-turn marker being latest, never from silence alone. A turn
+/// that ended on the usage limit is parked instead, which stops its worker.
 pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
     // `Waiting` is excluded: an approval is legitimately silent.
     let candidates: Vec<String> = {
@@ -58,6 +58,18 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
         {
             continue;
         }
+        // Before the probes, so a prompt admitted during them fails the stop.
+        let observed = state
+            .acp_supervisor
+            .running_lease(&id)
+            .map(|lease| (lease.admissions(), lease));
+        // A prompt still being published is not in the log yet.
+        if observed
+            .as_ref()
+            .is_some_and(|(_, lease)| lease.has_unsettled_admission())
+        {
+            continue;
+        }
         let probe = query_store(&state.acp_event_store, &id, "terminal-repair", |s, id| {
             (
                 s.terminal_repair_probe(id),
@@ -84,6 +96,21 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
         {
             continue;
         }
+        let sole_text = query_store(
+            &state.acp_event_store,
+            &id,
+            "terminal-repair text",
+            |s, id| s.agent_turn_sole_text(id),
+        )
+        .await
+        .flatten();
+        if let Some(info) = sole_text
+            .as_deref()
+            .and_then(crate::acp::state::RateLimitInfo::from_agent_text)
+        {
+            park_limited_agent_turn(state, &id, info, latest.latest_seq, observed).await;
+            continue;
+        }
         // Conditional on `latest_seq` (not the substantive seq, which ambient
         // events outrun) so anything published since the probe wins.
         if state.acp_supervisor.publish_stopped_if_seq(
@@ -100,6 +127,53 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
             );
         }
     }
+}
+
+/// Ends a turn whose only output was the agent's usage-limit text the way the
+/// connection does (#4373): `RateLimit`, a `rate_limited` stop, and no worker,
+/// so the rate-limit reaper owns the session (#5990).
+async fn park_limited_agent_turn(
+    state: &Arc<AppState>,
+    id: &str,
+    info: crate::acp::state::RateLimitInfo,
+    latest_seq: u64,
+    observed: Option<(u64, crate::acp::runner_lifecycle::Lease)>,
+) {
+    let supervisor = &state.acp_supervisor;
+    let status = info.status.clone();
+    // Only a stored park lets the reaper resume what the stop interrupts.
+    if !supervisor.publish_if_seq(id, &crate::acp::Event::RateLimit { info }, latest_seq) {
+        return;
+    }
+    use crate::acp::supervisor::SupervisorError;
+    // The stop publishes the `rate_limited` terminal itself.
+    let stop = match &observed {
+        Some((admissions, lease)) => {
+            supervisor
+                .shutdown_rate_limited(id, (lease, *admissions))
+                .await
+        }
+        None => Err(SupervisorError::UnknownSession(id.to_string())),
+    };
+    match stop {
+        Ok(()) => {}
+        Err(SupervisorError::UnknownSession(_)) => {
+            supervisor.publish_stopped_if_seq(id, "rate_limited", latest_seq + 1);
+        }
+        // A prompt admitted since owns the turn's terminal.
+        Err(SupervisorError::Superseded(_)) => return,
+        Err(e) => {
+            tracing::warn!(target: "acp.supervisor", session = %id, "terminal-repair: usage-limit stop failed: {e}");
+            return;
+        }
+    }
+    tracing::info!(
+        target: "acp.supervisor",
+        session = %id,
+        after_seq = latest_seq,
+        %status,
+        "terminal-repair: agent-initiated turn ended on the usage limit; published RateLimit + rate_limited"
+    );
 }
 
 /// A worker is auto-stopped only when enabled, not mid-turn, and its last
@@ -398,6 +472,7 @@ mod tests {
                         cancel_capable: true,
                         model: None,
                         background: true,
+                        runs: 0,
                     };
                     state
                         .acp_event_store
@@ -500,6 +575,7 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: true,
+                runs: 0,
             },
             at: Timestamp::now(),
         };
@@ -555,10 +631,11 @@ mod tests {
     }
 
     /// Case 0 replays the real occurrence: an agent-initiated turn after the
-    /// prompt's own `Stopped`, ending on the cost-bearing marker. The rest are vetoes.
+    /// prompt's own `Stopped`, ending on the cost-bearing marker. A turn whose
+    /// only output is the usage-limit text parks instead (#5990). The rest are vetoes.
     #[tokio::test]
     #[serial_test::serial]
-    async fn terminal_repair_publishes_only_for_a_finished_agent_turn() {
+    async fn terminal_repair_closes_only_a_finished_agent_turn() {
         fn usage(cost: bool) -> Event {
             Event::UsageUpdated {
                 usage: SessionUsage {
@@ -635,14 +712,51 @@ mod tests {
                 resolved: None,
             },
         };
-        // (name, events, status, age_secs, expect_repair)
+        const LIMIT: &str =
+            "You've hit your 5-hour limit · resets 10pm (America/New_York) · out of usage credits";
+        let limit_text = || Event::AgentMessageChunk {
+            text: LIMIT.to_string(),
+            message_id: None,
+        };
+        let limited_turn = vec![
+            prompt("go"),
+            Event::Stopped {
+                reason: "prompt_complete".to_string(),
+            },
+            limit_text(),
+            usage(true),
+        ];
+        const INFERRED: Option<&str> = Some("inferred_prompt_complete");
+        const PARKED: Option<&str> = Some("rate_limited");
+        // (name, events, status, age_secs, expected terminal)
         let cases = vec![
+            (
+                "usage-limit text is the turn's only output",
+                limited_turn.clone(),
+                Running,
+                120,
+                PARKED,
+            ),
+            (
+                "usage-limit text after a tool call",
+                finished_turn(vec![limit_text()], vec![]),
+                Running,
+                120,
+                INFERRED,
+            ),
+            (
+                "usage-limit text inside the grace window",
+                limited_turn,
+                Running,
+                5,
+                None,
+            ),
             (
                 "finished agent-initiated turn",
                 finished_turn(vec![], vec![]),
                 Running,
                 120,
-                true,
+                INFERRED,
             ),
             (
                 // The seq counter advances for ambient events too.
@@ -655,28 +769,28 @@ mod tests {
                 ),
                 Running,
                 120,
-                true,
+                INFERRED,
             ),
             (
                 "inside the grace window",
                 finished_turn(vec![], vec![]),
                 Running,
                 5,
-                false,
+                None,
             ),
             (
                 "latest is cost-free usage",
                 finished_turn(vec![], vec![usage(false)]),
                 Running,
                 120,
-                false,
+                None,
             ),
             (
                 "prompt lacks its terminator",
                 vec![prompt("go"), usage(true)],
                 Running,
                 120,
-                false,
+                None,
             ),
             (
                 "tool still open",
@@ -688,7 +802,7 @@ mod tests {
                 ),
                 Running,
                 120,
-                false,
+                None,
             ),
             // An approval can outlive the Waiting status; seeded before the marker.
             (
@@ -696,18 +810,18 @@ mod tests {
                 finished_turn(vec![approval], vec![]),
                 Running,
                 120,
-                false,
+                None,
             ),
             (
                 "waiting on the user",
                 finished_turn(vec![], vec![]),
                 Waiting,
                 120,
-                false,
+                None,
             ),
         ];
 
-        for (name, events, status, age_secs, expect_repair) in cases {
+        for (name, events, status, age_secs, expected) in cases {
             let id = "acp-terminal-repair";
             let project = tempfile::TempDir::new().unwrap();
             let mut inst = structured_instance(id, &project.path().to_string_lossy());
@@ -727,19 +841,113 @@ mod tests {
 
             repair_missing_terminal(&state).await;
 
-            let repaired: Vec<u64> = state
+            let published: Vec<Event> = state
                 .acp_event_store
-                .replay_from(id, 0)
+                .replay_from(id, last_seq)
                 .into_iter()
-                .filter(|(_, e)| matches!(e, Event::Stopped { reason } if reason == "inferred_prompt_complete"))
-                .map(|(seq, _)| seq)
+                .map(|(_, e)| e)
                 .collect();
-            let expected = if expect_repair {
-                vec![last_seq + 1]
-            } else {
-                vec![]
+            let stop = |reason: &str| Event::Stopped {
+                reason: reason.to_string(),
             };
-            assert_eq!(repaired, expected, "{name}");
+            let want = match expected {
+                None => vec![],
+                Some("rate_limited") => vec![
+                    Event::RateLimit {
+                        info: crate::acp::state::RateLimitInfo::from_agent_text(LIMIT).unwrap(),
+                    },
+                    stop("rate_limited"),
+                ],
+                Some(reason) => vec![stop(reason)],
+            };
+            assert_eq!(
+                serde_json::to_value(&published).unwrap(),
+                serde_json::to_value(&want).unwrap(),
+                "{name}"
+            );
+            if expected == PARKED {
+                let store = &state.acp_event_store;
+                assert!(store.rate_limit_park(id).is_some(), "{name}: parked");
+                assert!(
+                    store.rate_limit_interrupted_agent_turn(id),
+                    "{name}: resumes with a bare continuation"
+                );
+            }
+        }
+    }
+
+    /// The production shape: a live worker is stopped with a `rate_limited`
+    /// terminal, leaving a workerless park for the reaper (#5990). A prompt
+    /// admitted but not yet stored keeps the worker, however long it takes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_repair_stops_the_worker_of_a_limited_agent_turn() {
+        for admitted_unstored in [false, true] {
+            let id = "acp-limited-live";
+            let (_home, state, _project) = super::super::test_fixtures::test_state(id);
+            state.instances.write().await[0].status = crate::session::Status::Running;
+            let sup = &state.acp_supervisor;
+            sup.test_insert_worker(id).await;
+            let lease = sup.running_lease(id).unwrap();
+            // Backdated after the admission, so only its unsettled publication protects the worker.
+            let _admission = admitted_unstored.then(|| sup.test_note_admission(id));
+            lease.test_backdate_idle_baseline(Timestamp::now().as_millis() - 3_600_000);
+            let at_ms = Timestamp::now().as_millis() - 120_000;
+            let events = [
+                Event::Stopped {
+                    reason: "prompt_complete".to_string(),
+                },
+                Event::AgentMessageChunk {
+                    text: "You've hit your 5-hour limit · resets 10pm (America/New_York)"
+                        .to_string(),
+                    message_id: None,
+                },
+                Event::UsageUpdated {
+                    usage: SessionUsage {
+                        used: 1,
+                        size: 10,
+                        cost: Some(UsageCost {
+                            amount: 0.1,
+                            currency: "USD".to_string(),
+                        }),
+                    },
+                },
+            ];
+            for (idx, event) in events.iter().enumerate() {
+                state
+                    .acp_event_store
+                    .record_at(id, idx as u64 + 1, event, at_ms)
+                    .unwrap();
+            }
+            let last_seq = events.len() as u64;
+            sup.hydrate_seqs([(id.to_string(), last_seq)]);
+
+            repair_missing_terminal(&state).await;
+
+            let store = &state.acp_event_store;
+            let tail = store.replay_from(id, last_seq).len();
+            if admitted_unstored {
+                assert!(sup.is_running(id).await);
+                assert_eq!(tail, 0);
+                continue;
+            }
+            assert!(!sup.is_running(id).await);
+            // A test worker's stop publishes nothing, so the reason it asked for
+            // is read from the lease and the closing event recorded here.
+            assert_eq!(lease.test_stop_reason().as_deref(), Some("rate_limited"));
+            assert_eq!(tail, 1, "RateLimit");
+            store
+                .record_at(
+                    id,
+                    last_seq + 2,
+                    &Event::Stopped {
+                        reason: "rate_limited".to_string(),
+                    },
+                    Timestamp::now().as_millis(),
+                )
+                .unwrap();
+            assert!(store.rate_limit_park(id).is_some());
+            assert!(store.rate_limit_interrupted_agent_turn(id));
         }
     }
 }

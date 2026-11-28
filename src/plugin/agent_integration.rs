@@ -9,7 +9,8 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use aoe_plugin_api::agent_integration::{
-    AgentIntegrationContribution, AgentKeyDeclaration, AgentResumeDeclaration, AgentYoloDeclaration,
+    AgentIntegrationContribution, AgentKeyDeclaration, AgentResumeDeclaration, AgentTrustValue,
+    AgentYoloDeclaration,
 };
 use aoe_plugin_api::agent_integration::{
     AgentIntegrationPrompt, AgentIntegrationReply, AgentIntegrationResponse,
@@ -487,10 +488,17 @@ pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> 
     if let Some(detection) = &integration.detection {
         lines.push(format!("  detection: {:?}", detection.mode));
     }
-    lines.push(format!(
-        "  sandbox reports: {}/<session id>",
-        crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
-    ));
+    // A host-only declaration has no sandbox to report from.
+    if !integration
+        .launch
+        .as_ref()
+        .is_some_and(|launch| launch.host_only)
+    {
+        lines.push(format!(
+            "  sandbox reports: {}/<session id>",
+            crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
+        ));
+    }
     if !integration.provider_versions.is_empty() {
         lines.push(format!(
             "  provider versions: {}",
@@ -532,8 +540,86 @@ pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> 
             labels(&reply.deny)
         ));
     }
+    if let Some(hooks) = &integration.hooks {
+        let relocated = hooks.config_dir_env_var.as_ref().and_then(|var| {
+            let file = std::path::Path::new(&hooks.settings_rel_path).file_name()?;
+            Some(format!(
+                " or ${}/{}",
+                display_command(var),
+                display_command(&file.to_string_lossy())
+            ))
+        });
+        lines.push(format!(
+            "  hooks: writes AoE status hooks into ~/{}{}",
+            display_command(&hooks.settings_rel_path),
+            relocated.unwrap_or_default()
+        ));
+        for event in &hooks.events {
+            let mut parts = Vec::new();
+            if let Some(matcher) = &event.matcher {
+                parts.push(format!("matcher {}", display_command(matcher)));
+            }
+            if let Some(status) = event.status {
+                parts.push(format!("writes {status:?}"));
+            }
+            if let Some(field) = event.identity_field {
+                parts.push(format!("publishes {field:?}"));
+            }
+            if !event.waiting_tools.is_empty() {
+                parts.push(format!(
+                    "waiting on {}",
+                    event
+                        .waiting_tools
+                        .iter()
+                        .map(|tool| display_command(tool))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            lines.push(format!(
+                "    {}: {}",
+                display_command(&event.event),
+                parts.join("; ")
+            ));
+        }
+    }
+    if let Some(trust) = &integration.trust {
+        let relocated = trust
+            .config_dir_env_var
+            .as_ref()
+            .map(|var| {
+                format!(
+                    " or ${}/{}",
+                    display_command(var),
+                    display_command(&trust.file)
+                )
+            })
+            .unwrap_or_default();
+        lines.push(format!(
+            "  trust: writes {} = {} into ~/{}{} (sandbox: {:?}); kept on uninstall",
+            display_command(&trust.pointer),
+            match &trust.value {
+                AgentTrustValue::Bool(value) => value.to_string(),
+                AgentTrustValue::String(value) => format!("{:?}", display_command(value)),
+            },
+            display_command(&trust.file),
+            relocated,
+            trust.sandbox
+        ));
+    }
     lines
 }
+
+/// Tools of active declarations that carry hooks or trust, in plugin order.
+pub(crate) fn hook_declaring_tools(registry: &super::PluginRegistry) -> Vec<String> {
+    registry
+        .active()
+        .flat_map(|plugin| &plugin.manifest.agent_integrations)
+        .filter(|entry| entry.command.is_some() && (entry.hooks.is_some() || entry.trust.is_some()))
+        .map(|entry| entry.tool.clone())
+        .collect()
+}
+
 /// Resolve a unique plugin-provided agent launch command.
 pub fn agent_command<'a>(
     tool: &str,
@@ -754,9 +840,17 @@ pub fn snapshot(instance: &Instance) -> Option<AgentIntegrationSnapshot> {
         &instance.tool,
         plugin,
         instance.is_sandboxed(),
+        active_launch(instance),
     )
     .ok()
     .flatten()
+}
+
+fn active_launch(instance: &Instance) -> Option<&str> {
+    instance
+        .active_execution
+        .as_ref()
+        .map(|execution| execution.launch_id.as_str())
 }
 
 pub(crate) fn session_status(status: AgentIntegrationStatus) -> crate::session::Status {
@@ -861,7 +955,15 @@ pub(crate) fn owned_status(
         None
     } else {
         let read = plugin
-            .map(|plugin| read_report(&instance.id, tool, plugin, instance.is_sandboxed()))
+            .map(|plugin| {
+                read_report(
+                    &instance.id,
+                    tool,
+                    plugin,
+                    instance.is_sandboxed(),
+                    active_launch(instance),
+                )
+            })
             .transpose()
             .ok()
             .flatten();
@@ -902,9 +1004,12 @@ fn check_file(meta: &std::fs::Metadata, sandboxed: bool) -> Result<()> {
         owner == euid || (sandboxed && owner == 0),
         "integration report has another owner"
     );
+    // A root-owned 0600 file is unreadable to a non-root host, so a sandboxed
+    // report may also be 0644. The enclosing 0700 directory keeps it private.
+    let mode = meta.mode() & 0o7777;
     ensure!(
-        meta.mode() & 0o7777 == 0o600,
-        "integration report must be mode 0600"
+        mode == 0o600 || (sandboxed && mode == 0o644),
+        "integration report must be mode 0600 or 0644"
     );
     ensure!(
         meta.len() <= MAX_REPORT_BYTES as u64,
@@ -939,11 +1044,14 @@ fn read_snapshot(
     tool: &str,
     plugin: &super::LoadedPlugin,
     sandboxed: bool,
+    launch: Option<&str>,
 ) -> Result<Option<AgentIntegrationSnapshot>> {
-    Ok(match read_report(instance_id, tool, plugin, sandboxed)? {
-        ReportRead::Snapshot(report) => Some(report),
-        ReportRead::Absent | ReportRead::UnsupportedVersion { .. } => None,
-    })
+    Ok(
+        match read_report(instance_id, tool, plugin, sandboxed, launch)? {
+            ReportRead::Snapshot(report) => Some(report),
+            ReportRead::Absent | ReportRead::UnsupportedVersion { .. } => None,
+        },
+    )
 }
 
 fn read_report(
@@ -951,6 +1059,7 @@ fn read_report(
     tool: &str,
     plugin: &super::LoadedPlugin,
     sandboxed: bool,
+    launch: Option<&str>,
 ) -> Result<ReportRead> {
     let Some(dir) = dir_guard::open_instance_dir_read_only(instance_id)? else {
         return Ok(ReportRead::Absent);
@@ -969,6 +1078,17 @@ fn read_report(
     let mut report: AgentIntegrationSnapshot =
         serde_json::from_slice(&bytes).context("invalid integration report")?;
     validate_report(&report, instance_id)?;
+    // A container pid cannot prove the writer is the pane's current provider, so
+    // a sandboxed report names the launch that wrote it and liveness is that
+    // match: an earlier launch's fresh report never describes the replacement.
+    // An unmanaged launch holds no launch id, and the freshness bound is the
+    // only liveness it can offer, so binding applies only where one exists.
+    if sandboxed {
+        ensure!(
+            launch.is_none_or(|active| report.launch_id.as_deref() == Some(active)),
+            "integration report is not for the active launch"
+        );
+    }
     let integration = plugin
         .manifest
         .agent_integrations
@@ -1085,6 +1205,7 @@ fn sanitize_prompt(report: &mut AgentIntegrationSnapshot) {
 
 fn same_prompt(a: &AgentIntegrationSnapshot, b: &AgentIntegrationSnapshot) -> bool {
     a.instance_id == b.instance_id
+        && a.launch_id == b.launch_id
         && a.provider_version == b.provider_version
         && a.provider_session_id == b.provider_session_id
         && a.writer_pid == b.writer_pid
@@ -1171,6 +1292,7 @@ pub fn respond(
         &instance.tool,
         plugin,
         instance.is_sandboxed(),
+        active_launch(instance),
     )? {
         ReportRead::Snapshot(report) => report,
         ReportRead::UnsupportedVersion { version, declared } => bail!(
@@ -1236,7 +1358,7 @@ mod tests {
 id = "acme.sidecar"
 name = "Sidecar"
 version = "1.0.0"
-api_version = 25
+api_version = 28
 [[agent_integrations]]
 tool = "example-helper"
 command = "example-helper"
@@ -1570,14 +1692,21 @@ oneshot_flag = "-p"
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         make_alien_owned(&path);
 
-        let rejected = check_file(&std::fs::metadata(&path).unwrap(), false);
+        // The sandbox exception widens ownership to root alone, never to another
+        // uid, so the same file stays rejected for a sandboxed launch.
+        let (rejected, rejected_sandboxed) = (
+            check_file(&std::fs::metadata(&path).unwrap(), false),
+            check_file(&std::fs::metadata(&path).unwrap(), true),
+        );
         chown(
             &path,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
         )
         .unwrap();
-        assert!(rejected.unwrap_err().to_string().contains("another owner"));
+        for rejected in [rejected, rejected_sandboxed] {
+            assert!(rejected.unwrap_err().to_string().contains("another owner"));
+        }
     }
 
     fn install_test_integration(plugin_id: &str, tool: &str) {
@@ -2977,6 +3106,7 @@ command = "acme-omp-shim"
             provider_version: "18.11.1".into(),
             provider_session_id: "provider-session".into(),
             writer_pid: std::process::id(),
+            launch_id: None,
             revision: 1,
             status: AgentIntegrationStatus::Waiting,
             reply_keys: vec!["F12".into()],
@@ -3182,7 +3312,7 @@ command = "acme-omp-shim"
             granted: true,
         };
         assert!(matches!(
-            read_report("host-test", "test-agent", &plugin, false).unwrap(),
+            read_report("host-test", "test-agent", &plugin, false, None).unwrap(),
             ReportRead::Absent
         ));
         let dir = dir_guard::open_instance_dir("host-test").unwrap();
@@ -3192,7 +3322,7 @@ command = "acme-omp-shim"
             report.provider_version = version.into();
             dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&report).unwrap())
                 .unwrap();
-            let loaded = read_report("host-test", "test-agent", &plugin, false).unwrap();
+            let loaded = read_report("host-test", "test-agent", &plugin, false, None).unwrap();
             if matches!(version, "1.2.0" | "1.9.0") {
                 assert!(matches!(loaded, ReportRead::Snapshot(_)), "{version}");
             } else {
@@ -3220,7 +3350,7 @@ command = "acme-omp-shim"
             dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&wire).unwrap())
                 .unwrap();
             let ReportRead::Snapshot(loaded) =
-                read_report("host-test", "test-agent", &plugin, false).unwrap()
+                read_report("host-test", "test-agent", &plugin, false, None).unwrap()
             else {
                 panic!("a supported version must produce a snapshot");
             };
@@ -3234,7 +3364,7 @@ command = "acme-omp-shim"
             .unwrap();
         file.set_modified(SystemTime::now() - REPORT_MAX_AGE - Duration::from_secs(60))
             .unwrap();
-        assert!(read_report("host-test", "test-agent", &plugin, false)
+        assert!(read_report("host-test", "test-agent", &plugin, false, None)
             .unwrap_err()
             .to_string()
             .contains("expired"));
@@ -3249,5 +3379,95 @@ command = "acme-omp-shim"
         let mut changed = snapshot();
         changed.provider_version = "1.3.0".into();
         assert!(!same_prompt(&snapshot(), &changed));
+        // A restarted sandbox can reuse the pid, conversation and revision, so a
+        // retained prompt only answers the launch that asked it.
+        let mut earlier = snapshot();
+        earlier.launch_id = Some("launch-a".into());
+        let mut relaunched = earlier.clone();
+        relaunched.launch_id = Some("launch-b".into());
+        assert!(same_prompt(&earlier, &earlier.clone()));
+        assert!(!same_prompt(&earlier, &relaunched));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn a_sandboxed_report_is_bound_to_the_active_launch_and_readable_by_a_non_root_host() {
+        let (_guard, base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let manifest = aoe_plugin_api::PluginManifest::from_toml_str(
+            r#"
+            id = "acme.sandboxed"
+            name = "Sandboxed"
+            version = "0.1.0"
+            api_version = 19
+            capabilities = ["session.integration"]
+
+            [[agent_integrations]]
+            tool = "test-agent"
+            provider_versions = ["^1.2"]
+            "#,
+        )
+        .unwrap();
+        let plugin = super::super::LoadedPlugin {
+            manifest,
+            enabled: true,
+            trust: aoe_plugin_api::TrustLevel::Community,
+            validation: super::super::registry::ValidationState::Local,
+            source: None,
+            dir: None,
+            manifest_hash: String::new(),
+            granted: true,
+        };
+        let dir = dir_guard::open_instance_dir("sandbox-test").unwrap();
+        let leaf = format!("integration-{}.json", plugin.id());
+        let mut report = snapshot();
+        report.instance_id = "sandbox-test".into();
+        report.provider_version = "1.2.3".into();
+        report.launch_id = Some("launch-a".into());
+        let path = base.join("sandbox-test").join(&leaf);
+        dir_guard::write_atomic(dir.as_fd(), &leaf, &serde_json::to_vec(&report).unwrap()).unwrap();
+
+        // A replaced launch's fresh report must not describe the new pane.
+        let error = read_report(
+            "sandbox-test",
+            "test-agent",
+            &plugin,
+            true,
+            Some("launch-b"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not for the active launch"), "{error}");
+        // An unmanaged launch keeps no launch id, so its report is accepted and
+        // held to the freshness bound alone.
+        assert!(matches!(
+            read_report("sandbox-test", "test-agent", &plugin, true, None).unwrap(),
+            ReportRead::Snapshot(_)
+        ));
+        assert!(matches!(
+            read_report(
+                "sandbox-test",
+                "test-agent",
+                &plugin,
+                true,
+                Some("launch-a")
+            )
+            .unwrap(),
+            ReportRead::Snapshot(_)
+        ));
+
+        // A container running as root writes as root; 0644 lets a non-root host
+        // read it, and anything group- or world-writable stays rejected.
+        use std::os::unix::fs::PermissionsExt;
+        for (mode, accepted) in [(0o644, true), (0o664, false), (0o666, false)] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let read = read_report(
+                "sandbox-test",
+                "test-agent",
+                &plugin,
+                true,
+                Some("launch-a"),
+            );
+            assert_eq!(read.is_ok(), accepted, "mode {mode:o}");
+        }
     }
 }

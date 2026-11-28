@@ -1,7 +1,8 @@
 import { useId } from "react";
+import { INPUT } from "../../../lib/surfaces";
+import { FIELD_HINT, FIELD_LABEL } from "../../../lib/surfaces";
 
-const TEXT_INPUT =
-  "w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base md:text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none";
+const TEXT_INPUT = `${INPUT} font-mono`;
 
 export function LabeledInput({
   label,
@@ -22,7 +23,7 @@ export function LabeledInput({
   const id = useId();
   return (
     <div>
-      <label htmlFor={id} className="block text-sm text-text-dim mb-1.5">
+      <label htmlFor={id} className={FIELD_LABEL}>
         {label}
       </label>
       <input
@@ -52,8 +53,8 @@ export function EnvVarList({
 }) {
   return (
     <fieldset className="m-0 min-w-0 border-0 p-0">
-      <legend className="block text-sm text-text-dim mb-1.5">{label}</legend>
-      {hint && <p className="text-xs text-text-dim mb-1.5">{hint}</p>}
+      <legend className={FIELD_LABEL}>{label}</legend>
+      {hint && <p className={`${FIELD_HINT} mb-1.5`}>{hint}</p>}
       {values.map((env, i) => (
         <div key={i} className="flex gap-2 mb-1">
           <input
@@ -62,12 +63,13 @@ export function EnvVarList({
             onChange={(e) => onChange(values.map((v, j) => (j === i ? e.target.value : v)))}
             placeholder="KEY=value"
             aria-label={`${label} ${i + 1}`}
-            className="flex-1 bg-surface-900 border border-surface-700 rounded-md px-2 py-1.5 text-base md:text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+            className={`${TEXT_INPUT} flex-1`}
           />
           <button
             aria-label={`Remove ${label} ${i + 1}`}
             onClick={() => onChange(values.filter((_, j) => j !== i))}
-            className="px-2 text-text-dim hover:text-status-error cursor-pointer"
+            type="button"
+            className="shrink-0 w-9 max-md:w-11 rounded-lg text-text-dim hover:text-status-error hover:bg-surface-700/50 cursor-pointer"
           >
             &times;
           </button>
@@ -76,7 +78,8 @@ export function EnvVarList({
       <button
         aria-label={`Add ${label}`}
         onClick={() => onChange([...values, ""])}
-        className="text-xs text-text-dim hover:text-text-secondary cursor-pointer"
+        type="button"
+        className="min-h-11 md:min-h-0 text-[13px] md:text-xs text-text-dim hover:text-text-secondary cursor-pointer"
       >
         + Add variable
       </button>

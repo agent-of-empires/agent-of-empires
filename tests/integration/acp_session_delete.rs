@@ -25,6 +25,7 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
     SpawnConfig {
         launch_lease: None,
         provider_routing: Vec::new(),
+        mcp_credentials: Default::default(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
@@ -54,6 +55,8 @@ fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> Spaw
         prior_conversation: false,
         generation: 0,
         artifact_dir: None,
+        proxy: None,
+        degraded: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,
