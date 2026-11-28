@@ -149,17 +149,17 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // the constructor. Distinct `(profile, project_path)` pairs resolve once via
     // the shared cache.
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
+        // The key the constructor resolved built-ins with: `agent_name`, else `tool`.
+        let agent_key = inst
+            .agent_name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&inst.tool);
         if !resp.acp_capable {
             let cfg = session_cfg_cache.resolve(
                 &inst.source_profile,
                 &inst.repo_config_path().to_string_lossy(),
             );
-            // The key the constructor resolved built-ins with: `agent_name`, else `tool`.
-            let agent_key = inst
-                .agent_name
-                .as_deref()
-                .filter(|name| !name.is_empty())
-                .unwrap_or(&inst.tool);
             resp.acp_capable = custom_agent_acp_capable(cfg, agent_key);
             resp.acp_can_fork =
                 crate::session::fork::custom_structured_fork_capable(agent_key, None, cfg);
@@ -189,6 +189,21 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                     agent.profile_with(&acp_registry, session_cfg, default_agent)
                 }
             };
+            resp.agent_profile = crate::acp::agent_profiles::AgentProfileWire::new(
+                &profile,
+                profile.probe_fullscreen(&probes),
+            );
+            resp.claude_fullscreen = inst.tool == "claude" && resp.agent_profile.fullscreen;
+        } else if crate::acp::agent_profiles::resolve_undeclared(agent_key).is_none() {
+            // A terminal row's tool a plugin declares: a custom agent of that name shadows it.
+            let (session_cfg, _) =
+                session_cfg_cache.profile_config(&inst.source_profile, &inst.project_path);
+            let profile = crate::acp::agent_profiles::resolve_for(
+                crate::plugin::registry(),
+                agent_key,
+                crate::acp::agent_profiles::custom_agent_names(session_cfg),
+            )
+            .profile;
             resp.agent_profile = crate::acp::agent_profiles::AgentProfileWire::new(
                 &profile,
                 profile.probe_fullscreen(&probes),
