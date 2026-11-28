@@ -380,6 +380,9 @@ fn project_config(profile: &str, project: Option<&Project>) -> crate::session::c
         if let Some(enabled) = p.overrides.sandbox_enabled {
             config.sandbox.enabled_by_default = enabled;
         }
+        if p.overrides.default_tool.is_some() {
+            config.session.default_tool = p.overrides.default_tool.clone();
+        }
     }
     config
 }
@@ -404,6 +407,136 @@ mod tests {
             ["sandbox"]
         );
         assert!(project_default_overrides("default", &[plain], &base).is_empty());
+    }
+
+    /// The suggestion's agent: stored `(provider, criterion)` preset, then the
+    /// item's project, then the profile's `session.default_tool`, then `claude`.
+    #[test]
+    #[serial_test::serial]
+    fn the_suggested_agent_cascades_from_the_preset_through_the_project_to_the_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        let scope = projects::ProjectScope::Global;
+        projects::add("default", scope, Project::new("repo", &path, scope), false).unwrap();
+
+        let prepared = |preset: Option<&Preset>, project: Option<&str>| {
+            let mut i = item("a", "assigned");
+            i.project = project.map(String::from);
+            prepare("default", &i, preset, None).unwrap()["tool"].clone()
+        };
+        let set_project_tool = |tool: Option<&str>| {
+            projects::update_overrides("default", scope, "repo", |overrides| {
+                overrides.default_tool = tool.map(String::from);
+            })
+            .unwrap();
+        };
+
+        assert_eq!(prepared(None, Some("repo")), json!("claude"));
+        set_project_tool(Some("codex"));
+        assert_eq!(prepared(None, Some("repo")), json!("codex"));
+        assert_eq!(
+            prepared(None, Some("unregistered")),
+            json!("claude"),
+            "an unresolved project leaves the profile default in place"
+        );
+
+        crate::session::config::update_config(|config| {
+            config.session.default_tool = Some("opencode".to_string());
+        })
+        .unwrap();
+        assert_eq!(prepared(None, Some("repo")), json!("codex"));
+        assert_eq!(
+            prepared(None, None),
+            json!("opencode"),
+            "no resolved project falls back to the profile default"
+        );
+
+        set_project_tool(None);
+        assert_eq!(
+            prepared(None, Some("repo")),
+            json!("opencode"),
+            "an unset project tool inherits the profile default"
+        );
+
+        set_project_tool(Some("codex"));
+        let mut own = default_preset(&crate::session::config::Config::default());
+        own.agent = "gemini".into();
+        assert_eq!(
+            prepared(Some(&own), Some("repo")),
+            json!("gemini"),
+            "a stored criterion preset is narrower than the project"
+        );
+    }
+
+    /// A repo cannot choose the agent: `session.default_tool` is repo-denied, so
+    /// only the user's own project registry reaches this cascade.
+    #[test]
+    #[serial_test::serial]
+    fn a_repo_config_cannot_choose_the_suggested_agent() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            repo.join(".agent-of-empires/config.toml"),
+            "[session]\ndefault_tool = \"deploy-helper\"\n",
+        )
+        .unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        let scope = projects::ProjectScope::Global;
+        projects::add("default", scope, Project::new("repo", &path, scope), false).unwrap();
+        crate::session::config::update_config(|config| {
+            config.session.default_tool = Some("opencode".to_string());
+        })
+        .unwrap();
+        let mut i = item("a", "assigned");
+        i.project = Some("repo".into());
+        assert_eq!(
+            prepare("default", &i, None, None).unwrap()["tool"],
+            json!("opencode")
+        );
+    }
+
+    /// The list's `start` and the wizard's `prepare` read the project tool alike.
+    #[test]
+    #[serial_test::serial]
+    fn the_list_start_and_the_wizard_agree_on_the_project_agent() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        let scope = projects::ProjectScope::Global;
+        let mut project = Project::new("repo", &path, scope);
+        project.overrides.default_tool = Some("codex".into());
+        projects::add("default", scope, project, false).unwrap();
+
+        let conn = store();
+        let mut published = item("a", "assigned");
+        published.project = Some("repo".into());
+        publish(&conn, "default", &[published.clone()]);
+        let mut snapshot = snap(&conn, "default");
+        let registered = projects::load_merged("default").unwrap();
+        attach_projects(
+            &load_mappings(&conn, "default").unwrap(),
+            &mut snapshot,
+            &registered,
+        );
+        attach_presets("default", &[], &registered, &mut snapshot);
+
+        let start = &snapshot["items"][0]["start"];
+        assert_eq!(start["agent"], json!("codex"));
+        assert_eq!(
+            prepare("default", &published, None, None).unwrap()["tool"],
+            start["agent"]
+        );
+        assert_eq!(
+            start["view"], "structured",
+            "the project's ACP-capable agent picks the view"
+        );
     }
 
     #[test]

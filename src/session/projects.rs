@@ -85,6 +85,11 @@ pub struct ProjectOverrides {
     /// for new sessions launched against this project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_enabled: Option<bool>,
+    /// Overrides `session.default_tool` for new sessions started in this
+    /// project, including suggested ones. `session.default_tool` is
+    /// repo-denied, so this user-owned entry is how a project picks its agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tool: Option<String>,
     /// Plugin settings declared `per_project`, keyed by plugin id then setting key.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin_settings: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
@@ -95,6 +100,7 @@ impl ProjectOverrides {
         self.worktree_enabled.is_none()
             && self.smart_rename.is_none()
             && self.sandbox_enabled.is_none()
+            && self.default_tool.is_none()
             && self.plugin_settings.is_empty()
     }
 
@@ -167,6 +173,8 @@ pub struct ProjectPatch {
     pub worktree_enabled: Option<Option<bool>>,
     pub smart_rename: Option<Option<bool>>,
     pub sandbox_enabled: Option<Option<bool>>,
+    /// Absent preserves the override; present None restores inheritance.
+    pub default_tool: Option<Option<String>>,
     pub plugin_settings: BTreeMap<String, BTreeMap<String, Option<serde_json::Value>>>,
 }
 
@@ -180,6 +188,8 @@ impl Serialize for ProjectPatch {
             smart_rename: Option<&'a Option<bool>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             sandbox_enabled: Option<&'a Option<bool>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            default_tool: Option<&'a Option<String>>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             plugin_settings: &'a BTreeMap<String, BTreeMap<String, Option<serde_json::Value>>>,
         }
@@ -195,11 +205,13 @@ impl Serialize for ProjectPatch {
         let overrides = (self.worktree_enabled.is_some()
             || self.smart_rename.is_some()
             || self.sandbox_enabled.is_some()
+            || self.default_tool.is_some()
             || !self.plugin_settings.is_empty())
         .then_some(Overrides {
             worktree_enabled: self.worktree_enabled.as_ref(),
             smart_rename: self.smart_rename.as_ref(),
             sandbox_enabled: self.sandbox_enabled.as_ref(),
+            default_tool: self.default_tool.as_ref(),
             plugin_settings: &self.plugin_settings,
         });
         Body {
@@ -263,6 +275,14 @@ impl Project {
         let canonical = path.canonicalize().unwrap_or(path);
         crate::git::GitWorktree::is_git_repo(&canonical)
     }
+}
+
+/// A blank tool name means "inherit", as a blank base branch does.
+pub fn normalize_default_tool(tool: Option<String>) -> Option<String> {
+    tool.and_then(|tool| {
+        let tool = tool.trim();
+        (!tool.is_empty()).then(|| tool.to_string())
+    })
 }
 
 fn normalize_base_branch(base: Option<String>) -> Option<String> {
@@ -715,6 +735,9 @@ pub fn update(
             if let Some(enabled) = patch.sandbox_enabled {
                 existing[idx].overrides.sandbox_enabled = enabled;
             }
+            if let Some(tool) = patch.default_tool {
+                existing[idx].overrides.default_tool = normalize_default_tool(tool);
+            }
             for (plugin, settings) in patch.plugin_settings {
                 for (key, value) in settings {
                     existing[idx]
@@ -1016,6 +1039,15 @@ pub fn find_by_canonical_path_strict(profile: &str, path: &Path) -> Result<Optio
         .find(|p| canonical_key(&p.path) == target))
 }
 
+/// The agent new sessions started in `repo_path` default to: the registered
+/// project's `default_tool`, if it sets one, else `None` for the caller's
+/// profile default. An unreadable registry is an error, so a broken file never
+/// silently drops a project's agent.
+pub fn default_tool_override(profile: &str, repo_path: &Path) -> Result<Option<String>> {
+    Ok(find_by_canonical_path_strict(profile, repo_path)?
+        .and_then(|project| project.overrides.default_tool))
+}
+
 /// Resolve the effective `smart_rename` override for a session: `session_cfg`'s resolved
 /// `scratch_smart_rename` for scratch sessions (which have no stable path to key a registry entry
 /// on, so the setting lives on `Config` instead), otherwise the registered project's override at
@@ -1303,6 +1335,78 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).unwrap(), "invalid registry");
             fs::write(path, "[]").unwrap();
         }
+    }
+
+    #[test]
+    #[serial]
+    fn a_project_default_tool_saves_normalizes_clears_and_persists() -> Result<()> {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let repo = tempdir().unwrap();
+        let path = repo.path().to_string_lossy().to_string();
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("owner", &path, ProjectScope::Global),
+            false,
+        )
+        .unwrap();
+        let patch = |tool: Option<Option<&str>>| ProjectPatch {
+            default_tool: tool.map(|tool| tool.map(String::from)),
+            ..Default::default()
+        };
+        let commit = update(
+            "default",
+            ProjectScope::Global,
+            "owner",
+            patch(Some(Some("codex"))),
+        )?;
+        assert_eq!(
+            commit.projects[commit.result]
+                .overrides
+                .default_tool
+                .as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            load_global()?[0].overrides.default_tool.as_deref(),
+            Some("codex")
+        );
+        // A blank value restores inheritance instead of naming a tool.
+        update(
+            "default",
+            ProjectScope::Global,
+            "owner",
+            patch(Some(Some("  "))),
+        )?;
+        let reloaded = load_global()?;
+        assert_eq!(reloaded[0].overrides, ProjectOverrides::default());
+        assert!(
+            !fs::read_to_string(global_path()?)
+                .unwrap()
+                .contains("overrides"),
+            "an entry with no override writes no overrides block"
+        );
+        // An unset patch field neither sets nor clears the stored tool.
+        update(
+            "default",
+            ProjectScope::Global,
+            "owner",
+            patch(Some(Some("opencode"))),
+        )?;
+        let kept = update(
+            "default",
+            ProjectScope::Global,
+            "owner",
+            ProjectPatch {
+                pinned: Some(true),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            kept.projects[kept.result].overrides.default_tool.as_deref(),
+            Some("opencode")
+        );
+        Ok(())
     }
 
     #[test]

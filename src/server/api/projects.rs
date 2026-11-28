@@ -520,6 +520,7 @@ struct OverridesPatch {
     worktree_enabled: Option<Option<bool>>,
     smart_rename: Option<Option<bool>>,
     sandbox_enabled: Option<Option<bool>>,
+    default_tool: Option<Option<String>>,
     /// Per plugin id, per setting key: `Some(value)` sets, `None` (JSON `null`) clears.
     plugin_settings: PluginSettingsPatch,
 }
@@ -531,6 +532,7 @@ impl OverridesPatch {
         self.worktree_enabled.is_none()
             && self.smart_rename.is_none()
             && self.sandbox_enabled.is_none()
+            && self.default_tool.is_none()
             && self.plugin_settings.is_empty()
     }
 }
@@ -632,10 +634,24 @@ fn parse_overrides_patch(
             ))
         }
     };
+    let default_tool = match body.get("default_tool") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(tool)) => {
+            Some(projects::normalize_default_tool(Some(tool.clone())))
+        }
+        Some(_) => {
+            return Err((
+                "bad_field",
+                "overrides.default_tool must be a string or null",
+            ))
+        }
+    };
     Ok(OverridesPatch {
         worktree_enabled,
         smart_rename,
         sandbox_enabled,
+        default_tool,
         plugin_settings: parse_plugin_settings_patch(body)?,
     })
 }
@@ -674,6 +690,7 @@ fn parse_project_patch(
         worktree_enabled: overrides.worktree_enabled,
         smart_rename: overrides.smart_rename,
         sandbox_enabled: overrides.sandbox_enabled,
+        default_tool: overrides.default_tool,
         plugin_settings: overrides.plugin_settings,
     })
 }
@@ -1268,6 +1285,7 @@ mod tests {
                         worktree_enabled: Some(Some(true)),
                         smart_rename: Some(Some(false)),
                         sandbox_enabled: Some(Some(true)),
+                        default_tool: Some(Some("codex".into())),
                         plugin_settings: std::collections::BTreeMap::new(),
                     })?))?,
             )
@@ -1311,6 +1329,10 @@ mod tests {
         assert_eq!(profile.projects[0].overrides.worktree_enabled, Some(true));
         assert_eq!(profile.projects[0].overrides.smart_rename, Some(false));
         assert_eq!(profile.projects[0].overrides.sandbox_enabled, Some(true));
+        assert_eq!(
+            profile.projects[0].overrides.default_tool.as_deref(),
+            Some("codex")
+        );
         projects::add(
             "beta",
             ProjectScope::Profile,
@@ -1335,7 +1357,7 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&bytes)?,
             serde_json::to_value(&profile.projects)?
         );
-        for (patch, expected_base, expected_smart_rename, expected_sandbox) in [
+        for (patch, expected_base, expected_smart_rename, expected_sandbox, expected_tool) in [
             (
                 projects::ProjectPatch {
                     pinned: Some(false),
@@ -1344,6 +1366,7 @@ mod tests {
                 Some("release"),
                 Some(false),
                 Some(true),
+                Some("codex"),
             ),
             (
                 projects::ProjectPatch {
@@ -1353,6 +1376,7 @@ mod tests {
                 None,
                 Some(false),
                 Some(true),
+                Some("codex"),
             ),
             (
                 projects::ProjectPatch {
@@ -1362,6 +1386,7 @@ mod tests {
                 None,
                 None,
                 Some(true),
+                Some("codex"),
             ),
             (
                 projects::ProjectPatch {
@@ -1371,12 +1396,34 @@ mod tests {
                 None,
                 None,
                 Some(false),
+                Some("codex"),
             ),
             (
                 projects::ProjectPatch {
                     sandbox_enabled: Some(None),
                     ..Default::default()
                 },
+                None,
+                None,
+                None,
+                Some("codex"),
+            ),
+            (
+                projects::ProjectPatch {
+                    default_tool: Some(Some(" opencode ".into())),
+                    ..Default::default()
+                },
+                None,
+                None,
+                None,
+                Some("opencode"),
+            ),
+            (
+                projects::ProjectPatch {
+                    default_tool: Some(None),
+                    ..Default::default()
+                },
+                None,
                 None,
                 None,
                 None,
@@ -1406,6 +1453,7 @@ mod tests {
             assert_eq!(project.overrides.worktree_enabled, Some(true));
             assert_eq!(project.overrides.smart_rename, expected_smart_rename);
             assert_eq!(project.overrides.sandbox_enabled, expected_sandbox);
+            assert_eq!(project.overrides.default_tool.as_deref(), expected_tool);
             let persisted = projects::load_profile("beta")?;
             assert_eq!(persisted[0].overrides, project.overrides);
             let snapshot = state.runtime.snapshot(&state).await?;

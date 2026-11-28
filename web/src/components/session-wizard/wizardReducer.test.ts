@@ -426,6 +426,43 @@ describe("SEED_PROJECT_OVERRIDES sandbox", () => {
   });
 });
 
+describe("SEED_PROJECT_OVERRIDES agent", () => {
+  const seed = (tool: string | undefined): Action => ({
+    type: "SEED_PROJECT_OVERRIDES",
+    overrides: tool === undefined ? undefined : { default_tool: tool },
+  });
+
+  it("applies the project's agent and reverts to the profile default without one", () => {
+    const overridden = run(makeState(), defaults({ tool: "claude" }), seed("codex"));
+    expect(overridden.data).toMatchObject({ tool: "codex", projectToolOverride: "codex" });
+    expect(reducer(overridden, seed(undefined)).data.tool).toBe("claude");
+  });
+
+  it("outranks a profile-defaults response in either order", () => {
+    expect(run(makeState(), seed("codex"), defaults({ tool: "claude" })).data.tool).toBe("codex");
+    expect(run(makeState(), defaults({ tool: "claude" }), seed("codex")).data.tool).toBe("codex");
+  });
+
+  it("keeps a hand-picked tool, but still applies after an unrelated edit", () => {
+    const picked = run(makeState(), defaults({ tool: "claude" }), set("tool", "opencode"));
+    expect(reducer(picked, seed("codex")).data.tool).toBe("opencode");
+    const unrelated = run(makeState(), defaults({ tool: "claude" }), set("title", "Fix"));
+    expect(reducer(unrelated, seed("codex")).data.tool).toBe("codex");
+  });
+
+  it("drops the project's agent when leaving it for scratch", () => {
+    const project = run(makeState({ path: "/repo" }), defaults({ tool: "claude" }), seed("codex"));
+    expect(project.data.tool).toBe("codex");
+    expect(reducer(project, set("scratch", true)).data).toMatchObject({
+      projectToolOverride: undefined,
+      tool: "claude",
+    });
+    // A hand-picked agent is not the project's to drop.
+    const picked = reducer(project, set("tool", "opencode"));
+    expect(reducer(picked, set("scratch", true)).data.tool).toBe("opencode");
+  });
+});
+
 describe("agent list per profile and project", () => {
   const claude = { name: "claude", acp_create_ready: false } as WizardState["agents"][number];
   const failed = (agentsFor: string, missing = false): Action => ({ type: "AGENTS_FAILED", agentsFor, missing });

@@ -111,6 +111,44 @@ describe("SessionWizard prefill.worktreeEnabled (project override on quick-creat
   });
 });
 
+describe("project agent on the remembered last-used path", () => {
+  const project = (overrides?: Record<string, unknown>) => [
+    { name: "alpha", path: "/repo/alpha", scope: "global", pinned: false, ...(overrides && { overrides }) },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    localStorage.setItem("aoe-new-session-last-project", "/repo/alpha");
+    createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    fetchDockerStatus.mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" });
+    fetchProfiles.mockResolvedValue([]);
+    fetchRecentProjects.mockResolvedValue({ projects: [] });
+  });
+
+  it("starts on the project's agent over the profile's default", async () => {
+    fetchSettings.mockResolvedValue({ session: { default_tool: "claude" } });
+    fetchProjects.mockResolvedValue(project({ default_tool: "codex" }));
+    const { getByText } = renderWizard();
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalled());
+    await clickLaunch(getByText);
+
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/repo/alpha", tool: "codex" });
+  });
+
+  it("keeps the profile's agent for a project that sets none", async () => {
+    fetchSettings.mockResolvedValue({ session: { default_tool: "opencode" } });
+    fetchProjects.mockResolvedValue(project());
+    const { getByText } = renderWizard();
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalled());
+    await clickLaunch(getByText);
+
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/repo/alpha", tool: "opencode" });
+  });
+});
+
 describe("project sandbox override on the remembered last-used path", () => {
   const alpha = [
     { name: "alpha", path: "/repo/alpha", scope: "global", pinned: false, overrides: { sandbox_enabled: true } },

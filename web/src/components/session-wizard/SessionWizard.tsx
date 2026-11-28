@@ -135,6 +135,8 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     // A prefill without a path (group-only) keeps the remembered project; a tab-only one opens the picker.
     path: prefill.scratch ? "" : prefill.path || (prefill.initialTab ? "" : base.path),
     tool: prefill.tool || base.tool,
+    // A prefilled agent is a choice for this session; the project's own must not replace it.
+    toolDirty: !!prefill.tool,
     yoloMode: prefill.yoloMode ?? false,
     sandboxEnabled: prefill.sandboxEnabled ?? false,
     profile: prefill.profile || "",
@@ -550,7 +552,11 @@ export function SessionWizard({
               return;
             }
             const overrides = overridesForPath(projects, initialPath);
-            if (overrides?.worktree_enabled !== undefined || overrides?.sandbox_enabled !== undefined) {
+            if (
+              overrides?.worktree_enabled !== undefined ||
+              overrides?.sandbox_enabled !== undefined ||
+              overrides?.default_tool !== undefined
+            ) {
               dispatch({ type: "SEED_PROJECT_OVERRIDES", overrides, path: initialPath });
             }
             knownResolutionRef.current = normalizeProjectPathKey(initialPath);

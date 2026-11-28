@@ -1987,6 +1987,67 @@ fn test_scratch_ignores_the_retained_projects_sandbox_override() {
     assert!(!dialog.sandbox_enabled, "manual choice survives scratch");
 }
 
+#[test]
+#[serial_test::serial]
+fn test_the_projects_agent_outranks_the_profile_default_and_leaves_with_the_project() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    fs::create_dir_all(app_dir.join("profiles").join("default")).expect("default profile");
+    fs::write(
+        app_dir.join("config.toml"),
+        "default_profile = \"default\"\n\n[session]\ndefault_tool = \"codex\"\n",
+    )
+    .expect("global config");
+
+    let repo = tempfile::tempdir().expect("temp repo");
+    let repo_path = repo.path().to_string_lossy().to_string();
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new("demo", &repo_path, crate::session::ProjectScope::Global)
+            .with_overrides(crate::session::ProjectOverrides {
+                default_tool: Some("opencode".into()),
+                ..Default::default()
+            }),
+        false,
+    )
+    .expect("register project");
+    let tools = vec!["claude", "codex", "opencode"];
+    let open_in = |dialog: &mut NewSessionDialog, path: &str| {
+        dialog.path = Input::default();
+        dialog.focused_field = dialog.field_indices().path;
+        type_str(dialog, path);
+        dialog.handle_key(key(KeyCode::Tab));
+    };
+
+    // A typed project path seeds its agent over the profile's default.
+    let mut dialog = NewSessionDialog::new_with_tools(tools.clone(), String::new());
+    open_in(&mut dialog, &repo_path);
+    assert_eq!(dialog.selected_tool(), "opencode");
+
+    // A path outside the registry takes the profile default.
+    let plain = tempfile::tempdir().expect("temp plain");
+    open_in(&mut dialog, &plain.path().to_string_lossy());
+    assert_eq!(dialog.selected_tool(), "codex");
+
+    // A hand-picked tool survives later path picks.
+    dialog.set_tool("claude");
+    open_in(&mut dialog, &repo_path);
+    assert_eq!(dialog.selected_tool(), "claude");
+
+    // Scratch owns no project, so the project's agent leaves with it.
+    let mut dialog = NewSessionDialog::new_with_tools(tools, repo_path);
+    dialog.reload_config_defaults();
+    assert_eq!(dialog.selected_tool(), "opencode");
+    dialog.handle_key(ctrl_key(KeyCode::Char('t')));
+    assert_eq!(
+        dialog.selected_tool(),
+        "codex",
+        "profile default in scratch"
+    );
+}
+
 /// Registers a repo whose project asks for the sandbox, with the global default off, and returns the
 /// repo plus the registry file's valid content so a test can break and repair it.
 fn sandbox_project_with_broken_registry_helper() -> (tempfile::TempDir, std::path::PathBuf, String)
