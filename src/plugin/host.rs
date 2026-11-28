@@ -1567,6 +1567,36 @@ impl PluginHost {
         rx
     }
 
+    /// Publishes session-scoped UI entries as the plugin's live worker would.
+    pub(crate) fn set_test_ui_entries(
+        &self,
+        plugin_id: &str,
+        session_id: &str,
+        entries: &[(UiSlot, &str, Value)],
+    ) {
+        self.api
+            .set_ui_entries_for_test(plugin_id, session_id, entries);
+    }
+
+    /// Answers the host request in `frame` as the worker registered for `plugin_id` would.
+    pub(crate) async fn answer_test_request(
+        &self,
+        plugin_id: &str,
+        frame: &str,
+        outcome: Result<Value, WorkerRequestError>,
+    ) -> bool {
+        let id = serde_json::from_str::<Value>(frame).expect("a JSON-RPC frame")["id"]
+            .as_str()
+            .expect("a string request id")
+            .to_string();
+        let generation = self.state.lock().await.running[plugin_id].supervisor_id;
+        self.pending.resolve(
+            plugin_id,
+            generation,
+            crate::plugin::protocol::WorkerReply { id, outcome },
+        )
+    }
+
     /// Registers a fake worker launched from `manifest_hash` and returns what the host writes
     /// to its stdin.
     pub(crate) async fn register_test_inbound(

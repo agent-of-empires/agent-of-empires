@@ -1127,6 +1127,8 @@ export interface PluginUiEntry {
   slot: PluginUiSlot;
   id: string;
   session_id?: string;
+  /** A pane whose `payload` is a stub; its content is fetched on open. */
+  lazy?: boolean;
   payload: Record<string, unknown>;
 }
 
@@ -1178,6 +1180,19 @@ export function fetchPluginSessions(pluginId: string): Promise<{ sessions: Recor
  *  shape on the server when no plugin host is running. */
 export function fetchPluginUiState(init?: RequestInit): Promise<PluginUiState | null> {
   return fetchJson<PluginUiState>("/api/plugins/ui-state", init);
+}
+
+/** The content of a lazy pane, rendered by its worker on request; null when it cannot be rendered. */
+export function fetchPluginPane(
+  pluginId: string,
+  paneId: string,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown> | null> {
+  const query = new URLSearchParams({ session_id: sessionId });
+  return fetchJson(`/api/plugins/${encodeURIComponent(pluginId)}/panes/${encodeURIComponent(paneId)}?${query}`, {
+    signal,
+  });
 }
 
 /** Lets the next frame load of a page's `url` authenticate when device binding is on; the ticket rides an HttpOnly cookie. */

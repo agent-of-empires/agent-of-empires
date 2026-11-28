@@ -1,3 +1,4 @@
+import { useLazyPane } from "../../hooks/useLazyPane";
 import type { PluginUiEntry } from "../../lib/api";
 import { usePluginUiRefreshing } from "../../lib/pluginUiContext";
 import { lucideIcon, payloadStr, toneTextClass, validTone } from "../../lib/pluginUi";
@@ -5,16 +6,26 @@ import { DetailBlock } from "./paneBlocks";
 import { Spinner } from "./SlotChrome";
 import { isObject, objectList, renderIcon, str, type Obj } from "./slotPayload";
 
+/** Only these stub keys carry into a rendered pane; any other stub key could suppress the rendered content form. */
+function stubPresentation(payload: Obj): Obj {
+  return Object.fromEntries(
+    ["title", "icon", "default_location"].filter((key) => payload[key] !== undefined).map((key) => [key, payload[key]]),
+  );
+}
+
 /** The scrollable body of one plugin pane: a `blocks` list or the simple
  *  `{ title, body }` form, plus an optional pinned footer. */
 export function PluginPaneBody({
-  entry,
+  entry: stub,
   titleInChrome = false,
 }: {
   entry: PluginUiEntry;
   /** The caller already renders the payload title. */
   titleInChrome?: boolean;
 }) {
+  const lazy = useLazyPane(stub);
+  const entry =
+    lazy?.status === "ready" ? { ...stub, payload: { ...stubPresentation(stub.payload), ...lazy.payload } } : stub;
   const blocks = objectList(entry.payload, "blocks");
   const title = titleInChrome ? undefined : payloadStr(entry, "title");
   const body = payloadStr(entry, "body");
@@ -38,7 +49,11 @@ export function PluginPaneBody({
         </div>
       )}
       <div className="min-h-0 flex-1 overflow-auto p-3">
-        {blocks ? (
+        {lazy?.status === "failed" ? (
+          <div className="text-xs text-text-dim" data-testid="plugin-pane-failed">
+            Could not load this pane.
+          </div>
+        ) : blocks ? (
           <div className="flex flex-col gap-1.5">
             {blocks.map((b, i) => (
               <DetailBlock key={i} block={b} pluginId={entry.plugin_id} sessionId={entry.session_id} />

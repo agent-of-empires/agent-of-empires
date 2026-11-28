@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginPaneBody } from "../PluginPane";
 import {
@@ -15,20 +15,25 @@ import {
 } from "../PluginSlots";
 import { composerDraftOperation } from "../composerDraftOperation";
 
-const { entriesRef, refreshingRef, revisionRef, pokeMock, invokeMock } = vi.hoisted(() => ({
-  entriesRef: { current: [] as PluginUiEntry[] },
-  refreshingRef: { current: false },
-  revisionRef: { current: 0 },
-  pokeMock: vi.fn(),
-  invokeMock: vi.fn(async (): Promise<{ baselineRevision: number | null } | null> => ({ baselineRevision: 0 })),
-}));
+const { entriesRef, refreshingRef, revisionRef, generationRef, pokeMock, invokeMock, fetchPaneMock } = vi.hoisted(
+  () => ({
+    entriesRef: { current: [] as PluginUiEntry[] },
+    refreshingRef: { current: false },
+    revisionRef: { current: 0 },
+    generationRef: { current: 0 },
+    pokeMock: vi.fn(),
+    fetchPaneMock: vi.fn(async (): Promise<Record<string, unknown> | null> => null),
+    invokeMock: vi.fn(async (): Promise<{ baselineRevision: number | null } | null> => ({ baselineRevision: 0 })),
+  }),
+);
 vi.mock("../../../lib/pluginUiContext", () => ({
   usePluginUiEntries: () => entriesRef.current,
   usePluginUiRefreshing: () => refreshingRef.current,
   usePluginUiRevision: () => revisionRef.current,
+  usePluginUiGeneration: () => generationRef.current,
   usePluginUiPoke: () => pokeMock,
 }));
-vi.mock("../../../lib/api", () => ({ invokePluginAction: invokeMock }));
+vi.mock("../../../lib/api", () => ({ invokePluginAction: invokeMock, fetchPluginPane: fetchPaneMock }));
 
 const pane = (payload: Record<string, unknown>): PluginUiEntry => ({
   plugin_id: "acme.kit",
@@ -53,7 +58,10 @@ beforeEach(() => {
   entriesRef.current = [];
   refreshingRef.current = false;
   revisionRef.current = 0;
+  generationRef.current = 0;
   pokeMock.mockClear();
+  fetchPaneMock.mockReset();
+  fetchPaneMock.mockResolvedValue(null);
   invokeMock.mockReset();
   invokeMock.mockImplementation(async () => ({ baselineRevision: 0 }));
 });
@@ -846,5 +854,180 @@ describe("pane blocks", () => {
     expect(screen.getByText("GitHub")).toBeTruthy();
     vi.doUnmock("../BlockMarkdown");
     errSpy.mockRestore();
+  });
+});
+
+describe("lazy pane", () => {
+  const stub = (): PluginUiEntry => ({ ...pane({ title: "Stub title" }), lazy: true });
+  const content = (text: string) => ({ blocks: [{ kind: "heading", text }] });
+
+  it("fetches the content for the opened session and renders it over the stub", async () => {
+    fetchPaneMock.mockResolvedValue(content("Rendered"));
+    render(<PluginPaneBody entry={stub()} />);
+    expect(await screen.findByText("Rendered")).toBeTruthy();
+    expect(fetchPaneMock).toHaveBeenCalledWith("acme.kit", "p", "s1", expect.any(AbortSignal));
+  });
+
+  it("refetches when the session's UI revision moves and keeps the old content meanwhile", async () => {
+    fetchPaneMock.mockResolvedValueOnce(content("First"));
+    const entry = stub();
+    const { rerender } = render(<PluginPaneBody entry={entry} />);
+    expect(await screen.findByText("First")).toBeTruthy();
+
+    fetchPaneMock.mockResolvedValueOnce(null);
+    revisionRef.current = 1;
+    rerender(<PluginPaneBody entry={entry} />);
+    await waitFor(() => expect(fetchPaneMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("First")).toBeTruthy();
+
+    fetchPaneMock.mockResolvedValueOnce(content("Second"));
+    revisionRef.current = 2;
+    rerender(<PluginPaneBody entry={entry} />);
+    expect(await screen.findByText("Second")).toBeTruthy();
+  });
+
+  it("says so when a pane that never loaded cannot be rendered", async () => {
+    render(<PluginPaneBody entry={stub()} />);
+    expect(await screen.findByTestId("plugin-pane-failed")).toBeTruthy();
+  });
+
+  it("never fetches for an eager pane", () => {
+    renderPane({ title: "Eager" });
+    expect(fetchPaneMock).not.toHaveBeenCalled();
+  });
+
+  it("shows rendered simple-body content over a stub that carries blocks", async () => {
+    fetchPaneMock.mockResolvedValue({ body: "Loaded content" });
+    const withBlocks = (blocks: unknown[]): PluginUiEntry => ({
+      ...pane({ title: "Stub title", blocks, footer: { text: "stub footer" } }),
+      lazy: true,
+    });
+    const { unmount } = render(<PluginPaneBody entry={withBlocks([])} />);
+    expect(await screen.findByText("Loaded content")).toBeTruthy();
+    expect(screen.queryByText("stub footer")).toBeNull();
+    unmount();
+
+    render(<PluginPaneBody entry={withBlocks([{ kind: "heading", text: "Placeholder" }])} />);
+    expect(await screen.findByText("Loaded content")).toBeTruthy();
+    expect(screen.queryByText("Placeholder")).toBeNull();
+  });
+
+  it("reports an initial failure whatever blocks the stub carries", async () => {
+    for (const blocks of [[], [{ kind: "heading", text: "Placeholder" }]]) {
+      const { unmount } = render(<PluginPaneBody entry={{ ...pane({ blocks }), lazy: true }} />);
+      expect(await screen.findByTestId("plugin-pane-failed")).toBeTruthy();
+      expect(screen.queryByText("Placeholder")).toBeNull();
+      unmount();
+    }
+  });
+
+  it("shows a render that finishes after the revision moved, then refreshes once", async () => {
+    let finishFirst: (payload: Record<string, unknown>) => void = () => {};
+    let firstSignal: AbortSignal | undefined;
+    fetchPaneMock.mockImplementationOnce(
+      (_plugin: string, _pane: string, _session: string, signal: AbortSignal) =>
+        new Promise((resolve) => {
+          firstSignal = signal;
+          finishFirst = resolve;
+        }),
+    );
+    const entry = stub();
+    const { rerender } = render(<PluginPaneBody entry={entry} />);
+    await waitFor(() => expect(fetchPaneMock).toHaveBeenCalledTimes(1));
+
+    for (const revision of [1, 2, 3]) {
+      revisionRef.current = revision;
+      rerender(<PluginPaneBody entry={entry} />);
+    }
+    expect(firstSignal?.aborted).toBe(false);
+    expect(fetchPaneMock).toHaveBeenCalledTimes(1);
+
+    fetchPaneMock.mockResolvedValueOnce(content("Newer"));
+    await act(async () => finishFirst(content("Older")));
+    expect(await screen.findByText("Newer")).toBeTruthy();
+    expect(fetchPaneMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops content of a previous runtime when the UI generation changes", async () => {
+    fetchPaneMock.mockResolvedValueOnce(content("Old runtime"));
+    const entry = stub();
+    const { rerender } = render(<PluginPaneBody entry={entry} />);
+    expect(await screen.findByText("Old runtime")).toBeTruthy();
+
+    generationRef.current = 1;
+    fetchPaneMock.mockResolvedValueOnce(null);
+    rerender(<PluginPaneBody entry={entry} />);
+    expect(await screen.findByTestId("plugin-pane-failed")).toBeTruthy();
+    expect(screen.queryByText("Old runtime")).toBeNull();
+    expect(fetchPaneMock).toHaveBeenCalledTimes(2);
+  });
+
+  describe("switching sessions", () => {
+    const pending = new Map<string, (payload: Record<string, unknown>) => void>();
+    const signals = new Map<string, AbortSignal>();
+    const forSession = (session_id: string): PluginUiEntry => ({ ...stub(), session_id });
+
+    beforeEach(() => {
+      pending.clear();
+      signals.clear();
+      fetchPaneMock.mockImplementation(
+        (_plugin: string, _pane: string, session: string, signal: AbortSignal) =>
+          new Promise((resolve) => {
+            pending.set(session, resolve);
+            signals.set(session, signal);
+          }),
+      );
+    });
+
+    it("clears the content of the previous session before the new one answers", async () => {
+      const { rerender } = render(<PluginPaneBody entry={forSession("s1")} />);
+      await waitFor(() => expect(pending.has("s1")).toBe(true));
+      await act(async () => pending.get("s1")?.(content("Session one")));
+      expect(await screen.findByText("Session one")).toBeTruthy();
+
+      rerender(<PluginPaneBody entry={forSession("s2")} />);
+      await waitFor(() => expect(pending.has("s2")).toBe(true));
+      expect(screen.queryByText("Session one")).toBeNull();
+      await act(async () => pending.get("s2")?.(content("Session two")));
+      expect(await screen.findByText("Session two")).toBeTruthy();
+    });
+
+    it("never lets a request still pending across the switch show its late result", async () => {
+      const { rerender } = render(<PluginPaneBody entry={forSession("s1")} />);
+      await waitFor(() => expect(pending.has("s1")).toBe(true));
+
+      rerender(<PluginPaneBody entry={forSession("s2")} />);
+      await waitFor(() => expect(pending.has("s2")).toBe(true));
+      expect(signals.get("s1")?.aborted).toBe(true);
+
+      await act(async () => pending.get("s1")?.(content("Late session one")));
+      expect(screen.queryByText("Late session one")).toBeNull();
+      await act(async () => pending.get("s2")?.(content("Session two")));
+      expect(await screen.findByText("Session two")).toBeTruthy();
+      expect(screen.queryByText("Late session one")).toBeNull();
+    });
+  });
+
+  describe("recovery", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("retries a failed render a bounded number of times", async () => {
+      fetchPaneMock.mockResolvedValueOnce(null).mockResolvedValueOnce(content("Recovered"));
+      render(<PluginPaneBody entry={stub()} />);
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      expect(screen.getByTestId("plugin-pane-failed")).toBeTruthy();
+
+      await act(async () => vi.advanceTimersByTimeAsync(2_000));
+      expect(screen.getByText("Recovered")).toBeTruthy();
+      expect(fetchPaneMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("stops retrying once the attempts are spent", async () => {
+      render(<PluginPaneBody entry={stub()} />);
+      await act(async () => vi.advanceTimersByTimeAsync(120_000));
+      expect(fetchPaneMock).toHaveBeenCalledTimes(4);
+      expect(screen.getByTestId("plugin-pane-failed")).toBeTruthy();
+    });
   });
 });

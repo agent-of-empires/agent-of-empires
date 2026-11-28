@@ -148,3 +148,53 @@ describe("usePluginUiState pages", () => {
     expect(result.current.pages).toEqual([]);
   });
 });
+
+describe("usePluginUiState generation", () => {
+  const revised = (revisions: Record<string, Record<string, number>>): PluginUiState => ({
+    ...snapshot(),
+    revisions,
+  });
+
+  it("holds while revisions only advance", async () => {
+    const { result } = mountPolling(
+      revised({ "acme.kit": { s1: 1 } }),
+      revised({ "acme.kit": { s1: 2 } }),
+      revised({ "acme.kit": { s1: 2 } }),
+    );
+    await tick(0);
+    await tick(3000);
+    await tick(3000);
+    expect(result.current.generation).toBe(0);
+  });
+
+  it("moves after a failed poll recovers", async () => {
+    const good = revised({ "acme.kit": { s1: 1 } });
+    fetchMock.mockResolvedValueOnce(good).mockResolvedValueOnce(null).mockResolvedValue(good);
+    const { result } = renderHook(() => usePluginUiState());
+    await tick(0);
+    await tick(3000);
+    expect(result.current.generation).toBe(0);
+    await tick(3000);
+    expect(result.current.generation).toBe(1);
+  });
+
+  it("moves when a revision goes backwards", async () => {
+    const { result } = mountPolling(revised({ "acme.kit": { s1: 3 } }), revised({ "acme.kit": { s1: 1 } }));
+    await tick(0);
+    await tick(3000);
+    expect(result.current.generation).toBe(1);
+  });
+
+  it("moves when a scope disappears, so its return at a lower revision is not mistaken for unchanged", async () => {
+    const { result } = mountPolling(
+      revised({ "acme.kit": { s1: 3 } }),
+      revised({}),
+      revised({ "acme.kit": { s1: 1 } }),
+    );
+    await tick(0);
+    await tick(3000);
+    expect(result.current.generation).toBe(1);
+    await tick(3000);
+    expect(result.current.generation).toBe(1);
+  });
+});
