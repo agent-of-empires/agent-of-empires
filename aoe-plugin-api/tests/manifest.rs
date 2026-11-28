@@ -1232,6 +1232,26 @@ fn agent_profile_is_validated() {
             PROFILE.replace("\"(^|/)", "\"a?b?c?"),
             Some("memory_path_regex"),
         ),
+        (
+            PROFILE.replace("\"(^|/)", "\"[[:alpha:]]"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"[a[b]]"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"[a-z&&[^b]]"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"[a-z--b]"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"[a~~b]"),
+            Some("memory_path_regex"),
+        ),
         // Allowed: the core Claude regex (two quantifiers), lazy quantifiers counted once,
         // and `(?:` not counted.
         (
@@ -1240,6 +1260,7 @@ fn agent_profile_is_validated() {
         ),
         (with_regex(r"a{1,3}b{2}d\\b"), None),
         (with_regex(r"a*?b+?"), None),
+        (with_regex(r"[a&b~c-]x"), None),
         (with_regex(r"(?:a)b+c?"), None),
         (
             PROFILE.replace("command = \"example\"\n", ""),

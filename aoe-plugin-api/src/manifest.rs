@@ -1004,7 +1004,8 @@ fn quantifier_count(pattern: &str) -> usize {
 
 /// True when the pattern uses syntax the Rust `regex` crate accepts but a browser's
 /// `RegExp` rejects or reads differently: every `(?` group but `(?:`, and the escapes `\A`,
-/// `\z`, `\Z`, `\p`, `\P`, `\U`, `\a`, `\<`, `\>`, `\x{`, `\u{` and `\b{`.
+/// `\z`, `\Z`, `\p`, `\P`, `\U`, `\a`, `\<`, `\>`, `\x{`, `\u{` and `\b{`, and inside a
+/// bracket class a nested `[` (POSIX classes) or the set operators `&&`, `--` and `~~`.
 fn has_rust_only_regex_syntax(pattern: &str) -> bool {
     let chars: Vec<char> = pattern.chars().collect();
     let mut in_class = false;
@@ -1023,7 +1024,13 @@ fn has_rust_only_regex_syntax(pattern: &str) -> bool {
                 }
                 i += 1;
             }
-            _ if in_class => in_class = chars[i] != ']',
+            _ if in_class => {
+                let c = chars[i];
+                if c == '[' || (matches!(c, '&' | '-' | '~') && chars.get(i + 1) == Some(&c)) {
+                    return true;
+                }
+                in_class = c != ']';
+            }
             '[' => in_class = true,
             '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) != Some(&':') => {
                 return true;
