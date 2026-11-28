@@ -3204,10 +3204,11 @@ fn pane_accepts_automatic_input(
 /// bare shell) and its ready marker is showing. An agent without a ready marker
 /// is refused: stable output alone cannot tell a prompt from a dialog.
 fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> anyhow::Result<()> {
-    // A shell or custom command has no agent readiness signal; typing the
-    // prompt there would run it as a command.
+    // A shell or wrapper has no agent readiness signal; typing the prompt there
+    // would run it as a command. A plugin launch stores its declared command, so
+    // it is the agent's own program, not an override.
     anyhow::ensure!(
-        !instance.expects_shell() && !instance.has_command_override(),
+        !instance.expects_shell() && instance.launches_agent_itself(),
         "initial prompts are only typed into a known agent"
     );
     let markers = instance.ready_markers();
@@ -6426,6 +6427,28 @@ mod tests {
             .await
             .expect("turn is kept");
         assert!(turn.error.is_some_and(|e| e.contains("no ready marker")));
+    }
+
+    /// A stored command for the agent's own binary, as a plugin launch writes
+    /// from its declaration, is the agent; anything else is a wrapper and is
+    /// refused before any capture.
+    #[test]
+    fn a_stored_launch_command_is_the_agent_or_a_wrapper() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let row = |command: &str| {
+            let mut inst = terminal_turn_instance("sess-term-command", "term-command", "text");
+            inst.tool = "claude".into();
+            inst.command = command.into();
+            inst
+        };
+        assert!(row("claude").launches_agent_itself());
+
+        let error = wait_for_terminal_agent(&row("/tmp/wrapper.sh"), std::time::Duration::ZERO)
+            .expect_err("a wrapper has no input box to type into");
+        assert!(
+            error.to_string().contains("only typed into a known agent"),
+            "{error}"
+        );
     }
 
     /// A launch replaced after the wait was inspected, but before the error

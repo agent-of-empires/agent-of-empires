@@ -304,6 +304,22 @@ impl Instance {
         }
     }
 
+    /// Whether the row launches the agent's own program: nothing stored, the
+    /// built-in binary, or the command its declaration names. A wrapper or an
+    /// override is something else, so automatic input cannot expect the agent's
+    /// input box behind it.
+    pub(crate) fn launches_agent_itself(&self) -> bool {
+        if self.command.is_empty() {
+            return true;
+        }
+        if let Some(agent) = crate::agents::get_agent(&self.tool) {
+            return self.command == agent.binary;
+        }
+        self.declared_agent().is_some_and(|agent| {
+            agent.contribution().command.as_deref() == Some(self.command.as_str())
+        })
+    }
+
     fn declared_session_support(
         &self,
         sandboxed: bool,

@@ -2373,6 +2373,15 @@ oneshot_flag = "-p"
         );
         assert_eq!(declared_ready_markers("claude"), None);
 
+        // A launch stores the declaration's command, so the delivery guard has
+        // to read that as the agent's own program; a wrapper still loses it.
+        let mut launched = instance("marker-helper");
+        launched.command = "marker-helper".into();
+        assert!(launched.launches_agent_itself());
+        let mut wrapped = instance("marker-helper");
+        wrapped.command = "wrapper.sh".into();
+        assert!(!wrapped.launches_agent_itself());
+
         // Disabling the plugin leaves the tool unknown, not a stale declaration:
         // the refusal returns instead of markers nobody grants any more.
         crate::session::update_config(|config| {
