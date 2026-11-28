@@ -638,8 +638,8 @@ impl ResolvedProfile {
     }
 }
 
-/// The profile of a `key` no plugin declares, which no custom agent can shadow, so it needs
-/// no session config. `None` when a plugin declares it.
+/// The profile of a `key` no plugin declares a profile for, which no custom agent can shadow,
+/// so it needs no session config. `None` when a plugin declaration carries a `profile`.
 pub fn resolve_undeclared(key: &str) -> Option<Arc<AgentProfile>> {
     let resolved = resolve_for(crate::plugin::registry(), key, std::iter::empty());
     (!matches!(resolved.source, ProfileSource::Plugin { .. })).then_some(resolved.profile)

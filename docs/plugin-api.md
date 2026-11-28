@@ -145,6 +145,8 @@ For reply-enabled integrations, the provider report's `reply_keys` must contain 
 - Tool cards: `card_aliases` with `execute`, `read`, `edit`, `delete`, `search`, `fetch`, `think`; `special_titles` with `skill_names`, `schedule_names`, `harness_names`, `workflow_names`.
 - `memory_path_regex`: a path regex that marks memory file operations. It must compile with the Rust `regex` crate and, because browsers run it, must not repeat a group (with `*`, `+`, `?` or `{n,m}`) that contains a quantifier or an alternation, and must not use any `(?` group other than `(?:` (so no inline flags and no named groups in any spelling), or the `\A`, `\z` and `\Z` anchors, or the Rust-only escapes `\p`, `\P`, `\U`, `\a`, `\<`, `\>`, `\x{...}`, `\u{...}` and `\b{...}`, or inside a bracket class a nested `[` (POSIX classes) or the set operators `&&`, `--` and `~~`, which a browser reads as something else. It may hold at most two quantifiers (`*`, `+`, `?`, `{n}`, `{n,}` or `{n,m}`; a lazy `?` and `(?:` do not count), because sequential overlapping ones backtrack polynomially in a browser.
 
+A custom agent the user configures with the same name as a plugin's tool shadows that tool, so the plugin's profile does not apply to it and it gets the unreviewed default profile.
+
 Lists hold at most 32 unique, nonempty, printable strings of at most 128 bytes; `memory_path_regex` is at most 256 bytes. The agent key, fullscreen probe, one-shot capture patterns, native config agent, MCP env expansion and legacy mode fallback are not declarable.
 
 ### Display name and icon (API 29)
