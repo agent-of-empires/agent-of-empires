@@ -1062,6 +1062,12 @@ fn agent_profile_requires_api_30() {
 #[test]
 fn agent_profile_is_validated() {
     let with = |extra: &str| PROFILE.replace("todos = true\n", &format!("todos = true\n{extra}\n"));
+    let with_regex = |regex: &str| {
+        PROFILE.replace(
+            "memory_path_regex = \"(^|/)\\\\.example/memory/[^/]+\\\\.md$\"",
+            &format!("memory_path_regex = \"{regex}\""),
+        )
+    };
     let long = "x".repeat(129);
     let many = (0..33)
         .map(|n| format!("\"a{n}\""))
@@ -1155,6 +1161,60 @@ fn agent_profile_is_validated() {
             PROFILE.replace("\"(^|/)", "\"(?>a)"),
             Some("memory_path_regex"),
         ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\p{L}"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\P{L}"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\pL"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"[\\\\p{L}]"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\x{41}"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\u{41}"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\U00000041"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\a"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\<a"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"a\\\\>"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"\\\\b{start}"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"(?:a)(?P<n>b)"),
+            Some("memory_path_regex"),
+        ),
+        // Allowed: the core Claude regex (two unbounded repeats) and bounded repeats.
+        (
+            with_regex(r"/\\.claude/projects/[^/]+/memory/.*\\.md$"),
+            None,
+        ),
+        (with_regex(r"a{1,3}b{2}c*d\\b"), None),
         (
             PROFILE.replace("command = \"example\"\n", ""),
             Some("profile requires command"),

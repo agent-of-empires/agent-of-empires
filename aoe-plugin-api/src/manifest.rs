@@ -967,8 +967,8 @@ fn has_nested_quantifier(pattern: &str) -> bool {
 }
 
 /// True when the pattern uses syntax the Rust `regex` crate accepts but a browser's
-/// `RegExp` rejects or reads differently: inline flag groups, `(?P<` named groups and the
-/// `\A`, `\z` and `\Z` anchors. Only `(?:` groups are allowed.
+/// `RegExp` rejects or reads differently: every `(?` group but `(?:`, and the escapes `\A`,
+/// `\z`, `\Z`, `\p`, `\P`, `\U`, `\a`, `\<`, `\>`, `\x{`, `\u{` and `\b{`.
 fn has_rust_only_regex_syntax(pattern: &str) -> bool {
     let chars: Vec<char> = pattern.chars().collect();
     let mut in_class = false;
@@ -976,7 +976,13 @@ fn has_rust_only_regex_syntax(pattern: &str) -> bool {
     while i < chars.len() {
         match chars[i] {
             '\\' => {
-                if matches!(chars.get(i + 1), Some('A' | 'z' | 'Z')) {
+                let next = chars.get(i + 1);
+                let braced = chars.get(i + 2) == Some(&'{');
+                if matches!(
+                    next,
+                    Some('A' | 'z' | 'Z' | 'p' | 'P' | 'U' | 'a' | '<' | '>')
+                ) || (matches!(next, Some('x' | 'u' | 'b')) && braced)
+                {
                     return true;
                 }
                 i += 1;
@@ -1074,8 +1080,9 @@ fn validate_agent_profile(
         check(
             !has_rust_only_regex_syntax(pattern),
             format!(
-                "agent_integrations[{i}].profile.memory_path_regex must not use inline flags, \
-                 named groups or the \\A, \\z and \\Z anchors, which browsers do not read the same"
+                "agent_integrations[{i}].profile.memory_path_regex must not use `(?` groups other \
+                 than `(?:`, or Rust-only escapes (`\\A`, `\\z`, `\\Z`, `\\p`, `\\P`, `\\x{{`, \
+                 `\\u{{`), which browsers do not read the same"
             ),
         );
     }
