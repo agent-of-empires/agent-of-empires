@@ -38,6 +38,8 @@ impl HomeView {
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
         crate::session::set_favorites_first(resolved.session.favorites_first);
         crate::session::set_preview_link_prefixes(&resolved.session.preview_link_prefixes);
+        let keybind_warnings = super::config_refresh::install_keybinds(&resolved);
+        let live_send_chords = live_send::LiveSendChords::from_config(&resolved);
         let sort_order = user_config
             .as_ref()
             .and_then(|c| c.app_state.sort_order)
@@ -192,6 +194,11 @@ impl HomeView {
             projects_dialog: None,
             plugin_manager_dialog: None,
             skills_manager_dialog: None,
+            sandbox_login_dialog: None,
+            sandbox_login_poller: None,
+            sandbox_login_retiring: Vec::new(),
+            sandbox_login_clock: Default::default(),
+            sandbox_login_selection: None,
             command_palette: None,
             serve_view: None,
             serve_jobs: super::super::dialogs::ServeJobs::default(),
@@ -245,6 +252,7 @@ impl HomeView {
             pending_paste: None,
             pending_paste_for_structured_view: HashMap::new(),
             pending_attach_after_warning: None,
+            refused_send: None,
             pending_stop_session: None,
             pending_stop_auxiliary: None,
             pending_legacy_tool_preparation: None,
@@ -298,6 +306,7 @@ impl HomeView {
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
             pending_archive_cursor: None,
+            pending_snooze_flash: None,
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),
             terminal_preview_cache: PreviewCache::default(),
@@ -389,6 +398,7 @@ impl HomeView {
                 .as_ref()
                 .map(|c| c.tools.clone())
                 .unwrap_or_default(),
+            live_send_chords,
             tool_hotkey_cache: Vec::new(),
             tool_picker_dialog: None,
             file_watch,
@@ -401,13 +411,7 @@ impl HomeView {
         };
 
         view.tool_hotkey_cache = input::build_tool_hotkey_cache(&view.tool_configs);
-        let hotkey_warnings = input::validate_tool_hotkeys(&view.tool_configs);
-        if !hotkey_warnings.is_empty() && view.info_dialog.is_none() {
-            view.info_dialog = Some(InfoDialog::new(
-                "Tool hotkey config errors",
-                &hotkey_warnings.join("\n"),
-            ));
-        }
+        view.show_key_config_errors(keybind_warnings);
 
         view.refresh_registered_projects();
         view.refresh_flat_items();
@@ -470,7 +474,7 @@ impl HomeView {
             .iter()
             .flat_map(|(_, _, rows)| rows)
             .filter(|row| reports.iter().all(|report| report.id != row.id))
-            .map(|row| crate::server::api::sessions::session_response_from_instance(row, false))
+            .map(crate::server::api::sessions::session_response_from_instance)
             .collect();
         let default_profile = view
             .active_profile

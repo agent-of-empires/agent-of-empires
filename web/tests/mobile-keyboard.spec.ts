@@ -3,6 +3,7 @@ import { openLiveSession } from "./helpers/liveTerminal";
 import { devices, type Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import { mockTerminalApis, seedSettings, type MockHandle } from "./helpers/terminal-mocks";
+import { CLAUDE_PROFILE } from "../src/lib/__tests__/agentProfileFixtures";
 
 test.use({ ...devices["iPhone 13"] });
 
@@ -110,6 +111,27 @@ test.describe("Mobile keyboard detection and layout", () => {
     await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 
+  test("an unknown-version profile does not keep the keyboard closed", async ({ page }) => {
+    // A v2 profile is ignored, so its mobile_monitor_only must not suppress auto-open.
+    const agent_profile = { ...CLAUDE_PROFILE, v: 2, mobile_monitor_only: true };
+    const handle = await mockTerminalApis(page, { sessionFields: { agent_profile } });
+    await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+    const proxyFocused = () =>
+      page.evaluate(() => document.activeElement?.hasAttribute("data-keyboard-proxy") ?? false);
+
+    // Workspace selection: the sidebar row.
+    await openSession(page, handle, { mobileFontSize: 10, autoOpenKeyboard: true });
+    await expect.poll(proxyFocused).toBe(true);
+
+    // Session selection: the in-app notification tap.
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await expect.poll(proxyFocused).toBe(false);
+    await page.evaluate(() =>
+      window.dispatchEvent(new CustomEvent("aoe-open-session", { detail: { sessionId: "pinch-test" } })),
+    );
+    await expect.poll(proxyFocused).toBe(true);
+  });
+
   test("keyboard FAB tracks input focus, not viewport heuristics", async ({ page }) => {
     await setupAndOpen(page);
 
@@ -165,7 +187,8 @@ test.describe("Mobile proxy input keydown handling", () => {
     const handle = await setupProxySession(page);
     await sendProxyKey(page, "Enter", "Enter");
     await expect.poll(() => handle.liveInput.map((input) => input.toString())).toContain("\r");
-    // A plain Backspace edits the proxy natively and reaches the pane as its diff.
+    // No soft keyboard occludes the page here, so Enter keeps focus. A plain Backspace edits the proxy natively and
+    // reaches the pane as its diff.
     await page.keyboard.press("Backspace");
     await expect.poll(() => handle.liveInput.map((input) => input.toString())).toContain("\x7f");
   });

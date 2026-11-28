@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { INPUT } from "../../../lib/surfaces";
+import { BUTTON_GHOST_SM, BUTTON_PRIMARY_SM } from "../../../lib/surfaces";
 import type { DiffSide } from "./types";
 
 interface Props {
@@ -26,7 +28,7 @@ export function CommentForm({ startLine, endLine, side, initialBody = "", onSave
 
   return (
     <div className="border-y border-brand-600/30 bg-surface-850 px-3 py-2">
-      <div className="text-[11px] text-text-dim mb-1.5 font-mono">
+      <div className="text-[12px] text-text-dim mb-1.5 font-mono">
         Commenting on {range} ({side})
       </div>
       <textarea
@@ -45,21 +47,17 @@ export function CommentForm({ startLine, endLine, side, initialBody = "", onSave
         }}
         placeholder="Leave a comment (markdown supported). Cmd/Ctrl+Enter to save, Esc to cancel."
         rows={3}
-        className="w-full bg-surface-900 border border-surface-700 rounded px-2 py-1.5 text-[12px] font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none resize-y"
+        className={`${INPUT} font-mono resize-y`}
       />
-      <div className="mt-2 flex items-center gap-2 justify-end">
-        <button
-          type="button"
-          onClick={onCancel}
-          className="text-[11px] px-2 py-1 rounded text-text-dim hover:text-text-secondary hover:bg-surface-800 cursor-pointer transition-colors"
-        >
+      <div className="mt-2 flex items-center gap-1.5 justify-end">
+        <button type="button" onClick={onCancel} className={BUTTON_GHOST_SM}>
           Cancel
         </button>
         <button
           type="button"
           onClick={() => canSave && onSave(trimmed)}
           disabled={!canSave}
-          className="text-[11px] px-2 py-1 rounded bg-brand-600 text-white hover:bg-brand-500 disabled:bg-surface-700 disabled:text-text-dim disabled:cursor-not-allowed cursor-pointer transition-colors"
+          className={BUTTON_PRIMARY_SM}
         >
           Save
         </button>

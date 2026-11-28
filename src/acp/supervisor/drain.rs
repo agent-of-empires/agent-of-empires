@@ -12,8 +12,9 @@ use tracing::{debug, info, warn};
 use super::agents::log_wrapper_substitution;
 use super::launch::{
     admit_stored_row, apply_claude_store_pin, apply_declared_config_dir,
-    await_resume_to_completion, before_session_env, discovery_key, overlay_env, publish_rejection,
-    refresh_spawn_model_effort, resolve_mcp_servers, McpHostEnv, McpPaths, McpSandboxScope,
+    await_resume_to_completion, before_session_env, discovery_key, neutral_boot_fallback,
+    overlay_env, proxy_degraded_notice, publish_rejection, refresh_spawn_model_effort,
+    resolve_mcp_servers, McpHostEnv, McpPaths, McpSandboxScope,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
@@ -29,7 +30,7 @@ use crate::acp::runner_lifecycle::{
 /// Bounds recovery of a live runner whose control channel closed.
 const CONTROL_REATTACH_ATTEMPTS: u32 = 3;
 const CONTROL_REATTACH_DEADLINE: Duration = Duration::from_secs(3);
-use crate::acp::state::{AcpSessionId, Event, StartupCause};
+use crate::acp::state::{AcpSessionId, Event, IntegrationLostReason, StartupCause};
 use crate::process::worker_registry;
 
 impl<S: BroadcastSink> Supervisor<S> {
@@ -324,6 +325,23 @@ impl<S: BroadcastSink> Drain<S> {
                 self.sink
                     .publish_from_worker(&self.session_id, seq, &event, generation)
             });
+            // A new connection retires the degraded notice, so a degraded worker re-asserts it.
+            if matches!(event, Event::AcpSessionAssigned { .. }) {
+                let degraded = worker_registry::load(&self.session_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.degraded);
+                if let Some(name) = degraded {
+                    publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
+                        self.sink.publish_from_worker(
+                            &self.session_id,
+                            seq,
+                            &proxy_degraded_notice(&name),
+                            generation,
+                        )
+                    });
+                }
+            }
         }
         end.established = established;
         end
@@ -527,6 +545,13 @@ impl<S: BroadcastSink> Drain<S> {
             self.publish(Event::Stopped {
                 reason: "runner_control_lost".into(),
             });
+        }
+        // Nothing continues unproxied: the next respawn relaunches the proxy.
+        if loss.proxied && !self.restart_intended() {
+            self.publish(Event::IntegrationLost {
+                reason: IntegrationLostReason::ProxyExited,
+            });
+            return;
         }
         self.publish(Event::startup_error(
             "ACP connection failed: runner control channel closed",
@@ -896,7 +921,24 @@ impl<S: BroadcastSink> Drain<S> {
         }
         // Like spawn_inner, keep the cooperative handshake result so a
         // concurrent permanent stop can retire its adapter-side session.
-        let launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
+        let mut launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
+        let mut degraded = None;
+        if let Err(err) = &launched {
+            if let Some(name) = neutral_boot_fallback(
+                &self.lifecycle,
+                &*self.process_control,
+                &respawn_lease,
+                &config,
+                err,
+            )
+            .await
+            {
+                config.proxy = None;
+                config.degraded = Some(name.clone());
+                degraded = Some(name);
+                launched = (self.launcher)(config.clone(), AcpSessionId(session_id.clone())).await;
+            }
+        }
         let mut client = match launched {
             Ok(client) => client,
             Err(e) => {
@@ -972,6 +1014,10 @@ impl<S: BroadcastSink> Drain<S> {
                         handle.client = Arc::clone(&client);
                         handle.lease = respawn_lease.clone();
                         handle.native_session_id = None;
+                        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
+                            spawn_config.proxy.clone_from(&config.proxy);
+                            spawn_config.degraded.clone_from(&config.degraded);
+                        }
                         None
                     }
                     None => Some(InstallError::Stale),
@@ -1029,6 +1075,9 @@ impl<S: BroadcastSink> Drain<S> {
         );
         lock_recover(&self.incompatible_binaries).remove(session_id);
         lock_recover(&self.respawned_in_place).insert(session_id.clone());
+        if let Some(name) = &degraded {
+            self.publish(proxy_degraded_notice(name));
+        }
         Some((respawn_lease, inbound))
     }
 
@@ -1109,7 +1158,7 @@ impl<S: BroadcastSink> Drain<S> {
             config.host_environment = host_environment;
         }
 
-        config.mcp_servers = resolve_mcp_servers(
+        let resolved_mcp = resolve_mcp_servers(
             discovery_key(config.sandbox_info.is_some(), &config.agent_key, native),
             session_id,
             config.source_profile.clone(),
@@ -1130,6 +1179,8 @@ impl<S: BroadcastSink> Drain<S> {
             "MCP re-resolution on respawn failed",
         )
         .await;
+        config.mcp_servers = resolved_mcp.servers;
+        config.mcp_credentials = resolved_mcp.credentials;
     }
 
     /// Route an archived, trashed or purged row through the stop path, so the cancellation retires
@@ -1201,7 +1252,7 @@ impl<S: BroadcastSink> Drain<S> {
                 session = %session_id,
                 "respawn failed: {e}"
             );
-            if matches!(e, AcpError::IncompatibleAgent(_)) {
+            if super::launch::blames_adapter_binary(&e) {
                 lock_recover(&self.incompatible_binaries)
                     .insert(session_id.clone(), config.spec.command.clone());
             }
@@ -1367,6 +1418,62 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::daemon::AcpWorkerState;
+
+    /// The session-assigned event retires the degraded notice, so a degraded
+    /// worker's drain must publish it after the assignment, never before.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_degraded_worker_reasserts_its_notice_after_each_session_assignment() {
+        let (_home, _tmp) = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242);
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone()).with_process_control(control);
+        let id = "s-degraded-assigned";
+        let socket = worker_registry::socket_path_for(id).unwrap();
+        let mut record = worker_record(id, 4242, socket.clone());
+        record.degraded = Some("Fake".into());
+        worker_registry::save(&record).unwrap();
+        let lease = sup
+            .test_install_runner(
+                id,
+                runner_config(socket),
+                Some(RunnerIdentity::unattested(4242, 0)),
+            )
+            .await;
+        let (tx, rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task(id.into(), lease, rx, None);
+        for sid in ["acp-1", "acp-2"] {
+            tx.send(Event::AcpSessionAssigned {
+                acp_session_id: sid.into(),
+            })
+            .await
+            .unwrap();
+        }
+        let tags = || -> Vec<&'static str> {
+            sink.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, _, event)| match event {
+                    Event::AcpSessionAssigned { .. } => Some("assigned"),
+                    Event::SessionNotice { key, .. }
+                        if key.as_deref() == Some(crate::acp::state::PROXY_DEGRADED_NOTICE_KEY) =>
+                    {
+                        Some("degraded")
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tags().len() < 4 && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(tags(), ["assigned", "degraded", "assigned", "degraded"]);
+        drain.abort();
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -1763,6 +1870,57 @@ mod tests {
         }
     }
 
+    /// A runner whose proxied agent is gone loses its integration; a plain
+    /// agent, or a runner the daemon is restarting on purpose, fails as before.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_lost_proxied_runner_reports_the_integration_not_a_startup_error() {
+        // (name, proxied, restart pending, expect proxy_exited)
+        let cases = [
+            ("proxied", true, false, true),
+            ("plain agent", false, false, false),
+            ("deliberate restart", true, true, false),
+        ];
+        for (name, proxied, restarting, proxy_exited) in cases {
+            let (_home, tmp) = isolate_home();
+            let id = "s-proxy-lost";
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone());
+            worker_registry::save(
+                &worker_record(id, std::process::id(), tmp.path().join("attach.sock"))
+                    .with_generation(4),
+            )
+            .unwrap();
+            if restarting {
+                worker_registry::mark_restart_pending(id, 4);
+            }
+            let (client, _client_tx) = crate::acp::acp_client::AcpClient::fake_for_test(
+                crate::acp::state::AcpSessionId(id.into()),
+            );
+            recovery_test_drain(&sup, id).report_control_loss(
+                &client,
+                ControlLoss {
+                    io_error: None,
+                    turn_in_flight: false,
+                    proxied,
+                },
+            );
+            let frames = sink.frames.lock().unwrap();
+            let lost = frames.iter().any(|(_, _, ev)| {
+                matches!(
+                    ev,
+                    Event::IntegrationLost {
+                        reason: IntegrationLostReason::ProxyExited
+                    }
+                )
+            });
+            let startup = frames
+                .iter()
+                .any(|(_, _, ev)| matches!(ev, Event::AgentStartupError { .. }));
+            assert_eq!((lost, startup), (proxy_exited, !proxy_exited), "{name}");
+        }
+    }
+
     /// A worker that goes away with no respawn behind it takes its
     /// background-agent tailers with it, so the drain's terminal arms must
     /// detach whatever the log still shows running: otherwise the panel keeps
@@ -1806,6 +1964,7 @@ mod tests {
                     cancel_capable: true,
                     model: None,
                     background: true,
+                    runs: 0,
                 },
                 at: crate::time::Timestamp::now(),
             },
@@ -3082,6 +3241,61 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn respawn_reinjects_plugin_served_servers() {
+        use crate::acp::mcp_rewrite::test_support::SlotGuard;
+        use crate::plugin::mcp_serve::test_support::{names, ServingRewriter};
+        use crate::server::daemon_endpoint::{test_support::EndpointGuard, DaemonEndpoint};
+        use crate::server::session_credential::McpSessionSecret;
+        use agent_client_protocol::v1::schema::McpServer;
+
+        let (_home, temp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let rewriter = ServingRewriter::new(vec![("acme.a", names(&["docs"]))], false);
+        let _slot = SlotGuard::install(rewriter.clone());
+        let secret = std::sync::Arc::new(
+            McpSessionSecret::load_or_generate(&temp.path().join("mcp_session_secret")).unwrap(),
+        );
+        let _endpoint = EndpointGuard::install(DaemonEndpoint {
+            host_url: Some("http://127.0.0.1:4321".into()),
+            sandbox_url: None,
+            sandbox_socket: None,
+            secret: secret.clone(),
+        });
+
+        let mut config = runner_config(worker_registry::socket_path_for("s-plugin").unwrap());
+        config.cwd = temp.path().to_path_buf();
+        Drain::<VecSink>::refresh_launch_env("s-plugin", &mut config, Default::default()).await;
+
+        let [McpServer::Http(server)] = config.mcp_servers.as_slice() else {
+            panic!("one plugin entry expected: {:?}", config.mcp_servers);
+        };
+        assert_eq!(server.name, "acme_a__docs");
+        assert_eq!(server.url, "http://127.0.0.1:4321/mcp/plugins/acme.a/docs");
+        let credential = secret.plugin_server_credential_for("acme.a", "docs", "s-plugin");
+        let var = crate::plugin::mcp_serve::credential_var_name(&credential);
+        let bearer = format!("Bearer ${{{var}}}");
+        assert!(
+            server
+                .headers
+                .iter()
+                .any(|h| h.name == "Authorization" && h.value == bearer),
+            "{:?}",
+            server.headers
+        );
+        let want = vec![(var, credential)];
+        assert_eq!(
+            config.mcp_credentials,
+            want.into(),
+            "the respawn recomputes the pair from the derivation"
+        );
+        assert_eq!(
+            rewriter.requests.lock().unwrap()[0]["servers"][0]["plugin"],
+            "acme.a"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn respawn_reapplies_selected_claude_store_before_native_mcp_discovery() {
         use agent_client_protocol::v1::schema::McpServer;
 
@@ -3362,6 +3576,7 @@ mod tests {
                     ControlBody::ResumeSession => ControlBody::SessionReady {
                         acp_session_id: native.into(),
                         result: serde_json::json!({}),
+                        adapter_frames: 0,
                     },
                     ControlBody::Prompt { .. } => ControlBody::PromptStarted { prompt_req_id: 77 },
                     _ => continue,
@@ -3406,6 +3621,8 @@ mod tests {
             Some(tokio::time::Instant::now() + Duration::from_secs(5)),
             None,
             None,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -3537,6 +3754,7 @@ mod tests {
             loss: ControlLoss {
                 io_error: None,
                 turn_in_flight: true,
+                proxied: false,
             },
             attempts: 1,
         });
@@ -3660,6 +3878,7 @@ mod tests {
                             stream.write_all(&write(ControlBody::SessionReady {
                                 acp_session_id: "native-deadline".into(),
                                 result: serde_json::json!({}),
+                                adapter_frames: 0,
                             })).await.unwrap();
                             if connection == 1 {
                                 for n in 0..100 {
@@ -3694,6 +3913,8 @@ mod tests {
             Some(tokio::time::Instant::now() + Duration::from_secs(5)),
             None,
             None,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -3853,6 +4074,7 @@ mod tests {
                 let ready = || ControlBody::SessionReady {
                     acp_session_id: native.into(),
                     result: serde_json::json!({}),
+                    adapter_frames: 0,
                 };
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
@@ -3994,6 +4216,8 @@ mod tests {
             Some(tokio::time::Instant::now() + Duration::from_secs(5)),
             None,
             None,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -4158,5 +4382,167 @@ mod tests {
             }
         }
         peer.abort();
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ProxyRespawn {
+        Plain,
+        Cancelled,
+        StuckRunner,
+    }
+
+    struct ProxyRespawnRun {
+        replacement: bool,
+        configs: Vec<SpawnConfig>,
+        stored: Option<SpawnConfig>,
+        notices: Vec<String>,
+    }
+
+    /// Respawn a Runner worker holding a proxy under `policy`; each launch pops its outcome,
+    /// and a failed launch owns a runner (pid 4400 + launch number).
+    async fn respawn_with_proxy(
+        id: &str,
+        policy: crate::acp::acp_client::ProxyFailurePolicy,
+        outcomes: Vec<Result<(), AcpError>>,
+        case: ProxyRespawn,
+    ) -> ProxyRespawnRun {
+        let (_home, _tmp) = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4343);
+        if case == ProxyRespawn::StuckRunner {
+            control.immortal(4401);
+        }
+        let seen: Arc<std::sync::Mutex<Vec<SpawnConfig>>> = Default::default();
+        let outcomes = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            outcomes,
+        )));
+        let sink = VecSink::new();
+        let base = Supervisor::new(sink.clone()).with_process_control(control.clone());
+        let lifecycle = Arc::clone(&base.lifecycle);
+        let sup =
+            base.with_launcher(Arc::new({
+                let (seen, control) = (seen.clone(), control.clone());
+                move |config: SpawnConfig, session_id| {
+                    let launch = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(config.clone());
+                        seen.len() as u32
+                    };
+                    let outcome = outcomes.lock().unwrap().pop_front().expect("outcome");
+                    let (control, lifecycle) = (control.clone(), Arc::clone(&lifecycle));
+                    Box::pin(async move {
+                        let lease = config.launch_lease.clone().expect("respawn lease");
+                        lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
+                        if let Err(err) = outcome {
+                            let pid = 4400 + launch;
+                            assert!(
+                                lease.record_runner(attested_test_identity(pid, config.generation))
+                            );
+                            save_attested_test_record(&session_id.0, pid, config.generation);
+                            control.alive(pid);
+                            if case == ProxyRespawn::Cancelled {
+                                lock_recover(&lifecycle).begin_stop(
+                                    &session_id.0,
+                                    "user_stopped",
+                                    false,
+                                );
+                            }
+                            return Err(err);
+                        }
+                        assert!(
+                            lease.record_runner(attested_test_identity(4343, config.generation))
+                        );
+                        save_attested_test_record(&session_id.0, 4343, config.generation);
+                        let (client, _tx) = AcpClient::fake_for_test(session_id);
+                        Ok(client.with_runner_pid(4343))
+                    })
+                }
+            }));
+        let mut config = runner_config(worker_registry::socket_path_for(id).unwrap());
+        config.proxy = Some(crate::acp::acp_client::ProxySpec {
+            plugin_id: "fake".into(),
+            command: "/bin/proxy".into(),
+            args: Vec::new(),
+            failure_policy: policy,
+            display_name: "Fake".into(),
+            compat: Default::default(),
+        });
+        save_attested_test_record(id, 4343, 0);
+        let lease = sup
+            .test_install_runner(id, config.clone(), Some(attested_test_identity(4343, 0)))
+            .await;
+        let driver = recovery_test_drain(&sup, id);
+        let replacement = driver.respawn(&lease, config).await.is_some();
+        let stored = match sup.workers.lock().await.get(id).map(|handle| &handle.kind) {
+            Some(WorkerKind::Runner { spawn_config }) => Some((**spawn_config).clone()),
+            _ => None,
+        };
+        let notices = sink
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, _, event)| match event {
+                Event::SessionNotice { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .collect();
+        let configs = seen.lock().unwrap().clone();
+        ProxyRespawnRun {
+            replacement,
+            configs,
+            stored,
+            notices,
+        }
+    }
+
+    fn bad_proxy_hello() -> AcpError {
+        let detail = crate::acp::state::StartupErrorDetail::InvalidProxyHello {
+            reason: "no hello".into(),
+        };
+        AcpError::IncompatibleAgent(Box::new(crate::acp::acp_client::IncompatibleAgentError {
+            message: detail.user_message(),
+            detail,
+        }))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_retries_a_neutral_boot_proxy_failure_raw_and_stays_degraded() {
+        use crate::acp::acp_client::ProxyFailurePolicy::NeutralBoot;
+        let run = respawn_with_proxy(
+            "s-respawn-neutral",
+            NeutralBoot,
+            vec![Err(bad_proxy_hello()), Ok(())],
+            ProxyRespawn::Plain,
+        )
+        .await;
+        assert!(run.replacement, "the raw relaunch installs");
+        assert_eq!(run.configs.len(), 2);
+        assert!(run.configs[0].proxy.is_some() && run.configs[0].degraded.is_none());
+        assert!(run.configs[1].proxy.is_none());
+        assert_eq!(run.configs[1].degraded.as_deref(), Some("Fake"));
+        assert_eq!(run.notices, ["Fake features unavailable"]);
+        let stored = run.stored.expect("the replacement keeps its handle");
+        assert!(stored.proxy.is_none());
+        assert_eq!(stored.degraded.as_deref(), Some("Fake"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_respawn_does_not_retry_when_policy_or_state_forbids_it() {
+        use crate::acp::acp_client::ProxyFailurePolicy::{NeutralBoot, Refuse};
+        for (id, policy, case) in [
+            ("s-respawn-refuse", Refuse, ProxyRespawn::Plain),
+            ("s-respawn-cancel", NeutralBoot, ProxyRespawn::Cancelled),
+            ("s-respawn-stuck", NeutralBoot, ProxyRespawn::StuckRunner),
+        ] {
+            let run =
+                respawn_with_proxy(id, policy, vec![Err(bad_proxy_hello()), Ok(())], case).await;
+            assert!(!run.replacement, "{id}: the session is not replaced");
+            assert_eq!(run.configs.len(), 1, "{id}: one launch only");
+            assert!(run.notices.is_empty(), "{id}: no degraded notice");
+        }
     }
 }

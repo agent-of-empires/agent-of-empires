@@ -1,26 +1,92 @@
-// Minimal service worker: enables PWA installability but does not precache.
-// The previous version precached `/static/*` paths that no longer exist
-// (the app is Vite-built with hashed `/assets/*` files), which generated
-// a burst of auth-failing 404s on install and contributed to rate-limit
-// lockouts for mobile PWA users.
+// Service worker: PWA installability, an offline shell, and Web Push.
+//
+// Offline shell: without one, an installed app with no network shows a blank page. Navigations go to the network
+// and keep the last good index.html; offline they get it back, so the app loads and says it cannot reach the
+// Daemon, or failing that a small page with Retry. Hashed `/assets/*` files are immutable, so they are served from
+// the cache once fetched. Nothing is precached: an earlier version precached paths that no longer existed and set
+// off bursts of failing requests. API and WebSocket traffic never touches the cache.
+
+const SHELL_CACHE = "aoe-shell-v1";
+const ASSET_CACHE = "aoe-assets-v1";
+const KEEP = new Set([SHELL_CACHE, ASSET_CACHE]);
+const SHELL_KEY = "/index.html";
+// Hashed assets pile up across releases; keep the newest this many.
+const MAX_ASSETS = 150;
 
 self.addEventListener("install", () => {
   self.skipWaiting();
 });
 
 self.addEventListener("activate", (e) => {
-  // Clear any cache from the old precache-all strategy.
   e.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((k) => !KEEP.has(k)).map((k) => caches.delete(k))))
       .then(() => self.clients.claim()),
   );
 });
 
-// No fetch handler: requests go to the network directly. The Vite build
-// output is content-hashed, so HTTP caching headers handle offline/cache
-// behavior without us re-implementing cache-first logic.
+const OFFLINE_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1f1f1f"><title>Agent of Empires: offline</title>
+<style>html,body{height:100%;margin:0;background:#1f1f1f;color:#e5e5e5;font:16px/1.5 system-ui,-apple-system,sans-serif}
+main{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:24px;text-align:center}
+h1{font-size:20px;margin:0}p{margin:0;color:#a3a3a3;max-width:22rem}
+button{margin-top:8px;height:44px;padding:0 24px;border:0;border-radius:10px;background:#f59e0b;color:#1f1f1f;font:600 15px system-ui,sans-serif}</style>
+</head><body><main><h1>Can't reach Agent of Empires</h1>
+<p>This device is offline or the Daemon is not answering. Your sessions keep running.</p>
+<button onclick="location.reload()">Try again</button></main>
+<script>addEventListener("online",()=>location.reload())</script></body></html>`;
+
+async function trimAssets(cache) {
+  const keys = await cache.keys();
+  await Promise.all(keys.slice(0, Math.max(0, keys.length - MAX_ASSETS)).map((k) => cache.delete(k)));
+}
+
+async function navigate(request) {
+  try {
+    const response = await fetch(request);
+    if (response.ok && (response.headers.get("content-type") || "").includes("text/html")) {
+      const copy = response.clone();
+      caches
+        .open(SHELL_CACHE)
+        .then((cache) => cache.put(SHELL_KEY, copy))
+        .catch(() => {});
+    }
+    return response;
+  } catch {
+    const shell = await caches.match(SHELL_KEY, { cacheName: SHELL_CACHE }).catch(() => undefined);
+    return shell || new Response(OFFLINE_PAGE, { headers: { "content-type": "text/html; charset=utf-8" } });
+  }
+}
+
+// Caching is best effort: a quota error or unusable Cache Storage must not fail an asset the network served.
+async function asset(request) {
+  const cache = await caches.open(ASSET_CACHE).catch(() => null);
+  const hit = cache && (await cache.match(request).catch(() => undefined));
+  if (hit) return hit;
+  const response = await fetch(request);
+  if (cache && response.ok) {
+    cache
+      .put(request, response.clone())
+      .then(() => trimAssets(cache))
+      .catch(() => {});
+  }
+  return response;
+}
+
+self.addEventListener("fetch", (e) => {
+  const { request } = e;
+  if (request.method !== "GET") return;
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin) return;
+  if (request.mode === "navigate") {
+    // Only the app's own pages are its shell: a plugin page or other HTML under /api/ is not.
+    if (request.destination === "document" && !url.pathname.startsWith("/api/")) e.respondWith(navigate(request));
+  } else if (url.pathname.startsWith("/assets/")) {
+    e.respondWith(asset(request));
+  }
+});
 
 // Web Push receiver. The server POSTs an AES-128-GCM encrypted payload
 // to the browser's push endpoint; the browser decrypts it and fires

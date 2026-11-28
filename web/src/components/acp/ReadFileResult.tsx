@@ -7,6 +7,7 @@ import { isImagePath } from "../../lib/imagePath";
 import { openInNewTab } from "../../lib/openInNewTab";
 import { ExpandableImage } from "./artifactMedia";
 import { HighlightedBlock, PlaceholderLine } from "./ToolCardChrome";
+import { BUTTON_INLINE } from "../../lib/surfaces";
 
 type Loaded = { kind: "text"; text: string; truncated: boolean } | { kind: "binary" } | null;
 
@@ -129,11 +130,7 @@ function ReadImage({ url, name }: { url: string; name: string }) {
 
 function ReadFileChip({ url, name }: { url: string; name: string }) {
   return (
-    <button
-      type="button"
-      onClick={() => void openInNewTab(url, name)}
-      className="inline-flex cursor-pointer items-center gap-2 text-xs text-accent-500 hover:underline"
-    >
+    <button type="button" onClick={() => void openInNewTab(url, name)} className={BUTTON_INLINE}>
       <FileDown className="h-3.5 w-3.5" />
       {name}
     </button>

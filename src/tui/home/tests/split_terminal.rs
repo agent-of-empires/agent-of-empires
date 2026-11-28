@@ -435,3 +435,46 @@ fn split_empty_terminal_hint_follows_live_mode() {
         assert!(screen.contains(expected), "{name}:\n{screen}");
     }
 }
+
+/// The absent paired terminal names the effective attach-terminal key, keeps only the bare
+/// sentence when it is unbound, and the group-mode dialog does the same for pick-group-by.
+#[test]
+#[serial]
+fn absent_terminal_and_group_hints_follow_keybind_overrides() {
+    use crate::tui::home::keybinds;
+    let cache = crate::tmux::SessionCacheGuard::capture();
+    for (keys, want) in [
+        (vec!["F2".to_string()], "Press F2 to start one."),
+        (vec![], "No terminal running.\u{20}"),
+    ] {
+        let config = crate::session::Config {
+            keybinds: [
+                ("attach-terminal".to_string(), keys.clone()),
+                (
+                    "pick-group-by".to_string(),
+                    keys.iter().map(|_| "F3".to_string()).collect(),
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let (keymap, warnings) = keybinds::from_config(&config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // After setup, which applies the on-disk config's keymap.
+        let (mut env, agent, _term) = split_env(false, false);
+        keybinds::install(keymap);
+        cache.force_present(&[agent.as_str()]);
+        let screen = render_home_to_string(&mut env.view, 120, 40);
+        assert!(screen.contains(want), "{keys:?}:\n{screen}");
+        assert!(!screen.contains("Press T"), "{keys:?}:\n{screen}");
+
+        env.view.group_by = crate::session::config::GroupByMode::Project;
+        let (_, body) = env.view.automatic_group_hint().expect("automatic grouping");
+        let want = if keys.is_empty() {
+            "Pick Manual grouping to manage groups."
+        } else {
+            "Press F3 and pick Manual to manage groups."
+        };
+        assert!(body.ends_with(want), "{keys:?}: {body}");
+    }
+}

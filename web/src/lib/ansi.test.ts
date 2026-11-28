@@ -37,7 +37,7 @@ describe("parseAnsi", () => {
       "bold fg and reset",
       `${ESC}[0m${ESC}[01;34mApplications${ESC}[0m\nbin`,
       [
-        ["Applications", { bold: true, fg: "#2472c8" }],
+        ["Applications", { bold: true, fg: "var(--term-color-4, #2472c8)" }],
         ["\nbin", {}],
       ],
     ],
@@ -54,7 +54,7 @@ describe("parseAnsi", () => {
       "empty SGR as a reset",
       `${ESC}[31mred${ESC}[mreset`,
       [
-        ["red", { fg: "#cd3131" }],
+        ["red", { fg: "var(--term-color-1, #cd3131)" }],
         ["reset", {}],
       ],
     ],
@@ -78,20 +78,20 @@ describe("parseAnsi", () => {
       "fg/bg clears",
       `${ESC}[31;41;1mboth${ESC}[39mno-fg${ESC}[49mno-bg`,
       [
-        ["both", { fg: "#cd3131", bg: "#cd3131", bold: true }],
-        ["no-fg", { bg: "#cd3131", bold: true }],
+        ["both", { fg: "var(--term-color-1, #cd3131)", bg: "var(--term-color-1, #cd3131)", bold: true }],
+        ["no-fg", { bg: "var(--term-color-1, #cd3131)", bold: true }],
         ["no-bg", { bold: true }],
       ],
     ],
-    ["16-color background", `${ESC}[42mgreen-bg`, [["green-bg", { bg: "#0dbc79" }]]],
+    ["16-color background", `${ESC}[42mgreen-bg`, [["green-bg", { bg: "var(--term-color-2, #0dbc79)" }]]],
     ["unsupported code 53", `${ESC}[53mtext`, [["text", {}]]],
-    ["low 256 index", `${ESC}[38;5;4mblue`, [["blue", { fg: "#2472c8" }]]],
+    ["low 256 index", `${ESC}[38;5;4mblue`, [["blue", { fg: "var(--term-color-4, #2472c8)" }]]],
     ["grayscale 232", `${ESC}[38;5;232mgray`, [["gray", { fg: "rgb(8, 8, 8)" }]]],
     ["grayscale 255", `${ESC}[38;5;255mlight`, [["light", { fg: "rgb(238, 238, 238)" }]]],
     ["256-color background", `${ESC}[48;5;82mbg`, [["bg", { bg: "rgb(51, 255, 0)" }]]],
     ["truecolor background", `${ESC}[48;2;1;2;3mtc`, [["tc", { bg: "rgb(1, 2, 3)" }]]],
     ["unknown extended mode", `${ESC}[38;9mnoop`, [["noop", {}]]],
-    ["missing 256 params", `${ESC}[38;5mfill`, [["fill", { fg: "#000000" }]]],
+    ["missing 256 params", `${ESC}[38;5mfill`, [["fill", { fg: "var(--term-color-0, #000000)" }]]],
     ["missing truecolor params", `${ESC}[38;2mfill`, [["fill", { fg: "rgb(0, 0, 0)" }]]],
   ])("%s", (_name, text, expected) => {
     expect(parseAnsi(text).map((s) => [s.text, s.style])).toEqual(expected);
@@ -112,7 +112,7 @@ describe("OSC 8 hyperlinks and other OSC sequences", () => {
     [
       "keeps SGR inside a link",
       link("https://x.com", `${ESC}[31mred link${ESC}[0m`),
-      [{ text: "red link", style: { fg: "#cd3131" }, url: "https://x.com" }],
+      [{ text: "red link", style: { fg: "var(--term-color-1, #cd3131)" }, url: "https://x.com" }],
     ],
     [
       "supports a BEL terminator",
@@ -134,15 +134,15 @@ describe("OSC 8 hyperlinks and other OSC sequences", () => {
       `Styled: ${ESC}[31m${ESC}]8;;https://example.com/red${ESC}\\red link${ESC}[39m${ESC}]8;;${ESC}\\`,
       [
         { text: "Styled: ", style: {} },
-        { text: "red link", style: { fg: "#cd3131" }, url: "https://example.com/red" },
+        { text: "red link", style: { fg: "var(--term-color-1, #cd3131)" }, url: "https://example.com/red" },
       ],
     ],
     [
       "keeps the link off trailing text",
       `${ESC}[32m${ESC}]8;;https://example.com${ESC}\\link${ESC}]8;;${ESC}\\ tail`,
       [
-        { text: "link", style: { fg: "#0dbc79" }, url: "https://example.com" },
-        { text: " tail", style: { fg: "#0dbc79" } },
+        { text: "link", style: { fg: "var(--term-color-2, #0dbc79)" }, url: "https://example.com" },
+        { text: " tail", style: { fg: "var(--term-color-2, #0dbc79)" } },
       ],
     ],
     [

@@ -222,6 +222,7 @@ mod preview_links;
 mod profile_duplicate_reconciliation;
 mod render_and_save;
 mod right_click_context_menu;
+mod sandbox_login_dialog;
 mod save_field_merge;
 mod scroll_pane_isolation;
 mod search;
@@ -1157,8 +1158,7 @@ fn publish_canonical_rows(env: &mut TestEnv, stamps: &[(String, bool)], revision
         .view
         .instances()
         .map(|instance| {
-            let mut row =
-                crate::server::api::sessions::session_response_from_instance(instance, false);
+            let mut row = crate::server::api::sessions::session_response_from_instance(instance);
             if let Some((_, archived)) = stamps.iter().find(|(id, _)| id == &instance.id) {
                 row.archived_at = archived.then(|| now.clone());
             }

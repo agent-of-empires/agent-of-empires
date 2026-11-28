@@ -25,7 +25,7 @@ beforeEach(() => {
     http.get("*/api/telemetry/status", () =>
       HttpResponse.json({ enabled: false, responded: false, do_not_track: false }),
     ),
-    http.get("*/api/themes", () => HttpResponse.json(["empire"])),
+    http.get("*/api/themes", () => HttpResponse.json([{ name: "empire", label: "empire" }])),
     http.get("*/api/agents", () => HttpResponse.json([])),
     http.get("*/api/setup/runtimes", () => HttpResponse.json([])),
     http.get("*/api/projects", () => HttpResponse.json([])),

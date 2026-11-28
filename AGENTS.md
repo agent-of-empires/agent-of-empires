@@ -123,6 +123,8 @@ template, and [MAINTAINERS.md](MAINTAINERS.md) for review and merge rules.
   `--features web` when relevant.
 - For `web/` changes also run its format, lint, type, and applicable test checks
   from `web/AGENTS.md`, including the coverage matrix requirement.
+- Push once per round of fixes, not after each small change: every push to a
+  PR restarts its full CI run.
 - Update the documentation a change makes materially wrong or incomplete in the
   same PR: `docs/`, `CONTEXT.md`, ADRs, and generated references such as
   `docs/cli/reference.md`. Do not add docs for unchanged behavior; correcting

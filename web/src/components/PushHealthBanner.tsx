@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { usePushSubscription } from "../hooks/usePushSubscription";
 import { deniedGuidance, needsAttention, type PushHealth } from "../lib/pushHealth";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 const DISMISSED_KEY = "aoe.push.bannerDismissed";
 
@@ -41,12 +42,7 @@ export function PushHealthBanner({ hidden = false }: { hidden?: boolean }) {
         <>
           <span>Notifications stopped on this device.</span>
           {/* enable() must start inside this click: iOS needs the gesture to re-prompt. */}
-          <button
-            type="button"
-            onClick={() => void enable()}
-            disabled={busy}
-            className="underline hover:no-underline cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-          >
+          <button type="button" onClick={() => void enable()} disabled={busy} className={BUTTON_INLINE}>
             {busy ? "Enabling..." : "Re-enable"}
           </button>
         </>

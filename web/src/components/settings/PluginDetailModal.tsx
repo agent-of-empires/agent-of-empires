@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { fetchPluginDetails, type PluginDetail } from "../../lib/api";
 import { PluginIdentityIcon } from "./PluginIdentityIcon";
+import { LIGHTBOX } from "../../lib/surfaces";
 import { ModalSection, PluginModal } from "./PluginModal";
 import { uniqueSlots } from "./uniqueSlots";
 
@@ -78,7 +79,7 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
             testId="plugin-detail-icon"
           />
           <div>
-            <h2 className="font-semibold">{title}</h2>
+            <h2 className="text-[16px] md:text-[15px] font-semibold text-text-primary">{title}</h2>
             {version && <p className="text-xs text-text-dim">v{version}</p>}
             <p className="text-[11px] text-text-dim">{source}</p>
           </div>
@@ -87,7 +88,7 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
       overlay={
         zoomed && (
           <div
-            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4"
+            className={`${LIGHTBOX} z-[60]`}
             role="dialog"
             aria-modal="true"
             aria-label={`${zoomed.alt || "Screenshot"} full size`}
@@ -113,7 +114,7 @@ export function PluginDetailModal({ source, title, fallback, installCommand, onC
       {screenshots.length > 0 && (
         <div className="mb-3 grid gap-3" data-testid="plugin-detail-screenshots">
           {screenshots.map((shot) => (
-            <figure key={shot.src} className="overflow-hidden rounded border border-surface-700 bg-surface-950">
+            <figure key={shot.src} className="overflow-hidden rounded-lg border border-surface-700/60 bg-surface-950">
               <button
                 type="button"
                 className="block w-full cursor-zoom-in"

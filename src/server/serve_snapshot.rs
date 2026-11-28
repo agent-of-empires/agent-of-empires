@@ -262,6 +262,7 @@ pub(super) struct ReportedServeSignals {
     bound: crate::telemetry::consent::Bound,
     usage_seen: std::collections::BTreeMap<String, u32>,
     feature_uses: std::collections::BTreeMap<String, u32>,
+    suggestion_kinds: std::collections::BTreeMap<String, u32>,
     web_clients: FormFactorCounts,
     structured_clients: FormFactorCounts,
     session_creates: u32,
@@ -302,7 +303,14 @@ pub(super) async fn build_serve_snapshot(
     let instances = state.instances.read().await.clone();
     let (
         bound,
-        (usage_seen, web_clients, structured_clients, session_creates, feature_uses, reported_acp),
+        (
+            usage_seen,
+            web_clients,
+            structured_clients,
+            session_creates,
+            (feature_uses, suggestion_kinds),
+            reported_acp,
+        ),
     ) = crate::telemetry::consent::capture(|| {
         let c = &state.telemetry_structured;
         (
@@ -310,7 +318,10 @@ pub(super) async fn build_serve_snapshot(
             state.telemetry_web_clients.read(),
             state.telemetry_structured_clients.read(),
             state.telemetry_session_creates.load(Ordering::Relaxed),
-            crate::telemetry::feature_use::snapshot(),
+            (
+                crate::telemetry::feature_use::snapshot(),
+                crate::telemetry::suggestions::kinds_snapshot(),
+            ),
             ReportedAcpCounts {
                 approvals_allow: c.approvals_allow.load(Ordering::Relaxed),
                 approvals_allow_always: c.approvals_allow_always.load(Ordering::Relaxed),
@@ -335,6 +346,7 @@ pub(super) async fn build_serve_snapshot(
         bound: bound.clone(),
         usage_seen: usage_seen.clone(),
         feature_uses: feature_uses.clone(),
+        suggestion_kinds: suggestion_kinds.clone(),
         web_clients,
         structured_clients,
         session_creates,
@@ -350,11 +362,37 @@ pub(super) async fn build_serve_snapshot(
         &acp,
     )?;
     snapshot.feature_uses = feature_uses;
+    snapshot.suggestion_kind_uses = suggestion_kinds;
+    add_suggestions_adoption(state, &mut snapshot).await;
     // Layer the per-form-factor was-seen maps onto the snapshot.
     snapshot.web_clients_seen = web_clients.seen_map();
     snapshot.structured_clients_seen = structured_clients.seen_map();
     apply_window(&bound, aggregator, &mut snapshot);
     Some(snapshot)
+}
+
+/// Adds the suggested-sessions adoption flags and buckets to a snapshot; nothing when no
+/// plugin host runs.
+async fn add_suggestions_adoption(
+    state: &AppState,
+    snapshot: &mut crate::telemetry::UsageSnapshot,
+) {
+    let Some(host) = state.plugin_host.clone() else {
+        return;
+    };
+    let read = tokio::task::spawn_blocking(move || {
+        let providers = crate::plugin::suggestions::providers();
+        host.with_suggestions_db(|conn, profile| {
+            crate::plugin::suggestions::snapshot(conn, profile, &providers)
+        })
+    })
+    .await;
+    let Ok(Ok(body)) = read else {
+        return;
+    };
+    let adoption = crate::telemetry::suggestions::adoption(&body);
+    snapshot.features.extend(adoption.features);
+    snapshot.prefs.extend(adoption.prefs);
 }
 
 /// Layers the window aggregate onto a snapshot sent under the window's consent. Under
@@ -398,6 +436,7 @@ pub(super) fn clear_reported_serve_signals(
 fn decrement_reported(state: &AppState, reported: &ReportedServeSignals) {
     state.telemetry_usage_seen.decrement(&reported.usage_seen);
     crate::telemetry::feature_use::clear_reported(&reported.feature_uses);
+    crate::telemetry::suggestions::clear_reported_kinds(&reported.suggestion_kinds);
     state.telemetry_web_clients.decrement(&reported.web_clients);
     state
         .telemetry_structured_clients

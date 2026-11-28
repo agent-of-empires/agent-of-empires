@@ -1,4 +1,5 @@
 import { useWebSettings } from "../hooks/useWebSettings";
+import { CARD, CAPTION } from "../lib/surfaces";
 import {
   MAX_PERSISTENT_TERMINALS,
   MIN_PERSISTENT_TERMINALS,
@@ -14,9 +15,9 @@ export function TerminalSettings() {
 
   return (
     <div>
-      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">Terminal</h3>
+      <h3 className={CAPTION}>This browser</h3>
 
-      <div className="space-y-4">
+      <div className={`${CARD} py-4 space-y-4`}>
         <FontSizeControl
           label="Mobile font size"
           testIdPrefix="terminal-mobile-font-size"
@@ -53,26 +54,6 @@ export function TerminalSettings() {
               className="accent-brand-600 w-4 h-4 shrink-0"
             />
           </label>
-        </div>
-
-        <div>
-          <label htmlFor="sidebar-side" className="block text-[13px] text-text-secondary mb-2">
-            Sidebar side (mobile)
-          </label>
-          <select
-            id="sidebar-side"
-            value={settings.sidebarSide}
-            onChange={(e) => update({ sidebarSide: e.target.value === "right" ? "right" : "left" })}
-            className="w-full bg-surface-800 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary"
-          >
-            <option value="left">Left (default)</option>
-            <option value="right">Right</option>
-          </select>
-          <p className="text-[11px] text-text-muted mt-1">
-            Which edge the session sidebar slides in from on mobile. Move it to the right so the session list sits
-            within thumb reach of the keyboard button. The swipe-to-open gesture is disabled while on the right. Desktop
-            layout is unaffected.
-          </p>
         </div>
 
         <div>

@@ -196,6 +196,8 @@ impl CommandFailure {
                     && *status != reqwest::StatusCode::REQUEST_TIMEOUT
                     && *code != Some(crate::daemon::ApiErrorCode::CreateOutcomeUnknown)
             }
+            DaemonClientError::FavoriteSelection(_) => true,
+            DaemonClientError::RuntimeCursorUnsupported => !submitted,
             DaemonClientError::InvalidBaseUrl { .. }
             | DaemonClientError::InvalidPathSegment
             | DaemonClientError::InvalidBearerToken
@@ -2705,7 +2707,7 @@ mod tests {
         let mut instance = crate::session::Instance::new("original-title", "/tmp/rename");
         instance.id = "rename".into();
         instance.source_profile = "test".into();
-        let row = crate::server::api::sessions::session_response_from_instance(&instance, false);
+        let row = crate::server::api::sessions::session_response_from_instance(&instance);
         let mut original = snapshot("test", 1);
         Arc::make_mut(&mut original)
             .contents

@@ -198,6 +198,9 @@ impl SettingsView {
                         }
                     }
                     SettingsFocus::Fields => {
+                        if self.scroll_within_selected_field(true) {
+                            return SettingsAction::Continue;
+                        }
                         let mut idx = self.selected_field;
                         while idx > 0 {
                             idx -= 1;
@@ -226,6 +229,9 @@ impl SettingsView {
                         }
                     }
                     SettingsFocus::Fields => {
+                        if self.scroll_within_selected_field(false) {
+                            return SettingsAction::Continue;
+                        }
                         let mut idx = self.selected_field + 1;
                         while idx < self.fields.len() {
                             if !self.fields[idx].is_section_header() {
@@ -297,9 +303,13 @@ impl SettingsView {
                         FieldValue::List(_) => {
                             self.list_edit_state = Some(ListEditState::default());
                         }
+                        FieldValue::ReadOnly(_) => {}
                         FieldValue::SectionHeader => {
                             // Navigation never lands here; arm is for exhaustiveness.
                         }
+                    }
+                    if self.editing_input.is_some() || self.list_edit_state.is_some() {
+                        self.reveal_selected_field_value();
                     }
                 } else if self.focus == SettingsFocus::Categories {
                     self.focus = SettingsFocus::Fields;
@@ -525,12 +535,16 @@ impl SettingsView {
         };
 
         if state.editing_item.is_some() {
-            return self.handle_list_item_edit_key(key);
+            let action = self.handle_list_item_edit_key(key);
+            self.reveal_selected_field_value();
+            return action;
         }
 
         match key.code {
             KeyCode::Esc => {
                 self.list_edit_state = None;
+                self.clamp_fields_scroll();
+                return SettingsAction::Continue;
             }
             KeyCode::Up | KeyCode::Char('k') if state.selected_index > 0 => {
                 state.selected_index -= 1;
@@ -574,6 +588,7 @@ impl SettingsView {
             }
             _ => {}
         }
+        self.reveal_selected_field_value();
         SettingsAction::Continue
     }
 

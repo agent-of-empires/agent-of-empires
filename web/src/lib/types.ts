@@ -1,6 +1,22 @@
 import type { RateLimitInfo } from "./acpTypes";
-import type { AgentLifecycleInfo } from "./agentProfiles";
+import type { AgentProfile } from "./agentProfile";
 import type { SchemaSettings } from "./generated/settingsKeys";
+
+export interface AuxiliaryObservation {
+  target: { kind: "host"; index: number } | { kind: "container"; index: number } | { kind: "tool"; tool_name: string };
+  state: "absent" | "alive" | "dead" | "unknown";
+  tmux_session?: string | null;
+}
+
+/** Mirrors `AgentLifecycle` in src/agents.rs. */
+export type AgentLifecycleInfo =
+  | { state: "active" }
+  | {
+      state: "deprecated";
+      since: string;
+      note: string;
+      replacement: string | null;
+    };
 
 export interface SessionResponse {
   id: string;
@@ -69,6 +85,8 @@ export interface SessionResponse {
   /** Renaming also moves the worktree directory. */
   tie_workdir_to_name?: boolean;
   has_terminal: boolean;
+  /** The Daemon's latest look at the Session's paired shells and tool panes. */
+  auxiliary?: AuxiliaryObservation[];
   profile: string;
   cleanup_defaults: CleanupDefaults;
   remote_owner: string | null;
@@ -105,17 +123,13 @@ export interface SessionResponse {
   acp_provider?: string;
   /** Switching views preserves the conversation (server-computed). */
   keeps_context?: boolean;
-  /** Slash commands that reset the conversation for this agent. */
-  clear_aliases?: string[];
-  /** Slash commands that compact the conversation for this agent. */
-  compact_aliases?: string[];
+  /** The agent's capabilities and classifier data; absent from an older daemon. */
+  agent_profile?: AgentProfile;
   /** The agent implements ACP `session/fork` (resume-only agents do not). */
   acp_can_fork?: boolean;
-  /** The agent binary was replaced after launch and a restart is safe to offer now. */
-  update_restart?: boolean;
   /** `acp.structured_view = off` for this session: a terminal session cannot switch to structured. */
   structured_view_off?: boolean;
-  /** Claude's fullscreen renderer is on, so mobile skips copy-mode scrollback workarounds. */
+  /** @deprecated Read `agent_profile.fullscreen`. */
   claude_fullscreen: boolean;
   workspace_repos: WorkspaceRepoSummary[];
   /** Non-fatal notes: on create, rename, trash and restore responses. */
@@ -617,6 +631,8 @@ export interface SuggestionSource {
   enabled: boolean;
   /** Placeholder names every item of this criterion carries. */
   variables: string[];
+  /** Set when open items of this kind start on their own, at most `cap` per refresh. */
+  auto_start?: { cap: number } | null;
 }
 
 /** How a kind starts a Session. `prompt` is a template with `{variables}` filled from each item; null uses the plugin's own prompt. */
@@ -732,6 +748,8 @@ export interface SuggestionItem {
   stale?: boolean;
   /** The registered Project the item resolves to; the provider's `project` is only a hint. */
   resolved_project?: { name: string; path: string } | null;
+  /** Why auto start left this item alone, or that its start failed. */
+  auto_note?: string;
 }
 
 export interface SuggestionsSnapshot {

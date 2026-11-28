@@ -1,17 +1,54 @@
-//! Sessions held until the sandbox login they need exists, and the one push per episode.
+//! Sessions held until the sandbox login they need exists, the one push per episode and the
+//! login helper the dashboard runs.
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use crate::session::config::container_config::{
-    login_capable_agents, sandbox_login_status, SandboxLoginStatus,
+    login_capable_agents, login_target_with_command, sandbox_login_status, SandboxLoginStatus,
 };
+use crate::session::sandbox_login::helper::{LoginError, LoginHelper, Retired};
 use crate::session::SandboxLoginRequired;
 
 const LOG_TARGET: &str = "session.sandbox_login";
+
+/// Shutdown has a 5 s window in all; these stay well inside it.
+const SHUTDOWN_CANCEL_WAIT: Duration = Duration::from_millis(1500);
+const SHUTDOWN_SWEEP_WAIT: Duration = Duration::from_millis(1500);
+
+/// How many ended logins keep their outcome for a client whose answer got lost.
+const RETAINED_OUTCOMES: usize = 16;
+
+/// How long an outcome read waits for a code exchange in progress.
+const OUTCOME_WAIT: Duration = Duration::from_secs(5);
+
+/// What a login id came to, for a client that lost the answer to its code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginOutcome {
+    Succeeded,
+    Failed,
+    /// The login is still there and its code exchange has not ended.
+    Pending,
+    /// No exchange ended under this id, or it is no longer remembered.
+    Unknown,
+}
+
+#[cfg(test)]
+type TestStarter = Box<
+    dyn Fn(
+            &str,
+            &str,
+            Option<&str>,
+        )
+            -> futures_util::future::BoxFuture<'static, Result<Arc<LoginHelper>, LoginError>>
+        + Send
+        + Sync,
+>;
 
 /// Who a refused launch was for: only an unattended one notifies the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,11 +102,78 @@ struct State {
 
 /// An episode of a credential file runs from the first hold waiting on it until no held
 /// session waits on it any more.
-#[derive(Debug)]
 pub(crate) struct SandboxLoginService {
     state: Mutex<State>,
     notices: mpsc::UnboundedSender<LoginRequiredNotice>,
     receiver: Mutex<Option<mpsc::UnboundedReceiver<LoginRequiredNotice>>>,
+    /// The one helper this daemon runs. Held only briefly, so a status read never waits
+    /// for a start.
+    helper: Mutex<Option<Arc<LoginHelper>>>,
+    /// The helper whose container runs but whose sign-in URL is still awaited, so shutdown
+    /// can cancel it before it reaches `helper`. Taken together with `helper`, in that order.
+    in_flight: Mutex<Option<Arc<LoginHelper>>>,
+    /// Helpers that left their start or the slot without a confirmed container removal: shutdown
+    /// cancels them and sweeps for what they left. Unlisted once the removal succeeded.
+    retiring: Arc<Mutex<Vec<Arc<LoginHelper>>>>,
+    /// The outcomes of the latest logins that left the slot, oldest first.
+    outcomes: Mutex<VecDeque<(String, bool)>>,
+    /// Serializes starts: two requests spawn one helper.
+    starting: tokio::sync::Mutex<()>,
+    /// Set once by `shutdown`; no helper is spawned after it.
+    shutting_down: AtomicBool,
+    /// Cancelled by `shutdown`: ends the preparation of a start, the image pull included.
+    shutdown_token: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    starter: Mutex<Option<TestStarter>>,
+}
+
+impl std::fmt::Debug for SandboxLoginService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxLoginService")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Ends a start's claim on the `in_flight` slot. A helper left there, because the request was
+/// dropped or the start failed, is retired in the background and tracked in `retiring` until
+/// its container is removed.
+struct InFlightGuard<'a>(&'a SandboxLoginService);
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        // Listed in `retiring` before `in_flight` is released, so shutdown finds it in one.
+        let mut in_flight = self.0.in_flight_slot();
+        // Also one that ended already: its removal may have failed, which only shutdown's
+        // sweep can then clean up.
+        let Some(helper) = in_flight.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let retiring = Arc::clone(&self.0.retiring);
+        retiring
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::clone(&helper));
+        drop(in_flight);
+        runtime.spawn(async move {
+            let mut retired = helper.cancel().await;
+            if retired == Retired::Pending {
+                // Out of wait, still ending: see how it ended.
+                helper.ended().await;
+                retired = helper.cancel().await;
+            }
+            // Unlisted only once the container is gone; otherwise it stays for shutdown's sweep.
+            if retired == Retired::Removed {
+                retiring
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|retiring| !Arc::ptr_eq(retiring, &helper));
+            }
+        });
+    }
 }
 
 impl Default for SandboxLoginService {
@@ -79,6 +183,15 @@ impl Default for SandboxLoginService {
             state: Mutex::new(State::default()),
             notices,
             receiver: Mutex::new(Some(receiver)),
+            helper: Mutex::new(None),
+            in_flight: Mutex::new(None),
+            retiring: Arc::default(),
+            outcomes: Mutex::new(VecDeque::new()),
+            starting: tokio::sync::Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            starter: Mutex::new(None),
         }
     }
 }
@@ -99,6 +212,278 @@ impl State {
 impl SandboxLoginService {
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The running login helper, or a fresh one for `profile` and `tool`, with the lease of
+    /// the dialog joining it (`lease` when the dialog chose one). `command` is the one a session's launch runs for `tool` when
+    /// it overrides the profile's.
+    pub(crate) async fn start_login(
+        &self,
+        profile: &str,
+        tool: &str,
+        command: Option<&str>,
+        force: bool,
+        lease: Option<&str>,
+    ) -> Result<(Arc<LoginHelper>, String), LoginError> {
+        let _starting = self.starting.lock().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(LoginError::Cancelled);
+        }
+        if let Some(running) = self.running() {
+            // The one helper logs one file in: another tool's file keeps it busy. Compared
+            // with the helper in hand, which may finish meanwhile.
+            let wanted = login_target_with_command(profile, tool, command).map(|t| t.credential);
+            if wanted.as_deref() != Some(running.shared()) {
+                return Err(LoginError::Busy);
+            }
+            if let Some(lease) = running.join(lease) {
+                return Ok((running, lease));
+            }
+            // Its code is being exchanged or a cancel is taking it down: wait that out, never
+            // kill an exchange, and start a fresh login once it has let go of the credential.
+            running.settled_outcome().await;
+            if running.cancel().await == Retired::Pending {
+                return Err(LoginError::Busy);
+            }
+            self.forget_login(running.id());
+        } else {
+            // A finished helper may still be recording its exchange: replacing it first
+            // would lose the outcome.
+            let finished = self
+                .helper
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(finished) = finished {
+                finished.settled_outcome().await;
+            }
+        }
+        // A dropped request must not leave a helper in `in_flight`, kept alive and holding the
+        // login lock; dropped before `_starting`, so never after a newer start registered.
+        let _in_flight = InFlightGuard(self);
+        let helper = self.spawn_helper(profile, tool, command, force).await?;
+        {
+            // Under the slot lock, so a shutdown either sees this helper or this sees its flag.
+            let mut slot = self.helper.lock().unwrap_or_else(PoisonError::into_inner);
+            if !self.shutting_down.load(Ordering::SeqCst) {
+                self.leave_slot(slot.take());
+                *slot = Some(Arc::clone(&helper));
+                self.in_flight_slot().take();
+                let lease = helper.join(lease).ok_or(LoginError::Cancelled)?;
+                return Ok((helper, lease));
+            }
+        }
+        // Shutdown may have taken it from `in_flight` too: the cancel is safe to repeat.
+        helper.cancel().await;
+        Err(LoginError::Cancelled)
+    }
+
+    fn in_flight_slot(&self) -> std::sync::MutexGuard<'_, Option<Arc<LoginHelper>>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Spawns a helper unless shutdown has begun, and makes it reachable by shutdown from its
+    /// first moment, before its URL shows. Under the `in_flight` lock, which shutdown takes
+    /// after setting its flag: it either finds this helper or this finds the flag.
+    pub(crate) fn admit(
+        &self,
+        spawn: &mut dyn FnMut() -> Result<Arc<LoginHelper>, LoginError>,
+    ) -> Result<Arc<LoginHelper>, LoginError> {
+        let mut in_flight = self.in_flight_slot();
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(LoginError::Cancelled);
+        }
+        let helper = spawn()?;
+        *in_flight = Some(Arc::clone(&helper));
+        Ok(helper)
+    }
+
+    async fn spawn_helper(
+        &self,
+        profile: &str,
+        tool: &str,
+        command: Option<&str>,
+        force: bool,
+    ) -> Result<Arc<LoginHelper>, LoginError> {
+        #[cfg(test)]
+        {
+            let started = self
+                .starter
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .map(|start| start(profile, tool, command));
+            if let Some(started) = started {
+                return started.await;
+            }
+        }
+        LoginHelper::start_admitted(
+            profile,
+            tool,
+            command,
+            force,
+            &self.shutdown_token,
+            &|spawn| self.admit(spawn),
+        )
+        .await
+    }
+
+    /// The helper still waiting for its code. A finished one stays in its slot, so its
+    /// outcome can be read, until `forget_login` or a new start takes it out.
+    pub(crate) fn running(&self) -> Option<Arc<LoginHelper>> {
+        let slot = self.helper.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.clone().filter(|h| !h.is_finished())
+    }
+
+    /// The running helper logging in `credential`.
+    pub(crate) fn running_on(&self, credential: &Path) -> Option<Arc<LoginHelper>> {
+        self.running().filter(|h| h.shared() == credential)
+    }
+
+    /// The running helper named `login_id`.
+    pub(crate) fn running_login(&self, login_id: &str) -> Option<Arc<LoginHelper>> {
+        self.running().filter(|h| h.id() == login_id)
+    }
+
+    /// Drops `login_id`'s helper, leaving a newer one alone.
+    pub(crate) fn forget_login(&self, login_id: &str) {
+        let mut slot = self.helper.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|h| h.id() == login_id) {
+            self.leave_slot(slot.take());
+        }
+    }
+
+    /// Remembers the outcome of a login leaving the slot, and keeps one whose container
+    /// removal failed listed for shutdown's sweep.
+    fn leave_slot(&self, helper: Option<Arc<LoginHelper>>) {
+        let Some(helper) = helper else { return };
+        if helper.is_finished() && !helper.removed() {
+            self.retiring
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::clone(&helper));
+        }
+        let Some(succeeded) = helper.outcome() else {
+            return;
+        };
+        let mut outcomes = self.outcomes.lock().unwrap_or_else(PoisonError::into_inner);
+        if outcomes.len() == RETAINED_OUTCOMES {
+            outcomes.pop_front();
+        }
+        outcomes.push_back((helper.id().to_string(), succeeded));
+    }
+
+    /// What the code exchange of `login_id` came to. An exchange in progress is waited for,
+    /// within `OUTCOME_WAIT`, so a retry that finds the login gone while its exchange is
+    /// still cleaning up learns how it ended.
+    pub(crate) async fn outcome_of(&self, login_id: &str) -> LoginOutcome {
+        let in_slot = self
+            .helper
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .filter(|h| h.id() == login_id);
+        let known = match in_slot {
+            Some(helper) => {
+                match tokio::time::timeout(OUTCOME_WAIT, helper.settled_outcome()).await {
+                    Ok(Some(succeeded)) => Some(succeeded),
+                    // A login that ended without an exchange never will have one.
+                    Ok(None) if helper.is_finished() => None,
+                    Ok(None) | Err(_) => return LoginOutcome::Pending,
+                }
+            }
+            None => self
+                .outcomes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .find(|(id, _)| id == login_id)
+                .map(|(_, succeeded)| *succeeded),
+        };
+        match known {
+            Some(true) => LoginOutcome::Succeeded,
+            Some(false) => LoginOutcome::Failed,
+            None => LoginOutcome::Unknown,
+        }
+    }
+
+    /// Cancels this daemon's helper and sweeps what it may have left in the runtime, inside
+    /// a short fixed budget.
+    pub(crate) async fn shutdown(&self) {
+        self.shutdown_within(SHUTDOWN_CANCEL_WAIT).await;
+    }
+
+    async fn shutdown_within(&self, cancel_wait: Duration) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.shutdown_token.cancel();
+        let owned = {
+            let mut slot = self.helper.lock().unwrap_or_else(PoisonError::into_inner);
+            // One still waiting for its URL is not in the slot yet; one that left its start or
+            // the slot without a confirmed removal is listed in `retiring`.
+            let mut owned: Vec<_> = [slot.take(), self.in_flight_slot().take()]
+                .into_iter()
+                .flatten()
+                .collect();
+            owned.extend(
+                self.retiring
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .cloned(),
+            );
+            owned
+        };
+        futures_util::future::join_all(
+            owned
+                .iter()
+                .map(|helper| Self::retire_at_shutdown(helper, cancel_wait)),
+        )
+        .await;
+    }
+
+    async fn retire_at_shutdown(helper: &Arc<LoginHelper>, cancel_wait: Duration) {
+        if tokio::time::timeout(cancel_wait, helper.cancel())
+            .await
+            .is_ok_and(|retired| retired == Retired::Removed)
+        {
+            // The cancel removed the container by name; nothing is left to sweep.
+            return;
+        }
+        tracing::warn!(target: LOG_TARGET, "sandbox login helper cancel timed out at shutdown");
+        let sweep = async {
+            // The sweep needs the helper's login lock, which its exit releases.
+            helper.ended().await;
+            let Ok(runtime) =
+                tokio::task::spawn_blocking(crate::containers::get_container_runtime).await
+            else {
+                return;
+            };
+            sweep_shared_file(&runtime, helper.shared()).await;
+        };
+        if tokio::time::timeout(SHUTDOWN_SWEEP_WAIT, sweep)
+            .await
+            .is_err()
+        {
+            tracing::warn!(target: LOG_TARGET, "sandbox login helper sweep timed out at shutdown");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_starter(
+        &self,
+        starter: impl Fn(
+                &str,
+                &str,
+                Option<&str>,
+            )
+                -> futures_util::future::BoxFuture<'static, Result<Arc<LoginHelper>, LoginError>>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        *self.starter.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(starter));
     }
 
     /// Holds `session_id` for the login `blocked` names. Returns whether the session was
@@ -165,6 +550,15 @@ impl SandboxLoginService {
         self.state().held.keys().cloned().collect()
     }
 
+    /// How many held sessions wait on `credential`.
+    pub(crate) fn held_for(&self, credential: &Path) -> usize {
+        self.state()
+            .held
+            .values()
+            .filter(|hold| hold.credential == credential)
+            .count()
+    }
+
     /// Ends the episode of the session's credential file when no other held session waits
     /// on it.
     pub(crate) fn release(&self, session_id: &str) {
@@ -221,7 +615,6 @@ impl LoginScope {
 /// The distinct shared credential files of the `separate_login` scopes among `scopes`, each
 /// scope resolved once, as the gate resolves its target.
 fn separate_login_shared_files(scopes: impl IntoIterator<Item = LoginScope>) -> Vec<PathBuf> {
-    use crate::session::config::container_config::login_target_with_command;
     let distinct: HashSet<LoginScope> = scopes.into_iter().collect();
     let separate = |profile: &str| {
         crate::session::config::profile_config::resolve_config_or_warn(profile)
@@ -274,14 +667,18 @@ pub(crate) async fn sweep_stale_login_helpers(scopes: Vec<LoginScope>) {
         return;
     };
     for file in files {
-        match crate::session::sandbox_login::helper::sweep_stale_helpers(&runtime, &file).await {
-            Ok(()) => {}
-            Err(crate::session::sandbox_login::helper::LoginError::Busy) => {
-                tracing::debug!(target: LOG_TARGET, "sandbox login running, stale sweep skipped");
-            }
-            Err(e) => {
-                tracing::warn!(target: LOG_TARGET, "sandbox login helper stale sweep failed: {e}");
-            }
+        sweep_shared_file(&runtime, &file).await;
+    }
+}
+
+async fn sweep_shared_file(runtime: &crate::containers::ContainerRuntime, file: &Path) {
+    match crate::session::sandbox_login::helper::sweep_stale_helpers(runtime, file).await {
+        Ok(()) => {}
+        Err(LoginError::Busy) => {
+            tracing::debug!(target: LOG_TARGET, "sandbox login running, stale sweep skipped");
+        }
+        Err(e) => {
+            tracing::warn!(target: LOG_TARGET, "sandbox login helper stale sweep failed: {e}");
         }
     }
 }
@@ -321,6 +718,658 @@ pub(crate) async fn log_login_status(profile: String) {
 mod tests {
     use super::*;
     use tokio::sync::mpsc::error::TryRecvError;
+
+    /// A service whose helper is a fake process; `gate` holds each start until released and
+    /// `entered` is told when one begins.
+    #[cfg(unix)]
+    fn fake_service(
+        fake: &Arc<crate::session::sandbox_login::test_fake::Fake>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+        entered: Arc<tokio::sync::Notify>,
+    ) -> SandboxLoginService {
+        use crate::session::sandbox_login::helper::HelperTimeouts;
+        let service = SandboxLoginService::default();
+        let fake = Arc::clone(fake);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let (fake, gate, entered) = (Arc::clone(&fake), gate.clone(), Arc::clone(&entered));
+            Box::pin(async move {
+                entered.notify_one();
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                fake.start_timed(true, HelperTimeouts::default()).await
+            })
+        });
+        service
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_a_helper_still_ending_keeps_its_slot_and_blocks_a_new_start() {
+        use crate::session::sandbox_login::helper::HelperTimeouts;
+        let _home = crate::session::test_support::isolate_app_dir();
+        // The file the login of `claude` resolves to, or a start would be `Busy` as another
+        // tool's.
+        let shared = login_target_with_command("default", "claude", None)
+            .unwrap()
+            .credential;
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::at(
+            tempfile::TempDir::new().unwrap(),
+            shared,
+        ));
+        let service = SandboxLoginService::default();
+        let starter = Arc::clone(&fake);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let fake = Arc::clone(&starter);
+            Box::pin(async move {
+                LoginHelper::start_with(
+                    &crate::session::sandbox_login::claude::LOGIN,
+                    fake.argv(true),
+                    fake.shared.clone(),
+                    // The removal outlasts the cancel's wait.
+                    Some(vec!["sleep".into(), "1".into()]),
+                    HelperTimeouts {
+                        retire: Duration::from_millis(200),
+                        ..HelperTimeouts::default()
+                    },
+                )
+                .await
+            })
+        });
+        let (helper, lease) = service
+            .start_login("default", "claude", None, false, None)
+            .await
+            .unwrap();
+        let (joined, other) = service
+            .start_login("default", "claude", None, false, None)
+            .await
+            .unwrap();
+        assert_eq!(joined.id(), helper.id(), "a second dialog joins");
+        assert_eq!(helper.release(Some(&other)).await, None);
+        assert_eq!(helper.release(Some(&lease)).await, Some(Retired::Pending));
+
+        let again = service
+            .start_login("default", "claude", None, false, None)
+            .await;
+        assert!(matches!(again, Err(LoginError::Busy)));
+        assert!(
+            service.running_login(helper.id()).is_some(),
+            "the retiring owner is not forgotten"
+        );
+
+        // Once it let go, the next start replaces it.
+        tokio::time::timeout(Duration::from_secs(10), helper.ended())
+            .await
+            .unwrap();
+        let (fresh, _) = service
+            .start_login("default", "claude", None, false, None)
+            .await
+            .unwrap();
+        assert_ne!(fresh.id(), helper.id());
+        fresh.cancel().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_shutdown_cancels_the_helper_and_skips_the_redundant_sweep() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::probing_container_runtime(home.path());
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = fake_service(&fake, None, Arc::default());
+
+        let (helper, _lease) = service
+            .start_login("default", "claude", None, false, None)
+            .await
+            .unwrap();
+        assert!(!helper.is_finished());
+        tokio::time::timeout(Duration::from_secs(10), service.shutdown())
+            .await
+            .expect("shutdown stays inside its budget");
+
+        assert!(helper.is_finished(), "the helper was cancelled");
+        assert!(fake.cleaned().exists(), "its container cleanup ran");
+        assert!(service.running().is_none());
+        let runtime_calls = std::fs::read_to_string(calls).unwrap_or_default();
+        assert!(
+            !runtime_calls.contains("ps -aq"),
+            "a completed cancel leaves nothing to sweep: {runtime_calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_shutdown_sweeps_when_the_removal_failed() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::probing_container_runtime(home.path());
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = SandboxLoginService::default();
+        let starter = Arc::clone(&fake);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let fake = Arc::clone(&starter);
+            Box::pin(async move {
+                LoginHelper::start_with(
+                    &crate::session::sandbox_login::claude::LOGIN,
+                    fake.argv(true),
+                    fake.shared.clone(),
+                    Some(vec!["false".into()]),
+                    crate::session::sandbox_login::helper::HelperTimeouts::default(),
+                )
+                .await
+            })
+        });
+        let (helper, _lease) = service
+            .start_login("default", "claude", None, false, None)
+            .await
+            .unwrap();
+
+        service.shutdown().await;
+
+        assert!(helper.is_finished(), "the client ended");
+        let runtime_calls = std::fs::read_to_string(calls).unwrap_or_default();
+        assert!(
+            runtime_calls.contains("ps -aq --filter label="),
+            "a finished helper whose container removal failed is swept: {runtime_calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_shutdown_cancels_a_helper_still_waiting_for_its_url() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = Arc::new(SandboxLoginService::default());
+        let (registered_tx, mut registered) = mpsc::unbounded_channel();
+        let starter = Arc::clone(&fake);
+        let svc = Arc::clone(&service);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let fake = Arc::clone(&starter);
+            let svc = Arc::clone(&svc);
+            let registered_tx = registered_tx.clone();
+            Box::pin(async move {
+                LoginHelper::start_with_admission(
+                    &crate::session::sandbox_login::claude::LOGIN,
+                    // Runs, but never shows a sign-in URL.
+                    vec!["sleep".into(), "3600".into()],
+                    fake.shared.clone(),
+                    Some(vec!["true".into()]),
+                    crate::session::sandbox_login::helper::HelperTimeouts::default(),
+                    &|spawn| {
+                        let helper = svc.admit(spawn)?;
+                        let _ = registered_tx.send(Arc::clone(&helper));
+                        Ok(helper)
+                    },
+                )
+                .await
+            })
+        });
+        let start = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .start_login("default", "claude", None, false, None)
+                    .await
+            }
+        });
+        let helper = registered.recv().await.expect("the helper registered");
+        assert!(!helper.is_finished(), "still waiting for its URL");
+
+        tokio::time::timeout(Duration::from_secs(10), service.shutdown())
+            .await
+            .expect("shutdown stays inside its budget");
+
+        assert!(helper.is_finished(), "shutdown ended the started helper");
+        assert!(start.await.unwrap().is_err(), "the start did not succeed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_a_dropped_start_leaves_nothing_in_flight() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = Arc::new(SandboxLoginService::default());
+        let (registered_tx, mut registered) = mpsc::unbounded_channel();
+        let starter = Arc::clone(&fake);
+        let svc = Arc::downgrade(&service);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let fake = Arc::clone(&starter);
+            let svc = svc.upgrade().unwrap();
+            let registered_tx = registered_tx.clone();
+            Box::pin(async move {
+                LoginHelper::start_with_admission(
+                    &crate::session::sandbox_login::claude::LOGIN,
+                    vec!["sleep".into(), "3600".into()],
+                    fake.shared.clone(),
+                    Some(vec!["true".into()]),
+                    crate::session::sandbox_login::helper::HelperTimeouts::default(),
+                    &|spawn| {
+                        let helper = svc.admit(spawn)?;
+                        let _ = registered_tx.send(Arc::clone(&helper));
+                        Ok(helper)
+                    },
+                )
+                .await
+            })
+        });
+        let start = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .start_login("default", "claude", None, false, None)
+                    .await
+            }
+        });
+        let helper = registered.recv().await.expect("the helper registered");
+        assert!(service.in_flight_slot().is_some());
+
+        start.abort();
+        assert!(matches!(start.await, Err(e) if e.is_cancelled()));
+
+        assert!(
+            service.in_flight_slot().is_none(),
+            "the slot is not held by a dropped start"
+        );
+        // Dropping the request still ends the client.
+        tokio::time::timeout(Duration::from_secs(10), helper.ended())
+            .await
+            .expect("the dropped start's helper ends");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_a_start_preparing_when_shutdown_begins_never_spawns() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = Arc::new(SandboxLoginService::default());
+        let (entered_tx, mut entered) = mpsc::unbounded_channel();
+        let (spawned_tx, mut spawned) = mpsc::unbounded_channel();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let gate = Mutex::new(Some(gate));
+        let starter = Arc::clone(&fake);
+        let svc = Arc::downgrade(&service);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let fake = Arc::clone(&starter);
+            let svc = svc.upgrade().unwrap();
+            let entered_tx = entered_tx.clone();
+            let spawned_tx = spawned_tx.clone();
+            let gate = gate.lock().unwrap().take();
+            Box::pin(async move {
+                // The image pull of a real start.
+                let _ = entered_tx.send(());
+                let _ = gate.expect("one start").await;
+                LoginHelper::start_with_admission(
+                    &crate::session::sandbox_login::claude::LOGIN,
+                    vec!["sleep".into(), "3600".into()],
+                    fake.shared.clone(),
+                    Some(vec!["true".into()]),
+                    crate::session::sandbox_login::helper::HelperTimeouts::default(),
+                    &|spawn| {
+                        let helper = svc.admit(spawn)?;
+                        let _ = spawned_tx.send(());
+                        Ok(helper)
+                    },
+                )
+                .await
+            })
+        });
+        let start = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .start_login("default", "claude", None, false, None)
+                    .await
+            }
+        });
+        entered.recv().await.expect("the start is preparing");
+
+        tokio::time::timeout(Duration::from_secs(10), service.shutdown())
+            .await
+            .expect("shutdown stays inside its budget");
+        release.send(()).unwrap();
+
+        assert!(matches!(start.await.unwrap(), Err(LoginError::Cancelled)));
+        assert!(
+            spawned.try_recv().is_err(),
+            "no helper spawned after shutdown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_a_retiring_helper_stays_listed_until_it_has_ended() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = Arc::new(SandboxLoginService::default());
+        let (registered_tx, mut registered) = mpsc::unbounded_channel();
+        let starter = Arc::clone(&fake);
+        let svc = Arc::downgrade(&service);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let fake = Arc::clone(&starter);
+            let svc = svc.upgrade().unwrap();
+            let registered_tx = registered_tx.clone();
+            Box::pin(async move {
+                LoginHelper::start_with_admission(
+                    &crate::session::sandbox_login::claude::LOGIN,
+                    vec!["sleep".into(), "3600".into()],
+                    fake.shared.clone(),
+                    // The removal outlasts the cancel's wait.
+                    Some(vec!["sleep".into(), "2".into()]),
+                    crate::session::sandbox_login::helper::HelperTimeouts {
+                        retire: Duration::from_millis(100),
+                        ..crate::session::sandbox_login::helper::HelperTimeouts::default()
+                    },
+                    &|spawn| {
+                        let helper = svc.admit(spawn)?;
+                        let _ = registered_tx.send(Arc::clone(&helper));
+                        Ok(helper)
+                    },
+                )
+                .await
+            })
+        });
+        let start = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .start_login("default", "claude", None, false, None)
+                    .await
+            }
+        });
+        let helper = registered.recv().await.expect("the helper registered");
+        start.abort();
+        assert!(matches!(start.await, Err(e) if e.is_cancelled()));
+
+        // The dropped start's cancel waited as long as this one: both ran out of wait.
+        assert_eq!(helper.cancel().await, Retired::Pending);
+
+        assert_eq!(
+            service.retiring.lock().unwrap().len(),
+            1,
+            "still ending, so still listed for shutdown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_shutdown_sweeps_a_forgotten_login_whose_removal_failed() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::probing_container_runtime(home.path());
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = SandboxLoginService::default();
+        let starter = Arc::clone(&fake);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let fake = Arc::clone(&starter);
+            Box::pin(async move {
+                LoginHelper::start_with(
+                    &crate::session::sandbox_login::claude::LOGIN,
+                    fake.argv(true),
+                    fake.shared.clone(),
+                    // The removal fails.
+                    Some(vec!["false".into()]),
+                    crate::session::sandbox_login::helper::HelperTimeouts::default(),
+                )
+                .await
+            })
+        });
+        let (helper, _lease) = service
+            .start_login("default", "claude", None, false, None)
+            .await
+            .unwrap();
+        // As the API settles a cancelled login: the client ended, the removal failed, and the
+        // slot is let go.
+        assert_eq!(helper.cancel().await, Retired::Left);
+        service.forget_login(helper.id());
+
+        service.shutdown().await;
+
+        let runtime_calls = std::fs::read_to_string(calls).unwrap_or_default();
+        assert!(
+            runtime_calls.contains("ps -aq --filter label="),
+            "a forgotten login whose removal failed is still swept: {runtime_calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_shutdown_sweeps_a_dropped_start_whose_removal_failed_earlier() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::probing_container_runtime(home.path());
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = Arc::new(SandboxLoginService::default());
+        let (registered_tx, mut registered) = mpsc::unbounded_channel();
+        let starter = Arc::clone(&fake);
+        let svc = Arc::downgrade(&service);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let fake = Arc::clone(&starter);
+            let svc = svc.upgrade().unwrap();
+            let registered_tx = registered_tx.clone();
+            Box::pin(async move {
+                LoginHelper::start_with_admission(
+                    &crate::session::sandbox_login::claude::LOGIN,
+                    vec!["sleep".into(), "3600".into()],
+                    fake.shared.clone(),
+                    // The removal fails.
+                    Some(vec!["false".into()]),
+                    crate::session::sandbox_login::helper::HelperTimeouts::default(),
+                    &|spawn| {
+                        let helper = svc.admit(spawn)?;
+                        let _ = registered_tx.send(Arc::clone(&helper));
+                        Ok(helper)
+                    },
+                )
+                .await
+            })
+        });
+        let start = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .start_login("default", "claude", None, false, None)
+                    .await
+            }
+        });
+        let helper = registered.recv().await.expect("the helper registered");
+        start.abort();
+        assert!(matches!(start.await, Err(e) if e.is_cancelled()));
+        // Its removal failed and its client is gone, all before shutdown starts.
+        tokio::time::timeout(Duration::from_secs(10), helper.ended())
+            .await
+            .expect("the helper ends");
+        // The retirement task has finished once only the test and the list hold the helper
+        // (a task that unlisted it would leave the test alone).
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(&helper) > 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the retirement task finishes");
+
+        service.shutdown().await;
+
+        let runtime_calls = std::fs::read_to_string(calls).unwrap_or_default();
+        assert!(
+            runtime_calls.contains("ps -aq --filter label="),
+            "a failed removal that finished before shutdown is still swept: {runtime_calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_shutdown_waits_for_a_dropped_starts_cleanup() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = Arc::new(SandboxLoginService::default());
+        let (registered_tx, mut registered) = mpsc::unbounded_channel();
+        let starter = Arc::clone(&fake);
+        let svc = Arc::downgrade(&service);
+        service.set_test_starter(move |_profile, _tool, _command| {
+            let fake = Arc::clone(&starter);
+            let svc = svc.upgrade().unwrap();
+            let registered_tx = registered_tx.clone();
+            Box::pin(async move {
+                LoginHelper::start_with_admission(
+                    &crate::session::sandbox_login::claude::LOGIN,
+                    vec!["sleep".into(), "3600".into()],
+                    fake.shared.clone(),
+                    // A removal that takes a moment, as a real one does.
+                    Some(vec!["sleep".into(), "1".into()]),
+                    crate::session::sandbox_login::helper::HelperTimeouts::default(),
+                    &|spawn| {
+                        let helper = svc.admit(spawn)?;
+                        let _ = registered_tx.send(Arc::clone(&helper));
+                        Ok(helper)
+                    },
+                )
+                .await
+            })
+        });
+        let start = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .start_login("default", "claude", None, false, None)
+                    .await
+            }
+        });
+        let helper = registered.recv().await.expect("the helper registered");
+        start.abort();
+        assert!(matches!(start.await, Err(e) if e.is_cancelled()));
+
+        tokio::time::timeout(Duration::from_secs(10), service.shutdown())
+            .await
+            .expect("shutdown stays inside its budget");
+
+        assert!(
+            helper.is_finished(),
+            "shutdown returned before the dropped start's cleanup ended"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_shutdown_sweeps_when_the_cancel_times_out() {
+        let home = crate::session::test_support::isolate_app_dir();
+        let (_runtime, calls) =
+            crate::session::test_support::probing_container_runtime(home.path());
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = fake_service(&fake, None, Arc::default());
+        let _helper = service
+            .start_login("default", "claude", None, false, None)
+            .await
+            .unwrap();
+
+        service.shutdown_within(Duration::ZERO).await;
+
+        let runtime_calls = std::fs::read_to_string(calls).unwrap_or_default();
+        assert!(
+            runtime_calls.contains("ps -aq --filter label="),
+            "the helper's shared file was swept: {runtime_calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_shutdown_beats_a_start_in_flight() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let service = Arc::new(fake_service(
+            &fake,
+            Some(Arc::clone(&gate)),
+            Arc::clone(&entered),
+        ));
+
+        let starting = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .start_login("default", "claude", None, false, None)
+                    .await
+            }
+        });
+        entered.notified().await;
+        service.shutdown().await;
+        gate.notify_one();
+        let started = tokio::time::timeout(Duration::from_secs(10), starting)
+            .await
+            .expect("the start ends")
+            .unwrap();
+
+        assert!(
+            matches!(started, Err(LoginError::Cancelled)),
+            "a start that finishes after shutdown is refused"
+        );
+        assert!(
+            service.running().is_none(),
+            "no helper registered after shutdown"
+        );
+        assert!(
+            fake.cleaned().exists(),
+            "the late helper was cancelled and cleaned up"
+        );
+        assert!(
+            matches!(
+                service
+                    .start_login("default", "claude", None, false, None)
+                    .await,
+                Err(LoginError::Cancelled)
+            ),
+            "and no later start gets through"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_login_service_forget_leaves_a_newer_helper_alone() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fake = Arc::new(crate::session::sandbox_login::test_fake::Fake::new());
+        let service = fake_service(&fake, None, Arc::default());
+
+        let (old, _) = service
+            .start_login("default", "claude", None, false, None)
+            .await
+            .unwrap();
+        let old_id = old.id().to_string();
+        old.cancel().await;
+        let (newer, _) = service
+            .start_login("default", "claude", None, false, None)
+            .await
+            .unwrap();
+        assert_ne!(old_id, newer.id());
+
+        service.forget_login(&old_id);
+        assert!(service.running_login(newer.id()).is_some());
+        service.forget_login(newer.id());
+        assert!(service.running().is_none());
+    }
+
+    #[tokio::test]
+    async fn sandbox_login_service_shutdown_without_a_helper_does_nothing() {
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            SandboxLoginService::default().shutdown(),
+        )
+        .await
+        .expect("nothing to cancel, nothing to wait for");
+    }
 
     fn blocked(tool: &str, credential: &str) -> SandboxLoginRequired {
         SandboxLoginRequired {

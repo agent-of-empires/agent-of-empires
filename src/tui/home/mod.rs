@@ -9,6 +9,7 @@ mod file_watch_tests;
 pub(crate) use icons::get_indent;
 mod icons;
 mod input;
+pub(crate) mod keybinds;
 mod last_prompt;
 mod layout;
 mod lifecycle;
@@ -25,6 +26,7 @@ mod projects;
 pub(crate) mod render;
 mod reorder;
 mod rows;
+mod sandbox_login;
 mod selection;
 mod send;
 mod status;
@@ -149,6 +151,15 @@ pub(super) struct PendingArchiveCursor {
     pub(super) archived: bool,
     /// Where the cursor lands when the row sinks (non-Attention sorts).
     pub(super) successor: Option<String>,
+}
+
+/// Status flash owed to the snapshot that reflects a snooze toggle: the view
+/// submits the change, and the message waits for the canonical stamp so it
+/// never announces a change the daemon has not applied.
+pub(super) struct PendingSnoozeFlash {
+    pub(super) id: String,
+    pub(super) snoozed: bool,
+    pub(super) message: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -390,6 +401,15 @@ pub struct HomeView {
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
+    pub(super) sandbox_login_dialog: Option<super::dialogs::SandboxLoginDialog>,
+    /// The login the dialog shows; dropped (and so cancelled) with it.
+    pub(super) sandbox_login_poller: Option<super::sandbox_login_poller::SandboxLoginPoller>,
+    /// Cancelled logins whose helpers are still being cleaned up: quitting waits for them,
+    /// within one deadline shared with the live login.
+    pub(super) sandbox_login_retiring: Vec<super::sandbox_login_poller::Retiring>,
+    pub(super) sandbox_login_clock: super::sandbox_login_poller::QuitClock,
+    /// What the open dialog logs in, resolved once when it opened.
+    pub(super) sandbox_login_selection: Option<sandbox_login::LoginSelection>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     pub(super) serve_view: Option<ServeView>,
     pub(super) serve_jobs: super::dialogs::ServeJobs,
@@ -446,6 +466,9 @@ pub struct HomeView {
     /// Input for a row whose mount is still connecting, split at each Enter.
     pub(super) pending_paste_for_structured_view: HashMap<String, PendingStructuredInput>,
     pub(super) pending_attach_after_warning: Option<String>,
+    /// A send refused at delivery, reopened with its text once its refusal is dismissed:
+    /// the session, target, title and message.
+    pub(super) refused_send: Option<(String, live_send::LiveSendTarget, String, String)>,
     pub(super) pending_stop_session: Option<String>,
     /// Target captured when the auxiliary stop confirmation opens.
     pub(super) pending_stop_auxiliary: Option<(String, crate::daemon::StopAuxiliaryBody)>,
@@ -518,6 +541,9 @@ pub struct HomeView {
 
     /// Cursor placement owed to the applied snapshot after an archive toggle.
     pub(super) pending_archive_cursor: Option<PendingArchiveCursor>,
+
+    /// Status flash owed to the applied snapshot after a snooze toggle.
+    pub(super) pending_snooze_flash: Option<PendingSnoozeFlash>,
 
     pub(super) preview_cache: PreviewCache,
     pub(super) terminal_preview_cache: PreviewCache,
@@ -640,6 +666,8 @@ pub struct HomeView {
     pub(super) restart_cooldown_at: std::collections::HashMap<String, std::time::Instant>,
 
     pub(super) tool_configs: HashMap<String, crate::session::config::ToolSessionConfig>,
+    /// Live mode's exit and leader, applied alongside the keymap.
+    live_send_chords: live_send::LiveSendChords,
     pub(super) tool_hotkey_cache: Vec<(
         String,
         crossterm::event::KeyCode,

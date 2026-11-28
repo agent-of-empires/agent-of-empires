@@ -442,8 +442,7 @@ impl Instance {
             &self.id,
             &self.container_workdir(),
             self.is_yolo_mode(),
-        );
-        Ok(())
+        )
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
@@ -671,6 +670,19 @@ impl Instance {
                 } else {
                     container_config::place_shadowed_credential_mountpoints(&config);
                     checkpoint()?;
+                    // Revoke before the start: its mounts are the old ones, and a
+                    // failed revocation must stop the reuse before anything runs.
+                    // The workdir comes from `docker inspect`, which needs no running
+                    // container.
+                    self.reconcile_container_workdir(&container);
+                    container_config::ensure_folder_trust_config_for_active_agent(
+                        &self.tool,
+                        Some(command.as_str()),
+                        &profile_config.session,
+                        &self.id,
+                        &self.container_workdir(),
+                        self.is_yolo_mode(),
+                    )?;
                     container.start()?;
                     self.finish_container_reuse(
                         &container,
@@ -720,6 +732,13 @@ impl Instance {
         if let Some(sandbox) = self.sandbox_info.as_mut() {
             sandbox.image = used_image;
         }
+        // No earlier container is left to mount a trust record this launch cannot clear.
+        container_config::discard_staged_declared_trust(
+            &self.tool,
+            Some(command.as_str()),
+            &profile_config.session,
+            &self.id,
+        );
         let mut config = self.build_container_config(&launch_config)?;
         // The profile `spawn_prepared_launch` gives `scope_prefix_for`, so the
         // container lands in its session's slice.
@@ -1244,26 +1263,27 @@ impl Instance {
             .is_some()
     }
 
-    /// The refusal for a launch gated on `target`. The recovery it prints must release this
-    /// launch: it runs under the session's profile (`-p`, unless that is the default one the
-    /// CLI uses anyway), and names the session's own command (`--command`) only when
-    /// `--tool` alone reaches another file than `target` and the command is what leads to
-    /// it.
+    /// The refusal for a launch gated on `target`, with the recovery that releases this
+    /// launch ([`container_config::login_required_for`]).
     fn login_required(&self, target: &container_config::LoginTarget) -> SandboxLoginRequired {
+        container_config::login_required_for(
+            &self.effective_profile(),
+            &self.tool,
+            Some(self.command.as_str()).filter(|c| !c.is_empty()),
+            target,
+        )
+    }
+
+    /// What a login for this session's launch is: the refusal its sandbox launch would get
+    /// from the gate, with the recovery that runs the same login. Resolves the file the
+    /// gate waits on (the session's profile, tool and own command), whether or not it
+    /// holds a login now; `None` when the tool declares no sandbox login.
+    pub(crate) fn sandbox_login_request(&self) -> Option<SandboxLoginRequired> {
         let profile = self.effective_profile();
         let session_command = Some(self.command.as_str()).filter(|c| !c.is_empty());
-        let reaches = |command: Option<&str>| {
-            container_config::login_target_with_command(&profile, &self.tool, command)
-                .is_some_and(|t| t.credential == target.credential)
-        };
-        let command = session_command.filter(|_| !reaches(None) && reaches(session_command));
-        SandboxLoginRequired {
-            tool: self.tool.clone(),
-            credential: target.credential.clone(),
-            profile: (profile != crate::session::config::effective_profile(""))
-                .then(|| profile.clone()),
-            command: command.map(str::to_string),
-        }
+        let target =
+            container_config::login_target_with_command(&profile, &self.tool, session_command)?;
+        Some(self.login_required(&target))
     }
 
     /// [`Self::ensure_sandbox_launchable_for`] for a launch without a request.
@@ -2527,6 +2547,9 @@ mod tests {
             held.to_string(),
             "sandbox login required for personal: run `aoe sandbox login --tool personal`"
         );
+        // The typed cause always names the profile: a daemon serving another one reads an
+        // absent profile as its own.
+        assert_eq!(held.profile, Some(default));
     }
 
     /// Both flags needed: the session's profile is the only one declaring the tool's

@@ -45,7 +45,7 @@ export function VolumeIgnoresGlobDialog({ globs, onConfirm, onCancel }: Props) {
       </p>
 
       <label
-        className="flex items-start gap-2.5 cursor-pointer group"
+        className="flex items-start gap-2.5 max-md:py-2 cursor-pointer group"
         data-testid="volume-ignores-glob-dont-show-again"
         data-checked={dontShowAgain ? "true" : "false"}
       >
@@ -58,8 +58,8 @@ export function VolumeIgnoresGlobDialog({ globs, onConfirm, onCancel }: Props) {
         />
         <span
           aria-hidden="true"
-          className={`mt-0.5 w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-green-500 ${
-            dontShowAgain ? "bg-green-500 border-green-500" : "border-surface-600 group-hover:border-surface-500"
+          className={`mt-0.5 w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-brand-500 ${
+            dontShowAgain ? "bg-brand-600 border-brand-600" : "border-surface-600 group-hover:border-surface-500"
           }`}
         >
           {dontShowAgain && (

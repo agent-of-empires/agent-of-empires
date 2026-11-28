@@ -5,6 +5,7 @@ import { updateSuggestionPrefs, type SuggestionResult } from "../lib/api";
 import type { StartedSession, SuggestionProvider } from "../lib/types";
 import { agoLabel } from "../lib/suggestionTime";
 import { MENU_ITEM, MenuPopover, StartInMenu, StartMenu, type StartMenuProps } from "./SuggestionStartMenu";
+import { BUTTON_INLINE } from "../lib/surfaces";
 
 /** Buttons look 32px; on a phone an invisible 44px area around them takes the tap. */
 export const TAP =
@@ -55,6 +56,8 @@ interface RowProps {
   failure?: { reason: string; hint?: string };
   /** Under the reason line, e.g. why a started Session's prompt was not typed. */
   note?: ReactNode;
+  /** A checkbox ahead of the row, for starting several suggestions at once. */
+  select?: { checked: boolean; onChange: (checked: boolean) => void; label: string };
   actions: ReactNode;
 }
 
@@ -88,6 +91,7 @@ export function SuggestionRow({
   stale,
   failure,
   note,
+  select,
   actions,
 }: RowProps) {
   return (
@@ -97,6 +101,15 @@ export function SuggestionRow({
         failure ? "flex-wrap bg-status-error/[0.07] md:flex-nowrap" : ""
       }`}
     >
+      {select && (
+        <input
+          type="checkbox"
+          aria-label={select.label}
+          checked={select.checked}
+          onChange={(e) => select.onChange(e.target.checked)}
+          className="h-4 w-4 flex-none cursor-pointer accent-brand-500"
+        />
+      )}
       <div className={`min-w-0 flex-1 ${failure ? "max-md:basis-full" : ""}`}>
         {sourceRef && <SourceRef value={sourceRef} />}
         <div className={inlineRef !== undefined ? "md:flex md:items-baseline md:gap-3" : ""}>
@@ -358,12 +371,7 @@ export function SuggestionsOffNote({
       {readOnly ? (
         `Read-only: this dashboard can't turn ${one ? "it" : "them"} on.`
       ) : (
-        <button
-          type="button"
-          onClick={() => void turnOn()}
-          disabled={disabled}
-          className="cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
-        >
+        <button type="button" onClick={() => void turnOn()} disabled={disabled} className={BUTTON_INLINE}>
           {one ? "Turn it on" : "Turn them on"}
         </button>
       )}
@@ -420,7 +428,7 @@ export function UndoBar({
 }) {
   const [stopped, setStopped] = useState(false);
   return (
-    <div className="mt-2 flex w-max max-w-full flex-wrap items-baseline gap-x-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
+    <div className="mt-2 flex w-max max-w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-surface-800 px-3 py-1.5 text-[13px] text-text-secondary">
       {stopped ? (
         <>
           <span>Stopped suggesting {stopLabel}.</span>
@@ -430,7 +438,7 @@ export function UndoBar({
                 type="button"
                 onClick={() => void onResume().then((ok) => setStopped(!ok))}
                 disabled={disabled}
-                className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+                className={`${BUTTON_INLINE} flex-none`}
               >
                 Undo
               </button>
@@ -442,12 +450,7 @@ export function UndoBar({
       ) : (
         <>
           <span className="max-w-full truncate">Dismissed &ldquo;{title}&rdquo;.</span>
-          <button
-            type="button"
-            onClick={onUndo}
-            disabled={disabled}
-            className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
-          >
+          <button type="button" onClick={onUndo} disabled={disabled} className={`${BUTTON_INLINE} flex-none`}>
             Undo
           </button>
           {onStop && stopLabel && (
@@ -457,7 +460,7 @@ export function UndoBar({
                 type="button"
                 onClick={() => void onStop().then(setStopped)}
                 disabled={disabled}
-                className="flex-none cursor-pointer text-brand-500 hover:underline disabled:opacity-50"
+                className={`${BUTTON_INLINE} flex-none`}
               >
                 Stop suggesting {stopLabel}
               </button>

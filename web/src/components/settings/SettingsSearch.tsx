@@ -33,7 +33,7 @@ export function SettingsSearch({ schema, loading, onJump }: Props) {
         onValueChange={setQuery}
         placeholder={loading ? "Loading settings..." : "Search settings..."}
         disabled={loading}
-        className="w-full rounded-md bg-surface-800 border border-surface-700 px-3 py-2 text-sm text-text-primary outline-none placeholder:text-text-muted focus:border-brand-500 disabled:opacity-50"
+        className="w-full h-10 md:h-8 rounded-full float-control px-4 text-[15px] md:text-[13px] text-text-primary outline-none placeholder:text-text-dim focus:border-brand-500 disabled:opacity-50"
       />
       {open && (
         <Command.List className="absolute left-0 right-0 top-full mt-1 z-20 max-h-[40vh] overflow-y-auto rounded-md border border-surface-700 bg-surface-800 p-1 shadow-2xl">

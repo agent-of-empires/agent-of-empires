@@ -246,6 +246,12 @@ pub fn is_anchored(update: &serde_json::Value) -> bool {
         .is_some_and(|v| !v.is_null())
 }
 
+/// The update of `session/update` params, which the daemon decodes from
+/// object form or positional `[sessionId, update, ...]`.
+pub fn session_update_of(params: &serde_json::Value) -> Option<&serde_json::Value> {
+    params.get("update").or_else(|| params.get(1))
+}
+
 /// The envelope of an already-ingested update. A malformed one reads as
 /// absent here: `Shared` rejects it before mapping.
 pub fn envelope_of(meta: &Option<Meta>) -> Option<Envelope> {

@@ -37,6 +37,9 @@ pub enum ApiErrorCode {
     CreationNotPending,
     CreateHookFailed,
     CreateOutcomeUnknown,
+    FavoriteSelectionRefused,
+    FavoriteNamespaceBusy,
+    OutcomeUnconfirmed,
     /// The project path is not a directory on the Daemon host.
     WorkingDirMissing,
     /// A worktree checkout named a branch that exists neither locally nor on a remote.
@@ -47,6 +50,8 @@ pub enum ApiErrorCode {
     SmartRenameTimeout,
     GroupNotEmpty,
     SessionNotRunning,
+    /// A person's unsent text is in the terminal agent's input box.
+    InputLineBusy,
     SessionArchived,
     SessionTrashed,
     AccountSwapUnavailable,
@@ -85,6 +90,9 @@ impl ApiErrorCode {
             Self::CreationNotPending => "creation_not_pending",
             Self::CreateHookFailed => "create_hook_failed",
             Self::CreateOutcomeUnknown => "create_outcome_unknown",
+            Self::FavoriteSelectionRefused => "favorite_selection_refused",
+            Self::FavoriteNamespaceBusy => "favorite_namespace_busy",
+            Self::OutcomeUnconfirmed => "outcome_unconfirmed",
             Self::WorkingDirMissing => "working_dir_missing",
             Self::BranchNotFound => "branch_not_found",
             Self::AgentHooksNotApproved => "agent_hooks_not_approved",
@@ -93,6 +101,7 @@ impl ApiErrorCode {
             Self::SmartRenameTimeout => "smart_rename_timeout",
             Self::GroupNotEmpty => "group_not_empty",
             Self::SessionNotRunning => "session_not_running",
+            Self::InputLineBusy => "input_line_busy",
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
             Self::AccountSwapUnavailable => "account_swap_unavailable",
@@ -114,6 +123,7 @@ impl ApiErrorCode {
             | Self::LifecycleSuperseded
             | Self::ProfileMismatch
             | Self::RuntimeEpochMismatch
+            | Self::FavoriteNamespaceBusy
             | Self::ResumeFailed
             | Self::ManagedResumeRefused(_)
             | Self::SandboxMigrationDeferred
@@ -128,6 +138,7 @@ impl ApiErrorCode {
             | Self::PluginAlreadyInstalled
             | Self::GroupNotEmpty
             | Self::SessionNotRunning
+            | Self::InputLineBusy
             | Self::SessionArchived
             | Self::SessionTrashed
             | Self::AccountSwapUnavailable
@@ -142,6 +153,8 @@ impl ApiErrorCode {
             Self::SmartRenameFailed | Self::PluginPreviewFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::StartFailed | Self::SandboxMigrationFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::FavoriteSelectionRefused => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::OutcomeUnconfirmed => StatusCode::SERVICE_UNAVAILABLE,
             Self::TerminalSwitchRefused(
                 TerminalSwitchReason::HandoffPending | TerminalSwitchReason::ContextUnconfirmed,
             ) => StatusCode::SERVICE_UNAVAILABLE,
@@ -193,6 +206,9 @@ impl ApiErrorCode {
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
             b"create_outcome_unknown" => Self::CreateOutcomeUnknown,
+            b"favorite_selection_refused" => Self::FavoriteSelectionRefused,
+            b"favorite_namespace_busy" => Self::FavoriteNamespaceBusy,
+            b"outcome_unconfirmed" => Self::OutcomeUnconfirmed,
             b"agent_hooks_not_approved" => Self::AgentHooksNotApproved,
             b"resume_failed" => Self::ResumeFailed,
             b"managed_resume_refused" => Self::ManagedResumeRefused(managed_resume_cause(headers)),
@@ -212,6 +228,7 @@ impl ApiErrorCode {
             b"smart_rename_timeout" => Self::SmartRenameTimeout,
             b"group_not_empty" => Self::GroupNotEmpty,
             b"session_not_running" => Self::SessionNotRunning,
+            b"input_line_busy" => Self::InputLineBusy,
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
@@ -315,6 +332,12 @@ mod tests {
                 "session_not_running",
                 false,
                 Some(ApiErrorCode::SessionNotRunning),
+            ),
+            (
+                StatusCode::CONFLICT,
+                "input_line_busy",
+                false,
+                Some(ApiErrorCode::InputLineBusy),
             ),
             (
                 StatusCode::CONFLICT,

@@ -5,6 +5,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::cli::terminal_text;
+
 use super::dto::{
     component_healthy, freshness_observed, profile_component_healthy, ProfileRead, ProjectRead,
     ProjectScope, SessionRead, SnapshotData, WireState,
@@ -57,16 +59,6 @@ pub(crate) fn evaluate(
             render_projects(args, snapshot, source).map(Projection::text)
         }
     }
-}
-
-fn terminal_text(value: &str) -> Cow<'_, str> {
-    let Some((start, _)) = value.char_indices().find(|(_, ch)| ch.is_control()) else {
-        return Cow::Borrowed(value);
-    };
-    let mut clean = String::with_capacity(value.len());
-    clean.push_str(&value[..start]);
-    clean.extend(value[start..].chars().filter(|ch| !ch.is_control()));
-    Cow::Owned(clean)
 }
 
 fn selected_profile<'a>(
@@ -1175,8 +1167,7 @@ mod tests {
                 let cli =
                     serde_json::to_value(session_json(&inst, &inst.source_profile, false)).unwrap();
                 let wire = SessionRead::from_instance(&inst);
-                let rest =
-                    crate::server::api::sessions::session_response_from_instance(&inst, false);
+                let rest = crate::server::api::sessions::session_response_from_instance(&inst);
 
                 assert_eq!(wire.state.as_str(), cli["state"], "{label}");
                 let cli_time = |key: &str| cli[key].as_str().map(instant);

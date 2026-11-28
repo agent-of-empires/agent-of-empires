@@ -1,9 +1,9 @@
-import type { AgentLifecycleInfo } from "./agentProfiles";
 import { notifySettingsChanged } from "./settingsEvents";
 import { clientFormFactor } from "./formFactor";
 import { reportError } from "./logger";
 import type { SchemaSettings } from "./generated/settingsKeys";
 import type {
+  AgentLifecycleInfo,
   SessionResponse,
   RichDiffFilesResponse,
   RichFileContentsResponse,
@@ -34,6 +34,7 @@ import type {
 import type { AcpAttachment, ConfigOptionDescriptor, PromptAttachmentInput } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 import { INLINE_ELEVATION_HEADER } from "./fetchInterceptor";
+import { scopeParam, type DiffScope } from "./diffScope";
 import { notifySuggestionsChanged } from "./suggestionEvents";
 
 type Payload = Record<string, unknown>;
@@ -441,8 +442,9 @@ export async function killTerminal(id: string, index: number): Promise<boolean> 
   }
 }
 
-export function getSessionDiffFiles(id: string): Promise<RichDiffFilesResponse | null> {
-  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files`);
+export function getSessionDiffFiles(id: string, scope: DiffScope = "branch"): Promise<RichDiffFilesResponse | null> {
+  const param = scopeParam(scope);
+  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files${param ? `?scope=${param}` : ""}`);
 }
 
 /**
@@ -454,9 +456,12 @@ export function getSessionFileContents(
   id: string,
   filePath: string,
   repoName?: string,
+  scope: DiffScope = "branch",
 ): Promise<RichFileContentsResponse | null> {
   const params = new URLSearchParams({ path: filePath });
   if (repoName) params.set("repo", repoName);
+  const param = scopeParam(scope);
+  if (param) params.set("scope", param);
   return fetchJson<RichFileContentsResponse>(`/api/sessions/${id}/diff/file?${params.toString()}`);
 }
 
@@ -1528,8 +1533,14 @@ export async function updateProfileSettings(name: string, updates: Record<string
 
 import type { ResolvedTheme } from "./theme";
 
-export async function fetchThemes(): Promise<string[]> {
-  return (await fetchJson<string[]>("/api/themes")) ?? [];
+/** A theme the pickers offer: its config name, and what to call it ("dark" for zinc). */
+export interface ThemeChoice {
+  name: string;
+  label: string;
+}
+
+export async function fetchThemes(): Promise<ThemeChoice[]> {
+  return (await fetchJson<ThemeChoice[]>("/api/themes")) ?? [];
 }
 
 /** Fetch the resolved theme projection (web CSS vars, terminal CSS
@@ -2875,15 +2886,6 @@ export async function switchSessionAccount(id: string, tool: string): Promise<{ 
   );
 }
 
-/** The server re-checks eligibility; a 409 means the session got busy or is no longer out of date. */
-export async function restartSessionForUpdate(id: string): Promise<{ ok: boolean; message?: string }> {
-  try {
-    return await okWithMessage(`/api/sessions/${encodeURIComponent(id)}/restart-for-update`, { method: "POST" });
-  } catch {
-    return { ok: false };
-  }
-}
-
 /**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
@@ -3641,13 +3643,25 @@ export function fetchSuggestions(): Promise<SuggestionsSnapshot | null> {
   return fetchJson<SuggestionsSnapshot>("/api/suggestions");
 }
 
-async function suggestionRequest<T>(url: string, method: string, body?: unknown): Promise<SuggestionResult<T>> {
+/** A save the server may take a while on, such as one mapping among many; past this the caller reloads to see what stuck. */
+const SUGGESTION_SAVE_TIMEOUT_MS = 15_000;
+
+async function suggestionRequest<T>(
+  url: string,
+  method: string,
+  body?: unknown,
+  timeoutMs?: number,
+): Promise<SuggestionResult<T>> {
   let res: Response;
   let text: string;
   try {
-    res = await fetch(url, jsonInit(method, body));
+    const init = jsonInit(method, body);
+    res = await fetch(url, timeoutMs ? { ...init, signal: AbortSignal.timeout(timeoutMs) } : init);
     text = await res.text();
   } catch (error) {
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      return { ok: false, error: "Timed out. It may have saved; reload to check.", stale: false };
+    }
     return {
       ok: false,
       error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
@@ -3671,7 +3685,7 @@ async function suggestionMutation(url: string, method: string, body?: unknown): 
   return result;
 }
 
-export const refreshSuggestions = () => suggestionRequest("/api/suggestions/refresh", "POST");
+export const refreshSuggestions = () => suggestionMutation("/api/suggestions/refresh", "POST");
 
 export const runSuggestionFix = (providerId: string) =>
   suggestionRequest("/api/suggestions/fix", "POST", { provider_id: providerId });
@@ -3687,6 +3701,10 @@ export const dismissSuggestion = (providerId: string, id: string, dismissed: boo
 
 export const updateSuggestionSource = (providerId: string, criterion: string, enabled: boolean) =>
   suggestionMutation("/api/suggestions/sources", "PATCH", { provider_id: providerId, criterion, enabled });
+
+/** Turns auto start on for a kind (at most `cap` items per refresh) or off. */
+export const putSuggestionAutoStart = (providerId: string, criterion: string, enabled: boolean, cap?: number) =>
+  suggestionMutation("/api/suggestions/auto-start", "PUT", { provider_id: providerId, criterion, enabled, cap });
 
 /** Resolves the wizard prefill. Creates nothing. */
 export const prepareSuggestion = (providerId: string, id: string) =>
@@ -3744,20 +3762,8 @@ export type StartResult =
   | { kind: "no_project" }
   | { kind: "error"; error: string };
 
-/** Starts a Session from a suggestion with its kind's preset; the server answers 201 once it exists. */
-export async function startSuggestion(
-  providerId: string,
-  id: string,
-  options: StartOptions = {},
-): Promise<StartResult> {
-  let res: Response;
-  let text: string;
-  try {
-    res = await fetch("/api/suggestions/start", jsonInit("POST", { provider_id: providerId, id, ...options }));
-    text = await res.text();
-  } catch (error) {
-    return { kind: "error", error: `Network error: ${error instanceof Error ? error.message : "connection failed"}` };
-  }
+/** What `POST /api/suggestions/start` answered (or `start-batch` for one item), as a {@link StartResult}. */
+function startResult(status: number, text: string): StartResult {
   let body: Record<string, unknown> = {};
   try {
     body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
@@ -3765,7 +3771,7 @@ export async function startSuggestion(
     // Handled below by status.
   }
   const str = (v: unknown) => (typeof v === "string" ? v : undefined);
-  if (res.ok) {
+  if (status >= 200 && status < 300) {
     const sessionId = str(body.session_id);
     if (!sessionId)
       return { kind: "error", error: "Unexpected response from the server. Reload to see the current state." };
@@ -3773,16 +3779,16 @@ export async function startSuggestion(
     return { kind: "started", sessionId, title: str(body.title) ?? "" };
   }
   const code = str(body.error);
-  if (res.status === 409 && code === "already_started") {
+  if (status === 409 && code === "already_started") {
     notifySuggestionsChanged();
     return { kind: "already_started", sessionId: str(body.session_id) ?? "" };
   }
-  if (res.status === 409 && code === "hooks_need_trust") {
+  if (status === 409 && code === "hooks_need_trust") {
     return { kind: code, review: body as unknown as StartHooksReview };
   }
-  if (res.status === 409 && code === "trust_changed") return { kind: "trust_changed" };
-  if (res.status === 409 && code === "stale_suggestion") return { kind: "stale" };
-  if (res.status === 422 && code === "start_failed") {
+  if (status === 409 && code === "trust_changed") return { kind: "trust_changed" };
+  if (status === 409 && code === "stale_suggestion") return { kind: "stale" };
+  if (status === 422 && code === "start_failed") {
     return {
       kind: "failed",
       reason: str(body.reason) ?? str(body.message) ?? "The Session could not be started.",
@@ -3790,8 +3796,55 @@ export async function startSuggestion(
       retryable: body.retryable !== false,
     };
   }
-  if (res.status === 400 && code === "no_project") return { kind: "no_project" };
-  return { kind: "error", error: parseApiErrorText(text, res.status) };
+  if (status === 400 && code === "no_project") return { kind: "no_project" };
+  return { kind: "error", error: parseApiErrorText(text, status) };
+}
+
+/** Starts a Session from a suggestion with its kind's preset; the server answers 201 once it exists. */
+export async function startSuggestion(
+  providerId: string,
+  id: string,
+  options: StartOptions = {},
+): Promise<StartResult> {
+  try {
+    const res = await fetch("/api/suggestions/start", jsonInit("POST", { provider_id: providerId, id, ...options }));
+    return startResult(res.status, await res.text());
+  } catch (error) {
+    return { kind: "error", error: `Network error: ${error instanceof Error ? error.message : "connection failed"}` };
+  }
+}
+
+/** Most items the daemon takes in one batch start. */
+export const START_BATCH_MAX = 25;
+
+/**
+ * Starts the items in one request, one after another on the daemon, never approving hooks.
+ * The results come back in the order sent, each as `startSuggestion` would have answered it.
+ */
+export async function startSuggestions(items: { provider_id: string; id: string }[]): Promise<StartResult[]> {
+  const failAll = (error: string): StartResult[] => items.map(() => ({ kind: "error", error }));
+  let res: Response;
+  let text: string;
+  try {
+    res = await fetch("/api/suggestions/start-batch", jsonInit("POST", { items }));
+    text = await res.text();
+  } catch (error) {
+    return failAll(`Network error: ${error instanceof Error ? error.message : "connection failed"}`);
+  }
+  let results: { status?: unknown; body?: unknown }[] | undefined;
+  try {
+    results = res.ok ? (JSON.parse(text) as { results: typeof results }).results : undefined;
+  } catch {
+    // Handled below.
+  }
+  if (!results || results.length !== items.length) {
+    return failAll(
+      res.ok
+        ? "Unexpected response from the server. Reload to see the current state."
+        : parseApiErrorText(text, res.status),
+    );
+  }
+  return results.map((r) => startResult(typeof r.status === "number" ? r.status : 0, JSON.stringify(r.body ?? {})));
 }
 
 export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | null> {
@@ -3800,11 +3853,16 @@ export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | n
 }
 
 export const putSuggestionMapping = (providerId: string, mappingKey: string, projects: string[]) =>
-  suggestionRequest("/api/suggestions/mappings", "PUT", {
-    provider_id: providerId,
-    mapping_key: mappingKey,
-    projects,
-  });
+  suggestionRequest(
+    "/api/suggestions/mappings",
+    "PUT",
+    {
+      provider_id: providerId,
+      mapping_key: mappingKey,
+      projects,
+    },
+    SUGGESTION_SAVE_TIMEOUT_MS,
+  );
 
 export async function fetchSuggestionProjects(): Promise<SuggestionProject[] | null> {
   const body = await fetchJson<{ projects: SuggestionProject[] }>("/api/suggestions/projects");
@@ -3816,3 +3874,123 @@ export const deleteSuggestionMapping = (providerId: string, mappingKey: string) 
     `/api/suggestions/mappings?${new URLSearchParams({ provider_id: providerId, mapping_key: mappingKey })}`,
     "DELETE",
   );
+
+// --- Sandbox login ---
+
+export type SandboxLoginState = "needed" | "ok" | "not_applicable";
+
+export interface SandboxLoginStatus {
+  state: SandboxLoginState;
+  running: boolean;
+  heldSessions: number;
+}
+
+/**
+ * Null when the status cannot be read. Needs no elevation and never carries the link.
+ * `tool` is the agent whose shared credential file to read; the server picks the profile's default login tool when omitted.
+ * `command` is the one a session's launch runs for `tool` when it overrides the profile's, as the server named it.
+ * `profile` is the session's profile as the server named it in its error; the daemon's profile when omitted.
+ */
+export async function getSandboxLoginStatus(
+  tool?: string,
+  command?: string,
+  profile?: string,
+): Promise<SandboxLoginStatus | null> {
+  const params = new URLSearchParams();
+  if (tool) params.set("tool", tool);
+  // Only with its tool: the server refuses a command for no tool.
+  if (tool && command) params.set("command", command);
+  if (profile) params.set("profile", profile);
+  const query = params.toString() ? `?${params}` : "";
+  const body = await fetchJson<{
+    status?: { state?: SandboxLoginState };
+    running?: { login_id?: string } | null;
+    held_sessions?: number;
+  }>(`/api/sandbox/login${query}`, { headers: ACCEPT_JSON });
+  const state = body?.status?.state;
+  if (!state) return null;
+  return { state, running: Boolean(body?.running), heldSessions: body?.held_sessions ?? 0 };
+}
+
+/** A failed call: the server's `error` code and `message`, or only `message` on a network failure. */
+export interface SandboxLoginFailure {
+  kind: "error";
+  status: number;
+  code?: string;
+  message: string;
+}
+
+function sandboxLoginFailure(reply: Reply | null, fallback: string): SandboxLoginFailure {
+  if (!reply) return { kind: "error", status: 0, message: "Network error." };
+  return {
+    kind: "error",
+    status: reply.status,
+    code: stringField(reply.payload, "error"),
+    message: stringField(reply.payload, "message") ?? `${fallback} (HTTP ${reply.status}).`,
+  };
+}
+
+/**
+ * Start a login, or get the running one. `force` logs in although the credential is usable;
+ * `tool` names the agent whose shared credential file to log in (the server picks the profile's default login tool when omitted);
+ * `command` is the one a session's launch runs for `tool` when it overrides the profile's, as the server named it in its error;
+ * `profile` is the session's profile, as the server named it too (the daemon's profile when omitted);
+ * `lease` is the dialog's own, the same for every start it repeats, so a lost answer still leaves it a lease to leave by.
+ */
+export async function startSandboxLogin(
+  force = false,
+  tool?: string,
+  command?: string,
+  profile?: string,
+  lease?: string,
+): Promise<{ kind: "started"; loginId: string; lease?: string; url: string } | SandboxLoginFailure> {
+  const reply = await send("/api/sandbox/login", jsonInit("POST", { force, tool, command, profile, lease })).catch(
+    () => null,
+  );
+  const loginId = stringField(reply?.payload, "login_id");
+  const url = stringField(reply?.payload, "url");
+  if (reply?.ok && loginId && url) return { kind: "started", loginId, lease: stringField(reply.payload, "lease"), url };
+  return sandboxLoginFailure(reply, "Could not start the login");
+}
+
+/** Hand the code to the login client. `invalid_code` (400) leaves the login running; every other failure ended it. */
+export async function submitSandboxLoginCode(
+  loginId: string,
+  code: string,
+): Promise<{ kind: "ok" } | SandboxLoginFailure> {
+  const reply = await send(`/api/sandbox/login/${encodeURIComponent(loginId)}/code`, jsonInit("POST", { code })).catch(
+    () => null,
+  );
+  if (reply?.ok) return { kind: "ok" };
+  return sandboxLoginFailure(reply, "Could not submit the code");
+}
+
+/**
+ * What the code exchange of a login came to, for a client that lost the answer to its code.
+ * `null` when the server could not be asked.
+ */
+export async function getSandboxLoginOutcome(
+  loginId: string,
+): Promise<"succeeded" | "failed" | "pending" | "unknown" | null> {
+  const body = await fetchJson<{ outcome?: string }>(`/api/sandbox/login/${encodeURIComponent(loginId)}`, {
+    headers: ACCEPT_JSON,
+  });
+  const outcome = body?.outcome;
+  return outcome === "succeeded" || outcome === "failed" || outcome === "pending" || outcome === "unknown"
+    ? outcome
+    : null;
+}
+
+/** Best effort, like `cancelSandboxLogin`, for a dialog that never learned the login id of its start. */
+export async function leaveSandboxLogin(lease: string): Promise<void> {
+  await fetchOk(`/api/sandbox/login?lease=${encodeURIComponent(lease)}`, { method: "DELETE" });
+}
+
+/**
+ * Best effort: the server also answers 204 for a login that already ended. The login is shared by
+ * the dialogs for one credential, so `lease` (from the start) leaves only this dialog's part of it.
+ */
+export async function cancelSandboxLogin(loginId: string, lease?: string): Promise<void> {
+  const query = lease ? `?lease=${encodeURIComponent(lease)}` : "";
+  await fetchOk(`/api/sandbox/login/${encodeURIComponent(loginId)}${query}`, { method: "DELETE" });
+}

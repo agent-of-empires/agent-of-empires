@@ -63,7 +63,7 @@ AOE_TERMINAL_TRACE=1 cargo run
 aoe logs
 ```
 
-`cargo xtask dev` runs a dashboard-enabled debug backend on 8081 and Vite with HMR on 5173; `--watch` rebuilds and restarts the backend when Rust inputs change, leaving the previous backend running if a rebuild fails.
+`cargo xtask dev` runs a `--features web` debug backend on 8081, embedding `web/dist` without rebuilding it, and Vite with HMR on 5173; `--watch` rebuilds and restarts the backend when Rust inputs change, leaving the previous backend running if a rebuild fails.
 
 Use explicit dotted tracing area targets so per-target logging overrides affect
 native and dashboard failures consistently. Every `target:` root used in `src/`
@@ -113,4 +113,4 @@ Maintainer keys can only read and write `maint/`, so CI never consumes artifacts
 
 ## Demo recordings
 
-`web/scripts/record-tui-demo.mjs` produces `docs/assets/demo.gif`, and `web/scripts/record-web-demo.mjs` the desktop and mobile dashboard GIFs. Each documents its dependencies and setup in its file header. To record a PR's change for review, use the `record-pr-demo` agent skill in `.claude/skills/record-pr-demo/`.
+`web/scripts/record-tui-demo.mjs` produces `docs/assets/demo.gif`, `web/scripts/record-web-demo.mjs` the desktop and mobile dashboard GIFs, and `web/scripts/combine-showcase-videos.sh` one video of every Playwright spec. Each documents its dependencies and setup in its file header. To record a PR's change for review, use the `record-pr-demo` agent skill in `.claude/skills/record-pr-demo/`.

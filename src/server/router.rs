@@ -232,10 +232,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::recreate_container).layer(read_only.clone()),
         )
         .route(
-            "/api/sessions/{id}/restart-for-update",
-            post(api::restart_for_update).layer(read_only.clone()),
-        )
-        .route(
             "/api/sessions/{id}/terminal",
             post(api::ensure_terminal)
                 .delete(api::kill_terminal)
@@ -384,6 +380,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::dismiss_suggestion).layer(read_only.clone()),
         )
         .route(
+            "/api/suggestions/push",
+            post(api::push_suggestion).layer(read_only.clone()),
+        )
+        .route(
             "/api/suggestions/undismiss",
             post(api::undismiss_suggestion).layer(read_only.clone()),
         )
@@ -396,6 +396,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             patch(api::patch_suggestion_prefs).layer(read_only.clone()),
         )
         .route(
+            "/api/suggestions/auto-start",
+            put(api::put_suggestion_auto_start).layer(read_only.clone()),
+        )
+        .route(
             "/api/suggestions/presets",
             get(api::get_suggestion_presets)
                 .put(api::put_suggestion_preset)
@@ -406,6 +410,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/suggestions/start",
             post(api::start_suggestion).layer(read_only.clone()),
+        )
+        .route(
+            "/api/suggestions/start-batch",
+            post(api::start_suggestions).layer(read_only.clone()),
         )
         .route(
             "/api/suggestions/mappings",
@@ -497,6 +505,30 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sandbox/volume-ignores-preview",
             get(api::preview_volume_ignores_globs),
+        )
+        .route(
+            "/api/sandbox/login",
+            get(api::get_sandbox_login)
+                .post(api::start_sandbox_login)
+                .delete(api::leave_sandbox_login)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    api::SANDBOX_LOGIN_CODE_BODY_LIMIT,
+                ))
+                .layer(read_only.clone()),
+        )
+        .route(
+            "/api/sandbox/login/{login_id}",
+            get(api::get_sandbox_login_outcome)
+                .delete(api::cancel_sandbox_login)
+                .layer(read_only.clone()),
+        )
+        .route(
+            "/api/sandbox/login/{login_id}/code",
+            post(api::submit_sandbox_login_code)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    api::SANDBOX_LOGIN_CODE_BODY_LIMIT,
+                ))
+                .layer(read_only.clone()),
         )
         .route("/api/themes", get(api::list_themes))
         .route("/api/themes/{name}", get(api::get_resolved_theme))
@@ -711,6 +743,15 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
 
     let app = if state.web_config.mcp_enabled {
         app.route_service("/mcp", super::mcp::service(state.clone()))
+    } else {
+        app
+    };
+    // Served without `/mcp` whenever the secret exists, which a serving plugin implies.
+    let app = if state.web_config.mcp_enabled || state.mcp_session_secret.is_some() {
+        app.route_service(
+            "/mcp/plugins/{plugin}/{server}",
+            super::mcp_plugins::service(state.clone()),
+        )
     } else {
         app
     };

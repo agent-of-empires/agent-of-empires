@@ -128,10 +128,10 @@ test.describe("project tabs", () => {
     await expect(done).toBeFocused();
   });
 
-  test("opening from the sidebar New project session button focuses the search box", async ({ page }) => {
+  test("opening from the sidebar New session row focuses the search box", async ({ page }) => {
     await startWizard(page, { project: false });
     // No blur first: the button stays focused behind the wizard, as it does for a real click.
-    await page.getByRole("button", { name: "New project session" }).click();
+    await page.getByTestId("sidebar-new-session").click();
     await expect(page.getByLabel("Search projects")).toBeFocused();
   });
 
