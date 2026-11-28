@@ -103,6 +103,13 @@ impl StatusChange {
     pub fn rearms_error(&self) -> bool {
         self.old == self.new
     }
+
+    /// An Idle entered from Stopped (a resume) or Starting (a launch reaching its prompt, or a
+    /// cancelled Retry's rollback) ended no turn, so it is no idle cue (#5977). The browser's
+    /// list-based tracker applies the same rule (web/src/lib/statusSounds.ts).
+    pub fn resumes_a_stop(&self) -> bool {
+        self.new == Status::Idle && matches!(self.old, Status::Stopped | Status::Starting)
+    }
 }
 
 /// Logs then broadcasts; the log must not depend on a subscriber existing.
@@ -640,7 +647,24 @@ pub async fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
     });
 }
 
+/// The pushes `changes` send when every dwell and cooldown passes before the next change.
+#[cfg(test)]
+pub(crate) fn pushes_for_test(changes: Vec<StatusChange>) -> usize {
+    let mut dwell: HashMap<String, DwellState> = HashMap::new();
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let mut pushes = 0;
+    for change in changes {
+        handle_status_change(&mut dwell, change);
+        pushes += due_events(&mut dwell, &crate::server::state::WebWatch::Nothing, later).len();
+        dwell
+            .values_mut()
+            .for_each(|state| state.last_notified = None);
+    }
+    pushes
+}
+
 fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusChange) {
+    let resumes_a_stop = change.resumes_a_stop();
     let entry = dwell.entry(change.instance_id.clone()).or_default();
     entry.title = change.instance_title;
     entry.put_back_since = None;
@@ -666,7 +690,7 @@ fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusC
     entry.error_since = None;
     match change.new {
         Status::Waiting => entry.waiting_since = Some(now),
-        Status::Idle => entry.idle_since = Some(now),
+        Status::Idle if !resumes_a_stop => entry.idle_since = Some(now),
         Status::Error => entry.error_since = resumed_error.unwrap_or(Some(now)),
         _ => {}
     }
@@ -1927,6 +1951,29 @@ mod tests {
             },
         );
         assert!(dwell.get(&id).unwrap().waiting_since.is_none());
+    }
+
+    /// #5977: an Idle entered from Stopped or Starting never pushes, however long a Retry's
+    /// launch prepares; a turn that ends Idle does.
+    #[test]
+    fn a_resumed_stop_is_no_idle_push() {
+        for (case, old, restores_prior, want) in [
+            ("turn-ended", Status::Running, false, 1),
+            ("resumed-stop", Status::Stopped, false, 0),
+            ("rolled-back-resume", Status::Starting, true, 0),
+            ("launched-then-idle", Status::Starting, false, 0),
+        ] {
+            let got = pushes_for_test(vec![StatusChange {
+                instance_id: "sess-5977".into(),
+                instance_title: "retry".into(),
+                effective_profile: "default".into(),
+                old,
+                new: Status::Idle,
+                at: Timestamp::now(),
+                restores_prior,
+            }]);
+            assert_eq!(got, want, "{case}");
+        }
     }
 
     /// #5671: a Retry's rollback to Error resumes the earlier error instead of arming a second

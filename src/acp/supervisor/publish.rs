@@ -3,7 +3,7 @@
 use tracing::info;
 
 use super::{
-    publish_next_persisted, publish_with_next_seq, BroadcastSink, PromptDisposition,
+    publish_next_persisted, publish_with_next_seq, BroadcastSink, Persisted, PromptDisposition,
     PublishedPrompt, SeqMap, Supervisor, WorkerKind,
 };
 use crate::acp::approvals::ApprovalDecision;
@@ -45,6 +45,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         cause: Option<StartupCause>,
     ) {
         self.publish_next(session_id, &Event::AgentStartupError { message, cause });
+    }
+
+    /// Allocate a startup error's seq and queue it; the receipt waits for the store.
+    pub(crate) fn queue_startup_error(&self, session_id: &str, message: String) -> Persisted {
+        let event = Event::startup_error(message);
+        publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+            self.sink.queue_persisted(session_id, seq, &event)
+        })
     }
 
     /// The startup error of a launch held for the sandbox login: the instruction, and the

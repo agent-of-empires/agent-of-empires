@@ -32,7 +32,9 @@ impl Dwells {
     }
 
     pub(super) fn on_change(&mut self, change: &StatusChange, now: Instant) {
-        if !(change.new == Status::Error && change.rearms_error()) {
+        if change.resumes_a_stop() {
+            self.0.remove(&change.instance_id);
+        } else if !(change.new == Status::Error && change.rearms_error()) {
             self.track(&change.instance_id, change.new, now);
         }
     }
@@ -189,6 +191,38 @@ mod tests {
         }
     }
 
+    /// #5977: an Idle entered from Stopped or Starting is no cue, however long a Retry's launch
+    /// prepares; a turn that ends Idle cues.
+    #[test]
+    fn a_resumed_stop_cues_nothing() {
+        let t0 = Instant::now();
+        for (case, old, restores_prior, cues) in [
+            ("turn-ended", Status::Running, false, true),
+            ("resumed-stop", Status::Stopped, false, false),
+            ("rolled-back-resume", Status::Starting, true, false),
+            ("launched-then-idle", Status::Starting, false, false),
+        ] {
+            let mut dwells = Dwells::default();
+            dwells.on_change(
+                &StatusChange {
+                    old,
+                    restores_prior,
+                    ..change(case, Status::Idle)
+                },
+                t0,
+            );
+            assert_eq!(
+                dwells.take_due(t0 + Duration::from_secs(60)),
+                if cues {
+                    vec![(case.to_string(), NotificationEvent::Idle)]
+                } else {
+                    Vec::new()
+                },
+                "{case}"
+            );
+        }
+    }
+
     #[test]
     fn dwell_cues_after_the_status_holds_and_a_later_move_cancels_it() {
         let t0 = Instant::now();
@@ -333,6 +367,54 @@ mod tests {
                 .await
                 .is_err(),
             "a re-arm replayed the Error"
+        );
+
+        state.shutdown.cancel();
+        player.await.unwrap();
+    }
+
+    /// #5977: the host player shares the dwells, so an Idle entered from Stopped plays nothing
+    /// on the host, while a turn that ends Idle beside it still plays after its dwell.
+    #[tokio::test(start_paused = true)]
+    async fn host_player_plays_no_idle_for_a_resumed_stop() {
+        // Separate profiles, since a batch plays one sound per profile.
+        let rows: Vec<Instance> = [("resumed", "work"), ("finished", "home")]
+            .into_iter()
+            .map(|(title, profile)| {
+                let mut row = Instance::new(title, "/tmp/aoe-host-sound-resume");
+                row.status = Status::Idle;
+                row.source_profile = profile.to_string();
+                row
+            })
+            .collect();
+        let (resumed, finished) = (rows[0].id.clone(), rows[1].id.clone());
+        let state = crate::server::test_support::build_test_app_state(rows);
+        let (played_tx, mut played) = tokio::sync::mpsc::unbounded_channel();
+        let player = tokio::spawn(run_host_player(
+            state.clone(),
+            state.status_tx.subscribe(),
+            move |profile, event| played_tx.send((profile, event)).unwrap(),
+        ));
+
+        let resume = StatusChange {
+            old: Status::Stopped,
+            ..change(&resumed, Status::Idle)
+        };
+        state.status_tx.send(resume).unwrap();
+        state
+            .status_tx
+            .send(change(&finished, Status::Idle))
+            .unwrap();
+        assert_eq!(
+            next_played(&mut played).await,
+            ("home".to_string(), SoundEvent::Idle)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(60), played.recv())
+                .await
+                .ok(),
+            None,
+            "the resumed stop played an Idle"
         );
 
         state.shutdown.cancel();
