@@ -354,7 +354,6 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: read
-      id-token: write
     # Allow cold compilation and both test stages within a bounded job.
     timeout-minutes: 90
     env:
