@@ -444,29 +444,29 @@ describe("applyEvent control state", () => {
     expect(applyReducedState(adopted, reduced()).sessionNotices).toEqual([]);
   });
 
-  it("adopts integration_lost from the daemon snapshot and clears a stale live loss", () => {
-    const reduced = (extra: object = {}) =>
-      ({
-        agent: "claude",
-        model: null,
-        mode: "default",
-        current_plan: null,
-        in_flight_tool: null,
-        pending_approvals: [],
-        pending_elicitations: [],
-        thinking: null,
-        rate_limit: null,
-        available_commands: [],
-        available_modes: [],
-        current_mode_id: null,
-        turn_active: false,
-        cancelling: false,
-        compacting: false,
-        ...extra,
-      }) as ReducedState;
+  it("adopts and clears integration loss only from a current, explicit daemon projection", () => {
+    const reduced = (extra: Partial<ReducedState> = {}): ReducedState => ({
+      agent: "claude",
+      model: null,
+      mode: "default",
+      current_plan: null,
+      in_flight_tool: null,
+      pending_approvals: [],
+      pending_elicitations: [],
+      thinking: null,
+      rate_limit: null,
+      available_commands: [],
+      available_modes: [],
+      current_mode_id: null,
+      turn_active: false,
+      cancelling: false,
+      compacting: false,
+      ...extra,
+    });
 
-    const adopted = applyReducedState(emptyAcpState(), reduced({ integration_lost: { kind: "proxy_exited" } }));
-    expect(adopted.integrationLost).toEqual({ kind: "proxy_exited" });
+    const loss = reduced({ integration_lost: { kind: "proxy_exited" } });
+    expect(applyReducedState(emptyAcpState(), loss).integrationLost).toBeNull();
+    expect(applyReducedState(emptyAcpState(), loss, [], 1).integrationLost).toEqual({ kind: "proxy_exited" });
 
     const live = applyEvent(emptyAcpState(), {
       session_id: "s-1",
@@ -474,7 +474,11 @@ describe("applyEvent control state", () => {
       event: { IntegrationLost: { reason: { kind: "hold_overflow" } } },
     });
     expect(live.integrationLost).toEqual({ kind: "hold_overflow" });
-    expect(applyReducedState(live, reduced()).integrationLost).toBeNull();
+    const noLoss = reduced({ integration_lost: null });
+    expect(applyReducedState(live, noLoss, [], 0).integrationLost).toEqual({ kind: "hold_overflow" });
+    const omitted = applyReducedState(live, reduced(), [], 2);
+    expect(omitted.integrationLost).toEqual({ kind: "hold_overflow" });
+    expect(applyReducedState(omitted, noLoss, [], 3).integrationLost).toBeNull();
   });
 
   it("adopts a live child whose last update is older than the replay tail", () => {
