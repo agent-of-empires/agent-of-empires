@@ -279,6 +279,47 @@ impl Instance {
         declared.unwrap_or_else(|| crate::agents::send_keys_enter_delay(&self.tool))
     }
 
+    /// Lowercased screen text that shows the agent's input box is up.
+    ///
+    /// Only the program a declaration actually owns takes its markers, so a
+    /// custom wrapper, command override, stored command or ambiguous claim keeps
+    /// the built-in table's markers for its tool. An unknown agent's list is
+    /// empty, which refuses automatic input.
+    pub(crate) fn ready_markers(&self) -> Vec<String> {
+        let declared = self.declared_agent().and_then(|agent| {
+            agent.with_definition(|definition| {
+                definition
+                    .ready_markers
+                    .iter()
+                    .map(|marker| marker.to_lowercase())
+                    .collect::<Vec<_>>()
+            })
+        });
+        match declared.filter(|markers| !markers.is_empty()) {
+            Some(markers) => markers,
+            None => crate::agents::ready_markers(&self.tool)
+                .iter()
+                .map(|marker| marker.to_lowercase())
+                .collect(),
+        }
+    }
+
+    /// Whether the row launches the agent's own program: nothing stored, the
+    /// built-in binary, or the command its declaration names. A wrapper or an
+    /// override is something else, so automatic input cannot expect the agent's
+    /// input box behind it.
+    pub(crate) fn launches_agent_itself(&self) -> bool {
+        if self.command.is_empty() {
+            return true;
+        }
+        if let Some(agent) = crate::agents::get_agent(&self.tool) {
+            return self.command == agent.binary;
+        }
+        self.declared_agent().is_some_and(|agent| {
+            agent.contribution().command.as_deref() == Some(self.command.as_str())
+        })
+    }
+
     fn declared_session_support(
         &self,
         sandboxed: bool,

@@ -1125,6 +1125,20 @@ fn validate_agent_declaration(
                 format!("agent_integrations[{i}].launch.container_env[{key:?}] is invalid"),
             );
         }
+        check(
+            launch.ready_markers.len() <= 16,
+            format!("agent_integrations[{i}].launch.ready_markers must declare at most 16 markers"),
+        );
+        for (j, marker) in launch.ready_markers.iter().enumerate() {
+            check(
+                !marker.trim().is_empty()
+                    && marker.chars().count() <= 128
+                    && marker.chars().all(declaration_character_ok),
+                format!(
+                    "agent_integrations[{i}].launch.ready_markers[{j}] must be a nonempty on-screen string of at most 128 characters"
+                ),
+            );
+        }
         if let Some(hint) = &launch.install_hint {
             check(
                 !hint.trim().is_empty()
@@ -1643,6 +1657,18 @@ impl PluginManifest {
                     delay <= 2_000,
                     format!(
                         "agent_integrations[{i}].launch.send_keys_enter_delay_ms must be at most 2000"
+                    ),
+                );
+            }
+            if integration
+                .launch
+                .as_ref()
+                .is_some_and(|launch| !launch.ready_markers.is_empty())
+            {
+                check(
+                    self.api_version >= 29,
+                    format!(
+                        "agent_integrations[{i}].launch.ready_markers requires api_version >= 29"
                     ),
                 );
             }

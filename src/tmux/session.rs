@@ -937,7 +937,11 @@ impl Session {
     /// Wait for any known marker, or for two stable captures when no marker exists.
     /// The polling budget bounds readiness checks, not each native subprocess.
     /// Returns false when the budget ran out first.
-    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_markers: &[&str]) -> bool {
+    pub fn wait_until_ready(
+        &self,
+        max_wait: std::time::Duration,
+        ready_markers: &[impl AsRef<str>],
+    ) -> bool {
         self.wait_until_ready_unless(max_wait, ready_markers, |_| None::<()>)
             .unwrap_or(false)
     }
@@ -947,7 +951,7 @@ impl Session {
     pub fn wait_until_ready_unless<B>(
         &self,
         max_wait: std::time::Duration,
-        ready_markers: &[&str],
+        ready_markers: &[impl AsRef<str>],
         blocked: impl Fn(&str) -> Option<B>,
     ) -> Result<bool, B> {
         Self::poll_until_ready(max_wait, ready_markers, blocked, || {
@@ -961,7 +965,7 @@ impl Session {
         &self,
         pane: &str,
         max_wait: std::time::Duration,
-        ready_markers: &[&str],
+        ready_markers: &[impl AsRef<str>],
     ) -> Result<bool> {
         Self::poll_until_ready(
             max_wait,
@@ -981,13 +985,16 @@ impl Session {
 
     fn poll_until_ready<B>(
         max_wait: std::time::Duration,
-        ready_markers: &[&str],
+        ready_markers: &[impl AsRef<str>],
         blocked: impl Fn(&str) -> Option<B>,
         capture: impl Fn() -> Result<Option<String>, B>,
     ) -> Result<bool, B> {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
-        let ready_markers: Vec<String> = ready_markers.iter().map(|m| m.to_lowercase()).collect();
+        let ready_markers: Vec<String> = ready_markers
+            .iter()
+            .map(|marker| marker.as_ref().to_lowercase())
+            .collect();
         let mut last: Option<String> = None;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);

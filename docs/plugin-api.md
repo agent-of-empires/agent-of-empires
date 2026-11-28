@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `28`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `29`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 28
+api_version = 29
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `28`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `29`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
@@ -38,7 +38,7 @@ capabilities = ["runtime.worker"]
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `suggestions` | table | no | Suggested-session sources the worker publishes. Requires `api_version >= 23` and `runtime.worker`. See [Suggested sessions](#suggested-sessions). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, the session-id capture extension requires API 22, and the `hooks` and `trust` tables require API 28, each with a host implementing them. Provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21, the session-id capture extension requires API 22, and the `hooks` and `trust` tables require API 28, and the ready-markers extension requires API 29, each with a host implementing them. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
@@ -77,7 +77,7 @@ For status, a session's own integration takes precedence; an unowned tool may us
 
 These declarations require API 21 and a host that implements them. API 20 hosts reject them; API 20 agent integrations remain supported. Built-in agents and aliases retain precedence. An approved, enabled API 21 OMP launch declaration supersedes the bundled OMP launch contract, including for existing sessions with no stored command; provider status and replies still require their capability and valid reports. If that declaration is absent, disabled, or not approved, the bundled OMP launch, pane detection, and capture fallback remain available. A plugin-omp release declaring API 21 behavior is a separate prerequisite for the cutover.
 
-Launch flags, instruction templates, environment values, install hints, and literal reply keys reject control and Unicode format characters.
+Launch flags, instruction templates, environment values, install hints, ready markers, and literal reply keys reject control and Unicode format characters.
 
 ```toml
 capabilities = ["session.integration"]
@@ -96,6 +96,7 @@ model_flag = "--model"
 host_only = false
 install_hint = "Install example-agent from its vendor"
 send_keys_enter_delay_ms = 150
+ready_markers = ["ask anything"]
 
 [agent_integrations.launch.container_env]
 EXAMPLE_HOME = "/state"
@@ -125,6 +126,7 @@ The example's `detection` requires `session.integration` in the manifest's capab
 
 - `launch.aliases` are unique lowercase agent ids, distinct from the tool. `oneshot_flag` and `model_flag` are single shell-safe flags. `instruction_flag` has one `{}` placeholder, as a whole argument or after `=`, and otherwise contains shell-safe words.
 - `launch.send_keys_enter_delay_ms` is the pause, in milliseconds, that the host leaves between typing a message into the agent's pane and sending Enter. Some agents read a fast burst as a paste and drop the Enter, which leaves the message as an unsent draft that looks like a running session. It requires `api_version >= 22` and is capped at 2000. An agent that declares nothing falls back to the host's built-in pause for its tool.
+- `launch.ready_markers` is an optional list of at most 16 case-insensitive substrings of the agent's pane, each at most 128 characters; any one of them on screen means the input box is up, so the host may type a prompt into a running session. It requires `api_version >= 29` and has the same semantics as a built-in agent's markers. An agent that declares none keeps the initial-prompt refusal, because stable output cannot tell an input box from a dialog. A `sessions.message.send` still waits on the host's markerless readiness instead: two captures over 20 bytes that match, which a running agent usually reaches.
 - `launch.yolo` is `kind = "flag"` with `flag`, `kind = "always"`, or `kind = "env"` with `key` and `value`. An `always` declaration applies while active without changing the session's saved Yolo preference. `container_env` is applied to sandbox launches. Protected environment names are rejected.
 - `launch.resume` is `kind = "flag"` with `flag`, `kind = "flag_pair"` with `existing` and `new_session`, or `kind = "subcommand"` with `command`. Resume and capture require each other. Capture supports only backend `omp`, with `pane_scoped` in at least one of `host` or `sandbox` and `pane_scoped` or `unsupported` in the other.
 - `detection.mode = "native_only"` requires `session.integration`; the integration owns status rather than falling back to pane parsing when a report is missing or invalid.

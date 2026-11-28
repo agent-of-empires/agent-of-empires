@@ -257,18 +257,22 @@ fn resolve_initial_prompt(args: &AddArgs) -> Result<Option<String>> {
 }
 
 /// The refusal for a terminal first turn the daemon could never type: it needs a
-/// known agent's input box, so a shell, a `--cmd-override` command and an agent
-/// with no ready marker are turned away here instead of failing at launch.
+/// known agent's input box, so a shell, a command override and an agent with no
+/// ready marker are turned away here instead of failing at launch.
 const PROMPT_UNDELIVERABLE: &str =
     "--prompt needs an agent whose input box AoE can see, so this terminal session would never \
-     type it: a shell, a --cmd-override command, and an agent with no ready marker are refused \
-     here rather than after launch.\n\
+     type it: a shell, a command override (flag or config), and an agent with no ready marker \
+     are refused here rather than after launch.\n\
      Pass --structured-view (or --agent) to send the prompt as the session's first turn.";
 
-/// Whether a terminal session for these arguments has an agent the delivery step
-/// could type into. Mirrors `wait_for_terminal_agent`, which refuses a shell, a
-/// command override and any agent without a ready marker.
-fn terminal_prompt_is_deliverable(args: &AddArgs) -> bool {
+/// Whether a terminal session for these arguments has the agent's own program
+/// with a ready marker. Mirrors `wait_for_terminal_agent`, which refuses a shell,
+/// a wrapper and any agent without a ready marker.
+///
+/// The plugin registry and config are the local ones: a daemon that serves
+/// another profile, or the only install of a plugin, can still refuse the
+/// delivery it owns.
+fn terminal_prompt_is_deliverable(profile: &str, args: &AddArgs) -> bool {
     let Some(tool) = args
         .tool
         .as_deref()
@@ -278,12 +282,49 @@ fn terminal_prompt_is_deliverable(args: &AddArgs) -> bool {
         // No --tool: the row runs a shell.
         return false;
     };
-    let agent = crate::agents::get_agent(tool);
-    let overrides_agent = args
+    let config = crate::session::config::repo_config::resolve_config_with_repo(
+        profile,
+        args.path.as_deref().unwrap_or(std::path::Path::new(".")),
+    )
+    .ok();
+    let custom_names: Vec<&str> = config
+        .iter()
+        .flat_map(|config| config.session.custom_agents.iter())
+        .filter(|(_, command)| !command.trim().is_empty())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    // The program the agent is built to run, and the markers that show a prompt
+    // can be typed into it. A plugin agent stands in for the built-in table, so
+    // its declaration is the only place its markers can come from.
+    let (own, markers) = match crate::agents::get_agent(tool) {
+        Some(agent) => (
+            agent.binary.to_string(),
+            crate::agents::ready_markers(tool)
+                .iter()
+                .map(|marker| marker.to_string())
+                .collect(),
+        ),
+        None => match crate::plugin::agent_integration::declared_launch(tool, custom_names) {
+            Some(declared) => declared,
+            None => return false,
+        },
+    };
+    if markers.is_empty() {
+        return false;
+    }
+    // An override replaces that program, so the markers describe a different
+    // one; the drain refuses it for the same reason.
+    let launched = args
         .cmd_override
-        .as_deref()
-        .is_some_and(|command| agent.is_none_or(|a| command != a.binary));
-    !overrides_agent && !crate::agents::ready_markers(tool).is_empty()
+        .clone()
+        .filter(|command| !command.trim().is_empty())
+        .or_else(|| {
+            config.as_ref().and_then(|config| {
+                let resolved = config.session.resolve_tool_command(tool);
+                (!resolved.is_empty()).then_some(resolved)
+            })
+        });
+    launched.is_none_or(|launched| launched == own)
 }
 
 fn prompt_too_large() -> String {
@@ -309,7 +350,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
     if initial_prompt.is_some()
         && !(args.structured_view || args.agent.is_some())
-        && !terminal_prompt_is_deliverable(&args)
+        && !terminal_prompt_is_deliverable(profile, &args)
     {
         bail!(PROMPT_UNDELIVERABLE);
     }
@@ -1165,7 +1206,9 @@ mod tests {
     /// The refusal is only for what cannot be delivered: a marker-carrying agent
     /// with its own binary, and the structured view, both pass.
     #[test]
+    #[serial_test::serial]
     fn only_the_undeliverable_terminal_cases_are_refused() {
+        let _app = crate::session::test_support::isolate_app_dir();
         let path = tempfile::tempdir().unwrap();
         let path = path.path().to_str().unwrap();
         for (argv, deliverable) in [
@@ -1197,9 +1240,41 @@ mod tests {
         ] {
             let args = parse_add(&argv).unwrap();
             let structured = args.structured_view || args.agent.is_some();
-            let accepted = structured || super::terminal_prompt_is_deliverable(&args);
+            let accepted = structured || super::terminal_prompt_is_deliverable("default", &args);
             assert_eq!(accepted, deliverable, "{argv:?}");
         }
+    }
+
+    /// A configured override or custom agent replaces the program the markers
+    /// came from, so the preflight refuses what the drain would refuse.
+    #[test]
+    #[serial_test::serial]
+    fn a_configured_program_replacing_the_agent_is_refused() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().to_str().unwrap();
+        let args =
+            || parse_add(&["aoe", "add", path, "--tool", "claude", "--prompt", "go"]).unwrap();
+        assert!(super::terminal_prompt_is_deliverable("default", &args()));
+
+        crate::session::update_config(|config| {
+            config
+                .session
+                .agent_command_override
+                .insert("claude".to_string(), "my-agent --flag".to_string());
+        })
+        .unwrap();
+        assert!(!super::terminal_prompt_is_deliverable("default", &args()));
+
+        // The override naming the agent's own binary is not a replacement.
+        crate::session::update_config(|config| {
+            config
+                .session
+                .agent_command_override
+                .insert("claude".to_string(), "claude".to_string());
+        })
+        .unwrap();
+        assert!(super::terminal_prompt_is_deliverable("default", &args()));
     }
 
     #[test]

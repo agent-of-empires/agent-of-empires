@@ -182,6 +182,37 @@ pub fn reload_registry() -> Arc<PluginRegistry> {
     reg
 }
 
+/// Test-only fixed registry, restored on drop.
+///
+/// Holds the reload lock so a concurrent reload cannot swap the registry
+/// between a test's setup and its assertions.
+#[cfg(test)]
+pub(crate) struct TestRegistryGuard {
+    previous: Option<Arc<PluginRegistry>>,
+    _reload: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestRegistryGuard {
+    fn drop(&mut self) {
+        *REGISTRY.write_safe() = self.previous.take();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_registry(plugins: Vec<LoadedPlugin>) -> TestRegistryGuard {
+    let reload = REGISTRY_RELOAD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let previous = REGISTRY
+        .write_safe()
+        .replace(Arc::new(PluginRegistry::from_test_plugins(plugins)));
+    TestRegistryGuard {
+        previous,
+        _reload: reload,
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct ReloadRegistryOnDrop;
 

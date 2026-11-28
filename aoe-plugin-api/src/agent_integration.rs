@@ -271,6 +271,11 @@ pub struct AgentLaunchDeclaration {
     /// for an agent whose composer reads a fast burst as a paste and drops it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_keys_enter_delay_ms: Option<u64>,
+    /// Case-insensitive screen substrings that show the agent's input box is
+    /// up; any one match means a prompt can be typed. Empty means readiness
+    /// cannot be told from a dialog, so a prompt is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ready_markers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<AgentResumeDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

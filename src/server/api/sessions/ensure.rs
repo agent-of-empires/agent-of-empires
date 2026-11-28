@@ -246,8 +246,10 @@ fn agent_pane_in(
     if pane.pane_dead {
         return Ok(None);
     }
+    // A wrapper's pane process is unrecognisable, but a plugin launch runs the
+    // program its declaration names, so the shell check still holds for it.
     if !instance.expects_shell()
-        && !instance.has_command_override()
+        && instance.launches_agent_itself()
         && !(trust_hook_status && crate::hooks::read_hook_status(&instance.id).is_some())
     {
         let command = pane

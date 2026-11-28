@@ -3194,7 +3194,8 @@ fn pane_accepts_automatic_input(
         return Err(TerminalPromptBlocker::InputLineBusy.into());
     }
     let screen = screen.to_lowercase();
-    Ok(crate::agents::ready_markers(&instance.tool)
+    Ok(instance
+        .ready_markers()
         .iter()
         .any(|marker| screen.contains(marker)))
 }
@@ -3203,13 +3204,14 @@ fn pane_accepts_automatic_input(
 /// bare shell) and its ready marker is showing. An agent without a ready marker
 /// is refused: stable output alone cannot tell a prompt from a dialog.
 fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> anyhow::Result<()> {
-    // A shell or custom command has no agent readiness signal; typing the
-    // prompt there would run it as a command.
+    // A shell or wrapper has no agent readiness signal; typing the prompt there
+    // would run it as a command. A plugin launch stores its declared command, so
+    // it is the agent's own program, not an override.
     anyhow::ensure!(
-        !instance.expects_shell() && !instance.has_command_override(),
+        !instance.expects_shell() && instance.launches_agent_itself(),
         "initial prompts are only typed into a known agent"
     );
-    let markers = crate::agents::ready_markers(&instance.tool);
+    let markers = instance.ready_markers();
     anyhow::ensure!(
         !markers.is_empty(),
         "this agent has no ready marker, so the prompt is not typed"
@@ -3236,7 +3238,7 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     let tmux = instance.tmux_session()?;
     let ready = tmux
-        .wait_until_ready_unless(remaining, markers, |screen| {
+        .wait_until_ready_unless(remaining, &markers, |screen| {
             TerminalPromptBlocker::detect(&instance.tool, screen)
         })
         .map_err(anyhow::Error::from)?;
@@ -6425,6 +6427,84 @@ mod tests {
             .await
             .expect("turn is kept");
         assert!(turn.error.is_some_and(|e| e.contains("no ready marker")));
+    }
+
+    /// A plugin launch stores its declared command, so the automatic-input probe
+    /// must still refuse a pane that has fallen back to a shell. The declared
+    /// marker is on screen, so only the shell check can refuse it.
+    #[test]
+    #[serial_test::serial]
+    fn a_plugin_launch_in_a_shell_pane_is_not_an_agent() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let manifest: aoe_plugin_api::PluginManifest = toml::from_str(
+            r#"
+id = "acme.marker"
+name = "Marker"
+version = "1.0.0"
+api_version = 29
+[[agent_integrations]]
+tool = "marker-helper"
+command = "marker-helper"
+
+[agent_integrations.launch]
+ready_markers = ["ask anything"]
+"#,
+        )
+        .unwrap();
+        let _registry =
+            crate::plugin::install_test_registry(vec![crate::plugin::registry::LoadedPlugin {
+                manifest,
+                enabled: true,
+                trust: aoe_plugin_api::TrustLevel::Community,
+                validation: crate::plugin::registry::ValidationState::Local,
+                source: None,
+                dir: None,
+                manifest_hash: String::new(),
+                granted: true,
+            }]);
+
+        let mut inst =
+            terminal_turn_instance("sess-plugin-shell", "term-plugin-shell", "must-not-type");
+        inst.project_path = temp.path().to_string_lossy().to_string();
+        inst.tool = "marker-helper".into();
+        inst.command = "marker-helper".into();
+        assert!(inst.has_command_override(), "the command classifies as one");
+        assert!(inst.launches_agent_itself());
+        assert_eq!(inst.ready_markers(), ["ask anything"]);
+
+        let _pane = start_terminal_pane(&inst, "echo 'ask anything'; exec sh", false);
+        assert!(
+            crate::server::api::sessions::ready_agent_session_for_automatic_input(&inst)
+                .unwrap()
+                .is_none(),
+            "a shell is not the agent, even with its marker on screen"
+        );
+    }
+
+    /// A stored command for the agent's own binary, as a plugin launch writes
+    /// from its declaration, is the agent; anything else is a wrapper and is
+    /// refused before any capture.
+    #[test]
+    fn a_stored_launch_command_is_the_agent_or_a_wrapper() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let row = |command: &str| {
+            let mut inst = terminal_turn_instance("sess-term-command", "term-command", "text");
+            inst.tool = "claude".into();
+            inst.command = command.into();
+            inst
+        };
+        assert!(row("claude").launches_agent_itself());
+
+        let error = wait_for_terminal_agent(&row("/tmp/wrapper.sh"), std::time::Duration::ZERO)
+            .expect_err("a wrapper has no input box to type into");
+        assert!(
+            error.to_string().contains("only typed into a known agent"),
+            "{error}"
+        );
     }
 
     /// A launch replaced after the wait was inspected, but before the error
