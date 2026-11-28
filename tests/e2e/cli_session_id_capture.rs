@@ -1,9 +1,8 @@
-//! End-to-end coverage for pane-attributed OMP native session capture.
+//! End-to-end coverage for the OMP capture boundary.
 //!
-//! The fake OMP processes publish generation-qualified metadata through the
-//! pane's tmux environment. Tests cover CLI-only start/restart persistence,
-//! same-cwd isolation, reconstruction, and stale-artifact rejection without a
-//! daemon.
+//! Core no longer captures OMP sessions itself, so the fake OMP processes
+//! publish breadcrumbs and session stores that must never be adopted. A session
+//! id that the user pins still drives resume.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,12 +63,6 @@ impl Drop for StopSessionOnDrop<'_> {
         let _ = self.h.run_cli(&["session", "stop", self.title]);
     }
 }
-fn configure_fresh_restart_capture(h: &TuiTestHarness) {
-    h.append_config("[session]\nauto_resume_on_restart = false\nrestart_wake_message = \"\"");
-}
-
-const OMP_TITLE_FIRST: &str = "CliSidOmpFirstE2E";
-const OMP_TITLE_SECOND: &str = "CliSidOmpSecondE2E";
 const OMP_SID_FIRST: &str = "019342ab-1234-7def-8901-cccccccccccc";
 const OMP_SID_SECOND: &str = "019342ab-1234-7def-8901-dddddddddddd";
 const OMP_SID_THIRD: &str = "019342ab-1234-7def-8901-ffffffffffff";
@@ -146,14 +139,6 @@ fn tmux_query(h: &TuiTestHarness, title: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn tmux_pane_start_command(h: &TuiTestHarness, title: &str) -> String {
-    tmux_query(
-        h,
-        title,
-        &["display-message", "-p", "#{pane_start_command}"],
-    )
-}
-
 fn unset_tmux_environment(h: &TuiTestHarness, title: &str, key: &str) {
     let name = launched_tmux_name(h, title);
     let output = h
@@ -189,17 +174,6 @@ fn wait_for_path(path: &Path) {
         path.exists()
             .then_some(())
             .ok_or_else(|| format!("{} does not exist", path.display()))
-    });
-}
-
-fn wait_for_agent_session_id(h: &TuiTestHarness, title: &str, expected: &str) {
-    wait_until(Duration::from_secs(15), Duration::from_millis(100), || {
-        let actual = agent_session_id(h, title);
-        if actual.as_deref() == Some(expected) {
-            Ok(())
-        } else {
-            Err(format!("{title:?} has {actual:?}, want {expected}"))
-        }
     });
 }
 
@@ -314,82 +288,6 @@ fn install_reconstructing_fake_omp(
         cwd = sh_quote(project),
     );
     write_executable(&bin.join("omp"), &script);
-}
-
-#[test]
-#[parallel]
-fn omp_routing_restart_generation_and_same_cwd_pane_attribution_are_preserved() {
-    require_tmux!();
-    let mut h = TuiTestHarness::new_in_tmp("cli_sid_omp_terminal");
-    let project = h.project_path();
-    let omp_store = h.home_path().join("dotenv-omp-store");
-    fs::create_dir_all(omp_store.join("sessions/decoy")).expect("create OMP store");
-    write_project_omp_dotenv(&project, &omp_store);
-    configure_fresh_restart_capture(&h);
-    let control = install_toggling_fake_omp(&mut h, &project, &omp_store);
-
-    fs::write(
-        omp_store
-            .join("sessions/decoy")
-            .join(format!("2020-01-01T00-00-00-000Z_{OMP_STALE_SID}.jsonl")),
-        format!(
-            "{{\"type\":\"title\",\"v\":1,\"title\":\"Decoy OMP session\",\"source\":\"user\",\"updatedAt\":\"2020-01-01T00:00:00.000Z\",\"pad\":\"\"}}\n\
-             {{\"type\":\"session\",\"version\":3,\"id\":\"{OMP_STALE_SID}\",\"timestamp\":\"2020-01-01T00:00:00.000Z\",\"cwd\":\"{}\"}}\n",
-            project.display()
-        ),
-    )
-    .expect("write OMP decoy");
-
-    for title in [OMP_TITLE_FIRST, OMP_TITLE_SECOND] {
-        h.run_cli_ok(&[
-            "add",
-            project.to_str().unwrap(),
-            "-c",
-            "omp",
-            "-t",
-            title,
-            "--extra-args=--thinking low",
-        ]);
-    }
-    let _stop_first = StopSessionOnDrop {
-        h: &h,
-        title: OMP_TITLE_FIRST,
-    };
-    let _stop_second = StopSessionOnDrop {
-        h: &h,
-        title: OMP_TITLE_SECOND,
-    };
-
-    let mut generations = Vec::new();
-    for (operation, title, slot, expected) in [
-        ("start", OMP_TITLE_FIRST, "first", OMP_SID_FIRST),
-        ("restart", OMP_TITLE_FIRST, "second", OMP_SID_SECOND),
-        ("start", OMP_TITLE_SECOND, "third", OMP_SID_THIRD),
-    ] {
-        h.run_cli_ok(&["session", operation, title]);
-        wait_for_path(&control.join(format!("ready-{slot}")));
-        assert!(
-            !tmux_pane_start_command(&h, title).contains(OMP_ROUTING_SECRET),
-            "{operation} must not persist dotenv-expanded routing secrets in pane argv"
-        );
-        wait_for_agent_session_id(&h, title, expected);
-        let generation = session_field(&h, title, "omp_capture_generation")
-            .unwrap_or_else(|| panic!("{operation} must persist an OMP capture generation"));
-        generations.push(generation);
-    }
-    // Restart and a fresh same-cwd launch must each mint their own durable
-    // generation; a collision would let one pane's capture clobber another's.
-    let distinct: std::collections::HashSet<_> = generations.iter().collect();
-    assert_eq!(
-        distinct.len(),
-        generations.len(),
-        "each same-cwd (re)launch must mint a distinct OMP capture generation: {generations:?}"
-    );
-    assert_eq!(
-        agent_session_id(&h, OMP_TITLE_FIRST).as_deref(),
-        Some(OMP_SID_SECOND),
-        "the second same-cwd launch must not steal the restarted pane's SID2"
-    );
 }
 
 #[test]
