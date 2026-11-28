@@ -5080,7 +5080,7 @@ async fn list_sessions_derives_keeps_context_from_the_cached_config() {
     // The row constructor reads no config; only the list overlay can know this wrapper's identity.
     let bare = super::model::session_response_from_instance_with_plan(
         &sessions[0],
-        false,
+        &crate::json_probe::Memo::default(),
         None,
         crate::daemon::AcpWorkerState::Absent,
         None,
