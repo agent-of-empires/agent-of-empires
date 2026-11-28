@@ -3397,6 +3397,9 @@ thread_local! {
     static AGENT_PROBE_MISS_GATE: std::cell::RefCell<Option<(
         std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>,
     )>> = const { std::cell::RefCell::new(None) };
+    static AGENT_PROBE_WARM_READ_GATE: std::cell::RefCell<Option<(
+        std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>,
+    )>> = const { std::cell::RefCell::new(None) };
     static AGENT_PROBE_LOCK_CONTENDED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -3491,14 +3494,36 @@ fn probe_agents_available_inner(
     cancel: Option<&tokio_util::sync::CancellationToken>,
     force: bool,
 ) -> (std::collections::HashSet<String>, HashMap<String, String>) {
-    let (mut found, uncached) = if force {
+    let (mut found, mut uncached) = if force {
         (HashSet::new(), agents.to_vec())
     } else {
         partition_cached_agents(agents)
     };
+    #[cfg(test)]
+    if let Some((entered, resume)) =
+        AGENT_PROBE_WARM_READ_GATE.with(|gate| gate.borrow_mut().take())
+    {
+        let _ = entered.send(());
+        let _ = resume.recv();
+    }
     if uncached.is_empty() {
         let discovered = snapshot_discovered_binaries(agents, &found);
-        return (found, discovered);
+        let inconsistent: Vec<_> = agents
+            .iter()
+            .copied()
+            .filter(|agent| {
+                found.contains(agent.name)
+                    && !agent.fallback_binaries.is_empty()
+                    && !discovered.contains_key(agent.name)
+            })
+            .collect();
+        if inconsistent.is_empty() {
+            return (found, discovered);
+        }
+        for agent in inconsistent {
+            found.remove(agent.name);
+            uncached.push(agent);
+        }
     }
 
     #[cfg(test)]
@@ -3533,10 +3558,19 @@ fn probe_agents_available_inner(
             .write()
             .unwrap_or_else(|error| error.into_inner()) = None;
     }
-    let (already_found, uncached) = partition_cached_agents(&uncached);
+    let (already_found, mut uncached) = partition_cached_agents(&uncached);
     found.extend(already_found);
+    let discovered = snapshot_discovered_binaries(agents, &found);
+    for agent in agents {
+        if found.contains(agent.name)
+            && !agent.fallback_binaries.is_empty()
+            && !discovered.contains_key(agent.name)
+        {
+            found.remove(agent.name);
+            uncached.push(*agent);
+        }
+    }
     if uncached.is_empty() {
-        let discovered = snapshot_discovered_binaries(agents, &found);
         return (found, discovered);
     }
 
@@ -6324,5 +6358,72 @@ AOE_AGENT_OK\n";
         memo.clear();
         assert!(probe_agents_available(&[cursor]).contains("cursor"));
         assert_eq!(cursor.resolved_binary(), "agent");
+    }
+
+    /// A concurrent refresh clearing discovery between the warm availability read
+    /// and the discovered-binary read must re-probe under `AGENT_PROBE_LOCK`
+    /// rather than returning `None` and falling back to the missing primary name.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn warm_cache_probe_reprobes_when_refresh_clears_discovery_between_reads() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        let login_bin = home.path().join("login-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&login_bin).unwrap();
+
+        let make_exec = |path: &std::path::Path, content: &str| {
+            std::fs::write(path, content).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        make_exec(
+            &bin.join("which"),
+            "#!/bin/sh\nIFS=:; for d in $PATH; do [ -x \"$d/$1\" ] && exit 0; done; exit 1\n",
+        );
+        make_exec(&login_bin.join("cursor-agent"), "#!/bin/sh\nexit 0\n");
+        make_exec(
+            &bin.join("login-shell"),
+            &format!(
+                "#!/bin/sh\nexport PATH={}:$PATH\nexec /bin/sh -c \"$2\"\n",
+                shell_words::quote(login_bin.to_str().unwrap())
+            ),
+        );
+
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.path().to_path_buf()),
+            ("PATH", bin.clone()),
+            ("SHELL", bin.join("login-shell")),
+        ]);
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+        let cursor = crate::agents::get_agent("cursor").unwrap();
+
+        // Warm both availability and discovered-binary caches.
+        assert_eq!(
+            probe_agent_discovered_binary(cursor).as_deref(),
+            Some("cursor-agent")
+        );
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            AGENT_PROBE_WARM_READ_GATE.with(|gate| {
+                *gate.borrow_mut() = Some((entered_tx, resume_rx));
+            });
+            probe_agent_discovered_binary(cursor)
+        });
+
+        // Wait until the warm caller has read availability, then clear discovery
+        // before it reads `DISCOVERED_AGENT_BINARIES`.
+        entered_rx.recv().expect("warm read gate entered");
+        invalidate_agent_availability();
+        resume_tx.send(()).expect("warm read gate resumed");
+
+        assert_eq!(handle.join().unwrap().as_deref(), Some("cursor-agent"));
     }
 }
