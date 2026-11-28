@@ -31,6 +31,34 @@ const boxes = () =>
     .map((b) => [b.closest("label")!.textContent, (b as HTMLInputElement).checked]);
 
 describe("NewGroupDialog", () => {
+  it("lists a profile's Sessions once one becomes movable after it opened", () => {
+    const props = { selectedId: null, onCancel: vi.fn(), onCreated: vi.fn() };
+    const { rerender } = render(
+      <NewGroupDialog
+        sessions={[makeSession({ id: "a", title: "alpha", group_path: "", status: "Creating" })]}
+        {...props}
+      />,
+    );
+    expect(within(screen.getByTestId("new-group-sessions")).queryAllByRole("checkbox")).toEqual([]);
+    rerender(<NewGroupDialog sessions={[makeSession({ id: "a", title: "alpha", group_path: "" })]} {...props} />);
+    expect(boxes()).toEqual([["alpha", false]]);
+  });
+
+  it("keeps Tab inside and hands focus back to its opener on close", () => {
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+    const { unmount } = render(
+      <NewGroupDialog sessions={SESSIONS} selectedId="b" onCancel={vi.fn()} onCreated={vi.fn()} />,
+    );
+    const create = screen.getByTestId("new-group-create");
+    create.focus();
+    fireEvent.keyDown(create, { key: "Tab" });
+    expect(document.activeElement).toBe(screen.getByLabelText("Group name"));
+    unmount();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
   it.each<[string, boolean, string[]]>([
     ["offers only Sessions the Daemon can move", false, ["alpha", "terminal"]],
     ["offers only Structured view Sessions under CityHall", true, ["alpha"]],

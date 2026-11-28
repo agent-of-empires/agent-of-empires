@@ -17,8 +17,9 @@ export function applyViewPatch(view: SidebarView, patch: SidebarViewPatch): Side
   if (patch.group_by) next.group_by = patch.group_by;
   if (patch.sort) next.sort = patch.sort;
   if (patch.group_by || patch.sort) next.changed_by = "web";
-  if (patch.sort || patch.web_plugin_sort === null) delete next.web_plugin_sort;
-  else if (patch.web_plugin_sort) next.web_plugin_sort = patch.web_plugin_sort;
+  // An explicit marker wins over the clear a sort pick makes, as on the Daemon.
+  if (patch.web_plugin_sort) next.web_plugin_sort = patch.web_plugin_sort;
+  else if (patch.sort || patch.web_plugin_sort === null) delete next.web_plugin_sort;
   return next;
 }
 
@@ -30,14 +31,19 @@ export const sameView = (a: SidebarView, b: SidebarView) =>
 
 const PEER_PLACE = { tui: "in the TUI" } as const;
 
-/** Why the list moved when another Client kind changed the view from `before` to `after`, or null when this
- *  dashboard's own kind did, or neither the grouping nor the sort changed. */
-export function peerViewChangeNotice(before: SidebarView | null, after: SidebarView | null): string | null {
-  if (!before || !after) return null;
+/** Why the list moved to `after`, a Daemon read, from `shown`: names each of the grouping and sort that changed both
+ *  on screen and since `lastRead`, the read last shown, when another Client kind made the change. A field that only
+ *  changed on screen, such as this browser's refused pick falling back, is not named. */
+export function peerViewChangeNotice(
+  shown: SidebarView,
+  lastRead: SidebarView | null,
+  after: SidebarView | null,
+): string | null {
+  if (!lastRead || !after) return null;
   const by = after.changed_by;
   if (!by || by === "web") return null;
-  const grouping = before.group_by !== after.group_by;
-  const sort = before.sort !== after.sort;
+  const grouping = shown.group_by !== after.group_by && lastRead.group_by !== after.group_by;
+  const sort = shown.sort !== after.sort && lastRead.sort !== after.sort;
   if (!grouping && !sort) return null;
   const what = grouping && sort ? "Grouping and sort" : grouping ? "Grouping" : "Sort";
   return `${what} changed ${PEER_PLACE[by]}`;

@@ -197,10 +197,8 @@ export function SidebarViewMenu({
             testId="sidebar-view-new-group"
             disabled={newGroupDisabled && !(newGroupLocked && lockReason)}
             disabledBy={newGroupLocked && lockReason ? reasonId : undefined}
-            onClick={() => {
-              setOpen(false);
-              onNewGroup();
-            }}
+            // From the keyboard the trigger takes focus first, so the dialog hands it back there on close.
+            onClick={(e) => choose(e.detail === 0, onNewGroup)}
           >
             + New group…
           </MenuItem>

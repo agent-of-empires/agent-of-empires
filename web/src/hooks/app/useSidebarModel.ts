@@ -251,14 +251,18 @@ export function useSidebarModel({
     () => displayGroups.map((g) => `${g.id}:${g.workspaces.map((v) => v.key).join(",")}`).join("|"),
     [displayGroups],
   );
-  const lastShown = useRef({ polled: polledView, order: shownOrder });
+  const lastShown = useRef({ view, polled: polledView, order: shownOrder });
   useEffect(() => {
     const last = lastShown.current;
-    lastShown.current = { polled: polledView, order: shownOrder };
-    if (last.order === "" || last.order === shownOrder) return;
-    const notice = peerViewChangeNotice(last.polled, polledView);
+    // The baseline is the last read shown on screen, so a read held behind this browser's own write is compared
+    // with what was on screen once the list adopts it.
+    const shown =
+      polledView && polledView.group_by === view.group_by && polledView.sort === view.sort ? polledView : null;
+    lastShown.current = { view, polled: shown ?? last.polled, order: shownOrder };
+    const moved = last.order !== "" && last.order !== shownOrder;
+    const notice = moved ? peerViewChangeNotice(last.view, last.polled, shown) : null;
     if (notice) reportInfo(notice);
-  }, [polledView, shownOrder]);
+  }, [view, polledView, shownOrder]);
 
   // Like the TUI, a move is refused while the last one is saving, so it never builds on a write that may fail.
   const switching = useRef(false);
@@ -355,28 +359,42 @@ export function useSidebarModel({
     },
     [groupBy, changeSidebarView],
   );
-  // The plugin sort marker the other Clients show, as this browser last set it. It follows the active plugin sort,
-  // so a plugin that goes away clears it, and the page clears it as it unloads.
-  const markerSent = useRef<string | null>(null);
+  // The plugin sort marker the other Clients show, as this browser last set it, or undefined after a write failed.
+  // It follows the active plugin sort, so a plugin that goes away clears it, and the page clears it as it unloads.
+  const markerSent = useRef<string | null | undefined>(null);
+  const wantedRef = useRef<string | null>(null);
   const sendMarker = useCallback(
-    (label: string | null | undefined) => {
-      if (label === undefined || !viewWritable || label === markerSent.current) return;
+    (label: string | null) => {
+      if (!viewWritable || label === markerSent.current) return;
       markerSent.current = label;
-      rememberMarker(label);
-      void changeSidebarView({ web_plugin_sort: label });
+      if (label) rememberMarker(label);
+      void changeSidebarView({ web_plugin_sort: label }).then((result) => {
+        // A newer pick owns the marker now.
+        if (markerSent.current !== label) return;
+        if (result.receipt === null) markerSent.current = undefined;
+        else if (label === null) rememberMarker(null);
+      });
     },
     [viewWritable, changeSidebarView],
   );
-  // Undefined while no plugin sort is picked, which leaves the marker to the sort picks.
   const wantedMarker = useMemo(() => {
-    if (!pluginSortRef) return undefined;
-    const label = activePluginSort?.label;
+    const label = pluginSortRef ? activePluginSort?.label : undefined;
     return label?.trim() ? [...label].slice(0, 64).join("") : null;
   }, [pluginSortRef, activePluginSort]);
-  useEffect(() => sendMarker(wantedMarker), [wantedMarker, sendMarker]);
+  useEffect(() => {
+    wantedRef.current = wantedMarker;
+    sendMarker(wantedMarker);
+  }, [wantedMarker, sendMarker]);
+  // A failed marker write is retried on the next read, with the plugin sort picked then.
+  useEffect(() => {
+    const unsubscribe = onSharedRead(() => {
+      if (markerSent.current === undefined) sendMarker(wantedRef.current);
+    });
+    return unsubscribe;
+  }, [onSharedRead, sendMarker]);
   useEffect(() => {
     const onHide = () => {
-      if (markerSent.current) clearWebPluginSortOnUnload();
+      if (markerSent.current !== null) clearWebPluginSortOnUnload();
     };
     window.addEventListener("pagehide", onHide);
     return () => window.removeEventListener("pagehide", onHide);
@@ -388,7 +406,7 @@ export function useSidebarModel({
       if (!loaded || staleChecked.current) return;
       staleChecked.current = true;
       const stale = rememberedMarker();
-      if (!stale || markerSent.current) return;
+      if (!stale || markerSent.current !== null) return;
       rememberMarker(null);
       if (viewWritable && daemonMarker === stale) void changeSidebarView({ web_plugin_sort: null });
     },
@@ -408,11 +426,16 @@ export function useSidebarModel({
         return;
       }
       dropUndo();
-      if (viewWritable) {
+      const write = changeSidebarView({ sort: next });
+      // The Daemon clears the marker with a web sort; if that write fails, the next read retries the clear.
+      if (viewWritable && markerSent.current !== null) {
         markerSent.current = null;
-        rememberMarker(null);
+        void write.then((result) => {
+          if (markerSent.current !== null) return;
+          if (result.receipt === null) markerSent.current = undefined;
+          else rememberMarker(null);
+        });
       }
-      void changeSidebarView({ sort: next });
     },
     [sort, viewWritable, dropUndo, sendMarker, changeSidebarView],
   );

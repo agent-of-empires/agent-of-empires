@@ -371,8 +371,42 @@ describe("another Client's view change", () => {
     await waitFor(() => expect(rows(result)).toHaveLength(2));
     daemon.sidebar_view = { ...daemon.sidebar_view, ...change };
     await pollAt(result, 2);
-    await waitFor(() => expect(result.current.model.groupBy).toBe(change.group_by ?? "project"));
+    // Silence counts only once the list shows the new view.
+    await waitFor(() =>
+      expect([result.current.model.groupBy, result.current.model.sort]).toEqual([
+        change.group_by ?? "project",
+        change.sort ?? "custom",
+      ]),
+    );
     expect(toasts.info.mock.calls).toEqual(notice ? [[notice]] : []);
+  });
+
+  it("names the TUI for a change it made while this browser's write held the list", async () => {
+    // Custom puts mike first and Name puts alpha first, under either grouping.
+    daemon.sessions = [row("b1", "/r/beta", "alpha"), row("a1", "/r/Alpha", "mike")];
+    daemon.workspace_ordering = ["/r/Alpha::a1", "/r/beta::b1"];
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(2));
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    server.use(
+      http.patch("*/api/sidebar-view", async ({ request }) => {
+        daemon.sidebar_view = patchView((await request.json()) as Record<string, unknown>);
+        daemon.revision = 2;
+        await held;
+        return HttpResponse.json(daemon.sidebar_view, { headers: runtime(2) });
+      }),
+    );
+    act(() => result.current.model.selectGroupBy("group"));
+    await waitFor(() => expect(daemon.revision).toBe(2));
+    // The TUI changes the sort before this browser has its receipt, so the read is held off the list.
+    daemon.sidebar_view = { ...daemon.sidebar_view, sort: "name", changed_by: "tui" };
+    await pollAt(result, 3);
+    expect(result.current.model.sort).toBe("custom");
+    await act(async () => release());
+    await pollAt(result, 4);
+    await waitFor(() => expect(result.current.model.sort).toBe("name"));
+    expect(toasts.info.mock.calls).toEqual([["Sort changed in the TUI"]]);
   });
 
   it("does not blame the TUI for this browser's refused pick falling back", async () => {
@@ -447,6 +481,28 @@ describe("plugin sorts", () => {
     await pollAt(result, 2);
     expect(writes.map((w) => w.body)).toEqual(cleared ? [{ web_plugin_sort: null }] : []);
     expect(sessionStorage.getItem("aoe-web-plugin-sort-marker")).toBeNull();
+  });
+
+  it("retries a marker write that failed on the next read", async () => {
+    let refused = false;
+    server.use(
+      http.patch(
+        "*/api/sidebar-view",
+        () => {
+          refused = true;
+          return new HttpResponse(null, { status: 500 });
+        },
+        { once: true },
+      ),
+    );
+    const { result } = mount();
+    await waitFor(() => expect(rows(result)).toHaveLength(3));
+    act(() => result.current.model.selectPluginSort({ pluginId: "p", entryId: "cost" }));
+    await waitFor(() => expect(refused).toBe(true));
+    await act(async () => {});
+    expect(daemon.sidebar_view.web_plugin_sort).toBeUndefined();
+    await pollAt(result, 2);
+    await waitFor(() => expect(daemon.sidebar_view.web_plugin_sort).toBe("Cost"));
   });
 
   it("writes no marker where the Daemon refuses view changes", async () => {

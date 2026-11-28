@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { createGroup, type CreateGroupResult } from "../../lib/api";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { isImeComposing } from "../../lib/ime";
 import type { SessionResponse } from "../../lib/types";
 import { SidebarModal } from "./SidebarModal";
@@ -8,6 +9,7 @@ import { BUTTON_GHOST, BUTTON_PRIMARY, INPUT } from "../../lib/surfaces";
 function refusal(result: Exclude<CreateGroupResult, { ok: true }>): string {
   if (result.code === "group_sessions_required") return "Pick at least one session.";
   if (result.code === "read_only") return "This Daemon is read-only.";
+  if (result.code === "session_trashed") return "A picked session is in the Trash. Pick again.";
   switch (result.status) {
     case 0:
       return "Couldn't reach the Daemon.";
@@ -57,11 +59,16 @@ export function NewGroupDialog({
   );
   const profiles = useMemo(() => [...new Set(live.map((s) => s.profile))].sort(), [live]);
   const selected = live.find((s) => s.id === selectedId);
-  const [profile, setProfile] = useState(selected?.profile ?? profiles[0] ?? "");
+  const [chosenProfile, setProfile] = useState(selected?.profile ?? profiles[0] ?? "");
+  // The pick while it still has movable Sessions, else the first profile that does, as the list changes.
+  const profile = profiles.includes(chosenProfile) ? chosenProfile : (profiles[0] ?? "");
   const [name, setName] = useState("");
   const [checked, setChecked] = useState<Set<string>>(() => new Set(selected ? [selected.id] : []));
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const formRef = useRef<HTMLFormElement>(null);
+  // Tab stays in the dialog, and closing it returns focus to whatever opened it.
+  useFocusTrap(() => formRef.current, { restoreFocus: true });
   const shown = live.filter((s) => s.profile === profile);
   const picked = shown.filter((s) => checked.has(s.id)).map((s) => s.id);
 
@@ -103,6 +110,7 @@ export function NewGroupDialog({
       onCancel={onCancel}
     >
       <form
+        ref={formRef}
         onSubmit={(e) => {
           e.preventDefault();
           void submit();

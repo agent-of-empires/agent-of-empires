@@ -108,6 +108,15 @@ describe("SidebarViewMenu", () => {
     expect(props.onSortChange).toHaveBeenCalledWith("custom");
   });
 
+  it("hands focus to the trigger before a keyboard New group opens its dialog", () => {
+    const trigger = () => screen.getByTestId("sidebar-view-toggle");
+    const { props, open } = setup({ onNewGroup: vi.fn(() => expect(document.activeElement).toBe(trigger())) });
+    open();
+    // A keyboard click carries no pointer detail.
+    fireEvent.click(screen.getByTestId("sidebar-view-new-group"), { detail: 0 });
+    expect(props.onNewGroup).toHaveBeenCalledTimes(1);
+  });
+
   it("moves with the arrow keys and hands focus back on Escape", () => {
     const { open } = setup();
     open();
