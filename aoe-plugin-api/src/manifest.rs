@@ -78,6 +78,10 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks: Option<HooksSpec>,
 
+    /// Worker methods the host may call on the plugin's behalf (`api_version >= 29`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_calls: Vec<ProviderCall>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aoe_version: Option<String>,
 }
@@ -668,6 +672,34 @@ pub fn deep_link_value_ok(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
+}
+
+pub const PROVIDER_CALL_DEFAULT_TIMEOUT_MS: u64 = 5_000;
+pub const PROVIDER_CALL_MAX_TIMEOUT_MS: u64 = 60_000;
+pub const PROVIDER_CALL_DEFAULT_MAX_BYTES: usize = 1024 * 1024;
+pub const PROVIDER_CALL_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Prefix of the JSON-RPC method the host sends the worker for a provider call.
+pub const PROVIDER_CALL_METHOD_PREFIX: &str = "provider.";
+
+/// A worker method callable through the daemon as `provider.<name>` (`api_version >= 29`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCall {
+    /// `[a-z0-9_.-]+`, unique within the manifest.
+    pub name: String,
+    #[serde(default = "default_provider_call_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Bounds both the serialized request params and the serialized reply result.
+    #[serde(default = "default_provider_call_max_bytes")]
+    pub max_bytes: usize,
+}
+
+fn default_provider_call_timeout_ms() -> u64 {
+    PROVIDER_CALL_DEFAULT_TIMEOUT_MS
+}
+
+fn default_provider_call_max_bytes() -> usize {
+    PROVIDER_CALL_DEFAULT_MAX_BYTES
 }
 
 pub const MCP_REWRITE_DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -1951,6 +1983,51 @@ impl PluginManifest {
                 format!("hooks.mcp_rewrite.timeout_ms must be 1..={MCP_REWRITE_MAX_TIMEOUT_MS}"),
             );
         }
+        if !self.provider_calls.is_empty() {
+            check(
+                self.api_version >= 29,
+                "provider_calls requires api_version >= 29".into(),
+            );
+            check(
+                self.runtime.is_some(),
+                "provider_calls requires a runtime worker".into(),
+            );
+            check(
+                self.capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "runtime.worker"),
+                "provider_calls requires the runtime.worker capability".into(),
+            );
+            let mut seen = std::collections::HashSet::new();
+            for call in &self.provider_calls {
+                let name = &call.name;
+                check(
+                    !name.is_empty()
+                        && name.bytes().all(|b| {
+                            b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b)
+                        }),
+                    format!("provider_calls name {name:?} must match [a-z0-9_.-]+"),
+                );
+                check(
+                    !name.starts_with(PROVIDER_CALL_METHOD_PREFIX),
+                    format!("provider_calls name {name:?} must not start with \"provider.\""),
+                );
+                check(
+                    seen.insert(name.as_str()),
+                    format!("duplicate provider_calls name {name:?}"),
+                );
+                check(
+                    (1..=PROVIDER_CALL_MAX_TIMEOUT_MS).contains(&call.timeout_ms),
+                    format!("provider_calls {name:?} timeout_ms must be 1..={PROVIDER_CALL_MAX_TIMEOUT_MS}"),
+                );
+                check(
+                    (1..=PROVIDER_CALL_MAX_BYTES).contains(&call.max_bytes),
+                    format!(
+                        "provider_calls {name:?} max_bytes must be 1..={PROVIDER_CALL_MAX_BYTES}"
+                    ),
+                );
+            }
+        }
         if self
             .capabilities
             .iter()
@@ -2086,6 +2163,107 @@ mod tests {
              [runtime]\nkind = \"command\"\ncommand = [\"bin/worker\"]\n\n\
              [hooks.mcp_rewrite]\n{hook_body}"
         )
+    }
+
+    fn provider_calls_toml(api_version: u32, caps: &str, calls: &str) -> String {
+        format!(
+            "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\
+             capabilities = [{caps}]\n\n\
+             [runtime]\nkind = \"command\"\ncommand = [\"bin/worker\"]\n\n{calls}"
+        )
+    }
+
+    #[test]
+    fn provider_calls_parse_with_defaults_and_explicit_values() {
+        let m = PluginManifest::from_toml_str(&provider_calls_toml(
+            29,
+            "\"runtime.worker\"",
+            "[[provider_calls]]\nname = \"status\"\n\n\
+             [[provider_calls]]\nname = \"x.y_z-1\"\ntimeout_ms = 60000\nmax_bytes = 10\n",
+        ))
+        .expect("v29 provider_calls parse");
+        assert_eq!(
+            m.provider_calls[0].timeout_ms,
+            PROVIDER_CALL_DEFAULT_TIMEOUT_MS
+        );
+        assert_eq!(
+            m.provider_calls[0].max_bytes,
+            PROVIDER_CALL_DEFAULT_MAX_BYTES
+        );
+        assert_eq!(m.provider_calls[1].timeout_ms, 60_000);
+        assert_eq!(m.provider_calls[1].max_bytes, 10);
+    }
+
+    #[test]
+    fn provider_calls_are_validated() {
+        let caps = "\"runtime.worker\"";
+        let call = |body: &str| format!("[[provider_calls]]\n{body}");
+        let no_runtime =
+            "id = \"acme.gate\"\nname = \"Gate\"\nversion = \"1.0.0\"\napi_version = 29\n\
+             capabilities = [\"runtime.worker\"]\n\n[[provider_calls]]\nname = \"a\"\n"
+                .to_string();
+        rejects(&[
+            (
+                "below v29",
+                provider_calls_toml(28, caps, &call("name = \"a\"\n")),
+                "api_version >= 29",
+            ),
+            (
+                "missing capability",
+                provider_calls_toml(29, "", &call("name = \"a\"\n")),
+                "runtime.worker capability",
+            ),
+            ("missing runtime", no_runtime, "runtime worker"),
+            (
+                "empty name",
+                provider_calls_toml(29, caps, &call("name = \"\"\n")),
+                "[a-z0-9_.-]+",
+            ),
+            (
+                "uppercase name",
+                provider_calls_toml(29, caps, &call("name = \"Foo\"\n")),
+                "[a-z0-9_.-]+",
+            ),
+            (
+                "reserved prefix",
+                provider_calls_toml(29, caps, &call("name = \"provider.x\"\n")),
+                "must not start with",
+            ),
+            (
+                "duplicate",
+                provider_calls_toml(
+                    29,
+                    caps,
+                    &format!("{}\n{}", call("name = \"a\"\n"), call("name = \"a\"\n")),
+                ),
+                "duplicate provider_calls",
+            ),
+            (
+                "zero timeout",
+                provider_calls_toml(29, caps, &call("name = \"a\"\ntimeout_ms = 0\n")),
+                "timeout_ms",
+            ),
+            (
+                "huge timeout",
+                provider_calls_toml(29, caps, &call("name = \"a\"\ntimeout_ms = 60001\n")),
+                "timeout_ms",
+            ),
+            (
+                "zero max_bytes",
+                provider_calls_toml(29, caps, &call("name = \"a\"\nmax_bytes = 0\n")),
+                "max_bytes",
+            ),
+            (
+                "huge max_bytes",
+                provider_calls_toml(29, caps, &call("name = \"a\"\nmax_bytes = 16777217\n")),
+                "max_bytes",
+            ),
+            (
+                "unknown key",
+                provider_calls_toml(29, caps, &call("name = \"a\"\nbogus = 1\n")),
+                "bogus",
+            ),
+        ]);
     }
 
     #[test]
