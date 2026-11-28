@@ -77,7 +77,7 @@ For status, a session's own integration takes precedence; an unowned tool may us
 
 These declarations require API 21 and a host that implements them. API 20 hosts reject them; API 20 agent integrations remain supported. Built-in agents and aliases retain precedence. An approved, enabled API 21 OMP launch declaration supersedes the bundled OMP launch contract, including for existing sessions with no stored command; provider status and replies still require their capability and valid reports. If that declaration is absent, disabled, or not approved, the bundled OMP launch, pane detection, and capture fallback remain available. A plugin-omp release declaring API 21 behavior is a separate prerequisite for the cutover.
 
-Launch flags, instruction templates, environment values, install hints, and literal reply keys reject control and Unicode format characters.
+Launch flags, instruction templates, environment values, install hints, ready markers, and literal reply keys reject control and Unicode format characters.
 
 ```toml
 capabilities = ["session.integration"]
@@ -96,6 +96,7 @@ model_flag = "--model"
 host_only = false
 install_hint = "Install example-agent from its vendor"
 send_keys_enter_delay_ms = 150
+ready_markers = ["ask anything"]
 
 [agent_integrations.launch.container_env]
 EXAMPLE_HOME = "/state"
@@ -125,6 +126,7 @@ The example's `detection` requires `session.integration` in the manifest's capab
 
 - `launch.aliases` are unique lowercase agent ids, distinct from the tool. `oneshot_flag` and `model_flag` are single shell-safe flags. `instruction_flag` has one `{}` placeholder, as a whole argument or after `=`, and otherwise contains shell-safe words.
 - `launch.send_keys_enter_delay_ms` is the pause, in milliseconds, that the host leaves between typing a message into the agent's pane and sending Enter. Some agents read a fast burst as a paste and drop the Enter, which leaves the message as an unsent draft that looks like a running session. It requires `api_version >= 22` and is capped at 2000. An agent that declares nothing falls back to the host's built-in pause for its tool.
+- `launch.ready_markers` is an optional list of at most 16 case-insensitive substrings of the agent's pane, each at most 128 characters; any one of them on screen means the input box is up, so the host may type a prompt into a running session. It requires `api_version >= 28` and has the same semantics as a built-in agent's markers. An agent that declares none keeps today's refusal: stable output cannot tell an input box from a dialog, so an initial prompt and `sessions.message.send` are not typed.
 - `launch.yolo` is `kind = "flag"` with `flag`, `kind = "always"`, or `kind = "env"` with `key` and `value`. An `always` declaration applies while active without changing the session's saved Yolo preference. `container_env` is applied to sandbox launches. Protected environment names are rejected.
 - `launch.resume` is `kind = "flag"` with `flag`, `kind = "flag_pair"` with `existing` and `new_session`, or `kind = "subcommand"` with `command`. Resume and capture require each other. Capture supports only backend `omp`, with `pane_scoped` in at least one of `host` or `sandbox` and `pane_scoped` or `unsupported` in the other.
 - `detection.mode = "native_only"` requires `session.integration`; the integration owns status rather than falling back to pane parsing when a report is missing or invalid.

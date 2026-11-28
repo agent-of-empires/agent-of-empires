@@ -3194,7 +3194,8 @@ fn pane_accepts_automatic_input(
         return Err(TerminalPromptBlocker::InputLineBusy.into());
     }
     let screen = screen.to_lowercase();
-    Ok(crate::agents::ready_markers(&instance.tool)
+    Ok(instance
+        .ready_markers()
         .iter()
         .any(|marker| screen.contains(marker)))
 }
@@ -3209,7 +3210,7 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         !instance.expects_shell() && !instance.has_command_override(),
         "initial prompts are only typed into a known agent"
     );
-    let markers = crate::agents::ready_markers(&instance.tool);
+    let markers = instance.ready_markers();
     anyhow::ensure!(
         !markers.is_empty(),
         "this agent has no ready marker, so the prompt is not typed"
@@ -3236,7 +3237,7 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     let tmux = instance.tmux_session()?;
     let ready = tmux
-        .wait_until_ready_unless(remaining, markers, |screen| {
+        .wait_until_ready_unless(remaining, &markers, |screen| {
             TerminalPromptBlocker::detect(&instance.tool, screen)
         })
         .map_err(anyhow::Error::from)?;

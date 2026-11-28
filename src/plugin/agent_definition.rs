@@ -16,6 +16,7 @@ use crate::agents::{
 /// Reference arrays owned separately from the declaration, without leaking a registry snapshot.
 pub(super) struct DefinitionData<'a> {
     aliases: Vec<&'a str>,
+    ready_markers: Vec<&'a str>,
     environment: Vec<(&'a str, &'a str)>,
     allow: Vec<KeyToken<'a>>,
     always: Option<Vec<KeyToken<'a>>>,
@@ -56,6 +57,11 @@ impl<'a> DefinitionData<'a> {
                 .launch
                 .iter()
                 .flat_map(|launch| launch.aliases.iter().map(String::as_str))
+                .collect(),
+            ready_markers: entry
+                .launch
+                .iter()
+                .flat_map(|launch| launch.ready_markers.iter().map(String::as_str))
                 .collect(),
             environment: entry
                 .launch
@@ -171,7 +177,7 @@ impl<'a> DefinitionData<'a> {
             fork_host_only: false,
             host_only: launch.host_only,
             send_keys_enter_delay_ms: launch.send_keys_enter_delay_ms.unwrap_or(0),
-            ready_markers: &[],
+            ready_markers: &self.ready_markers,
             install_hint: launch.install_hint.as_deref().unwrap_or(&entry.tool),
             permission_response: entry.reply_fallback.as_ref().map(|_| PermissionResponse {
                 allow: &self.allow,

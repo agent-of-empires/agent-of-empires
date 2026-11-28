@@ -283,7 +283,16 @@ fn terminal_prompt_is_deliverable(args: &AddArgs) -> bool {
         .cmd_override
         .as_deref()
         .is_some_and(|command| agent.is_none_or(|a| command != a.binary));
-    !overrides_agent && !crate::agents::ready_markers(tool).is_empty()
+    if overrides_agent {
+        return false;
+    }
+    if !crate::agents::ready_markers(tool).is_empty() {
+        return true;
+    }
+    // A plugin agent stands in for the built-in table, so its declaration is
+    // the only place its markers can come from.
+    crate::plugin::agent_integration::declared_ready_markers(tool)
+        .is_some_and(|markers| !markers.is_empty())
 }
 
 fn prompt_too_large() -> String {

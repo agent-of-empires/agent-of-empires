@@ -252,7 +252,7 @@ async fn send_terminal_message_inner(
                 .wait_until_ready_in(
                     &pane,
                     std::time::Duration::from_secs(5),
-                    crate::agents::ready_markers(&instance.tool),
+                    &instance.ready_markers(),
                 )
                 .map_err(|_| TerminalNotRunning)?;
             // Typed after a person's unsent text, the message would merge with it on Enter.

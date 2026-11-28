@@ -279,6 +279,31 @@ impl Instance {
         declared.unwrap_or_else(|| crate::agents::send_keys_enter_delay(&self.tool))
     }
 
+    /// Lowercased screen text that shows the agent's input box is up.
+    ///
+    /// Only the program a declaration actually owns takes its markers, so a
+    /// custom wrapper, command override, stored command or ambiguous claim keeps
+    /// the built-in table's markers for its tool. An unknown agent's list is
+    /// empty, which refuses automatic input.
+    pub(crate) fn ready_markers(&self) -> Vec<String> {
+        let declared = self.declared_agent().and_then(|agent| {
+            agent.with_definition(|definition| {
+                definition
+                    .ready_markers
+                    .iter()
+                    .map(|marker| marker.to_lowercase())
+                    .collect::<Vec<_>>()
+            })
+        });
+        match declared.filter(|markers| !markers.is_empty()) {
+            Some(markers) => markers,
+            None => crate::agents::ready_markers(&self.tool)
+                .iter()
+                .map(|marker| marker.to_lowercase())
+                .collect(),
+        }
+    }
+
     fn declared_session_support(
         &self,
         sandboxed: bool,

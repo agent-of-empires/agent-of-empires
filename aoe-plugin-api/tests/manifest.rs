@@ -476,6 +476,83 @@ fn send_keys_enter_delay_requires_api_22_and_caps_at_two_seconds() {
 }
 
 #[test]
+fn ready_markers_require_api_28_and_reject_unusable_text() {
+    let declaration = "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n\
+                       [agent_integrations.launch]\n\
+                       ready_markers = [\"ask anything\"]\n";
+
+    let parsed = parse(28, declaration);
+    let markers = &parsed.agent_integrations[0]
+        .launch
+        .as_ref()
+        .expect("declared")
+        .ready_markers;
+    assert_eq!(markers, &["ask anything"]);
+    assert_eq!(
+        &PluginManifest::from_toml_str(&toml::to_string(&parsed).unwrap())
+            .expect("round-trips")
+            .agent_integrations[0]
+            .launch
+            .as_ref()
+            .expect("declared")
+            .ready_markers,
+        markers
+    );
+
+    let errors = invalid(27, declaration);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("ready_markers requires api_version >= 28")),
+        "{errors:?}"
+    );
+
+    // Empty and blank markers cannot identify an input box, and no marker may
+    // carry control or format characters onto the screen the host matches.
+    for marker in ["\"\"", "\"  \"", "\"ask\\u001b[2J\""] {
+        let errors = invalid(28, &declaration.replace("\"ask anything\"", marker));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("ready_markers[0] must be a nonempty on-screen string")),
+            "{marker}: {errors:?}"
+        );
+    }
+
+    let too_many: Vec<String> = (0..17).map(|i| format!("\"m{i}\"")).collect();
+    let errors = invalid(
+        28,
+        &declaration.replace("[\"ask anything\"]", &format!("[{}]", too_many.join(", "))),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("at most 16 markers")),
+        "{errors:?}"
+    );
+
+    // The length cap counts characters, so a 128-character marker of multi-byte
+    // screen text fits and one character over does not.
+    parse(
+        28,
+        &declaration.replace("\"ask anything\"", &format!("\"{}\"", "é".repeat(128))),
+    );
+    let errors = invalid(
+        28,
+        &declaration.replace("\"ask anything\"", &format!("\"{}\"", "é".repeat(129))),
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("ready_markers[0] must be a nonempty on-screen string")),
+        "{errors:?}"
+    );
+
+    // An empty list declares nothing, so it stays valid before API 28.
+    parse(21, &declaration.replace("[\"ask anything\"]", "[]"));
+}
+
+#[test]
 fn session_id_capture_requires_api_22_and_a_worker_runtime() {
     let runtime = "capabilities = [\"runtime.worker\"]\n\
                    [runtime]\n\

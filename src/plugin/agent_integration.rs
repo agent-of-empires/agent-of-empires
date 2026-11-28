@@ -362,6 +362,21 @@ pub(crate) fn declared_agent<'a>(
     })
 }
 
+/// Ready markers from the declaration that owns `tool`'s launch, or `None` when
+/// no active plugin declares the name. `Some` with an empty list is a
+/// declaration whose input box cannot be told from a dialog.
+pub(crate) fn declared_ready_markers(tool: &str) -> Option<Vec<String>> {
+    declared_agent(super::registry(), tool, std::iter::empty()).and_then(|agent| {
+        agent.with_definition(|definition| {
+            definition
+                .ready_markers
+                .iter()
+                .map(|marker| marker.to_string())
+                .collect()
+        })
+    })
+}
+
 /// Whether a character could spoof or rewrite displayed text: control
 /// characters (Cc) and Unicode format characters (Cf), especially the bidi
 /// controls a browser or terminal would otherwise reorder.
@@ -427,6 +442,17 @@ pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> 
         }
         if let Some(delay) = launch.send_keys_enter_delay_ms {
             lines.push(format!("  enter delay: {delay} ms"));
+        }
+        if !launch.ready_markers.is_empty() {
+            lines.push(format!(
+                "  ready markers: {}",
+                launch
+                    .ready_markers
+                    .iter()
+                    .map(|value| display_command(value))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         if !launch.aliases.is_empty() {
             lines.push(format!(
@@ -2251,6 +2277,113 @@ sandbox = "unsupported"
         assert_eq!(instance("codex", "").send_keys_enter_delay(), 150);
     }
 
+    /// A declared marker list is what makes a plugin agent's pane typeable: it
+    /// resolves through the definition instead of the built-in table, which has
+    /// no entry for a plugin tool, and an empty list keeps the refusal.
+    #[test]
+    #[serial_test::serial]
+    fn a_declared_ready_marker_gates_prompt_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_manifest(
+            "acme.marker",
+            r#"
+id = "acme.marker"
+name = "Marker"
+version = "1.0.0"
+api_version = 28
+
+[[agent_integrations]]
+tool = "marker-helper"
+command = "marker-helper"
+
+[agent_integrations.launch]
+ready_markers = ["Ask anything", "type a message"]
+"#,
+        );
+        install_test_manifest(
+            "acme.markerless",
+            r#"
+id = "acme.markerless"
+name = "Markerless"
+version = "1.0.0"
+api_version = 28
+
+[[agent_integrations]]
+tool = "markerless-helper"
+command = "markerless-helper"
+
+[agent_integrations.launch]
+oneshot_flag = "-p"
+"#,
+        );
+        super::super::reload_registry();
+
+        let instance = |tool: &str| {
+            let mut instance = Instance::new("declared-markers", temp.path().to_str().unwrap());
+            instance.tool = tool.into();
+            instance
+        };
+
+        // The declaration reaches the definition, and the host compares it
+        // against a lowercased screen like a built-in agent's markers.
+        assert_eq!(
+            declared_agent(
+                super::super::registry(),
+                "marker-helper",
+                std::iter::empty()
+            )
+            .expect("declared")
+            .with_definition(|definition| {
+                definition
+                    .ready_markers
+                    .iter()
+                    .map(|marker| marker.to_string())
+                    .collect::<Vec<_>>()
+            }),
+            Some(vec![
+                "Ask anything".to_string(),
+                "type a message".to_string()
+            ])
+        );
+        assert_eq!(
+            instance("marker-helper").ready_markers(),
+            ["ask anything", "type a message"]
+        );
+
+        // A declaration with no markers cannot tell its input box from a dialog.
+        assert!(instance("markerless-helper").ready_markers().is_empty());
+
+        // A built-in keeps the compiled-in table and gains nothing from a plugin.
+        assert_eq!(
+            instance("claude").ready_markers(),
+            crate::agents::ready_markers("claude")
+        );
+
+        // The `aoe add --prompt` gate answers the same way before any row exists.
+        assert!(declared_ready_markers("marker-helper").is_some_and(|markers| !markers.is_empty()));
+        assert!(
+            declared_ready_markers("markerless-helper").is_some_and(|markers| markers.is_empty())
+        );
+        assert_eq!(declared_ready_markers("claude"), None);
+
+        // Disabling the plugin leaves the tool unknown, not a stale declaration:
+        // the refusal returns instead of markers nobody grants any more.
+        crate::session::update_config(|config| {
+            config.plugins.get_mut("acme.marker").unwrap().enabled = false;
+        })
+        .unwrap();
+        super::super::reload_registry();
+        assert_eq!(declared_ready_markers("marker-helper"), None);
+        assert!(instance("marker-helper").ready_markers().is_empty());
+    }
+
     /// Two approved providers make the own-name claim ambiguous. A readable
     /// custom selection still owns its program, so ambiguity must not hand it to
     /// the plugins and report `Unknown` over the wrapper's pane rules.
@@ -3010,6 +3143,29 @@ command = "acme-omp-shim"
             lines
                 .iter()
                 .any(|line| line.contains("enter delay: 150 ms")),
+            "{lines:?}"
+        );
+    }
+
+    /// A marker-only declaration change re-prompts for consent, so the prompt
+    /// must show the screen text the user is approving.
+    #[test]
+    fn consent_lines_disclose_ready_markers() {
+        use aoe_plugin_api::agent_integration::AgentLaunchDeclaration;
+        let integration = AgentIntegrationContribution {
+            tool: "helper".into(),
+            command: Some("helper".into()),
+            launch: Some(AgentLaunchDeclaration {
+                ready_markers: vec!["ask anything".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let lines = consent_lines(&integration);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("ready markers: ask anything")),
             "{lines:?}"
         );
     }
