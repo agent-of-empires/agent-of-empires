@@ -138,7 +138,7 @@ struct RawInputLine {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawInputBox {
-    /// Matches the prompt glyph at the start of a line; the rest of the line is the typed text.
+    /// Matches the prompt glyph at the start of a line (anchored implicitly); the rest of the line is the typed text.
     prompt: String,
     /// Matched against the trimmed line; matching lines are skipped above the box.
     #[serde(default)]
@@ -602,13 +602,13 @@ impl Manifest {
                         anyhow::anyhow!("input_box {what} {p:?} is not a valid regex: {e}")
                     })
                 };
-                let prompt = compile("prompt", &geometry.prompt)?;
-                if !geometry.prompt.starts_with('^') {
-                    anyhow::bail!(
-                        "input_box prompt {:?} must start with ^ to match at the line start",
-                        geometry.prompt
-                    );
-                }
+                let prompt =
+                    regex::Regex::new(&format!("^(?:{})", geometry.prompt)).map_err(|e| {
+                        anyhow::anyhow!(
+                            "input_box prompt {:?} is not a valid regex: {e}",
+                            geometry.prompt
+                        )
+                    })?;
                 if prompt.is_match("") {
                     anyhow::bail!(
                         "input_box prompt {:?} must not match an empty line",
@@ -786,23 +786,32 @@ not = [{ region = "evidence(secondary)", contains = ["cancel"] }]
     }
 
     #[test]
-    fn input_box_prompt_must_be_anchored_and_non_empty() {
+    fn input_box_prompt_is_anchored_by_construction_and_non_empty() {
         let parse = |prompt: &str| {
             Manifest::parse(
                 &format!("id = \"t\"\nrules = []\n[input_box]\nprompt = '{prompt}'\n"),
                 &[],
             )
         };
-        for (prompt, message) in [
-            (">", "start with ^"),
-            (r"\s*>", "start with ^"),
-            ("^", "empty line"),
-            (r"^\s*", "empty line"),
-        ] {
+        for prompt in ["^", r"^\s*", r"\s*", ""] {
             let err = parse(prompt).err().expect("must not compile");
-            assert!(err.to_string().contains(message), "{prompt}: {err}");
+            assert!(err.to_string().contains("empty line"), "{prompt}: {err}");
         }
-        parse(r"^\s*>\s").expect("anchored prompt compiles");
+        let is_row = |prompt: &str, line: &str| {
+            let manifest = parse(prompt).expect("compiles");
+            manifest.input_box.expect("input_box").prompt.is_match(line)
+        };
+        for (prompt, line, expected) in [
+            (">", "> hi", true),
+            (">", "a > b", false),
+            ("^>|x", "foo x", false),
+            ("^>|x", "x foo", true),
+            (r"(?i)^\s*>\s", "  > hi", true),
+            (r"\A\s*>", "> hi", true),
+            (r"\A\s*>", "a > b", false),
+        ] {
+            assert_eq!(is_row(prompt, line), expected, "{prompt} on {line:?}");
+        }
         Manifest::parse(include_str!("manifests/claude.toml"), &[]).expect("claude manifest");
     }
 

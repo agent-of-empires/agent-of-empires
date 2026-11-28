@@ -209,7 +209,7 @@ pub fn submitted_prompt<'a>(agent: &str, line: &'a str) -> Option<&'a str> {
 
 fn strip_prompt<'a>(manifest: &Manifest, line: &'a str) -> Option<&'a str> {
     let prompt = &manifest.input_box.as_ref()?.prompt;
-    let found = prompt.find(line).filter(|m| m.start() == 0)?;
+    let found = prompt.find(line)?;
     let end = found.end();
     let boundary = line[..end].ends_with(char::is_whitespace)
         || line[end..].chars().next().is_none_or(char::is_whitespace);
