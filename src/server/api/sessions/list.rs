@@ -175,16 +175,15 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                     explicit: inst.agent_name.clone(),
                 },
             };
-            let profile = match &agent {
-                SessionAgent::Worker(key) if crate::acp::agent_profiles::is_builtin(key) => {
-                    crate::acp::agent_profiles::resolve_for(
-                        crate::plugin::registry(),
-                        key,
-                        std::iter::empty(),
-                    )
-                    .profile
+            let builtin = match &agent {
+                SessionAgent::Worker(key) => {
+                    crate::acp::agent_profiles::resolve_builtin_undeclared(key)
                 }
-                _ => {
+                SessionAgent::Next { .. } => None,
+            };
+            let profile = match builtin {
+                Some(profile) => profile,
+                None => {
                     let (session_cfg, default_agent) =
                         session_cfg_cache.profile_config(&inst.source_profile, &inst.project_path);
                     agent.profile_with(&acp_registry, session_cfg, default_agent)

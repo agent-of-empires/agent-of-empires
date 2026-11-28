@@ -645,6 +645,11 @@ pub fn resolve_undeclared(key: &str) -> Option<Arc<AgentProfile>> {
     (!matches!(resolved.source, ProfileSource::Plugin { .. })).then_some(resolved.profile)
 }
 
+/// [`resolve_undeclared`] for a built-in `key`: the profile that needs no session config.
+pub fn resolve_builtin_undeclared(key: &str) -> Option<Arc<AgentProfile>> {
+    is_builtin(key).then(|| resolve_undeclared(key)).flatten()
+}
+
 /// The profile for `key` under `registry`: the declaration of the plugin that wins the tool,
 /// else the core profile, else the default. A name in `custom_names` is a user's custom agent
 /// and shadows a plugin's tool of that name.
