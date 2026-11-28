@@ -2832,35 +2832,40 @@ impl Instance {
         })
     }
 
-    /// Whether two executions describe one context.
-    ///
     /// Host paths compare by local filesystem identity. Paths in every other
     /// filesystem domain compare as pure lexical paths.
+    pub(super) fn paths_match(
+        left: &std::path::Path,
+        right: &std::path::Path,
+        filesystem: &str,
+    ) -> bool {
+        if left == right {
+            return true;
+        }
+        let identity = |path: &std::path::Path| {
+            if filesystem == "host" {
+                crate::session::capture::canonicalize_allowing_missing_leaf(path)
+                    .unwrap_or_else(|| crate::git::template::lexical_normalize(path))
+            } else {
+                crate::git::template::lexical_normalize(path)
+            }
+        };
+        identity(left) == identity(right)
+    }
+
+    /// Whether two executions describe one context.
     pub(super) fn execution_identity_matches(
         left: &ExecutionBinding,
         right: &ExecutionBinding,
     ) -> bool {
-        fn paths_match(left: &std::path::Path, right: &std::path::Path, filesystem: &str) -> bool {
-            if left == right {
-                return true;
-            }
-            let identity = |path: &std::path::Path| {
-                if filesystem == "host" {
-                    crate::session::capture::canonicalize_allowing_missing_leaf(path)
-                        .unwrap_or_else(|| crate::git::template::lexical_normalize(path))
-                } else {
-                    crate::git::template::lexical_normalize(path)
-                }
-            };
-            identity(left) == identity(right)
-        }
-        fn locations_match(left: &[ExecutionLocation], right: &[ExecutionLocation]) -> bool {
+        let paths_match = Self::paths_match;
+        let locations_match = |left: &[ExecutionLocation], right: &[ExecutionLocation]| {
             left.len() == right.len()
                 && left.iter().zip(right).all(|(left, right)| {
                     left.filesystem == right.filesystem
                         && paths_match(&left.path, &right.path, &left.filesystem)
                 })
-        }
+        };
         left.agent == right.agent
             && left.filesystem == right.filesystem
             && left.cwd_filesystem == right.cwd_filesystem
@@ -2892,12 +2897,37 @@ impl Instance {
             .context("conversation provenance is unknown; use aoe session set-session-id with an explicitly configured execution identity and store before resuming or forking")?;
         anyhow::ensure!(binding.is_known() || binding.is_unattributed() || (!explicit && binding.provenance == ConversationProvenance::Preallocated),
             "conversation has not been observed or explicitly asserted; a preallocated ID is not a forkable conversation");
+        // A fork pins the launch to the parent's own transcript directory, so that
+        // one store is derived from the binding rather than compared to it. The
+        // rest of the execution must still describe the same context.
+        let forking_into_the_parent_store = matches!(
+            &self.resume_intent,
+            ResumeIntent::Fork { from } if from == sid
+        ) && binding
+            .transcript_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .is_some_and(|directory| {
+                execution.stores.len() == 1
+                    && Self::paths_match(&execution.stores[0], directory, &execution.filesystem)
+                    && binding.execution.as_ref().is_some_and(|bound| {
+                        bound.agent == execution.agent
+                            && bound.filesystem == execution.filesystem
+                            && bound.cwd_filesystem == execution.cwd_filesystem
+                            && Self::paths_match(
+                                &bound.cwd,
+                                &execution.cwd,
+                                &execution.cwd_filesystem,
+                            )
+                    })
+            });
         // Default may adopt a known ID after a context move when agent and filesystem agree.
         anyhow::ensure!(
-            binding
-                .execution
-                .as_ref()
-                .is_some_and(|bound| Self::execution_identity_matches(bound, execution))
+            forking_into_the_parent_store
+                || binding
+                    .execution
+                    .as_ref()
+                    .is_some_and(|bound| Self::execution_identity_matches(bound, execution))
                 || !binding.is_known()
                 || (matches!(self.resume_intent, ResumeIntent::Default)
                     && binding.is_known()
