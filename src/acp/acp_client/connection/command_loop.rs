@@ -400,10 +400,18 @@ impl Session {
             return;
         };
         let adopted = shared.adopted_turn_active.swap(false, Ordering::Relaxed);
+        // The limit arrives as agent text with no prompt error; park like the
+        // prompt path so the reaper can resume after the reset (#4373).
+        let lone_text_limit = shared
+            .agent_turn_text
+            .lock()
+            .expect("agent turn text mutex poisoned")
+            .take_rate_limit();
         let captured = take_rate_limit_from_captured_rejection(
             &shared.rate_limit_rejections,
             crate::time::Timestamp::now(),
-        );
+        )
+        .or(lone_text_limit);
         if let Some(info) = captured {
             if !shared.terminal_claim.claim_failed() {
                 return;

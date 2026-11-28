@@ -22,7 +22,7 @@ use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal, TerminalClaim,
 };
 use crate::acp::acp_client::rate_limit::{
-    record_rate_limit_report, take_rate_limit_from_captured_rejection,
+    record_rate_limit_report, take_rate_limit_from_captured_rejection, AgentTurnText,
 };
 use crate::acp::acp_client::session_identity::{PendingIngress, SessionIngress};
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
@@ -46,7 +46,7 @@ pub(super) struct Shared {
     pub(super) event_tx: mpsc::Sender<Event>,
     pub(super) state: Arc<SessionState>,
     pub(super) connection_state: Arc<super::ConnectionState>,
-    control: Option<Arc<DaemonControlClient>>,
+    pub(super) control: Option<Arc<DaemonControlClient>>,
     pending_responders: crate::acp::acp_client::pending::PendingResponders,
     /// Admits only the lifecycle-selected native session; everything the
     /// agent sends for another id is refused or buffered here (#3937).
@@ -91,6 +91,7 @@ pub(super) struct Shared {
     pub(super) cancel_send_gate: Arc<tokio::sync::RwLock<()>>,
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
+    pub(super) agent_turn_text: std::sync::Mutex<AgentTurnText>,
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
     /// Merged snapshot per subagent session; see `subagents.rs`.
@@ -158,6 +159,7 @@ impl Shared {
             #[cfg(test)]
             cancel_send_gate: state.cancel_send_gate.clone(),
             agent_msg_dedup: Default::default(),
+            agent_turn_text: Default::default(),
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             subagents: Default::default(),
@@ -333,6 +335,10 @@ impl Shared {
         let event_tx = self.event_tx.clone();
         let state = self.state.clone();
         let publication = state.publication.clone().lock_owned().await;
+        let stopped = Event::Stopped { reason };
+        if state.terminal_claim.claimed_turn() == Some(turn) {
+            self.observe_turn_text(&stopped);
+        }
         let publication = tokio::spawn(async move {
             let _publication = publication;
             if state.terminal_claim.claimed_turn() != Some(turn) {
@@ -344,7 +350,7 @@ impl Shared {
                     return;
                 }
             }
-            let _ = event_tx.send(Event::Stopped { reason }).await;
+            let _ = event_tx.send(stopped).await;
         });
         #[cfg(test)]
         let _settle = self.state.terminal_settle_gate.read().await;
@@ -474,6 +480,13 @@ impl Shared {
         if let Ok(replay) = self.ingress.finish(self.ingress.current()) {
             self.apply_replay(replay).await;
         }
+    }
+
+    pub(super) fn observe_turn_text(&self, event: &Event) {
+        self.agent_turn_text
+            .lock()
+            .expect("agent turn text mutex poisoned")
+            .observe(event);
     }
 
     /// Re-tail sub-agents a previous daemon launched and left unresolved.
@@ -812,6 +825,9 @@ impl Shared {
                 &mut event,
                 &update_for_tool_context,
             );
+            if !suppressing {
+                self.observe_turn_text(&event);
+            }
             if self.event_tx.send(event).await.is_err() {
                 break;
             }

@@ -109,10 +109,10 @@ fn test_sort_order_change_after_enter_rescores_search_matches() {
         _ => panic!("initial match must be a Session"),
     };
 
-    let new_order = if env.view.sort_order == SortOrder::Newest {
-        SortOrder::Oldest
+    let new_order = if env.view.sort_order == SortOrder::Custom {
+        SortOrder::Name
     } else {
-        SortOrder::Newest
+        SortOrder::Custom
     };
     env.view.apply_sort_order(new_order);
 
@@ -282,7 +282,7 @@ fn matched_running_row_keeps_status_color_on_spinner_and_bolds() {
     // the status color and highlight with bold only.
     use ratatui::style::Modifier;
 
-    let (env, running, _waiting) = attention_env_running_then_waiting();
+    let (env, running, _waiting) = env_running_then_waiting();
     let theme = crate::tui::styles::load_theme_with_mode("empire", false);
     assert_ne!(
         theme.running, theme.search,
@@ -648,47 +648,6 @@ fn test_select_session_by_id() {
     env.view.select_session_by_id(&session_id);
     assert_eq!(env.view.cursor, 1);
     assert_eq!(env.view.selected_session, Some(session_id));
-}
-
-/// `select_top_attention` lands on the first session, skips the session being returned
-/// from, and falls back to it when it is the only session.
-#[test]
-#[serial]
-fn test_select_top_attention() {
-    let mut env = create_test_env_with_sessions(3);
-    let first_id = match &env.view.flat_items[0] {
-        Item::Session { id, .. } => id.clone(),
-        _ => panic!("first row is a session"),
-    };
-    let second_id = match &env.view.flat_items[1] {
-        Item::Session { id, .. } => id.clone(),
-        _ => panic!("second row is a session"),
-    };
-    env.view.cursor = 2;
-    env.view.update_selected();
-
-    env.view.select_top_attention(None);
-    assert_eq!(env.view.cursor, 0);
-    assert_eq!(
-        env.view.selected_session.as_deref(),
-        Some(first_id.as_str())
-    );
-
-    env.view.select_top_attention(Some(&first_id));
-    assert_eq!(env.view.cursor, 1);
-    assert_eq!(
-        env.view.selected_session.as_deref(),
-        Some(second_id.as_str())
-    );
-
-    let mut env = create_test_env_with_sessions(1);
-    let only_id = match &env.view.flat_items[0] {
-        Item::Session { id, .. } => id.clone(),
-        _ => panic!("only row is a session"),
-    };
-    env.view.select_top_attention(Some(&only_id));
-    assert_eq!(env.view.cursor, 0);
-    assert_eq!(env.view.selected_session.as_deref(), Some(only_id.as_str()));
 }
 
 /// `P` opens the profile picker, except in search mode where it is query input.

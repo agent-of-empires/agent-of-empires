@@ -26,7 +26,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::keybinds::{self, Keymap};
 use super::ViewMode;
-use crate::session::config::SortOrder;
 use crate::tui::dialogs::PaletteGroup;
 
 /// Logical action. Each variant is dispatched by `HomeView::run_action`.
@@ -276,10 +275,9 @@ pub enum Context {
     /// that session, and must not claim the chord on a group header, where `h` still
     /// collapses the group.
     SessionSelected,
-    /// Favorites are actionable: either the Attention sort is active, where
-    /// favorite is a within-tier tiebreak, or `session.favorites_first` is on,
-    /// where it pins in every sort order. With neither, toggling a favorite
-    /// would have no visible effect, so the key stays inert.
+    /// Favorites are actionable: `session.favorites_first` is on, where they pin under
+    /// the Name and Newest first sorts. Otherwise toggling a favorite would have no visible effect, so the
+    /// key stays inert.
     FavoritesUsable,
     SearchActive,
     /// The cursor is on a real (non-synthetic) project header in project view.
@@ -330,7 +328,6 @@ pub struct Binding {
 /// Runtime state the guards consult.
 pub struct Ctx {
     pub view_mode: ViewMode,
-    pub sort_order: SortOrder,
     pub has_search: bool,
     /// True when the cursor sits on a session row rather than a group or suggestion header.
     pub session_selected: bool,
@@ -358,9 +355,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::Always => true,
         Context::TerminalView => ctx.view_mode == ViewMode::Terminal,
         Context::SessionSelected => ctx.session_selected,
-        Context::FavoritesUsable => {
-            ctx.sort_order == SortOrder::Attention || crate::session::favorites_first()
-        }
+        Context::FavoritesUsable => crate::session::favorites_first(),
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
@@ -1564,7 +1559,6 @@ mod tests {
     fn ctx() -> Ctx {
         Ctx {
             view_mode: ViewMode::Structured,
-            sort_order: SortOrder::Newest,
             has_search: false,
             session_selected: true,
             project_group_selected: false,
@@ -1792,9 +1786,8 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn context_guards_gate_attention_and_terminal_actions() {
-        // Snooze resolves on a session row in any sort. Favorite resolves there regardless
-        // of `session.favorites_first`, which only opens it outside Attention.
+    fn context_guards_gate_favorite_and_terminal_actions() {
+        // Favorite resolves only with `session.favorites_first` on; snooze resolves on a session row.
         let original = crate::session::favorites_first();
         crate::session::set_favorites_first(false);
 
@@ -1808,16 +1801,8 @@ mod tests {
         crate::session::set_favorites_first(true);
         assert_eq!(
             resolve(&key('f'), false, &c),
-            Some(ActionId::ToggleFavorite),
-            "favorites-first on: 'f' must work outside the Attention sort"
-        );
-        crate::session::set_favorites_first(false);
-        c.sort_order = SortOrder::Attention;
-        assert_eq!(
-            resolve(&key('f'), false, &c),
             Some(ActionId::ToggleFavorite)
         );
-        assert_eq!(resolve(&key('h'), false, &c), Some(ActionId::ToggleSnooze));
 
         crate::session::set_favorites_first(original);
 

@@ -303,7 +303,8 @@ export type IncompatibleAgentDetail =
 export type IntegrationLostReason =
   | { kind: "contract_violation"; detail: string }
   | { kind: "hold_overflow" }
-  | { kind: "lease_overflow" };
+  | { kind: "lease_overflow" }
+  | { kind: "proxy_exited" };
 
 export interface OperationErrorEvidence {
   source: "terminal_text" | "tmux_observation" | "local_prompt_result" | "runner_completion" | "transcript_recovery";
@@ -693,6 +694,7 @@ export interface AcpState {
   oldestSeq: number;
   lagged: boolean;
   startupError: string | null;
+  /** Why the Agent's plugin integration was lost, independent of native input. */
   integrationLost: IntegrationLostReason | null;
   /** The accepted diagnostic boundary, independent of native-input authority. */
   integrationLostSnapshotSeq: number | null;
@@ -1240,6 +1242,8 @@ function isSteeredContinuation(state: AcpState, precedingTurnActive: boolean): b
   return precedingTurnActive && !!state.promptCapabilities?.steering;
 }
 
+const PROXY_DEGRADED_NOTICE_ID = "notice-proxy-degraded";
+
 function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
   next.startupCause = null;
@@ -1270,9 +1274,9 @@ function applyNewTurnResets(next: AcpState): void {
   next.monitorWorkSeen = false;
   next.monitorDescription = null;
   next.contextPrimerAvailable = null;
-  // Advisories describe the turn they arrived in; the transcript keeps history.
-  next.sessionNotices = [];
-  next.dismissedNoticeIds = [];
+  // Advisories describe the turn they arrived in, except the degraded-proxy banner; the transcript keeps history.
+  next.sessionNotices = next.sessionNotices.filter((n) => n.id === PROXY_DEGRADED_NOTICE_ID);
+  next.dismissedNoticeIds = next.dismissedNoticeIds.filter((id) => id === PROXY_DEGRADED_NOTICE_ID);
 }
 
 /** Pure reducer. Drops frames whose seq is not above `state.lastSeq` so replays are idempotent. */
@@ -1452,7 +1456,14 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
       next.sessionNotices = next.sessionNotices.map((n) => (n.id === id ? entry : n));
       return next;
     }
-    next.sessionNotices = [...next.sessionNotices, entry].slice(-MAX_SESSION_NOTICES);
+    // The degraded-proxy banner outlives the cap, like the daemon's reducer.
+    const notices = [...next.sessionNotices, entry];
+    while (notices.length > MAX_SESSION_NOTICES) {
+      const oldest = notices.findIndex((n) => n.id !== PROXY_DEGRADED_NOTICE_ID);
+      if (oldest < 0) break;
+      notices.splice(oldest, 1);
+    }
+    next.sessionNotices = notices;
     return next;
   }
   if ("AuthStatusUpdated" in event) {
@@ -1637,6 +1648,10 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
   if ("AcpSessionAssigned" in event) {
     // Session ids and replayed availability are history. Only a current daemon
     // projection may restore native controls or physical-worker chrome.
+    if (state.integrationLostSnapshotSeq == null) next.integrationLost = null;
+    // A degraded worker re-asserts the notice after assignment. A current
+    // snapshot already folds that edge, so replay cannot retire its notice.
+    if (!covered) next.sessionNotices = next.sessionNotices.filter((n) => n.id !== PROXY_DEGRADED_NOTICE_ID);
     return next;
   }
   if ("RateLimitAutoResumed" in event) {
@@ -1686,6 +1701,7 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.lastError = null;
     next.lastErrorEvidence = null;
     next.interactionError = null;
+    if (state.integrationLostSnapshotSeq == null) next.integrationLost = null;
     next.retriedError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
     // The switch emits Stopped { user_stopped } first; keep its banner hidden through the handshake.

@@ -671,6 +671,17 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
     }
 
+    /// Stop the observed epoch of a worker whose turn ended on a usage limit;
+    /// its closing `Stopped` is `rate_limited`, so the park stands.
+    pub(crate) async fn shutdown_rate_limited(
+        &self,
+        session_id: &str,
+        observed: (&Lease, u64),
+    ) -> Result<(), SupervisorError> {
+        self.shutdown_with_reason(session_id, "rate_limited", false, None, Some(observed))
+            .await
+    }
+
     /// Stop a worker being permanently discarded, releasing agent-side state
     /// via `session/delete`. Reversible stops must not use this.
     pub async fn shutdown_and_delete(&self, session_id: &str) -> Result<(), SupervisorError> {

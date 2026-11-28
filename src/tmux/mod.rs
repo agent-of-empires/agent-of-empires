@@ -20,7 +20,7 @@ pub(crate) mod vt;
 pub(crate) mod wraps;
 
 pub use composite::PaneGeom;
-pub use detect::{HookObservation, Observation, ObservationKey};
+pub use detect::{HookObservation, InputLine, Observation, ObservationKey};
 pub(crate) use session::{submit_text, SubmitText};
 pub use session::{
     PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL, VT_OWNER_TTL,

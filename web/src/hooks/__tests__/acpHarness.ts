@@ -4,6 +4,8 @@ import { act } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { vi } from "vitest";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import { CLAUDE_PROFILE } from "../../lib/__tests__/agentProfileFixtures";
+
 export { currentControlSnapshot } from "../../../tests/helpers/acpControlSnapshot";
 
 export class FakeWebSocket {
@@ -104,4 +106,4 @@ export async function flushAsync(ticks = 10): Promise<void> {
 }
 
 export const profileWrapper = ({ children }: { children: ReactNode }) =>
-  createElement(AgentProfileProvider, { toolKey: "claude", children });
+  createElement(AgentProfileProvider, { profile: CLAUDE_PROFILE, children });

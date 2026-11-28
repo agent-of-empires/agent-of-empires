@@ -57,7 +57,7 @@ pub(crate) use runner::wrap_in_scope;
 pub use session_sandbox::{effective_launch_env, SessionSandbox};
 pub(crate) use session_sandbox::{known_container_workdir, SandboxLayout};
 pub(crate) use spawn::host_environment_denyreason;
-pub use spawn::SpawnConfig;
+pub use spawn::{ProxyFailurePolicy, ProxySpec, SpawnConfig};
 
 use crate::acp::agent_compat::ExpectedAgent;
 use crate::acp::agent_profiles;
@@ -133,7 +133,7 @@ pub struct AcpClient {
     connection_shutdown: tokio_util::sync::CancellationToken,
     connection_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     _prime_runtime: Option<crate::process::prime::PrimeCleanupGuard>,
-    control_loss: Option<Arc<std::sync::OnceLock<control::ControlLoss>>>,
+    control_loss: Option<control::ControlLossHandle>,
     reattach: Option<Box<ReattachSpec>>,
 }
 
@@ -148,7 +148,19 @@ struct ReattachSpec {
     agent_key: String,
     source_profile: Option<String>,
     claude_home: Option<PathBuf>,
+    proxy: Option<ProxySpec>,
+    /// A `neutral_boot` fallback ran the adapter raw; it keeps the neutral profile.
+    degraded: bool,
     state: Arc<SessionState>,
+}
+
+/// The neutral profile when a failed proxy left the adapter unmediated.
+fn launch_profile(agent_key: &str, degraded: bool) -> &'static agent_profiles::AgentProfile {
+    if degraded {
+        &agent_profiles::DEFAULT
+    } else {
+        agent_profiles::resolve(agent_key)
+    }
 }
 
 /// Resources and turn ownership survive replacement of the control connection.
@@ -263,6 +275,8 @@ struct Launch {
     sandbox: Option<(SessionSandbox, SandboxPathMap)>,
     profile: &'static agent_profiles::AgentProfile,
     install_binary: String,
+    /// Set when the runner launches a proxy; the hello is held to it.
+    proxy: Option<ProxySpec>,
     source_profile: Option<String>,
     default_effort: Option<String>,
     default_model_config: std::collections::BTreeMap<String, String>,
@@ -317,6 +331,7 @@ impl Launch {
             ready_tx,
             profile: self.profile,
             expected_agent: ExpectedAgent::from_command(&self.install_binary),
+            proxy: self.proxy,
             source_profile: self.source_profile,
             default_effort: self.default_effort,
             default_model_config: self.default_model_config,
@@ -619,8 +634,9 @@ impl AcpClient {
             cwd: config.cwd.clone(),
             additional_dirs: config.additional_dirs.clone(),
             sandbox,
-            profile: agent_profiles::resolve(&config.agent_key),
+            profile: launch_profile(&config.agent_key, config.degraded.is_some()),
             install_binary: config.spec.command.clone(),
+            proxy: config.proxy.clone(),
             source_profile: config.source_profile.clone(),
             default_effort: config.default_effort.clone(),
             default_model_config: config.default_model_config.clone(),
@@ -669,6 +685,8 @@ impl AcpClient {
                 agent_key: config.agent_key.clone(),
                 source_profile: launch.source_profile.clone(),
                 claude_home: launch.claude_home.clone(),
+                proxy: launch.proxy.clone(),
+                degraded: config.degraded.is_some(),
                 state: launch.state.clone(),
             };
             let mut client =
@@ -823,6 +841,8 @@ impl AcpClient {
         deadline: Option<tokio::time::Instant>,
         launch_lease: Option<crate::acp::runner_lifecycle::Lease>,
         claude_home: Option<PathBuf>,
+        proxy: Option<ProxySpec>,
+        degraded: bool,
     ) -> Result<Self, AcpError> {
         let expected_owner = match launch_lease
             .as_ref()
@@ -850,6 +870,8 @@ impl AcpClient {
             agent_key,
             source_profile,
             claude_home,
+            proxy,
+            degraded,
             state: Arc::default(),
         };
         let mode = ConnectMode::Resume {
@@ -880,8 +902,9 @@ impl AcpClient {
             cwd: spec.cwd.clone(),
             additional_dirs: spec.additional_dirs.clone(),
             sandbox: spec.sandbox.clone(),
-            profile: agent_profiles::resolve(&spec.agent_key),
+            profile: launch_profile(&spec.agent_key, spec.degraded),
             install_binary,
+            proxy: spec.proxy.clone(),
             source_profile: spec.source_profile.clone(),
             // Resume sends no session/new or load, so defaults and MCP servers
             // were applied on first connect.
@@ -931,7 +954,7 @@ impl AcpClient {
 
     /// Set once the runner side ended this client's control channel.
     pub(crate) fn control_loss(&self) -> Option<control::ControlLoss> {
-        self.control_loss.as_ref()?.get().copied()
+        self.control_loss.as_ref()?.get()
     }
 
     #[cfg(test)]

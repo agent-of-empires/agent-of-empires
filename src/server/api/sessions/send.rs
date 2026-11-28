@@ -27,6 +27,8 @@ pub(crate) enum SendKeysError {
     StructuredView,
     Ignored,
     Blocked(crate::session::StartBlocked),
+    /// The agent's input box held a person's unsent text for the whole wait.
+    InputLineBusy,
     Gone,
     Tmux(anyhow::Error),
     Preparation {
@@ -41,6 +43,29 @@ pub(crate) struct TerminalSendError {
     committed_cursor: Option<Box<(axum::http::HeaderValue, axum::http::HeaderValue)>>,
 }
 
+/// Row and physical pane captured before MCP inspects the prompt.
+pub(crate) struct CheckedSendPane {
+    pub created_at: crate::time::Timestamp,
+    pub lifecycle_generation: u64,
+    pub profile: String,
+    pub physical: Arc<crate::session::LegacyToolObservation>,
+}
+
+/// Which pane a terminal send types into, and how long it waits there for a draft to clear.
+pub(crate) struct SendPane {
+    /// A pane the caller already checked. Never substitute another pane or revive it.
+    pub checked: Option<CheckedSendPane>,
+    pub draft_wait: std::time::Duration,
+}
+
+impl SendPane {
+    /// The session's live pane, with [`INPUT_LINE_WAIT`] for a draft.
+    pub(crate) const LIVE: SendPane = SendPane {
+        checked: None,
+        draft_wait: INPUT_LINE_WAIT,
+    };
+}
+
 /// Revive through the native lifecycle command, then send under immutable pane ownership.
 pub(crate) async fn send_terminal_message(
     service: &SessionService,
@@ -48,6 +73,7 @@ pub(crate) async fn send_terminal_message(
     message: String,
     revive: bool,
     refuse_if_ignored: bool,
+    target: SendPane,
 ) -> Result<bool, TerminalSendError> {
     let mut committed_cursor = None;
     send_terminal_message_inner(
@@ -56,6 +82,7 @@ pub(crate) async fn send_terminal_message(
         message,
         revive,
         refuse_if_ignored,
+        target,
         &mut committed_cursor,
     )
     .await
@@ -71,8 +98,13 @@ async fn send_terminal_message_inner(
     message: String,
     revive: bool,
     refuse_if_ignored: bool,
+    target: SendPane,
     committed_cursor: &mut Option<(axum::http::HeaderValue, axum::http::HeaderValue)>,
 ) -> Result<bool, SendKeysError> {
+    let SendPane {
+        checked,
+        draft_wait,
+    } = target;
     let state = service.native_state().map_err(SendKeysError::Tmux)?;
     if state.read_only {
         return Err(SendKeysError::Preparation {
@@ -179,6 +211,30 @@ async fn send_terminal_message_inner(
         .map_err(|error| terminal_send_failure(&state, error))?;
     drop(initial_guard);
     drop(initial_namespace);
+    if let Some(checked) = &checked {
+        if revive
+            || checked.created_at != before.created_at
+            || checked.lifecycle_generation != initial_identity.lifecycle_generation
+            || checked.profile != initial_identity.profile
+        {
+            return Err(terminal_send_failure(
+                &state,
+                crate::session::LifecycleReservationError::Superseded.into(),
+            ));
+        }
+        let live = existing_target
+            .as_ref()
+            .and_then(|target| target.physical.as_ref())
+            .ok_or(SendKeysError::NotRunning)?;
+        if checked.physical.server != live.server
+            || checked.physical.identity.session_id != live.identity.session_id
+        {
+            return Err(terminal_send_failure(
+                &state,
+                crate::session::NativeInputError::Ownership.into(),
+            ));
+        }
+    }
     let mut target = if revive {
         let response = super::lifecycle::prepare_captured_terminal_session(
             state.clone(),
@@ -307,8 +363,25 @@ async fn send_terminal_message_inner(
             true,
             expected.profile_identity,
         )?;
-        let session = instance.agent_input_session(&name, physical, true, Some(fence))?;
-        session.send_keys_with_ack(&message, instance.send_keys_enter_delay(), move |sent| {
+        let physical = checked.map_or(physical, |checked| checked.physical);
+        let pane = &physical.identity.pane_id;
+        let mut session = crate::tmux::Session::from_observation(&name, Arc::clone(&physical))
+            .with_native_input_fence(fence);
+        // Readiness, the draft brake, and both input effects stay on the same pane.
+        session
+            .wait_until_ready_in(
+                pane,
+                std::time::Duration::from_secs(5),
+                crate::agents::ready_markers(&instance.tool),
+            )
+            .map_err(|_| TerminalNotRunning)?;
+        session.admit_agent_input(instance.expects_shell())?;
+        anyhow::ensure!(
+            instance.wait_for_input_line(&session, pane, draft_wait),
+            InputLineBusy
+        );
+        let delay = instance.send_keys_enter_delay();
+        let settle = move |sent: anyhow::Result<()>| {
             let _custody = (namespace, submission, guard);
             sent?;
             #[cfg(test)]
@@ -366,7 +439,8 @@ async fn send_terminal_message_inner(
                 }
             }
             Ok(revived)
-        })
+        };
+        session.send_keys_to_pane_with_ack(pane, &message, delay, settle)
     })
     .await
     .map_err(anyhow::Error::from)
@@ -383,6 +457,8 @@ fn terminal_send_failure(state: &crate::server::AppState, error: anyhow::Error) 
         SendKeysError::Gone
     } else if error.is::<TerminalNotRunning>() {
         SendKeysError::NotRunning
+    } else if error.is::<InputLineBusy>() {
+        SendKeysError::InputLineBusy
     } else if error.is::<crate::session::NativeInputError>() {
         let detail = serde_json::json!({
             "error": "terminal_input_unavailable", "message": error.to_string(),
@@ -417,6 +493,13 @@ pub(super) fn ignored_response() -> axum::response::Response {
     )
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("The agent's input box holds unsent text")]
+struct InputLineBusy;
+
+/// How long a send waits for a person's draft to clear before refusing.
+const INPUT_LINE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl IntoResponse for TerminalSendError {
     fn into_response(self) -> axum::response::Response {
         let mut response = match self.error {
@@ -424,6 +507,10 @@ impl IntoResponse for TerminalSendError {
             SendKeysError::NotRunning => crate::server::api::api_error_with_code_header(
                 crate::daemon::ApiErrorCode::SessionNotRunning,
                 "Terminal session is not running",
+            ),
+            SendKeysError::InputLineBusy => crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::InputLineBusy,
+                crate::tmux::InputLine::BUSY_MESSAGE,
             ),
             SendKeysError::Preparation { response, .. } => *response,
             SendKeysError::Transient(status) => (
@@ -501,7 +588,16 @@ pub async fn send_message(
     }
 
     let revive = req.revive;
-    match send_terminal_message(&state.session_service, &id, req.message, revive, false).await {
+    match send_terminal_message(
+        &state.session_service,
+        &id,
+        req.message,
+        revive,
+        false,
+        SendPane::LIVE,
+    )
+    .await
+    {
         Ok(_) => {
             tracing::info!(target: "session.lifecycle", session = %id, len, revive, "terminal message sent");
             match state.runtime.publish(&state).await {
@@ -922,6 +1018,17 @@ mod send_output_tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"],
             "session_not_running"
+        );
+
+        let response = TerminalSendError {
+            error: SendKeysError::InputLineBusy,
+            committed_cursor: None,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers()[crate::daemon::ERROR_CODE_HEADER],
+            "input_line_busy"
         );
 
         let response = TerminalSendError {

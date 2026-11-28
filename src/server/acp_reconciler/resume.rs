@@ -335,7 +335,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                         target: "acp.supervisor",
                         session = %id,
                         old_build = %record.build_version,
-                        new_build = crate::build_info::BUILD_VERSION,
+                        new_build = crate::build_info::build_version(),
                         "adopting build-stale structured view worker to drain in-flight turn before respawn"
                     );
                 }
@@ -436,7 +436,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
                     target: "acp.supervisor",
                     session = %id,
                     old_build = %record.build_version,
-                    new_build = crate::build_info::BUILD_VERSION,
+                    new_build = crate::build_info::build_version(),
                     "respawning idle build-stale structured view worker on current binary"
                 );
                 if worker_registry::terminate_record_and_wait(record, ())
@@ -694,6 +694,7 @@ async fn build_spawn_request(
         seed_history_replay,
         prior_conversation,
         claude_store_pin,
+        proxy: None,
     })
 }
 

@@ -1451,13 +1451,61 @@ impl Session {
         ready_markers: &[&str],
         blocked: impl Fn(&str) -> Option<B>,
     ) -> Result<bool, B> {
+        Self::poll_until_ready(max_wait, ready_markers, blocked, || {
+            Ok(self.capture_pane(0).ok())
+        })
+    }
+
+    /// [`Self::wait_until_ready`] reading only `pane`, a `#{pane_id}`. `Err` as soon as the
+    /// pane is gone or dead, rather than at the deadline.
+    pub fn wait_until_ready_in(
+        &self,
+        pane: &str,
+        max_wait: std::time::Duration,
+        ready_markers: &[&str],
+    ) -> Result<bool> {
+        Self::poll_until_ready(
+            max_wait,
+            ready_markers,
+            |_| None,
+            || {
+                let deadline = crate::tmux::TmuxCommandDeadline::new();
+                let live = deadline.run(self.input_command()?.args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane,
+                    "#{pane_id}|#{pane_dead}|#{session_id}",
+                ]))?;
+                let observed = std::str::from_utf8(&live.stdout)?.trim_end();
+                let matches = observed.split_once("|0|").is_some_and(|(id, session_id)| {
+                    id == pane
+                        && self
+                            .physical
+                            .as_ref()
+                            .is_none_or(|physical| session_id == physical.identity.session_id)
+                });
+                if !live.status.success() || !matches {
+                    bail!("tmux pane '{pane}' is gone or dead");
+                }
+                self.capture_target(pane, 0)
+            },
+        )
+    }
+
+    fn poll_until_ready<B>(
+        max_wait: std::time::Duration,
+        ready_markers: &[&str],
+        blocked: impl Fn(&str) -> Option<B>,
+        capture: impl Fn() -> Result<Option<String>, B>,
+    ) -> Result<bool, B> {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
         let ready_markers: Vec<String> = ready_markers.iter().map(|m| m.to_lowercase()).collect();
         let mut last: Option<String> = None;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);
-            let Ok(now) = self.capture_pane(0) else {
+            let Some(now) = capture()? else {
                 continue;
             };
             #[cfg(test)]
@@ -2167,18 +2215,12 @@ impl Session {
         self.send_keys_with_delay_inner(text, enter_delay_ms, None)
     }
 
-    /// Settle daemon custody after the final input ACK (or input failure) and
-    /// before waiting for any send/paste command clients. Their user hooks may
-    /// re-enter the daemon, including during the text phase before Enter.
-    pub(crate) fn send_keys_with_ack<T>(
-        &self,
-        text: &str,
-        enter_delay_ms: u64,
+    fn settle_acknowledged_input<T>(
         settle: impl FnOnce(Result<()>) -> Result<T>,
+        send: impl FnOnce(&mut Vec<AcknowledgedInput>) -> Result<()>,
     ) -> Result<T> {
         let mut pending = Vec::new();
-        let result = self.send_keys_with_delay_inner(text, enter_delay_ms, Some(&mut pending));
-        let result = settle(result);
+        let result = settle(send(&mut pending));
         for client in pending {
             client.finish();
         }
@@ -2197,23 +2239,67 @@ impl Session {
 
         let target =
             self.live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())?;
-        self.send_keys_to(&target, text, enter_delay_ms, pending)
+        self.send_keys_to(&target, text, enter_delay_ms, None, pending)
     }
 
     /// [`Self::send_keys_with_delay`] to exactly `pane`, a `#{pane_id}`: text and Enter
-    /// reach the pane that was checked, or fail if it is gone.
+    /// reach the pane that was checked while it is still in this session, or fail. A pane moved
+    /// out after its text was typed keeps the text unsubmitted, rather than submitting it to
+    /// another session's agent.
     pub fn send_keys_to_pane(&self, pane: &str, text: &str, enter_delay_ms: u64) -> Result<()> {
-        if !self.exists() {
-            bail!("Session does not exist: {}", self.name);
-        }
-        self.send_keys_to(pane, text, enter_delay_ms, None)
+        self.send_keys_to_checked_pane(pane, text, enter_delay_ms, None)
     }
 
+    /// Like [`Self::send_keys_to_pane`], settling custody before waiting on hooks.
+    pub(crate) fn send_keys_to_pane_with_ack<T>(
+        &self,
+        pane: &str,
+        text: &str,
+        enter_delay_ms: u64,
+        settle: impl FnOnce(Result<()>) -> Result<T>,
+    ) -> Result<T> {
+        Self::settle_acknowledged_input(settle, |pending| {
+            self.send_keys_to_checked_pane(pane, text, enter_delay_ms, Some(pending))
+        })
+    }
+
+    fn send_keys_to_checked_pane(
+        &self,
+        pane: &str,
+        text: &str,
+        enter_delay_ms: u64,
+        pending: Option<&mut Vec<AcknowledgedInput>>,
+    ) -> Result<()> {
+        if let Some(physical) = &self.physical {
+            anyhow::ensure!(
+                pane == physical.identity.pane_id,
+                crate::session::NativeInputError::Ownership
+            );
+            // Each acknowledged effect checks physical membership atomically.
+            return self.send_keys_to(pane, text, enter_delay_ms, None, pending);
+        }
+        if !self.holds_pane(pane) {
+            bail!("tmux pane '{pane}' is no longer in session {}", self.name);
+        }
+        self.send_keys_to(pane, text, enter_delay_ms, Some(self), pending)
+    }
+
+    fn holds_pane(&self, pane: &str) -> bool {
+        super::utils::session_holds_pane(
+            &self.name,
+            None,
+            pane,
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+    }
+
+    /// `checked`, when set, is the session `target` must still be in for Enter.
     fn send_keys_to(
         &self,
         target: &str,
         text: &str,
         enter_delay_ms: u64,
+        checked: Option<&Self>,
         mut pending: Option<&mut Vec<AcknowledgedInput>>,
     ) -> Result<()> {
         let delivery = submit_text(text);
@@ -2252,6 +2338,17 @@ impl Session {
 
         if enter_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
+        }
+        #[cfg(test)]
+        crate::tmux::test_helpers::after_text_typed(target);
+        if let Some(session) = checked {
+            if !session.holds_pane(target) {
+                bail!(
+                    "typed into tmux pane '{target}' but did not submit it: the pane is no longer \
+                     in session {}",
+                    session.name
+                );
+            }
         }
 
         // Enter to submit
@@ -6149,9 +6246,9 @@ mod tests {
             (
                 "session pane membership",
                 Some(
-                    crate::tmux::vt::session_holds_pane(
+                    crate::tmux::utils::session_holds_pane(
                         &session_name,
-                        &server_pid,
+                        Some(&server_pid),
                         &pane,
                         &deadline,
                     )
@@ -7150,5 +7247,71 @@ mod tests {
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
         );
+    }
+
+    /// A readiness wait on one pane reads only that pane, and ends with `Err` once the pane is
+    /// gone, well inside its budget.
+    #[test]
+    fn wait_until_ready_in_reads_its_pane_and_stops_when_it_dies() {
+        if !tmux_available() {
+            return;
+        }
+        let budget = std::time::Duration::from_secs(5);
+        // (case, whether the pane is killed at its first capture)
+        for (case, kill) in [("marker", false), ("killed", true)] {
+            let session = TmuxTestSession::new("ready_in");
+            let name = session.name();
+            let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sh", "-c", "exec cat"]
+                .map(String::from)
+                .into();
+            append_pane_base_index_args(&mut args, name);
+            assert!(crate::tmux::tmux_command()
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+            let script = if kill {
+                "exec cat"
+            } else {
+                "echo 'ask anything'; exec cat"
+            };
+            let pane = super::super::test_helpers::split_pane(name, script);
+            let (captured_tx, captured_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let started = std::time::Instant::now();
+            let result = std::thread::scope(|scope| {
+                let pane = &pane;
+                let waiter = scope.spawn(move || {
+                    let _probe = ReadyCaptureGuard::install(ReadyCaptureProbe {
+                        captured: captured_tx,
+                        resume: resume_rx,
+                    });
+                    Session::from_name(name).wait_until_ready_in(pane, budget, &["ask anything"])
+                });
+                while captured_rx.recv_timeout(budget).is_ok() {
+                    if kill {
+                        let _ = crate::tmux::tmux_command()
+                            .args(["kill-pane", "-t", pane])
+                            .status();
+                    }
+                    if resume_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+                // A capture after the timeout must neither block on `resume` nor hang the join.
+                drop((captured_rx, resume_tx));
+                waiter.join().unwrap()
+            });
+            if kill {
+                assert!(result.is_err(), "{case}: {result:?}");
+                assert!(started.elapsed() < budget, "{case}: ran to the deadline");
+            } else {
+                assert_eq!(
+                    result.ok(),
+                    Some(true),
+                    "{case}: the first pane has no marker"
+                );
+            }
+        }
     }
 }

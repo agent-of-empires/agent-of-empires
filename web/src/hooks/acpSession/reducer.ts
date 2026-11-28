@@ -309,7 +309,6 @@ export function reducer(state: AcpState, action: Action): AcpState {
             lastErrorEvidence: null,
             startupError: null,
             startupCause: null,
-            integrationLost: null,
           };
     case "approval_resolved_locally": {
       // Don't wait for the broadcast, which the seq dedupe can swallow (#1821).

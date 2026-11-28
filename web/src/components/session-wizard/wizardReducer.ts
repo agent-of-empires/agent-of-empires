@@ -97,7 +97,8 @@ export type Action =
   | { type: "SUBMIT_FAILED"; failure: CreateFailure }
   | { type: "SUBMIT_SUCCESS" }
   | { type: "SUBMIT_CANCEL" }
-  | { type: "SET_AGENTS"; agents: AgentInfo[]; agentsFor: string; agentsProject: string }
+  /** `resetTool` replaces a remembered tool the list no longer offers; it is not a user edit, so profileDirty stays. */
+  | { type: "SET_AGENTS"; agents: AgentInfo[]; agentsFor: string; agentsProject: string; resetTool?: string }
   | { type: "AGENTS_FAILED"; agentsFor: string; missing: boolean }
   | { type: "SET_GROUPS"; groups: GroupInfo[]; groupsFor: string }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
@@ -319,6 +320,9 @@ function reduce(state: WizardState, action: Action): WizardState {
     case "SET_AGENTS":
       return {
         ...state,
+        data: action.resetTool
+          ? { ...state.data, tool: action.resetTool, agentModel: "", agentEffort: "" }
+          : state.data,
         agents: action.agents,
         agentsStatus: "ready",
         agentsFor: action.agentsFor,

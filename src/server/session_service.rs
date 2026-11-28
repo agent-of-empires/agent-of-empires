@@ -3452,12 +3452,14 @@ impl SessionService {
 
 const TERMINAL_INITIAL_TURN_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A one-time Claude Code dialog that holds the input box back. The prompt is
-/// never typed into it, and neither screen is ever accepted on the user's behalf.
+/// What holds a terminal initial prompt back: a one-time Claude Code dialog, never accepted
+/// on the user's behalf, or a person's draft in the input box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalPromptBlocker {
     FolderNotTrusted,
     BypassNotAccepted,
+    /// A person's unsent text is in the input box.
+    InputLineBusy,
 }
 
 impl TerminalPromptBlocker {
@@ -3480,6 +3482,7 @@ impl TerminalPromptBlocker {
         match self {
             Self::FolderNotTrusted => "agent_folder_not_trusted",
             Self::BypassNotAccepted => "agent_bypass_not_accepted",
+            Self::InputLineBusy => crate::daemon::ApiErrorCode::InputLineBusy.as_str(),
         }
     }
 }
@@ -3497,6 +3500,10 @@ impl std::fmt::Display for TerminalPromptBlocker {
                 "Claude Code is asking you to accept Bypass Permissions mode, so the prompt was not \
                  typed. Open the session once and accept it.",
             ),
+            Self::InputLineBusy => f.write_str(
+                "The agent's input box holds text someone typed and has not sent, so the prompt \
+                 was not typed. Send it yourself once the box is clear.",
+            ),
         }
     }
 }
@@ -3511,9 +3518,15 @@ fn pane_accepts_automatic_input(
     tmux: &crate::tmux::Session,
     pane: &str,
 ) -> anyhow::Result<bool> {
-    let screen = crate::tmux::utils::strip_ansi(&tmux.try_capture_pane_in(pane, 0)?);
+    let capture = tmux.try_capture_pane_in(pane, 0)?;
+    #[cfg(test)]
+    crate::tmux::test_helpers::after_screen_captured(pane);
+    let screen = crate::tmux::utils::strip_ansi(&capture);
     if let Some(blocker) = TerminalPromptBlocker::detect(&instance.tool, &screen) {
         return Err(blocker.into());
+    }
+    if instance.input_line_of(&capture) == crate::tmux::InputLine::Draft {
+        return Err(TerminalPromptBlocker::InputLineBusy.into());
     }
     let screen = screen.to_lowercase();
     Ok(crate::agents::ready_markers(&instance.tool)
@@ -3556,8 +3569,8 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let ready = instance
-        .tmux_session()?
+    let tmux = instance.tmux_session()?;
+    let ready = tmux
         .wait_until_ready_unless(remaining, markers, |screen| {
             TerminalPromptBlocker::detect(&instance.tool, screen)
         })
@@ -3567,6 +3580,16 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         "the agent was not ready within {}s",
         budget.as_secs()
     );
+    // A person's draft is "not yet" too, until the budget runs out.
+    if let Some((name, physical)) =
+        crate::server::api::sessions::ready_agent_target_for_automatic_input(instance)?
+    {
+        let tmux = crate::tmux::Session::from_observation(&name, Arc::clone(&physical));
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if !instance.wait_for_input_line(&tmux, &physical.identity.pane_id, remaining) {
+            return Err(TerminalPromptBlocker::InputLineBusy.into());
+        }
+    }
     Ok(())
 }
 
@@ -5833,6 +5856,37 @@ mod tests {
         }
     }
 
+    /// The draft check reads the capture the dialog check took: a pane that can't be captured
+    /// again doesn't turn the draft it showed into a ready screen.
+    #[test]
+    #[serial_test::serial]
+    fn the_automatic_input_check_reads_its_draft_from_its_one_capture() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-one-capture", "term-one-capture", "unused");
+        inst.tool = "claude".into();
+        let pane = start_terminal_pane(&inst, INPUT_BOX_SCRIPT, false);
+        let pane_id = type_draft(&pane, "half typed");
+        let target = pane_id.clone();
+        crate::tmux::test_helpers::on_screen_captured(&pane_id, move || {
+            let status = crate::tmux::tmux_command()
+                .args(["kill-pane", "-t", &target])
+                .status()
+                .unwrap();
+            assert!(status.success(), "kill-pane");
+        });
+
+        let tmux = crate::tmux::Session::from_name(pane.name());
+        let error = pane_accepts_automatic_input(&inst, &tmux, &pane_id)
+            .expect_err("the captured draft refuses");
+        assert_eq!(
+            error.downcast_ref::<TerminalPromptBlocker>(),
+            Some(&TerminalPromptBlocker::InputLineBusy)
+        );
+    }
+
     /// The screen is read again under the final guards: a ready marker that has
     /// since gone, or a dialog that has since appeared, receives no input.
     #[test]
@@ -5885,6 +5939,365 @@ mod tests {
 
         wait_for(&|screen| screen.contains("loading"));
         assert!(!accepts().unwrap());
+    }
+
+    use crate::tmux::test_helpers::INPUT_BOX_SCRIPT;
+
+    /// Types `draft` into the box drawn by [`INPUT_BOX_SCRIPT`] and waits until it shows.
+    fn type_draft(pane: &crate::tmux::test_helpers::TmuxTestSession, draft: &str) -> String {
+        let tmux = crate::tmux::Session::from_name(pane.name());
+        let pane_id = tmux
+            .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
+            .unwrap();
+        wait_for_pane(pane, |screen| screen.contains("for shortcuts"));
+        tmux_keys(&pane_id, &["-l", draft]);
+        wait_for_pane(pane, |screen| screen.contains(&format!("❯ {draft}")));
+        pane_id
+    }
+
+    fn wait_for_pane(
+        pane: &crate::tmux::test_helpers::TmuxTestSession,
+        want: impl Fn(&str) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !want(&crate::tmux::utils::strip_ansi(&pane_text(pane))) {
+            assert!(std::time::Instant::now() < deadline, "{}", pane_text(pane));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn tmux_keys(pane_id: &str, keys: &[&str]) {
+        let status = crate::tmux::tmux_command()
+            .args(["send-keys", "-t", pane_id])
+            .args(keys)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// With the live target pinned to a pane other than pane 0, the draft check and the keys both
+    /// address the pinned pane: a draft in pane 0 alone doesn't refuse the send, one in the pinned
+    /// pane does, and then nothing is typed into either.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn a_terminal_send_checks_and_types_into_the_pinned_pane() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        // (case, whether the draft is in the pinned pane rather than pane 0)
+        for (case, draft_in_pinned) in [("draft-in-pane-0", false), ("draft-in-pinned", true)] {
+            let id = format!("sess-pinned-{case}");
+            let mut inst =
+                terminal_turn_instance(&id, &format!("term-pinned-{case}"), "initial-turn");
+            inst.tool = "claude".into();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                &inst.source_profile,
+                vec![inst.clone()],
+            );
+            let session = start_terminal_pane(&inst, INPUT_BOX_SCRIPT, false);
+            let tmux = crate::tmux::Session::from_name(session.name());
+            let first = crate::tmux::test_helpers::only_pane_id(session.name());
+            let pinned = crate::tmux::test_helpers::split_pane(session.name(), INPUT_BOX_SCRIPT);
+            let dir = tempfile::tempdir().unwrap();
+            let _pin =
+                crate::tmux::vt::register_live_target_for_test(session.name(), dir.path(), &pinned);
+            let screen = |pane: &str| {
+                crate::tmux::utils::strip_ansi(
+                    &tmux.try_capture_pane_in(pane, 0).unwrap_or_default(),
+                )
+            };
+            let wait_for = |pane: &str, text: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !screen(pane).contains(text) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{case}: {}",
+                        screen(pane)
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            };
+            wait_for(&first, "for shortcuts");
+            wait_for(&pinned, "for shortcuts");
+            let drafted = if draft_in_pinned { &pinned } else { &first };
+            tmux_keys(drafted, &["-l", "half typed"]);
+            wait_for(drafted, "❯ half typed");
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+            let sent = crate::server::api::sessions::send_terminal_message(
+                &state.session_service,
+                &id,
+                "hello".to_string(),
+                false,
+                false,
+                crate::server::api::sessions::SendPane::LIVE,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.error);
+
+            if draft_in_pinned {
+                assert!(
+                    matches!(
+                        sent,
+                        Err(crate::server::api::sessions::SendKeysError::InputLineBusy)
+                    ),
+                    "{case}: {}",
+                    screen(&pinned)
+                );
+                assert!(
+                    !screen(&pinned).contains("hello"),
+                    "{case}: {}",
+                    screen(&pinned)
+                );
+            } else {
+                assert!(sent.is_ok(), "{case}: {}", screen(&pinned));
+                wait_for(&pinned, "❯ hello");
+            }
+            assert!(
+                !screen(&first).contains("hello"),
+                "{case}: {}",
+                screen(&first)
+            );
+        }
+    }
+
+    /// A draft blocks until a read of an empty box completes within the budget. An unreadable
+    /// pane after a draft, a box cleared once the budget is spent, or an empty read that
+    /// completes after it, still refuses. A first read that is empty or can't tell, or an agent
+    /// with no input-line rule, passes without waiting.
+    #[test]
+    #[serial_test::serial]
+    fn a_seen_draft_blocks_until_a_clear_read_within_the_budget() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        enum Then {
+            KillFirst,
+            KillOnDraft,
+            ClearFirst,
+            ClearOnDraft,
+            ClearOnDraftHeldPastDeadline,
+            Leave,
+        }
+        for (name, tool, budget_ms, then, want) in [
+            (
+                "capture-fails-after-draft",
+                "claude",
+                3_000,
+                Then::KillOnDraft,
+                false,
+            ),
+            (
+                "cleared-after-deadline",
+                "claude",
+                150,
+                Then::ClearOnDraft,
+                false,
+            ),
+            (
+                "cleared-in-budget",
+                "claude",
+                3_000,
+                Then::ClearOnDraft,
+                true,
+            ),
+            (
+                "empty-after-deadline",
+                "claude",
+                1_000,
+                Then::ClearOnDraftHeldPastDeadline,
+                false,
+            ),
+            ("no-rule", "opencode", 3_000, Then::Leave, true),
+            ("unknown-first", "claude", 3_000, Then::KillFirst, true),
+            ("initial-empty", "claude", 0, Then::ClearFirst, true),
+            ("initial-unknown", "claude", 0, Then::KillFirst, true),
+        ] {
+            let mut inst = terminal_turn_instance(&format!("sess-wait-{name}"), name, "unused");
+            inst.tool = tool.into();
+            let pane = start_terminal_pane(&inst, INPUT_BOX_SCRIPT, false);
+            let pane_id = type_draft(&pane, "half typed");
+            let session = crate::tmux::Session::from_name(pane.name());
+            let drafts = crate::tmux::test_helpers::watch_drafts(&pane_id);
+            let kill = {
+                let pane_id = pane_id.clone();
+                move || {
+                    let status = crate::tmux::tmux_command()
+                        .args(["kill-pane", "-t", &pane_id])
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "{name}: kill-pane");
+                }
+            };
+            let clear = {
+                let target = pane_id.clone();
+                let name = pane.name().to_string();
+                move || {
+                    tmux_keys(&target, &["C-u"]);
+                    let tmux = crate::tmux::Session::from_name(&name);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while tmux
+                        .try_capture_pane_in(&target, 0)
+                        .is_ok_and(|screen| screen.contains("half typed"))
+                    {
+                        assert!(std::time::Instant::now() < deadline, "the draft clears");
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            };
+            match then {
+                Then::KillFirst => kill(),
+                Then::Leave => {}
+                Then::KillOnDraft => crate::tmux::test_helpers::on_draft_seen(&pane_id, kill),
+                Then::ClearFirst => clear(),
+                Then::ClearOnDraft => crate::tmux::test_helpers::on_draft_seen(&pane_id, clear),
+                Then::ClearOnDraftHeldPastDeadline => {
+                    let held = pane_id.clone();
+                    crate::tmux::test_helpers::on_draft_seen(&pane_id, move || {
+                        clear();
+                        // The next read's capture returns only once the wait's deadline passed.
+                        let pane = held.clone();
+                        crate::tmux::test_helpers::on_input_captured(&held, move || {
+                            let deadline = crate::tmux::test_helpers::input_wait_deadline(&pane)
+                                .expect("the wait recorded its deadline");
+                            let bound =
+                                std::time::Instant::now() + std::time::Duration::from_secs(10);
+                            while std::time::Instant::now() < deadline {
+                                assert!(
+                                    std::time::Instant::now() < bound,
+                                    "the held capture was never released"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                        });
+                    });
+                }
+            }
+            // A first read loads the detection manifest; the budget measures only the wait.
+            let _ = inst.input_line_in(&session, &pane_id);
+            let got = inst.wait_for_input_line(
+                &session,
+                &pane_id,
+                std::time::Duration::from_millis(budget_ms),
+            );
+            assert_eq!(got, want, "{name}");
+            let waited = drafts.try_recv().is_ok();
+            assert_eq!(
+                waited,
+                tool == "claude" && !matches!(then, Then::KillFirst | Then::ClearFirst),
+                "{name}: draft read"
+            );
+        }
+    }
+
+    /// A send waits for a person's draft to clear, and refuses one that stays, leaving it as
+    /// typed.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn a_terminal_send_waits_out_a_draft_and_refuses_one_that_stays() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-draft", "term-draft", "initial-turn");
+        inst.tool = "claude".into();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, INPUT_BOX_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let send = |service: Arc<SessionService>| async move {
+            crate::server::api::sessions::send_terminal_message(
+                &service,
+                "sess-draft",
+                "hello".to_string(),
+                false,
+                false,
+                crate::server::api::sessions::SendPane::LIVE,
+            )
+            .await
+        };
+
+        let pane_id = type_draft(&pane, "half typed");
+        let refused = send(service.clone()).await.err().map(|e| e.error);
+        assert!(
+            matches!(
+                refused,
+                Some(crate::server::api::sessions::SendKeysError::InputLineBusy)
+            ),
+            "{}",
+            pane_text(&pane)
+        );
+        let screen = crate::tmux::utils::strip_ansi(&pane_text(&pane));
+        assert!(screen.contains("❯ half typed"), "{screen}");
+        assert!(!screen.contains("hello"), "{screen}");
+        assert!(pending_turn(&service, "sess-draft").await.is_some());
+
+        let drafts = crate::tmux::test_helpers::watch_drafts(&pane_id);
+        let sending = tokio::spawn(send(service.clone()));
+        tokio::task::spawn_blocking(move || {
+            drafts.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap()
+        .expect("the gate reads the draft");
+        tmux_keys(&pane_id, &["C-u"]);
+        assert!(sending.await.unwrap().is_ok(), "{}", pane_text(&pane));
+        wait_for_pane(&pane, |screen| screen.contains("❯ hello"));
+    }
+
+    /// An initial prompt that meets a draft waits within its budget, then fails as
+    /// `input_line_busy` and is not typed. The wait fails by itself, so a draft cleared after
+    /// the budget cannot let the prompt through.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    async fn an_initial_prompt_that_meets_a_draft_fails_busy() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-draft-turn", "term-draft-turn", "initial-turn");
+        inst.tool = "claude".into();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, INPUT_BOX_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        type_draft(&pane, "half typed");
+        let waited = state.instances.read().await[0].clone();
+        let wait = tokio::task::spawn_blocking(move || {
+            wait_for_terminal_agent(&waited, std::time::Duration::from_secs(1))
+        })
+        .await
+        .unwrap()
+        .expect_err("a draft that outlasts the budget fails the wait");
+        assert_eq!(
+            wait.downcast_ref::<TerminalPromptBlocker>(),
+            Some(&TerminalPromptBlocker::InputLineBusy)
+        );
+        service
+            .drain_terminal_initial_turn_within(
+                "sess-draft-turn",
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+
+        let turn = pending_turn(&service, "sess-draft-turn").await.unwrap();
+        assert_eq!(turn.error_code.as_deref(), Some("input_line_busy"));
+        let screen = crate::tmux::utils::strip_ansi(&pane_text(&pane));
+        assert!(screen.contains("❯ half typed"), "{screen}");
+        assert!(!screen.contains("initial-turn"), "{screen}");
     }
 
     /// Capture and send address the pane that was checked. When it is gone, a
@@ -6513,6 +6926,7 @@ mod tests {
             "user-message-B".to_string(),
             false,
             false,
+            crate::server::api::sessions::SendPane::LIVE,
         )
         .await;
         assert!(sent.is_ok());
@@ -6564,6 +6978,7 @@ mod tests {
                     "user-message-B".to_string(),
                     false,
                     false,
+                    crate::server::api::sessions::SendPane::LIVE,
                 ),
             )
             .await
@@ -6605,6 +7020,7 @@ mod tests {
                     "user-message-B".to_string(),
                     false,
                     false,
+                    crate::server::api::sessions::SendPane::LIVE,
                 )
                 .await
             })

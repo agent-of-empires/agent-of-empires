@@ -483,6 +483,12 @@ liveness. The quota window (such as `five_hour` or `seven_day`) becomes
 `RateLimitInfo.resets_at` contains a reset attributed to the rejected window or
 parsed in the stated time zone from the agent's status text, or `None`.
 
+Agent-initiated turns can report a limit without an error. If no tool ran,
+the connection's idle tick parks the turn on a captured rejected window or a
+lone usage-limit sentence. Terminal repair sees only the transcript: it parks
+a missed turn only when that sentence is the sole text, rather than closing
+it as `inferred_prompt_complete`.
+
 With `[acp] rate_limit_auto_resume`, the reconciler resumes the same worker once `resets_at` plus a 15s grace passes, or, with no reset from either source, an hour after the park with the wait doubling per redelivery (1h, 2h, 4h, 8h, 16h). Each resume re-delivers the interrupted prompt once, capped at 5 per streak, after which the session parks on `Stopped { reason: "rate_limit_exhausted_retries" }`. The streak is counted from persisted `RateLimitAutoResumed` breadcrumbs since the last organic turn end or agent switch, kept in a per-session row outside the pruned transcript. Nothing un-parks a session on a timer otherwise: dispatch treats the park like idle dormancy, which is what makes "send a new prompt" true.
 
 Manual retry does not require auto-resume opt-in. Both paths serialize selection,
@@ -520,12 +526,9 @@ Claude-family provider changes restart the worker, preserve conversation and rea
 
 ## Agent profiles
 
-Each agent has two profile sources, kept aligned by registry key:
+`src/acp/agent_profiles.rs` is the single source: reset and compact aliases, capability gates, the card-classifier alias map, MCP prefixes, special-title patterns, the memory path regex and the daemon-side fullscreen probe. Each session row sends it to clients as the versioned `agent_profile` object (`AgentProfileWire`, `v`); the web client reads it from the row and keeps no per-agent table. Changing its shape needs a `WIRE_VERSION` bump.
 
-- **Server**, `src/acp/agent_profiles.rs`: `parent_meta_namespaces`, `clear_aliases`, and the `supports_exit_plan_mode` / `supports_wakeup_tools` gates.
-- **Frontend**, `web/src/lib/agentProfiles.ts`: the card-classifier alias map, claude-specialized capabilities (`todos`, `skills`, `wakeup`), the MCP prefix list, and special-title patterns matched only when the capability is on.
-
-Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId` on child tool calls; for a profile that supports subagents the link comes from the delegation `session_message` instead (see Subagent sessions). An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagentToolNames`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
+Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId` on child tool calls; for a profile that supports subagents the link comes from the delegation `session_message` instead (see Subagent sessions). An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagent_tool_names`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
 
 ## Security model
 

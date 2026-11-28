@@ -111,6 +111,15 @@ pub struct AcpRunnerArgs {
     pub systemd_scope: Option<String>,
     #[arg(long)]
     pub prime_runtime: Option<String>,
+    /// JSON `ProxySpec` of the proxy ahead of the adapter in `agent_argv`.
+    #[arg(long)]
+    pub proxy: Option<String>,
+    /// Display name of the proxy a `neutral_boot` fallback dropped.
+    #[arg(long)]
+    pub degraded: Option<String>,
+    /// Launch config the daemon wrote for the proxy; the runner removes it at exit.
+    #[arg(long)]
+    pub proxy_launch_config: Option<PathBuf>,
     /// Agent program + args after `--`.
     #[arg(last = true, required = true)]
     pub agent_argv: Vec<String>,
@@ -212,6 +221,13 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         .map(serde_json::from_str)
         .transpose()
         .context("parsing Prime runtime")?;
+    record.proxy = args
+        .proxy
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("parsing proxy spec")?;
+    record.degraded = args.degraded.clone();
     let (control_listener, mut agent_child, agent_stdin, agent_stdout, agent_stderr) =
         register_and_spawn_agent(&args, &record)?;
     let agent_started_at = std::time::Instant::now();
@@ -372,15 +388,30 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
 
     watchdog_handle.abort();
     agent_stdout_task.abort();
+    // Not covered by the registry retire below when a replacement runner owns the session.
+    if let Some(config) = &args.proxy_launch_config {
+        if let Err(error) = worker_registry::remove_proxy_launch_config(&session_id, config) {
+            warn!(target: "acp.runner", session = %session_id, %error, "failed to remove proxy launch config");
+        }
+    }
     let cleanup_record = record.clone();
-    tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&cleanup_record))
-        .await??;
-    if !preserve_registry {
+    let cleanup =
+        tokio::task::spawn_blocking(move || worker_registry::cleanup_runtime(&cleanup_record))
+            .await?;
+    // A failed cleanup keeps the record so the daemon can still recover the runtime.
+    if should_delete_record(&cleanup, preserve_registry) {
         if let Err(error) = worker_registry::delete_if_owned(&session_id, our_pid) {
             warn!(target: "acp.runner", session = %session_id, %error, "failed to delete worker record");
         }
     }
-    Ok(())
+    // Last, so a grandchild that outlived its parent (a proxy's adapter) dies too.
+    // A cleanup error must not spare the group, so it is returned only if this process survives.
+    crate::process::worker::kill_own_process_group_if_leader(our_pid);
+    cleanup
+}
+
+fn should_delete_record(cleanup: &Result<()>, preserve_registry: bool) -> bool {
+    cleanup.is_ok() && !preserve_registry
 }
 
 async fn run_watchdog(
@@ -700,6 +731,14 @@ fn open_log_file(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn worker_record_survives_a_failed_cleanup_or_a_replacement() {
+        let failed: Result<()> = Err(anyhow::anyhow!("cleanup failed"));
+        assert!(should_delete_record(&Ok(()), false));
+        assert!(!should_delete_record(&failed, false));
+        assert!(!should_delete_record(&Ok(()), true));
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn native_registration_rejects_stopped_and_superseded_births_before_agent_spawn() {
@@ -728,6 +767,9 @@ mod tests {
             lifecycle_generation: Some(5),
             systemd_scope: None,
             prime_runtime: None,
+            proxy: None,
+            degraded: None,
+            proxy_launch_config: None,
             agent_argv: vec!["sh".into(), "-c".into(), "printf born > agent-born".into()],
         };
         let record = WorkerRecord::new(

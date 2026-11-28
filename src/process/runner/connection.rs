@@ -261,6 +261,8 @@ pub(super) async fn handle_control_connection(
                                 acp_session_id,
                                 result,
                                 native_channel: handshake_shared.native_availability(),
+                                // Filled in by `enqueue` under the queue lock.
+                                adapter_frames: 0,
                             },
                             Err(error) => error.into_frame("resume_session"),
                         }
@@ -282,6 +284,7 @@ pub(super) async fn handle_control_connection(
                                     acp_session_id,
                                     result,
                                     native_channel: handshake_shared.native_availability(),
+                                    adapter_frames: 0,
                                 }
                             }
                             Err(error) => {

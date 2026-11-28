@@ -26,7 +26,9 @@ use super::rate_limit::classify_rate_limit_error;
 /// scope behind a partial write to an unavailable peer.
 const LOSS_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 use super::runner::runner_socket_deadline;
-use super::session_identity::{SessionIngress, CONTROL_FRAME_BYTES_FIELD};
+use super::session_identity::{
+    SessionIngress, ADAPTER_FRAMES_SHED_METHOD, CONTROL_FRAME_BYTES_FIELD,
+};
 
 /// Cancels a socket handshake abandoned mid-construction. Closing this exact
 /// channel cancels only its own runner.
@@ -62,7 +64,11 @@ pub(super) struct DaemonControlClient {
     peer_identity: crate::acp::runner_lifecycle::RunnerIdentity,
     peer_process: crate::process::CapturedProcess,
     closed_locally: Arc<AtomicBool>,
-    loss: Arc<std::sync::OnceLock<ControlLoss>>,
+    loss: Arc<std::sync::OnceLock<(Option<std::io::ErrorKind>, bool)>>,
+    /// The agent sent a valid proxy hello on this connection.
+    proxied: Arc<AtomicBool>,
+    #[cfg(test)]
+    disconnected: tokio_util::sync::CancellationToken,
     #[cfg(test)]
     completion_relayed: Arc<AtomicBool>,
 }
@@ -78,6 +84,27 @@ pub(crate) struct ControlLoss {
     /// `None` for a clean EOF.
     pub(crate) io_error: Option<std::io::ErrorKind>,
     pub(crate) turn_in_flight: bool,
+    /// A proxied agent was behind the channel, so its loss is the proxy's.
+    /// Read from the validated hello when the loss is read, never at EOF,
+    /// which can beat the hello's handoff.
+    pub(crate) proxied: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct ControlLossHandle {
+    loss: Arc<std::sync::OnceLock<(Option<std::io::ErrorKind>, bool)>>,
+    proxied: Arc<AtomicBool>,
+}
+
+impl ControlLossHandle {
+    pub(super) fn get(&self) -> Option<ControlLoss> {
+        let &(io_error, turn_in_flight) = self.loss.get()?;
+        Some(ControlLoss {
+            io_error,
+            turn_in_flight,
+            proxied: self.proxied.load(AtomicOrdering::Acquire),
+        })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -258,12 +285,19 @@ impl DaemonControlClient {
         unsafe { libc::shutdown(self.raw_fd, libc::SHUT_RDWR) };
     }
 
+    pub(super) fn mark_proxied(&self) {
+        self.proxied.store(true, AtomicOrdering::Release);
+    }
+
     pub(super) fn lost(&self) -> bool {
         self.loss.get().is_some()
     }
 
-    pub(super) fn loss_handle(&self) -> Arc<std::sync::OnceLock<ControlLoss>> {
-        Arc::clone(&self.loss)
+    pub(super) fn loss_handle(&self) -> ControlLossHandle {
+        ControlLossHandle {
+            loss: Arc::clone(&self.loss),
+            proxied: Arc::clone(&self.proxied),
+        }
     }
 
     async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
@@ -796,6 +830,11 @@ pub(super) async fn connect_runner_control_v5(
     let closed_locally = Arc::new(AtomicBool::new(false));
     let loss = Arc::new(std::sync::OnceLock::new());
     let (reader_closed_locally, reader_loss) = (closed_locally.clone(), loss.clone());
+    let proxied = Arc::new(AtomicBool::new(false));
+    #[cfg(test)]
+    let disconnected = tokio_util::sync::CancellationToken::new();
+    #[cfg(test)]
+    let reader_disconnected = disconnected.clone();
     #[cfg(test)]
     let completion_relayed = Arc::new(AtomicBool::new(false));
     #[cfg(test)]
@@ -817,6 +856,9 @@ pub(super) async fn connect_runner_control_v5(
         peer_process,
         closed_locally,
         loss,
+        proxied,
+        #[cfg(test)]
+        disconnected,
         #[cfg(test)]
         completion_relayed,
     });
@@ -825,18 +867,15 @@ pub(super) async fn connect_runner_control_v5(
             if reader_closed_locally.load(AtomicOrdering::Acquire) {
                 return;
             }
-            let loss = ControlLoss {
-                io_error,
-                turn_in_flight: reader_prompt_in_flight.load(AtomicOrdering::Relaxed),
-            };
+            let turn_in_flight = reader_prompt_in_flight.load(AtomicOrdering::Relaxed);
             warn!(
                 target: "acp.protocol",
                 session = %reader_session,
-                io_error = ?loss.io_error,
-                turn_in_flight = loss.turn_in_flight,
+                io_error = ?io_error,
+                turn_in_flight,
                 "runner closed the control channel"
             );
-            let _ = reader_loss.set(loss);
+            let _ = reader_loss.set((io_error, turn_in_flight));
         };
         async {
             let mut native_loss_relayed = false;
@@ -851,6 +890,7 @@ pub(super) async fn connect_runner_control_v5(
                         if let ControlBody::SessionReady {
                             acp_session_id,
                             native_channel,
+                            adapter_frames,
                             ..
                         } = &frame
                         {
@@ -868,6 +908,7 @@ pub(super) async fn connect_runner_control_v5(
                                 reader_connection_state.record_usable();
                             }
                             reader_ingress.resolve(None, acp_session_id.clone().into());
+                            reader_ingress.skip_adapter_frames(*adapter_frames);
                         }
                         let application = (!reader_connection_state.sdk_is_closing()
                             && matches!(&frame, ControlBody::HandshakeFailed {
@@ -878,6 +919,25 @@ pub(super) async fn connect_runner_control_v5(
                                 HandshakeApplication(reader_connection_state.clone())
                             });
                         if hs_tx.send(HandshakeReply { body: frame, application }).await.is_err() {
+                            return;
+                        }
+                    }
+                    // Relayed in stream position: crediting it here would run ahead
+                    // of earlier frames still buffered for the crate.
+                    Ok(Some((ControlBody::AdapterFramesShed { count }, _))) => {
+                        let line = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": ADAPTER_FRAMES_SHED_METHOD,
+                            "params": { "count": count },
+                        });
+                        if !shim_write_line_releasing(
+                            &reader_shim_write,
+                            &line,
+                            &reader_settled,
+                            &reader_connection_state,
+                        )
+                        .await
+                        {
                             return;
                         }
                     }
@@ -1154,6 +1214,8 @@ pub(super) async fn connect_runner_control_v5(
             }
         }
         .await;
+        #[cfg(test)]
+        reader_disconnected.cancel();
         reader_connection_state.observe(
             crate::acp::state::AcpConnectionSource::Control,
             crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
@@ -2377,6 +2439,57 @@ mod tests {
         fake.await.unwrap();
     }
 
+    /// A shed marker keeps its place among the buffered adapter frames, so it
+    /// credits only after the frames sent before it.
+    #[tokio::test]
+    async fn a_shed_marker_keeps_its_stream_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (control, listener) = bind(&tmp);
+        let fake = tokio::spawn(async move {
+            let mut peer = accept_hello(
+                &listener,
+                "shed",
+                control_protocol::CONTROL_PROTOCOL_VERSION,
+            )
+            .await;
+            for n in 1..=2 {
+                let body = ControlBody::Notify {
+                    method: "x/frame".into(),
+                    params: serde_json::json!({ "n": n }),
+                };
+                control_protocol::write_frame(&mut peer, &body)
+                    .await
+                    .unwrap();
+            }
+            control_protocol::write_frame(&mut peer, &ControlBody::AdapterFramesShed { count: 3 })
+                .await
+                .unwrap();
+            peer
+        });
+        let (client, crate_side) = connect(&control, "shed", Arc::new(TerminalClaim::new()), false)
+            .await
+            .unwrap();
+        let _peer = fake.await.unwrap();
+        let mut lines = BufReader::new(crate_side).lines();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("the reader relays every frame")
+                .unwrap()
+                .expect("stream open");
+            seen.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+        }
+        let methods: Vec<_> = seen.iter().map(|v| v["method"].as_str().unwrap()).collect();
+        assert_eq!(methods, ["x/frame", "x/frame", ADAPTER_FRAMES_SHED_METHOD]);
+        assert_eq!(seen[2]["params"]["count"], 3);
+        assert_eq!(
+            client.ingress.take_discarded_adapter_frames(),
+            0,
+            "the reader credits nothing itself"
+        );
+    }
+
     #[tokio::test]
     async fn runner_control_eof_closes_transport_and_cancels_prompt() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2411,6 +2524,39 @@ mod tests {
             .await
             .expect("crate transport must observe control EOF");
         assert_eq!(read.unwrap(), 0);
+    }
+
+    /// EOF can be read before `establish` marks the validated proxy hello. The
+    /// loss still reports the proxy, so the order is forced here: the reader
+    /// records the loss first, the mark lands after.
+    #[tokio::test]
+    async fn control_loss_reports_a_proxy_hello_validated_after_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (control, listener) = bind(&tmp);
+        let fake = tokio::spawn(async move {
+            let mut peer = accept_hello(
+                &listener,
+                "late",
+                control_protocol::CONTROL_PROTOCOL_VERSION,
+            )
+            .await;
+            assert!(matches!(
+                control_protocol::read_frame(&mut peer).await.unwrap(),
+                Some(ControlBody::Attach { .. })
+            ));
+        });
+        let (client, _crate_side) =
+            connect(&control, "late", Arc::new(TerminalClaim::new()), false)
+                .await
+                .unwrap();
+        fake.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.disconnected.cancelled())
+            .await
+            .expect("reader must observe control EOF");
+        let handle = client.loss_handle();
+        assert!(!handle.get().expect("loss recorded").proxied);
+        client.mark_proxied();
+        assert!(handle.get().expect("loss recorded").proxied);
     }
 
     #[tokio::test]
@@ -2448,6 +2594,7 @@ mod tests {
                                 result: serde_json::json!({}),
                                 native_channel:
                                     control_protocol::NativeChannelAvailability::Available,
+                                adapter_frames: 0,
                             }
                         }
                         ControlBody::Prompt { request } => {
@@ -2502,6 +2649,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    false,
                 )
                 .await
                 .unwrap();
@@ -2648,7 +2797,12 @@ mod tests {
                         }
                         control_protocol::write_frame(
                             &mut peer,
-                            &ControlBody::SessionReady { acp_session_id: "actual".into(), result: serde_json::json!({}), native_channel: crate::acp::control_protocol::NativeChannelAvailability::Available },
+                            &ControlBody::SessionReady {
+                                acp_session_id: "actual".into(),
+                                result: serde_json::json!({}),
+                                native_channel: NativeChannelAvailability::Available,
+                                adapter_frames: 0,
+                            },
                         )
                         .await
                         .unwrap();
@@ -2694,6 +2848,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -2759,7 +2915,12 @@ mod tests {
                     ControlBody::ResumeSession => {
                         control_protocol::write_frame(
                             &mut peer,
-                            &ControlBody::SessionReady { acp_session_id: "actual".into(), result: serde_json::json!({}), native_channel: crate::acp::control_protocol::NativeChannelAvailability::Available },
+                            &ControlBody::SessionReady {
+                                acp_session_id: "actual".into(),
+                                result: serde_json::json!({}),
+                                native_channel: NativeChannelAvailability::Available,
+                                adapter_frames: 0,
+                            },
                         )
                         .await
                         .unwrap();
@@ -2783,6 +2944,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -2875,7 +3038,12 @@ mod tests {
                         assert_eq!(error.code, -32602);
                         control_protocol::write_frame(
                             &mut peer,
-                            &ControlBody::SessionReady { acp_session_id: "s".into(), result: serde_json::json!({}), native_channel: crate::acp::control_protocol::NativeChannelAvailability::Available },
+                            &ControlBody::SessionReady {
+                                acp_session_id: "s".into(),
+                                result: serde_json::json!({}),
+                                native_channel: NativeChannelAvailability::Available,
+                                adapter_frames: 0,
+                            },
                         )
                         .await
                         .unwrap();
@@ -2906,6 +3074,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                false,
             )
             .await
             .expect("producer-admitted backlog must attach");
@@ -3100,7 +3270,12 @@ mod tests {
                     }
                     ControlBody::EstablishSession { .. } => {
                         for body in [
-                            ControlBody::SessionReady { acp_session_id: "s".into(), result: serde_json::json!({}), native_channel: crate::acp::control_protocol::NativeChannelAvailability::Available },
+                            ControlBody::SessionReady {
+                                acp_session_id: "s".into(),
+                                result: serde_json::json!({}),
+                                native_channel: NativeChannelAvailability::Available,
+                                adapter_frames: 0,
+                            },
                             ControlBody::Notify {
                                 method: "session/update".into(),
                                 params: serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"}}}),
@@ -3178,7 +3353,8 @@ mod tests {
                                             "the healthy replay fixture must not lose native I/O"
                                         );
                                     }
-                                    SessionIngressNotification::AuthStatus(_) => {}
+                                    SessionIngressNotification::AuthStatus(_)
+                                    | SessionIngressNotification::AdapterFramesShed(_) => {}
                                     SessionIngressNotification::Update(_) => {
                                         let (entered, release) =
                                             gate.lock().await.recv().await.unwrap();
@@ -3351,6 +3527,7 @@ mod tests {
                     ready_tx,
                     profile: &crate::acp::agent_profiles::GEMINI,
                     expected_agent: ExpectedAgent::Gemini,
+                    proxy: None,
                     source_profile: None,
                     default_effort: None,
                     default_model_config: Default::default(),
@@ -3413,6 +3590,7 @@ mod tests {
                 acp_session_id: "sid-adopted".into(),
                 result: serde_json::json!({}),
                 native_channel: crate::acp::control_protocol::NativeChannelAvailability::Available,
+                adapter_frames: 0,
             })
             .await;
             if established_first {
