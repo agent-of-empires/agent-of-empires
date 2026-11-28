@@ -983,6 +983,7 @@ mod tests {
             last_accessed_at: None,
             idle_entered_at: None,
             last_error: None,
+            last_error_evidence: None,
             archived_at: None,
             ignored_at: None,
             trashed_at: None,

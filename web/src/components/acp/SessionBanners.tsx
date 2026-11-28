@@ -1,7 +1,14 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
-import type { AcpState } from "../../lib/acpTypes";
+import { CancelButton, ConfirmButton, Dialog } from "../Dialog";
+import { useBusyAction, useConfirmKeys, useDialogFocus } from "../dialogHooks";
+import {
+  nativeInputAvailable,
+  type AcpConnectionUnavailability,
+  type AcpState,
+  type EstablishmentRevision,
+} from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
 import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
 import { IntegrationLostBanner } from "./IntegrationLostBanner";
@@ -56,19 +63,36 @@ export function SessionBanners({
   onSwitchToTerminal?: () => void;
   dismissError: () => void;
 }) {
-  const variant = pickWorkerStoppedVariant({
-    workerStopped: state.workerStopped,
-    startupError: state.startupError,
-    trashedAt,
-    archivedAt,
-    snoozedUntil,
-    workerStopping: acpWorkerState === "stopping",
-  });
-  const healthy = !state.startupError && !state.integrationLost && !state.workerStopped && !state.workerRestarting;
+  const nativeReady = nativeInputAvailable(state);
+  // A prior current input receipt changes the diagnostic, never today's control authority.
+  const startupDiagnosticOnly = nativeReady || state.sessionAssigned;
+  const reason = state.integrationLost;
+  const integrationError = reason
+    ? `Agent integration lost: ${reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")}`
+    : null;
+  const startupError = state.startupError;
+  const variant = reason
+    ? "none"
+    : pickWorkerStoppedVariant({
+        workerStopped: state.workerStopped,
+        startupError,
+        trashedAt,
+        archivedAt,
+        snoozedUntil,
+        workerStopping: acpWorkerState === "stopping",
+      });
+  const healthy =
+     !reason && !state.integrationLost &&
+    !state.workerStopped &&
+    !state.workerRestarting &&
+    !state.connectionUnavailable &&
+    (!startupError || nativeReady);
   const idle = healthy && !state.turnActive;
+  const errorMessage = state.interactionError?.message ?? state.lastError;
   return (
     <>
-      {state.startupError && state.startupCause?.kind === "container_missing" && (
+      {integrationError && <InteractionErrorBanner title="Structured view diagnostic" message={integrationError} />}
+      {state.startupError && !startupDiagnosticOnly && state.startupCause?.kind === "container_missing" && (
         <ContainerGoneBanner
           sessionId={sessionId}
           message={state.startupError}
@@ -81,12 +105,13 @@ export function SessionBanners({
           onRecreated={() => onRestarted?.(state.restartEpoch, false, state.startupError ?? "")}
         />
       )}
-      {state.startupError && state.startupCause?.kind !== "container_missing" && (
+      {startupError && !startupDiagnosticOnly && state.startupCause?.kind !== "container_missing" && (
         <StartupErrorBanner
           sessionId={sessionId}
           tool={tool}
-          message={state.startupError}
+          message={startupError}
           acpWorkerState={acpWorkerState}
+          canRecover={canRestart && state.connectionUnavailable === null}
           sentStopped={state.restartStoppedSent}
           retriedError={state.retriedError}
           restartEpoch={state.restartEpoch}
@@ -96,6 +121,26 @@ export function SessionBanners({
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
+      {startupError && startupDiagnosticOnly && (
+        <InteractionErrorBanner message={startupError} onDismiss={dismissError} />
+      )}
+      {state.connectionUnavailable ? (
+        <NativeChannelNotice observation={state.connectionUnavailable} current />
+      ) : state.connectionUnavailableNotice ? (
+        <NativeChannelNotice observation={state.connectionUnavailableNotice} current={false} />
+      ) : null}
+      {state.nativeSnapshotSeq !== null &&
+        !nativeReady &&
+        !state.connectionUnavailable &&
+        !startingAgent &&
+        acpWorkerState === "running" && (
+          <div
+            className="border-b border-surface-700 px-4 py-2 text-xs text-text-muted"
+            data-testid="native-channel-unknown"
+          >
+            Native input readiness is unconfirmed. The transcript remains available.
+          </div>
+        )}
       {state.integrationLost && <IntegrationLostBanner reason={state.integrationLost} />}
       {variant === "trashed" && <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />}
       {variant === "archived" && <ArchivedWorkerStoppedBanner sessionId={sessionId} />}
@@ -109,18 +154,19 @@ export function SessionBanners({
           sentStopped={state.restartStoppedSent}
         />
       )}
-      {state.workerRestarting && !state.startupError && !state.workerStopped && (
+      {state.workerRestarting && !startupError && !reason && !state.workerStopped && (
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
-      {startingAgent ? (
+      {!reason && startingAgent ? (
         <StartupWaitLine
           sessionId={sessionId}
           agent={startingAgent}
-          sentPending={state.turnActive}
+          sentPending={state.turnActive || state.hostPromptIntent != null}
           queuedPending={state.queuedPrompts.length > 0}
           canRestart={canRestart}
           restartEpoch={state.restartEpoch}
           sentStopped={state.restartStoppedSent}
+          establishmentRevision={state.establishmentRevision}
           onRestarted={onRestarted}
           onRestartFailed={onRestartFailed}
         />
@@ -134,11 +180,12 @@ export function SessionBanners({
           </PulseBanner>
         )
       )}
-      {showWorkerStoppingBanner({
-        acpWorkerState,
-        startupError: state.startupError,
-        restartInFlight: state.restartInFlight,
-      }) && <WorkerStoppingBanner />}
+      {!reason &&
+        showWorkerStoppingBanner({
+          acpWorkerState,
+          startupError,
+          restartInFlight: state.restartInFlight,
+        }) && <WorkerStoppingBanner />}
       {state.nextWakeupAt && idle && (
         <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
       )}
@@ -147,8 +194,24 @@ export function SessionBanners({
           Monitoring a background job
         </ChipBanner>
       )}
-      {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
+      {errorMessage && <InteractionErrorBanner message={errorMessage} onDismiss={dismissError} />}
     </>
+  );
+}
+
+function NativeChannelNotice({ observation, current }: { observation: AcpConnectionUnavailability; current: boolean }) {
+  return (
+    <div
+      className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning"
+      data-testid={current ? "native-channel-unavailable" : "native-channel-diagnostic"}
+    >
+      <div className="font-medium">{current ? "Native input unavailable" : "Previous native-channel diagnostic"}</div>
+      <div className="mt-0.5">
+        {observation.cause.replaceAll("_", " ")} ({observation.source}; {observation.phase}).
+        {current &&
+          " The retained conversation has not been replaced. Channel loss alone does not prove the process exited."}
+      </div>
+    </div>
   );
 }
 
@@ -170,6 +233,7 @@ export function StartupWaitLine({
   canRestart,
   restartEpoch,
   sentStopped,
+  establishmentRevision = null,
   onRestarted,
   onRestartFailed,
 }: {
@@ -183,6 +247,7 @@ export function StartupWaitLine({
   restartEpoch: number;
   /** A restart stopped the sent message and it hasn't been sent again. */
   sentStopped: boolean;
+  establishmentRevision?: EstablishmentRevision | null;
   onRestarted?: (epoch: number, stoppedSent: boolean) => void;
   onRestartFailed?: (epoch: number, message: string, stoppedSent: boolean) => void;
 }) {
@@ -191,6 +256,20 @@ export function StartupWaitLine({
   const [frame, setFrame] = useState(0);
   const [still] = useState(reducedMotion);
   const mounted = useRef(true);
+  const [confirmation, setConfirmation] = useState<{ sessionId: string; revision: EstablishmentRevision } | null>(null);
+  const [freshError, setFreshError] = useState<string | null>(null);
+  const currentSession = useRef(sessionId);
+  const currentRevision = useRef(establishmentRevision);
+  useLayoutEffect(() => {
+    if (currentSession.current !== sessionId) {
+      setConfirmation(null);
+      setFreshError(null);
+      setStartedAt(Date.now());
+      setSeconds(0);
+    }
+    currentSession.current = sessionId;
+    currentRevision.current = establishmentRevision;
+  }, [sessionId, establishmentRevision]);
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -201,11 +280,12 @@ export function StartupWaitLine({
     state: restartState,
     error: restartError,
     respawn,
-  } = useRespawnSession(sessionId, null, {
+  } = useRespawnSession(sessionId, sessionId, {
     restart: true,
     // A mounted line shows the failure itself; once the restart's stop has unmounted it, or for a server
     // error, which only follows the stop, the stopped banner names it.
     onFailed: (status, error) => {
+      if (currentSession.current !== sessionId) return;
       if ((status !== null && status >= 500) || !mounted.current) onRestartFailed?.(restartEpoch, error, sentPending);
     },
   });
@@ -221,12 +301,29 @@ export function StartupWaitLine({
   const glyph = still ? "⣿" : RATTLES.breathe.frames[frame];
   const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
   const restart = async () => {
+    const frozen = confirmation;
+    if (
+      !frozen ||
+      !mounted.current ||
+      frozen.sessionId !== currentSession.current ||
+      currentRevision.current === null ||
+      JSON.stringify(frozen.revision) !== JSON.stringify(currentRevision.current)
+    ) {
+      setConfirmation(null);
+      setFreshError("The conversation changed. Review Start fresh again.");
+      return;
+    }
     const epoch = restartEpoch;
     const stopsSent = sentPending;
-    if (!(await respawn())) return;
+    const restarted = await respawn({ revision: frozen.revision, action: "fresh" });
+    if (currentSession.current !== frozen.sessionId) return;
+    if (mounted.current) setConfirmation(null);
+    if (!restarted) return;
     onRestarted?.(epoch, stopsSent);
-    setStartedAt(Date.now());
-    setSeconds(0);
+    if (mounted.current) {
+      setStartedAt(Date.now());
+      setSeconds(0);
+    }
   };
   const costId = useId();
   const cost = [
@@ -254,30 +351,82 @@ export function StartupWaitLine({
         {elapsed}
       </span>
       {offerRestart && (
-        <button
-          type="button"
-          data-testid="startup-wait-restart"
-          onClick={() => void restart()}
-          disabled={restartState === "retrying"}
-          aria-describedby={cost ? costId : undefined}
-          aria-busy={restartState === "retrying"}
-          className={`${BUTTON_SECONDARY_SM} shrink-0`}
-        >
-          {restartState === "retrying" && <Spinner />}
-          {restartState === "retrying" ? "Restarting…" : `Restart ${agent}`}
-        </button>
+        <div className="shrink-0">
+          <button
+            type="button"
+            className={BUTTON_SECONDARY_SM}
+            data-testid="startup-wait-restart"
+            aria-label={`Start fresh ${agent}`}
+            disabled={restartState === "retrying" || establishmentRevision === null}
+            aria-busy={restartState === "retrying"}
+            title={establishmentRevision === null ? "Waiting for current conversation state." : undefined}
+            aria-describedby={cost ? costId : undefined}
+            onClick={() => {
+              const revision = currentRevision.current;
+              if (revision === null) return;
+              setFreshError(null);
+              setConfirmation({ sessionId: currentSession.current, revision });
+            }}
+          >
+            {restartState === "retrying" && <Spinner />}
+            {restartState === "retrying" ? "Starting fresh…" : "Start fresh"}
+          </button>
+        </div>
       )}
       {offerRestart && cost && (
         <span id={costId} data-testid="startup-wait-restart-cost" className="basis-full">
           {cost}
         </span>
       )}
-      {restartState === "failed" && restartError && (
+      {(freshError || (restartState === "failed" && restartError)) && (
         <span data-testid="startup-wait-restart-error" className="basis-full text-status-error-text">
-          Restart failed: {restartError}
+          {freshError ?? `Restart failed: ${restartError}`}
         </span>
       )}
+      {confirmation?.sessionId === sessionId && (
+        <StartupFreshDialog agent={agent} onConfirm={restart} onCancel={() => setConfirmation(null)} />
+      )}
     </div>
+  );
+}
+
+function StartupFreshDialog({
+  agent,
+  onConfirm,
+  onCancel,
+}: {
+  agent: string;
+  onConfirm: () => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [starting, confirm] = useBusyAction(onConfirm);
+  const confirmRef = useRef<HTMLButtonElement | null>(null);
+  useDialogFocus(confirmRef);
+  useConfirmKeys(onCancel, confirm, starting);
+  return (
+    <Dialog
+      id="startup-fresh-dialog"
+      title="Start fresh?"
+      onDismiss={onCancel}
+      footer={
+        <>
+          <CancelButton onClick={onCancel} disabled={starting} />
+          <ConfirmButton
+            buttonRef={confirmRef}
+            onClick={confirm}
+            busy={starting}
+            testId="startup-fresh-confirm"
+          >
+            {starting ? "Starting fresh…" : "Start fresh"}
+          </ConfirmButton>
+        </>
+      }
+    >
+      <p className="text-[13px] text-text-secondary">
+        Start a fresh {agent} conversation? This stops the current start. Your message will not be resent; send it once
+        the agent is ready.
+      </p>
+    </Dialog>
   );
 }
 
@@ -326,11 +475,29 @@ function ChipBanner({
   );
 }
 
-function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+function InteractionErrorBanner({
+  title = "Action did not complete",
+  message,
+  onDismiss,
+}: {
+  title?: string;
+  message: string;
+  onDismiss?: () => void;
+}) {
+  if (onDismiss) {
+    return (
+      <WarningStrip title={title} onDismiss={onDismiss}>
+        <span className="block">{message}</span>
+      </WarningStrip>
+    );
+  }
   return (
-    <WarningStrip title="Action did not complete." onDismiss={onDismiss}>
-      {message}
-    </WarningStrip>
+    <div className="flex items-start justify-between gap-3 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-status-warning">
+      <div className="flex-1 min-w-0">
+        <div className="text-xs font-medium">{title}</div>
+        <div className="mt-0.5 text-xs text-status-warning/90 break-words">{message}</div>
+      </div>
+    </div>
   );
 }
 
@@ -450,7 +617,12 @@ function WorkerStoppedBanner({
     <StoppedPanel
       title="Structured view worker stopped"
       action={
-        <button type="button" onClick={handleReconnect} disabled={retryState === "retrying"} className={WARNING_BUTTON}>
+        <button
+          type="button"
+          onClick={() => void handleReconnect()}
+          disabled={retryState === "retrying"}
+          className={WARNING_BUTTON}
+        >
           {retryState === "retrying" ? "Reconnecting…" : "Reconnect"}
         </button>
       }

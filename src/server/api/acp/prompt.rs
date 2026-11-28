@@ -31,8 +31,15 @@ pub struct PromptDispatchResponse {
     pub seq: Option<u64>,
 }
 
-/// 503 for a worker that could not be resumed; the client retries.
+/// Transient resume failures are 503; typed admission refusals are not queue permission.
 fn resume_failed_response(err: &SupervisorError) -> Response {
+    if matches!(
+        err,
+        SupervisorError::Acp(AcpError::ConnectionUnavailable(_) | AcpError::Establishment(_))
+            | SupervisorError::Establishment(_)
+    ) {
+        return supervisor_error_response("worker unavailable", err);
+    }
     let body = match err {
         SupervisorError::CapacityFull { current, limit } => {
             format!("worker_capacity_full ({current}/{limit})")
@@ -55,6 +62,10 @@ fn stop_fenced_refused() -> Response {
 
 fn worker_not_ready() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+}
+
+pub(super) fn control_state_unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "control_state_unavailable").into_response()
 }
 
 /// `no_revive` refused: reviving (snoozed/idle-dormant wake, or a
@@ -171,6 +182,7 @@ pub async fn acp_prompt(
         Err(PromptSubmitError::SessionNotFound) => session_not_found(),
         Err(PromptSubmitError::RevivalRefused) => no_revive_refused(),
         Err(PromptSubmitError::WorkerNotReady) => worker_not_ready(),
+        Err(PromptSubmitError::AdmissionRefused(response)) => response,
         Err(PromptSubmitError::Blocked(blocked)) => {
             crate::server::api::start_blocked_response(blocked)
         }
@@ -196,7 +208,14 @@ pub async fn acp_prompt(
             SendTurnError::WorkerNotReady
             | SendTurnError::AgentChanged
             | SendTurnError::WorkerLostAfterPublish => worker_not_ready(),
+            SendTurnError::ControlStateUnavailable => control_state_unavailable(),
             SendTurnError::RevivalRefused => no_revive_refused(),
+            SendTurnError::Unavailable(unavailability)
+            | SendTurnError::UnavailableAfterPublish(unavailability) => (
+                StatusCode::CONFLICT,
+                Json(PromptDispatch::Unavailable { unavailability }),
+            )
+                .into_response(),
             // Unreachable for a User caller.
             SendTurnError::NotOwner => {
                 (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
@@ -245,6 +264,7 @@ pub(crate) enum PromptSubmitError {
     SessionNotFound,
     RevivalRefused,
     WorkerNotReady,
+    AdmissionRefused(Response),
     Blocked(crate::session::StartBlocked),
     Ignored,
     Attachments(StatusCode, String),
@@ -289,24 +309,6 @@ pub(crate) async fn submit_prompt(
     else {
         return Err(PromptSubmitError::SessionNotFound);
     };
-    let touch = if req.refuse_if_ignored {
-        state
-            .session_service
-            .touch_and_wake_on_prompt_refusing_ignored(id, req.no_revive)
-            .await
-    } else {
-        state
-            .session_service
-            .touch_and_wake_on_prompt(id, req.no_revive)
-            .await
-    };
-    let woke_idle_dormant = match touch {
-        PromptTouch::Touched { idle_dormant } => idle_dormant,
-        PromptTouch::RevivalRefused => return Err(PromptSubmitError::RevivalRefused),
-        PromptTouch::WorkerNotReady => return Err(PromptSubmitError::WorkerNotReady),
-        PromptTouch::Blocked(blocked) => return Err(PromptSubmitError::Blocked(blocked)),
-        PromptTouch::Ignored => return Err(PromptSubmitError::Ignored),
-    };
     // Validated before publishing or resuming, so a rejected prompt leaves no
     // trace in the transcript and spawns no worker.
     // A named queue row is delivered with its stored bytes, so request uploads are not read.
@@ -341,24 +343,70 @@ pub(crate) async fn submit_prompt(
     }
     let origin_plugin = queued_row.as_ref().and_then(|r| r.origin_plugin.clone());
     let origin = queued_row.as_ref().map_or(req.origin, |r| r.origin);
-    // Decided under the guard so the decision and its dispatch are atomic
-    // (#3621). The wake already cleared the dormant marker, hence the flag.
-    let dispatch = state
-        .session_service
-        .prompt_dispatch_under_submission(id, req.text, woke_idle_dormant, req.no_revive)
-        .await;
-    // A prompt typed on a foreground surface to a stop-fenced session starts it like an
-    // idle wake. The resume admits against this observed intent, so a newer stop wins and
-    // refuses the prompt. MCP, plugin and automated prompts keep waiting behind the fence.
-    let mut observed_stop = None;
-    let dispatch = if !req.no_revive
-        && req.queued_prompt_id.is_none()
+    let allow_explicit_stop = matches!(caller, SessionCaller::User)
+        && queued_row.is_none()
         && matches!(
             req.origin,
             crate::daemon::PromptOrigin::Dashboard
                 | crate::daemon::PromptOrigin::Tui
                 | crate::daemon::PromptOrigin::Cli
+        );
+    let touch = state
+        .session_service
+        .touch_and_wake_on_prompt_with(
+            id,
+            req.no_revive,
+            req.refuse_if_ignored,
+            allow_explicit_stop,
         )
+        .await;
+    let (woke_idle_dormant, resume_reservation) = match touch {
+        PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } => (idle_dormant, resume_reservation),
+        PromptTouch::AdmissionRefused(response) => {
+            return Err(PromptSubmitError::AdmissionRefused(response))
+        }
+        PromptTouch::Unavailable(unavailability) => {
+            return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
+                unavailability,
+            )));
+        }
+        PromptTouch::Establishment(refusal) => {
+            return Err(PromptSubmitError::Turn(SendTurnError::ResumeFailed(
+                refusal.into(),
+            )));
+        }
+        PromptTouch::ControlStateUnavailable => {
+            return Err(PromptSubmitError::Turn(
+                SendTurnError::ControlStateUnavailable,
+            ));
+        }
+        PromptTouch::RevivalRefused => return Err(PromptSubmitError::RevivalRefused),
+        PromptTouch::WorkerNotReady => return Err(PromptSubmitError::WorkerNotReady),
+        PromptTouch::Blocked(blocked) => return Err(PromptSubmitError::Blocked(blocked)),
+        PromptTouch::Ignored => return Err(PromptSubmitError::Ignored),
+    };
+    // Decided under the guard so the decision and its dispatch are atomic
+    // (#3621). The wake already cleared the dormant marker, hence the flag.
+    let dispatch = state
+        .session_service
+        .prompt_dispatch_under_submission(id, req.text, woke_idle_dormant, req.no_revive)
+        .await
+        .map_err(|_| PromptSubmitError::Turn(SendTurnError::ControlStateUnavailable))?;
+    if let PromptDispatch::Unavailable { unavailability } = dispatch {
+        return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
+            unavailability,
+        )));
+    }
+    // A prompt typed on a foreground surface to a stop-fenced session starts it like an
+    // idle wake. The resume admits against this observed intent, so a newer stop wins and
+    // refuses the prompt. MCP, plugin and automated prompts keep waiting behind the fence.
+    // A foreground decision that did not observe a stop cannot clear a later one.
+    let mut observed_stop = allow_explicit_stop.then_some(None);
+    let dispatch = if !req.no_revive
+        && allow_explicit_stop
         && matches!(
             dispatch,
             PromptDispatch::Queued {
@@ -371,11 +419,8 @@ pub(crate) async fn submit_prompt(
                 PromptDispatch::Sent
             }
             Ok(None) => dispatch,
-            // Unreadable: observe no stop, so admission still refuses it and any newer stop.
-            Err(_) => {
-                observed_stop = Some(None);
-                PromptDispatch::Sent
-            }
+            // Keep the observed absence so an unreadable fence still refuses admission.
+            Err(_) => PromptDispatch::Sent,
         }
     } else {
         dispatch
@@ -393,60 +438,68 @@ pub(crate) async fn submit_prompt(
         return Err(PromptSubmitError::RevivalRefused);
     }
     if let PromptDispatch::Queued { reason } = dispatch {
-        // A fresh prompt supersedes a queued rate-limit continuation (#3028),
-        // but only once it is queued: a refusal must leave it in place (#4081 review).
+        // A fresh request supersedes pending intent only after queue admission.
         // The named row is already the parked copy; queueing again would duplicate it.
-        if let Some(row) = &queued_row {
+        let queued_id = if let Some(row) = &queued_row {
             state.session_service.clear_pending_initial_turn(id).await;
-            return Ok(PromptSubmitted {
-                dispatch,
-                queued_id: Some(row.id.clone()),
-                seq: None,
-            });
-        }
-        let prompt_id = req
-            .prompt_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        return match super::super::queue::buffer_and_enqueue(
-            state,
-            id,
-            super::super::queue::QueuedPrompt {
-                prompt_id: &prompt_id,
-                text: req.text.to_string(),
-                blobs: &attachments,
-                origin_device: None,
-                origin_plugin: origin_plugin.clone(),
-                origin,
-                supersede_pending_turn: true,
-            },
-        )
-        .await
-        {
-            Ok(entry) => {
-                tracing::debug!(
-                    target: "acp.queue",
-                    session = %id,
-                    ?reason,
-                    queued_id = %entry.id,
-                    "prompt queued"
-                );
-                Ok(PromptSubmitted {
-                    dispatch,
-                    queued_id: Some(entry.id),
-                    seq: None,
-                })
-            }
-            Err((status, msg)) => {
-                tracing::warn!(
-                    target: "http.api.acp",
-                    session = %id,
-                    ?reason,
-                    "prompt dispatch chose the queue but enqueue failed: {msg}"
-                );
-                Err(PromptSubmitError::Enqueue(status, msg))
+            row.id.clone()
+        } else {
+            let prompt_id = req
+                .prompt_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            match super::super::queue::buffer_and_enqueue(
+                state,
+                id,
+                super::super::queue::QueuedPrompt {
+                    prompt_id: &prompt_id,
+                    text: req.text.to_string(),
+                    blobs: &attachments,
+                    origin_device: None,
+                    origin_plugin: origin_plugin.clone(),
+                    origin,
+                    supersede_pending_turn: true,
+                },
+            )
+            .await
+            {
+                Ok(entry) => {
+                    tracing::debug!(
+                        target: "acp.queue",
+                        session = %id,
+                        ?reason,
+                        queued_id = %entry.id,
+                        "prompt queued"
+                    );
+                    entry.id
+                }
+                Err((status, msg)) => {
+                    tracing::warn!(target: "http.api.acp", session = %id, ?reason,
+                        "prompt dispatch chose the queue but enqueue failed: {msg}");
+                    return Err(PromptSubmitError::Enqueue(status, msg));
+                }
             }
         };
+        if let Some(reservation) = resume_reservation {
+            if let Err(error) = crate::server::acp_reconciler::trigger_resume_background(
+                &state.session_service,
+                id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+                crate::server::sandbox_login::LaunchOrigin::Interactive,
+                Some(reservation),
+            )
+            .await
+            {
+                // Queue acceptance already committed; retain its receipt and intent.
+                tracing::warn!(target: "http.api.acp", session = %id, %error,
+                    "queued intent retained; prepared wake was refused");
+            }
+        }
+        return Ok(PromptSubmitted {
+            dispatch,
+            queued_id: Some(queued_id),
+            seq: None,
+        });
     }
     // A named row is delivered with the bytes the daemon stored for it, never the request's.
     let attachments = match &queued_row {
@@ -481,7 +534,12 @@ pub(crate) async fn submit_prompt(
             caller,
             id,
             SendTurnRequest {
-                resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
+                resume_reservation,
+                resume_authority: if allow_explicit_stop {
+                    crate::process::worker_registry::ResumeAuthority::Explicit
+                } else {
+                    crate::process::worker_registry::ResumeAuthority::Automatic
+                },
                 text: req.text,
                 attachments: &attachments,
                 woke_idle_dormant,
@@ -679,14 +737,29 @@ pub async fn acp_prompt_diff_comments(
     else {
         return session_not_found();
     };
-    let woke_idle_dormant = match state
+    let (woke_idle_dormant, resume_reservation) = match state
         .session_service
         .touch_and_wake_on_prompt(&id, false)
         .await
     {
-        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } => (idle_dormant, resume_reservation),
+        PromptTouch::Establishment(refusal) => {
+            return supervisor_error_response("prompt refused", &refusal.into());
+        }
+        PromptTouch::AdmissionRefused(response) => return response,
+        PromptTouch::Unavailable(unavailability) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(PromptDispatch::Unavailable { unavailability }),
+            )
+                .into_response();
+        }
         PromptTouch::RevivalRefused => return no_revive_refused(),
         PromptTouch::WorkerNotReady => return worker_not_ready(),
+        PromptTouch::ControlStateUnavailable => return control_state_unavailable(),
         PromptTouch::Blocked(blocked) => {
             return crate::server::api::start_blocked_response(blocked)
         }
@@ -696,13 +769,22 @@ pub async fn acp_prompt_diff_comments(
         .session_service
         .prompt_dispatch_under_submission(&id, "", woke_idle_dormant, false)
         .await;
+    let dispatch = match dispatch {
+        Ok(dispatch) => dispatch,
+        Err(_) => return control_state_unavailable(),
+    };
+    if matches!(dispatch, PromptDispatch::Unavailable { .. }) {
+        return (StatusCode::CONFLICT, Json(dispatch)).into_response();
+    }
     // There is no queue row for a typed review, so refuse rather than publish
     // a card the agent would then reject as busy.
     if let PromptDispatch::Queued { reason } = dispatch {
         return diff_comments_not_now(reason);
     }
     // Idle-dormant sessions and rate-limit parks are sendable with no live worker.
-    let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
+    let needs_resume = resume_reservation.is_some()
+        || woke_idle_dormant
+        || !state.acp_supervisor.is_running(&id).await;
     if needs_resume {
         use crate::server::acp_reconciler::ResumeTrigger;
         match crate::server::acp_reconciler::trigger_resume_background(
@@ -710,6 +792,7 @@ pub async fn acp_prompt_diff_comments(
             &id,
             crate::process::worker_registry::ResumeAuthority::Explicit,
             crate::server::sandbox_login::LaunchOrigin::Interactive,
+            resume_reservation,
         )
         .await
         {
@@ -720,11 +803,7 @@ pub async fn acp_prompt_diff_comments(
     }
     // Publish only once a worker exists, or the card strands on "running" (#3172).
     if let Err(e) = state.acp_supervisor.wait_until_ready(&id).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("worker_not_ready: {e}"),
-        )
-            .into_response();
+        return resume_failed_response(&e);
     }
     state
         .acp_supervisor
@@ -774,12 +853,19 @@ pub async fn acp_attachment(
     }
 }
 
+#[derive(Default, serde::Deserialize)]
+struct CancelPromptRequest {
+    #[serde(default)]
+    host_prompt_intent: Option<uuid::Uuid>,
+}
+
 /// Cancel the in-flight turn, ordered behind any prompt submission in flight.
 /// The guard can also be held by a queue drain or a rename, so a long wait is
 /// logged: the UI shows no progress meanwhile.
 pub async fn acp_cancel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
@@ -787,6 +873,14 @@ pub async fn acp_cancel(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    let request = if body.is_empty() {
+        CancelPromptRequest::default()
+    } else {
+        match serde_json::from_slice::<CancelPromptRequest>(&body) {
+            Ok(request) => request,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        }
+    };
     let waited_from = std::time::Instant::now();
     let _submission = state
         .session_service
@@ -802,7 +896,11 @@ pub async fn acp_cancel(
              progress for that long"
         );
     }
-    match state.acp_supervisor.cancel_prompt(&id).await {
+    match state
+        .acp_supervisor
+        .cancel_prompt(&id, request.host_prompt_intent)
+        .await
+    {
         Ok(()) => {
             tracing::info!(
                 target: "acp.supervisor",
@@ -876,13 +974,33 @@ pub async fn resolve_approval(
     let nonce = Nonce(nonce_str.clone());
     // A dismissal must not go through option matching, which would send the
     // first reject option as the user's answer (#3741).
-    let outcome = match req.decision {
-        ApprovalDecisionWire::Cancelled => state.acp_supervisor.cancel_permission(&id, nonce).await,
-        decision => {
-            state
-                .acp_supervisor
-                .resolve_permission(&id, nonce, decision.into(), req.option_id)
-                .await
+    let outcome = if let Some(pending) = state
+        .session_service
+        .acp_control_cache
+        .original_responders(&id)
+    {
+        use crate::acp::acp_client::pending::{self, ApprovalResolutionMessage};
+        let message = match req.decision {
+            ApprovalDecisionWire::Cancelled => ApprovalResolutionMessage::Cancelled,
+            decision => ApprovalResolutionMessage::Decision {
+                decision: decision.into(),
+                option_id: req.option_id,
+            },
+        };
+        pending::resolve_approval(&pending, &nonce, message)
+            .await
+            .map_err(SupervisorError::Acp)
+    } else {
+        match req.decision {
+            ApprovalDecisionWire::Cancelled => {
+                state.acp_supervisor.cancel_permission(&id, nonce).await
+            }
+            decision => {
+                state
+                    .acp_supervisor
+                    .resolve_permission(&id, nonce, decision.into(), req.option_id)
+                    .await
+            }
         }
     };
     match outcome {
@@ -915,11 +1033,21 @@ pub async fn resolve_elicitation(
         Err(rej) => return rej.into_response(),
     };
     let nonce = Nonce(nonce_str.clone());
-    match state
-        .acp_supervisor
-        .resolve_elicitation(&id, nonce, resolution)
-        .await
+    let outcome = if let Some(pending) = state
+        .session_service
+        .acp_control_cache
+        .original_responders(&id)
     {
+        crate::acp::acp_client::pending::resolve_elicitation(&pending, &nonce, resolution)
+            .await
+            .map_err(SupervisorError::Acp)
+    } else {
+        state
+            .acp_supervisor
+            .resolve_elicitation(&id, nonce, resolution)
+            .await
+    };
+    match outcome {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(SupervisorError::Acp(AcpError::UnknownNonce)) => (
             StatusCode::NOT_FOUND,

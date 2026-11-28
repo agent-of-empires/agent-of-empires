@@ -9,6 +9,8 @@ use super::spawn::{
     apply_claude_store_route, apply_env_filter, host_environment_denyreason, prepend_path_dirs,
     ProxySpec, SpawnConfig,
 };
+#[cfg(test)]
+use crate::process::runner::test_support::managed_runner::ManagedRunnerCommand;
 
 /// Deadline for the runner socket to appear. 10s suffices in production, but
 /// a debug-build cold start under CI load blows past it deterministically, so
@@ -219,6 +221,42 @@ fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
     )))
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) enum TestRunner {
+    Executable(std::path::PathBuf),
+    Managed(ManagedRunnerCommand),
+}
+
+#[cfg(test)]
+impl TestRunner {
+    fn executable(&self) -> &std::path::Path {
+        match self {
+            Self::Executable(path) => path,
+            Self::Managed(command) => command.executable(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<std::path::PathBuf> for TestRunner {
+    fn from(path: std::path::PathBuf) -> Self {
+        Self::Executable(path)
+    }
+}
+
+#[cfg(test)]
+impl From<ManagedRunnerCommand> for TestRunner {
+    fn from(command: ManagedRunnerCommand) -> Self {
+        Self::Managed(command)
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static TEST_RUNNER: TestRunner;
+}
+
 /// Everything after the runner's `--`: the proxy, when present, then the
 /// adapter command it wraps.
 pub(super) fn agent_argv(proxy: Option<&ProxySpec>, command: &str, args: &[String]) -> Vec<String> {
@@ -269,9 +307,22 @@ pub(super) async fn spawn_runner_detached(
     socket_path: &std::path::Path,
     session_id: String,
     session_sandbox: Option<&SessionSandbox>,
-) -> Result<(u32, Option<crate::session::ExecutionBinding>), AcpError> {
+) -> Result<
+    (
+        crate::acp::runner_lifecycle::RunnerIdentity,
+        Option<crate::session::ExecutionBinding>,
+    ),
+    AcpError,
+> {
     let current_exe =
         std::env::current_exe().map_err(|e| AcpError::Spawn(format!("current_exe: {e}")))?;
+    #[cfg(test)]
+    let test_runner = TEST_RUNNER.try_with(Clone::clone).ok();
+    #[cfg(test)]
+    let current_exe = test_runner
+        .as_ref()
+        .map(|runner| runner.executable().to_owned())
+        .unwrap_or(current_exe);
     ensure_runner_exe(&current_exe)?;
     let log_path = crate::process::worker_registry::log_path_for(&session_id)
         .map_err(|e| AcpError::Spawn(format!("log path: {e:#}")))?;
@@ -421,6 +472,16 @@ pub(super) async fn spawn_runner_detached(
     {
         cmd.arg("--lifecycle-generation")
             .arg(admission.generation.to_string());
+        let attempt = admission.establishment.as_ref().ok_or_else(|| {
+            AcpError::Spawn("runner birth has no original establishment attempt".into())
+        })?;
+        let producer = attempt.producer.ok_or_else(|| {
+            AcpError::Spawn("runner birth has no original establishment producer".into())
+        })?;
+        cmd.arg("--establishment-attempt")
+            .arg(attempt.id.to_string())
+            .arg("--establishment-producer")
+            .arg(producer.to_string());
     }
     if let crate::process::worker_registry::ScopeOwnership::Owned { unit } = &scope {
         cmd.arg("--systemd-scope").arg(unit);
@@ -536,6 +597,28 @@ pub(super) async fn spawn_runner_detached(
 
     // Reads the runner env, so it runs before the scope wrapper adds its own.
     let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
+    // Darwin audit tokens identify an execution, not an exec-stable birth.
+    // Start the real libtest runner directly so the lease cannot attest a
+    // shell trampoline instead of the executable that registers the worker.
+    #[cfg(test)]
+    if let Some(TestRunner::Managed(test_runner)) = test_runner {
+        let mut direct = test_runner
+            .command(cmd.as_std().get_args())
+            .map_err(|error| AcpError::Spawn(format!("prepare managed runner: {error}")))?;
+        let fixture_environment: Vec<_> = direct
+            .get_envs()
+            .filter_map(|(key, value)| Some((key.to_owned(), value?.to_owned())))
+            .collect();
+        direct
+            .env_clear()
+            .envs(
+                cmd.as_std()
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .envs(fixture_environment);
+        cmd = direct.into();
+    }
     let mut cmd = match &prefix {
         Some(prefix) => wrap_in_scope(cmd, prefix),
         None => cmd,
@@ -584,7 +667,7 @@ pub(super) async fn spawn_runner_detached(
     let lease = config.launch_lease.clone();
     let admission = lease.as_ref().and_then(|lease| lease.admission());
     let generation = config.generation;
-    let pid = crate::acp::supervisor::with_durable_launch(admission, session_id, move || {
+    let identity = crate::acp::supervisor::with_durable_launch(admission, session_id, move || {
         let mut birth = lease.as_ref().map(|lease| lease.lock_birth());
         if lease
             .as_ref()
@@ -608,29 +691,27 @@ pub(super) async fn spawn_runner_detached(
         let pid = child
             .id()
             .ok_or_else(|| AcpError::Spawn("runner exited before it could be identified".into()))?;
+        let identity = crate::acp::runner_lifecycle::RunnerIdentity {
+            pid,
+            generation,
+            birth_fingerprint: crate::process::process_birth_identity(pid)
+                .ok()
+                .flatten()
+                .map(|identity| identity.fingerprint()),
+        };
         // Transfer reaping before the blocking result can be dropped.
         if let Some(lease) = &lease {
-            lease.record_spawned_child(
-                child,
-                crate::acp::runner_lifecycle::RunnerIdentity {
-                    pid,
-                    generation,
-                    birth_fingerprint: crate::process::process_birth_identity(pid)
-                        .ok()
-                        .flatten()
-                        .map(|identity| identity.fingerprint()),
-                },
-            );
+            lease.record_spawned_child(child, identity);
         } else {
             tokio::spawn(async move {
                 let _ = child.wait().await;
             });
         }
-        Ok(pid)
+        Ok(identity)
     })
     .await
     .map_err(|error| AcpError::Spawn(error.to_string()))?;
-    Ok((pid, native_store))
+    Ok((identity, native_store))
 }
 
 #[cfg(test)]
@@ -1184,19 +1265,11 @@ mod tests {
             super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
         config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
         config.socket_path = Some(socket.clone());
-        let mut lifecycle = crate::acp::runner_lifecycle::LifecycleTable::new(1);
-        let lease = lifecycle
-            .admit(&session, crate::acp::runner_lifecycle::ResumeKind::Spawn)
-            .unwrap();
-        config.launch_lease = Some(lease.clone());
 
-        let err = super::super::AcpClient::spawn(
-            config,
-            crate::acp::state::AcpSessionId(session.clone()),
-        )
-        .await
-        .err()
-        .expect("spawn must fail");
+        let err = match spawn_runner_detached(&config, &socket, session.clone(), None).await {
+            Err(error) => error,
+            Ok(_) => panic!("spawn must fail"),
+        };
         assert!(
             matches!(&err, AcpError::Spawn(msg) if msg.contains("not found on the daemon's PATH")),
             "{err:?}"
@@ -1209,9 +1282,5 @@ mod tests {
         ] {
             assert!(!path.exists(), "left behind: {}", path.display());
         }
-        assert!(lifecycle.abandon(&lease), "the failed producer must settle");
-        lifecycle
-            .admit(&session, crate::acp::runner_lifecycle::ResumeKind::Spawn)
-            .expect("adapter refusal must not strand the session reservation");
     }
 }

@@ -1,20 +1,27 @@
 import { useCallback, useMemo, useState } from "react";
 
 import type { ActivityRow } from "../lib/acpTypes";
-import { HISTORY_WINDOW_STEP, canLoadEarlierFrom, historyWindow, initialHistoryWindow } from "../lib/acpHistoryWindow";
+import {
+  HISTORY_WINDOW_STEP,
+  canLoadEarlierFrom,
+  clearHistoryProjection,
+  historyWindow,
+  initialHistoryWindow,
+} from "../lib/acpHistoryWindow";
 import { useWebSettings } from "./useWebSettings";
 
 export interface HistoryWindowState {
-  windowedActivity: ActivityRow[];
+  windowedActivity: readonly ActivityRow[];
   canLoadEarlier: boolean;
   loadEarlier: () => void;
 }
 
 export function useHistoryWindow(
   sessionId: string,
-  activity: ActivityRow[],
+  rawActivity: readonly ActivityRow[],
   showClearedTurns: boolean,
 ): HistoryWindowState {
+  const activity = useMemo(() => clearHistoryProjection(rawActivity), [rawActivity]);
   const liveBaseWindow = useWebSettings().settings.structuredHistoryWindow;
   // Captured at open and session switch only, so changing the setting never resizes an open session.
   const [baseWindow, setBaseWindow] = useState(liveBaseWindow);

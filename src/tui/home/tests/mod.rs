@@ -50,10 +50,10 @@ pub(super) async fn request_with_headers(
     body: serde_json::Value,
 ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
     let before = state.runtime.publish(state).await.unwrap();
-    request_at_epoch_with_headers(state, method, path, body, &before.value.cursor.epoch).await
+    request_with_headers_at_epoch(state, method, path, body, &before.value.cursor.epoch).await
 }
 
-pub(super) async fn request_at_epoch_with_headers(
+pub(super) async fn request_with_headers_at_epoch(
     state: &Arc<AppState>,
     method: &str,
     path: &str,

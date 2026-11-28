@@ -1,22 +1,33 @@
-//! The v3 runner control socket: connecting, establishing a session, and
-//! routing ACP frames over it.
+//! The strict private runner control channel and its SDK transport relay.
 
-use crate::acp::control_protocol::{self, ControlBody, PromptCompletedMarker, SessionReplayed};
-use agent_client_protocol::v1::schema::PromptResponse;
+use crate::acp::control_protocol::{
+    self, ControlBody, NativeChannelAvailability, NativeChannelLossCause, NativeChannelLostMarker,
+    PromptCompletedMarker, SessionReplayed,
+};
+use crate::acp::establishment::NativeRequestScope;
+use crate::acp::state::{AcpConnectionCause, AcpConnectionSource, Event};
+use agent_client_protocol::v1::schema::{PromptResponse, RequestId};
 use agent_client_protocol::JsonRpcMessage as _;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
-use tokio::sync::{mpsc, oneshot, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
-use super::errors::{acp_error_from_value, acp_internal_error, AcpError};
+use super::connection::ConnectionState;
+use super::errors::{acp_error_from_value, acp_internal_error, prompt_runtime_error, AcpError};
 use super::lifecycle::TerminalClaim;
+use super::rate_limit::classify_rate_limit_error;
+
+/// Bound completion of an admitted control frame after observed loss, using
+/// the runner's existing two-second write window rather than hanging an app
+/// scope behind a partial write to an unavailable peer.
+const LOSS_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 use super::runner::runner_socket_deadline;
 use super::session_identity::{
-    SessionIngress, ADAPTER_FRAMES_SHED_METHOD, CONTROL_FRAME_BYTES_FIELD,
+    ControlIngressMetadata, SessionIngress, ADAPTER_FRAMES_SHED_METHOD, CONTROL_FRAME_BYTES_FIELD,
 };
 
 /// Cancels a socket handshake abandoned mid-construction. Closing this exact
@@ -35,25 +46,103 @@ impl Drop for ShutdownControlOnDrop {
 /// it; before any local prompt, a waiterless completion ends an adopted turn.
 pub(super) struct DaemonControlClient {
     pub(super) ingress: Arc<SessionIngress>,
+    pub(super) connection_state: Arc<ConnectionState>,
+    pub(super) projection: Arc<crate::acp::event_sender::ProjectionState>,
+    establishment_context: Arc<
+        std::sync::Mutex<(
+            Option<crate::session::ExecutionBinding>,
+            Option<crate::acp::state::NativeObservationScope>,
+        )>,
+    >,
+    application: Arc<std::sync::Mutex<Option<ApplicationSlot>>>,
     write: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
-    sessions_established: AtomicU64,
-    sessions_replayed: watch::Sender<u64>,
-    completion: Arc<std::sync::Mutex<PromptCompletion>>,
+    native_cache: Arc<AtomicBool>,
+    native_ready: Arc<AtomicBool>,
+    pub(super) completion: Arc<std::sync::Mutex<PromptCompletion>>,
     /// Released waiters whose `PromptStarted` has not arrived. The runner
     /// starts prompts in order, so the next that many starts belong to them.
     /// Only touched under the `completion` lock.
     abandoned_starts: Arc<AtomicUsize>,
     /// Outcomes awaiting their ordered [`PromptCompletedMarker`].
-    settled: Arc<std::sync::Mutex<VecDeque<CompletionDelivery>>>,
+    settled: Arc<std::sync::Mutex<Option<LocalOutcome>>>,
     raw_fd: RawFd,
+    peer_identity: crate::acp::runner_lifecycle::RunnerIdentity,
+    peer_process: crate::process::CapturedProcess,
+    correlation: Arc<std::sync::Mutex<ShimCorrelation>>,
+    reverse_changed: Arc<tokio::sync::Notify>,
     closed_locally: Arc<AtomicBool>,
     loss: Arc<std::sync::OnceLock<(Option<std::io::ErrorKind>, bool)>>,
     /// The agent sent a valid proxy hello on this connection.
     proxied: Arc<AtomicBool>,
-    pub(super) disconnected: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    disconnected: tokio_util::sync::CancellationToken,
 }
 
+struct ApplicationSlot {
+    attempt: crate::acp::establishment::AttemptId,
+    context: crate::acp::state::NativeEventContext,
+    completed: Option<HandshakeApplication>,
+}
+
+pub(super) struct EstablishmentApplication {
+    control: Arc<DaemonControlClient>,
+    attempt: Option<crate::acp::establishment::AttemptId>,
+}
+
+impl EstablishmentApplication {
+    pub(super) fn new(
+        control: Arc<DaemonControlClient>,
+    ) -> Result<Self, agent_client_protocol::Error> {
+        let attempt = control
+            .expected_attempt()
+            .ok_or_else(|| acp_internal_error("establishment has no captured authority".into()))?;
+        let context = control
+            .establishment_context
+            .lock()
+            .expect("native establishment context")
+            .1
+            .as_ref()
+            .map(|scope| scope.context)
+            .or_else(|| control.projection.attempt().map(|attempt| attempt.context))
+            .ok_or_else(|| {
+                acp_internal_error("establishment has no captured physical context".into())
+            })?;
+        {
+            let mut slot = control
+                .application
+                .lock()
+                .expect("native response application");
+            if slot.is_some() {
+                return Err(acp_internal_error(
+                    "previous original result is still being applied".into(),
+                ));
+            }
+            *slot = Some(ApplicationSlot {
+                attempt,
+                context,
+                completed: None,
+            });
+        }
+        Ok(Self {
+            control,
+            attempt: Some(attempt),
+        })
+    }
+}
+
+impl Drop for EstablishmentApplication {
+    fn drop(&mut self) {
+        self.control.finish_establishment_projection(self.attempt);
+    }
+}
+
+struct LocalOutcome {
+    prompt_req_id: i64,
+    correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    tx: oneshot::Sender<ControlPromptResult>,
+    result: ControlPromptResult,
+}
 /// The runner side ended a channel this daemon did not close. The runner may
 /// still be alive and attachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,31 +163,72 @@ pub(super) struct ControlLossHandle {
 }
 
 impl ControlLossHandle {
+    pub(super) fn proxied(&self) -> bool {
+        self.proxied.load(AtomicOrdering::Acquire)
+    }
+
     pub(super) fn get(&self) -> Option<ControlLoss> {
         let &(io_error, turn_in_flight) = self.loss.get()?;
         Some(ControlLoss {
             io_error,
             turn_in_flight,
-            proxied: self.proxied.load(AtomicOrdering::Acquire),
+            proxied: self.proxied(),
         })
     }
 }
 
-enum CompletionDelivery {
-    Local(
-        oneshot::Sender<control_protocol::PromptOutcome>,
-        control_protocol::PromptOutcome,
-    ),
-    Adopted(control_protocol::PromptOutcome),
+#[derive(Debug, PartialEq)]
+pub(super) enum ControlPromptResult {
+    Outcome {
+        outcome: control_protocol::PromptOutcome,
+        evidence: Option<Box<control_protocol::NativePromptCompletionEvidence>>,
+    },
+    NativeLost,
 }
 
-enum PromptCompletion {
-    Adopted,
+struct HandshakeApplication(Arc<ConnectionState>);
+
+impl std::fmt::Debug for HandshakeApplication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HandshakeApplication")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for HandshakeApplication {
+    fn drop(&mut self) {
+        self.0.finish_completed_outcome();
+    }
+}
+
+fn observe_native_loss(state: &ConnectionState, cause: NativeChannelLossCause) {
+    state.observe(
+        AcpConnectionSource::Native,
+        match cause {
+            NativeChannelLossCause::StdoutEof => AcpConnectionCause::StdoutEof,
+            NativeChannelLossCause::ReadFailed => AcpConnectionCause::ReadFailed,
+            NativeChannelLossCause::WriteFailed => AcpConnectionCause::WriteFailed,
+            NativeChannelLossCause::ProtocolEnded => AcpConnectionCause::ProtocolEnded,
+        },
+    );
+}
+#[derive(serde::Serialize)]
+struct CompletionMarkerLine<'a> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    params: &'a PromptCompletedMarker,
+}
+
+pub(super) enum PromptCompletion {
+    Adopted(Option<control_protocol::NativePromptHead>),
     Pending {
         // `None` until `PromptStarted`, so retained history read during send
         // cannot resolve this waiter.
         prompt_req_id: Option<i64>,
-        tx: oneshot::Sender<control_protocol::PromptOutcome>,
+        scope: crate::acp::establishment::NativeRequestScope,
+        window_id: Option<crate::acp::protocol::AcpPromptWindowId>,
+        tx: oneshot::Sender<ControlPromptResult>,
     },
     // Kept after delivery: a retained completion can arrive before the prompt
     // loop receives its outcome and clears prompt_in_flight.
@@ -111,10 +241,67 @@ enum PromptCompletion {
 /// must never cross.
 #[derive(Default)]
 struct ShimCorrelation {
-    reverse: HashMap<i64, u64>,
-    forward: HashMap<u64, serde_json::Value>,
+    reverse: HashMap<i64, ReverseTicket>,
+    forward: HashMap<ForwardKey, ForwardTicket>,
     /// Negative and descending so it never collides with a crate-minted id.
     next_synthetic: i64,
+    reverse_exclusive: bool,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+enum ForwardKey {
+    Sdk(RequestId),
+    Runner(u64),
+}
+
+enum ForwardTicket {
+    Sdk {
+        call_id: u64,
+        scope: NativeRequestScope,
+    },
+    Runner {
+        sdk_id: RequestId,
+    },
+}
+
+/// The relay owns duration until the runner settles its actual reverse write.
+struct ReverseTicket {
+    call_id: u64,
+    _publication: Option<super::connection::CallbackDuration>,
+    _parked: Option<super::session_identity::ParkedRequest>,
+    admitted: bool,
+    reply_started: bool,
+    callback: Option<Arc<super::session_identity::CapturedCallback>>,
+}
+
+pub(super) enum ReverseCallbackAdmission {
+    Admitted(Arc<super::session_identity::CapturedCallback>),
+    Excluded,
+    Ended,
+}
+
+pub(super) struct ReverseQuiescence {
+    correlation: Arc<std::sync::Mutex<ShimCorrelation>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for ReverseQuiescence {
+    fn drop(&mut self) {
+        self.correlation
+            .lock()
+            .expect("shim correlation")
+            .reverse_exclusive = false;
+        self.changed.notify_waiters();
+    }
+}
+
+/// A pump exit is a real control end, including a terminal encoding failure.
+struct EndControlPump(Arc<DaemonControlClient>);
+
+impl Drop for EndControlPump {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
 }
 
 /// Process-wide, so forward ids stay monotonic across attaches.
@@ -133,9 +320,9 @@ impl ShimCorrelation {
 
 /// `true` once the line sits in the pipe for the crate; `false` once this
 /// write half is closed, by the crate hanging up or by the reader's teardown.
-async fn shim_write_line(
+async fn shim_write_line<T: serde::Serialize + ?Sized>(
     duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
-    value: &serde_json::Value,
+    value: &T,
 ) -> bool {
     use tokio::io::AsyncWriteExt;
     let Ok(mut bytes) = serde_json::to_vec(value) else {
@@ -146,41 +333,384 @@ async fn shim_write_line(
     w.write_all(&bytes).await.is_ok() && w.flush().await.is_ok()
 }
 
-/// Drop the settled outcome, so its waiter aborts instead of waiting on a
-/// marker that can no longer reach the crate.
-fn release_settled(settled: &std::sync::Mutex<VecDeque<CompletionDelivery>>) {
-    settled.lock().expect("settled mutex poisoned").clear();
+/// Preserve a correlated outcome when its relay marker can no longer arrive.
+fn release_settled(settled: &std::sync::Mutex<Option<LocalOutcome>>) {
+    if let Some(settled) = settled.lock().expect("settled mutex poisoned").take() {
+        let _ = settled.tx.send(settled.result);
+    }
 }
 
-/// Every relay the reader makes to the crate, so a failed one releases the
-/// settled sender: the crate is gone, and no marker will reach it. Only a
-/// write failure returns `false` here, since a `serde_json::Value` always
-/// encodes.
-async fn shim_write_line_releasing(
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TestRelayStage {
+    Prepared,
+    Relayed,
+    Failed,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct TestRelayObservation {
+    pub(super) stage: TestRelayStage,
+    pub(super) payload: serde_json::Value,
+}
+
+#[cfg(test)]
+fn observe_test_relay<T: serde::Serialize + ?Sized>(
+    state: &ConnectionState,
+    value: &T,
+    stage: TestRelayStage,
+) {
+    let observer = state.test_relay_observer.lock().unwrap();
+    if let Some(observer) = observer.as_ref() {
+        let payload = serde_json::to_value(value).expect("actual relay payload serializes");
+        let _ = observer.send(TestRelayObservation { stage, payload });
+    }
+}
+
+fn settle_unreachable_sdk_route(
+    settled: &std::sync::Mutex<Option<LocalOutcome>>,
+    state: &ConnectionState,
+    source: AcpConnectionSource,
+    cause: AcpConnectionCause,
+) {
+    state.observe(source, cause);
+    release_settled(settled);
+    state.mark_ordered_loss();
+}
+
+/// A failed relay releases any local outcome whose marker can no longer arrive.
+async fn shim_write_line_releasing<T: serde::Serialize + ?Sized>(
     duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
-    value: &serde_json::Value,
-    settled: &std::sync::Mutex<VecDeque<CompletionDelivery>>,
+    value: &T,
+    settled: &std::sync::Mutex<Option<LocalOutcome>>,
+    state: &ConnectionState,
 ) -> bool {
+    #[cfg(test)]
+    observe_test_relay(state, value, TestRelayStage::Prepared);
     if shim_write_line(duplex, value).await {
+        #[cfg(test)]
+        observe_test_relay(state, value, TestRelayStage::Relayed);
         return true;
     }
-    release_settled(settled);
+    settle_unreachable_sdk_route(
+        settled,
+        state,
+        AcpConnectionSource::Control,
+        AcpConnectionCause::ForwardPumpEnded,
+    );
+    #[cfg(test)]
+    observe_test_relay(state, value, TestRelayStage::Failed);
     false
 }
 
 impl DaemonControlClient {
+    /// Register the real SDK id before its output pump can consume the request.
+    pub(super) fn register_forward<T>(
+        &self,
+        scope: NativeRequestScope,
+        send: impl FnOnce() -> agent_client_protocol::v1::SentRequest<T>,
+    ) -> (agent_client_protocol::v1::SentRequest<T>, u64) {
+        let mut correlation = self.correlation.lock().expect("shim correlation");
+        let call_id = correlation.forward_id();
+        let sent = send();
+        correlation.forward.insert(
+            ForwardKey::Sdk(sent.id().clone()),
+            ForwardTicket::Sdk { call_id, scope },
+        );
+        (sent, call_id)
+    }
+
+    pub(super) fn cancel_forward(&self, sdk_id: &RequestId, call_id: u64) {
+        use std::collections::hash_map::Entry;
+
+        let mut correlation = self.correlation.lock().expect("shim correlation");
+        if let Entry::Occupied(entry) = correlation.forward.entry(ForwardKey::Sdk(sdk_id.clone())) {
+            if matches!(entry.get(), ForwardTicket::Sdk { call_id: registered, .. } if *registered == call_id)
+            {
+                entry.remove();
+                return;
+            }
+        }
+        if let Entry::Occupied(entry) = correlation.forward.entry(ForwardKey::Runner(call_id)) {
+            if matches!(entry.get(), ForwardTicket::Runner { sdk_id: registered } if registered == sdk_id)
+            {
+                entry.remove();
+            }
+        }
+    }
+
+    /// Move the existing ticket once; never capture permission at pump time.
+    fn prepare_forward(
+        &self,
+        sdk_id: RequestId,
+        method: String,
+        params: serde_json::Value,
+    ) -> Option<(RequestId, u64, ControlBody)> {
+        let mut correlation = self.correlation.lock().expect("shim correlation");
+        let ForwardTicket::Sdk { call_id, scope } = correlation
+            .forward
+            .remove(&ForwardKey::Sdk(sdk_id.clone()))?
+        else {
+            unreachable!("SDK keys contain only queued SDK tickets");
+        };
+        correlation.forward.insert(
+            ForwardKey::Runner(call_id),
+            ForwardTicket::Runner {
+                sdk_id: sdk_id.clone(),
+            },
+        );
+        Some((
+            sdk_id,
+            call_id,
+            ControlBody::AgentCall {
+                call_id,
+                method,
+                params,
+                scope,
+            },
+        ))
+    }
+
+    pub(super) fn admit_reverse_callback(&self, id: &RequestId) -> ReverseCallbackAdmission {
+        let ticket = self.connection_state.admit(|| {
+            let correlation = self.correlation.lock().expect("shim correlation");
+            match id {
+                RequestId::Number(id) => correlation
+                    .reverse
+                    .get(id)
+                    .map(|ticket| ticket.admitted.then(|| ticket.callback.clone()).flatten()),
+                _ => None,
+            }
+        });
+        match ticket {
+            Ok(Some(Some(callback))) => ReverseCallbackAdmission::Admitted(callback),
+            Ok(Some(None)) => ReverseCallbackAdmission::Excluded,
+            Err(_) => ReverseCallbackAdmission::Ended,
+            Ok(None) => {
+                // A healthy relay must have reserved the actual ticket first.
+                self.connection_state.observe(
+                    AcpConnectionSource::Control,
+                    AcpConnectionCause::ProtocolEnded,
+                );
+                self.shutdown();
+                ReverseCallbackAdmission::Ended
+            }
+        }
+    }
+
+    pub(super) async fn quiesce_reverse(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<ReverseQuiescence, AcpError> {
+        loop {
+            let changed = self.reverse_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let ready = self.connection_state.admit(|| {
+                let mut correlation = self.correlation.lock().expect("shim correlation");
+                if correlation.reverse.is_empty() && !correlation.reverse_exclusive {
+                    correlation.reverse_exclusive = true;
+                    true
+                } else {
+                    false
+                }
+            })?;
+            if ready {
+                return Ok(ReverseQuiescence {
+                    correlation: Arc::clone(&self.correlation),
+                    changed: Arc::clone(&self.reverse_changed),
+                });
+            }
+            tokio::select! {
+                biased;
+                _ = self.connection_state.wait_callback_end() => return Err(AcpError::NotRunning),
+                result = tokio::time::timeout_at(deadline, changed) => {
+                    result.map_err(|_| AcpError::ResetFailed(
+                        "reset deadline expired while reverse replies were in flight".into(),
+                    ))?;
+                }
+            }
+        }
+    }
+
+    fn clear_correlation(&self) {
+        {
+            let mut correlation = self.correlation.lock().expect("shim correlation");
+            correlation.forward.clear();
+            correlation.reverse.clear();
+        }
+        self.reverse_changed.notify_waiters();
+    }
+
+    pub(super) fn set_establishment_context(
+        &self,
+        store: Option<crate::session::ExecutionBinding>,
+        scope: Option<crate::acp::state::NativeObservationScope>,
+    ) {
+        *self
+            .establishment_context
+            .lock()
+            .expect("native establishment context") = (store, scope);
+    }
+
+    pub(super) fn install_original_ingress(&self) -> agent_client_protocol::Result<()> {
+        // A read-only canonical attempt may have been generation-rebased.
+        // Only the actual Original invocation or receipt identifies its physical source.
+        let Some(attempt) = self
+            .projection
+            .original_window()
+            .map(|(attempt, _)| attempt)
+            .or_else(|| {
+                self.projection
+                    .receipt_snapshot()
+                    .map(|receipt| Arc::clone(&receipt.attempt))
+            })
+        else {
+            return Ok(());
+        };
+        let (store, constructor) = {
+            let context = self
+                .establishment_context
+                .lock()
+                .expect("native establishment context");
+            (
+                context.0.clone(),
+                context
+                    .1
+                    .as_ref()
+                    .map(|scope| (scope.context, Arc::clone(&scope.fence))),
+            )
+        };
+        let postimage = self
+            .projection
+            .receipt_snapshot()
+            .filter(|receipt| receipt.attempt.same_source(&attempt))
+            .map(|receipt| receipt.postimage(attempt.context).map(Arc::new))
+            .transpose()
+            .map_err(|error| acp_internal_error(error.to_string()))?;
+        if !self.ingress.authorize_original(
+            Arc::clone(&attempt),
+            self.peer_identity,
+            store,
+            postimage,
+        ) {
+            return Err(acp_internal_error(
+                "original ingress custody is unavailable".into(),
+            ));
+        }
+        match constructor {
+            Some((context, fence)) if context == attempt.context => {
+                if !self.ingress.authorize_constructor(&attempt, context, fence) {
+                    return Err(acp_internal_error(
+                        "original constructor custody is unavailable".into(),
+                    ));
+                }
+            }
+            // A rebased canonical destination is not this physical constructor.
+            // Keep its authenticated Original/replay custody, without granting Current.
+            Some(_) => {}
+            None if self.projection.original_window().is_some() => {
+                return Err(acp_internal_error(
+                    "original constructor has no retained native fence".into(),
+                ));
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    pub(super) fn original_receipt(
+        &self,
+    ) -> Option<Arc<crate::acp::establishment::NativeEstablishmentReceipt>> {
+        self.projection.receipt_snapshot()
+    }
+
+    pub(super) fn original_request_context(
+        &self,
+    ) -> Option<crate::acp::establishment::NativeRequestContext> {
+        let receipt = self.projection.receipt_snapshot()?;
+        let attempt = self.projection.attempt()?;
+        if !receipt.attempt.same_source(&attempt) {
+            return None;
+        }
+        let store = self
+            .establishment_context
+            .lock()
+            .expect("native establishment context")
+            .0
+            .clone()
+            .map(Arc::new);
+        crate::acp::establishment::NativeRequestContext::new(
+            crate::acp::establishment::NativeRequestScope::Original {
+                attempt,
+                owner: receipt.owner,
+                store,
+                operation: None,
+            },
+            None,
+        )
+        .with_original_evidence(receipt)
+        .ok()
+    }
+
+    fn expected_attempt(&self) -> Option<crate::acp::establishment::AttemptId> {
+        let context = self
+            .establishment_context
+            .lock()
+            .expect("native establishment context");
+        context
+            .1
+            .as_ref()
+            .and_then(|scope| scope.choice.as_ref())
+            .and_then(|choice| choice.authority.map(|key| key.id))
+            .or_else(|| self.projection.attempt().map(|attempt| attempt.id))
+    }
+
+    fn finish_establishment_projection(
+        &self,
+        expected: Option<crate::acp::establishment::AttemptId>,
+    ) {
+        let mut application = self
+            .application
+            .lock()
+            .expect("native response application");
+        if application
+            .as_ref()
+            .is_some_and(|slot| Some(slot.attempt) == expected)
+        {
+            application.take();
+        }
+    }
+
+    pub(super) fn applying_attempt(
+        &self,
+    ) -> Option<(
+        crate::acp::establishment::AttemptId,
+        crate::acp::state::NativeEventContext,
+    )> {
+        self.application
+            .lock()
+            .expect("native response application")
+            .as_ref()
+            .map(|slot| (slot.attempt, slot.context))
+    }
+
+    pub(super) fn close_sdk_route(&self, source: AcpConnectionSource, cause: AcpConnectionCause) {
+        // Only an already-correlated outcome may precede the ordered loss wakeup.
+        settle_unreachable_sdk_route(&self.settled, &self.connection_state, source, cause);
+        self.shutdown();
+    }
     pub(super) fn shutdown(&self) {
         self.closed_locally.store(true, AtomicOrdering::Release);
         // SAFETY: `self` keeps this exact socket alive for the call.
         unsafe { libc::shutdown(self.raw_fd, libc::SHUT_RDWR) };
+        self.clear_correlation();
     }
 
     pub(super) fn mark_proxied(&self) {
+        self.projection.observe_verified_proxy();
         self.proxied.store(true, AtomicOrdering::Release);
-    }
-
-    pub(super) fn lost(&self) -> bool {
-        self.loss.get().is_some()
     }
 
     pub(super) fn loss_handle(&self) -> ControlLossHandle {
@@ -191,10 +721,173 @@ impl DaemonControlClient {
     }
 
     async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
-        let mut w = self.write.lock().await;
-        control_protocol::write_frame(&mut *w, &body)
-            .await
-            .map_err(|e| AcpError::Spawn(format!("control write failed: {e}")))
+        let cached_management = matches!(
+            &body,
+            ControlBody::Initialize { .. }
+                | ControlBody::EstablishSession { .. }
+                | ControlBody::ResumeSession
+        );
+        let wire = control_protocol::encode_frame(&body).map_err(|error| {
+            warn!(target: "acp.protocol", ?error, "control request encoding refused");
+            AcpError::Protocol("request exceeds runner control capacity".into())
+        })?;
+        let result = self.send_encoded(&wire, cached_management, None).await;
+        #[cfg(test)]
+        if result.is_ok() {
+            if let Some(observer) = self
+                .connection_state
+                .test_control_output
+                .lock()
+                .unwrap()
+                .as_ref()
+            {
+                let _ = observer.send(body);
+            }
+        }
+        result
+    }
+
+    fn may_report_cache(&self, cached_management: bool) -> bool {
+        cached_management
+            && self.native_cache.load(AtomicOrdering::Acquire)
+            && self
+                .connection_state
+                .loss()
+                .is_some_and(|loss| loss.source == AcpConnectionSource::Native)
+    }
+
+    async fn send_encoded(
+        &self,
+        wire: &[u8],
+        cached_management: bool,
+        prompt: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) -> Result<(), AcpError> {
+        let cancellation = self.connection_state.initial_prompt_cancellation(prompt);
+        let lock = self.write.lock();
+        tokio::pin!(lock);
+        let mut writer = tokio::select! {
+            biased;
+            _ = async {
+                match cancellation.as_ref() {
+                    Some(cancellation) => cancellation.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Err(AcpError::NotRunning),
+            writer = &mut lock => writer,
+            loss = self.connection_state.wait_unavailable() => {
+                if !self.may_report_cache(cached_management) {
+                    return Err(AcpError::ConnectionUnavailable(loss));
+                }
+                match tokio::time::timeout(LOSS_WRITE_GRACE, &mut lock).await {
+                    Ok(writer) => writer,
+                    Err(_) => return Err(AcpError::ConnectionUnavailable(loss)),
+                }
+            }
+        };
+        let write = control_protocol::write_encoded_frame(&mut *writer, wire);
+        tokio::pin!(write);
+        let mut started = false;
+        let write = std::future::poll_fn(|cx| {
+            let _admission = self
+                .connection_state
+                .admission
+                .lock()
+                .expect("connection admission lock");
+            if !started {
+                if self.connection_state.is_stopping() {
+                    return std::task::Poll::Ready(Err(AcpError::NotRunning));
+                }
+                if let Some(observation) = self.connection_state.loss() {
+                    if !self.may_report_cache(cached_management) {
+                        return std::task::Poll::Ready(Err(AcpError::ConnectionUnavailable(
+                            observation,
+                        )));
+                    }
+                }
+                if prompt.is_some() && !self.connection_state.begin_initial_prompt_write(prompt) {
+                    return std::task::Poll::Ready(Err(AcpError::NotRunning));
+                }
+                // Finish an admitted control frame rather than corrupting its
+                // length framing on partial writes. The runner separately
+                // rejects all native effects once its own channel is lost.
+                started = true;
+            }
+            match std::future::Future::poll(write.as_mut(), cx) {
+                std::task::Poll::Pending => std::task::Poll::Pending,
+                std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Ready(Err(error)) => {
+                    self.connection_state.record_loss(
+                        AcpConnectionSource::Control,
+                        AcpConnectionCause::WriteFailed,
+                    );
+                    drop(_admission);
+                    warn!(target: "acp.protocol", ?error, "runner control write failed");
+                    self.shutdown();
+                    std::task::Poll::Ready(Err(AcpError::ConnectionUnavailable(
+                        self.connection_state
+                            .loss()
+                            .expect("write failure recorded"),
+                    )))
+                }
+            }
+        });
+        tokio::pin!(write);
+        tokio::select! {
+            biased;
+            result = &mut write => result,
+            loss = self.connection_state.wait_unavailable() => {
+                match tokio::time::timeout(LOSS_WRITE_GRACE, &mut write).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // A genuinely stalled partial control write cannot be
+                        // reused. Close that exact management stream, not the
+                        // retained native process or its ownership record.
+                        self.shutdown();
+                        Err(AcpError::ConnectionUnavailable(loss))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn receive_handshake(&self) -> Option<ControlBody> {
+        let mut replies = self.handshake_rx.lock().await;
+        tokio::select! {
+            biased;
+            reply = replies.recv() => reply,
+            _ = async {
+                let loss = self.connection_state.wait_unavailable().await;
+                if loss.source == AcpConnectionSource::Native
+                    && self.native_cache.load(AtomicOrdering::Acquire)
+                {
+                    // Genuine cached management replies require no native I/O.
+                    // Actual management EOF closes `replies` and still settles us.
+                    std::future::pending::<()>().await;
+                }
+            } => None,
+        }
+    }
+
+    pub(super) fn native_session_ready(&self) -> bool {
+        self.native_ready.load(AtomicOrdering::Acquire) && self.connection_state.loss().is_none()
+    }
+
+    pub(super) fn peer_identity(&self) -> crate::acp::runner_lifecycle::RunnerIdentity {
+        self.peer_identity
+    }
+
+    /// A lost connection does not assert process death or authorize a signal.
+    pub(super) async fn wait_peer_exit(&self) {
+        loop {
+            match self.peer_process.exited() {
+                Ok(true) => return,
+                Ok(false) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                Err(error) => {
+                    warn!(target: "acp.protocol", ?error, "retained runner exit observation is unavailable");
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
     }
 
     /// A `HandshakeFailed` reconstructs the agent's own error, as direct stdio
@@ -206,9 +899,11 @@ impl DaemonControlClient {
         self.send(ControlBody::Initialize { request })
             .await
             .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
-        match self.handshake_rx.lock().await.recv().await {
+        match self.receive_handshake().await {
             Some(ControlBody::Initialized { result }) => Ok(result),
-            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
+            Some(ControlBody::HandshakeFailed { method, error, .. }) if method == "initialize" => {
+                Err(acp_error_from_value(error))
+            }
             _ => Err(acp_internal_error(
                 "control channel closed during initialize".into(),
             )),
@@ -219,91 +914,160 @@ impl DaemonControlClient {
         &self,
         method: &str,
         request: serde_json::Value,
-    ) -> Result<(String, serde_json::Value), agent_client_protocol::Error> {
+    ) -> agent_client_protocol::Result<(String, Arc<serde_json::Value>)> {
+        let attempt = self
+            .projection
+            .attempt()
+            .filter(|attempt| attempt.target.accepts_request(method, &request))
+            .ok_or_else(|| {
+                acp_internal_error("native establishment has no matching durable attempt".into())
+            })?;
+        let store = self
+            .establishment_context
+            .lock()
+            .expect("native establishment context")
+            .0
+            .clone();
+        let expected_id = attempt.id;
+        if !self.projection.rpc_may_be_issued(attempt.id) {
+            return Err(acp_internal_error(
+                "native establishment custody is sealed".into(),
+            ));
+        }
+        if !self.ingress.authorize_original(
+            Arc::clone(&attempt),
+            self.peer_identity,
+            store.clone(),
+            None,
+        ) {
+            return Err(acp_internal_error(
+                "original callback custody is unavailable".into(),
+            ));
+        }
         self.send(ControlBody::EstablishSession {
             method: method.to_string(),
             request,
+            attempt: Arc::clone(&attempt),
+            store: store.clone(),
         })
         .await
         .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
-        match self.handshake_rx.lock().await.recv().await {
-            Some(ControlBody::SessionReady {
+        let Some(body) = self.receive_handshake().await else {
+            return Err(acp_internal_error(
+                "control channel closed during session establishment".into(),
+            ));
+        };
+        match body {
+            ControlBody::SessionReady {
                 acp_session_id,
                 result,
+                receipt,
                 ..
-            }) => {
-                self.sessions_established
-                    .fetch_add(1, AtomicOrdering::Relaxed);
+            } if receipt.attempt.id == expected_id
+                && receipt.owner == self.peer_identity
+                && native_stores_match(&receipt.store, &store)
+                && receipt.attempt.same_source(&attempt) =>
+            {
                 Ok((acp_session_id, result))
             }
-            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
+            ControlBody::EstablishmentFailed { receipt, error, .. }
+                if receipt.attempt.id == expected_id
+                    && receipt.owner == self.peer_identity
+                    && native_stores_match(&receipt.store, &store)
+                    && receipt.attempt.same_source(&attempt) =>
+            {
+                Err(acp_error_from_value(Arc::unwrap_or_clone(error)))
+            }
+            ControlBody::HandshakeFailed {
+                method: failed,
+                error,
+                ..
+            } if failed == method => Err(acp_error_from_value(error)),
             _ => Err(acp_internal_error(
-                "control channel closed during session establishment".into(),
+                "control handshake did not match session establishment".into(),
             )),
         }
     }
 
     /// Obtain the runner's committed identity without touching agent session state.
     pub(super) async fn resume_session(&self) -> Result<String, agent_client_protocol::Error> {
+        // Capture admission authority before requesting the immutable cached result.
+        let expected = self
+            .expected_attempt()
+            .ok_or_else(|| acp_internal_error("resume has no captured native authority".into()))?;
+        let store = self
+            .establishment_context
+            .lock()
+            .expect("native establishment context")
+            .0
+            .clone();
         self.send(ControlBody::ResumeSession)
             .await
             .map_err(|e| acp_internal_error(format!("control write failed: {e}")))?;
-        match self.handshake_rx.lock().await.recv().await {
-            Some(ControlBody::SessionReady { acp_session_id, .. }) => Ok(acp_session_id),
-            Some(ControlBody::HandshakeFailed { error }) => Err(acp_error_from_value(error)),
+        match self.receive_handshake().await {
+            Some(ControlBody::SessionReady {
+                acp_session_id,
+                receipt,
+                ..
+            }) if receipt.attempt.id == expected
+                && receipt.owner == self.peer_identity
+                && native_stores_match(&receipt.store, &store) =>
+            {
+                Ok(acp_session_id)
+            }
+            Some(ControlBody::EstablishmentFailed { error, receipt, .. })
+                if receipt.attempt.id == expected
+                    && receipt.owner == self.peer_identity
+                    && native_stores_match(&receipt.store, &store) =>
+            {
+                Err(acp_error_from_value(Arc::unwrap_or_clone(error)))
+            }
+            Some(ControlBody::HandshakeFailed { method, error, .. })
+                if method == "resume_session" =>
+            {
+                Err(acp_error_from_value(error))
+            }
             _ => Err(acp_internal_error(
                 "control channel closed during resume".into(),
             )),
         }
     }
 
-    /// Wait until the crate has applied the updates the runner queued ahead of
-    /// every established session's replay barrier.
-    pub(super) async fn session_replayed(&self) {
-        let established = self.sessions_established.load(AtomicOrdering::Relaxed);
-        let _ = self
-            .sessions_replayed
-            .subscribe()
-            .wait_for(|replayed| *replayed >= established)
-            .await;
+    pub(super) async fn session_replayed(&self) -> bool {
+        self.projection.wait_wire().await
     }
 
-    pub(super) fn mark_session_replayed(&self, _: SessionReplayed) {
-        self.sessions_replayed
-            .send_modify(|replayed| *replayed += 1);
+    pub(super) fn mark_session_replayed(&self, marker: SessionReplayed) {
+        self.projection
+            .close_wire(marker.attempt_id, marker.closure, marker.delivery);
     }
 
-    /// Releases the oldest settled completion when the crate reaches its marker.
-    /// A local outcome goes to its waiter; an adopted one is returned only
-    /// while this client still owns the adopted turn.
-    pub(super) fn deliver_prompt_completion(
-        &self,
-        _: PromptCompletedMarker,
-    ) -> Option<control_protocol::PromptOutcome> {
-        let completion = self.completion.lock().expect("completion mutex poisoned");
-        let settled = self
-            .settled
-            .lock()
-            .expect("settled mutex poisoned")
-            .pop_front();
-        match settled {
-            Some(CompletionDelivery::Local(tx, outcome)) => {
-                let _ = tx.send(outcome);
-                None
-            }
-            Some(CompletionDelivery::Adopted(outcome))
-                if matches!(*completion, PromptCompletion::Adopted) =>
+    pub(super) fn deliver_prompt_completion(&self, marker: PromptCompletedMarker) {
+        let mut settled = self.settled.lock().expect("settled mutex poisoned");
+        if settled.as_ref().is_some_and(|outcome| {
+            marker.prompt_req_id == Some(outcome.prompt_req_id)
+                && marker.correlation == outcome.correlation
+        }) {
+            let outcome = settled.take().expect("matching original completion");
+            let _ = outcome.tx.send(outcome.result);
+        }
+    }
+
+    pub(super) fn deliver_native_lost(&self) {
+        let mut completion = self.completion.lock().expect("completion mutex poisoned");
+        if matches!(*completion, PromptCompletion::Pending { .. }) {
+            if let PromptCompletion::Pending { tx, .. } =
+                std::mem::replace(&mut *completion, PromptCompletion::LocalIdle)
             {
-                Some(outcome)
+                let _ = tx.send(ControlPromptResult::NativeLost);
             }
-            _ => None,
         }
     }
 
     /// Transfer terminal ownership before the command loop arms a local turn.
     pub(super) fn supersede_adopted_turn(&self) {
         let mut completion = self.completion.lock().expect("completion mutex poisoned");
-        if matches!(*completion, PromptCompletion::Adopted) {
+        if matches!(*completion, PromptCompletion::Adopted(_)) {
             *completion = PromptCompletion::LocalIdle;
         }
     }
@@ -326,50 +1090,154 @@ impl DaemonControlClient {
     pub(super) async fn prompt(
         &self,
         request: serde_json::Value,
-    ) -> Result<oneshot::Receiver<control_protocol::PromptOutcome>, agent_client_protocol::Error>
-    {
-        let (tx, rx) = oneshot::channel();
-        {
+        scope: crate::acp::establishment::NativeRequestScope,
+    ) -> Result<oneshot::Receiver<ControlPromptResult>, AcpError> {
+        self.connection_state.admit(|| ())?;
+        let correlation = scope.correlation();
+        let pending_scope = scope.clone();
+        let wire = control_protocol::encode_frame(&ControlBody::Prompt { request, scope })
+            .map_err(|error| {
+                warn!(target: "acp.protocol", ?error, "prompt encoding refused");
+                AcpError::Protocol("prompt exceeds runner control capacity".into())
+            })?;
+        let rx = self.connection_state.admit(|| {
             let mut completion = self.completion.lock().expect("completion mutex poisoned");
             if matches!(*completion, PromptCompletion::Pending { .. }) {
-                return Err(acp_internal_error(
+                return Err(AcpError::Protocol(
                     "a local prompt is already awaiting completion".into(),
                 ));
             }
+            let (tx, rx) = oneshot::channel();
             *completion = PromptCompletion::Pending {
                 prompt_req_id: None,
+                scope: pending_scope,
+                window_id: None,
                 tx,
             };
-        }
+            Ok(rx)
+        })??;
         debug!(target: "acp.protocol", "prompt completion waiter installed");
-        if self.send(ControlBody::Prompt { request }).await.is_err() {
-            // Dropping the waiter resolves `rx` as aborted right away.
-            *self.completion.lock().expect("completion mutex poisoned") =
-                PromptCompletion::LocalIdle;
+        if self.send_encoded(&wire, false, correlation).await.is_err() {
+            let mut completion = self.completion.lock().expect("completion mutex poisoned");
+            if matches!(*completion, PromptCompletion::Pending { .. }) {
+                *completion = PromptCompletion::LocalIdle;
+            }
         }
         Ok(rx)
     }
 
-    pub(super) async fn cancel(&self) {
-        let _ = self.send(ControlBody::Cancel).await;
+    pub(super) async fn cancel(
+        &self,
+        scope: crate::acp::establishment::NativeRequestScope,
+    ) -> Result<(), AcpError> {
+        self.send(ControlBody::Cancel { scope }).await
     }
 
-    pub(super) async fn cancel_session(&self, session_id: String) -> bool {
-        self.send(ControlBody::CancelSession { session_id })
-            .await
-            .is_ok()
+    pub(super) async fn cancel_session(
+        &self,
+        parent_session_id: String,
+        session_id: String,
+        scope: crate::acp::establishment::NativeRequestScope,
+    ) -> bool {
+        self.send(ControlBody::CancelSession {
+            parent_session_id,
+            session_id,
+            scope,
+        })
+        .await
+        .is_ok()
     }
 }
 
-/// Dial and validate one v3 runner control socket. Retry only startup races;
-/// preserve all permanent I/O, framing, identity, and version failures.
-pub(super) async fn connect_runner_control_v3(
+/// A newborn must publish its own declaration; never retrofit a retained record.
+pub(super) async fn wait_runner_registration(
+    session_id: &str,
+    expected_owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    newborn: bool,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<(), AcpError> {
+    let deadline =
+        deadline.unwrap_or_else(|| tokio::time::Instant::now() + runner_socket_deadline());
+    let unconfirmed = || {
+        AcpError::RetainedRuntimeUnavailable(Box::new(
+            crate::process::worker_registry::ControlAdmissionRefusal::unconfirmed(Some(
+                expected_owner,
+            )),
+        ))
+    };
+    loop {
+        let observed = {
+            let registry =
+                crate::process::worker_registry::registry_lock_until(session_id, deadline)
+                    .await
+                    .map_err(|error| {
+                        if error.is::<crate::process::worker_registry::RegistryBusy>() {
+                            AcpError::RegistryBusy
+                        } else {
+                            unconfirmed()
+                        }
+                    })?;
+            registry.record()
+        };
+        match observed {
+            Ok(Some(record)) if expected_owner.owns_record(&record) => {
+                if let Some(refusal) =
+                    crate::process::worker_registry::control_protocol_refusal(&record)
+                {
+                    return Err(AcpError::RetainedRuntimeUnavailable(Box::new(refusal)));
+                }
+                return Ok(());
+            }
+            Ok(Some(record))
+                if !newborn
+                    || crate::process::worker_registry::retained_process_may_be_alive(&record) =>
+            {
+                return Err(unconfirmed());
+            }
+            Ok(None) if !newborn => return Err(unconfirmed()),
+            Err(error) => {
+                warn!(target: "acp.protocol", ?error, "runner registration observation failed");
+                return Err(unconfirmed());
+            }
+            Ok(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(unconfirmed());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Dial one protocol6 socket and bind its actual peer before trusting Hello.
+pub(super) async fn connect_runner_control(
     control_path: &std::path::Path,
     session_label: String,
-    terminal_claim: Arc<TerminalClaim>,
+    state: Arc<super::SessionState>,
     prompt_in_flight: Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<(Arc<DaemonControlClient>, tokio::io::DuplexStream)> {
+    expected_owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    projection: Arc<crate::acp::event_sender::ProjectionState>,
+) -> Result<(Arc<DaemonControlClient>, tokio::io::DuplexStream), AcpError> {
+    let terminal_claim = Arc::clone(&state.terminal_claim);
     let bound = runner_socket_deadline();
+    let refused = |reason, observed_protocol| {
+        AcpError::RetainedRuntimeUnavailable(Box::new(
+            crate::process::worker_registry::ControlAdmissionRefusal {
+                reason,
+                owner: Some(expected_owner),
+                declared_protocol: Some(control_protocol::CONTROL_PROTOCOL_VERSION),
+                observed_protocol,
+                route_fingerprint: Some(
+                    crate::process::worker_registry::control_route_fingerprint(control_path),
+                ),
+            },
+        ))
+    };
+    let unconfirmed = || {
+        refused(
+            crate::process::worker_registry::ControlRefusalReason::OwnershipUnconfirmed,
+            None,
+        )
+    };
     let dial = async {
         let stream = loop {
             match tokio::net::UnixStream::connect(control_path).await {
@@ -383,35 +1251,84 @@ pub(super) async fn connect_runner_control_v3(
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await
                 }
                 Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "connect runner control socket {}: {error}",
-                        control_path.display()
-                    ));
+                    warn!(target: "acp.protocol", ?error, "runner control connection failed");
+                    return Err(unconfirmed());
                 }
             }
         };
+        if crate::process::worker::connected_peer_pid(&stream) != Some(expected_owner.pid) {
+            return Err(unconfirmed());
+        }
+        let birth = crate::process::process_birth_identity(expected_owner.pid)
+            .map_err(|error| {
+                warn!(target: "acp.protocol", ?error, "runner peer birth observation failed");
+                unconfirmed()
+            })?
+            .ok_or_else(unconfirmed)?;
+        if Some(birth.fingerprint()) != expected_owner.birth_fingerprint {
+            return Err(unconfirmed());
+        }
+        let peer_process = crate::process::CapturedProcess::capture(expected_owner.pid, &birth)
+            .map_err(|error| {
+                warn!(target: "acp.protocol", ?error, "runner peer capture failed");
+                unconfirmed()
+            })?
+            .ok_or_else(unconfirmed)?;
         let (mut read_half, mut write_half) = stream.into_split();
-        match control_protocol::read_frame(&mut read_half).await {
+        let (prompt_head, native_autonomous) = match control_protocol::read_frame(&mut read_half)
+            .await
+        {
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
                 session_id,
+                prompt_head,
+                native_autonomous,
             })) if control_protocol_version == control_protocol::CONTROL_PROTOCOL_VERSION
-                && session_id == session_label => {}
+                && session_id == session_label =>
+            {
+                if let Some(snapshot) = &native_autonomous {
+                    snapshot.validate().map_err(|_| unconfirmed())?;
+                    if snapshot
+                        .started
+                        .evidence
+                        .physical_source
+                        .and_then(|source| source.witness.owner)
+                        != Some(expected_owner)
+                    {
+                        return Err(unconfirmed());
+                    }
+                }
+                (
+                    prompt_head.filter(|head| {
+                        head.scope.owner() == Some(expected_owner)
+                            && head.scope.correlation().is_some()
+                    }),
+                    native_autonomous,
+                )
+            }
             Ok(Some(ControlBody::Hello {
                 control_protocol_version,
-                session_id,
+                ..
             })) => {
-                return Err(anyhow::anyhow!(
-                    "runner Hello mismatch: expected session {session_label:?} protocol v{}, got session {session_id:?} protocol v{control_protocol_version}",
-                    control_protocol::CONTROL_PROTOCOL_VERSION
-                ));
+                warn!(target: "acp.protocol", session = %session_label, protocol = control_protocol_version, "runner Hello identity or protocol mismatch");
+                let reason =
+                    if control_protocol_version != control_protocol::CONTROL_PROTOCOL_VERSION {
+                        crate::process::worker_registry::ControlRefusalReason::ProtocolIncompatible
+                    } else {
+                        crate::process::worker_registry::ControlRefusalReason::OwnershipUnconfirmed
+                    };
+                return Err(refused(reason, Some(control_protocol_version)));
             }
             Ok(Some(frame)) => {
-                return Err(anyhow::anyhow!("runner sent {:?} before Hello", frame));
+                warn!(target: "acp.protocol", frame_kind = ?std::mem::discriminant(&frame), "runner sent a non-Hello frame before admission");
+                return Err(unconfirmed());
             }
-            Ok(None) => return Err(anyhow::anyhow!("runner closed before Hello")),
-            Err(error) => return Err(anyhow::anyhow!("read runner Hello: {error}")),
-        }
+            Ok(None) => return Err(unconfirmed()),
+            Err(error) => {
+                warn!(target: "acp.protocol", ?error, "runner Hello decoding failed");
+                return Err(unconfirmed());
+            }
+        };
         control_protocol::write_frame(
             &mut write_half,
             &ControlBody::Attach {
@@ -419,52 +1336,115 @@ pub(super) async fn connect_runner_control_v3(
             },
         )
         .await
-        .map_err(|error| anyhow::anyhow!("write runner Attach: {error}"))?;
-        Ok((read_half, write_half))
+        .map_err(|error| {
+            warn!(target: "acp.protocol", ?error, "runner Attach write failed");
+            unconfirmed()
+        })?;
+        Ok((
+            read_half,
+            write_half,
+            peer_process,
+            prompt_head,
+            native_autonomous,
+        ))
     };
-    let (mut read_half, write_half) = tokio::time::timeout(bound, dial).await.map_err(|_| {
-        anyhow::anyhow!(
-            "timed out attaching runner control socket {}",
-            control_path.display()
-        )
-    })??;
+    let (mut read_half, write_half, peer_process, prompt_head, mut native_autonomous) =
+        tokio::time::timeout(bound, dial)
+            .await
+            .map_err(|_| unconfirmed())??;
 
     info!(
         target: "acp.protocol",
         session = %session_label,
-        "runner control channel v3 attached; runner owns the ACP protocol"
+        "runner control channel6 attached; runner owns the ACP protocol"
     );
 
     // 64 KiB matches the stdio pipe size.
     let (crate_side, shim_side) = tokio::io::duplex(64 * 1024);
     let (shim_read, shim_write) = tokio::io::split(shim_side);
     let shim_write = Arc::new(Mutex::new(shim_write));
-    let correlation = Arc::new(Mutex::new(ShimCorrelation::default()));
+    let correlation = Arc::new(std::sync::Mutex::new(ShimCorrelation::default()));
+    let reverse_changed = Arc::new(tokio::sync::Notify::new());
 
     let raw_fd = write_half.as_ref().as_raw_fd();
     let write_half = Arc::new(Mutex::new(write_half));
 
     let reader_prompt_in_flight = prompt_in_flight.clone();
     let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
-    let completion = Arc::new(std::sync::Mutex::new(PromptCompletion::Adopted));
+    let completion = Arc::new(std::sync::Mutex::new(PromptCompletion::Adopted(
+        prompt_head,
+    )));
     let reader_completion = completion.clone();
     let abandoned_starts = Arc::new(AtomicUsize::new(0));
     let reader_abandoned_starts = abandoned_starts.clone();
-    let settled = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    let settled = Arc::new(std::sync::Mutex::new(None));
     let reader_settled = settled.clone();
     let reader_session = session_label.clone();
     let reader_shim_write = shim_write.clone();
     let reader_correlation = correlation.clone();
-    let ingress = Arc::new(SessionIngress::default());
+    let reader_reverse_changed = Arc::clone(&reverse_changed);
+    let ingress = Arc::new(SessionIngress::with_original_quota(Arc::clone(
+        &state.original_quota,
+    )));
+    let connection_state = Arc::new(ConnectionState::default());
+    #[cfg(test)]
+    let _ = connection_state.test_shim.set(shim_write.clone());
     let reader_ingress = ingress.clone();
+    let reader_connection_state = connection_state.clone();
+    let native_cache = Arc::new(AtomicBool::new(false));
+    let native_ready = Arc::new(AtomicBool::new(false));
+    let reader_native_cache = native_cache.clone();
+    let reader_native_ready = native_ready.clone();
+    let reader_projection = Arc::clone(&projection);
+    let application = Arc::new(std::sync::Mutex::new(None));
+    let reader_application = Arc::clone(&application);
+    let establishment_context = Arc::new(std::sync::Mutex::new((None, None)));
+    let reader_establishment_context = Arc::clone(&establishment_context);
     let closed_locally = Arc::new(AtomicBool::new(false));
     let loss = Arc::new(std::sync::OnceLock::new());
     let (reader_closed_locally, reader_loss) = (closed_locally.clone(), loss.clone());
     let proxied = Arc::new(AtomicBool::new(false));
+    #[cfg(test)]
     let disconnected = tokio_util::sync::CancellationToken::new();
+    #[cfg(test)]
     let reader_disconnected = disconnected.clone();
+    let client = Arc::new(DaemonControlClient {
+        correlation: Arc::clone(&correlation),
+        reverse_changed,
+        ingress,
+        connection_state,
+        projection,
+        establishment_context,
+        application,
+        write: write_half,
+        handshake_rx: Mutex::new(hs_rx),
+        native_cache,
+        native_ready,
+        completion,
+        abandoned_starts,
+        settled,
+        raw_fd,
+        peer_identity: expected_owner,
+        peer_process,
+        closed_locally,
+        loss,
+        proxied,
+        #[cfg(test)]
+        disconnected,
+    });
+    let _ = client.connection_state.control.set(Arc::downgrade(&client));
+    #[cfg(test)]
+    let _ = client
+        .connection_state
+        .test_terminal
+        .set(Arc::clone(&terminal_claim));
+    #[cfg(test)]
+    let _ = client
+        .connection_state
+        .test_in_flight
+        .set(Arc::clone(&prompt_in_flight));
+    let reader_control = Arc::downgrade(&client);
     tokio::spawn(async move {
-        let _disconnected = reader_disconnected.drop_guard();
         let record_loss = |io_error| {
             if reader_closed_locally.load(AtomicOrdering::Acquire) {
                 return;
@@ -480,42 +1460,264 @@ pub(super) async fn connect_runner_control_v3(
             let _ = reader_loss.set((io_error, turn_in_flight));
         };
         async {
+            let mut native_loss_relayed = false;
+            let mut adapter_baseline_applied = false;
             loop {
                 match control_protocol::read_frame_with_size(&mut read_half).await {
-                    Ok(Some((
-                        frame @ (ControlBody::Initialized { .. }
-                        | ControlBody::SessionReady { .. }
-                        | ControlBody::HandshakeFailed { .. }),
-                        _,
-                    ))) => {
-                        if let ControlBody::SessionReady {
-                            acp_session_id,
-                            adapter_frames,
-                            ..
-                        } = &frame
-                        {
-                            reader_ingress.resolve(None, acp_session_id.clone().into());
-                            reader_ingress.skip_adapter_frames(*adapter_frames);
+                    Ok(Some((ControlBody::OriginalEstablishment { invocation }, _))) => {
+                        let context = reader_establishment_context.lock()
+                            .expect("native establishment context").clone();
+                        let expected_attempt = reader_projection.attempt();
+                        let expected = context.1.as_ref()
+                            .and_then(|scope: &crate::acp::state::NativeObservationScope| scope.choice.as_ref())
+                            .and_then(|choice| choice.authority.map(|key| key.id))
+                            .or_else(|| expected_attempt.as_ref().map(|attempt| attempt.id));
+                        if expected != Some(invocation.attempt.id) {
+                            continue;
                         }
-                        if hs_tx.send(frame).await.is_err() {
+                        // Original source survives rebase; this grants no Current permission.
+                        if invocation.owner != expected_owner
+                            || invocation.owner.birth_fingerprint.is_none()
+                            || invocation.attempt.session_id != reader_session
+                            || invocation.attempt.producer.is_none()
+                            || expected_attempt.as_deref().is_none_or(|expected| {
+                                !expected.same_source(&invocation.attempt)
+                                    || expected.destination != invocation.attempt.destination
+                            })
+                            || !native_stores_match(&invocation.store, &context.0)
+                            || invocation.replay.closed
+                            || invocation.replay.lost
+                            || !matches!(invocation.outcome,
+                                crate::acp::establishment::NativeEstablishmentOutcome::Failed {
+                                    reason: crate::acp::establishment::EstablishmentBlockReason::OutcomeUnknown,
+                                })
+                            || !reader_projection.observe_original_invocation(Arc::clone(&invocation.attempt))
+                            || !reader_ingress.authorize_original(
+                                Arc::clone(&invocation.attempt), invocation.owner,
+                                invocation.store.clone(), None,
+                            )
+                        {
+                            reader_projection.lost();
                             return;
                         }
                     }
-                    // Relayed in stream position: crediting it here would run ahead
-                    // of earlier frames still buffered for the crate.
+                    // The SDK credits this only after earlier queued frames.
                     Ok(Some((ControlBody::AdapterFramesShed { count }, _))) => {
                         let line = serde_json::json!({
                             "jsonrpc": "2.0",
                             "method": ADAPTER_FRAMES_SHED_METHOD,
                             "params": { "count": count },
                         });
-                        if !shim_write_line_releasing(&reader_shim_write, &line, &reader_settled)
-                            .await
+                        if !shim_write_line_releasing(
+                            &reader_shim_write, &line, &reader_settled, &reader_connection_state,
+                        ).await { return; }
+                    }
+                    Ok(Some((
+                        frame @ (ControlBody::Initialized { .. }
+                        | ControlBody::SessionReady { .. }
+                        | ControlBody::HandshakeFailed { .. }
+                        | ControlBody::EstablishmentFailed { .. }),
+                        _,
+                    ))) => {
+                        if matches!(&frame, ControlBody::Initialized { .. }) {
+                            reader_connection_state.received_managed_initialize();
+                        }
+                        let captured = match &frame {
+                            ControlBody::SessionReady {
+                                receipt, original_delivery, delivery,
+                                acp_session_id, result, postimage, ..
+                            } => {
+                                let expected = receipt.postimage(receipt.attempt.context).ok();
+                                if receipt.session_id() != Some(acp_session_id.as_str())
+                                    || receipt.attempt.target.resulting_session_id(result).ok() != Some(acp_session_id.as_str())
+                                    || postimage.as_deref() != expected.as_ref()
+                                {
+                                    reader_projection.lost();
+                                    return;
+                                }
+                                Some((receipt, *original_delivery, *delivery))
+                            }
+                            ControlBody::EstablishmentFailed {
+                                receipt, original_delivery, delivery, ..
+                            } => Some((receipt, *original_delivery, *delivery)),
+                            _ => None,
+                        };
+                        if let Some((receipt, original, delivery)) = captured {
+                            let context = reader_establishment_context.lock()
+                                .expect("native establishment context").clone();
+                            let expected = context.1.as_ref().and_then(|scope| scope.choice.as_ref())
+                                .and_then(|choice| choice.authority.map(|key| key.id))
+                                .or_else(|| reader_projection.attempt().map(|attempt| attempt.id));
+                            if expected != Some(receipt.attempt.id) {
+                                // A delayed old frame cannot release or resolve the new attempt.
+                                continue;
+                            }
+                            if receipt.owner != expected_owner
+                                || receipt.owner.birth_fingerprint.is_none()
+                                || receipt.attempt.session_id != reader_session
+                                || receipt.attempt.producer.is_none()
+                                || !native_stores_match(&receipt.store, &context.0)
+                                || !reader_projection.receipt(Arc::clone(receipt), original, delivery)
+                            {
+                                reader_projection.lost();
+                                return;
+                            }
+                            if receipt.replay.closed && !reader_connection_state.sdk_is_closing() {
+                                let mut application = reader_application.lock()
+                                    .expect("native response application");
+                                if let Some(slot) = application.as_mut() {
+                                    if slot.attempt == receipt.attempt.id && slot.completed.is_none() {
+                                        reader_connection_state.begin_completed_outcome();
+                                        slot.completed = Some(HandshakeApplication(Arc::clone(&reader_connection_state)));
+                                    }
+                                }
+                            }
+                        }
+                        match &frame {
+                            ControlBody::SessionReady { receipt, postimage, .. } => {
+                                let authorized = reader_ingress.authorize_original(
+                                    Arc::clone(&receipt.attempt), receipt.owner,
+                                    receipt.store.clone(), postimage.clone(),
+                                );
+                                if !authorized && !reader_ingress.failed_original_matches(
+                                    &receipt.attempt, receipt.owner, receipt.store.as_ref(),
+                                ) {
+                                    reader_projection.lost();
+                                    return;
+                                }
+                                if authorized {
+                                    let constructor = {
+                                        let context = reader_establishment_context.lock()
+                                            .expect("native establishment context");
+                                        context.1.as_ref()
+                                            .map(|scope| (scope.context, Arc::clone(&scope.fence)))
+                                    };
+                                    if let Some((context, fence)) = constructor
+                                        .filter(|(context, _)| *context == receipt.attempt.context)
+                                    {
+                                        if !reader_ingress.authorize_constructor(
+                                            &receipt.attempt, context, fence,
+                                        ) {
+                                            reader_projection.lost();
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            ControlBody::EstablishmentFailed {
+                                receipt,
+                                error,
+                                origin: control_protocol::HandshakeFailureOrigin::NativeResponse,
+                                original_delivery: true,
+                                ..
+                            } => {
+                                *reader_connection_state.original_establishment_rejection
+                                    .lock().expect("original establishment rejection") =
+                                    Some((receipt.attempt.id, Arc::clone(error)));
+                                reader_ingress.revoke_requests();
+                                reader_connection_state.decline_establishment();
+                            }
+                            ControlBody::EstablishmentFailed { .. } => {
+                                reader_ingress.revoke_requests();
+                                reader_connection_state.decline_establishment();
+                            }
+                            _ => {}
+                        }
+                        if let ControlBody::SessionReady {
+                            acp_session_id,
+                            native_channel,
+                            adapter_frames,
+                            ..
+                        } = &frame
                         {
+                            reader_native_cache.store(true, AtomicOrdering::Release);
+                            if let NativeChannelAvailability::Unavailable { cause } = native_channel
+                            {
+                                observe_native_loss(&reader_connection_state, *cause);
+                            }
+                            reader_native_ready.store(
+                                matches!(native_channel, NativeChannelAvailability::Available)
+                                    && !reader_ingress.has_failed()
+                                    && reader_connection_state.loss().is_none(),
+                                AtomicOrdering::Release,
+                            );
+                            if !adapter_baseline_applied {
+                                reader_ingress.skip_adapter_frames(*adapter_frames);
+                                adapter_baseline_applied = true;
+                            }
+                            reader_ingress.resolve(None, acp_session_id.clone().into());
+                            #[cfg(test)]
+                            if reader_native_ready.load(AtomicOrdering::Acquire) {
+                                if let Some(observer) = reader_connection_state.test_native_session_seen.lock().unwrap().take() {
+                                    let _ = observer.send(());
+                                }
+                            }
+                        }
+                        let replay_autonomous = if let ControlBody::SessionReady { receipt, .. } = &frame {
+                            native_autonomous.take().filter(|snapshot| {
+                                receipt.session_id() == Some(snapshot.started.notification.session_id.as_str())
+                                    && snapshot.started.evidence.physical_source.map(|physical| physical.witness)
+                                        == crate::acp::state::NativeEventOrigin::owned_attempt(
+                                            &receipt.attempt, Some(receipt.owner),
+                                        )
+                            })
+                        } else { None };
+                        if hs_tx.send(frame).await.is_err() {
                             return;
                         }
+                        if let Some(snapshot) = replay_autonomous {
+                            let Ok(wire_bytes) = snapshot.encoded_bytes() else {
+                                reader_projection.lost();
+                                return;
+                            };
+                            let envelope = control_protocol::NativeAutonomousSnapshotEnvelope { snapshot, wire_bytes };
+                            let line = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD,
+                                "params": envelope,
+                            });
+                            if !shim_write_line_releasing(
+                                &reader_shim_write, &line, &reader_settled, &reader_connection_state,
+                            ).await { return; }
+                        }
                     }
-                    Ok(Some((ControlBody::PromptStarted { prompt_req_id }, _))) => {
+                    Ok(Some((
+                        ControlBody::NativeChannelLost {
+                            cause,
+                            cached_session,
+                        },
+                        _,
+                    ))) => {
+                        reader_native_cache.store(cached_session, AtomicOrdering::Release);
+                        reader_native_ready.store(false, AtomicOrdering::Release);
+                        observe_native_loss(&reader_connection_state, cause);
+                        {
+                            let mut correlation = reader_correlation.lock().expect("shim correlation");
+                            correlation.forward.clear();
+                            correlation.reverse.clear();
+                        }
+                        reader_reverse_changed.notify_waiters();
+                        if !native_loss_relayed {
+                            native_loss_relayed = true;
+                            let marker = NativeChannelLostMarker::default();
+                            let line = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "method": marker.method(),
+                                "params": {},
+                            });
+                            if !shim_write_line_releasing(
+                                &reader_shim_write,
+                                &line,
+                                &reader_settled,
+                                &reader_connection_state,
+                            )
+                            .await
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Some((ControlBody::PromptStarted { prompt_req_id, correlation, window_id }, _))) => {
                         let mut completion =
                             reader_completion.lock().expect("completion mutex poisoned");
                         let abandoned = reader_abandoned_starts.load(AtomicOrdering::Relaxed);
@@ -523,84 +1725,172 @@ pub(super) async fn connect_runner_control_v3(
                             reader_abandoned_starts.store(abandoned - 1, AtomicOrdering::Relaxed);
                         } else if let PromptCompletion::Pending {
                             prompt_req_id: id @ None,
+                            scope,
+                            window_id: window,
                             ..
-                        } = &mut *completion
-                        {
-                            *id = Some(prompt_req_id);
+                        } = &mut *completion {
+                            if scope.correlation() == correlation {
+                                *id = Some(prompt_req_id);
+                                *window = Some(window_id);
+                            }
                         }
                     }
                     Ok(Some((
                         ControlBody::PromptCompleted {
                             prompt_req_id,
                             outcome,
+                            evidence,
                         },
                         _,
                     ))) => {
+                        #[cfg(test)]
+                        {
+                            let gate = reader_connection_state.test_prompt_completed.lock().unwrap().take();
+                            if let Some((entered, release)) = gate {
+                                let _ = entered.send(());
+                                tokio::select! {
+                                    biased;
+                                    _ = reader_connection_state.wait_callback_end() => return,
+                                    released = release => if released.is_err() { return; },
+                                }
+                            }
+                        }
+                        let evidence = if matches!(outcome, control_protocol::PromptOutcome::Aborted) {
+                            None
+                        } else { evidence };
                         let waiter = {
                             let mut completion =
                                 reader_completion.lock().expect("completion mutex poisoned");
                             match &*completion {
                                 PromptCompletion::Pending {
                                     prompt_req_id: Some(id),
+                                    scope,
+                                    window_id,
                                     ..
-                                } if *id == prompt_req_id => {
+                                } if *id == prompt_req_id && evidence.as_ref().is_none_or(|evidence| {
+                                    evidence.prompt_req_id == prompt_req_id
+                                        && evidence.scope == *scope && Some(evidence.window_id) == *window_id
+                                }) => {
                                     match std::mem::replace(
                                         &mut *completion,
                                         PromptCompletion::LocalIdle,
                                     ) {
-                                        PromptCompletion::Pending { tx, .. } => Some(tx),
+                                        PromptCompletion::Pending { tx, scope, .. } => Some((tx, scope.correlation())),
                                         _ => unreachable!(),
                                     }
                                 }
-                                PromptCompletion::Adopted => {
-                                    if !reader_prompt_in_flight.load(AtomicOrdering::Relaxed)
-                                        || terminal_claim.claimed()
-                                    {
-                                        reader_prompt_in_flight
-                                            .store(false, AtomicOrdering::Relaxed);
-                                        continue;
-                                    }
-                                    None
-                                }
-                                _ => continue,
+                                _ => None,
                             }
                         };
-                        let delivery = match waiter {
-                            Some(tx) => CompletionDelivery::Local(tx, outcome),
-                            None => CompletionDelivery::Adopted(outcome),
-                        };
-                        reader_settled
-                            .lock()
-                            .expect("settled mutex poisoned")
-                            .push_back(delivery);
-                        let marker = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": PromptCompletedMarker::default().method(),
-                            "params": {},
-                        });
-                        if !shim_write_line_releasing(&reader_shim_write, &marker, &reader_settled)
+                        if let Some((tx, correlation)) = waiter {
+                            *reader_settled.lock().expect("settled mutex poisoned") = Some(LocalOutcome {
+                                prompt_req_id,
+                                correlation,
+                                tx,
+                                result: ControlPromptResult::Outcome { outcome, evidence },
+                            });
+                            let params = PromptCompletedMarker {
+                                prompt_req_id: Some(prompt_req_id),
+                                correlation,
+                                ..PromptCompletedMarker::default()
+                            };
+                            let marker = CompletionMarkerLine {
+                                jsonrpc: "2.0",
+                                method: params.method(),
+                                params: &params,
+                            };
+                            if !shim_write_line_releasing(
+                                &reader_shim_write,
+                                &marker,
+                                &reader_settled,
+                                &reader_connection_state,
+                            )
                             .await
                         {
                             return;
                         }
+                        }
+                        else if let Some(adopted) = prepare_adopted_completion(
+                            prompt_req_id, outcome, evidence, &reader_completion,
+                            &reader_prompt_in_flight, &terminal_claim,
+                        ) {
+                            let params = PromptCompletedMarker {
+                                adopted: Some(Box::new(adopted)),
+                                ..PromptCompletedMarker::default()
+                            };
+                            let marker = CompletionMarkerLine {
+                                jsonrpc: "2.0",
+                                method: params.method(),
+                                params: &params,
+                            };
+                            if !shim_write_line_releasing(
+                                &reader_shim_write, &marker, &reader_settled,
+                                &reader_connection_state,
+                            ).await {
+                                return;
+                            }
+                        }
                     }
-
-                    // Reverse lane: served by the crate's request handlers. The
-                    // ordered dispatcher starts each handler before reading the
-                    // next frame, so SessionReady must publish its candidate first.
+                    // Refuse invalid scopes without waiting behind Fresh or
+                    // blocked SDK publication; duration capture never waits.
                     Ok(Some((
                         ControlBody::ServerCall {
                             call_id,
                             method,
                             params,
+                            evidence,
                         },
                         _,
                     ))) => {
-                        let synthetic = {
-                            let mut c = reader_correlation.lock().await;
+                        let callback = reader_ingress.capture_native_callback(
+                            evidence,
+                            params.get("sessionId").or_else(|| params.get(0))
+                                .and_then(serde_json::Value::as_str),
+                            &reader_connection_state,
+                        );
+                        if callback.is_none()
+                            && (control_protocol::session_scoped_callback(&method, &params)
+                                || method == "elicitation/create")
+                        {
+                            let Some(control) = reader_control.upgrade() else {
+                                return;
+                            };
+                            if control.send(ControlBody::ServerError {
+                                call_id,
+                                error: control_protocol::JsonRpcError {
+                                    code: control_protocol::INVALID_PARAMS,
+                                    message: SessionIngress::request_refused().message,
+                                    data: None,
+                                },
+                            }).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let synthetic = reader_connection_state.admit(|| {
+                            let mut c = reader_correlation.lock().expect("shim correlation");
                             let id = c.synthetic_id();
-                            c.reverse.insert(id, call_id);
+                            let publication = if !c.reverse_exclusive && callback.is_some() {
+                                reader_connection_state.callback_publication()
+                            } else {
+                                None
+                            };
+                            let admitted = publication.is_some();
+                            c.reverse.insert(id, ReverseTicket {
+                                call_id,
+                                _publication: publication,
+                                _parked: (admitted && (method == "session/request_permission"
+                                    || (method == "elicitation/create"
+                                        && control_protocol::session_scoped_callback(&method, &params))))
+                                    .then(|| reader_ingress.park()),
+                                admitted,
+                                reply_started: false,
+                                callback,
+                            });
                             id
+                        });
+                        let Ok(synthetic) = synthetic else {
+                            continue;
                         };
                         let line = serde_json::json!({
                             "jsonrpc": "2.0",
@@ -608,47 +1898,110 @@ pub(super) async fn connect_runner_control_v3(
                             "method": method,
                             "params": params,
                         });
-                        if !shim_write_line_releasing(&reader_shim_write, &line, &reader_settled)
-                            .await
+                        if !shim_write_line_releasing(
+                            &reader_shim_write,
+                            &line,
+                            &reader_settled,
+                            &reader_connection_state,
+                        )
+                        .await
                         {
                             return;
                         }
                     }
                     // Preserve producer bytes across the private SDK transport
                     // without nesting or trusting any native accounting claim.
-                    Ok(Some((ControlBody::Notify { method, mut params }, wire_bytes))) => {
-                        if method == "session/update" {
+                    Ok(Some((ControlBody::Notify { method, mut params, replay, evidence }, wire_bytes))) => {
+                        if let Some(replay) = &replay {
+                            // Account for rejected replay too, but never expose a
+                            // known-incomplete prefix as committed Native history.
+                            if !reader_projection.frame(replay) {
+                                continue;
+                            }
+                        }
+                        // Only this daemon mints completion barriers and their classified payload.
+                        if PromptCompletedMarker::matches_method(&method)
+                            || NativeChannelLostMarker::matches_method(&method)
+                            || method == control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD
+                            || method == ADAPTER_FRAMES_SHED_METHOD
+                        {
+                            continue;
+                        }
+                        let replay_closed: Option<SessionReplayed> =
+                            if SessionReplayed::matches_method(&method) {
+                                if replay.is_some() {
+                                    reader_projection.lost();
+                                    continue;
+                                }
+                                match serde::Deserialize::deserialize(&params) {
+                                    Ok(marker) => Some(marker),
+                                    Err(_) => {
+                                        reader_projection.lost();
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                        if method == "session/update" || method == crate::acp::state::AUTH_STATUS_UPDATE_METHOD
+                            || crate::acp::control_protocol::NativeAutonomousPhase::from_method(&method).is_some() {
+                            let metadata = serde_json::to_value(ControlIngressMetadata { wire_bytes, evidence })
+                                .expect("private ingress metadata serializes");
                             match &mut params {
                                 serde_json::Value::Object(fields) => {
-                                    fields.insert(
-                                        CONTROL_FRAME_BYTES_FIELD.into(),
-                                        wire_bytes.into(),
-                                    );
+                                    fields.insert(CONTROL_FRAME_BYTES_FIELD.into(), metadata);
                                 }
-                                serde_json::Value::Array(fields) => fields.push(wire_bytes.into()),
+                                serde_json::Value::Array(fields) => fields.push(metadata),
                                 _ => {}
                             }
                         }
                         let mut line = serde_json::json!({"jsonrpc": "2.0"});
                         line["method"] = method.into();
                         line["params"] = params;
-                        if !shim_write_line_releasing(&reader_shim_write, &line, &reader_settled)
-                            .await
+                        if !shim_write_line_releasing(
+                            &reader_shim_write,
+                            &line,
+                            &reader_settled,
+                            &reader_connection_state,
+                        )
+                        .await
                         {
                             return;
+                        }
+                        if let Some(marker) = replay_closed {
+                            reader_projection.wire_forwarded(&marker);
+                        }
+                    }
+                    Ok(Some((ControlBody::ServerCallSettled { call_id }, _))) => {
+                        let removed = {
+                            let mut correlation = reader_correlation.lock().expect("shim correlation");
+                            let synthetic = correlation.reverse.iter().find_map(|(id, ticket)| {
+                                (ticket.call_id == call_id && ticket.reply_started).then_some(*id)
+                            });
+                            synthetic.and_then(|id| correlation.reverse.remove(&id))
+                        };
+                        if removed.is_some() {
+                            // Socket send alone cannot release Fresh's duration fence:
+                            // the runner must finish its per-write source check first.
+                            drop(removed);
+                            if let Some(control) = reader_control.upgrade() {
+                                control.reverse_changed.notify_waiters();
+                            }
                         }
                     }
                     // Forward lane: resolve the crate's own pending request.
                     Ok(Some((ControlBody::AgentResult { call_id, result }, _))) => {
-                        let id = reader_correlation.lock().await.forward.remove(&call_id);
-                        if let Some(id) = id {
+                        let ticket = reader_correlation.lock().expect("shim correlation")
+                            .forward.remove(&ForwardKey::Runner(call_id));
+                        if let Some(ForwardTicket::Runner { sdk_id }) = ticket {
                             let line = serde_json::json!({
-                                "jsonrpc": "2.0", "id": id, "result": result,
+                                "jsonrpc": "2.0", "id": sdk_id, "result": result,
                             });
                             if !shim_write_line_releasing(
                                 &reader_shim_write,
                                 &line,
                                 &reader_settled,
+                                &reader_connection_state,
                             )
                             .await
                             {
@@ -657,15 +2010,17 @@ pub(super) async fn connect_runner_control_v3(
                         }
                     }
                     Ok(Some((ControlBody::AgentError { call_id, error }, _))) => {
-                        let id = reader_correlation.lock().await.forward.remove(&call_id);
-                        if let Some(id) = id {
+                        let ticket = reader_correlation.lock().expect("shim correlation")
+                            .forward.remove(&ForwardKey::Runner(call_id));
+                        if let Some(ForwardTicket::Runner { sdk_id }) = ticket {
                             let line = serde_json::json!({
-                                "jsonrpc": "2.0", "id": id, "error": error,
+                                "jsonrpc": "2.0", "id": sdk_id, "error": error,
                             });
                             if !shim_write_line_releasing(
                                 &reader_shim_write,
                                 &line,
                                 &reader_settled,
+                                &reader_connection_state,
                             )
                             .await
                             {
@@ -676,51 +2031,78 @@ pub(super) async fn connect_runner_control_v3(
                     Ok(Some(_)) => {}
                     Ok(None) => {
                         record_loss(None);
+                        reader_connection_state.observe(
+                            AcpConnectionSource::Control,
+                            AcpConnectionCause::IncomingEnded,
+                        );
                         return;
                     }
-                    Err(e) => match e.downcast_ref::<std::io::Error>() {
-                        Some(io) => {
+                    Err(error) => {
+                        let cause = if let Some(io) = error.downcast_ref::<std::io::Error>() {
                             record_loss(Some(io.kind()));
-                            return;
-                        }
-                        None => {
-                            warn!(
-                                target: "acp.protocol",
-                                session = %reader_session,
-                                "undecodable runner control frame: {e}"
-                            );
-                            return;
-                        }
-                    },
+                            AcpConnectionCause::ReadFailed
+                        } else {
+                            AcpConnectionCause::ProtocolEnded
+                        };
+                        reader_connection_state.observe(AcpConnectionSource::Control, cause);
+                        debug!(target: "acp.protocol", session = %reader_session, %error, "runner control read ended");
+                        return;
+                    }
                 }
             }
         }
         .await;
+        reader_projection.control_ended();
+        reader_connection_state.observe(
+            crate::acp::state::AcpConnectionSource::Control,
+            crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+        );
+        {
+            let mut correlation = reader_correlation.lock().expect("shim correlation");
+            correlation.forward.clear();
+            correlation.reverse.clear();
+        }
+        reader_reverse_changed.notify_waiters();
         {
             let mut completion = reader_completion.lock().expect("completion mutex poisoned");
+            // EOF aborts a pending waiter, not an already queued completion.
             if matches!(*completion, PromptCompletion::Pending { .. }) {
                 *completion = PromptCompletion::LocalIdle;
             }
         }
+        #[cfg(test)]
+        reader_disconnected.cancel();
         let mut shim_write = reader_shim_write.lock().await;
         let _ = shim_write.shutdown().await;
     });
 
     // Crate output: a line with `method` is a forward request, anything else
     // answers a reverse call.
-    let pump_write = write_half.clone();
+    let pump_control = client.clone();
     let pump_shim_write = shim_write.clone();
     let pump_correlation = correlation.clone();
     let pump_session = session_label.clone();
+    let pump_connection_state = client.connection_state.clone();
     tokio::spawn(async move {
+        let _end = EndControlPump(Arc::clone(&pump_control));
         let mut reader = tokio::io::BufReader::new(shim_read);
         let mut line = String::new();
         loop {
             line.clear();
             match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
-                Ok(0) => return,
+                Ok(0) => {
+                    pump_control.close_sdk_route(
+                        AcpConnectionSource::Control,
+                        AcpConnectionCause::ForwardPumpEnded,
+                    );
+                    return;
+                }
                 Ok(_) => {}
                 Err(error) => {
+                    pump_control.close_sdk_route(
+                        AcpConnectionSource::Control,
+                        AcpConnectionCause::ForwardPumpEnded,
+                    );
                     debug!(
                         target: "acp.protocol",
                         session = %pump_session,
@@ -729,32 +2111,73 @@ pub(super) async fn connect_runner_control_v3(
                     return;
                 }
             }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            // The native-loss receipt settled application scopes. SDK-private
+            // pre-loss callbacks may finish/drop later, but cannot allocate a
+            // forwarded ID or re-enter native I/O after observed loss.
+            if pump_connection_state.loss().is_some()
+                || pump_connection_state.driver_finished()
+                || pump_connection_state.is_stopping()
+            {
+                continue;
+            }
+            let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                 continue;
             };
-            let mut forward = None;
-            let frame = if let Some(method) = value.get("method").and_then(|method| method.as_str())
+            #[cfg(test)]
+            if let Some(observer) = pump_connection_state
+                .test_sdk_output
+                .lock()
+                .unwrap()
+                .as_ref()
             {
-                let Some(id) = value.get("id").cloned() else {
+                let _ = observer.send(value.clone());
+            }
+            let mut forward = None;
+            #[cfg(test)]
+            let mut reverse_reply = false;
+            let frame = if let Some(method) = value
+                .get("method")
+                .and_then(|method| method.as_str())
+                .map(str::to_owned)
+            {
+                let Some(id) = value.get_mut("id").map(std::mem::take) else {
                     continue;
                 };
-                let call_id = pump_correlation.lock().await.forward_id();
-                forward = Some((call_id, id));
-                ControlBody::AgentCall {
-                    call_id,
-                    method: method.to_string(),
-                    params: value
-                        .get("params")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                }
+                let Ok(sdk_id) = serde_json::from_value::<RequestId>(id) else {
+                    continue;
+                };
+                let params = value
+                    .get_mut("params")
+                    .map(std::mem::take)
+                    .unwrap_or(serde_json::Value::Null);
+                let prepared = pump_connection_state
+                    .admit(|| pump_control.prepare_forward(sdk_id, method, params));
+                let Ok(Some((sdk_id, call_id, frame))) = prepared else {
+                    continue;
+                };
+                forward = Some((sdk_id, call_id));
+                frame
             } else {
                 let Some(synthetic) = value.get("id").and_then(|id| id.as_i64()) else {
                     continue;
                 };
-                let Some(call_id) = pump_correlation.lock().await.reverse.remove(&synthetic) else {
+                let Some(call_id) = ({
+                    let mut correlation = pump_correlation.lock().expect("shim correlation");
+                    correlation.reverse.get_mut(&synthetic).and_then(|ticket| {
+                        if ticket.reply_started {
+                            None
+                        } else {
+                            ticket.reply_started = true;
+                            Some(ticket.call_id)
+                        }
+                    })
+                }) else {
                     continue;
                 };
+                #[cfg(test)]
+                {
+                    reverse_reply = true;
+                }
                 match value.get("error") {
                     Some(error) if !error.is_null() => ControlBody::ServerError {
                         call_id,
@@ -778,7 +2201,8 @@ pub(super) async fn connect_runner_control_v3(
             let wire = match control_protocol::encode_frame(&frame) {
                 Ok(wire) => wire,
                 Err(error) => {
-                    if let Some((_, id)) = forward.take() {
+                    if let Some((id, call_id)) = forward.take() {
+                        pump_control.cancel_forward(&id, call_id);
                         let response = serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -790,6 +2214,12 @@ pub(super) async fn connect_runner_control_v3(
                         // The reader's teardown closes this half too, so a
                         // failure here does not mean the crate is gone.
                         if !shim_write_line(&pump_shim_write, &response).await {
+                            pump_connection_state.observe(
+                                crate::acp::state::AcpConnectionSource::Control,
+                                crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+                            );
+                            // SAFETY: pump_write retains this exact socket.
+                            unsafe { libc::shutdown(raw_fd, libc::SHUT_RDWR) };
                             return;
                         }
                         continue;
@@ -813,98 +2243,354 @@ pub(super) async fn connect_runner_control_v3(
                 }
             };
 
-            if let Some((call_id, id)) = forward.as_ref() {
-                pump_correlation
-                    .lock()
-                    .await
-                    .forward
-                    .insert(*call_id, id.clone());
-            }
-            let write_failed = {
-                let mut writer = pump_write.lock().await;
-                if control_protocol::write_encoded_frame(&mut *writer, &wire)
-                    .await
-                    .is_err()
-                {
-                    let _ = writer.shutdown().await;
-                    true
-                } else {
-                    false
+            drop(frame);
+            drop(value);
+            if let Some((_, call_id)) = &forward {
+                let registered = pump_connection_state.admit(|| {
+                    pump_correlation
+                        .lock()
+                        .expect("shim correlation")
+                        .forward
+                        .contains_key(&ForwardKey::Runner(*call_id))
+                });
+                if !matches!(registered, Ok(true)) {
+                    continue;
                 }
-            };
-            if write_failed {
-                if let Some((call_id, id)) = forward {
-                    pump_correlation.lock().await.forward.remove(&call_id);
-                    let response = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {
-                            "code": control_protocol::DAEMON_GONE,
-                            "message": "runner control transport closed",
-                        },
-                    });
-                    let _ = shim_write_line(&pump_shim_write, &response).await;
+            }
+            #[cfg(test)]
+            if reverse_reply {
+                let gate = pump_connection_state
+                    .test_reverse_send
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some((entered, release)) = gate {
+                    let _ = entered.send(());
+                    tokio::select! {
+                        biased;
+                        _ = pump_connection_state.wait_callback_end() => return,
+                        released = release => if released.is_err() { return; },
+                    }
+                }
+            }
+            if pump_control.send_encoded(&wire, false, None).await.is_err() {
+                if let Some((sdk_id, call_id)) = forward {
+                    pump_control.cancel_forward(&sdk_id, call_id);
+                }
+                if pump_connection_state
+                    .loss()
+                    .is_some_and(|loss| loss.source == AcpConnectionSource::Native)
+                {
+                    continue;
                 }
                 return;
             }
         }
     });
 
-    Ok((
-        Arc::new(DaemonControlClient {
-            ingress,
-            write: write_half,
-            handshake_rx: Mutex::new(hs_rx),
-            sessions_established: AtomicU64::new(0),
-            sessions_replayed: watch::Sender::new(0),
-            completion,
-            abandoned_starts,
-            settled,
-            raw_fd,
-            closed_locally,
-            loss,
-            proxied,
-            disconnected,
-        }),
-        crate_side,
-    ))
+    Ok((client, crate_side))
 }
 
-/// Known ACP stop reasons pass through verbatim; anything else ends as
-/// `prompt_complete`.
+/// Unknown successful stop reasons retain the existing completion fallback.
 pub(super) fn control_outcome_reason(
     outcome: &crate::acp::control_protocol::PromptOutcome,
-) -> String {
+) -> &'static str {
     use crate::acp::control_protocol::PromptOutcome;
     match outcome {
         PromptOutcome::Completed {
             stop_reason: Some(r),
         } => match r.as_str() {
             // The adapter spells it both ways.
-            "rate_limited" | "rate_limit" => "rate_limited".to_string(),
-            "cancelled" | "max_tokens" | "refusal" | "max_turn_requests" => r.clone(),
-            _ => "prompt_complete".to_string(),
+            "rate_limited" | "rate_limit" => "rate_limited",
+            "cancelled" => "cancelled",
+            "max_tokens" => "max_tokens",
+            "refusal" => "refusal",
+            "max_turn_requests" => "max_turn_requests",
+            _ => "prompt_complete",
         },
-        _ => "prompt_complete".to_string(),
+        PromptOutcome::Completed { stop_reason: None } => "prompt_complete",
+        PromptOutcome::Error { .. } | PromptOutcome::Aborted => "prompt_failed",
+    }
+}
+
+fn adopted_prompt_completion(
+    outcome: control_protocol::PromptOutcome,
+) -> (Option<control_protocol::AdoptedPromptDiagnostic>, String) {
+    let reason = control_outcome_reason(&outcome);
+    match prompt_outcome_to_response(outcome) {
+        Ok(_) => (None, reason.into()),
+        Err(error) => {
+            if let Some(info) =
+                classify_rate_limit_error(&error, None, crate::time::Timestamp::now())
+            {
+                (
+                    control_protocol::AdoptedPromptDiagnostic::new(Event::RateLimit { info }),
+                    "rate_limited".into(),
+                )
+            } else {
+                warn!(target: "acp.protocol", error = ?error, "adopted prompt failed; preserving runner and conversation");
+                (
+                    control_protocol::AdoptedPromptDiagnostic::new(prompt_runtime_error(
+                        &error,
+                        crate::session::ErrorEvidenceSource::RunnerCompletion,
+                    )),
+                    "prompt_failed".into(),
+                )
+            }
+        }
+    }
+}
+
+fn matches_adopted_head(
+    head: &control_protocol::NativePromptHead,
+    prompt_req_id: i64,
+    evidence: Option<&control_protocol::NativePromptCompletionEvidence>,
+) -> bool {
+    head.prompt_req_id == prompt_req_id
+        && evidence.is_none_or(|evidence| {
+            evidence.scope == head.scope && evidence.window_id == head.window_id
+        })
+}
+
+fn completion_correlation(
+    evidence: &control_protocol::NativePromptCompletionEvidence,
+    peer: crate::acp::runner_lifecycle::RunnerIdentity,
+) -> Option<crate::acp::establishment::NativeOperationCorrelation> {
+    use crate::acp::establishment::NativeRequestScope;
+    let receipt = &evidence.receipt;
+    if receipt.owner != peer
+        || peer.birth_fingerprint.is_none()
+        || receipt.attempt.producer.is_none()
+        || !receipt.replay.closed
+        || receipt.replay.lost
+        || !receipt.session_id().is_some_and(|sid| !sid.is_empty())
+        || evidence.scope.owner() != Some(peer)
+        || evidence.scope.origin(Some(receipt)) != Some(evidence.origin)
+    {
+        return None;
+    }
+    match &evidence.scope {
+        NativeRequestScope::Operation { permission } => {
+            if receipt
+                .postimage(permission.session.postimage.context)
+                .ok()?
+                != permission.session.postimage
+            {
+                return None;
+            }
+        }
+        NativeRequestScope::Original {
+            attempt,
+            owner,
+            store,
+            ..
+        } => {
+            if attempt.as_ref() != receipt.attempt.as_ref()
+                || *owner != receipt.owner
+                || !receipt.same_store(store.as_deref())
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    evidence.scope.correlation()
+}
+
+fn prepare_adopted_completion(
+    prompt_req_id: i64,
+    outcome: control_protocol::PromptOutcome,
+    evidence: Option<Box<control_protocol::NativePromptCompletionEvidence>>,
+    completion: &std::sync::Mutex<PromptCompletion>,
+    in_flight: &std::sync::atomic::AtomicBool,
+    terminal: &TerminalClaim,
+) -> Option<control_protocol::AdoptedPromptCompletion> {
+    use control_protocol::AdoptedPromptOutcomeKind;
+    let outcome_kind = match &outcome {
+        control_protocol::PromptOutcome::Completed { .. } => AdoptedPromptOutcomeKind::Completed,
+        control_protocol::PromptOutcome::Error { .. } => AdoptedPromptOutcomeKind::Error,
+        control_protocol::PromptOutcome::Aborted => AdoptedPromptOutcomeKind::Aborted,
+    };
+    let turn = {
+        let completion = completion.lock().expect("completion mutex poisoned");
+        match &*completion {
+            PromptCompletion::Adopted(Some(head))
+                if matches_adopted_head(head, prompt_req_id, evidence.as_deref())
+                    && in_flight.load(AtomicOrdering::Acquire) =>
+            {
+                Some(terminal.current_turn())
+            }
+            _ => None,
+        }
+    };
+    if turn.is_none()
+        && (evidence.is_none() || matches!(outcome_kind, AdoptedPromptOutcomeKind::Aborted))
+    {
+        return None;
+    }
+    let (diagnostic, reason) = adopted_prompt_completion(outcome);
+    Some(control_protocol::AdoptedPromptCompletion {
+        turn,
+        prompt_req_id,
+        outcome_kind,
+        diagnostic,
+        reason,
+        evidence,
+    })
+}
+
+pub(super) enum AdoptedCompletionPublication {
+    Rejected,
+    Historical,
+    Settled(u64),
+}
+
+pub(super) async fn publish_adopted_completion(
+    adopted: control_protocol::AdoptedPromptCompletion,
+    events: &crate::acp::event_sender::EventSender,
+    control: &DaemonControlClient,
+    in_flight: &std::sync::atomic::AtomicBool,
+    terminal: &TerminalClaim,
+    calendar_hint: impl FnOnce(
+        &control_protocol::NativePromptCompletionEvidence,
+    ) -> Option<(String, crate::time::Timestamp)>,
+    publication: Option<tokio::sync::OwnedMutexGuard<()>>,
+) -> AdoptedCompletionPublication {
+    use crate::acp::event_sender::EventMetadata;
+    use crate::acp::protocol::{
+        AcpOperationMetadata, AcpOriginalRequestResult, AcpPromptObservation,
+    };
+    use control_protocol::AdoptedPromptOutcomeKind;
+    let control_protocol::AdoptedPromptCompletion {
+        turn,
+        prompt_req_id,
+        outcome_kind,
+        mut diagnostic,
+        reason,
+        evidence,
+    } = adopted;
+    let correlation = evidence
+        .as_deref()
+        .and_then(|evidence| completion_correlation(evidence, control.peer_identity));
+    if evidence
+        .as_ref()
+        .is_some_and(|evidence| evidence.prompt_req_id != prompt_req_id)
+        || (evidence.is_some() && correlation.is_none())
+    {
+        return AdoptedCompletionPublication::Rejected;
+    }
+    let original_hint = evidence.as_deref().and_then(calendar_hint);
+    let native_outcome = match (evidence.as_ref(), outcome_kind) {
+        (Some(_), AdoptedPromptOutcomeKind::Completed) => Some(AcpOriginalRequestResult::Succeeded),
+        (Some(_), AdoptedPromptOutcomeKind::Error) => Some(AcpOriginalRequestResult::Failed),
+        _ => None,
+    };
+    let local_correlation = {
+        let completion = control
+            .completion
+            .lock()
+            .expect("completion mutex poisoned");
+        match &*completion {
+            PromptCompletion::Adopted(Some(head))
+                if turn.is_some()
+                    && matches_adopted_head(head, prompt_req_id, evidence.as_deref()) =>
+            {
+                head.scope.correlation()
+            }
+            _ => None,
+        }
+    };
+    let mut metadata = EventMetadata::history();
+    if let Some(outcome) = native_outcome {
+        let evidence = evidence.as_ref().expect("qualified Native result");
+        metadata.native_origin = Some(evidence.origin);
+        metadata.native_prompt_id = Some(evidence.prompt_req_id);
+        metadata.operation = Some(AcpOperationMetadata {
+            correlation: correlation.expect("validated original correlation"),
+            outcome: Some(outcome),
+        });
+        metadata.prompt_observation = Some(AcpPromptObservation::Written {
+            window_id: evidence.window_id,
+        });
+        metadata.output_uncertainty = evidence.uncertain_output.then_some(evidence.window_id);
+    } else if let Some(correlation) = local_correlation {
+        metadata.operation = Some(AcpOperationMetadata {
+            correlation,
+            outcome: None,
+        });
+    } else {
+        return AdoptedCompletionPublication::Rejected;
+    }
+    let sender = events.with_metadata(metadata);
+    let failed = matches!(reason.as_str(), "prompt_failed" | "rate_limited");
+    let local_turn = {
+        let completion = control
+            .completion
+            .lock()
+            .expect("completion mutex poisoned");
+        let local_match = matches!(&*completion, PromptCompletion::Adopted(Some(head))
+            if matches_adopted_head(head, prompt_req_id, evidence.as_deref()))
+            && in_flight.load(AtomicOrdering::Acquire);
+        turn.filter(|_| local_match)
+            .filter(|turn| terminal.claim_epoch(*turn, failed))
+    };
+    if local_turn.is_none() && native_outcome.is_none() {
+        return AdoptedCompletionPublication::Rejected;
+    }
+    let _publication = if local_turn.is_some() {
+        publication
+    } else {
+        None
+    };
+    if let Some(diagnostic) = &mut diagnostic {
+        diagnostic.inherit_rate_limit_hint(|| original_hint);
+    }
+    if let Some(event) = diagnostic {
+        if sender.send(event.into_event()).await.is_err() {
+            return AdoptedCompletionPublication::Rejected;
+        }
+    }
+    if sender.send(Event::Stopped { reason }).await.is_err() {
+        return AdoptedCompletionPublication::Rejected;
+    }
+    if let Some(turn) = local_turn {
+        if terminal.publish_claimed(turn, failed, || {
+            in_flight.store(false, AtomicOrdering::Release);
+        }) {
+            return AdoptedCompletionPublication::Settled(turn);
+        }
+    }
+    if native_outcome.is_some() {
+        AdoptedCompletionPublication::Historical
+    } else {
+        AdoptedCompletionPublication::Rejected
     }
 }
 
 /// Same result shape as the crate `send_request` it replaces.
-pub(super) async fn establish_session_v3<Resp: serde::de::DeserializeOwned>(
+pub(super) async fn establish_session<Resp: serde::de::DeserializeOwned>(
     control: &DaemonControlClient,
     method: &str,
     request: &impl serde::Serialize,
-) -> Result<Resp, agent_client_protocol::Error> {
+) -> agent_client_protocol::Result<Resp> {
     let params = serde_json::to_value(request)
         .map_err(|e| acp_internal_error(format!("serialize {method} params: {e}")))?;
     let (_id, result) = control.establish_session(method, params).await?;
-    serde_json::from_value(result)
+    serde::Deserialize::deserialize(result.as_ref())
         .map_err(|e| acp_internal_error(format!("deserialize {method} result: {e}")))
 }
 
-/// Maps a runner outcome onto the prompt loop's direct-stdio result shape.
-/// Errors keep code and data so rate limits still classify; an abort ends
-/// the turn as `end_turn`.
+fn native_stores_match(
+    left: &Option<crate::session::ExecutionBinding>,
+    right: &Option<crate::session::ExecutionBinding>,
+) -> bool {
+    left == right
+        && left.as_ref().map(|store| store.exported_default_store)
+            == right.as_ref().map(|store| store.exported_default_store)
+}
+
+/// Preserve private error code/data for structured classifiers. An abort is
+/// an unsuccessful operation, not a synthetic successful `end_turn`.
 pub(super) fn prompt_outcome_to_response(
     outcome: control_protocol::PromptOutcome,
 ) -> Result<PromptResponse, agent_client_protocol::Error> {
@@ -918,7 +2604,9 @@ pub(super) fn prompt_outcome_to_response(
         PromptOutcome::Completed { stop_reason } => {
             build(stop_reason.as_deref().unwrap_or("end_turn"))
         }
-        PromptOutcome::Aborted => build("end_turn"),
+        PromptOutcome::Aborted => Err(acp_internal_error(
+            "prompt aborted before completion".into(),
+        )),
         PromptOutcome::Error {
             code,
             message,
@@ -934,12 +2622,953 @@ pub(super) fn prompt_outcome_to_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::control_protocol::PromptOutcome;
-    use crate::acp::state::Event;
+    use crate::acp::event_sender::EventScope;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
+
+    struct ManagedControlFixture {
+        client: crate::acp::supervisor::test_support::managed::ManagedClient,
+        native: crate::acp::supervisor::test_support::managed::NativePeer,
+        prompts: mpsc::UnboundedReceiver<serde_json::Value>,
+        store: Arc<crate::acp::event_store::EventStore>,
+    }
+
+    impl ManagedControlFixture {
+        async fn new(
+            scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+        ) -> Self {
+            let directory = scope.tempdir();
+            let session_id = format!("control-native-{}", uuid::Uuid::new_v4());
+            let (seen, prompts) = mpsc::unbounded_channel();
+            let (config, native) =
+                scope.native_peer(directory.path().into(), "codex", "codex", move |request| {
+                    let id = request.get("id")?;
+                    match request["method"].as_str().unwrap() {
+                        "initialize" => Some(serde_json::json!({
+                            "jsonrpc":"2.0","id":id,
+                            "result":{"protocolVersion":1,"agentCapabilities":{}}
+                        })),
+                        "session/new" => Some(serde_json::json!({
+                            "jsonrpc":"2.0","id":id,"result":{"sessionId":session_id}
+                        })),
+                        "session/prompt" => {
+                            assert_eq!(request["params"]["sessionId"], session_id);
+                            seen.send(request.clone()).unwrap();
+                            None
+                        }
+                        "session/cancel" => None,
+                        method => panic!("unexpected native operation: {method}"),
+                    }
+                });
+            let store = Arc::clone(&scope.state.acp_event_store);
+            let client = scope.spawn(config, "control-contract").await.unwrap();
+            client.ready().await;
+            Self {
+                client,
+                native,
+                prompts,
+                store,
+            }
+        }
+
+        async fn start_prompt(&mut self, text: &str) -> serde_json::Value {
+            self.client.send_prompt(text, &[]).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), self.prompts.recv())
+                .await
+                .expect("actual Native prompt received")
+                .expect("Native peer remains live")
+        }
+
+        async fn adopt_in_flight(
+            self,
+            scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+        ) -> Self {
+            let Self {
+                client,
+                native,
+                prompts,
+                store,
+            } = self;
+            let client = scope.adopt(client, true).await;
+            client.ready().await;
+            Self {
+                client,
+                native,
+                prompts,
+                store,
+            }
+        }
+
+        async fn next_event(&mut self) -> Event {
+            tokio::time::timeout(Duration::from_secs(10), self.client.next_event())
+                .await
+                .expect("actual SDK publication before deadline")
+                .expect("observer remains live")
+        }
+
+        async fn complete(&self, request: &serde_json::Value, reason: &str) {
+            self.native
+                .send(serde_json::json!({
+                    "jsonrpc":"2.0","id":request["id"],"result":{"stopReason":reason}
+                }))
+                .await;
+        }
+    }
+    use std::future::Future;
+
+    async fn real_control_deadline<F: Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(15), future)
+            .await
+            .expect("actual managed control operation completes")
+    }
+
+    fn observe_real_relay(
+        control: &DaemonControlClient,
+    ) -> mpsc::UnboundedReceiver<TestRelayObservation> {
+        let (observer, observed) = mpsc::unbounded_channel();
+        assert!(control
+            .connection_state
+            .test_relay_observer
+            .lock()
+            .unwrap()
+            .replace(observer)
+            .is_none());
+        observed
+    }
+
+    async fn real_relay_observation(
+        observed: &mut mpsc::UnboundedReceiver<TestRelayObservation>,
+        stage: TestRelayStage,
+        method: &str,
+    ) -> serde_json::Value {
+        real_control_deadline(async {
+            loop {
+                let observation = observed
+                    .recv()
+                    .await
+                    .expect("actual relay remains observed");
+                if observation.stage == stage && observation.payload["method"] == method {
+                    return observation.payload;
+                }
+            }
+        })
+        .await
+    }
+
+    async fn real_completion_marker(
+        observed: &mut mpsc::UnboundedReceiver<TestRelayObservation>,
+        stage: TestRelayStage,
+        request: &serde_json::Value,
+    ) -> PromptCompletedMarker {
+        let method = PromptCompletedMarker::default().method().to_owned();
+        let payload = real_relay_observation(observed, stage, &method).await;
+        let marker: PromptCompletedMarker =
+            serde_json::from_value(payload["params"].clone()).unwrap();
+        let id = marker
+            .prompt_req_id
+            .or_else(|| marker.adopted.as_ref().map(|adopted| adopted.prompt_req_id));
+        assert_eq!(id, request["id"].as_i64());
+        marker
+    }
+
+    async fn real_pending_scope(
+        control: &DaemonControlClient,
+        request: &serde_json::Value,
+    ) -> (
+        crate::acp::establishment::NativeRequestScope,
+        crate::acp::protocol::AcpPromptWindowId,
+    ) {
+        let id = request["id"]
+            .as_i64()
+            .expect("actual native numeric request id");
+        real_control_deadline(async {
+            loop {
+                let snapshot = {
+                    let completion = control.completion.lock().unwrap();
+                    match &*completion {
+                        PromptCompletion::Pending {
+                            prompt_req_id: Some(pending),
+                            scope,
+                            window_id: Some(window),
+                            ..
+                        } if *pending == id => Some((scope.clone(), *window)),
+                        _ => None,
+                    }
+                };
+                if let Some(snapshot) = snapshot {
+                    assert_eq!(snapshot.0.owner(), Some(control.peer_identity()));
+                    assert!(snapshot.0.correlation().is_some());
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_prompt_admission_waits_for_the_same_frozen_native_scope() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut fixture = ManagedControlFixture::new(scope).await;
+                let actual = fixture.client.actual();
+                let state = actual.test_connection_state();
+                let control = actual.test_control();
+                let receipt = actual
+                    .establishment_projection()
+                    .unwrap()
+                    .receipt_snapshot()
+                    .unwrap();
+                let (prepared, prepared_wait) = oneshot::channel();
+                let (release, release_wait) = oneshot::channel();
+                let (busy, busy_wait) = oneshot::channel();
+                assert!(state
+                    .test_prompt_admission
+                    .lock()
+                    .unwrap()
+                    .replace((prepared, release_wait))
+                    .is_none());
+                assert!(state
+                    .test_prompt_admission_busy
+                    .lock()
+                    .unwrap()
+                    .replace(busy)
+                    .is_none());
+                fixture
+                    .client
+                    .send_prompt("one frozen original across actual contention", &[])
+                    .await
+                    .unwrap();
+                real_control_deadline(prepared_wait).await.unwrap();
+                let storage = crate::session::Storage::open_reference("test").unwrap();
+                let exclusion = storage
+                    .acquire_instance_lifecycle_lock(&fixture.client.id)
+                    .unwrap();
+                release.send(()).unwrap();
+                real_control_deadline(busy_wait).await.unwrap();
+                assert!(
+                    state.admission.try_lock().is_ok(),
+                    "no admission mutex is retained across the physical wait"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), fixture.prompts.recv())
+                        .await
+                        .is_err(),
+                    "actual RegistryBusy was observed before this no-write window"
+                );
+                assert_eq!(
+                    fixture
+                        .native
+                        .requests()
+                        .iter()
+                        .filter(|method| method.as_str() == "session/prompt")
+                        .count(),
+                    0
+                );
+                drop(exclusion);
+                let request = real_control_deadline(fixture.prompts.recv()).await.unwrap();
+                let (original_scope, window) = real_pending_scope(&control, &request).await;
+                assert_eq!(original_scope.owner(), Some(receipt.owner));
+                assert_eq!(
+                    actual
+                        .establishment_projection()
+                        .unwrap()
+                        .receipt_snapshot()
+                        .unwrap()
+                        .as_ref(),
+                    receipt.as_ref()
+                );
+                fixture.complete(&request, "end_turn").await;
+                real_events_until_stopped(&mut fixture, "prompt_complete").await;
+                assert_one_real_stopped(&fixture, 0, &request, &original_scope, window);
+                let methods = fixture.native.requests();
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| method.as_str() == "session/new")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| method.as_str() == "session/prompt")
+                        .count(),
+                    1
+                );
+                assert!(!methods.iter().any(|method| method == "session/load"));
+                fixture.client.shutdown().await.unwrap();
+            })
+        })
+        .await;
+    }
+
+    fn assert_real_settled(
+        control: &DaemonControlClient,
+        request: &serde_json::Value,
+        scope: &crate::acp::establishment::NativeRequestScope,
+        window: crate::acp::protocol::AcpPromptWindowId,
+    ) {
+        let settled = control.settled.lock().unwrap();
+        let settled = settled
+            .as_ref()
+            .expect("actual correlated result is held for its marker");
+        assert_eq!(Some(settled.prompt_req_id), request["id"].as_i64());
+        assert_eq!(settled.correlation, scope.correlation());
+        match &settled.result {
+            ControlPromptResult::Outcome {
+                evidence: Some(evidence),
+                ..
+            } => {
+                assert_eq!(Some(evidence.prompt_req_id), request["id"].as_i64());
+                assert_eq!(&evidence.scope, scope);
+                assert_eq!(evidence.window_id, window);
+                assert_eq!(evidence.receipt.owner, control.peer_identity());
+                assert_eq!(
+                    evidence.receipt.session_id(),
+                    request["params"]["sessionId"].as_str()
+                );
+            }
+            other => panic!("actual native result must retain real evidence: {other:?}"),
+        }
+    }
+
+    async fn real_events_until_stopped(
+        fixture: &mut ManagedControlFixture,
+        expected_reason: &str,
+    ) -> Vec<Event> {
+        real_control_deadline(async {
+            let mut events = Vec::new();
+            loop {
+                let event = fixture.next_event().await;
+                assert!(
+                    !matches!(
+                        &event,
+                        Event::AgentStartupError { .. } | Event::AcpConnectionUnavailable { .. }
+                    ),
+                    "live native operation unexpectedly failed: {event:?}"
+                );
+                assert!(!serde_json::to_string(&event)
+                    .unwrap()
+                    .contains("privateTokenMarker"));
+                let stopped = if let Event::Stopped { reason } = &event {
+                    assert_eq!(reason, expected_reason);
+                    true
+                } else {
+                    false
+                };
+                events.push(event);
+                if stopped {
+                    return events;
+                }
+            }
+        })
+        .await
+    }
+
+    fn assert_one_real_stopped(
+        fixture: &ManagedControlFixture,
+        after: u64,
+        request: &serde_json::Value,
+        scope: &crate::acp::establishment::NativeRequestScope,
+        window: crate::acp::protocol::AcpPromptWindowId,
+    ) {
+        let stored = fixture
+            .store
+            .replay_from(&fixture.client.id, after)
+            .unwrap();
+        let stops: Vec<_> = stored
+            .iter()
+            .filter(|stored| matches!(stored.event.as_ref(), Event::Stopped { .. }))
+            .collect();
+        assert_eq!(
+            stops.len(),
+            1,
+            "one publication belongs to this original request"
+        );
+        let metadata = &stops[0].metadata;
+        assert_eq!(metadata.native_prompt_id, request["id"].as_i64());
+        assert_eq!(
+            metadata.operation.map(|operation| operation.correlation),
+            scope.correlation()
+        );
+        assert_eq!(
+            metadata.prompt_observation,
+            Some(crate::acp::protocol::AcpPromptObservation::Written { window_id: window })
+        );
+        assert!(metadata.native_origin.is_some());
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RealAdoptedOutcome {
+        Completed,
+        Error,
+        Quota,
+    }
+
+    impl RealAdoptedOutcome {
+        fn reason(self) -> &'static str {
+            match self {
+                Self::Completed => "prompt_complete",
+                Self::Error => "prompt_failed",
+                Self::Quota => "rate_limited",
+            }
+        }
+
+        async fn reply(self, fixture: &ManagedControlFixture, request: &serde_json::Value) {
+            if matches!(self, Self::Quota) {
+                fixture.native.send(serde_json::json!({
+                    "jsonrpc":"2.0", "method":"session/update", "params":{
+                        "sessionId":request["params"]["sessionId"],
+                        "update":{"sessionUpdate":"usage_update","used":100,"size":200,
+                            "_meta":{"_claude/rateLimit":{
+                                "status":"rejected","rateLimitType":"five_hour","resetsAt":4_102_444_800_i64
+                            }}
+                        }
+                    }
+                })).await;
+            }
+            let response = match self {
+                Self::Completed => serde_json::json!({
+                    "jsonrpc":"2.0", "id":request["id"], "result":{"stopReason":"end_turn"}
+                }),
+                Self::Error => serde_json::json!({
+                    "jsonrpc":"2.0", "id":request["id"], "error":{
+                        "code":-32603, "message":"original request failed",
+                        "data":{"errorKind":"provider_error", "privateTokenMarker":"must-not-leak"}
+                    }
+                }),
+                Self::Quota => serde_json::json!({
+                    "jsonrpc":"2.0", "id":request["id"], "error":{
+                        "code":-32000, "message":"rate limit exceeded",
+                        "data":{"errorKind":"rate_limit", "privateTokenMarker":"must-not-leak"}
+                    }
+                }),
+            };
+            fixture.native.send(response).await;
+        }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_adopted_original_outcomes_preserve_the_next_explicit_input() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                for case in [
+                    RealAdoptedOutcome::Completed,
+                    RealAdoptedOutcome::Error,
+                    RealAdoptedOutcome::Quota,
+                ] {
+                    let mut fixture = ManagedControlFixture::new(scope).await;
+                    let request = fixture.start_prompt("real original before adoption").await;
+                    let mut fixture = fixture.adopt_in_flight(scope).await;
+                    let actual = fixture.client.actual();
+                    let control = actual.test_control();
+                    let state = actual.test_connection_state();
+                    let terminal = state.test_terminal.get().unwrap().clone();
+                    let in_flight = state.test_in_flight.get().unwrap().clone();
+                    let head = match &*control.completion.lock().unwrap() {
+                        PromptCompletion::Adopted(Some(head)) => head.clone(),
+                        _ => panic!("actual adoption retains its genuine original head"),
+                    };
+                    assert_eq!(Some(head.prompt_req_id), request["id"].as_i64());
+                    assert_eq!(head.scope.owner(), Some(control.peer_identity()));
+                    assert!(head.scope.correlation().is_some());
+                    assert_ne!(control.peer_identity().pid, std::process::id());
+                    let turn = terminal.current_turn();
+                    let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                    assert!(!terminal.claimed());
+                    assert!(in_flight.load(AtomicOrdering::Acquire));
+                    case.reply(&fixture, &request).await;
+                    let events = real_events_until_stopped(&mut fixture, case.reason()).await;
+                    let errors: Vec<_> = events
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, event)| matches!(event, Event::PromptRuntimeError { .. }))
+                        .collect();
+                    let quotas: Vec<_> = events
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, event)| matches!(event, Event::RateLimit { .. }))
+                        .collect();
+                    match case {
+                        RealAdoptedOutcome::Completed => {
+                            assert!(errors.is_empty() && quotas.is_empty())
+                        }
+                        RealAdoptedOutcome::Error => {
+                            assert_eq!(errors.len(), 1);
+                            assert!(quotas.is_empty());
+                            assert!(errors[0].0 < events.len() - 1);
+                            match errors[0].1 {
+                                Event::PromptRuntimeError {
+                                    message,
+                                    evidence: Some(evidence),
+                                    ..
+                                } => {
+                                    assert_eq!(message, "original request failed");
+                                    assert_eq!(
+                                        evidence.source,
+                                        crate::session::ErrorEvidenceSource::RunnerCompletion
+                                    );
+                                    assert_eq!(
+                                        evidence.runtime,
+                                        crate::session::RuntimeEvidence::Unknown
+                                    );
+                                    assert_eq!(evidence.origin, None);
+                                    assert_eq!(evidence.retryable, None);
+                                }
+                                event => panic!("expected bounded original diagnostic: {event:?}"),
+                            }
+                        }
+                        RealAdoptedOutcome::Quota => {
+                            assert!(errors.is_empty());
+                            assert_eq!(quotas.len(), 1);
+                            assert!(quotas[0].0 < events.len() - 1);
+                            assert!(matches!(quotas[0].1, Event::RateLimit { info }
+                            if info.resets_at.is_some_and(|at| at.as_unix_secs() == 4_102_444_800)));
+                        }
+                    }
+                    assert_eq!(terminal.current_turn(), turn);
+                    assert!(terminal.claimed());
+                    assert!(!in_flight.load(AtomicOrdering::Acquire));
+                    assert_one_real_stopped(
+                        &fixture,
+                        before,
+                        &request,
+                        &head.scope,
+                        head.window_id,
+                    );
+                    let before_next = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                    let next = fixture
+                        .start_prompt("next explicit original after native result")
+                        .await;
+                    assert_ne!(next["id"], request["id"]);
+                    assert_eq!(next["params"]["sessionId"], request["params"]["sessionId"]);
+                    let (next_scope, next_window) = real_pending_scope(&control, &next).await;
+                    assert_ne!(next_scope.correlation(), head.scope.correlation());
+                    assert_ne!(next_window, head.window_id);
+                    fixture.complete(&next, "end_turn").await;
+                    let events = real_events_until_stopped(&mut fixture, "prompt_complete").await;
+                    assert!(!events.iter().any(|event| matches!(
+                        event,
+                        Event::PromptRuntimeError { .. }
+                            | Event::RateLimit { .. }
+                            | Event::SessionContextReset { .. }
+                    )));
+                    assert_one_real_stopped(&fixture, before_next, &next, &next_scope, next_window);
+                    let methods = fixture.native.requests();
+                    assert_eq!(
+                        methods
+                            .iter()
+                            .filter(|method| *method == "session/new")
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        methods
+                            .iter()
+                            .filter(|method| *method == "session/prompt")
+                            .count(),
+                        2
+                    );
+                    assert!(!methods.iter().any(|method| matches!(
+                        method.as_str(),
+                        "session/load" | "session/fork" | "session/cancel"
+                    )));
+                    fixture.client.shutdown().await.unwrap();
+                }
+            })
+        })
+        .await;
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_old_completion_markers_cannot_consume_the_next_local_outcome() {
+        use crate::acp::event_sender::{EventScope, SdkEvent};
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+            for adopt_original in [false, true] {
+                let mut fixture = ManagedControlFixture::new(scope).await;
+                let original = fixture.start_prompt("first real original").await;
+                let mut fixture = if adopt_original { fixture.adopt_in_flight(scope).await } else { fixture };
+                let actual = fixture.client.actual();
+                let control = actual.test_control();
+                let state = actual.test_connection_state();
+                let terminal = state.test_terminal.get().unwrap().clone();
+                let in_flight = state.test_in_flight.get().unwrap().clone();
+                let mut observed = observe_real_relay(&control);
+                fixture.complete(&original, "end_turn").await;
+                let old_marker = real_completion_marker(&mut observed, TestRelayStage::Relayed, &original).await;
+                assert_eq!(old_marker.adopted.is_some(), adopt_original);
+                real_events_until_stopped(&mut fixture, "prompt_complete").await;
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                let next = fixture.start_prompt("second real original").await;
+                let (next_scope, next_window) = real_pending_scope(&control, &next).await;
+                let next_turn = terminal.current_turn();
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                let shim = state.test_shim.get().unwrap().clone();
+                let write = shim.lock().await;
+                fixture.complete(&next, "end_turn").await;
+                let next_marker = real_completion_marker(&mut observed, TestRelayStage::Prepared, &next).await;
+                assert_real_settled(&control, &next, &next_scope, next_window);
+                control.deliver_prompt_completion(old_marker.clone());
+                assert_real_settled(&control, &next, &next_scope, next_window);
+                if let Some(adopted) = old_marker.adopted {
+                    let evidence = adopted.evidence.as_ref().expect("actual original evidence");
+                    assert_eq!(Some(evidence.prompt_req_id), original["id"].as_i64());
+                    let old_correlation = evidence.scope.correlation();
+                    let old_window = evidence.window_id;
+                    let (events, mut received) = mpsc::channel::<SdkEvent>(4);
+                    let events: crate::acp::event_sender::EventSender = events.into();
+                    let publication = publish_adopted_completion(
+                        *adopted, &events, &control, &in_flight, &terminal, |_| None, None,
+                    ).await;
+                    assert!(matches!(publication, AdoptedCompletionPublication::Historical));
+                    let data = match received.recv().await.unwrap() {
+                        SdkEvent::Data(data) => data,
+                        other => panic!("pure history consumer expects Data, got {other:?}"),
+                    };
+                    assert!(matches!(data.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete"));
+                    assert_eq!(data.metadata.scope, EventScope::HistoryOnly);
+                    assert_eq!(data.metadata.native_prompt_id, original["id"].as_i64());
+                    assert_eq!(data.metadata.operation.map(|operation| operation.correlation), old_correlation);
+                    assert_eq!(data.metadata.prompt_observation, Some(
+                        crate::acp::protocol::AcpPromptObservation::Written { window_id: old_window }
+                    ));
+                    assert!(matches!(received.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+                } else {
+                    assert_ne!(old_marker.prompt_req_id, next_marker.prompt_req_id);
+                    assert_ne!(old_marker.correlation, next_marker.correlation);
+                }
+                assert_real_settled(&control, &next, &next_scope, next_window);
+                assert_eq!(terminal.current_turn(), next_turn);
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                drop(write);
+                real_completion_marker(&mut observed, TestRelayStage::Relayed, &next).await;
+                real_events_until_stopped(&mut fixture, "prompt_complete").await;
+                assert_one_real_stopped(&fixture, before, &next, &next_scope, next_window);
+                assert_eq!(fixture.native.requests().iter().filter(|method| *method == "session/prompt").count(), 2);
+                fixture.client.shutdown().await.unwrap();
+            }
+        })).await;
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_duplicate_local_prompt_preserves_the_real_first_waiter() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut fixture = ManagedControlFixture::new(scope).await;
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                let request = fixture
+                    .start_prompt("only this original may reach native stdin")
+                    .await;
+                let actual = fixture.client.actual();
+                let control = actual.test_control();
+                let (pending_scope, window) = real_pending_scope(&control, &request).await;
+                let duplicate = control
+                    .prompt(request["params"].clone(), pending_scope.clone())
+                    .await;
+                assert!(matches!(duplicate, Err(AcpError::Protocol(_))));
+                let (still_pending, still_window) = real_pending_scope(&control, &request).await;
+                assert_eq!(still_pending, pending_scope);
+                assert_eq!(still_window, window);
+                assert_eq!(
+                    fixture
+                        .native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "session/prompt")
+                        .count(),
+                    1
+                );
+                fixture.complete(&request, "cancelled").await;
+                real_events_until_stopped(&mut fixture, "cancelled").await;
+                assert_one_real_stopped(&fixture, before, &request, &pending_scope, window);
+                assert_eq!(
+                    fixture
+                        .native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "session/prompt")
+                        .count(),
+                    1
+                );
+                assert!(!fixture
+                    .native
+                    .requests()
+                    .iter()
+                    .any(|method| method == "session/cancel"));
+                fixture.client.shutdown().await.unwrap();
+            })
+        })
+        .await;
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum RealRelayTiming {
+        MarkerWriteFails,
+        ControlEofAfterMarker,
+        LaterWriteFails,
+        ControlEofBeforeResult,
+    }
+    async fn run_managed_prompt_relay(name: &'static str, timing: RealRelayTiming) {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use tokio::io::AsyncWriteExt as _;
+        if crate::process::runner::test_support::managed_runner::child_if_requested(name).await {
+            return;
+        }
+        with_managed(|scope| Box::pin(async move {
+                let inspection = scope.inspect_next_runner(name);
+                let mut fixture = ManagedControlFixture::new(scope).await;
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                let request = fixture.start_prompt("real local original held for relay timing").await;
+                let actual = fixture.client.actual();
+                let control = actual.test_control();
+                let state = actual.test_connection_state();
+                let (pending_scope, window) = real_pending_scope(&control, &request).await;
+                assert_ne!(control.peer_identity().pid, std::process::id());
+                let mut observed = observe_real_relay(&control);
+                let shim = state.test_shim.get().unwrap().clone();
+                let mut update_release = None;
+                if matches!(timing, RealRelayTiming::ControlEofAfterMarker | RealRelayTiming::LaterWriteFails) {
+                    let (gate, release, entered) = scope.gate();
+                    actual.gate_next_update(gate);
+                    fixture.native.send(serde_json::json!({
+                        "jsonrpc":"2.0", "method":"session/update", "params":{
+                            "sessionId":request["params"]["sessionId"], "update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text", "text":"real update before the original result"}
+                            }
+                        }
+                    })).await;
+                    real_control_deadline(entered).await.unwrap();
+                    update_release = Some(release);
+                }
+                match timing {
+                    RealRelayTiming::MarkerWriteFails => {
+                        let mut write = shim.lock().await;
+                        fixture.complete(&request, "cancelled").await;
+                        real_completion_marker(&mut observed, TestRelayStage::Prepared, &request).await;
+                        assert_real_settled(&control, &request, &pending_scope, window);
+                        write.shutdown().await.unwrap();
+                        drop(write);
+                        real_completion_marker(&mut observed, TestRelayStage::Failed, &request).await;
+                    }
+                    RealRelayTiming::ControlEofAfterMarker => {
+                        fixture.complete(&request, "cancelled").await;
+                        real_completion_marker(&mut observed, TestRelayStage::Relayed, &request).await;
+                        assert_real_settled(&control, &request, &pending_scope, window);
+                        inspection.query("close-control").await;
+                        real_control_deadline(async {
+                            loop {
+                                if control.handshake_rx.lock().await.is_closed() { break; }
+                                tokio::task::yield_now().await;
+                            }
+                        }).await;
+                    }
+                    RealRelayTiming::LaterWriteFails => {
+                        fixture.complete(&request, "cancelled").await;
+                        real_completion_marker(&mut observed, TestRelayStage::Relayed, &request).await;
+                        assert_real_settled(&control, &request, &pending_scope, window);
+                        let mut write = shim.lock().await;
+                        fixture.native.send(serde_json::json!({
+                            "jsonrpc":"2.0", "method":"session/update", "params":{
+                                "sessionId":request["params"]["sessionId"], "update":{
+                                    "sessionUpdate":"agent_message_chunk",
+                                    "content":{"type":"text", "text":"the later relay whose real write must fail"}
+                                }
+                            }
+                        })).await;
+                        let later = real_relay_observation(&mut observed, TestRelayStage::Prepared, "session/update").await;
+                        assert_eq!(later["params"]["update"]["content"]["text"],
+                            "the later relay whose real write must fail");
+                        write.shutdown().await.unwrap();
+                        drop(write);
+                        real_relay_observation(&mut observed, TestRelayStage::Failed, "session/update").await;
+                    }
+                    RealRelayTiming::ControlEofBeforeResult => { inspection.query("close-control").await; }
+                }
+                // A real loss may cancel the callback receiver before release.
+                if let Some(release) = update_release { let _ = release.release(); }
+                let events = real_control_deadline(async {
+                    let mut events = Vec::new();
+                    loop {
+                        let event = fixture.next_event().await;
+                        assert!(!matches!(&event, Event::AgentStartupError { .. }), "{event:?}");
+                        let unavailable = matches!(&event, Event::AcpConnectionUnavailable { .. });
+                        events.push(event);
+                        if unavailable { break events; }
+                    }
+                }).await;
+                let loss = state.loss().expect("a real relay/control endpoint ended");
+                if matches!(timing, RealRelayTiming::ControlEofAfterMarker | RealRelayTiming::ControlEofBeforeResult) {
+                    assert_eq!(loss.source, crate::acp::state::AcpConnectionSource::Control);
+                    assert_eq!(loss.cause, crate::acp::state::AcpConnectionCause::IncomingEnded);
+                } else {
+                    // The actual shim writer and SDK reader can race to observe
+                    // this physical closure. Failed above proves the write I/O;
+                    // the first real typed cause must remain sticky below.
+                    assert!(matches!((loss.source, loss.cause),
+                        (crate::acp::state::AcpConnectionSource::Control,
+                         crate::acp::state::AcpConnectionCause::ForwardPumpEnded)
+                        | (crate::acp::state::AcpConnectionSource::Sdk,
+                           crate::acp::state::AcpConnectionCause::IncomingEnded)
+                    ), "unexpected observed relay loss: {loss:?}");
+                }
+                assert!(!control.peer_process.exited().unwrap(), "control/shim EOF is not native owner death");
+                let fatal = events.iter().position(|event| matches!(event,
+                    Event::AcpConnectionUnavailable { .. }
+                )).unwrap();
+                assert_eq!(events.iter().filter(|event| matches!(event,
+                    Event::AcpConnectionUnavailable { .. }
+                )).count(), 1);
+                if matches!(timing, RealRelayTiming::ControlEofBeforeResult) {
+                    assert!(!events.iter().any(|event| matches!(event,
+                        Event::Stopped { reason } if reason == "prompt_complete" || reason == "cancelled"
+                    )));
+                    let stored = fixture.store.replay_from(&fixture.client.id, before).unwrap();
+                    assert!(!stored.iter().any(|stored|
+                        matches!(stored.event.as_ref(), Event::Stopped { .. })
+                            && stored.metadata.native_prompt_id == request["id"].as_i64()
+                            && stored.metadata.operation.is_some_and(|operation| operation.outcome.is_some())
+                    ), "an unanswered original has no native result evidence");
+                } else {
+                    let stopped = events.iter().position(|event| matches!(event,
+                        Event::Stopped { reason } if reason == "cancelled"
+                    )).expect("the actual original stop reason survives the failed route");
+                    assert!(stopped < fatal);
+                    assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { .. })).count(), 1);
+                    assert!(!events.iter().any(|event| matches!(event,
+                        Event::PromptRuntimeError { .. } | Event::RateLimit { .. }
+                    )));
+                    assert_one_real_stopped(&fixture, before, &request, &pending_scope, window);
+                }
+                let native_requests = fixture.native.requests();
+                assert_eq!(native_requests.iter().filter(|method| *method == "session/prompt").count(), 1);
+                assert!(matches!(control.cancel(pending_scope.clone()).await,
+                    Err(AcpError::ConnectionUnavailable(observation)) if observation == loss));
+                let refused = control.prompt(request["params"].clone(), pending_scope).await;
+                assert!(matches!(refused,
+                    Err(AcpError::ConnectionUnavailable(observation)) if observation == loss));
+                assert_eq!(fixture.native.requests(), native_requests);
+                assert_eq!(state.loss(), Some(loss));
+                fixture.client.shutdown().await.unwrap();
+                assert_eq!(fixture.native.requests(), native_requests,
+                    "physical cleanup cannot send native input after observed loss");
+                assert_eq!(state.loss(), Some(loss));
+        })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_prompt_relays_preserve_results_and_fence_eof() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::managed_prompt_relays_preserve_results_and_fence_eof",
+            RealRelayTiming::ControlEofBeforeResult,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_marker_relay_preserves_completed_result_without_further_native_controls() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::failed_marker_relay_preserves_completed_result_without_further_native_controls",
+            RealRelayTiming::MarkerWriteFails,
+        ).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runner_hangup_still_delivers_a_relayed_outcome() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::runner_hangup_still_delivers_a_relayed_outcome",
+            RealRelayTiming::ControlEofAfterMarker,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_relay_after_a_relayed_marker_preserves_completed_result() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::failed_relay_after_a_relayed_marker_preserves_completed_result",
+            RealRelayTiming::LaterWriteFails,
+        ).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn deferred_original_error_pair_cannot_settle_the_next_real_prompt() {
+        use crate::acp::event_sender::{EventScope, SdkEvent};
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+            let mut fixture = ManagedControlFixture::new(scope).await;
+            let original = fixture.start_prompt("actual original before adoption").await;
+            let mut fixture = fixture.adopt_in_flight(scope).await;
+            let actual = fixture.client.actual();
+            let control = actual.test_control();
+            let state = actual.test_connection_state();
+            let terminal = state.test_terminal.get().unwrap().clone();
+            let in_flight = state.test_in_flight.get().unwrap().clone();
+            let mut observed = observe_real_relay(&control);
+            RealAdoptedOutcome::Error.reply(&fixture, &original).await;
+            let marker = real_completion_marker(&mut observed, TestRelayStage::Relayed, &original).await;
+            real_events_until_stopped(&mut fixture, "prompt_failed").await;
+            let adopted = marker.adopted.expect("real adopted Native error marker");
+            let evidence = adopted.evidence.as_ref().expect("real original result evidence");
+            let old_correlation = evidence.scope.correlation();
+            let old_window = evidence.window_id;
+            let (events, mut received) = mpsc::channel::<SdkEvent>(2);
+            let events: crate::acp::event_sender::EventSender = events.into();
+            events.send(Event::AvailableCommandsUpdated { commands: vec![] }).await.unwrap();
+            let publication = publish_adopted_completion(
+                *adopted, &events, &control, &in_flight, &terminal, |_| None, None,
+            );
+            tokio::pin!(publication);
+            assert!(futures_util::poll!(publication.as_mut()).is_pending());
+            let next = fixture.start_prompt("distinct actual input while historical pair waits").await;
+            let (next_scope, next_window) = real_pending_scope(&control, &next).await;
+            let next_turn = terminal.current_turn();
+            assert!(!terminal.claimed());
+            assert!(in_flight.load(AtomicOrdering::Acquire));
+            assert!(matches!(received.recv().await, Some(SdkEvent::Data(data))
+                if matches!(data.event.as_ref(), Event::AvailableCommandsUpdated { .. })));
+            assert!(matches!(real_control_deadline(publication).await,
+                AdoptedCompletionPublication::Historical));
+            for diagnostic in [true, false] {
+                let data = match real_control_deadline(received.recv()).await.unwrap() {
+                    SdkEvent::Data(data) => data,
+                    other => panic!("expected historical original component: {other:?}"),
+                };
+                assert_eq!(data.metadata.scope, EventScope::HistoryOnly);
+                assert_eq!(data.metadata.native_prompt_id, original["id"].as_i64());
+                assert_eq!(data.metadata.operation.map(|operation| operation.correlation), old_correlation);
+                assert_eq!(data.metadata.prompt_observation, Some(
+                    crate::acp::protocol::AcpPromptObservation::Written { window_id: old_window }));
+                if diagnostic {
+                    assert!(matches!(data.event.as_ref(), Event::PromptRuntimeError { .. }));
+                } else {
+                    assert!(matches!(data.event.as_ref(), Event::Stopped { reason } if reason == "prompt_failed"));
+                }
+            }
+            assert!(matches!(received.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            assert_eq!(real_pending_scope(&control, &next).await, (next_scope, next_window));
+            assert_eq!(terminal.current_turn(), next_turn);
+            assert!(!terminal.claimed());
+            assert!(in_flight.load(AtomicOrdering::Acquire));
+            fixture.complete(&next, "end_turn").await;
+            real_events_until_stopped(&mut fixture, "prompt_complete").await;
+            assert_eq!(fixture.native.requests().iter().filter(|method| *method == "session/prompt").count(), 2);
+            fixture.client.shutdown().await.unwrap();
+        })).await;
+    }
 
     fn bind(tmp: &tempfile::TempDir) -> (std::path::PathBuf, UnixListener) {
         let control = crate::process::worker::control_socket_sibling(&tmp.path().join("s.sock"));
@@ -953,9 +3582,23 @@ mod tests {
         let hello = ControlBody::Hello {
             control_protocol_version: version,
             session_id: session.into(),
+            prompt_head: None,
+            native_autonomous: None,
         };
         let _ = control_protocol::write_frame(&mut peer, &hello).await;
         peer
+    }
+
+    fn fixture_owner() -> crate::acp::runner_lifecycle::RunnerIdentity {
+        let pid = std::process::id();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        crate::acp::runner_lifecycle::RunnerIdentity {
+            pid,
+            generation: 1,
+            birth_fingerprint: Some(birth.fingerprint()),
+        }
     }
 
     async fn connect(
@@ -963,409 +3606,213 @@ mod tests {
         session: &str,
         terminal: Arc<TerminalClaim>,
         in_flight: bool,
-    ) -> anyhow::Result<(Arc<DaemonControlClient>, tokio::io::DuplexStream)> {
+    ) -> Result<(Arc<DaemonControlClient>, tokio::io::DuplexStream), AcpError> {
         let in_flight = Arc::new(AtomicBool::new(in_flight));
-        connect_runner_control_v3(control, session.into(), terminal, in_flight).await
+        connect_runner_control(
+            control,
+            session.into(),
+            Arc::new(super::super::SessionState {
+                terminal_claim: terminal,
+                ..Default::default()
+            }),
+            in_flight,
+            fixture_owner(),
+            Arc::new(crate::acp::event_sender::ProjectionState::read_only(None)),
+        )
+        .await
     }
-
-    struct PromptControlPeer {
-        client: Arc<DaemonControlClient>,
-        peer: UnixStream,
-        transport: BufReader<tokio::io::DuplexStream>,
-        terminal: Arc<TerminalClaim>,
-        in_flight: Arc<AtomicBool>,
-    }
-
-    impl Drop for PromptControlPeer {
-        fn drop(&mut self) {
-            self.client.shutdown();
-        }
-    }
-
-    impl PromptControlPeer {
-        async fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
-            let (socket, listener) = bind(&tmp);
-            let terminal = Arc::new(TerminalClaim::new());
-            let in_flight = Arc::new(AtomicBool::new(true));
-            let (client, peer) = tokio::join!(
-                connect_runner_control_v3(
-                    &socket,
-                    "prompt".into(),
-                    terminal.clone(),
-                    in_flight.clone(),
-                ),
-                async {
-                    let mut peer = accept_hello(
-                        &listener,
-                        "prompt",
-                        control_protocol::CONTROL_PROTOCOL_VERSION,
-                    )
-                    .await;
-                    assert!(matches!(
-                        control_protocol::read_frame(&mut peer).await.unwrap(),
-                        Some(ControlBody::Attach { .. })
-                    ));
-                    peer
-                }
-            );
-            let (client, transport) = client.unwrap();
-            Self {
-                client,
-                peer,
-                transport: BufReader::new(transport),
-                terminal,
-                in_flight,
-            }
-        }
-
-        async fn send(&mut self, frame: ControlBody) {
-            control_protocol::write_frame(&mut self.peer, &frame)
-                .await
-                .unwrap();
-        }
-
-        async fn prompt(&mut self) -> oneshot::Receiver<PromptOutcome> {
-            let rx = self.client.prompt(serde_json::json!({})).await.unwrap();
-            assert!(matches!(
-                control_protocol::read_frame(&mut self.peer).await.unwrap(),
-                Some(ControlBody::Prompt { .. })
-            ));
-            rx
-        }
-
-        async fn completed(&mut self, prompt_req_id: i64, reason: &str) {
-            let outcome = end(reason);
-            self.send(ControlBody::PromptCompleted {
-                prompt_req_id,
-                outcome,
-            })
-            .await;
-        }
-
-        /// The reader forwards Notify only after handling every earlier frame,
-        /// so this is a deterministic barrier. Completion markers ahead of it
-        /// are handled as the crate would.
-        async fn drain(&mut self) {
-            self.send(ControlBody::Notify {
-                method: "test/barrier".into(),
-                params: serde_json::json!({}),
-            })
-            .await;
-            loop {
-                let mut line = String::new();
-                tokio::time::timeout(Duration::from_secs(2), self.transport.read_line(&mut line))
-                    .await
-                    .expect("control reader must reach the notification barrier")
-                    .unwrap();
-                let notification: serde_json::Value = serde_json::from_str(&line).unwrap();
-                if notification["method"] == "test/barrier" {
-                    return;
-                }
-                assert_eq!(notification["method"], "_aoe/prompt_completed");
-                self.client
-                    .deliver_prompt_completion(PromptCompletedMarker::default());
-            }
-        }
-
-        /// Drop the crate side so a reader relay fails as it would for a dead
-        /// transport. The replacement only keeps the field typed.
-        fn close_crate_side(&mut self) {
-            let (dead, peer) = tokio::io::duplex(64);
-            drop(peer);
-            self.transport = BufReader::new(dead);
-        }
-
-        /// Wait until the reader has settled the matched outcome, which a
-        /// relayed marker alone never resolves.
-        async fn await_settled_outcome(&self, completion: &mut oneshot::Receiver<PromptOutcome>) {
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while self
-                    .client
-                    .settled
-                    .lock()
-                    .expect("settled mutex poisoned")
-                    .is_empty()
-                {
-                    assert_eq!(
-                        completion.try_recv(),
-                        Err(oneshot::error::TryRecvError::Empty),
-                        "the waiter must stay open and unresolved until the reader settles the outcome"
-                    );
+    async fn own_stop(fixture: &ManagedControlFixture, request: &serde_json::Value) {
+        real_control_deadline(async {
+                loop {
+                    let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
+                    if events.iter().any(|stored| {
+                        stored.metadata.scope == EventScope::OperationCurrent
+                            && stored.metadata.native_prompt_id == request["id"].as_i64()
+                            && matches!(stored.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete")
+                    }) { break; }
                     tokio::task::yield_now().await;
                 }
-            })
-            .await
-            .expect("the reader must settle the matched outcome");
-        }
-
-        fn assert_local_terminal_ownership(&mut self) {
-            assert!(self.in_flight.load(AtomicOrdering::Relaxed));
-            assert!(!self.terminal.claimed());
-        }
+            }).await;
     }
 
-    fn end(reason: &str) -> PromptOutcome {
-        PromptOutcome::Completed {
-            stop_reason: Some(reason.into()),
-        }
-    }
-
-    #[tokio::test]
-    async fn historical_completions_preserve_local_terminal_ownership() {
-        let mut peer = PromptControlPeer::new().await;
-        let mut completion = peer.prompt().await;
-        // History read before and after the runner assigns the new id must
-        // resolve neither the waiter nor an adopted terminal.
-        peer.completed(7, "cancelled").await;
-        peer.drain().await;
-        assert_eq!(
-            completion.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        );
-        peer.assert_local_terminal_ownership();
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
-            .await;
-        peer.completed(7, "cancelled").await;
-        peer.drain().await;
-        assert_eq!(
-            completion.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        );
-        peer.assert_local_terminal_ownership();
-        peer.completed(9, "end_turn").await;
-        peer.drain().await;
-        assert_eq!(completion.await.unwrap(), end("end_turn"));
-        peer.assert_local_terminal_ownership();
-
-        {
-            let mut peer = PromptControlPeer::new().await;
-            let completion = peer.prompt().await;
-            peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
-                .await;
-            peer.completed(9, "end_turn").await;
-            peer.completed(7, "cancelled").await;
-            peer.drain().await;
-            peer.assert_local_terminal_ownership();
-            assert_eq!(completion.await.unwrap(), end("end_turn"));
-        }
-
-        {
-            let mut peer = PromptControlPeer::new().await;
-            peer.client.supersede_adopted_turn();
-            peer.completed(7, "cancelled").await;
-            peer.drain().await;
-            peer.assert_local_terminal_ownership();
-        }
-    }
-
-    #[tokio::test]
-    async fn duplicate_local_prompt_preserves_first_waiter_and_sends_no_prompt() {
-        let mut peer = PromptControlPeer::new().await;
-        let completion = peer.prompt().await;
-        let duplicate = peer
-            .client
-            .prompt(serde_json::json!({"duplicate": true}))
-            .await;
-        assert!(duplicate.is_err());
-        // Cancel arriving next proves the duplicate sent no Prompt frame.
-        peer.client.cancel().await;
-        assert!(matches!(
-            control_protocol::read_frame(&mut peer.peer).await.unwrap(),
-            Some(ControlBody::Cancel)
-        ));
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
-            .await;
-        peer.completed(9, "cancelled").await;
-        peer.drain().await;
-        assert_eq!(completion.await.unwrap(), end("cancelled"));
-        peer.assert_local_terminal_ownership();
-    }
-
-    #[tokio::test]
-    async fn released_local_prompt_lets_the_next_prompt_through_and_ignores_the_late_completion() {
-        let mut peer = PromptControlPeer::new().await;
-        let abandoned = peer.prompt().await;
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 5 })
-            .await;
-        peer.drain().await;
-        peer.client.release_local_prompt();
-        assert!(abandoned.await.is_err(), "released waiter aborts");
-
-        let mut next = peer.prompt().await;
-        assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 6 })
-            .await;
-        // The abandoned turn's completion must not resolve the new waiter.
-        peer.completed(5, "end_turn").await;
-        peer.drain().await;
-        assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
-        peer.completed(6, "end_turn").await;
-        peer.drain().await;
-        assert_eq!(next.await.unwrap(), end("end_turn"));
-        peer.assert_local_terminal_ownership();
-    }
-
-    #[tokio::test]
-    async fn released_unbound_waiter_start_and_completion_never_settle_the_next_waiter() {
-        let mut peer = PromptControlPeer::new().await;
-        let abandoned = peer.prompt().await;
-        // Released before its PromptStarted arrived.
-        peer.client.release_local_prompt();
-        assert!(abandoned.await.is_err(), "released waiter aborts");
-
-        let mut next = peer.prompt().await;
-        // The abandoned prompt's delayed start must not bind the next waiter.
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 5 })
-            .await;
-        peer.completed(5, "end_turn").await;
-        peer.drain().await;
-        assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
-
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 6 })
-            .await;
-        peer.completed(6, "end_turn").await;
-        peer.drain().await;
-        assert_eq!(next.await.unwrap(), end("end_turn"));
-        peer.assert_local_terminal_ownership();
-    }
-
-    /// The sender is settled before the marker is relayed, so a failed relay
-    /// drops it and aborts the waiter while the client still commands the runner.
-    #[tokio::test]
-    async fn failed_marker_relay_aborts_the_waiter_without_dropping_the_client() {
-        let mut peer = PromptControlPeer::new().await;
-        let completion = peer.prompt().await;
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
-            .await;
-        peer.close_crate_side();
-        peer.completed(9, "end_turn").await;
-        assert!(tokio::time::timeout(Duration::from_secs(2), completion)
-            .await
-            .expect("a completion the crate never receives must abort the waiter")
-            .is_err());
-        // The waiter aborted, not the handle: the client still commands the
-        // runner.
-        peer.client.cancel().await;
-        assert!(matches!(
-            control_protocol::read_frame(&mut peer.peer).await.unwrap(),
-            Some(ControlBody::Cancel)
-        ));
-    }
-
-    /// A marker already buffered for the crate stays deliverable, so the
-    /// reader's teardown must not release the sender: the turn would end as
-    /// aborted, losing its real stop reason and any rate-limit parking.
-    #[tokio::test]
-    async fn runner_hangup_still_delivers_a_relayed_outcome() {
-        let mut peer = PromptControlPeer::new().await;
-        let mut completion = peer.prompt().await;
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
-            .await;
-        // No crate reads this peer's transport, so the relayed marker stays
-        // undispatched.
-        peer.completed(9, "end_turn").await;
-        peer.await_settled_outcome(&mut completion).await;
-        // Hang the runner up so the reader's teardown runs, crate side up.
-        peer.peer.shutdown().await.unwrap();
-        // Reading to EOF drains the buffer ahead of the shutdown, and only the
-        // reader's teardown produces that EOF, so this waits out the teardown
-        // rather than racing it.
-        let mut relayed = String::new();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            peer.transport.read_to_string(&mut relayed),
-        )
-        .await
-        .expect("a relayed marker must reach the crate")
-        .unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(relayed.trim())
-                .unwrap()
-                .get("method")
-                .unwrap(),
-            &serde_json::json!(PromptCompletedMarker::default().method())
-        );
-        peer.client
-            .deliver_prompt_completion(PromptCompletedMarker::default());
-        assert_eq!(completion.await.unwrap(), end("end_turn"));
-    }
-
-    /// The settled sender loses its route when any later relay fails, so that
-    /// waiter aborts too rather than waiting for the handle to drop.
-    #[tokio::test]
-    async fn failed_relay_after_a_relayed_marker_aborts_the_waiter() {
-        let mut peer = PromptControlPeer::new().await;
-        let mut completion = peer.prompt().await;
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
-            .await;
-        peer.completed(9, "end_turn").await;
-        peer.await_settled_outcome(&mut completion).await;
-        // Reading the marker proves the relay that wrote it returned, so the
-        // notification below is the relay that fails.
-        let mut relayed = String::new();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            peer.transport.read_line(&mut relayed),
-        )
-        .await
-        .expect("the relayed marker must reach the crate")
-        .unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(relayed.trim())
-                .unwrap()
-                .get("method")
-                .unwrap(),
-            &serde_json::json!(PromptCompletedMarker::default().method())
-        );
-        peer.close_crate_side();
-        peer.send(ControlBody::Notify {
-            method: "test/after".into(),
-            params: serde_json::json!({}),
+    async fn drained_old_completion(
+        fixture: &mut ManagedControlFixture,
+        callback_id: &str,
+        forbidden: &std::path::Path,
+    ) {
+        fixture.native.send(serde_json::json!({"jsonrpc":"2.0","id":callback_id,
+                "method":"fs/write_text_file","params":{
+                    "sessionId":"foreign-correlation-barrier","path":forbidden,"content":"must not be written"
+                }})).await;
+        let reply = real_control_deadline(fixture.native.reply()).await;
+        assert_eq!(reply["id"], callback_id);
+        assert_eq!(reply["error"]["code"], control_protocol::INVALID_PARAMS);
+        assert!(!forbidden.exists());
+        // A direct refusal proves reader progress, not SDK or parent application.
+        let barrier = format!("parent-processed-{callback_id}");
+        fixture.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":"foreign-correlation-barrier","update":{
+                    "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":barrier}
+                }
+            }})).await;
+        real_control_deadline(async {
+            loop {
+                let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
+                if let Some(stored) = events.iter().find(|stored| {
+                    matches!(stored.event.as_ref(),
+                        Event::AgentMessageChunk { text, .. } if text == &barrier
+                    )
+                }) {
+                    assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
+                    assert_eq!(
+                        stored
+                            .metadata
+                            .reported_session_id
+                            .as_ref()
+                            .map(|id| id.0.as_ref()),
+                        Some("foreign-correlation-barrier")
+                    );
+                    assert!(stored.metadata.operation.is_none());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
         })
         .await;
-        assert!(tokio::time::timeout(Duration::from_secs(2), completion)
-            .await
-            .expect("an unreachable crate must abort the waiter")
-            .is_err());
     }
 
-    /// A runner from the other side of a protocol bump fails the attach with a
-    /// readable mismatch error, not a decode failure.
+    async fn release_real_prompt_and_keep_the_next_owner(release_before_start: bool) {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(move |scope| {
+            Box::pin(async move {
+                let directory = scope.tempdir();
+                let forbidden = directory.path().join("foreign-write");
+                let mut fixture = ManagedControlFixture::new(scope).await;
+                let actual = fixture.client.actual();
+                let control = actual.test_control();
+                let state = actual.test_connection_state();
+                let terminal = state.test_terminal.get().unwrap().clone();
+                let in_flight = state.test_in_flight.get().unwrap().clone();
+                let shim = state.test_shim.get().unwrap().clone();
+                let mut observed = observe_real_relay(&control);
+                let relay_gate = if release_before_start {
+                    let write = shim.lock().await;
+                    fixture.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":"release-before-start-barrier","update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text","text":"block the actual control reader"}
+                            }
+                        }
+                    })).await;
+                    real_relay_observation(
+                        &mut observed,
+                        TestRelayStage::Prepared,
+                        "session/update",
+                    )
+                    .await;
+                    Some(write)
+                } else {
+                    None
+                };
+                let old = fixture.start_prompt("real abandoned input").await;
+                let (old_scope, old_window) = if release_before_start {
+                    let completion = control.completion.lock().unwrap();
+                    match &*completion {
+                        PromptCompletion::Pending {
+                            prompt_req_id: None,
+                            scope,
+                            window_id: None,
+                            ..
+                        } => (scope.clone(), None),
+                        _ => panic!("reader must not have bound the abandoned start"),
+                    }
+                } else {
+                    let (scope, window) = real_pending_scope(&control, &old).await;
+                    (scope, Some(window))
+                };
+                control.release_local_prompt();
+                assert!(matches!(
+                    *control.completion.lock().unwrap(),
+                    PromptCompletion::LocalIdle
+                ));
+                assert_eq!(
+                    control.abandoned_starts.load(AtomicOrdering::Relaxed),
+                    usize::from(release_before_start),
+                );
+                let next = fixture.start_prompt("real next explicit input").await;
+                assert_ne!(old["id"], next["id"]);
+                // Both requests reached the Native peer before the delayed start is released.
+                drop(relay_gate);
+                let (next_scope, next_window) = real_pending_scope(&control, &next).await;
+                assert_ne!(old_scope.correlation(), next_scope.correlation());
+                if let Some(old_window) = old_window {
+                    assert_ne!(old_window, next_window);
+                }
+                assert_eq!(control.abandoned_starts.load(AtomicOrdering::Relaxed), 0);
+                let turn = terminal.current_turn();
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                fixture.complete(&old, "end_turn").await;
+                drained_old_completion(&mut fixture, "released-original-barrier", &forbidden).await;
+                assert_eq!(
+                    real_pending_scope(&control, &next).await,
+                    (next_scope.clone(), next_window),
+                );
+                assert_eq!(terminal.current_turn(), turn);
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                fixture.complete(&next, "end_turn").await;
+                own_stop(&fixture, &next).await;
+                assert_one_real_stopped(&fixture, before, &next, &next_scope, next_window);
+                assert_eq!(terminal.current_turn(), turn);
+                assert!(terminal.claimed());
+                assert!(!in_flight.load(AtomicOrdering::Acquire));
+                let methods = fixture.native.requests();
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| *method == "session/new")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| *method == "session/prompt")
+                        .count(),
+                    2
+                );
+                assert!(!methods.iter().any(|method| matches!(
+                    method.as_str(),
+                    "session/load" | "session/fork" | "session/cancel"
+                )));
+                fixture.client.shutdown().await.unwrap();
+            })
+        })
+        .await;
+    }
+
     #[tokio::test]
-    async fn a_runner_on_another_protocol_version_fails_with_a_mismatch_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (control, listener) = bind(&tmp);
-        let fake = tokio::spawn(async move {
-            accept_hello(
-                &listener,
-                "old",
-                control_protocol::CONTROL_PROTOCOL_VERSION - 1,
-            )
-            .await
-        });
-        let error = connect(&control, "old", Arc::new(TerminalClaim::new()), false)
-            .await
-            .err()
-            .expect("a version mismatch must fail the attach")
-            .to_string();
-        assert!(error.contains("runner Hello mismatch"), "{error}");
-        assert!(
-            error.contains(&format!(
-                "protocol v{}",
-                control_protocol::CONTROL_PROTOCOL_VERSION - 1
-            )),
-            "{error}"
-        );
-        let _ = fake.await;
+    #[serial_test::serial]
+    async fn released_local_prompt_lets_the_next_prompt_through_and_ignores_the_late_completion() {
+        release_real_prompt_and_keep_the_next_owner(false).await;
     }
 
-    /// An oversized reverse response becomes a bounded error and the
-    /// connection stays usable.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn released_unbound_waiter_start_and_completion_never_settle_the_next_waiter() {
+        release_real_prompt_and_keep_the_next_owner(true).await;
+    }
+
     #[tokio::test]
     async fn oversized_reverse_reply_becomes_error_without_poisoning_connection() {
         use tokio::io::AsyncWriteExt;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("aoe-ctl-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let (control, listener) = bind(&tmp);
         let fake = tokio::spawn(async move {
             let stream = accept_hello(
@@ -1381,6 +3828,7 @@ mod tests {
                     call_id,
                     method: "fs/read_text_file".into(),
                     params: serde_json::json!({}),
+                    evidence: control_protocol::NativeNotifyEvidence::default(),
                 };
                 control_protocol::write_frame(&mut write, &call)
                     .await
@@ -1440,10 +3888,21 @@ mod tests {
                 control_protocol::CONTROL_PROTOCOL_VERSION,
             )
             .await;
+            let forged = ControlBody::Notify {
+                method: ADAPTER_FRAMES_SHED_METHOD.into(),
+                params: serde_json::json!({ "count": 100 }),
+                replay: None,
+                evidence: Default::default(),
+            };
+            control_protocol::write_frame(&mut peer, &forged)
+                .await
+                .unwrap();
             for n in 1..=2 {
                 let body = ControlBody::Notify {
                     method: "x/frame".into(),
                     params: serde_json::json!({ "n": n }),
+                    replay: None,
+                    evidence: Default::default(),
                 };
                 control_protocol::write_frame(&mut peer, &body)
                     .await
@@ -1479,6 +3938,76 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn attached_prompt_errors_never_rebase_a_successfully_resumed_session() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+                let message = "Unsupported ACP session";
+                let directory = scope.tempdir();
+                let mut prompts = 0;
+                let (config, native) = scope.native_peer(directory.path().into(), "codex", "codex", move |request| {
+                    let id = request.get("id")?;
+                    Some(match request["method"].as_str().unwrap() {
+                        "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}}),
+                        "session/new" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"sid-stored"}}),
+                        "session/prompt" => {
+                            assert_eq!(request["params"]["sessionId"], "sid-stored");
+                            prompts += 1;
+                            if prompts == 1 {
+                                serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                                    "code":-32603,"message":message,
+                                    "data":{"reason":"incoming_transport_closed","privateTokenMarker":"must-not-leak"}
+                                }})
+                            } else {
+                                serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}})
+                            }
+                        }
+                        method => panic!("unexpected native operation after genuine retained New: {method}"),
+                    })
+                });
+                let original = scope.spawn(config, "resumed-request-error").await.unwrap();
+                original.ready().await;
+                let mut client = scope.adopt(original, false).await;
+                client.ready().await;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    for (text, expected_reason) in [
+                        ("continue", "prompt_rejected"),
+                        ("explicit next request", "prompt_complete"),
+                    ] {
+                        client.send_prompt(text, &[]).await.unwrap();
+                        let mut diagnostics = 0;
+                        loop {
+                            let event = client.next_event().await.expect("same real SDK connection remains live");
+                            assert!(!serde_json::to_string(&event).unwrap().contains("privateTokenMarker"));
+                            match event {
+                                Event::SessionContextReset { .. } => panic!("ordinary request prose must not rebase"),
+                                Event::AgentStartupError { message, .. } => panic!("{message}"),
+                                Event::AcpConnectionUnavailable { .. } => panic!("peer data is not an EOF observation"),
+                                Event::PromptRuntimeError { message: error, .. } => {
+                                    assert_eq!(expected_reason, "prompt_rejected");
+                                    assert_eq!(error, message);
+                                    diagnostics += 1;
+                                }
+                                Event::Stopped { reason } => {
+                                    assert_eq!(reason, expected_reason);
+                                    assert_eq!(diagnostics, usize::from(expected_reason == "prompt_rejected"));
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }).await.expect("same-runtime request recovery completes");
+                client.shutdown().await.unwrap();
+                let requests = native.requests();
+                assert_eq!(requests.iter().filter(|method| *method == "initialize").count(), 1);
+                assert_eq!(requests.iter().filter(|method| *method == "session/new").count(), 1);
+                assert_eq!(requests.iter().filter(|method| *method == "session/prompt").count(), 2);
+                assert!(!requests.iter().any(|method| matches!(method.as_str(), "session/load" | "session/fork")));
+        })).await;
+    }
+
+    #[tokio::test]
     async fn runner_control_eof_closes_transport_and_cancels_prompt() {
         let tmp = tempfile::tempdir().unwrap();
         let (control, listener) = bind(&tmp);
@@ -1497,7 +4026,13 @@ mod tests {
         let (client, crate_side) = connect(&control, "eof", Arc::new(TerminalClaim::new()), false)
             .await
             .unwrap();
-        let completion = client.prompt(serde_json::json!({})).await.unwrap();
+        let completion = client
+            .prompt(
+                serde_json::json!({}),
+                crate::acp::establishment::NativeRequestScope::Observation,
+            )
+            .await
+            .unwrap();
         fake.await.unwrap();
         assert!(tokio::time::timeout(Duration::from_secs(1), completion)
             .await
@@ -1545,500 +4080,250 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attached_session_prompt_errors_reset_tear_down_or_end_the_turn() {
-        use crate::acp::acp_client::AcpClient;
-        use crate::acp::state::AcpSessionId;
-
-        // -32000 alone is not a login: some adapters use it for any failure.
-        for (message, code, want) in [
-            ("Unsupported ACP session", -32603, &["reset", "stopped"][..]),
-            ("Unsupported session mode", -32603, &["rejected"]),
-            ("Authentication required", -32000, &["startup_error"]),
-            ("model overloaded", -32000, &["rejected"]),
-        ] {
-            let tmp = tempfile::tempdir().unwrap();
-            let socket = tmp.path().join("s.sock");
-            let (_, listener) = bind(&tmp);
-            let runner = async {
-                let mut peer = accept_hello(
-                    &listener,
-                    "resume",
-                    control_protocol::CONTROL_PROTOCOL_VERSION,
-                )
-                .await;
-                while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
-                    let reply = match frame {
-                        ControlBody::Attach { .. } => continue,
-                        ControlBody::Initialize { .. } => ControlBody::Initialized {
-                            result: serde_json::json!({
-                                "protocolVersion": 1, "agentCapabilities": {}
-                            }),
-                        },
-                        ControlBody::ResumeSession => ControlBody::SessionReady {
-                            acp_session_id: "sid-stored".into(),
-                            result: serde_json::json!({}),
-                            adapter_frames: 0,
-                        },
-                        ControlBody::Prompt { request } => {
-                            assert_eq!(request["sessionId"], "sid-stored");
-                            let started = ControlBody::PromptStarted { prompt_req_id: 1 };
-                            control_protocol::write_frame(&mut peer, &started)
-                                .await
-                                .unwrap();
-                            ControlBody::PromptCompleted {
-                                prompt_req_id: 1,
-                                outcome: PromptOutcome::Error {
-                                    code,
-                                    message: message.into(),
-                                    data: None,
-                                },
-                            }
-                        }
-                        // Sent after a plain rejection (#5662).
-                        ControlBody::Cancel => continue,
-                        frame => panic!("unexpected resumed-session request: {frame:?}"),
-                    };
-                    control_protocol::write_frame(&mut peer, &reply)
-                        .await
-                        .unwrap();
+    #[serial_test::serial]
+    async fn native_identity_reattach_uses_runner_id_and_drains_adopted_updates() {
+        use crate::acp::acp_client::SdkTestOptions;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+            let directory = scope.tempdir();
+            let own_file = directory.path().join("own");
+            let foreign_file = directory.path().join("foreign");
+            let (config, mut native) = scope.native_peer(directory.path().into(), "codex", "codex", |request| {
+                let id = request.get("id")?;
+                Some(match request["method"].as_str().unwrap() {
+                    "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}}),
+                    "session/new" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"actual"}}),
+                    other => panic!("adoption must not issue another native session operation: {other}"),
+                })
+            });
+            let original = scope.spawn(config, "native-resume").await.unwrap();
+            original.ready().await;
+            let storage = crate::session::Storage::open_unwatched("test").unwrap();
+            let before = storage.load().unwrap().into_iter().find(|row| row.id == original.id).unwrap();
+            let (fence, release, entered) = scope.gate();
+            let (observed, mut control) = mpsc::unbounded_channel();
+            scope.configure_sdk(SdkTestOptions { bootstrap_fence: Some(fence), control_output: Some(observed), ..Default::default() });
+            let mut client = scope.adopt(original, false).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                entered.await.unwrap();
+                loop {
+                    match control.recv().await.unwrap() {
+                        ControlBody::Initialize { .. } => {}
+                        ControlBody::ResumeSession => break,
+                        other => panic!("unexpected actual adoption request: {other:?}"),
+                    }
                 }
-            };
-            let daemon = async {
-                let mut client = AcpClient::attach(
-                    socket,
-                    tmp.path().into(),
-                    vec![],
-                    "sid-stored".into(),
-                    false,
-                    AcpSessionId("resume".into()),
-                    None,
-                    "codex".into(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                )
-                .await
-                .unwrap();
-                client.send_prompt("continue", &[]).await.unwrap();
-                let mut recovery = Vec::new();
-                while let Some(event) = client.next_event().await {
-                    match event {
-                        Event::SessionContextReset { .. } => recovery.push("reset"),
-                        Event::Stopped { reason } if reason == "stored_session_rejected" => {
-                            recovery.push("stopped");
-                        }
-                        // Any other rejection ends only the turn (#5662).
-                        Event::Stopped { reason } if reason == "prompt_rejected" => {
-                            recovery.push("rejected");
-                            break;
-                        }
-                        Event::Stopped { reason } => panic!("{message}: stopped as {reason}"),
-                        Event::AgentStartupError { message: error, .. } => {
-                            assert!(error.contains(message), "{error}");
-                            recovery.push("startup_error");
-                        }
+                let update = |text: &str| serde_json::json!({
+                    "sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":text}
+                });
+                for index in 0..200 {
+                    native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                        "sessionId":"actual","update":update(&format!("own-{index}"))
+                    }})).await;
+                }
+                native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":"stale","update":update("FOREIGN")
+                }})).await;
+                for params in [
+                    serde_json::Value::Null,
+                    serde_json::json!(7),
+                    serde_json::json!([]),
+                    serde_json::json!({"update":update("INVALID")}),
+                    serde_json::json!({"notification":{"sessionId":"actual","update":update("INVALID")},"__aoe_control_frame_bytes":0}),
+                    serde_json::json!(["actual", update("INVALID"), null, 0]),
+                ] {
+                    native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":params})).await;
+                }
+                let deep = (0..124).fold(serde_json::Value::Null, |value, _| serde_json::Value::Array(vec![value]));
+                for params in [
+                    serde_json::json!(["actual",update("own-200"),{"deep":deep}]),
+                    serde_json::json!({"sessionId":"actual","update":update("own-201"),"__aoe_control_frame_bytes":{"untrusted":true}}),
+                    serde_json::json!({"sessionId":"actual","update":update("own-202"),"__aoe_control_frame_bytes":u64::MAX}),
+                    serde_json::json!(["actual", update("own-203")]),
+                ] {
+                    native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":params})).await;
+                }
+                native.send(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"fs/write_text_file","params":{
+                    "sessionId":"stale","path":foreign_file,"content":"owned"
+                }})).await;
+                let denied = native.reply().await;
+                assert_eq!(denied["id"], 2);
+                assert_eq!(denied["error"]["code"], -32602);
+                assert!(release.release());
+                client.ready().await;
+                native.send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"fs/write_text_file","params":{
+                    "sessionId":"actual","path":own_file,"content":"owned"
+                }})).await;
+                let accepted = native.reply().await;
+                assert_eq!(accepted["id"], 1);
+                assert!(accepted.get("error").is_none(), "{accepted}");
+                let mut chunks = Vec::new();
+                let mut resets = 0;
+                let mut assigned = false;
+                while chunks.len() < 205 || !assigned {
+                    match client.next_event().await.unwrap() {
+                        Event::AgentMessageChunk { text, .. } => chunks.push(text),
+                        Event::SessionContextReset { .. } => resets += 1,
+                        Event::AcpSessionAssigned { .. } => assigned = true,
+                        Event::AgentStartupError { message, .. } => panic!("{message}"),
+                        Event::AcpConnectionUnavailable { .. } => panic!("actual native owner remains live"),
                         _ => {}
                     }
                 }
-                assert_eq!(recovery, want, "{message}");
-                let _ = client.shutdown().await;
-            };
-            tokio::time::timeout(Duration::from_secs(10), async {
-                tokio::join!(runner, daemon);
-            })
-            .await
-            .expect("attach recovery must finish and close its control socket");
-        }
-    }
-
-    #[tokio::test]
-    async fn native_identity_reattach_uses_runner_id_and_drains_adopted_updates() {
-        use crate::acp::acp_client::AcpClient;
-        use crate::acp::state::AcpSessionId;
-        let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("native.sock");
-        let control = crate::process::worker::control_socket_sibling(&socket);
-        let listener = tokio::net::UnixListener::bind(control).unwrap();
-        let own_file = temp.path().join("own");
-        let foreign_file = temp.path().join("foreign");
-        let (callbacks_done, callbacks_ready) = oneshot::channel();
-        let runner = async {
-            let (mut peer, _) = listener.accept().await.unwrap();
-            control_protocol::write_frame(
-                &mut peer,
-                &ControlBody::Hello {
-                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                    session_id: "native-resume".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let mut callbacks_done = Some(callbacks_done);
-            let mut replies = 0;
-            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
-                match frame {
-                    ControlBody::Attach { .. } => {}
-                    ControlBody::Initialize { .. } => {
-                        control_protocol::write_frame(&mut peer, &ControlBody::Initialized {
-                            result: serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
-                        }).await.unwrap();
-                    }
-                    ControlBody::ResumeSession => {
-                        for index in 0..200 {
-                            control_protocol::write_frame(&mut peer, &ControlBody::Notify {
-                                method: "session/update".into(),
-                                params: serde_json::json!({"sessionId":"actual","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":format!("own-{index}")}}}),
-                            }).await.unwrap();
-                        }
-                        control_protocol::write_frame(&mut peer, &ControlBody::Notify {
-                            method: "session/update".into(),
-                            params: serde_json::json!({"sessionId":"stale","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FOREIGN"}}}),
-                        }).await.unwrap();
-                        let update = |text: &str| {
-                            serde_json::json!({
-                                "sessionUpdate":"agent_message_chunk",
-                                "content":{"type":"text","text":text}
-                            })
-                        };
-                        // Invalid native shapes must not become valid by mistaking
-                        // a native field/tail for the shim-owned accounting marker.
-                        for params in [
-                            serde_json::Value::Null,
-                            serde_json::json!(7),
-                            serde_json::json!([]),
-                            serde_json::json!({"update":update("INVALID")}),
-                            serde_json::json!({"notification":{"sessionId":"actual","update":update("INVALID")},"__aoe_control_frame_bytes":0}),
-                            serde_json::json!(["actual", update("INVALID"), null, 0]),
-                        ] {
-                            control_protocol::write_frame(
-                                &mut peer,
-                                &ControlBody::Notify {
-                                    method: "session/update".into(),
-                                    params,
-                                },
-                            )
-                            .await
-                            .unwrap();
-                        }
-                        // Positional params and the existing JSON nesting ceiling
-                        // survive the private accounting transport unchanged.
-                        let deep = (0..124).fold(serde_json::Value::Null, |value, _| {
-                            serde_json::Value::Array(vec![value])
-                        });
-                        for params in [
-                            serde_json::json!(["actual",update("own-200"),{"deep":deep}]),
-                            serde_json::json!({"sessionId":"actual","update":update("own-201"),"__aoe_control_frame_bytes":{"untrusted":true}}),
-                            serde_json::json!({"sessionId":"actual","update":update("own-202"),"__aoe_control_frame_bytes":u64::MAX}),
-                            serde_json::json!(["actual", update("own-203")]),
-                        ] {
-                            control_protocol::write_frame(
-                                &mut peer,
-                                &ControlBody::Notify {
-                                    method: "session/update".into(),
-                                    params,
-                                },
-                            )
-                            .await
-                            .unwrap();
-                        }
-                        control_protocol::write_frame(
-                            &mut peer,
-                            &ControlBody::SessionReady {
-                                acp_session_id: "actual".into(),
-                                result: serde_json::json!({}),
-                                adapter_frames: 0,
-                            },
-                        )
-                        .await
-                        .unwrap();
-                        for (call_id, session_id, path) in
-                            [(1, "actual", &own_file), (2, "stale", &foreign_file)]
-                        {
-                            control_protocol::write_frame(&mut peer, &ControlBody::ServerCall {
-                                call_id, method: "fs/write_text_file".into(),
-                                params: serde_json::json!({"sessionId":session_id,"path":path,"content":"owned"}),
-                            }).await.unwrap();
-                        }
-                    }
-                    ControlBody::ServerResult { call_id, .. } => {
-                        assert_eq!(call_id, 1);
-                        replies += 1;
-                    }
-                    ControlBody::ServerError { call_id, error } => {
-                        assert_eq!(call_id, 2);
-                        assert_eq!(error.code, -32602);
-                        replies += 1;
-                    }
-                    other => panic!("unexpected frame {other:?}"),
-                }
-                if replies == 2 {
-                    if let Some(done) = callbacks_done.take() {
-                        done.send(()).unwrap();
-                    }
-                }
-            }
-        };
-        let daemon = async {
-            let mut client = AcpClient::attach(
-                socket,
-                temp.path().into(),
-                vec![],
-                "stale".into(),
-                true,
-                AcpSessionId("native-resume".into()),
-                None,
-                "codex".into(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-            .await
-            .unwrap();
-            let mut chunks = Vec::new();
-            let mut resets = 0;
-            let mut assigned = false;
-            while chunks.len() < 204 || !assigned {
-                match client.next_event().await.unwrap() {
-                    Event::AgentMessageChunk { text, .. } => chunks.push(text),
-                    Event::SessionContextReset { .. } => resets += 1,
-                    Event::AcpSessionAssigned { .. } => assigned = true,
-                    Event::AgentStartupError { message, .. } => panic!("{message}"),
-                    _ => {}
-                }
-            }
-            callbacks_ready.await.unwrap();
-            client.shutdown().await.unwrap();
-            assert_eq!(resets, 1, "a different runner id announces one reset");
-            assert_eq!(
-                chunks,
-                (0..204)
-                    .map(|index| format!("own-{index}"))
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(std::fs::read_to_string(&own_file).unwrap(), "owned");
-            assert!(!foreign_file.exists());
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(runner, daemon);
-        })
-        .await
-        .unwrap();
+                assert_eq!(resets, 0, "certified adoption cannot replace a different durable selection");
+                assert_eq!(chunks.remove(200), "FOREIGN");
+                assert_eq!(chunks, (0..204).map(|index| format!("own-{index}")).collect::<Vec<_>>());
+                let events = client.app_state().acp_event_store.replay_from(&client.id, 0).unwrap();
+                let foreign = events.iter().find(|event| matches!(&*event.event,
+                    Event::AgentMessageChunk { text, .. } if text == "FOREIGN"
+                )).expect("foreign neutral output remains visible as history");
+                assert_eq!(foreign.metadata.scope, crate::acp::event_sender::EventScope::HistoryOnly);
+                assert_eq!(foreign.metadata.reported_session_id.as_ref().map(|id| id.0.as_ref()), Some("stale"));
+                assert!(foreign.metadata.operation.is_none());
+                assert_eq!(std::fs::read_to_string(&own_file).unwrap(), "owned");
+                assert!(!foreign_file.exists());
+                let after = storage.load().unwrap().into_iter().find(|row| row.id == client.id).unwrap();
+                assert_eq!(after.acp_session_id, before.acp_session_id);
+                assert_eq!(after.resume_binding, before.resume_binding);
+                assert_eq!(after.acp_establishment, before.acp_establishment);
+                client.shutdown().await.unwrap();
+            }).await.expect("actual adopted callbacks and complete identity backlog finish");
+        })).await;
     }
     #[tokio::test]
+    #[serial_test::serial]
     async fn same_id_reattach_announces_no_reset() {
-        use crate::acp::acp_client::AcpClient;
-        use crate::acp::state::AcpSessionId;
-        let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("same-id.sock");
-        let control = crate::process::worker::control_socket_sibling(&socket);
-        let listener = tokio::net::UnixListener::bind(control).unwrap();
-        let runner = async {
-            let (mut peer, _) = listener.accept().await.unwrap();
-            control_protocol::write_frame(
-                &mut peer,
-                &ControlBody::Hello {
-                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                    session_id: "same-id".into(),
-                },
-            )
-            .await
-            .unwrap();
-            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
-                match frame {
-                    ControlBody::Attach { .. } => {}
-                    ControlBody::Initialize { .. } => {
-                        control_protocol::write_frame(&mut peer, &ControlBody::Initialized {
-                            result: serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
-                        }).await.unwrap();
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+            let directory = scope.tempdir();
+            let (config, native) = scope.native_peer(directory.path().into(), "codex", "codex", |request| {
+                let id = request.get("id")?;
+                Some(match request["method"].as_str().unwrap() {
+                    "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}}),
+                    "session/new" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"actual"}}),
+                    other => panic!("no new native operation on same-owner adoption: {other}"),
+                })
+            });
+            let original = scope.spawn(config, "same-id").await.unwrap();
+            original.ready().await;
+            let mut client = scope.adopt(original, false).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match client.next_event().await.unwrap() {
+                        Event::SessionContextReset { .. } => panic!("same qualified choice must not reset"),
+                        Event::AcpSessionAssigned { .. } => break,
+                        Event::AgentStartupError { message, .. } => panic!("{message}"),
+                        Event::AcpConnectionUnavailable { .. } => panic!("same physical native owner remains live"),
+                        _ => {}
                     }
-                    ControlBody::ResumeSession => {
-                        control_protocol::write_frame(
-                            &mut peer,
-                            &ControlBody::SessionReady {
-                                acp_session_id: "actual".into(),
-                                result: serde_json::json!({}),
-                                adapter_frames: 0,
-                            },
-                        )
-                        .await
-                        .unwrap();
-                    }
-                    other => panic!("unexpected frame {other:?}"),
                 }
-            }
-        };
-        let daemon = async {
-            let mut client = AcpClient::attach(
-                socket,
-                temp.path().into(),
-                vec![],
-                "actual".into(),
-                true,
-                AcpSessionId("same-id".into()),
-                None,
-                "codex".into(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-            .await
-            .unwrap();
-            // The reset, when emitted, precedes the assignment.
-            loop {
-                match client.next_event().await.unwrap() {
-                    Event::SessionContextReset { .. } => panic!("same id must not reset"),
-                    Event::AcpSessionAssigned { .. } => break,
-                    Event::AgentStartupError { message, .. } => panic!("{message}"),
-                    _ => {}
-                }
-            }
-            client.shutdown().await.unwrap();
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(runner, daemon);
-        })
-        .await
-        .unwrap();
+                client.shutdown().await.unwrap();
+            }).await.expect("real same-owner adoption assigns its certified session");
+            assert_eq!(native.requests().iter().filter(|method| *method == "session/new").count(), 1);
+        })).await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn native_identity_reattach_preserves_a_full_wire_byte_backlog() {
-        use crate::acp::acp_client::AcpClient;
-        use crate::acp::state::AcpSessionId;
-        let temp = tempfile::tempdir().unwrap();
-        let socket = temp.path().join("byte-backlog.sock");
-        let control = crate::process::worker::control_socket_sibling(&socket);
-        let listener = tokio::net::UnixListener::bind(control).unwrap();
-        let own_file = temp.path().join("own");
-        let (callback_done, callback_ready) = oneshot::channel();
-        let runner = async {
-            let (mut peer, _) = listener.accept().await.unwrap();
-            control_protocol::write_frame(
-                &mut peer,
-                &ControlBody::Hello {
-                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                    session_id: "byte-backlog".into(),
-                },
-            )
-            .await
-            .unwrap();
-            let mut callback_done = Some(callback_done);
-            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
-                match frame {
-                    ControlBody::Attach { .. } => {}
-                    ControlBody::Initialize { .. } => {
-                        control_protocol::write_frame(&mut peer, &ControlBody::Initialized {
-                            result: serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
-                        }).await.unwrap();
-                    }
-                    ControlBody::ResumeSession => {
-                        let mut wire_total = 0;
-                        for id in ["a", "b", "c"] {
-                            // Integer priorities become typed f64 values. Their later
-                            // encoding can exceed the original valid runner backlog.
-                            let body = ControlBody::Notify {
-                                method: "session/update".into(),
-                                params: serde_json::json!({
-                                    "sessionId":"s",
-                                    "update":{"sessionUpdate":"tool_call","toolCallId":id,"title":"t",
-                                        "content":vec![serde_json::json!({"type":"content","content":{
-                                            "type":"text","text":"x","annotations":{"priority":1}}});100]},
-                                    "_meta":{"pad":"x".repeat(44_730_469)}
-                                }),
-                            };
-                            let frame = control_protocol::encode_frame(&body).unwrap();
-                            wire_total += frame.len();
-                            assert!(wire_total <= control_protocol::MAX_CONTROL_QUEUE_BYTES);
-                            control_protocol::write_encoded_frame(&mut peer, &frame)
-                                .await
-                                .unwrap();
+        use crate::acp::acp_client::SdkTestOptions;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+            let directory = scope.tempdir();
+            let own_file = directory.path().join("own");
+            let (config, mut native) = scope.native_peer(directory.path().into(), "codex", "codex", |request| {
+                let id = request.get("id")?;
+                Some(match request["method"].as_str().unwrap() {
+                    "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}}),
+                    "session/new" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"s"}}),
+                    other => panic!("no native RPC on read-only adoption: {other}"),
+                })
+            });
+            let original = scope.spawn(config, "byte-backlog").await.unwrap();
+            original.ready().await;
+            let (fence, release, entered) = scope.gate();
+            let (native_seen, received_native) = oneshot::channel();
+            scope.configure_sdk(SdkTestOptions {
+                bootstrap_fence: Some(fence), native_session_seen: Some(native_seen),
+                ..Default::default()
+            });
+            let mut client = scope.adopt(original, false).await;
+            tokio::time::timeout(Duration::from_secs(120), async {
+                entered.await.unwrap();
+                received_native.await.unwrap();
+                let ingress = Arc::clone(&client.actual().test_control().ingress);
+                let state = client.actual().test_connection_state();
+                for (index, id) in ["a", "b", "c"].into_iter().enumerate() {
+                    // Typed f64 expansion exceeds the budget, but genuine wire
+                    // provenance and all three native updates still fit.
+                    let body = ControlBody::Notify { method: "session/update".into(), params: serde_json::json!({
+                        "sessionId":"s",
+                        "update":{"sessionUpdate":"tool_call","toolCallId":id,"title":"t",
+                            "content":vec![serde_json::json!({"type":"content","content":{
+                                "type":"text","text":"x","annotations":{"priority":1}}});20_000]},
+                        "_meta":{"pad":""}
+                    }), replay: None, evidence: crate::acp::control_protocol::NativeNotifyEvidence::default() };
+                    let frame = control_protocol::encode_frame(&body).unwrap();
+                    let padding = (control_protocol::MAX_CONTROL_QUEUE_BYTES - 65_536) / 3 - frame.len();
+                    drop(frame);
+                    let ControlBody::Notify { mut params, .. } = body else { unreachable!() };
+                    params["_meta"]["pad"] = serde_json::Value::String("x".repeat(padding));
+                    native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":params})).await;
+                    loop {
+                        let pending = ingress.test_pending_footprint(false);
+                        let loss = state.loss();
+                        assert!(loss.is_none(), "native byte admission {index}: loss={loss:?}; pending={pending:?}");
+                        let (failed, updates, wire_bytes, _) = pending.expect("actual bootstrap still owns pending replay");
+                        assert!(!failed, "native byte admission {index}: updates={updates}, wire_bytes={wire_bytes}");
+                        if updates == index + 1 {
+                            break;
                         }
-                        // SDK dispatch is ordered: this denied callback proves all
-                        // three updates reached pending admission before readiness.
-                        control_protocol::write_frame(
-                            &mut peer,
-                            &ControlBody::ServerCall {
-                                call_id: 1,
-                                method: "fs/read_text_file".into(),
-                                params: serde_json::json!({"sessionId":"unknown","path":own_file}),
-                            },
-                        )
-                        .await
-                        .unwrap();
+                        tokio::task::yield_now().await;
                     }
-                    ControlBody::ServerError { call_id: 1, error } => {
-                        assert_eq!(error.code, -32602);
-                        control_protocol::write_frame(
-                            &mut peer,
-                            &ControlBody::SessionReady {
-                                acp_session_id: "s".into(),
-                                result: serde_json::json!({}),
-                                adapter_frames: 0,
-                            },
-                        )
-                        .await
-                        .unwrap();
-                        control_protocol::write_frame(&mut peer, &ControlBody::ServerCall {
-                            call_id: 2, method: "fs/write_text_file".into(),
-                            params: serde_json::json!({"sessionId":"s","path":own_file,"content":"owned"}),
-                        }).await.unwrap();
-                    }
-                    ControlBody::ServerResult { call_id: 2, .. } => {
-                        callback_done.take().unwrap().send(()).unwrap();
-                    }
-                    other => panic!("unexpected frame {other:?}"),
                 }
-            }
-        };
-        let daemon = async {
-            let mut client = AcpClient::attach(
-                socket,
-                temp.path().into(),
-                vec![],
-                "stale".into(),
-                true,
-                AcpSessionId("byte-backlog".into()),
-                None,
-                "codex".into(),
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-            .await
-            .expect("producer-admitted backlog must attach");
-            let mut calls = Vec::new();
-            while calls.len() < 3 {
-                match client.next_event().await.unwrap() {
-                    Event::ToolCallStarted { tool_call } => calls.push(tool_call.id),
-                    Event::AgentStartupError { message, .. } => panic!("{message}"),
-                    _ => {}
+                native.send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"fs/read_text_file","params":{
+                    "sessionId":"unknown","path":own_file
+                }})).await;
+                let denied = native.reply().await;
+                assert_eq!(denied["id"], 1);
+                assert_eq!(denied["error"]["code"], -32602, "{denied}");
+                let (failed, updates, wire_bytes, typed_bytes) = ingress
+                    .test_pending_footprint(true).expect("bootstrap remains fenced");
+                assert!(!failed);
+                assert_eq!(updates, 3);
+                assert!(wire_bytes <= control_protocol::MAX_CONTROL_QUEUE_BYTES);
+                assert!(typed_bytes > control_protocol::MAX_CONTROL_QUEUE_BYTES);
+                while let Ok(event) = client.try_recv() {
+                    assert!(!matches!(event, Event::AcpSessionAssigned { .. } | Event::ToolCallStarted { .. }),
+                        "publication crossed the actual SDK bootstrap fence: {event:?}");
                 }
-            }
-            callback_ready.await.unwrap();
-            client.shutdown().await.unwrap();
-            assert_eq!(calls, ["a", "b", "c"]);
-            assert_eq!(std::fs::read_to_string(&own_file).unwrap(), "owned");
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(120), async {
-            tokio::join!(runner, daemon);
-        })
-        .await
-        .unwrap();
+                assert!(release.release());
+                client.ready().await;
+                native.send(serde_json::json!({"jsonrpc":"2.0","id":2,"method":"fs/write_text_file","params":{
+                    "sessionId":"s","path":own_file,"content":"owned"
+                }})).await;
+                let accepted = native.reply().await;
+                assert_eq!(accepted["id"], 2);
+                assert!(accepted.get("error").is_none(), "{accepted}");
+                let mut calls = Vec::new();
+                while calls.len() < 3 {
+                    match client.next_event().await.unwrap() {
+                        Event::ToolCallStarted { tool_call } => calls.push(tool_call.id),
+                        Event::AgentStartupError { message, .. } => panic!("{message}"),
+                        Event::AcpConnectionUnavailable { .. } => panic!("producer-admitted byte backlog must remain live"),
+                        _ => {}
+                    }
+                }
+                assert_eq!(calls, ["a", "b", "c"]);
+                assert_eq!(std::fs::read_to_string(&own_file).unwrap(), "owned");
+                client.shutdown().await.unwrap();
+            }).await.expect("full real wire-byte backlog survives actual SDK admission");
+        })).await;
     }
 
-    /// An untrusted Hello, an absent socket, or a hard dial error yields no client.
+    /// An untrusted Hello, an absent socket, or a hard dial error yields no
+    /// client, no terminal claim, and no event.
     #[tokio::test]
     #[serial_test::serial]
     async fn failed_attach_leaves_guard_unclaimed() {
@@ -2046,247 +4331,1142 @@ mod tests {
             "AOE_ACP_RUNNER_SOCKET_TIMEOUT_MS",
             "150",
         )]);
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("aoe-ctl-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let (mismatch, listener) = bind(&tmp);
         let fake = tokio::spawn(async move { accept_hello(&listener, "s", 999).await });
         let absent =
             crate::process::worker::control_socket_sibling(&tmp.path().join("absent.sock"));
         let overlong = tmp.path().join("x".repeat(200));
-        for (path, expected, unexpected) in [
-            (&mismatch, "runner Hello mismatch", None),
-            (&absent, "timed out attaching runner control socket", None),
-            (
-                &overlong,
-                "connect runner control socket",
-                Some("timed out attaching"),
-            ),
+        use crate::process::worker_registry::ControlRefusalReason;
+        for (path, expected) in [
+            (&mismatch, ControlRefusalReason::ProtocolIncompatible),
+            (&absent, ControlRefusalReason::OwnershipUnconfirmed),
+            (&overlong, ControlRefusalReason::OwnershipUnconfirmed),
         ] {
             let guard = Arc::new(TerminalClaim::new());
             let Err(error) = connect(path, "s", guard.clone(), false).await else {
                 panic!("attach to {} must fail", path.display());
             };
-            let message = format!("{error:#}");
-            assert!(message.contains(expected), "{message}");
-            assert!(unexpected.is_none_or(|u| !message.contains(u)), "{message}");
+            let AcpError::RetainedRuntimeUnavailable(refusal) = error else {
+                panic!("attach failures must preserve typed non-destructive refusal");
+            };
+            assert_eq!(refusal.reason, expected);
+            assert_eq!(refusal.owner, Some(fixture_owner()));
             assert!(!guard.claimed());
         }
         let _ = fake.await;
     }
 
-    /// A load must not count as replayed until the crate has applied the replay
-    /// sent after the session reply (#4016), and a prompt must not resolve
-    /// before the updates sent ahead of its completion, such as a rate-limit
-    /// reset, have been applied.
+    /// Actual SDK Load replay and prompt completion wait for preceding update application.
     #[tokio::test]
+    #[serial_test::serial]
     async fn barriers_wait_for_updates_applied_by_the_crate() {
-        use super::super::session_identity::SessionIngressNotification;
-        use agent_client_protocol::{ByteStreams, Client};
+        use crate::acp::acp_client::SdkTestOptions;
+        use crate::acp::supervisor::test_support::managed::with_managed;
         use futures_util::FutureExt as _;
-        use std::sync::atomic::{AtomicBool, AtomicUsize};
-        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        with_managed(|scope| Box::pin(async move {
+            let directory = scope.tempdir();
+            let (prime_config, _) = scope.native_peer(directory.path().into(), "codex", "codex", |request| {
+                let id = request.get("id")?;
+                Some(match request["method"].as_str().unwrap() {
+                    "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}}),
+                    "session/new" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"s"}}),
+                    other => panic!("unexpected original native operation: {other}"),
+                })
+            });
+            let original = scope.spawn(prime_config, "replay-prime").await.unwrap();
+            original.ready().await;
+            let (load_id, load_requested) = oneshot::channel();
+            let (prompt_id, mut prompt_requested) = mpsc::unbounded_channel();
+            let mut load_id = Some(load_id);
+            let (config, native) = scope.native_peer(directory.path().into(), "codex", "codex", move |request| {
+                let id = request.get("id")?;
+                match request["method"].as_str().unwrap() {
+                    "initialize" => Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
+                        "protocolVersion":1,"agentCapabilities":{"loadSession":true}
+                    }})),
+                    "session/load" => {
+                        assert_eq!(request["params"]["sessionId"], "s");
+                        load_id.take().unwrap().send(id.clone()).unwrap();
+                        None
+                    }
+                    "session/prompt" => {
+                        assert_eq!(request["params"]["sessionId"], "s");
+                        prompt_id.send(id.clone()).unwrap();
+                        None
+                    }
+                    other => panic!("no implicit New or retry in a real retained Load: {other}"),
+                }
+            });
+            let (update_gate, release_update, entered_update) = scope.gate();
+            scope.configure_sdk(SdkTestOptions { update: Some(update_gate), ..Default::default() });
+            let mut client = scope.retained_after(original, config, "replayed").await;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let id = load_requested.await.unwrap();
+                native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"}}
+                }})).await;
+                native.send(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}})).await;
+                entered_update.await.unwrap();
+                let control = client.actual().test_control();
+                let replayed = control.session_replayed();
+                tokio::pin!(replayed);
+                assert!(replayed.as_mut().now_or_never().is_none(), "Load cannot count as replayed mid-handler");
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+                loop {
+                    match tokio::time::timeout_at(deadline, client.next_event()).await {
+                        Err(_) => break,
+                        Ok(None) => panic!("retained Load closed while its update handler was held"),
+                        Ok(Some(event)) => assert!(!matches!(event, Event::AcpSessionAssigned { .. }),
+                            "assignment crossed the actual held SDK update handler"),
+                    }
+                }
+                assert!(release_update.release());
+                replayed.await;
+                client.ready().await;
+                loop {
+                    match client.next_event().await.expect("actual parent publishes the replay") {
+                        Event::AcpSessionAssigned { .. } => break,
+                        Event::AgentStartupError { message, .. } => panic!("{message}"),
+                        Event::AcpConnectionUnavailable { .. } => panic!("retained Load remains live"),
+                        _ => {}
+                    }
+                }
+                for limited in [false, true] {
+                    let (update_gate, release_update, entered_update) = scope.gate();
+                    client.actual().gate_next_update(update_gate);
+                    client.send_prompt("apply usage before settling", &[]).await.unwrap();
+                    let id = prompt_requested.recv().await.unwrap();
+                    for (session, used, resets_at) in [("s", 100, 4_102_444_800_i64), ("foreign", 999, 4_102_444_900_i64)] {
+                        native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":session,"update":{
+                                "sessionUpdate":"usage_update","used":used,"size":200,
+                                "_meta":{"_claude/rateLimit":{
+                                    "status":"rejected","rateLimitType":"five_hour","resetsAt":resets_at
+                                }}
+                            }
+                        }})).await;
+                    }
+                    let outcome = if limited {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-32000,"message":"actual native quota refusal","data":{"errorKind":"rate_limit"}
+                        }})
+                    } else {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}})
+                    };
+                    native.send(outcome).await;
+                    entered_update.await.unwrap();
+                    while control.settled.lock().unwrap().is_none() {
+                        while let Ok(event) = client.try_recv() {
+                            assert!(!matches!(event, Event::Stopped { .. } | Event::RateLimit { .. }),
+                                "prompt settled before its actual SDK update handler: {event:?}");
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+                    loop {
+                        match tokio::time::timeout_at(deadline, client.next_event()).await {
+                            Err(_) => break,
+                            Ok(None) => panic!("original native request remains live until update application"),
+                            Ok(Some(event)) => assert!(!matches!(event, Event::Stopped { .. } | Event::RateLimit { .. }),
+                                "native outcome crossed the held SDK update handler: {event:?}"),
+                        }
+                    }
+                    assert!(release_update.release());
+                    let mut events = Vec::new();
+                    loop {
+                        let event = client.next_event().await.unwrap();
+                        let stopped = matches!(event, Event::Stopped { .. });
+                        events.push(event);
+                        if stopped { break; }
+                    }
+                    let usage = events.iter().position(|event| matches!(event,
+                        Event::UsageUpdated { usage } if usage.used == 100)).unwrap();
+                    let stopped = events.iter().position(|event| matches!(event, Event::Stopped { .. })).unwrap();
+                    assert!(usage < stopped);
+                    let quotas: Vec<_> = events.iter().enumerate().filter(|(_, event)| matches!(event, Event::RateLimit { .. })).collect();
+                    assert_eq!(quotas.len(), usize::from(limited), "usage metadata cannot invent a Native quota outcome");
+                    if limited {
+                        assert!(usage < quotas[0].0 && quotas[0].0 < stopped);
+                        assert!(matches!(quotas[0].1, Event::RateLimit { info }
+                            if info.resets_at.is_some_and(|at| at.as_unix_secs() == 4_102_444_800)));
+                    }
+                    let expected = if limited { "rate_limited" } else { "prompt_complete" };
+                    assert!(matches!(&events[stopped], Event::Stopped { reason } if reason == expected));
+                }
+                assert_eq!(native.requests().iter().filter(|method| *method == "session/load").count(), 1);
+                assert_eq!(native.requests().iter().filter(|method| *method == "session/prompt").count(), 2);
+                assert!(!native.requests().iter().any(|method| method == "session/new"));
+                client.shutdown().await.unwrap();
+            }).await.expect("actual SDK replay and prompt barriers settle in order");
+        })).await;
+    }
+    async fn send_adopted_backlog(
+        native: &crate::acp::supervisor::test_support::managed::NativePeer,
+        prompt_id: &serde_json::Value,
+    ) {
+        for index in 0..12 {
+            native
+                .send(
+                    serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                        "sessionId":"sid-adopted","update":{
+                            "sessionUpdate":"agent_message_chunk",
+                            "content":{"type":"text","text":format!("prior output {index}\n")}
+                        }
+                    }}),
+                )
+                .await;
+        }
+        native
+            .send(serde_json::json!({"jsonrpc":"2.0","id":prompt_id,"error":{
+                "code":-32603,"message":"adopted request failed",
+                "data":{"privateTokenMarker":"must-not-leak"}
+            }}))
+            .await;
+    }
 
-        let tmp = tempfile::tempdir().unwrap();
-        let control =
-            crate::process::worker::control_socket_sibling(&tmp.path().join("replayed.sock"));
-        let listener = tokio::net::UnixListener::bind(&control).unwrap();
-        let runner = async {
-            let (mut peer, _) = listener.accept().await.unwrap();
-            control_protocol::write_frame(
-                &mut peer,
-                &ControlBody::Hello {
-                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
-                    session_id: "replayed".into(),
-                },
-            )
-            .await
-            .unwrap();
-            while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
-                match frame {
-                    ControlBody::Attach { .. } => {}
-                    ControlBody::Prompt { .. } => {
-                        for body in [
-                            ControlBody::PromptStarted { prompt_req_id: 1 },
-                            ControlBody::Notify {
-                                method: "session/update".into(),
-                                params: serde_json::json!({
-                                    "sessionId": "s",
-                                    "update": {
-                                        "sessionUpdate": "usage_update",
-                                        "used": 100,
-                                        "size": 200,
-                                        "_meta": {
-                                            "_claude/rateLimit": {
-                                                "status": "rejected",
-                                                "rateLimitType": "five_hour",
-                                                "resetsAt": 4_102_444_800_i64
-                                            }
-                                        }
-                                    }
-                                }),
-                            },
-                            ControlBody::PromptCompleted {
-                                prompt_req_id: 1,
-                                outcome: end("end_turn"),
-                            },
-                        ] {
-                            control_protocol::write_frame(&mut peer, &body)
-                                .await
-                                .unwrap();
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fresh_initialize_refusal_never_assigns_or_applies() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                // A genuine retained owner cannot change its cached successful
+                // initialize into failure. Keep Fresh refusal separate from adoption.
+                let directory = scope.tempdir();
+                let (config, native) =
+                    scope.native_peer(directory.path().into(), "gemini", "gemini", |request| {
+                        let id = request.get("id")?;
+                        assert_eq!(request["method"], "initialize");
+                        Some(serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-32603,"message":"initialize failed",
+                            "data":{"privateTokenMarker":"must-not-leak"}
+                        }}))
+                    });
+                let (id, mut observed) = scope.create_observed(config, "initialize-refused").await;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let frame = observed
+                            .recv()
+                            .await
+                            .expect("pre-factory observer must not lag");
+                        if frame.session_id != id {
+                            continue;
+                        }
+                        assert!(!serde_json::to_string(&frame.event)
+                            .unwrap()
+                            .contains("privateTokenMarker"));
+                        assert!(!matches!(&*frame.event, Event::AcpSessionAssigned { .. }));
+                        if matches!(&*frame.event, Event::AgentStartupError { .. }) {
+                            break;
                         }
                     }
-                    ControlBody::EstablishSession { .. } => {
-                        for body in [
-                            ControlBody::SessionReady {
-                                acp_session_id: "s".into(),
-                                result: serde_json::json!({}),
-                                adapter_frames: 0,
-                            },
-                            ControlBody::Notify {
-                                method: "session/update".into(),
-                                params: serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"replayed"}}}),
-                            },
-                            ControlBody::Notify {
-                                method: "_aoe/session_replayed".into(),
-                                params: serde_json::json!({}),
-                            },
-                            ControlBody::PromptCompleted {
-                                prompt_req_id: 0,
-                                outcome: end("end_turn"),
-                            },
-                        ] {
-                            control_protocol::write_frame(&mut peer, &body)
-                                .await
-                                .unwrap();
+                })
+                .await
+                .expect("real native initialize refusal reaches its actual creator");
+                assert_eq!(
+                    native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "initialize")
+                        .count(),
+                    1
+                );
+                assert!(!native
+                    .requests()
+                    .iter()
+                    .any(|method| method == "session/new"));
+                let rows = crate::session::Storage::open_unwatched("test")
+                    .unwrap()
+                    .load()
+                    .unwrap();
+                assert!(rows.iter().filter(|row| row.id == id).all(|row| !matches!(
+                    row.acp_establishment,
+                    Some(crate::acp::establishment::AcpEstablishment::Applied { .. })
+                )));
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn adopted_failure_barrier_orders_buffered_notifications_and_bootstrap_commit() {
+        use crate::acp::acp_client::SdkTestOptions;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::process::runner::test_support::managed_runner::child_if_requested;
+        use futures_util::FutureExt as _;
+        const TEST_NAME: &str = "acp::acp_client::control::tests::adopted_failure_barrier_orders_buffered_notifications_and_bootstrap_commit";
+        if child_if_requested(TEST_NAME).await {
+            return;
+        }
+        with_managed(|scope| Box::pin(async move {
+            for (case_index, (cached_before_initialize, close_control, established_first)) in [
+                (true, false, false),
+                (false, false, false),
+                (false, false, true),
+                (true, true, false),
+                (false, true, false),
+                (false, true, true),
+            ].into_iter().enumerate() {
+                let directory = scope.tempdir();
+                let inspection = scope.inspect_next_runner(TEST_NAME);
+                let (first_prompt, prompt_started) = oneshot::channel();
+                let mut first_prompt = Some(first_prompt);
+                let (config, mut native) = scope.native_peer(directory.path().into(), "gemini", "gemini", move |request| {
+                    let id = request.get("id")?;
+                    match request["method"].as_str().unwrap() {
+                        "initialize" => Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1,"agentCapabilities":{}}})),
+                        "session/new" => Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":"sid-adopted"}})),
+                        "session/prompt" => {
+                            assert_eq!(request["params"]["sessionId"], "sid-adopted");
+                            if let Some(started) = first_prompt.take() {
+                                started.send(id.clone()).unwrap();
+                                None
+                            } else {
+                                Some(serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}))
+                            }
+                        }
+                        other => panic!("no implicit native establishment during adoption: {other}"),
+                    }
+                });
+                let original = scope.spawn(config, "adopted-barrier").await.unwrap();
+                original.ready().await;
+                original.send_prompt("genuine in-flight original", &[]).await.unwrap();
+                let prompt_id = tokio::time::timeout(Duration::from_secs(10), prompt_started).await.unwrap().unwrap();
+                let (fence, release, entered) = scope.gate();
+                let (native_seen, received_native) = oneshot::channel();
+                scope.configure_sdk(SdkTestOptions {
+                    bootstrap_fence: (!established_first).then_some(fence),
+                    native_session_seen: Some(native_seen),
+                    ..Default::default()
+                });
+                let mut client = scope.adopt_with(original, true, || async {
+                    if cached_before_initialize {
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            // Detach joins the SDK, but the real runner still
+                            // has to observe that socket's EOF. No original
+                            // writer may consume this before-init backlog.
+                            loop {
+                                let snapshot = inspection.query("snapshot").await;
+                                if snapshot["attached"] == false {
+                                    assert_eq!(snapshot["queued_frames"], 0, "the original SDK left no earlier queue frames");
+                                    assert_eq!(snapshot["retained_bytes"], 0, "the original prompt has not completed yet");
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            send_adopted_backlog(&native, &prompt_id).await;
+                            loop {
+                                let snapshot = inspection.query("snapshot").await;
+                                let completions = snapshot["queued_prompt_completions"].as_array().unwrap();
+                                if let Some(completion) = completions.iter().find(|entry| entry[0] == prompt_id) {
+                                    assert_eq!(snapshot["attached"], false, "no second SDK has initialized");
+                                    assert_eq!(completions.len(), 1, "one real original outcome is cached");
+                                    assert_eq!(completion[1], 12, "native chunks precede their cached outcome");
+                                    assert_eq!(completion[2], 12, "all twelve native notifications are cached");
+                                    assert_eq!(completion[3], true, "the cached original result is the native error");
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                        }).await.expect("the genuine native outcome is cached before the new SDK initializes");
+                    }
+                }).await;
+                let actual = client.actual();
+                let control = actual.test_control();
+                let state = actual.test_connection_state();
+                let terminal = state.test_terminal.get().unwrap().clone();
+                let in_flight = state.test_in_flight.get().unwrap().clone();
+                let task = actual.observe_sdk_task();
+                let adopted_turn = terminal.current_turn();
+                assert_ne!(control.peer_identity().pid, std::process::id());
+                let retain = |events: &mut Vec<Event>, event: Event| {
+                    if matches!(&event, Event::AcpSessionAssigned { connection_ready: true, .. }) {
+                        assert!(actual.establishment_projection().and_then(|projection| projection.applied()).is_some(),
+                            "a ready assignment requires the actual Applied projection");
+                    }
+                    events.push(event);
+                };
+                let mut events = Vec::new();
+                const PHASES: &[&str] = &[
+                    "bootstrap_gate",
+                    "native_seen",
+                    "ready_before_pressure",
+                    "assignment_before_pressure",
+                    "drain_receive_pause",
+                    "backlog_written",
+                    "ordered_reverse_denial",
+                    "control_close_requested",
+                    "control_rx_closed",
+                    "gate_released",
+                    "failed_stopped",
+                    "fatal_observed",
+                    "foreground_finished",
+                    "eof_cancel_refusal",
+                    "eof_prompt_refusal",
+                    "prepare_original_retirement",
+                    "sdk_task_joined",
+                    "retired",
+                    "forged_call_written",
+                    "forged_call_rejected",
+                    "plan_written",
+                    "plan_observed",
+                    "ready_before_next_prompt",
+                    "next_prompt_sent",
+                    "next_prompt_stopped",
+                ];
+                let phase = std::sync::atomic::AtomicUsize::new(0);
+                let completed = tokio::time::timeout(Duration::from_secs(10), async {
+                    if !established_first { entered.await.unwrap(); }
+                    phase.store(1, AtomicOrdering::Relaxed);
+                    received_native.await.unwrap();
+                    if established_first {
+                        phase.store(2, AtomicOrdering::Relaxed);
+                        client.ready().await;
+                        phase.store(3, AtomicOrdering::Relaxed);
+                        loop {
+                            let event = client.next_event().await.unwrap();
+                            let assigned = matches!(event, Event::AcpSessionAssigned { .. });
+                            retain(&mut events, event);
+                            if assigned { break; }
                         }
                     }
-                    other => panic!("unexpected frame {other:?}"),
+                    // Fill the real SDK lane while its sole drain is paused.
+                    phase.store(4, AtomicOrdering::Relaxed);
+                    let pause = client.pause_drain().await;
+                    let sender = actual.test_event_queue().upgrade().unwrap();
+                    while let Some(result) = sender.historical().send(
+                        Event::AuthStatusUpdated { status: None },
+                    ).now_or_never() {
+                        result.expect("actual SDK event lane remains open");
+                    }
+                    assert_eq!(sender.capacity(), 0, "public queue is full before adopted publication");
+                    phase.store(5, AtomicOrdering::Relaxed);
+                    if !cached_before_initialize { send_adopted_backlog(&native, &prompt_id).await; }
+                    phase.store(6, AtomicOrdering::Relaxed);
+                    let barrier_id = 10_000_i64 + case_index as i64;
+                    let barrier_path = directory.path().join("denied-ordering-barrier");
+                    assert!(!barrier_path.exists());
+                    native.send(serde_json::json!({
+                        "jsonrpc": "2.0", "id": barrier_id,
+                        "method": "fs/write_text_file",
+                        "params": {
+                            "sessionId": "not-the-selected-session",
+                            "path": barrier_path,
+                            "content": "must not be written"
+                        }
+                    })).await;
+                    let denied = native.reply().await;
+                    assert_eq!(denied["id"], barrier_id);
+                    assert_eq!(denied["error"]["code"], -32602);
+                    assert!(!barrier_path.exists());
+                    assert_eq!(sender.capacity(), 0);
+                    assert!(!terminal.claimed(), "receipt is not publication under backpressure");
+                    assert_eq!(terminal.current_turn(), adopted_turn);
+                    assert!(in_flight.load(AtomicOrdering::Acquire));
+                    let operation_scope = match &*control.completion.lock().unwrap() {
+                        PromptCompletion::Adopted(Some(head)) => head.scope.clone(),
+                        _ => panic!("unpublished completion must retain its actual adopted head"),
+                    };
+                    while let Ok(event) = client.try_recv() {
+                        assert!(!matches!(&event,
+                            Event::PromptRuntimeError { .. }
+                                | Event::Stopped { .. }
+                                | Event::AcpConnectionUnavailable { .. }
+                                | Event::AgentStartupError { .. }),
+                            "completion crossed the actual publication boundary: {event:?}");
+                        retain(&mut events, event);
+                    }
+                    if close_control {
+                        phase.store(7, AtomicOrdering::Relaxed);
+                        inspection.query("close-control").await;
+                        phase.store(8, AtomicOrdering::Relaxed);
+                        loop {
+                            let ended = control.handshake_rx.lock().await.is_closed();
+                            if ended { break; }
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    phase.store(9, AtomicOrdering::Relaxed);
+                    if !established_first { assert!(release.release()); }
+                    drop(pause);
+                    drop(sender);
+                    phase.store(10, AtomicOrdering::Relaxed);
+                    loop {
+                        let event = client.next_event().await.unwrap();
+                        let stopped = matches!(event, Event::Stopped { .. });
+                        retain(&mut events, event);
+                        if stopped { break; }
+                    }
+                    let diagnostic = events.iter().position(|event| matches!(event, Event::PromptRuntimeError { .. })).unwrap();
+                    assert_eq!(events[..diagnostic].iter().filter(|event| matches!(event, Event::AgentMessageChunk { .. })).count(), 12);
+                    assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { .. })).count(), 1);
+                    assert!(matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_failed"));
+                    assert_eq!(terminal.current_turn(), adopted_turn, "buffered output cannot invent a main-turn epoch");
+                    assert!(!in_flight.load(AtomicOrdering::Acquire));
+                    assert!(!serde_json::to_string(&events).unwrap().contains("privateTokenMarker"));
+                    if close_control {
+                        phase.store(11, AtomicOrdering::Relaxed);
+                        loop {
+                            let event = client.next_event().await.unwrap();
+                            let fatal = matches!(event, Event::AcpConnectionUnavailable { .. });
+                            retain(&mut events, event);
+                            if fatal { break; }
+                        }
+                        phase.store(12, AtomicOrdering::Relaxed);
+                        while !actual.connection_state.driver_finished() {
+                            tokio::task::yield_now().await;
+                        }
+                        let expected = actual.connection_unavailable().expect("actual sticky Control EOF");
+                        assert!(matches!(expected, crate::acp::state::AcpConnectionUnavailability {
+                            source: crate::acp::state::AcpConnectionSource::Control,
+                            cause: crate::acp::state::AcpConnectionCause::IncomingEnded, ..
+                        }));
+                        assert!(!control.peer_process.exited().unwrap());
+                        assert_eq!(actual.connected_runner(), Some(control.peer_identity()), "SDK EOF preserves the captured Native owner");
+                        phase.store(13, AtomicOrdering::Relaxed);
+                        let _ = control.cancel(operation_scope.clone()).await;
+                        let request: agent_client_protocol::v1::schema::PromptRequest =
+                            serde_json::from_value(serde_json::json!({
+                                "sessionId":"sid-adopted",
+                                "prompt":[{"type":"text","text":"must be refused after observed EOF"}]
+                            })).unwrap();
+                        phase.store(14, AtomicOrdering::Relaxed);
+                        let error = match control.prompt(serde_json::to_value(request).unwrap(), operation_scope).await {
+                            Err(error) => error,
+                            Ok(_) => panic!("known Control EOF admitted a native prompt"),
+                        };
+                        assert!(matches!(&error, AcpError::ConnectionUnavailable(observation) if *observation == expected),
+                            "unexpected EOF admission error: {error:?}");
+                        let requests = native.requests();
+                        for (method, count) in [("session/new", 1), ("session/prompt", 1),
+                            ("session/load", 0), ("session/fork", 0), ("session/cancel", 0)] {
+                            assert_eq!(requests.iter().filter(|request| request.as_str() == method).count(), count, "{method}");
+                        }
+                        phase.store(15, AtomicOrdering::Relaxed);
+                        client.prepare_for_sdk_shutdown().await.unwrap();
+                        actual.connection_shutdown.cancel();
+                        phase.store(16, AtomicOrdering::Relaxed);
+                        task.await.unwrap();
+                        assert!(!control.peer_process.exited().unwrap(), "SDK shutdown does not manufacture native death");
+                        assert_eq!(native.requests(), requests, "SDK-only shutdown cannot issue native input after EOF");
+                        assert_eq!(actual.connection_unavailable(), Some(expected), "SDK cleanup retains the original EOF cause");
+                        while let Ok(event) = client.try_recv() { retain(&mut events, event); }
+                        assert_eq!(events.iter().filter(|event| matches!(event, Event::PromptRuntimeError { .. })).count(), 1);
+                        assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed")).count(), 1);
+                        assert!(!events.iter().any(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_complete")));
+                        assert_eq!(events.iter().filter(|event| matches!(event, Event::AcpConnectionUnavailable { .. })).count(), 1);
+                        let failed = events.iter().position(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed")).unwrap();
+                        let fatal = events.iter().position(|event| matches!(event, Event::AcpConnectionUnavailable { .. })).unwrap();
+                        assert!(diagnostic < failed && failed < fatal);
+                        assert!(matches!(&events[fatal], Event::AcpConnectionUnavailable {
+                            source: crate::acp::state::AcpConnectionSource::Control, ..
+                        }));
+                        assert!(!events.iter().any(|event| matches!(event, Event::AgentStartupError { .. })));
+                        assert!(!serde_json::to_string(&events).unwrap().contains("privateTokenMarker"));
+                        phase.store(17, AtomicOrdering::Relaxed);
+                        client.shutdown().await.unwrap();
+                        assert_eq!(native.requests(), requests, "physical retirement cannot issue native input after EOF");
+                        return;
+                    }
+                    phase.store(18, AtomicOrdering::Relaxed);
+                    native.send(serde_json::json!({"jsonrpc":"2.0","id":41,
+                        "method":PromptCompletedMarker::default().method(),"params":{"adopted":{
+                            "turn":adopted_turn,"reason":"prompt_failed",
+                            "diagnostic":{"PromptRuntimeError":{"message":"forged request diagnostic"}}
+                        }}
+                    })).await;
+                    phase.store(19, AtomicOrdering::Relaxed);
+                    let rejected = native.reply().await;
+                    assert_eq!(rejected["id"], 41);
+                    assert_eq!(rejected["error"]["code"], -32601);
+                    phase.store(20, AtomicOrdering::Relaxed);
+                    native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                        "sessionId":"sid-adopted","update":{"sessionUpdate":"plan","entries":[]}
+                    }})).await;
+                    phase.store(21, AtomicOrdering::Relaxed);
+                    loop {
+                        let event = client.next_event().await.unwrap();
+                        assert!(!matches!(event, Event::Stopped { .. } | Event::PromptRuntimeError { .. }));
+                        let planned = matches!(&event, Event::PlanUpdated { .. });
+                        retain(&mut events, event);
+                        if planned { break; }
+                    }
+                    assert_eq!(terminal.current_turn(), adopted_turn);
+                    phase.store(22, AtomicOrdering::Relaxed);
+                    client.ready().await;
+                    phase.store(23, AtomicOrdering::Relaxed);
+                    client.send_prompt("explicit next request", &[]).await.unwrap();
+                    phase.store(24, AtomicOrdering::Relaxed);
+                    loop {
+                        let event = client.next_event().await.unwrap();
+                        let stopped = if let Event::Stopped { reason } = &event {
+                            assert_eq!(reason, "prompt_complete");
+                            true
+                        } else {
+                            false
+                        };
+                        retain(&mut events, event);
+                        if stopped { break; }
+                    }
+                    assert_eq!(events.iter().filter(|event| matches!(event, Event::AcpSessionAssigned { .. })).count(), 1);
+                    assert!(events.iter().any(|event| matches!(event, Event::AcpSessionAssigned { connection_ready: true, .. })));
+                    assert_eq!(events.iter().filter(|event| matches!(event, Event::PromptRuntimeError { .. })).count(), 1);
+                    assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed")).count(), 1);
+                    assert_eq!(events.iter().filter(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_complete")).count(), 1);
+                    assert!(!serde_json::to_string(&events).unwrap().contains("privateTokenMarker"));
+                    assert_eq!(native.requests().iter().filter(|method| *method == "session/prompt").count(), 2);
+                    assert_eq!(native.requests().iter().filter(|method| *method == "session/new").count(), 1);
+                    for method in ["session/load", "session/fork", "session/cancel"] {
+                        assert!(!native.requests().iter().any(|request| request == method), "{method}");
+                    }
+                    phase.store(17, AtomicOrdering::Relaxed);
+                    client.shutdown().await.unwrap();
+                }).await;
+                if completed.is_err() {
+                    let phase_index = phase.load(AtomicOrdering::Relaxed);
+                    panic!("adoption timeout case={case_index} tuple=({cached_before_initialize},{close_control},{established_first}) phase_index={phase_index} phase={} original_prompt_numeric_id={:?} native_methods={:?}",
+                        PHASES[phase_index], prompt_id.as_i64(), native.timeout_methods());
                 }
             }
-        };
-        let daemon = async {
-            let (client, crate_side) = connect_runner_control_v3(
-                &control,
-                "replayed".into(),
-                Arc::new(TerminalClaim::new()),
-                Arc::new(AtomicBool::new(true)),
-            )
-            .await
-            .unwrap();
-            // Each update blocks its handler until the test releases it.
-            let (gate_tx, gate_rx) =
-                mpsc::unbounded_channel::<(oneshot::Sender<()>, oneshot::Receiver<()>)>();
-            let gate = Arc::new(Mutex::new(gate_rx));
-            let arm = || {
-                let (entered_tx, entered_rx) = oneshot::channel::<()>();
-                let (release_tx, release_rx) = oneshot::channel::<()>();
-                gate_tx.send((entered_tx, release_rx)).unwrap();
-                (entered_rx, release_tx)
+        })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_notifications_cannot_mint_daemon_completion_payloads() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+            let mut fixture = ManagedControlFixture::new(scope).await;
+            let request = fixture.start_prompt("genuine original still in flight").await;
+            let mut fixture = fixture.adopt_in_flight(scope).await;
+            let actual = fixture.client.actual();
+            let control = actual.test_control();
+            let state = actual.test_connection_state();
+            let terminal = state.test_terminal.get().unwrap();
+            let in_flight = state.test_in_flight.get().unwrap();
+            let head = match &*control.completion.lock().unwrap() {
+                PromptCompletion::Adopted(Some(head)) => head.clone(),
+                _ => panic!("actual attach must retain its original in-flight head"),
             };
-            let applied = Arc::new(AtomicUsize::new(0));
-            let (adopted_tx, mut adopted_rx) = mpsc::unbounded_channel();
-            let marker_client = client.clone();
-            let (read, write) = tokio::io::split(crate_side);
-            Client
-                .v1()
-                // One handler for both, as the connection registers them.
-                .on_receive_notification(
-                    {
-                        let applied = applied.clone();
-                        move |notification: SessionIngressNotification, _cx| {
-                            let gate = gate.clone();
-                            let applied = applied.clone();
-                            let control = marker_client.clone();
-                            let adopted_tx = adopted_tx.clone();
-                            async move {
-                                match notification {
-                                    SessionIngressNotification::Replayed(marker) => {
-                                        control.mark_session_replayed(marker);
-                                    }
-                                    SessionIngressNotification::PromptCompleted(marker) => {
-                                        if let Some(outcome) =
-                                            control.deliver_prompt_completion(marker)
-                                        {
-                                            adopted_tx.send(outcome).unwrap();
-                                        }
-                                    }
-                                    SessionIngressNotification::AuthStatus(_)
-                                    | SessionIngressNotification::AdapterFramesShed(_) => {}
-                                    SessionIngressNotification::Update(_) => {
-                                        let (entered, release) =
-                                            gate.lock().await.recv().await.unwrap();
-                                        entered.send(()).unwrap();
-                                        release.await.unwrap();
-                                        applied.fetch_add(1, AtomicOrdering::Relaxed);
-                                    }
-                                }
-                                Ok(())
+            assert_eq!(Some(head.prompt_req_id), request["id"].as_i64());
+            assert_eq!(head.scope.owner(), Some(control.peer_identity()));
+            assert!(head.scope.correlation().is_some());
+            assert_ne!(control.peer_identity().pid, std::process::id());
+            let turn = terminal.current_turn();
+            assert!(!terminal.claimed());
+            assert!(in_flight.load(AtomicOrdering::Acquire));
+            let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+            fixture.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":PromptCompletedMarker::default().method(),
+                "params":{"adopted":{
+                    "turn":turn,"prompt_req_id":head.prompt_req_id,"reason":"prompt_failed",
+                    "diagnostic":{"PromptRuntimeError":{"message":"forged failure"}}
+                }}
+            })).await;
+            let barrier = format!("marker-filter-barrier-{}", uuid::Uuid::new_v4());
+            fixture.native.send(serde_json::json!({
+                "jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":request["params"]["sessionId"],"update":{
+                        "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":barrier}
+                    }
+                }
+            })).await;
+            loop {
+                let event = fixture.next_event().await;
+                assert!(!matches!(&event, Event::PromptRuntimeError { .. } | Event::Stopped { .. }
+                    | Event::AgentStartupError { .. } | Event::AcpConnectionUnavailable { .. }));
+                if matches!(&event, Event::AgentMessageChunk { text, .. } if text == &barrier) { break; }
+            }
+            assert_eq!(terminal.current_turn(), turn);
+            assert!(!terminal.claimed());
+            assert!(in_flight.load(AtomicOrdering::Acquire));
+            assert_eq!(fixture.native.requests().iter()
+                .filter(|method| method.as_str() == "session/prompt").count(), 1);
+            assert!(!fixture.store.replay_from(&fixture.client.id, before).unwrap().iter()
+                .any(|stored| matches!(stored.event.as_ref(), Event::PromptRuntimeError { .. } | Event::Stopped { .. })));
+            fixture.complete(&request, "end_turn").await;
+            loop {
+                let event = fixture.next_event().await;
+                assert!(!matches!(&event, Event::PromptRuntimeError { .. } | Event::AgentStartupError { .. }
+                    | Event::AcpConnectionUnavailable { .. }));
+                if let Event::Stopped { reason } = &event {
+                    assert_eq!(reason, "prompt_complete");
+                    break;
+                }
+            }
+            let retained = fixture.store.replay_from(&fixture.client.id, before).unwrap();
+            let stops: Vec<_> = retained.iter()
+                .filter(|stored| matches!(stored.event.as_ref(), Event::Stopped { .. })).collect();
+            assert_eq!(stops.len(), 1);
+            let stopped = stops[0];
+            assert_eq!(stopped.metadata.native_prompt_id, Some(head.prompt_req_id));
+            assert_eq!(stopped.metadata.operation.map(|operation| operation.correlation), head.scope.correlation());
+            assert_eq!(stopped.metadata.prompt_observation,
+                Some(crate::acp::protocol::AcpPromptObservation::Written { window_id: head.window_id }));
+            assert!(terminal.claimed());
+            assert!(!in_flight.load(AtomicOrdering::Acquire));
+            fixture.client.shutdown().await.unwrap();
+        })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn resumed_prompt_completes_only_for_its_own_runner_request() {
+        use crate::acp::event_sender::EventScope;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+
+        with_managed(|scope| {
+            Box::pin(async move {
+                for old_first in [true, false] {
+                    let directory = scope.tempdir();
+                    let forbidden = directory.path().join("foreign-write");
+                    let mut fixture = ManagedControlFixture::new(scope).await;
+                    let old = fixture
+                        .start_prompt("actual original before reattachment")
+                        .await;
+                    let mut fixture = fixture.adopt_in_flight(scope).await;
+                    let actual = fixture.client.actual();
+                    let control = actual.test_control();
+                    let state = actual.test_connection_state();
+                    let terminal = state.test_terminal.get().unwrap().clone();
+                    let in_flight = state.test_in_flight.get().unwrap().clone();
+                    let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                    let new = fixture.start_prompt("actual new local request").await;
+                    assert_ne!(old["id"], new["id"]);
+                    let (new_scope, new_window) = real_pending_scope(&control, &new).await;
+                    let turn = terminal.current_turn();
+                    if old_first {
+                        fixture.complete(&old, "cancelled").await;
+                        drained_old_completion(&mut fixture, "old-first-barrier", &forbidden).await;
+                        let still_pending = real_pending_scope(&control, &new).await;
+                        assert_eq!(still_pending, (new_scope.clone(), new_window));
+                        assert_eq!(terminal.current_turn(), turn);
+                        assert!(!terminal.claimed());
+                        assert!(in_flight.load(AtomicOrdering::Acquire));
+                    }
+                    fixture.complete(&new, "max_tokens").await;
+                    own_stop(&fixture, &new).await;
+                    assert_eq!(terminal.current_turn(), turn);
+                    assert!(terminal.claimed());
+                    assert!(!in_flight.load(AtomicOrdering::Acquire));
+                    if !old_first {
+                        fixture.complete(&old, "cancelled").await;
+                        drained_old_completion(&mut fixture, "new-first-barrier", &forbidden).await;
+                        assert_eq!(terminal.current_turn(), turn);
+                        assert!(terminal.claimed());
+                        assert!(!in_flight.load(AtomicOrdering::Acquire));
+                    }
+                    let following = fixture.start_prompt("following real local request").await;
+                    let (following_scope, following_window) =
+                        real_pending_scope(&control, &following).await;
+                    assert_ne!(following["id"], new["id"]);
+                    assert_ne!(following_scope.correlation(), new_scope.correlation());
+                    assert_ne!(following_window, new_window);
+                    fixture.complete(&following, "end_turn").await;
+                    own_stop(&fixture, &following).await;
+                    let stored = fixture
+                        .store
+                        .replay_from(&fixture.client.id, before)
+                        .unwrap();
+                    let current: Vec<_> = stored
+                        .iter()
+                        .filter(|stored| {
+                            stored.metadata.scope == EventScope::OperationCurrent
+                                && matches!(stored.event.as_ref(), Event::Stopped { .. })
+                        })
+                        .collect();
+                    assert_eq!(
+                        current.len(),
+                        2,
+                        "only the two actual local requests own current completion"
+                    );
+                    for (stored, request, scope, window) in [
+                        (current[0], &new, &new_scope, new_window),
+                        (current[1], &following, &following_scope, following_window),
+                    ] {
+                        assert_eq!(stored.metadata.native_prompt_id, request["id"].as_i64());
+                        assert_eq!(
+                            stored
+                                .metadata
+                                .operation
+                                .map(|operation| operation.correlation),
+                            scope.correlation()
+                        );
+                        assert_eq!(
+                            stored.metadata.prompt_observation,
+                            Some(crate::acp::protocol::AcpPromptObservation::Written {
+                                window_id: window
+                            })
+                        );
+                    }
+                    assert!(!stored.iter().any(|stored| stored.metadata.scope
+                        == EventScope::OperationCurrent
+                        && stored.metadata.native_prompt_id == old["id"].as_i64()
+                        && matches!(stored.event.as_ref(), Event::Stopped { .. })));
+                    let methods = fixture.native.requests();
+                    assert_eq!(
+                        methods
+                            .iter()
+                            .filter(|method| *method == "session/new")
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        methods
+                            .iter()
+                            .filter(|method| *method == "session/prompt")
+                            .count(),
+                        3
+                    );
+                    assert!(!methods.iter().any(|method| matches!(
+                        method.as_str(),
+                        "session/load" | "session/fork" | "session/cancel"
+                    )));
+                    fixture.client.shutdown().await.unwrap();
+                }
+            })
+        })
+        .await;
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_runner_on_another_protocol_version_fails_with_a_mismatch_error() {
+        use crate::process::worker_registry::ControlRefusalReason;
+        for version in [5, 6, control_protocol::CONTROL_PROTOCOL_VERSION + 1] {
+            let tmp = tempfile::Builder::new()
+                .prefix("aoe-protocol-refusal-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let (socket, listener) = bind(&tmp);
+            let peer = tokio::spawn(async move {
+                let mut stream = accept_hello(&listener, "s", version).await;
+                assert!(
+                    matches!(control_protocol::read_frame(&mut stream).await, Ok(None)),
+                    "an incompatible Hello cannot receive Attach or a Native mutation"
+                );
+            });
+            let terminal = Arc::new(TerminalClaim::new());
+            let error = match connect(&socket, "s", terminal.clone(), false).await {
+                Err(error) => error,
+                Ok(_) => panic!("protocol {version} must be refused before attachment"),
+            };
+            let AcpError::RetainedRuntimeUnavailable(refusal) = error else {
+                panic!("protocol mismatch must preserve typed non-destructive refusal");
+            };
+            assert_eq!(refusal.reason, ControlRefusalReason::ProtocolIncompatible);
+            assert_eq!(refusal.owner, Some(fixture_owner()));
+            assert!(!terminal.claimed());
+            peer.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_historical_quota_keeps_only_its_written_window() {
+        use crate::acp::event_sender::EventScope;
+        use crate::acp::protocol::AcpPromptObservation;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+
+        with_managed(|scope| Box::pin(async move {
+            for report_next in [false, true] {
+                let mut fixture = ManagedControlFixture::new(scope).await;
+                let original = fixture.start_prompt("original quota before adoption").await;
+                let mut fixture = fixture.adopt_in_flight(scope).await;
+                let actual = fixture.client.actual();
+                let control = actual.test_control();
+                let state = actual.test_connection_state();
+                let terminal = state.test_terminal.get().unwrap().clone();
+                let in_flight = state.test_in_flight.get().unwrap().clone();
+                let head = match &*control.completion.lock().unwrap() {
+                    PromptCompletion::Adopted(Some(head)) => head.clone(),
+                    _ => panic!("actual adoption retains the original head"),
+                };
+                let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                fixture.native.send(serde_json::json!({
+                    "jsonrpc":"2.0", "method":"session/update", "params":{
+                        "sessionId":original["params"]["sessionId"],
+                        "update":{"sessionUpdate":"usage_update", "used":100, "size":200,
+                            "_meta":{"_claude/rateLimit":{
+                                "status":"rejected", "rateLimitType":"weekly",
+                                "resetsAt":4_102_444_800_i64
+                            }}
+                        }
+                    }
+                })).await;
+                real_control_deadline(async {
+                    loop {
+                        if matches!(fixture.next_event().await,
+                            Event::UsageUpdated { usage } if usage.used == 100)
+                        {
+                            break;
+                        }
+                    }
+                }).await;
+
+                let next = fixture.start_prompt("next explicit input while original is pending").await;
+                let (next_scope, next_window) = real_pending_scope(&control, &next).await;
+                let next_turn = terminal.current_turn();
+                assert_ne!(next_window, head.window_id);
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+
+                // Both requests are physically outstanding, so this report is Ambiguous.
+                fixture.native.send(serde_json::json!({
+                    "jsonrpc":"2.0", "method":"session/update", "params":{
+                        "sessionId":original["params"]["sessionId"],
+                        "update":{"sessionUpdate":"usage_update", "used":101, "size":200,
+                            "_meta":{"_claude/rateLimit":{
+                                "status":"rejected", "rateLimitType":"weekly",
+                                "resetsAt":4_102_445_000_i64
+                            }}
+                        }
+                    }
+                })).await;
+                real_control_deadline(async {
+                    loop {
+                        if matches!(fixture.next_event().await,
+                            Event::UsageUpdated { usage } if usage.used == 101)
+                        {
+                            break;
+                        }
+                    }
+                }).await;
+                fixture.native.send(serde_json::json!({
+                    "jsonrpc":"2.0", "id":original["id"], "error":{
+                        "code":-32000, "message":"original quota refusal",
+                        "data":{"errorKind":"rate_limit"}
+                    }
+                })).await;
+                let original_events = real_events_until_stopped(&mut fixture, "rate_limited").await;
+                let original_quotas: Vec<_> = original_events.iter().filter_map(|event| {
+                    match event { Event::RateLimit { info } => Some(info), _ => None }
+                }).collect();
+                assert_eq!(original_quotas.len(), 1);
+                assert_eq!(original_quotas[0].kind, "weekly");
+                assert_eq!(original_quotas[0].resets_at.unwrap().as_unix_secs(), 4_102_444_800);
+                assert_eq!(terminal.current_turn(), next_turn);
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                assert_eq!(real_pending_scope(&control, &next).await, (next_scope.clone(), next_window));
+                let stored = fixture.store.replay_from(&fixture.client.id, before).unwrap();
+                let quota = stored.iter().find(|stored| {
+                    matches!(stored.event.as_ref(), Event::RateLimit { .. })
+                        && stored.metadata.native_prompt_id == original["id"].as_i64()
+                }).expect("historical original quota was published");
+                assert_eq!(quota.metadata.scope, EventScope::HistoryOnly);
+                assert_eq!(quota.metadata.operation.unwrap().correlation, head.scope.correlation().unwrap());
+                assert_eq!(quota.metadata.prompt_observation, Some(
+                    AcpPromptObservation::Written { window_id: head.window_id }
+                ));
+                assert!(stored.iter().any(|stored| {
+                    matches!(stored.event.as_ref(), Event::UsageUpdated { usage } if usage.used == 101)
+                        && stored.metadata.prompt_observation == Some(AcpPromptObservation::Ambiguous)
+                }));
+
+                if report_next {
+                    fixture.native.send(serde_json::json!({
+                        "jsonrpc":"2.0", "method":"session/update", "params":{
+                            "sessionId":next["params"]["sessionId"],
+                            "update":{"sessionUpdate":"usage_update", "used":102, "size":200,
+                                "_meta":{"_claude/rateLimit":{
+                                    "status":"rejected", "rateLimitType":"five_hour",
+                                    "resetsAt":4_102_444_900_i64
+                                }}
                             }
                         }
-                    },
-                    agent_client_protocol::on_receive_notification!(),
-                )
-                .connect_with(
-                    ByteStreams::new(write.compat_write(), read.compat()),
-                    |_connection| async move {
-                        let (entered_rx, release_tx) = arm();
-                        client
-                            .establish_session("session/load", serde_json::json!({}))
-                            .await
-                            .unwrap();
-                        entered_rx.await.unwrap();
-                        let replayed = client.session_replayed();
-                        tokio::pin!(replayed);
-                        assert!(
-                            replayed.as_mut().now_or_never().is_none(),
-                            "a load must not count as replayed mid-replay"
-                        );
-                        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                            while client.settled.lock().unwrap().is_empty() {
-                                tokio::task::yield_now().await;
+                    })).await;
+                    real_control_deadline(async {
+                        loop {
+                            if matches!(fixture.next_event().await,
+                                Event::UsageUpdated { usage } if usage.used == 102)
+                            {
+                                break;
                             }
-                        })
-                        .await
-                        .expect("the reader never queued the adopted completion delivery");
-                        assert!(
-                            matches!(adopted_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
-                            "an adopted completion must wait behind the blocked update"
-                        );
-                        release_tx.send(()).unwrap();
-                        replayed.await;
-                        assert_eq!(adopted_rx.recv().await.unwrap(), end("end_turn"));
-                        assert_eq!(applied.load(AtomicOrdering::Relaxed), 1);
+                        }
+                    }).await;
+                }
+                fixture.native.send(serde_json::json!({
+                    "jsonrpc":"2.0", "id":next["id"], "error":{
+                        "code":-32000, "message":"next quota refusal",
+                        "data":{"errorKind":"rate_limit"}
+                    }
+                })).await;
+                let next_events = real_events_until_stopped(&mut fixture, "rate_limited").await;
+                let next_quotas: Vec<_> = next_events.iter().filter_map(|event| {
+                    match event { Event::RateLimit { info } => Some(info), _ => None }
+                }).collect();
+                assert_eq!(next_quotas.len(), 1);
+                if report_next {
+                    assert_eq!(next_quotas[0].kind, "five_hour");
+                    assert_eq!(next_quotas[0].resets_at.unwrap().as_unix_secs(), 4_102_444_900);
+                } else {
+                    assert_eq!(next_quotas[0].kind, "rate_limit");
+                    assert_eq!(next_quotas[0].resets_at, None);
+                }
+                assert_eq!(fixture.native.requests().iter().filter(|method| *method == "session/prompt").count(), 2);
+                fixture.client.shutdown().await.unwrap();
+            }
+        })).await;
+    }
 
-                        let (entered_rx, release_tx) = arm();
-                        let mut completion = client.prompt(serde_json::json!({})).await.unwrap();
-                        entered_rx.await.unwrap();
-                        // Wait for the reader to match the completion while the
-                        // crate is still applying the update sent before it.
-                        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                            while client.settled.lock().unwrap().is_empty() {
-                                assert_eq!(
-                                    completion.try_recv(),
-                                    Err(oneshot::error::TryRecvError::Empty),
-                                    "a prompt must not resolve before its updates are applied"
-                                );
-                                tokio::task::yield_now().await;
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_quota_hints_keep_physical_custody_and_normalize_unnamed_windows() {
+        use crate::acp::state::NativePhysicalSource;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+
+        with_managed(|scope| {
+            Box::pin(async move {
+                for rebased in [false, true] {
+                    for adopted in [false, true] {
+                        for named in [false, true] {
+                            let mut fixture = ManagedControlFixture::new(scope).await;
+                            let receipt = fixture
+                                .client
+                                .actual()
+                                .establishment_projection()
+                                .unwrap()
+                                .receipt_snapshot()
+                                .unwrap();
+                            let physical = NativePhysicalSource::from_receipt(&receipt).unwrap();
+
+                            if rebased {
+                                let mut row = scope
+                                    .state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == fixture.client.id)
+                                    .unwrap()
+                                    .clone();
+                                let generation = row.lifecycle_generation;
+                                {
+                                    let storage = crate::session::Storage::open_reference(
+                                        &row.source_profile,
+                                    )
+                                    .unwrap();
+                                    let _native =
+                                        storage.acquire_instance_lifecycle_lock(&row.id).unwrap();
+                                    row.advance_auxiliary_generation_in(&storage).unwrap();
+                                    assert!(row.lifecycle_generation > generation);
+                                }
+                                // Refresh only from the genuinely persisted lifecycle mutation.
+                                let mut rows = scope.state.instances.write().await;
+                                *rows
+                                    .iter_mut()
+                                    .find(|current| current.id == fixture.client.id)
+                                    .unwrap() = row;
                             }
-                        })
-                        .await
-                        .expect("the reader never queued the local prompt completion delivery");
-                        release_tx.send(()).unwrap();
-                        assert_eq!(completion.await.unwrap(), end("end_turn"));
-                        assert_eq!(applied.load(AtomicOrdering::Relaxed), 2);
-                        client.shutdown();
-                        Ok(())
-                    },
-                )
-                .await
-                .unwrap();
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(runner, daemon);
+
+                            let before = fixture.store.highest_seq(&fixture.client.id).unwrap();
+                            let request = fixture
+                                .start_prompt("quota hint after genuine admission")
+                                .await;
+                            let control = fixture.client.actual().test_control();
+                            let (original_scope, window) =
+                                real_pending_scope(&control, &request).await;
+                            let origin = original_scope.origin(Some(&receipt)).unwrap();
+                            assert_eq!(origin.owner, Some(control.peer_identity()));
+                            assert_eq!(origin.attempt_id, physical.witness.attempt_id);
+                            assert_eq!(origin.producer, physical.witness.producer);
+                            assert_eq!(origin == physical.witness, !rebased);
+                            assert_eq!(origin.generation == physical.witness.generation, !rebased);
+                            if adopted {
+                                fixture = fixture.adopt_in_flight(scope).await;
+                            }
+
+                            let mut report = serde_json::json!({
+                                "status":"rejected", "resetsAt":4_102_444_800_i64
+                            });
+                            if named {
+                                report["rateLimitType"] = serde_json::json!("weekly");
+                            }
+                            fixture.native.send(serde_json::json!({
+                            "jsonrpc":"2.0", "method":"session/update", "params":{
+                                "sessionId":request["params"]["sessionId"],
+                                "update":{"sessionUpdate":"usage_update", "used":100, "size":200,
+                                    "_meta":{"_claude/rateLimit":report}}
+                            }
+                        })).await;
+                            fixture
+                                .native
+                                .send(serde_json::json!({
+                                    "jsonrpc":"2.0", "id":request["id"], "error":{
+                                        "code":-32000, "message":"genuine original quota refusal",
+                                        "data":{"errorKind":"rate_limit"}
+                                    }
+                                }))
+                                .await;
+                            let events =
+                                real_events_until_stopped(&mut fixture, "rate_limited").await;
+                            let quotas: Vec<_> = events
+                                .iter()
+                                .filter_map(|event| match event {
+                                    Event::RateLimit { info } => Some(info),
+                                    _ => None,
+                                })
+                                .collect();
+                            assert_eq!(quotas.len(), 1);
+                            assert_eq!(quotas[0].kind, if named { "weekly" } else { "rate_limit" });
+                            assert_eq!(quotas[0].resets_at.unwrap().as_unix_secs(), 4_102_444_800);
+                            assert_one_real_stopped(
+                                &fixture,
+                                before,
+                                &request,
+                                &original_scope,
+                                window,
+                            );
+                            let stored = fixture
+                                .store
+                                .replay_from(&fixture.client.id, before)
+                                .unwrap();
+                            let quota = stored
+                                .iter()
+                                .find(|entry| {
+                                    matches!(entry.event.as_ref(), Event::RateLimit { .. })
+                                        && entry.metadata.native_prompt_id == request["id"].as_i64()
+                                })
+                                .unwrap();
+                            assert_eq!(quota.metadata.native_origin, Some(origin));
+                            assert_eq!(
+                                quota.metadata.operation.unwrap().correlation,
+                                original_scope.correlation().unwrap()
+                            );
+                            assert_eq!(
+                                quota.metadata.prompt_observation,
+                                Some(crate::acp::protocol::AcpPromptObservation::Written {
+                                    window_id: window,
+                                })
+                            );
+                            assert_eq!(
+                                fixture
+                                    .native
+                                    .requests()
+                                    .iter()
+                                    .filter(|method| *method == "session/new")
+                                    .count(),
+                                1
+                            );
+                            assert_eq!(
+                                fixture
+                                    .native
+                                    .requests()
+                                    .iter()
+                                    .filter(|method| *method == "session/prompt")
+                                    .count(),
+                                1
+                            );
+                            fixture.client.shutdown().await.unwrap();
+                        }
+                    }
+                }
+            })
         })
-        .await
-        .unwrap();
+        .await;
     }
 }

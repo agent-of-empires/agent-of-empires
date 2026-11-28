@@ -17,6 +17,7 @@ import { Markdown } from "./Markdown";
 
 interface Props {
   plan: string;
+  canDecide: boolean;
   submitting: boolean;
   offline: boolean;
   /** An answer list: its options are offered instead of the Allow/Always/Deny trio. */
@@ -63,7 +64,7 @@ function useModalFocus(onClose: () => void) {
 const VIEWS = ["rendered", "raw"] as const;
 type View = (typeof VIEWS)[number];
 
-export function PlanModal({ plan, submitting, offline, options, onDecide, onClose }: Props) {
+export function PlanModal({ plan, canDecide, submitting, offline, options, onDecide, onClose }: Props) {
   const [view, setView] = useState<View>("rendered");
   const marker = useModalFocus(onClose);
   // A plan link opens the file viewer behind the dialog, so the modal closes
@@ -98,7 +99,7 @@ export function PlanModal({ plan, submitting, offline, options, onDecide, onClos
     setView(next);
     document.getElementById(`plan-tab-${next}`)?.focus();
   };
-  const blocked = offline || submitting;
+  const blocked = !canDecide || offline || submitting;
   const decide = (label: string, decision: ApprovalDecision, className: string, optionId?: string) => (
     <button
       key={optionId ?? decision}
@@ -106,7 +107,9 @@ export function PlanModal({ plan, submitting, offline, options, onDecide, onClos
       className={className}
       disabled={blocked}
       title={offline ? OFFLINE_TITLE : undefined}
-      onClick={() => onDecide(decision, optionId)}
+      onClick={() => {
+        if (!blocked) onDecide(decision, optionId);
+      }}
     >
       {label}
     </button>

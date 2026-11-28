@@ -6,7 +6,7 @@
 import type { ThreadMessageLike } from "@assistant-ui/react";
 
 import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
-import { lastClearIndex } from "../../lib/acpHistoryWindow";
+import { clearHistoryProjection, lastClearIndex } from "../../lib/acpHistoryWindow";
 import type { ActivityRow, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
 import { type AgentProfile, DEFAULT_AGENT_PROFILE } from "../../lib/agentProfile";
 
@@ -24,8 +24,9 @@ const TOOL_GROUP_MAX_RUN = 10;
 /** React key for the fold point: the last `/clear` id, "none" before one, "all" when unfolded. */
 export function clearFoldGeneration(rows: readonly ActivityRow[], showClearedTurns: boolean): string {
   if (showClearedTurns) return "all";
-  const i = lastClearIndex(rows);
-  return i < 0 ? "none" : rows[i]!.id;
+  const projected = clearHistoryProjection(rows);
+  const i = lastClearIndex(projected);
+  return i < 0 ? "none" : projected[i]!.id;
 }
 
 function parseDate(iso: string): Date | undefined {
@@ -56,8 +57,9 @@ export function activityToThreadMessages(
   profile: AgentProfile = DEFAULT_AGENT_PROFILE,
 ): ThreadMessageLike[] {
   // Turns before the last /clear are forgotten by the model, so they fold by default.
-  const start = showClearedTurns ? -1 : lastClearIndex(rows);
-  const effectiveRows = start >= 0 ? rows.slice(start) : rows;
+  const projected = clearHistoryProjection(rows);
+  const start = showClearedTurns ? -1 : lastClearIndex(projected);
+  const effectiveRows = start >= 0 ? projected.slice(start) : projected;
 
   // Builders stay open until the end so background subagent children can land in their parent's message.
   const messages: (ThreadMessageLike | AssistantBuilder)[] = [];
@@ -144,7 +146,7 @@ export function activityToThreadMessages(
       // A sub-agent call whose card is outside these rows is never a row of its own.
       if (parentId && !parentBuilder) continue;
       const builder = parentBuilder ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
-      builder.appendToolCall(row.tool, !!parentBuilder);
+      builder.appendToolCall(row.tool, !!parentBuilder, row.output);
       builderByToolId.set(row.tool.id, builder);
     } else if (row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") {
       const toolCallId = row.toolCallId ?? row.id.replace(/^(done|stopped)-/, "");
@@ -160,9 +162,6 @@ export function activityToThreadMessages(
         row.asyncSubagent ?? false,
         row.output,
       );
-    } else if (row.kind === "empty_output") {
-      // A turn with no output (interactive-only slash commands) gets a muted note.
-      (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(`_${row.text}_`);
     } else if (row.kind === "thinking") {
       (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendReasoning(row.text, row.messageStart);
     } else {
@@ -237,7 +236,7 @@ class AssistantBuilder {
   }
 
   /** assistant-ui parts carry no timestamps or titles, so they travel as namespaced args. */
-  appendToolCall(tool: ToolCall, isChild = false) {
+  appendToolCall(tool: ToolCall, isChild = false, output?: ToolOutputBlock[]) {
     const argsObj = parseJsonObject(tool.args_preview) ?? {};
     if (tool.name) argsObj._aoe_title = tool.name;
     if (tool.started_at) argsObj._aoe_started_at = tool.started_at;
@@ -248,6 +247,8 @@ class AssistantBuilder {
     // `args_preview` is cut at ingest, so an oversized Task prompt only survives here.
     if (tool.prompt) argsObj._aoe_prompt = tool.prompt;
     if (tool.diffs?.length) argsObj._aoe_diffs = tool.diffs;
+    // Streamed output is not a tool result; keep the part open until a real terminal arrives.
+    if (output?.length) argsObj._aoe_partial_output = output;
     const part: ToolPart = {
       type: "tool-call",
       toolCallId: tool.id,

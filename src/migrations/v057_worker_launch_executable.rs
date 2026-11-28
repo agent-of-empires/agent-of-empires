@@ -1,5 +1,5 @@
 //! Registered `WorkerRecord.launch_executable` and `launch_resolved_executable`, retired alongside
-//! v064; spawns rewrite worker records, so no migration drops them.
+//! v066; spawns rewrite worker records, so no migration drops them.
 
 use anyhow::Result;
 

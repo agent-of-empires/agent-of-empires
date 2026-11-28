@@ -29,7 +29,7 @@ pub(super) struct PreparedLaunch {
     pub(super) canonical_conversation: Option<ConversationState>,
     pub(super) expected_prior_omp_generation: Option<String>,
     pub(super) execution: Option<super::execution::NativeExecution>,
-    /// Relocated and store-adopted conversations require durable confirmation.
+    /// Conversation changes require durable confirmation.
     pub(super) require_conversation_publication: bool,
 }
 
@@ -1205,11 +1205,15 @@ impl Instance {
                 &self.resolved_host_environment(),
             ));
         }
-        let require_conversation_publication = execution
-            .as_ref()
-            .is_some_and(|execution| execution.binding.agent == "opencode")
-            && !fork_mints_child
-            && self.stored_fork_child().is_some();
+        let replaces_conversation = !is_existing
+            && (expected_conversation.session_id.is_some()
+                || expected_conversation.intent != ResumeIntent::Default);
+        let require_conversation_publication = replaces_conversation
+            || (execution
+                .as_ref()
+                .is_some_and(|execution| execution.binding.agent == "opencode")
+                && !fork_mints_child
+                && self.stored_fork_child().is_some());
         Ok(PreparedLaunch {
             command,
             is_existing,

@@ -1,6 +1,7 @@
 // Structured view composer controls: slash command picks, Stop, and the mode picker.
 
 import type { Page } from "@playwright/test";
+import type { TranscriptRow } from "../../../src/lib/acpTypes";
 import { test, expect } from "../../helpers/liveTest";
 import {
   HOLD,
@@ -114,10 +115,22 @@ test("Stop cancels the turn whatever the agent is doing", async ({ page, spawnSe
     await test.step(`Stop while ${c.name}`, async () => {
       const cancelledBefore = await cancelledTurns();
       await idle.fill(c.prompt);
-      await idle.press("Enter");
+      await page.getByRole("button", { name: "Send message", exact: true }).click();
       await expect.poll(replay).toContain(c.marker);
       await expect(stopButton(page)).toBeVisible({ timeout: 15_000 });
-      await stopButton(page).click();
+      // A same-frontier refresh can disable Stop after Playwright's actionability check.
+      await page.waitForFunction(
+        () => {
+          const button = document.querySelector<HTMLButtonElement>(
+            '[data-testid="composer-actions"] button[aria-label="Stop"]',
+          );
+          if (!button || button.disabled) return false;
+          button.click();
+          return true;
+        },
+        undefined,
+        { timeout: 15_000 },
+      );
       await expect(idle).toBeVisible({ timeout: 15_000 });
       await expect(stopButton(page)).toBeHidden({ timeout: 15_000 });
       await expect.poll(cancelledTurns).toBe(cancelledBefore + 1);
@@ -126,31 +139,50 @@ test("Stop cancels the turn whatever the agent is doing", async ({ page, spawnSe
   }
 });
 
-test("stopping mid-tool settles the card and survives reload", async ({ page, spawnServe }) => {
-  // #1646: a cancel emits no per-tool completion, so the card used to stay "running" forever.
+test("cancelling preserves unattributed output without inventing a tool result", async ({ page, spawnServe }) => {
+  const partial = "Retained partial Native output.";
   const { serve, sessionId } = await startAcpSession(spawnServe, {
-    title: "story-stuck-tool",
-    fakeAcpScript: script(endTurn(STOP_CASES[2]!.updates[0]!, HOLD)),
+    title: "story-unattributed-tool",
+    fakeAcpScript: script(endTurn(chunk(partial), STOP_CASES[2]!.updates[0]!, HOLD)),
   });
   await openStructuredView(page, serve, sessionId, "run a slow tool");
-  // The exact title excludes the prompt echo and the "Operating Slow tool…" spinner.
-  const card = () =>
-    page.getByText("Slow tool", { exact: true }).locator("xpath=ancestor::div[contains(@class,'rounded-md')][1]");
-  await expect(card()).toBeVisible({ timeout: 10_000 });
-  await expect(card().getByText("running", { exact: true })).toBeVisible({ timeout: 10_000 });
-
-  await expect(stopButton(page)).toBeVisible({ timeout: 10_000 });
+  const card = page.getByText("Slow tool", { exact: true });
+  await expect(card).toBeVisible();
+  await expect(page.getByText(partial, { exact: true })).toBeVisible();
   await stopButton(page).click();
 
-  const expectStopped = async () => {
-    await expect(card()).toBeVisible({ timeout: 10_000 });
-    await expect(card().getByText("stopped", { exact: true })).toBeVisible({ timeout: 10_000 });
-    await expect(card().getByText("running", { exact: true })).toBeHidden();
+  type ObservedFrame = {
+    seq: number;
+    event?: { Stopped?: { reason: string } };
+    operation?: { outcome?: string };
+    prompt_observation?: { state: string; window_id?: string };
+    output_uncertainty?: string;
   };
-  await expectStopped();
+  const cancelled = async () =>
+    ((await replayFrames(serve.baseUrl, sessionId)) as ObservedFrame[]).find(
+      (frame) => frame.event?.Stopped?.reason === "cancelled" && frame.operation?.outcome === "succeeded",
+    );
+  await expect.poll(cancelled).toBeDefined();
+  const terminal = (await cancelled())!;
+  expect(terminal.prompt_observation?.state).toBe("written");
+  expect(terminal.prompt_observation?.window_id).toEqual(expect.any(String));
+  expect(terminal.output_uncertainty).toBe(terminal.prompt_observation?.window_id);
+  await expect(stopButton(page)).toBeHidden();
+
+  const expectRetained = async () => {
+    await expect(card).toBeVisible();
+    await expect(page.getByText(partial, { exact: true })).toBeVisible();
+    const replay = (await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?view=rows&since=0`).then(
+      (response) => response.json(),
+    )) as { highest_seq: number; rows: TranscriptRow[] };
+    expect(replay.highest_seq).toBeGreaterThanOrEqual(terminal.seq);
+    const toolRows = replay.rows.filter((row) => row.tool_call_id === "tc-stop-tool-1");
+    expect(toolRows.map((row) => row.kind)).toEqual(["tool_start"]);
+  };
+  await expectRetained();
   await page.reload();
   await waitForStructuredView(page);
-  await expectStopped();
+  await expectRetained();
 });
 
 function modeTrigger(page: Page, labels: RegExp) {

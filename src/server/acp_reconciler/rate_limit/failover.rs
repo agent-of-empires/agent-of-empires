@@ -500,12 +500,6 @@ impl Drop for InFlight {
     }
 }
 
-/// Marks a failover to `target` as running for `id` until the returned guard drops.
-#[cfg(test)]
-pub(super) fn hold_in_flight(id: &str, target: &str) -> impl Sized {
-    InFlight::claim(id, target).expect("no failover is running for the session")
-}
-
 pub(crate) fn in_flight(id: &str) -> bool {
     lock(&IN_FLIGHT).contains_key(id)
 }
@@ -582,16 +576,6 @@ impl Retries {
     fn succeeded(&mut self, id: &str) {
         self.0.remove(id);
     }
-}
-
-/// The failed attempts recorded for `id`'s park, if any were made.
-#[cfg(test)]
-pub(super) fn attempts_made(id: &str, park: i64) -> Option<u32> {
-    lock(&RETRIES)
-        .0
-        .get(id)
-        .filter(|retry| retry.park == park)
-        .map(|retry| retry.failures)
 }
 
 /// Whether a failover for `id` is running, or must wait for a retry or give way, so the caller
@@ -820,18 +804,23 @@ mod tests {
         assert!(begin_outage(&flag), "a later outage is");
     }
 
-    /// A login failure the target's launch reported is recorded against the target, but only
-    /// when it came after the attempt started, not from an earlier launch.
+    /// Only an error after the attempt starts marks its target unusable.
     #[test]
     fn a_login_failure_after_the_attempt_marks_the_target_unusable() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            crate::acp::event_store::EventStore::open(&dir.path().join("events.db"), 100).unwrap();
+        let store = crate::acp::event_store::EventStore::open(
+            &dir.path().join("events.db"),
+            100,
+            Arc::default(),
+        )
+        .unwrap();
+        let event = crate::acp::state::Event::startup_error("Authentication required");
         store
             .record(
                 "s",
                 1,
-                &crate::acp::state::Event::startup_error("Authentication required"),
+                &event,
+                &crate::acp::event_sender::EventMetadata::host(&event),
             )
             .unwrap();
         let now = Timestamp::now().as_millis();
@@ -851,13 +840,16 @@ mod tests {
         );
     }
 
-    /// B failed to log in at `initialize`, which leaves no startup error in the session's log:
-    /// the next pass must still pass over B and take C.
+    /// A login failure before session establishment still excludes that account.
     #[test]
     fn a_login_failure_the_launch_reported_sends_the_next_pass_to_the_next_account() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            crate::acp::event_store::EventStore::open(&dir.path().join("events.db"), 100).unwrap();
+        let store = crate::acp::event_store::EventStore::open(
+            &dir.path().join("events.db"),
+            100,
+            Arc::default(),
+        )
+        .unwrap();
         let pool = [account("b", "/b"), account("c", "/c")];
         let now = Timestamp::now().as_millis();
         let pick = || {
@@ -881,13 +873,16 @@ mod tests {
         assert!(state.has_headroom(now + AUTH_FAILED_RETRY_MS), "it expires");
     }
 
-    /// A limit B's launch reported is B's: it holds B for the window, leaves A untouched, and the
-    /// next pass takes C; with C limited too nothing is left.
+    /// A target's launch limit excludes it without changing the original account.
     #[test]
     fn a_rate_limit_the_launch_reported_is_recorded_against_the_target() {
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            crate::acp::event_store::EventStore::open(&dir.path().join("events.db"), 100).unwrap();
+        let store = crate::acp::event_store::EventStore::open(
+            &dir.path().join("events.db"),
+            100,
+            Arc::default(),
+        )
+        .unwrap();
         let pool = [account("b", "/b"), account("c", "/c")];
         let now = Timestamp::now().as_millis();
         let limited = |kind: &str, resets_in_ms: Option<i64>| FailoverError {

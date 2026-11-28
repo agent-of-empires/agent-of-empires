@@ -66,13 +66,15 @@ On Apple Container, worker descriptor snapshots are streamed as a tar archive by
 
 CLI stop and kill persist a stop intent before signalling. Reattachment, automatic respawn, queued turns, and runner publication respect that fence. Only an explicit resume after settled retirement can clear the stop intent it observed; a newer stop remains authoritative. A message typed into a stopped session from the dashboard, TUI or CLI starts it as an explicit resume; already-queued prompts and MCP, plugin or automated prompts keep waiting behind the fence and a stopped session with queued prompts shows a startup banner saying so, while `no_revive` senders are refused. For a tracked runtime that cannot prove settlement, externally stop only that execution on its original host or pinned container and retry `aoe acp stop <id>`.
 
+ACP session-ID and store assignments do not consume a committed Stop or dormancy marker, even when the originating worker epoch is still current. An assignment does not resolve a failed operation or clear its diagnostic. Native lifecycle and queue-wake producers own wake decisions before launch admission. Uncorrelated assignments preserve explicit conversation choices and outstanding import/fork markers; matching opaque IDs do not attest a store. Completion effects use the existing native launch admission or matched retained handoff scope. Attach retains its captured admission on the original lease. Display-only renames do not revoke this conversation-completion scope; pre-birth title checks remain in launch admission.
+
 A legacy Prime record without an attested native cleanup route cannot be retired automatically. Upgrades pin an existing control receipt only when it matches the recorded execution route; otherwise the route and ownership record remain intact with an unknown control path. First identify its original host or container and externally stop every native worker and service belonging to that execution. If that scope cannot be identified or its shutdown cannot be confirmed, retain the record. Do not use a global Prime shutdown that would affect unrelated executions.
 
 After confirming native shutdown and verifying the original runner has exited, run `aoe acp recover <id> --confirm-prime-stopped` on the original worker host. The flag is an operator attestation, not proof obtained by AoE. Recovery refuses live original runners, attested native routes, non-Prime records, and changed execution identities. It retires only the selected record and runner sockets, not conversation history.
 
 Malformed registry bytes remain an admission fence. After externally stopping the original runner and all its host or container native processes, use `aoe acp recover <id> --confirm-worker-stopped`. This covers unattested legacy runners and orphaned runner groups after external settlement. Recovery observes rather than signals: a known runner or group still executing, a live control-socket peer, changed evidence, or failed cleanup of an attested native route prevents retirement. Unidentified native receipts remain intact. If the original scope cannot be identified and stopped, retain the record rather than discarding it.
 
-Prime 0.10.0 does not advertise ACP `session/load`: reattachment preserves a live session, but a cold ACP start creates a new native context and reports a context reset.
+Prime 0.10.0 does not advertise ACP `session/load`. Reattachment preserves a live session. If native continuation is unavailable, a cold ACP start preserves the selected conversation and history instead of implicitly creating a fresh context; recovery must be explicit.
 
 ### Switching provider
 
@@ -86,6 +88,8 @@ Two further effects are worth knowing before you switch:
 - A sandboxed session's container is recreated, since the GCP credential mount is decided when the container is built. Anything written inside the container but outside the workspace volume is lost.
 
 The switch is refused while a turn or a background agent is running, since it restarts the worker. Once idle, the worker restarts and resumes the same conversation.
+
+An account restart out of a confirmed rate-limit park captures its qualified continuation before the replacement worker's assignment retires that park. Unconfirmed or unreadable quota history refuses the restart instead of defaulting to an unparked turn. The manual budget breadcrumb must commit before continuation installation; both stay under the submission guard and current lifecycle generation. A publication failure installs no pending input, and an explicit wake or newer queued work keeps precedence.
 
 ### Feature matrix
 
@@ -147,7 +151,9 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 - **CLI:** defaults to the terminal view; opt in with `--structured-view` or `--agent`.
 - Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (requires a healthy runtime; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface. A session whose command or arguments carry the agent's own session flag (`--resume <id>`, for example) lets that flag pick the conversation. A switch that also chooses a conversation is refused with 409 `command_selects_conversation`, and one where AoE also holds a conversation for the session with 409 `command_selector_conflict`; remove the flag to switch. A switch owed from before that refusal ends in Terminal view with the session in Error: restart it with the flag removed, or run `aoe session set-session-id <session> ""` and restart it to run its command as written.
 
-If the agent cannot resume a prior conversation, the transcript reports a context reset before assigning a fresh conversation. Recorded terminal context and an explicitly selected conversation count as prior context. Reattaching to the same live conversation does not add a reset.
+AoE reserves a structured worker before closing the terminal. If admission is refused, the terminal stays open.
+
+If the agent cannot resume a prior conversation, AoE preserves the conversation selection and transcript history and refuses an implicit new conversation. Recorded terminal context and an explicitly selected conversation count as prior context. Inspect the current state and use explicit recovery rather than resending a prompt to create replacement context. Reattaching to the same live conversation does not reset it.
 
 Non-ACP tools always run in the terminal view.
 
@@ -179,6 +185,8 @@ placeholders.
 Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
+
+HTTP and websocket replay preserve operation qualifiers even in hidden prefixes. A local request's terminal cannot settle other tools or replace their streamed output with an invented success.
 
 The reader refreshes available content automatically, including replacements or
 backfills that leave sequence bounds unchanged, and preserves focus and scroll

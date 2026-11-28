@@ -9,7 +9,12 @@ import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
-import { visibleSessionNotices } from "../../lib/acpTypes";
+import {
+  canDecideRequest,
+  canSubmitPromptIntent,
+  nativeInputAvailable,
+  visibleSessionNotices,
+} from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
 import { isNewSessionStarting, notRunningCopy } from "./startupWait";
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
@@ -222,11 +227,13 @@ function AcpChrome({
   const notRunning = notRunningCopy(state, agentName(state.agent ?? acpAgent));
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
+  const nativeReady = status === "open" && nativeInputAvailable(state);
+  const canDecide = (nonce: string) => !readOnly && status === "open" && canDecideRequest(state, nonce);
   // Rows before the latest `/clear` divider are the hidden history.
   const hiddenCount = lastClearIndex(state.activity);
   const [primerPrefill, setPrimerPrefill] = useState<Prefill>(null);
   // The usage-limit banner covers a cap park while the limit is still known.
-  const exhaustedWithoutLimit = state.rateLimitRetriesExhausted && !state.rateLimit;
+  const exhaustedWithoutLimit = state.rateLimitRetriesExhausted === true && !state.rateLimit;
   // Phone-width only: fold the composer away for reading.
   const composerCollapsible = !useIsWideViewport();
   const [composerCollapsed, setComposerCollapsed] = useState(false);
@@ -249,8 +256,8 @@ function AcpChrome({
     localInflight: state.inflightPromptIds.length > 0,
   });
 
-  // An adapter that failed the compatibility check never runs, so no chat surface.
-  if (state.incompatibleAgent) {
+  // Structured compatibility diagnostics do not override a current healthy native receipt.
+  if (state.incompatibleAgent && !nativeReady) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
         <StartupErrorScreen
@@ -378,16 +385,26 @@ function AcpChrome({
                 <ApprovalCard
                   key={approval.nonce}
                   approval={approval}
-                  onResolve={(decision, optionId) => ctx.resolveApproval(approval.nonce, decision, optionId)}
+                  canDecide={canDecide(approval.nonce)}
+                  onResolve={(decision, optionId) => {
+                    if (!canDecide(approval.nonce)) return Promise.reject(new Error("Decision authority unavailable"));
+                    return ctx.resolveApproval(approval.nonce, decision, optionId);
+                  }}
                 />
               ))}
 
               {state.pendingElicitations.map((elicitation) => (
-                <AskUserQuestionCard
-                  key={elicitation.nonce}
-                  elicitation={elicitation}
-                  onResolve={(resolution) => ctx.resolveElicitation(elicitation.nonce, resolution)}
-                />
+                <fieldset key={elicitation.nonce} disabled={!canDecide(elicitation.nonce)} className="contents">
+                  <AskUserQuestionCard
+                    elicitation={elicitation}
+                    canDecide={canDecide(elicitation.nonce)}
+                    onResolve={(resolution) => {
+                      if (!canDecide(elicitation.nonce))
+                        return Promise.reject(new Error("Decision authority unavailable"));
+                      return ctx.resolveElicitation(elicitation.nonce, resolution);
+                    }}
+                  />
+                </fieldset>
               ))}
             </div>
           </ThreadPrimitive.Viewport>
@@ -486,7 +503,7 @@ function ComposerDock({
         rateLimit={state.rateLimit}
         autoResume={view.rateLimitAutoResume}
         failoverTo={view.rateLimitFailoverTo}
-        retriesExhausted={state.rateLimitRetriesExhausted}
+        retriesExhausted={state.rateLimitRetriesExhausted === true}
         settingsHref={view.settingsHref ?? null}
         onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
       />
@@ -503,7 +520,7 @@ function ComposerDock({
           online: status === "open",
           anyPending: state.queuedPrompts.some((q) => q.pending),
           waitingFor: startingAgent,
-          rateLimitParked: state.rateLimitParked,
+          rateLimitParked: state.rateLimitParked === true,
           rateLimit: state.rateLimit,
           rateLimitAutoResume: view.rateLimitAutoResume,
           // Idle-dormant and rate-limit-parked Workers wake on a send, so they aren't down.
@@ -529,7 +546,7 @@ function ComposerDock({
         onRetry={ctx.retryRejectedPrompt}
         onDismiss={ctx.dismissRejectedPrompt}
         disabled={
-          state.workerRestarting || state.workerStopped || Boolean(state.startupError) || Boolean(state.integrationLost)
+          !!blockedReason || status !== "open" || !canSubmitPromptIntent(state) || Boolean(state.integrationLost)
         }
       />
 
@@ -597,7 +614,16 @@ function ComposerDock({
             canRestart: !!view.canRestartAgent,
           }}
           availableCommands={state.availableCommands}
-          connected={status === "open" && !state.workerStopped && !state.workerRestarting}
+          connected={status === "open" && nativeInputAvailable(state)}
+          canCancelHostIntent={
+            status === "open" &&
+            state.nativeSnapshotSeq != null &&
+            state.connectionUnavailable === null &&
+            state.hostPromptIntent != null
+          }
+          canForceEndTurn={ctx.canForceEndTurn}
+          stopTurn={ctx.stopTurn}
+          canSubmit={status === "open" && canSubmitPromptIntent(state)}
           turnActive={state.turnActive}
           enqueuePrompt={ctx.sendPrompt}
           promptCapabilities={state.promptCapabilities}

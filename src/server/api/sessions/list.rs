@@ -37,10 +37,39 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionResponse> {
+pub(crate) async fn queue_control_states(
+    state: &Arc<AppState>,
+) -> anyhow::Result<HashMap<String, crate::acp::state::AcpState>> {
+    let ids: Vec<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|row| row.is_structured() && !row.queued_prompts.is_empty())
+        .map(|row| row.id.clone())
+        .collect();
+    let mut controls = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let control = state.session_service.fold_control_state(&id).await?;
+        controls.insert(id, control);
+    }
+    Ok(controls)
+}
+
+/// Sample worker presence and qualified queue state before publication/instance exclusion.
+pub(crate) async fn project_sessions(
+    state: &Arc<AppState>,
+    worker_states: &HashMap<
+        String,
+        (
+            crate::daemon::AcpWorkerState,
+            Option<crate::daemon::AcpWorkerStart>,
+        ),
+    >,
+    queue_controls: &HashMap<String, crate::acp::state::AcpState>,
+) -> anyhow::Result<Vec<SessionResponse>> {
     let instances = state.instances.read().await;
     let probes = crate::json_probe::Memo::default();
-    let worker_states = state.acp_supervisor.worker_states_snapshot().await;
     // Every positional overlay shares this filtered view.
     let scoped_instances: Vec<&Instance> = instances
         .iter()
@@ -255,9 +284,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         }
     }
 
-    // Inputs for the rate-limit park overlay, snapshotted so the blocking
-    // batch can run once the registry read lock is released. A live worker is
-    // never parked, so only workerless sessions pay for the probe.
+    // Snapshot canonical quota probes before releasing the registry read lock.
     let park_probes: Vec<(usize, String, String, Option<crate::session::Instance>)> = sessions
         .iter()
         .zip(scoped_instances.iter().copied())
@@ -369,7 +396,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     drop(instances);
     if !park_probes.is_empty() {
         let store = Arc::clone(&state.acp_event_store);
-        let overlays = tokio::task::spawn_blocking(move || {
+        let overlays = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             use std::collections::HashMap;
             let mut config_cache: HashMap<
                 String,
@@ -377,53 +404,47 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             > = HashMap::new();
             park_probes
                 .into_iter()
-                .map(|(i, id, profile, workerless)| {
-                    let (auto_resume, failover) = config_cache
-                        .entry(profile.clone())
-                        .or_insert_with(|| {
-                            let config =
-                                crate::session::config::profile_config::resolve_config_or_warn(
-                                    &profile,
-                                );
+                .map(|(i, id, profile, workerless)| -> anyhow::Result<_> {
+                    use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
+                    let (auto_resume, failover) =
+                        config_cache.entry(profile.clone()).or_insert_with(|| {
+                            let cfg = crate::session::resolve_config_or_warn(&profile);
                             (
-                                config.acp.rate_limit_auto_resume,
-                                crate::server::acp_reconciler::FailoverSettings::of(&config),
+                                cfg.acp.rate_limit_auto_resume,
+                                crate::server::acp_reconciler::FailoverSettings::of(&cfg),
                             )
-                        })
-                        .clone();
-                    let park = workerless.as_ref().and_then(|_| store.rate_limit_park(&id));
-                    let failover_to =
-                        workerless
-                            .as_ref()
-                            .zip(park.as_ref())
-                            .and_then(|(row, park)| {
-                                crate::server::acp_reconciler::failover_target(
-                                    row,
-                                    &failover,
-                                    park,
-                                    store.rate_limit_redelivery_streak(&id),
-                                    &store,
-                                )
-                            });
+                        });
+                    let (known, park) = match store.rate_limit_park(&id)? {
+                        Known(park) => (true, park),
+                        Indeterminate => (false, None),
+                    };
+                    let failover_to = match (workerless.as_ref(), park.as_ref()) {
+                        (Some(row), Some(park)) => match store.rate_limit_redelivery_streak(&id)? {
+                            Known(streak) => crate::server::acp_reconciler::failover_target(
+                                row, failover, park, streak, &store,
+                            ),
+                            Indeterminate => None,
+                        },
+                        _ => None,
+                    };
                     let park = park.map(|park| {
                         park.info
                             .unwrap_or_else(crate::acp::state::RateLimitInfo::undated)
                     });
-                    (i, auto_resume, park, failover_to)
+                    Ok((i, *auto_resume, known, park, failover_to))
                 })
-                .collect::<Vec<_>>()
+                .collect::<anyhow::Result<Vec<_>>>()
         })
-        .await
-        .unwrap_or_default();
-        for (i, auto_resume, park, failover_to) in overlays {
+        .await??;
+        for (i, auto_resume, known, park, failover_to) in overlays {
             sessions[i].rate_limit_auto_resume = Some(auto_resume);
+            sessions[i].rate_limit_known = Some(known);
             sessions[i].rate_limit = park;
             sessions[i].rate_limit_failover_to = failover_to;
         }
     }
 
-    // After the park overlay, which is one of its inputs, and unlocked, because the fold
-    // takes the registry lock itself.
+    // The park overlay completes the pre-publication queue-state snapshot.
     for (i, id, first, agent_key, idle_dormant) in queue_probes {
         use crate::daemon::AcpWorkerState::{Resuming, Running};
         let worker = crate::acp::dispatch::WorkerLiveness {
@@ -431,9 +452,11 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             idle_dormant,
             rate_limit_parked: sessions[i].rate_limit.is_some(),
         };
-        let control = state.session_service.fold_control_state(&id).await;
+        let Some(control) = queue_controls.get(&id) else {
+            continue;
+        };
         let solo = crate::acp::agent_profiles::resolve(&agent_key).is_solo_command(&first);
-        sessions[i].queue_reason = crate::acp::dispatch::queue_hold(&control, worker, solo);
+        sessions[i].queue_reason = crate::acp::dispatch::queue_hold(control, worker, solo);
     }
 
     // Resolve remote owners with a permanent cache on AppState
@@ -489,7 +512,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         }
     }
 
-    sessions
+    Ok(sessions)
 }
 
 #[derive(Default)]
@@ -842,6 +865,7 @@ mod workspace_ordering_tests {
             last_accessed_at: None,
             idle_entered_at: None,
             last_error: None,
+            last_error_evidence: None,
             branch: branch.map(str::to_string),
             main_repo_path: None,
             base_branch: None,
@@ -881,6 +905,7 @@ mod workspace_ordering_tests {
                 reason: ContextResumeUnavailableReason::NoTarget,
             }),
             rate_limit: None,
+            rate_limit_known: None,
             rate_limit_auto_resume: None,
             rate_limit_failover_to: None,
             queued_count: 0,
@@ -937,6 +962,178 @@ mod workspace_ordering_tests {
             (worktree, "/tmp/repo::main"),
         ] {
             assert_eq!(workspace_id_for_session(&response), expected);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn canonical_quota_metadata_preserves_known_absent_unknown_and_sql_failure() {
+        use crate::acp::event_sender::EventMetadata;
+        use crate::acp::event_store::ControlKnowledge::Known;
+        use crate::acp::state::{test_support::prompt, Event, RateLimitInfo};
+        for (present, background, shelf, undated) in [
+            (false, false, "live", false),
+            (true, false, "live", false),
+            (false, true, "live", false),
+            (true, true, "live", false),
+            (true, false, "live", true),
+            (true, false, "archived", false),
+            (true, false, "trashed", false),
+            (false, false, "terminal", false),
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let project = tempdir().unwrap();
+            let mut row = Instance::new("quota metadata", project.path().to_str().unwrap());
+            row.source_profile = "default".into();
+            row.view = if shelf == "terminal" {
+                crate::session::View::Terminal
+            } else {
+                crate::session::View::Structured
+            };
+            row.status = if background {
+                crate::session::Status::Running
+            } else {
+                crate::session::Status::Idle
+            };
+            if shelf == "archived" {
+                row.archive();
+            }
+            if shelf == "trashed" {
+                row.trash();
+            }
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            // Snapshot DATA only: no worker is installed and no runtime or I/O grant is created.
+            let mut workers = HashMap::new();
+            if present {
+                workers.insert(
+                    row.id.clone(),
+                    (crate::daemon::AcpWorkerState::Running, None),
+                );
+            }
+            let input = prompt("interrupted main");
+            state
+                .acp_event_store
+                .record(&row.id, 1, &input, &EventMetadata::host(&input))
+                .unwrap();
+            let mut metadata = crate::server::test_support::sql_projection_metadata();
+            state
+                .acp_event_store
+                .record(&row.id, 2, &Event::ThinkingStarted, &metadata)
+                .unwrap();
+            metadata.operation.as_mut().unwrap().outcome =
+                Some(crate::acp::protocol::AcpOriginalRequestResult::Failed);
+            metadata.prompt_observation =
+                Some(crate::acp::protocol::AcpPromptObservation::Written {
+                    window_id: crate::acp::protocol::AcpPromptWindowId::new(),
+                });
+            let reset = crate::time::Timestamp::now() + crate::time::Duration::hours(1);
+            let quota = Event::RateLimit {
+                info: RateLimitInfo {
+                    status: "limited".into(),
+                    resets_at: (!undated).then_some(reset),
+                    kind: "usage".into(),
+                },
+            };
+            state
+                .acp_event_store
+                .record(&row.id, 3, &quota, &metadata)
+                .unwrap();
+            state
+                .acp_event_store
+                .record(
+                    &row.id,
+                    4,
+                    &Event::Stopped {
+                        reason: "rate_limited".into(),
+                    },
+                    &metadata,
+                )
+                .unwrap();
+            if background {
+                let event = Event::BackgroundAgentLaunched {
+                    agent_id: "background".into(),
+                    tool_call_id: "background-tool".into(),
+                    description: "historical work".into(),
+                    prompt: "historical work".into(),
+                    model: "test".into(),
+                    output_file: String::new(),
+                    workflow: None,
+                    started_at: crate::time::Timestamp::now(),
+                };
+                state
+                    .acp_event_store
+                    .record(&row.id, 5, &event, &EventMetadata::history())
+                    .unwrap();
+            }
+            assert_eq!(
+                state
+                    .acp_event_store
+                    .has_in_flight_main_turn(&row.id)
+                    .unwrap(),
+                Known(false)
+            );
+            let controls = queue_control_states(&state).await.unwrap();
+            let projected = project_sessions(&state, &workers, &controls)
+                .await
+                .expect("canonical projection");
+            let response = &projected[0];
+            let eligible = shelf == "live";
+            assert_eq!(response.rate_limit.is_some(), eligible);
+            assert_eq!(response.rate_limit_known, eligible.then_some(true));
+            assert_eq!(response.rate_limit_auto_resume, eligible.then_some(false));
+            assert_eq!(
+                response.acp_worker_state == crate::daemon::AcpWorkerState::Running,
+                present
+            );
+            if eligible {
+                assert_eq!(response.status, row.status.wire_str());
+                assert_eq!(
+                    response.rate_limit.as_ref().unwrap().resets_at,
+                    (!undated).then_some(reset)
+                );
+                state
+                    .acp_event_store
+                    .test_conn()
+                    .execute(
+                        "DELETE FROM acp_events WHERE session_id=?1 AND seq<4",
+                        [&row.id],
+                    )
+                    .unwrap();
+                state.acp_event_store.control_cache().forget(&row.id);
+                let controls = queue_control_states(&state).await.unwrap();
+                let unknown = project_sessions(&state, &workers, &controls).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(&unknown[0]).unwrap()["rate_limit_known"],
+                    false
+                );
+                assert_eq!(unknown[0].status, row.status.wire_str());
+                let next = state.acp_event_store.highest_seq(&row.id).unwrap() + 1;
+                let new_input = prompt("new explicit main intent");
+                state
+                    .acp_event_store
+                    .record(&row.id, next, &new_input, &EventMetadata::host(&new_input))
+                    .unwrap();
+                let absent = project_sessions(&state, &workers, &controls).await.unwrap();
+                assert_eq!(absent[0].rate_limit_known, Some(true));
+                assert!(absent[0].rate_limit.is_none());
+                state
+                    .acp_event_store
+                    .test_conn()
+                    .execute_batch(
+                        "ALTER TABLE acp_rate_limit_budgets RENAME TO hidden_list_budgets",
+                    )
+                    .unwrap();
+                state.acp_event_store.control_cache().forget(&row.id);
+                assert!(project_sessions(&state, &workers, &controls).await.is_err());
+                state
+                    .acp_event_store
+                    .test_conn()
+                    .execute_batch(
+                        "ALTER TABLE hidden_list_budgets RENAME TO acp_rate_limit_budgets",
+                    )
+                    .unwrap();
+            }
+            state.shutdown.cancel();
         }
     }
 

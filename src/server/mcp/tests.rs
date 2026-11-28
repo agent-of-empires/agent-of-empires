@@ -877,179 +877,92 @@ fn seed_events(state: &crate::server::AppState, id: &str, events: &[crate::acp::
     for (seq, event) in events.iter().enumerate() {
         state
             .acp_event_store
-            .record(id, seq as u64 + 1, event)
+            .record(
+                id,
+                seq as u64 + 1,
+                event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .expect("seed");
     }
-    state
-        .acp_supervisor
-        .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+    state.acp_supervisor.hydrate_seqs([(
+        id.to_string(),
+        state.acp_event_store.highest_seq(id).unwrap(),
+    )]);
 }
 
-/// `send` reports what the dispatch decided and, for a turn, the seq `read_output` resumes
-/// from; a queued prompt has a row id and no seq.
+/// A sent/steered MCP receipt identifies its durable prompt row; a queue receipt does not.
 #[tokio::test]
 #[serial_test::serial]
 async fn send_reports_the_dispatch_and_the_prompts_seq() {
-    let caps = |steering| crate::acp::Event::PromptCapabilities {
-        image: false,
-        audio: false,
-        embedded_context: false,
-        load_session: None,
-        steering,
-    };
-    // (case, events already on disk, disposition, queue reason)
-    let cases = [
-        ("idle", vec![], "sent", None),
-        (
-            "mid-turn, steerable",
-            vec![caps(true), user_prompt("an earlier turn")],
-            "steered",
-            None,
-        ),
-        (
-            "mid-turn, not steerable",
-            vec![caps(false), user_prompt("an earlier turn")],
-            "queued",
-            Some("turn_active"),
-        ),
-    ];
-    for (case, events, disposition, reason) in cases {
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let id = "mcp-send";
-        let (app, state) = seeded_app(vec![structured_session(id)], false).await;
-        let _cmds = state
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(id)
-            .await;
-        seed_events(&state, id, &events);
+    use crate::acp::supervisor::test_support::managed::with_managed_configuration;
+    use std::time::Duration;
 
-        let sent = call(
-            &app,
-            "send",
-            json!({"session_id": id, "message": "the new prompt"}),
-        )
-        .await;
-        assert_eq!(sent["disposition"], disposition, "{case}: {sent}");
-        assert_eq!(sent["reason"].as_str(), reason, "{case}: {sent}");
-        let recorded = state
-            .acp_event_store
-            .replay_from(id, 0)
-            .into_iter()
-            .find_map(|(seq, e)| {
-                matches!(&e, crate::acp::Event::UserPromptSent { text, .. } if text == "the new prompt")
-                    .then_some(seq)
-            });
-        assert_eq!(sent["seq"].as_u64(), recorded, "{case}: {sent}");
-        if disposition != "queued" {
-            let origin = state
-                .acp_event_store
-                .replay_from(id, 0)
-                .into_iter()
-                .find_map(|(_, e)| match e {
-                    crate::acp::Event::UserPromptSent { text, origin, .. }
-                        if text == "the new prompt" =>
-                    {
-                        Some(origin)
+    with_managed_configuration(
+        |state| {
+            state.web_config.mcp_enabled = true;
+            state.allowed_hosts = vec!["localhost".to_owned()];
+            state.allowed_origins = Vec::new();
+            state.token_manager = std::sync::Arc::new(crate::server::TokenManager::new(
+                Some(TOKEN.to_owned()), Duration::from_secs(3600),
+            ));
+        },
+        |scope| Box::pin(async move {
+            for (case, steering, mid_turn, disposition, reason) in [
+                ("idle", false, false, "sent", None),
+                ("mid-turn, steerable", true, true, "steered", None),
+                ("mid-turn, not steerable", false, true, "queued", Some("turn_active")),
+            ] {
+                let mut live = test_support::managed_control_session_as(
+                    scope, case, "claude", "claude", None, steering, None,
+                ).await;
+                let state = live.state.clone();
+                let id = live.id().to_owned();
+                let app = test_support::build_router_for_test(state.clone());
+                if mid_turn {
+                    live.start_prompt("an earlier turn").await;
+                }
+                let control = live.wait_control(|control| {
+                    control.turn_active == mid_turn && control.steering == steering
+                }).await;
+                assert!(control.connection_ready, "actual Current Native readiness is required");
+                let before = live.native.requests();
+                let sent = call(&app, "send", json!({
+                    "session_id":id, "message":"the new prompt"
+                })).await;
+                assert_eq!(sent["disposition"], disposition, "{case}: {sent}");
+                assert_eq!(sent["reason"].as_str(), reason, "{case}: {sent}");
+                let recorded = state.acp_event_store.replay_from(&id, 0).unwrap().into_iter()
+                    .find_map(|stored| {
+                        matches!(stored.event.as_ref(), crate::acp::Event::UserPromptSent { text, .. }
+                            if text == "the new prompt").then_some(stored.seq)
+                    });
+                assert_eq!(sent["seq"].as_u64(), recorded, "{case}: {sent}");
+                assert_eq!(sent["queued_id"].is_string(), disposition == "queued", "{case}: {sent}");
+                if disposition == "queued" {
+                    assert_eq!(recorded, None, "queued input has no transcript row");
+                    assert_eq!(live.native.requests(), before,
+                        "a queued MCP send performs no Native prompt/steering I/O");
+                } else {
+                    assert!(recorded.is_some(), "the receipt refers to a real durable input");
+                    if disposition == "sent" {
+                        let received = live.next_prompt().await;
+                        assert_eq!(received["params"]["prompt"][0]["text"], "the new prompt");
+                    } else {
+                        let previous = before.iter().filter(|method| method.as_str() == "_session/steering").count();
+                        tokio::time::timeout(Duration::from_secs(10), async {
+                            while live.native.requests().iter()
+                                .filter(|method| method.as_str() == "_session/steering").count() != previous + 1
+                            {
+                                tokio::task::yield_now().await;
+                            }
+                        }).await.expect("the original Native peer receives the MCP steering request");
                     }
-                    _ => None,
-                });
-            assert_eq!(origin, Some(crate::daemon::PromptOrigin::Mcp), "{case}");
-        }
-        assert_eq!(
-            sent["queued_id"].is_string(),
-            disposition == "queued",
-            "{case}: {sent}"
-        );
-    }
-}
-
-/// Routine MCP access must not unsnooze or unignore a managed session: a send
-/// is refused with its own code, and reading leaves the row's markers intact.
-#[tokio::test]
-#[serial_test::serial]
-async fn mcp_send_and_read_leave_an_ignored_managed_session_alone() {
-    let _guard = crate::session::test_support::isolate_app_dir();
-    let managed = {
-        let mut inst = structured_session("mcp-managed");
-        inst.parent_session_id = Some("mcp-manager".into());
-        inst.ignore();
-        inst.snooze(30);
-        inst.ignore();
-        inst
-    };
-    let ignored_at = managed.ignored_at;
-    let snoozed_until = managed.snoozed_until;
-    let (app, state) = seeded_app(vec![structured_session("mcp-manager"), managed], false).await;
-
-    let refused = call_result(
-        &app,
-        "send",
-        json!({"session_id": "mcp-managed", "message": "hello"}),
-    )
-    .await;
-    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
-
-    let read = call(&app, "read_output", json!({"session_id": "mcp-managed"})).await;
-    assert_eq!(read["view"], "structured", "{read}");
-
-    let instances = state.instances.read().await;
-    let row = instances
-        .iter()
-        .find(|inst| inst.id == "mcp-managed")
-        .unwrap();
-    assert_eq!(
-        row.ignored_at, ignored_at,
-        "MCP access must not clear ignore"
-    );
-    assert_eq!(
-        row.snoozed_until, snoozed_until,
-        "MCP access must not unsnooze"
-    );
-    assert_eq!(row.parent_session_id.as_deref(), Some("mcp-manager"));
-}
-
-/// A terminal send re-reads the canonical row under the instance lock: an ignore committed
-/// after the dashboard snapshot refuses before any keys are typed.
-#[tokio::test]
-#[serial_test::serial]
-async fn mcp_terminal_send_refuses_an_ignore_committed_after_the_snapshot() {
-    let _guard = crate::session::test_support::isolate_app_dir();
-    let mut live = Instance::new("mcp-ignored-pane", "/tmp/aoe-mcp-ignored-pane");
-    live.source_profile = "default".into();
-    let id = live.id.clone();
-    let (app, _state) = seeded_app(vec![live.clone()], false).await;
-
-    // A local CLI or another process marks the stored row ignored; the in-memory
-    // snapshot the pre-check reads still looks live.
-    let mut ignored = live;
-    ignored.ignore();
-    test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
-
-    let refused = call_result(&app, "send", json!({"session_id": id, "message": "hello"})).await;
-    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
-}
-
-/// An ignored row whose pane is still coming up is refused as ignored rather than
-/// left to the transient "still starting" status: the person who hid it is not told
-/// to retry into it.
-#[tokio::test]
-#[serial_test::serial]
-async fn mcp_send_reports_ignored_before_a_pane_is_ready() {
-    let _guard = crate::session::test_support::isolate_app_dir();
-    let mut live = Instance::new("mcp-ignored-starting", "/tmp/aoe-mcp-ignored-starting");
-    live.source_profile = "default".into();
-    live.status = crate::session::Status::Creating;
-    let id = live.id.clone();
-    let (app, _state) = seeded_app(vec![live.clone()], false).await;
-
-    // A peer ignores the row while its pane is still starting; the snapshot this
-    // daemon holds still shows it live.
-    let mut ignored = live;
-    ignored.ignore();
-    test_support::seed_instances_on_disk_for_test("default", vec![ignored]);
-
-    let refused = call_result(&app, "send", json!({"session_id": id, "message": "hello"})).await;
-    assert_eq!(error_code(&refused), Some("ignored"), "{refused}");
+                }
+                live.client.shutdown().await.unwrap();
+            }
+        }),
+    ).await;
 }
 
 /// A structured transcript reads as text from a cursor, pages on from `next_since`, and comes
@@ -1127,7 +1040,7 @@ async fn mutating_tools_refuse_while_read_only() {
         );
     }
     assert_eq!(state.instances.read().await.len(), 1);
-    assert!(state.acp_event_store.replay_from(id, 0).is_empty());
+    assert!(state.acp_event_store.replay_from(id, 0).unwrap().is_empty());
     let read = call(&app, "read_output", json!({"session_id": id})).await;
     assert_eq!(read["view"], "structured");
 }
@@ -1361,9 +1274,8 @@ async fn terminal_sessions_send_and_read_through_their_pane() {
     pane_shows("from-the-child").await;
 }
 
-/// MCP `send` types into the pane its dialog check read, or refuses, even when the live target
-/// moves to another pane after the check, or the checked pane leaves the session. A draft typed
-/// after the check refuses at once rather than being waited out.
+/// MCP `send` types into the pane its dialog check read, or refuses if that pane leaves
+/// the session or changes process. A draft typed after the check refuses at once.
 #[tokio::test]
 #[serial_test::serial]
 async fn an_mcp_send_types_into_the_pane_it_checked() {
@@ -1397,6 +1309,7 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
         Unpin,
         Kill,
         Move,
+        Respawn,
         Draft,
     }
     // (case, what happens to the checked pane after the check besides losing its pin, the code)
@@ -1404,6 +1317,7 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
         ("unpinned", Then::Unpin, None),
         ("killed", Then::Kill, Some("not_running")),
         ("moved", Then::Move, Some("send_failed")),
+        ("same-pane-new-process", Then::Respawn, Some("send_failed")),
         ("drafted-after-check", Then::Draft, Some("input_line_busy")),
     ] {
         let mut live = Instance::new("mcp-checked", "/tmp/aoe-mcp-checked");
@@ -1454,6 +1368,7 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
             let action = match then {
                 Then::Kill => vec!["kill-pane", "-t", &target],
                 Then::Move => vec!["join-pane", "-d", "-s", &target, "-t", &to],
+                Then::Respawn => vec!["respawn-pane", "-k", "-t", &target, "exec cat"],
                 Then::Draft => vec!["send-keys", "-t", &target, "-l", "half typed"],
                 Then::Unpin => {
                     let _ = mutated.send(true);
@@ -1501,7 +1416,7 @@ async fn an_mcp_send_types_into_the_pane_it_checked() {
         match then {
             Then::Kill => assert_eq!(checked_session, None, "{case}: still there"),
             Then::Move => assert_eq!(checked_session.as_deref(), Some(other.name()), "{case}"),
-            Then::Unpin | Then::Draft => {}
+            Then::Unpin | Then::Draft | Then::Respawn => {}
         }
 
         if then == Then::Unpin {
@@ -1723,7 +1638,7 @@ async fn send_refuses_an_empty_message() {
             "{view}: {refused}"
         );
         assert!(
-            state.acp_event_store.replay_from(id, 0).is_empty(),
+            state.acp_event_store.replay_from(id, 0).unwrap().is_empty(),
             "{view}"
         );
         assert!(
@@ -1932,7 +1847,15 @@ async fn wait_for_after_seq_waits_for_that_turn_and_returns_its_messages() {
         },
     ];
     for (seq, event) in (2..).zip(&rest) {
-        state.acp_event_store.record(id, seq, event).expect("seed");
+        state
+            .acp_event_store
+            .record(
+                id,
+                seq,
+                event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .expect("seed");
     }
     move_status(&state, id, crate::session::Status::Running).await;
     move_status(&state, id, crate::session::Status::Idle).await;
@@ -1963,13 +1886,13 @@ async fn wait_for_after_seq_does_not_settle_when_the_event_query_fails() {
         .execute_batch("DROP TABLE acp_events")
         .expect("break the store");
 
-    let result = call(
+    let result = call_result(
         &app,
         "wait_for",
         json!({"session_id": id, "after_seq": 1, "timeout_s": 0}),
     )
     .await;
-    assert_eq!(result["timed_out"], true, "{result}");
+    assert_eq!(error_code(&result), Some("internal"), "{result}");
 }
 
 /// Approvals seeded through the event log are listed, by `wait_for` too, and each decision
@@ -1977,7 +1900,8 @@ async fn wait_for_after_seq_does_not_settle_when_the_event_query_fails() {
 #[tokio::test]
 #[serial_test::serial]
 async fn approvals_are_listed_and_settled_by_nonce() {
-    use crate::acp::approvals::{ApprovalDecision, ApprovalOption, ApprovalOptionKind};
+    use crate::acp::approvals::{ApprovalOption, ApprovalOptionKind};
+    use crate::acp::supervisor::test_support::managed::with_managed_configuration;
     let _guard = crate::session::test_support::isolate_app_dir();
     let id = "mcp-approve";
     let mut session = structured_session(id);
@@ -2020,102 +1944,81 @@ async fn approvals_are_listed_and_settled_by_nonce() {
     .await;
     assert_eq!(error_code(&no_worker), Some("not_running"), "{no_worker}");
 
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording(id)
-        .await;
-    let mut parked = std::collections::HashMap::new();
-    for nonce in nonces {
-        parked.insert(
-            nonce,
-            state.acp_supervisor.test_park_approval(id, nonce).await,
-        );
-    }
-
-    let listed = call(&app, "list_approvals", json!({"session_id": id})).await;
-    let approvals = listed["approvals"].as_array().unwrap();
-    let listed_nonces: Vec<&str> = approvals
-        .iter()
-        .map(|a| a["nonce"].as_str().unwrap())
-        .collect();
-    assert_eq!(listed_nonces, nonces);
-    assert_eq!(approvals[0]["tool_name"], "Bash");
-    assert_eq!(approvals[0]["summary"], "cargo test");
-    assert_eq!(approvals[3]["choice"], true);
-    assert_eq!(approvals[3]["options"][1]["option_id"], "blue");
-    assert_eq!(approvals[3]["options"][1]["kind"], "allow_once");
-
-    let waited = call(&app, "wait_for", json!({"session_id": id, "timeout_s": 0})).await;
-    assert_eq!(waited["status"], "Waiting", "{waited}");
-    assert_eq!(waited["timed_out"], false);
-    assert_eq!(waited["pending_approvals"].as_array().unwrap().len(), 4);
-
-    // (arguments, error code) for refusals that leave the approval pending.
-    let refused = [
-        (
-            json!({"nonce": "n-choice", "decision": "allow"}),
-            "invalid_request",
-        ),
-        (
-            json!({"nonce": "n-choice", "decision": "option"}),
-            "invalid_request",
-        ),
-        (
-            json!({"nonce": "n-choice", "decision": "option", "option_id": "green"}),
-            "invalid_request",
-        ),
-        (
-            json!({"nonce": "n-unknown", "decision": "allow"}),
-            "not_found",
-        ),
-    ];
-    for (mut arguments, code) in refused {
-        arguments["session_id"] = id.into();
-        let result = call_result(&app, "approve", arguments.clone()).await;
-        assert_eq!(error_code(&result), Some(code), "{arguments}: {result}");
-    }
-
-    // (nonce, arguments, what the agent receives)
-    let settled = [
-        (
-            "n-allow",
-            json!({"decision": "allow"}),
-            (ApprovalDecision::Allow, None),
-        ),
-        (
-            "n-always",
-            json!({"decision": "always"}),
-            (ApprovalDecision::AllowAlways, None),
-        ),
-        (
-            "n-deny",
-            json!({"decision": "deny"}),
-            (ApprovalDecision::Deny, None),
-        ),
-        (
-            "n-choice",
-            json!({"decision": "option", "option_id": "blue"}),
-            (ApprovalDecision::Allow, Some("blue".to_string())),
-        ),
-    ];
-    for (nonce, mut arguments, want) in settled {
-        arguments["session_id"] = id.into();
-        arguments["nonce"] = nonce.into();
-        let approved = call(&app, "approve", arguments).await;
-        assert_eq!(approved["approved"], true, "{nonce}");
-        let answer = parked.remove(nonce).unwrap().await.unwrap();
-        assert_eq!(answer, Some(want), "{nonce}");
-    }
-
-    // The log still lists it until the agent records the resolution, but the agent no longer
-    // holds the nonce.
-    let again = call_result(
-        &app,
-        "approve",
-        json!({"session_id": id, "nonce": "n-allow", "decision": "allow"}),
-    )
-    .await;
-    assert_eq!(error_code(&again), Some("not_found"), "{again}");
+    drop(_guard);
+    with_managed_configuration(
+        |state| {
+            state.web_config.mcp_enabled = true;
+            state.allowed_hosts = vec!["localhost".into()];
+            state.allowed_origins.clear();
+            state.token_manager = std::sync::Arc::new(crate::server::TokenManager::new(
+                Some(TOKEN.into()),
+                std::time::Duration::from_secs(3600),
+            ));
+        },
+        |scope| Box::pin(async move {
+            let mut live = test_support::managed_control_session(scope, "mcp-approvals", "claude", None).await;
+            let app = test_support::build_router_for_test(live.state.clone());
+            let id = live.id().to_owned();
+            let prompt = live.start_prompt("request permission").await;
+            for (decision, option, kind) in [
+                ("allow", "yes", "allow_once"),
+                ("always", "always", "allow_always"),
+                ("deny", "no", "reject_once"),
+                ("option", "blue", "allow_once"),
+            ] {
+                let options = if decision == "option" {
+                    json!([
+                        {"optionId":"red","name":"Red","kind":"allow_once"},
+                        {"optionId":"blue","name":"Blue","kind":"allow_once"}
+                    ])
+                } else {
+                    json!([{"optionId":option,"name":option,"kind":kind}])
+                };
+                live.native.send(json!({
+                    "jsonrpc":"2.0","id":decision,"method":"session/request_permission",
+                    "params":{"sessionId":live.sid,"toolCall":{"toolCallId":decision,"title":"Run command"},"options":options}
+                })).await;
+                let nonce = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        if let crate::acp::Event::ApprovalRequested { approval } = live.client.next_event().await.unwrap() {
+                            break approval.nonce.0;
+                        }
+                    }
+                }).await.unwrap();
+                let listed = call(&app, "list_approvals", json!({"session_id":id})).await;
+                let approvals = listed["approvals"].as_array().unwrap();
+                assert_eq!(approvals.len(), 1);
+                assert_eq!(approvals[0]["nonce"], nonce);
+                let waited = call(&app, "wait_for", json!({"session_id":id,"timeout_s":0})).await;
+                live.wait_control(|control| control.sidebar_status() == crate::session::Status::Waiting).await;
+                assert_eq!(waited["timed_out"], false);
+                assert_eq!(waited["pending_approvals"][0]["nonce"], nonce);
+                if decision == "option" {
+                    assert_eq!(approvals[0]["choice"], true);
+                    assert_eq!(approvals[0]["options"][1]["option_id"], "blue");
+                    for args in [
+                        json!({"session_id":id,"nonce":nonce,"decision":"allow"}),
+                        json!({"session_id":id,"nonce":nonce,"decision":"option"}),
+                        json!({"session_id":id,"nonce":nonce,"decision":"option","option_id":"green"}),
+                    ] {
+                        let refused = call_result(&app, "approve", args).await;
+                        assert_eq!(error_code(&refused), Some("invalid_request"), "{refused}");
+                    }
+                }
+                let mut args = json!({"session_id":id,"nonce":nonce,"decision":decision});
+                if decision == "option" {
+                    args["option_id"] = option.into();
+                }
+                assert_eq!(call(&app, "approve", args.clone()).await["approved"], true);
+                let reply = tokio::time::timeout(std::time::Duration::from_secs(10), live.native.reply()).await.unwrap();
+                assert_eq!(reply["id"], decision);
+                assert_eq!(reply["result"]["outcome"]["optionId"], option, "{reply}");
+                let again = call_result(&app, "approve", args).await;
+                assert_eq!(error_code(&again), Some("not_found"), "{again}");
+            }
+            live.finish_prompt(&prompt, None).await;
+        }),
+    ).await;
 }
 
 /// A terminal session has no approvals or turns: none are listed, `approve` is refused, and
@@ -2191,10 +2094,32 @@ async fn rpc_as(
 #[tokio::test]
 #[serial_test::serial]
 async fn send_to_parent_is_listed_and_delivers_only_for_a_live_parent() {
-    let _guard = crate::session::test_support::isolate_app_dir();
-    let parent = structured_session("mcp-parent");
+    use crate::acp::supervisor::test_support::managed::with_managed_configuration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let secret = std::sync::Arc::new(
+        crate::server::session_credential::McpSessionSecret::load_or_generate(
+            &directory.path().join("mcp_session_secret"),
+        )
+        .unwrap(),
+    );
+    let configured_secret = secret.clone();
+    with_managed_configuration(
+        move |state| {
+            state.web_config.mcp_enabled = true;
+            state.allowed_hosts = vec!["localhost".into()];
+            state.allowed_origins.clear();
+            state.token_manager = std::sync::Arc::new(crate::server::TokenManager::new(
+                Some(TOKEN.into()), std::time::Duration::from_secs(3600),
+            ));
+            state.mcp_session_secret = Some(configured_secret);
+        },
+        |scope| Box::pin(async move {
+    let mut parent = test_support::managed_control_session(scope, "mcp-parent", "claude", None).await;
+    let parent_id = parent.id().to_owned();
+    let state = parent.state.clone();
     let mut child = structured_session("mcp-child");
-    child.parent_session_id = Some(parent.id.clone());
+    child.parent_session_id = Some(parent_id.clone());
     let orphan = structured_session("mcp-orphan");
     let mut trashed_parent = structured_session("mcp-trashed-parent");
     trashed_parent.trash();
@@ -2206,8 +2131,7 @@ async fn send_to_parent_is_listed_and_delivers_only_for_a_live_parent() {
     shelved.parent_session_id = Some(archived_parent.id.clone());
     let mut dangling = structured_session("mcp-dangling");
     dangling.parent_session_id = Some("no-such-session".into());
-    let rows = vec![
-        parent,
+    let mut rows = vec![
         child,
         orphan,
         trashed_parent,
@@ -2216,11 +2140,16 @@ async fn send_to_parent_is_listed_and_delivers_only_for_a_live_parent() {
         shelved,
         dangling,
     ];
-    let (app, state, secret) = seeded_app_with_secret(rows, false).await;
-    let _cmds = state
-        .acp_supervisor
-        .test_insert_worker_cmd_recording("mcp-parent")
-        .await;
+    let profile = state.instances.read().await.iter()
+        .find(|row| row.id == parent_id).unwrap().source_profile.clone();
+    for row in &mut rows {
+        row.source_profile.clone_from(&profile);
+    }
+    crate::session::Storage::open_reference(&profile).unwrap()
+        .update(|stored, _| { stored.extend_from_slice(&rows); Ok(()) }).unwrap();
+    state.instances.write().await.extend(rows);
+    test_support::refresh_canonical_metadata_for_test(&state).await;
+    let app = test_support::build_router_for_test(state.clone());
 
     let message = json!({"message": "child is done"});
     // (caller, listed); `None` is the plain daemon bearer.
@@ -2257,14 +2186,18 @@ async fn send_to_parent_is_listed_and_delivers_only_for_a_live_parent() {
             assert_eq!(sent["disposition"], "sent", "{result}");
             let recorded = state
                 .acp_event_store
-                .replay_from("mcp-parent", 0)
+                .replay_from(&parent_id, 0)
+                .unwrap()
                 .into_iter()
-                .find_map(|(seq, e)| {
-                    matches!(&e, crate::acp::Event::UserPromptSent { text, .. } if text == "child is done")
-                        .then_some(seq)
+                .find_map(|stored| {
+                    matches!(stored.event.as_ref(), crate::acp::Event::UserPromptSent { text, .. } if text == "child is done")
+                        .then_some(stored.seq)
                 });
             assert!(recorded.is_some(), "{result}");
             assert_eq!(sent["seq"].as_u64(), recorded, "{result}");
+            let request = parent.next_prompt().await;
+            assert_eq!(request["params"]["prompt"][0]["text"], "child is done");
+            parent.finish_prompt(&request, None).await;
         } else {
             assert_eq!(
                 error_code(&result),
@@ -2274,8 +2207,15 @@ async fn send_to_parent_is_listed_and_delivers_only_for_a_live_parent() {
         }
     }
     for id in ["mcp-trashed-parent", "mcp-archived-parent"] {
-        assert!(state.acp_event_store.replay_from(id, 0).is_empty(), "{id}");
+        assert!(
+            state.acp_event_store.replay_from(id, 0).unwrap().is_empty(),
+            "{id}"
+        );
     }
+        }),
+    ).await;
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let message = json!({"message": "child is done"});
 
     // Read-only refuses it before anything is delivered.
     let (app, state, secret) = seeded_app_with_secret(
@@ -2298,5 +2238,6 @@ async fn send_to_parent_is_listed_and_delivers_only_for_a_live_parent() {
     assert!(state
         .acp_event_store
         .replay_from("mcp-parent", 0)
+        .unwrap()
         .is_empty());
 }

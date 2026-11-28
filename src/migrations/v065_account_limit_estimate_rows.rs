@@ -5,6 +5,7 @@
 //! live under `<window>#estimate`. Where that row already holds an estimate, the later
 //! observation stands, by the stamps and not by which build wrote it.
 
+use super::{v055_acp_event_scope::resolve_database_path, v058_account_limits_window_shape};
 use anyhow::{Context, Result};
 use std::path::Path;
 use tracing::info;
@@ -18,17 +19,16 @@ pub fn run() -> Result<()> {
 }
 
 fn migrate_database(path: &Path) -> Result<()> {
-    if !path.try_exists()? {
+    let Some(path) = resolve_database_path(path)? else {
         return Ok(());
-    }
-    let conn = rusqlite::Connection::open(path)
-        .with_context(|| format!("open event store {}", path.display()))?;
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [TABLE],
-        |row| row.get(0),
-    )?;
-    if !exists {
+    };
+    let conn = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .with_context(|| format!("open event store {}", path.display()))?;
+    // An ACP lineage marker may have skipped main's v058 window-key migration.
+    if !v058_account_limits_window_shape::reconcile_table(&conn)? {
         return Ok(());
     }
     let tx = conn.unchecked_transaction()?;
@@ -105,7 +105,7 @@ mod tests {
     fn database() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("acp_events.db");
-        drop(EventStore::open(&path, 100).unwrap());
+        drop(EventStore::open(&path, 100, Default::default()).unwrap());
         (dir, path)
     }
 

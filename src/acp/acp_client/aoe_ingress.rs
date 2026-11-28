@@ -1,17 +1,17 @@
 //! Consumes `_meta.aoe` on inbound `session/update` frames, in arrival order,
 //! before anything maps them to events.
 
+use super::session_identity::IngressUpdate;
 use crate::acp::aoe_meta::lease::LeaseTable;
 use crate::acp::aoe_meta::ordering::{Arrival, ArrivalOrder};
 use crate::acp::aoe_meta::{self, Envelope};
 use crate::acp::state::IntegrationLostReason;
-use agent_client_protocol::v1::schema::SessionNotification;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A frame waiting in, or released by, the ordering gate.
 struct Frame {
-    notification: SessionNotification,
+    notification: IngressUpdate,
     local_prompt_signals: bool,
     /// Whether its lease may be taken: live, not replayed history. Decided on
     /// arrival, as a held frame is released after the load ends.
@@ -22,7 +22,7 @@ struct Frame {
 }
 
 pub(super) struct Delivered {
-    pub(super) notification: SessionNotification,
+    pub(super) notification: IngressUpdate,
     pub(super) local_prompt_signals: bool,
     pub(super) epoch: u64,
 }
@@ -83,12 +83,12 @@ impl AoeIngress {
 
     pub(super) fn ingest(
         &self,
-        notification: SessionNotification,
+        notification: IngressUpdate,
         local_prompt_signals: bool,
         epoch: u64,
         now_ms: i64,
     ) -> Ingested {
-        let update = serde_json::to_value(&notification.update);
+        let update = serde_json::to_value(&notification.notification.update);
         // A tailer frame carries an anchor even when its envelope is invalid,
         // and takes no adapter frame number.
         let is_adapter_frame = !update.as_ref().is_ok_and(aoe_meta::is_anchored);
@@ -214,15 +214,21 @@ impl AoeIngress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::v1::schema::{SessionUpdate, ToolCall};
+    use agent_client_protocol::v1::schema::{SessionNotification, SessionUpdate, ToolCall};
     use serde_json::json;
 
-    fn frame(id: &str, aoe: serde_json::Value) -> SessionNotification {
+    fn frame(id: &str, aoe: serde_json::Value) -> IngressUpdate {
         let mut tc = ToolCall::new(id.to_string(), "T");
         if !aoe.is_null() {
             tc.meta = json!({ "aoe": aoe }).as_object().cloned();
         }
-        SessionNotification::new("s", SessionUpdate::ToolCall(tc))
+        super::super::session_identity::SessionIngressNotification::decode_update(
+            serde_json::to_value(SessionNotification::new("s", SessionUpdate::ToolCall(tc)))
+                .unwrap(),
+            false,
+        )
+        .unwrap()
+        .0
     }
 
     fn ids(ingested: Ingested) -> Vec<String> {
@@ -231,7 +237,7 @@ mod tests {
         };
         frames
             .into_iter()
-            .map(|d| match d.notification.update {
+            .map(|d| match d.notification.notification.update {
                 SessionUpdate::ToolCall(tc) => tc.tool_call_id.0.to_string(),
                 _ => unreachable!(),
             })
@@ -464,7 +470,7 @@ mod tests {
         };
         let delivered: Vec<_> = frames
             .iter()
-            .map(|d| match &d.notification.update {
+            .map(|d| match &d.notification.notification.update {
                 SessionUpdate::ToolCall(tc) => tc.tool_call_id.0.to_string(),
                 _ => unreachable!(),
             })

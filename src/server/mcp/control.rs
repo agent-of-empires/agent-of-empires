@@ -14,7 +14,7 @@ use crate::acp::dispatch::PromptDispatch;
 use crate::daemon::{CreateSessionBody, SessionResponse};
 use crate::server::api::sessions::{
     capture_terminal_output, create_session_with, send_terminal_message, CaptureError,
-    CreateOrigin, SendKeysError, SendPane,
+    CheckedSendPane, CreateOrigin, SendKeysError, SendPane,
 };
 use crate::server::api::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 use crate::server::session_service::{SendTurnError, SessionCaller};
@@ -427,12 +427,13 @@ impl McpServer {
             let page = self
                 .state
                 .acp_event_store
-                .replay_page(&id, since, Some(READ_PAGE));
+                .replay_page(&id, since, Some(READ_PAGE))
+                .map_err(|_| tool_error("internal", "Could not read stored output"))?;
             if params.raw {
                 let events = page
                     .events
                     .iter()
-                    .map(|(seq, event)| json!({"seq": seq, "event": event}))
+                    .map(|stored| json!({"seq": stored.seq, "event": stored.event.as_ref()}))
                     .collect();
                 return Ok(Json(Output {
                     view: View::Structured,
@@ -499,10 +500,13 @@ impl McpServer {
                 refuse_if_ignored: true,
                 origin: crate::daemon::PromptOrigin::Mcp,
             };
-            let submitted = submit_prompt(&self.state, &SessionCaller::User, &id, submission)
-                .await
-                .map_err(|e| Box::new(prompt_refusal(&id, e)))?;
-            return Ok(send_outcome(submitted));
+            let submitted =
+                match submit_prompt(&self.state, &SessionCaller::User, &id, submission).await {
+                    Ok(submitted) => submitted,
+                    Err(error) => return Err(Box::new(prompt_refusal(&id, error).await)),
+                };
+            return send_outcome(submitted)
+                .map_err(|unavailability| Box::new(native_unavailable(unavailability)));
         }
         let Some(message) = terminal_text(message) else {
             return Err(Box::new(tool_error(
@@ -618,7 +622,7 @@ impl McpServer {
         id: &str,
         text: String,
         readiness: PaneReadiness,
-        checked_pane: Option<String>,
+        checked_pane: Option<CheckedSendPane>,
     ) -> PromptOutcome {
         match readiness {
             PaneReadiness::Waiting => (
@@ -660,45 +664,52 @@ impl McpServer {
             ),
             PaneReadiness::Gone => (false, PromptDelivery::NotRunning, None, None),
             // A session that just failed to start is not restarted behind the caller's back.
-            PaneReadiness::AtPrompt => match send_terminal_message(
-                &self.state.session_service,
-                id,
-                text.clone(),
-                false,
-                true,
-                SendPane {
-                    checked: checked_pane,
-                    draft_wait: std::time::Duration::ZERO,
-                },
-            )
-            .await
-            {
-                Ok(_) => {
-                    log_terminal_message_sent(id, &text);
-                    self.publish().await;
-                    (true, PromptDelivery::Sent, None, None)
-                }
-                Err(e) => match e.error {
-                    SendKeysError::Ignored => (
-                        false,
-                        PromptDelivery::Ignored,
-                        Some(IGNORED_PROMPT.to_string()),
-                        None,
-                    ),
-                    SendKeysError::NotRunning => (false, PromptDelivery::NotRunning, None, None),
-                    other => {
-                        let code = matches!(other, SendKeysError::InputLineBusy)
-                            .then_some(INPUT_LINE_BUSY);
-                        let refusal = terminal_refusal(id, other).await;
-                        let message = refusal
-                            .structured_content
-                            .as_ref()
-                            .and_then(|c| c["message"].as_str())
-                            .map(str::to_string);
-                        (false, PromptDelivery::Failed, message, code)
+            PaneReadiness::AtPrompt => {
+                let Some(checked) = checked_pane else {
+                    return (false, PromptDelivery::NotRunning, None, None);
+                };
+                match send_terminal_message(
+                    &self.state.session_service,
+                    id,
+                    text.clone(),
+                    false,
+                    true,
+                    SendPane {
+                        checked: Some(checked),
+                        draft_wait: std::time::Duration::ZERO,
+                    },
+                )
+                .await
+                {
+                    Ok(_) => {
+                        log_terminal_message_sent(id, &text);
+                        self.publish().await;
+                        (true, PromptDelivery::Sent, None, None)
                     }
-                },
-            },
+                    Err(e) => match e.error {
+                        SendKeysError::Ignored => (
+                            false,
+                            PromptDelivery::Ignored,
+                            Some(IGNORED_PROMPT.to_string()),
+                            None,
+                        ),
+                        SendKeysError::NotRunning => {
+                            (false, PromptDelivery::NotRunning, None, None)
+                        }
+                        other => {
+                            let code = matches!(other, SendKeysError::InputLineBusy)
+                                .then_some(INPUT_LINE_BUSY);
+                            let refusal = terminal_refusal(id, other).await;
+                            let message = refusal
+                                .structured_content
+                                .as_ref()
+                                .and_then(|c| c["message"].as_str())
+                                .map(str::to_string);
+                            (false, PromptDelivery::Failed, message, code)
+                        }
+                    },
+                }
+            }
         }
     }
 
@@ -709,7 +720,10 @@ impl McpServer {
     /// (`NoPromptRule`) is not refused. A session with no pane to check is refused as not
     /// running, so `send` never types into a pane that appeared after the check. Otherwise
     /// answers the pane it checked, for the send.
-    async fn terminal_pane_refusal(&self, id: &str) -> Result<String, Box<CallToolResult>> {
+    async fn terminal_pane_refusal(
+        &self,
+        id: &str,
+    ) -> Result<CheckedSendPane, Box<CallToolResult>> {
         let instance = self
             .state
             .instances
@@ -821,7 +835,7 @@ enum PaneReadiness {
 async fn wait_for_input_prompt(
     state: &std::sync::Arc<crate::server::AppState>,
     id: &str,
-) -> (PaneReadiness, Option<String>) {
+) -> (PaneReadiness, Option<CheckedSendPane>) {
     let deadline = tokio::time::Instant::now() + PROMPT_READY_TIMEOUT;
     loop {
         let instance = state
@@ -848,7 +862,7 @@ async fn wait_for_input_prompt(
 /// One fresh capture of the agent's pane, decided by its detection manifest, as `aoe session
 /// show` reads it, and the pane it read, so the send types into that one. A stopped session is
 /// `Gone` before any capture, whose failure would read as `Unreadable`.
-fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<String>) {
+fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<CheckedSendPane>) {
     if matches!(
         instance.status,
         Status::Error | Status::Stopped | Status::Deleting
@@ -864,7 +878,14 @@ fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<String>) {
     let pane = session
         .live_pane_target_with_deadline(&crate::tmux::TmuxCommandDeadline::new())
         .ok();
-    readiness_in(instance, &session, pane)
+    let Some(checked) = pane
+        .as_deref()
+        .and_then(|pane| CheckedSendPane::capture(instance, session.name(), pane).ok())
+    else {
+        return (PaneReadiness::Unreadable, None);
+    };
+    let readiness = readiness_in(instance, &checked.session(), Some(checked.pane_id()));
+    (readiness, Some(checked))
 }
 
 /// [`pane_readiness`] of the pane its lookup found. Without one nothing is captured: the
@@ -872,17 +893,17 @@ fn pane_readiness(instance: &Instance) -> (PaneReadiness, Option<String>) {
 fn readiness_in(
     instance: &Instance,
     session: &crate::tmux::Session,
-    pane: Option<String>,
-) -> (PaneReadiness, Option<String>) {
+    pane: Option<&str>,
+) -> PaneReadiness {
     let Some(pane) = pane else {
-        return (PaneReadiness::Unreadable, None);
+        return PaneReadiness::Unreadable;
     };
     let (detected, input_line) =
-        instance.detect_pane_and_input_line_now(&instance.source_profile, session, &pane);
+        instance.detect_pane_and_input_line_now(&instance.source_profile, session, pane);
     let readiness = readiness_of(detected, input_line);
     #[cfg(test)]
-    crate::tmux::test_helpers::after_input_check(&pane);
-    (readiness, Some(pane))
+    crate::tmux::test_helpers::after_input_check(pane);
+    readiness
 }
 
 /// MCP `send` refuses a pane whose status rules detect a dialog, one holding a draft, or one it
@@ -922,13 +943,11 @@ pub(super) fn transcript_page(
     state: &crate::server::AppState,
     id: &str,
     since: u64,
-) -> (String, u64, bool) {
-    rendered_page(
-        state
-            .acp_event_store
-            .replay_page(id, since, Some(READ_PAGE)),
-        since,
-    )
+) -> anyhow::Result<(String, u64, bool)> {
+    let page = state
+        .acp_event_store
+        .replay_page(id, since, Some(READ_PAGE))?;
+    Ok(rendered_page(page, since))
 }
 
 fn rendered_page(page: crate::acp::event_store::ReplayPage, since: u64) -> (String, u64, bool) {
@@ -951,9 +970,17 @@ struct TextPage {
     cut: bool,
 }
 
-fn text_page(events: &[(u64, crate::acp::state::Event)], since: u64) -> TextPage {
+fn text_page(events: &[crate::acp::event_store::StoredEvent], since: u64) -> TextPage {
     use crate::session::conversation_summary::render_transcript_delta;
-    let render = |n: usize| render_transcript_delta(&events[..n], since).0;
+    let render = |n: usize| {
+        render_transcript_delta(
+            events[..n]
+                .iter()
+                .map(|stored| (stored.seq, stored.event.as_ref())),
+            since,
+        )
+        .0
+    };
     let whole = render(events.len());
     if whole.len() <= TEXT_PAGE_BYTES {
         return TextPage {
@@ -976,7 +1003,7 @@ fn text_page(events: &[(u64, crate::acp::state::Event)], since: u64) -> TextPage
     let n = fits.max(1);
     TextPage {
         text: render(n),
-        last_seq: Some(events[n - 1].0),
+        last_seq: Some(events[n - 1].seq),
         cut: n < events.len(),
     }
 }
@@ -1031,10 +1058,15 @@ fn refusal(status: StatusCode, body: &[u8]) -> CallToolResult {
     }
 }
 
-fn send_outcome(submitted: PromptSubmitted) -> SendOutcome {
+fn send_outcome(
+    submitted: PromptSubmitted,
+) -> Result<SendOutcome, crate::acp::state::AcpConnectionUnavailability> {
     let (disposition, reason) = match submitted.dispatch {
         PromptDispatch::Sent => (Disposition::Sent, None),
         PromptDispatch::Steered => (Disposition::Steered, None),
+        PromptDispatch::Unavailable { unavailability } => {
+            return Err(unavailability);
+        }
         PromptDispatch::Queued { reason } => (
             Disposition::Queued,
             serde_json::to_value(reason)
@@ -1042,16 +1074,33 @@ fn send_outcome(submitted: PromptSubmitted) -> SendOutcome {
                 .and_then(|v| v.as_str().map(str::to_string)),
         ),
     };
-    SendOutcome {
+    Ok(SendOutcome {
         disposition,
         reason,
         queued_id: submitted.queued_id,
         seq: submitted.seq,
-    }
+    })
 }
 
-fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
+fn native_unavailable(
+    unavailability: crate::acp::state::AcpConnectionUnavailability,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "code": "native_unavailable",
+        "message": "Native input is unavailable; read_output before resending",
+        "unavailability": unavailability,
+    }))
+}
+
+async fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
     match error {
+        PromptSubmitError::AdmissionRefused(response) => {
+            let status = response.status();
+            match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+                Ok(bytes) => refusal(status, &bytes),
+                Err(error) => tool_error("internal", error.to_string()),
+            }
+        }
         PromptSubmitError::SessionNotFound
         | PromptSubmitError::Turn(SendTurnError::SessionNotFound) => not_found(id),
         PromptSubmitError::WorkerNotReady
@@ -1064,6 +1113,14 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
             "send_failed",
             "The agent stopped after the prompt was recorded; read_output before resending it",
         ),
+        PromptSubmitError::Turn(SendTurnError::ControlStateUnavailable) => tool_error(
+            "control_state_unavailable",
+            "Session control state could not be read",
+        ),
+        PromptSubmitError::Turn(SendTurnError::Unavailable(unavailability))
+        | PromptSubmitError::Turn(SendTurnError::UnavailableAfterPublish(unavailability)) => {
+            native_unavailable(unavailability)
+        }
         PromptSubmitError::Turn(SendTurnError::ResumeFailed(e)) => tool_error(
             "busy",
             format!("The session's agent could not be resumed: {e}"),
@@ -1129,6 +1186,14 @@ async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
         }
         SendKeysError::Transient(status) => {
             tool_error("busy", format!("The session is {status:?}; try again"))
+        }
+        SendKeysError::Preparation { detail, .. }
+            if detail["error"] == "terminal_input_unavailable" =>
+        {
+            tool_error(
+                "send_failed",
+                "The checked terminal pane is no longer available for input",
+            )
         }
         SendKeysError::Preparation { response, .. } => {
             let status = response.status();
@@ -1230,13 +1295,14 @@ mod tests {
             }
             let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let checked = CheckedSendPane::capture(&instance, session.name(), &pane).unwrap();
 
             let (sent, _, _, code) = McpServer::new(state)
                 .deliver_terminal_prompt(
                     &instance.id,
                     "typed-by-create".into(),
                     readiness,
-                    Some(pane.clone()),
+                    Some(checked),
                 )
                 .await;
             assert!(!sent, "{case}");
@@ -1287,14 +1353,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // (case, the lookup's pane, readiness; the send gets the looked-up pane back)
         for (case, looked_up, want) in [
-            ("looked-up", Some(pane.clone()), PaneReadiness::AtPrompt),
+            ("looked-up", Some(pane.as_str()), PaneReadiness::AtPrompt),
             ("lookup-failed", None, PaneReadiness::Unreadable),
         ] {
-            let (readiness, checked) = readiness_in(&instance, &session, looked_up.clone());
+            let readiness = readiness_in(&instance, &session, looked_up);
             assert_eq!(readiness, want, "{case}");
-            assert_eq!(checked, looked_up, "{case}");
         }
     }
 
@@ -1408,9 +1472,8 @@ mod tests {
                     }
                 });
             }
-            let (readiness, checked) = readiness_in(&instance, &session, Some(pane.clone()));
+            let readiness = readiness_in(&instance, &session, Some(&pane));
             assert_eq!(readiness, want, "{case}");
-            assert_eq!(checked, Some(pane), "{case}");
         }
     }
 
@@ -1641,21 +1704,65 @@ mod tests {
             let result = terminal_refusal("s", error).await;
             assert_eq!(result.structured_content.unwrap()["code"], code);
         }
+        let unavailable = crate::acp::state::AcpConnectionUnavailability {
+            source: crate::acp::state::AcpConnectionSource::Sdk,
+            cause: crate::acp::state::AcpConnectionCause::IncomingEnded,
+            phase: crate::acp::state::AcpConnectionPhase::Established,
+        };
         let prompt_cases = [
             (
                 PromptSubmitError::Enqueue(StatusCode::TOO_MANY_REQUESTS, "queue is full".into()),
                 "busy",
             ),
             (PromptSubmitError::WorkerNotReady, "busy"),
+            (
+                PromptSubmitError::Turn(SendTurnError::ControlStateUnavailable),
+                "control_state_unavailable",
+            ),
             // Already in the transcript, so a retry would record it twice.
             (
                 PromptSubmitError::Turn(SendTurnError::WorkerLostAfterPublish),
                 "send_failed",
             ),
+            (
+                PromptSubmitError::Turn(SendTurnError::Unavailable(unavailable)),
+                "native_unavailable",
+            ),
+            (
+                PromptSubmitError::Turn(SendTurnError::UnavailableAfterPublish(unavailable)),
+                "native_unavailable",
+            ),
         ];
         for (error, code) in prompt_cases {
-            let result = prompt_refusal("s", error);
-            assert_eq!(result.structured_content.unwrap()["code"], code);
+            let result = prompt_refusal("s", error).await;
+            let content = result.structured_content.unwrap();
+            assert_eq!(content["code"], code);
+            if code == "native_unavailable" {
+                assert_eq!(content["unavailability"], json!(unavailable));
+                assert!(content["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("read_output before resending"));
+            }
         }
+        let result = prompt_refusal(
+            "s",
+            PromptSubmitError::AdmissionRefused(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(json!({
+                        "error": "worker_capacity",
+                        "message": "No worker capacity",
+                    })),
+                )
+                    .into_response(),
+            ),
+        )
+        .await;
+        let content = result.structured_content.unwrap();
+        assert_eq!(content["code"], "busy");
+        assert_eq!(content["http_error"], "worker_capacity");
+        assert_eq!(content["http_status"], 503);
+        assert_eq!(content["message"], "No worker capacity");
     }
 }

@@ -3,6 +3,75 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "acp.operation-error-evidence",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/hooks/acpSession/stateCache.test.ts",
+        "src/hooks/useAcpSession.test.ts",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/ApprovalCard.test.tsx",
+        "src/components/acp/AskUserQuestionCard.test.tsx",
+        "src/components/acp/SessionConfigControls.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/hooks/acpSession/useAcpConnection.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/ApprovalCard.tsx",
+        "web/src/components/acp/AskUserQuestionCard.tsx",
+        "web/src/lib/types.ts",
+        "web/src/components/acp/SystemNotices.tsx"
+      ],
+      "notes": "Request-local prompt failure preserves the canonical diagnostic without a startup failure or stopped-worker claim. Typed and legacy missing/null failures survive retained-card resolution and A-to-transient-B-to-resolution compound failures. Hook/card consumers cover HTTP and network rejection, enabled retry of the same nonce, and success or named-404 resolution revealing the canonical banner; destructive approval retries require a fresh full hold. HTTP errors are not relabelled as network failures. Matching request errors clear independently and reveal the canonical banner; transient errors are not persisted. Reattach and optimistic retry retain diagnostics; accepted prompts and intentional clear/switch retire them. Session responses forward optional terminal evidence without a new retry policy. Current wrapper receipts, including same-seq refresh and seq zero, are distinct from raw history/socket/cache authority. Cache reopen and disconnect revoke native authority without erasing diagnostics; generic Unknown/refused/lost owners cannot queue or wake, while explicit current governed wake eligibility remains separate from native config/actionability. Header-before-catch-up regressions retain configuration results, usage baselines, capability/park state, diagnostics and client-only history without replacing current controls. Safe queue listing preserves unconfirmed cached intent; migration waits for current native or explicit governed eligibility, including an eligibility change after refusal. A runner-record management refusal preserves retained turn/tool/callback history and raw replay turn context while native controls remain unavailable; actual native loss still retires impossible controls."
+    },
+    {
+      "id": "acp.current-native-authority",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-structured-view.spec.ts", "tests/acp-startup-wait.spec.ts", "tests/acp-plan-modal.spec.ts"],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/SessionConfigControls.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/startupWait.ts"
+      ],
+      "notes": "Browser regressions specify socket/history refusal, a current healthy receipt without historical readiness, stale covered raw loss, same-seq healthy/lost/Unknown refreshes, preserved request diagnostics and explicit next-request delivery. A separate current-governor case permits an existing managed queue intent without enabling native model/config controls. Fixtures emit explicit daemon snapshots instead of granting readiness from socket-open; historical context remains visible across authority withdrawal."
+    },
+    {
+      "id": "acp.native-input-commit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/acpTypes.test.ts",
+        "src/components/acp/__tests__/CommittedStop.test.tsx"
+      ],
+      "components": [
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/useCancelEscalation.ts"
+      ],
+      "notes": "Real hooks establish an active prompt and echo, then a Host layout consumes same-frontier Unknown-to-Ready and Ready-to-Unknown snapshots before passive effects; exact cancel HTTP and force-after-acceptance follow committed authority. Original handshake decisions use only fresh canonical exact-nonce capabilities; both approval and form submissions recheck revocation without granting main input or historical request authority. Cache normalization and disconnect revoke capabilities. Existing installed-SDK stop coverage remains."
+    },
+    {
+      "id": "acp.operation-error-native-continuity",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
+      "components": ["web/src/components/acp/SessionBanners.tsx"],
+      "notes": "A controlled Native fixture uses the real daemon and runner. A provider request refusal retains its typed operation-only diagnostic through browser reload, preserves the recorded physical PID/birth and exact worker epoch, does not become a startup or stopped-worker failure, and accepts only a second explicit prompt on the same assigned native conversation. The case attaches its actual retained-error surface."
+    },
+    {
       "id": "files.edit-eligibility-recovery",
       "kind": "vitest",
       "risk": "high",
@@ -372,14 +441,15 @@
         "web/src/components/TerminalComposeSheet.tsx",
         "web/src/components/TerminalConnectionBanners.tsx"
       ],
-      "notes": "Deterministic real WebSocket and terminal consumers cover read-only agent, host and container observation, suppressed ensure/claim/resize/input/mouse/restart writes, late open and reconnect after revocation, retained callbacks and proxy refusal, no unsent replay, preserved compose drafts, accepted in-flight ensure results, and fresh writable takeover/paste. Real consumer cases revoke and restore policy while image decoding, dispatched upload responses and toolbar clipboard reads are pending; only fresh gesture admission permits later upload/paste, while dispatched upload receipts remain accepted. API tests also gate decoding before HTTP dispatch. Backend ownership heartbeat fences require the live read-only recheck; these unit cases do not claim physical tmux-lock coverage."
+      "notes": "Deterministic real WebSocket and terminal consumers cover read-only agent, host and container observation, suppressed ensure/claim/resize/input/mouse/restart writes, late open and reconnect after revocation, retained callbacks and proxy refusal, no unsent replay, preserved compose drafts, accepted in-flight ensure results, and fresh writable takeover/paste. Real consumer cases revoke and restore policy while image decoding, dispatched upload responses and toolbar clipboard reads are pending; only fresh gesture admission permits later upload/paste, while dispatched upload receipts remain accepted. API tests also gate decoding before HTTP dispatch. Hook regressions retire queued binary and paste input across close, error, manual/online reconnect, session/route/deselection changes and ownership denial; stale socket callbacks cannot affect a new connection, and fresh owner-confirmed input retains order. Backend ownership heartbeat and native generation/physical fences require backend tests and live rechecks; these unit cases do not claim physical tmux-lock coverage."
     },
     {
       "id": "terminal.live-grid-transport",
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/live-terminal.spec.ts"],
-      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"],
+      "notes": "Real Native PTY transport and two-device ownership changes preserve the visible prompt/cursor alignment. The existing ownership ping-pong case saves and attaches a positive screenshot after the final verified takeover."
     },
     {
       "id": "terminal.live-row-patches",
@@ -846,7 +916,7 @@
       "risk": "high",
       "specs": ["tests/live/startup-recovery.spec.ts"],
       "components": ["src/server/api/sessions/lifecycle.rs", "src/server/startup_recovery.rs"],
-      "notes": "Missing Idle/Waiting/Running panes resume at Daemon startup, in any profile, and a failed resume leaves no pane. For terminal sessions, neither recovery nor an API or CLI restart types anything into the agent; Structured restarts are not covered here. Uses private fake agents."
+      "notes": "Missing Idle/Waiting/Running terminal panes resume the recorded native conversation at Daemon startup, including in a non-default profile. A failed resume records the failed native ID, retains the conversation association, clears the lifecycle reservation, and leaves no pane. Startup recovery and API and CLI terminal restarts deliver neither prompts nor partial input to the private fake agents. Structured restarts are not covered here."
     },
     {
       "id": "settings.list-field",
@@ -3499,8 +3569,17 @@
       "id": "acp.clear-fold-remount",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/AcpRuntime.test.tsx"],
-      "components": ["web/src/components/acp/AcpRuntime.tsx"]
+      "specs": [
+        "src/components/acp/__tests__/AcpRuntime.test.tsx",
+        "src/components/acp/activityMessages.test.ts",
+        "src/lib/acpHistoryWindow.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/lib/acpHistoryWindow.ts"
+      ],
+      "notes": "Certified journal cuts preserve New output published before a late clear marker in the actual default message consumer, including empty Original history. Shared projection drives fold identity, hidden count and history pagination without mutating stored chronology."
     },
     {
       "id": "diff-comments.storage-cleanup",
@@ -3763,6 +3842,7 @@
       "id": "acp.spawn-prompt",
       "kind": "live-playwright",
       "risk": "high",
+      "notes": "Live fixtures explicitly create a first structured conversation and spawn its selected Native. Enabling an unselected terminal row cannot silently substitute a Fresh conversation.",
       "specs": ["tests/live/acp-prompt-lifecycle.spec.ts"],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
@@ -3777,7 +3857,7 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
-      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase. A Workflow call stays a workflow card when a permission start retitles it, and reads \"Preparing workflow script\" until the call returns.",
+      "notes": "Shells and sub-agents filter by kind and group Running and Recent. Child details share thread-card rows; Claude Workflow runs group by run and phase. Current-snapshot/replay coverage keeps a current run live when covered historical events reuse its task id, while retaining completed historical runs for inspection. A Workflow call stays a workflow card when a permission start retitles it, and reads \"Preparing workflow script\" until the call returns.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
@@ -3949,8 +4029,20 @@
       "id": "acp.stop-button-escalation",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/useCancelEscalation.test.tsx"],
-      "components": ["web/src/components/acp/AcpRuntime.tsx", "web/src/components/acp/useCancelEscalation.ts"]
+      "specs": [
+        "src/components/acp/__tests__/useCancelEscalation.test.tsx",
+        "src/components/acp/Composer.test.tsx",
+        "src/hooks/useAcpSession.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/useCancelEscalation.ts",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/hooks/useAcpSession.ts"
+      ],
+      "notes": "Graceful Stop requires current native readiness even when managed prompt intent may queue. Server-confirmed cancellation or an accepted current-identity cancel enables explicit local force after readiness withdraws, including server confirmation before the first HTTP response settles. Only unconfirmed pending gestures coalesce. Refusal never arms escalation; distinct committed identities prevent late A-to-B-to-A results or stale callbacks from granting or erasing newer eligibility. Composer tests exercise disabled Unknown, restored Ready, accepted cancellation followed by Unknown, and server-confirmed cancellation while Unknown. The existing live Stop story retains one deliberate click and the native cancelled outcome."
     },
     {
       "id": "acp.spinner-tool-precedence",
@@ -4131,7 +4223,7 @@
         "web/src/components/acp/ContextPrimerBanner.tsx",
         "web/src/components/acp/useFilesIndex.ts"
       ],
-      "notes": "Lagged broadcast recovery is exercised through an upgraded WebSocket by src/server/acp_ws.rs::tests::lagged_broadcast_reports_gap_and_rebuilds_control_state; the former skipped browser sketch is not counted as coverage."
+      "notes": "Primer coverage requires fresh native readiness and accepted held input before force-end. src/server/acp_ws.rs::tests::lagged_broadcast_reports_gap_and_rebuilds_control_state exercises lagged recovery through an upgraded WebSocket."
     },
     {
       "id": "acp.mode-switch-tmux-teardown",
@@ -4168,6 +4260,8 @@
       "risk": "high",
       "specs": [
         "src/lib/acpTypes.test.ts",
+        "src/lib/acpTypes.reducer.test.ts",
+        "src/components/acp/SystemNotices.test.tsx",
         "src/hooks/useRespawnSession.test.tsx",
         "src/components/acp/UsageLimitBanner.test.tsx",
         "src/components/acp/SwitchAgentModal.test.tsx",
@@ -4184,7 +4278,8 @@
         "web/src/lib/acpTypes.ts",
         "web/src/components/acp/UsageLimitBanner.tsx",
         "web/src/lib/autoResumeSettingsHref.ts"
-      ]
+      ],
+      "notes": "Canonical rate_limit_park snapshots alone drive park and exhaustion notices and queued reasons. Foreign or unqualified raw history, hydration and disconnect cannot recreate control. Null or omission is unknown; stale snapshots do not replace current knowledge. Current native readiness still permits distinct input."
     },
     {
       "id": "acp.switch-agent-manual",
@@ -4244,6 +4339,7 @@
       "id": "acp.keep-context-round-trip",
       "kind": "live-playwright",
       "risk": "high",
+      "notes": "View round trips first establish an actual Native identity and captured store, then disable and re-enable that retained conversation. Fresh reset checks the new persisted SID and subsequent explicit input rather than internal frame ordering.",
       "specs": ["tests/live/acp-session-history.spec.ts"],
       "components": ["src/server/api/acp.rs"]
     },
@@ -4395,7 +4491,7 @@
       "risk": "high",
       "specs": ["src/components/acp/ApprovalCard.test.tsx"],
       "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"],
-      "notes": "Destructive holds run by mouse, touch, or Space/Enter held 800ms; release, button blur, window blur, and page hiding cancel. Offline buttons are disabled and dimmed. A rejected submit re-enables every decision. Card and modal order decisions Allow, Always, Deny."
+      "notes": "Native decision permission is explicit and independent of offline/submitting state. Withdrawing permission retires an active destructive hold; regranting permission cannot revive it and requires a new full hold. Destructive holds run by mouse, touch, or Space/Enter held 800ms; release, button blur, window blur, and page hiding cancel. Offline buttons are disabled and dimmed. A rejected submit re-enables every authorized decision. Card and modal order decisions Allow, Always, Deny."
     },
     {
       "id": "acp.approval-hold-browser",
@@ -4411,7 +4507,7 @@
       "risk": "medium",
       "specs": ["tests/acp-plan-modal.spec.ts"],
       "components": ["web/src/components/acp/PlanModal.tsx", "web/src/components/Dialog.tsx"],
-      "notes": "On a short 390px screen an answer list wraps inside a bounded, scrollable footer; every action stays inside the panel and Dismiss is reachable by scrolling."
+      "notes": "View plan, local expansion, Raw/Rendered, copy, and dismissal remain available without current native authority. A browser case opens under Unknown, changes current sequenced readiness while the modal stays open, then reads/copies/closes the plan with native decisions disabled and zero approval POSTs. On a short 390px screen an answer list wraps inside a bounded, scrollable footer; every action stays inside the panel and Dismiss is reachable by scrolling."
     },
     {
       "id": "acp.markdown",
@@ -4545,7 +4641,7 @@
       "risk": "low",
       "specs": ["tests/acp-queued-tooltip.spec.ts", "src/components/acp/QueuedPromptsStrip.test.tsx"],
       "components": ["web/src/components/acp/PromptStrips.tsx", "web/src/components/acp/StructuredView.tsx"],
-      "reason": "The queued-messages header is a keyboard-reachable Tooltip trigger, not a title, and says the Daemon holds the queue; a strip with an unconfirmed row says it isn't sent yet."
+      "reason": "The queued-messages header's Tooltip opens on keyboard focus and dismisses on Tab; a strip with an unconfirmed row says it isn't sent yet."
     },
     {
       "id": "acp.queue-send-now",
@@ -4612,11 +4708,25 @@
       ]
     },
     {
-      "id": "acp.story.stop-tool-card-terminal",
+      "id": "acp.story.cancel-unattributed-tool-output",
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/composer-controls.spec.ts"],
+      "notes": "A genuine Native cancel result closes only its original prompt. The live story retains partial Native output across reload, verifies its written-window uncertainty and refuses a fabricated per-tool completion, error or stopped projection. Output diagnostics require an original result and the same uncertain Written window; historical silence, thinking, compaction, notices and steering do not invent an output diagnosis. A temporal observation window does not establish tool authorship or outcome.",
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/ToolCards.tsx"]
+    },
+    {
+      "id": "acp.story.original-tool-output-after-correlated-failure",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-transcript.spec.ts", "src/components/acp/ThreadMessages.test.tsx"],
+      "components": [
+        "web/src/components/acp/activityMessages.ts",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/components/acp/ToolCardChrome.tsx",
+        "web/src/components/acp/ToolCards.tsx"
+      ],
+      "notes": "A controlled real Native emits an original tool start and partial output, then fails its current request. The actual thread and card retain that partial output across reload without inventing a tool terminal. A second explicit prompt produces the real terminal and replaces the partial output. The DOM regression also checks that streamed output stays separate from the SDK result."
     },
     {
       "id": "acp.todo-group-fold",
@@ -4758,7 +4868,7 @@
         "web/src/components/acp/PromptStrips.tsx",
         "web/src/components/acp/StructuredView.tsx"
       ],
-      "notes": "The queued strip header says why the queue waits (Agent starting, rate limit, compacting, cancelling, a running turn, a solo command, or offline with an unconfirmed row as Not sent (n)) at text-text-subtle, and each row's action matches: Send now, Stop and send, Stop and run, Start and send, an aria-disabled waiting button with its reason, or none. Stop and run on a solo command behind a steerable turn posts a real cancel, while message rows still steer. Rate-limit copy promises delivery only while auto-resume is armed. Enabled action labels use text-text-primary. A row that can't send yet shows the queue's reason on a focusable aria-disabled button. At 375px a long reason wraps inside the strip without horizontal scroll or overlapping Clear all."
+      "notes": "The queued strip header says why the queue waits (Agent starting, rate limit, compacting, cancelling, a running turn, a solo command, or offline with an unconfirmed row as Not sent (n)) at text-text-subtle, and each row's action matches: Send now, Stop and send, Stop and run, Start and send, an aria-disabled waiting button with its reason, or none. Stop and run on a solo command behind a steerable turn posts a real cancel, while message rows still steer. Rate-limit copy promises delivery only while auto-resume is armed. Enabled action labels use text-text-primary. A row that can't send yet shows the queue's reason on a focusable aria-disabled button. At 375px a long reason wraps inside the strip without horizontal scroll or overlapping Clear all. Explicit Start posts /start under core admission without granting native send authority; socket-open with Unknown cannot send or wake queued intent until a current governor receipt permits it."
     },
     {
       "id": "acp.startup-error-screen",
@@ -4776,14 +4886,18 @@
       "id": "acp.startup-error-banner",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/StartupErrorBanner.test.tsx"],
+      "specs": [
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/components/acp/__tests__/SessionBanners.test.tsx"
+      ],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
         "web/src/components/acp/StartupErrorBanner.tsx",
         "web/src/components/acp/RecoveryActionRow.tsx",
         "web/src/components/acp/signInSteps.ts"
       ],
-      "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI. A Session stopped with aoe acp stop shows a was stopped headline and says its queued message waits for Retry, with no adapter install hint or Install button."
+      "notes": "Startup guidance names the agent's own sign-in steps and directs sandbox image updates to the dashboard. Cold and replayed startup diagnostics keep Details and logs open during Native unavailability. Retry, Install and Switch stay disabled when unavailable or when canRestart is false. A session stopped with aoe acp stop shows a stopped headline and explains that queued messages wait for Retry, without offering Install."
     },
     {
       "id": "acp.container-gone-banner",
@@ -4935,7 +5049,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-worker-api.spec.ts", "tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "src/server/api/acp.rs", "src/acp/acp_client/"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "src/server/api/acp.rs", "src/acp/acp_client/"],
+      "notes": "The existing native-binary startup story opens Details and the agent log, refreshes it, waits for loading to settle, and saves/attaches the positive disclosed surface to the Playwright HTML report."
     },
     {
       "id": "read-only.mode",
@@ -5588,7 +5703,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/composer-controls.spec.ts"],
-      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/ToolCards.tsx"]
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/ToolCards.tsx"],
+      "notes": "The four-phase cancellation story checks enabled and activates Stop in one browser task, once only; it observes while disabled and never retries an admitted or refused click. Cancellation count, idle, hidden Stop and absent tail output remain required. This story does not certify physical pointer down/up; the other Stop stories retain real pointer clicks."
     },
     {
       "id": "acp.story.composer-queue-follow-up",

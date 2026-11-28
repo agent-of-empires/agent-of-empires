@@ -95,6 +95,7 @@ impl Instance {
             acp_effort: None,
             acp_model_config: std::collections::BTreeMap::new(),
             acp_session_id: None,
+            acp_establishment: None,
             import_pending: None,
             fork_pending: None,
             terminal_rebind_pending: false,
@@ -109,10 +110,12 @@ impl Instance {
             launch_admission: None,
             before_start_minted_for_launch: false,
             capture_started_at: None,
+            unproven_native_birth_generation: None,
             launch_executable: None,
             pi_extension_launched: false,
             identity_publisher_launched: false,
             pi_session_path: None,
+            last_error_evidence: None,
             last_error: LastError::default(),
             capture_poller: Default::default(),
             retroactive_capture_excludes: HashSet::new(),
@@ -960,37 +963,6 @@ impl Instance {
         attested
     }
 
-    /// Persist the store a worker observed for the ACP id it was just assigned,
-    /// so a dormant session can still prove it at the next terminal switch.
-    pub(crate) fn record_observed_acp_store(
-        &mut self,
-        sid: &str,
-        observed: Option<&ExecutionBinding>,
-    ) -> bool {
-        let Some(observed) = observed.filter(|o| o.agent == "claude" && o.filesystem == "host")
-        else {
-            return false;
-        };
-        if self.is_sandboxed()
-            || self.agent_session_binding.as_ref().is_some_and(|binding| {
-                binding.session_id == sid
-                    && (binding.provenance != ConversationProvenance::Observed
-                        || binding.execution.as_ref().is_some_and(|known| {
-                            known.stores == observed.stores && known.cwd == observed.cwd
-                        }))
-            })
-        {
-            return false;
-        }
-        self.agent_session_binding = Some(ConversationBinding {
-            session_id: sid.to_owned(),
-            execution: Some(observed.clone()),
-            provenance: ConversationProvenance::Observed,
-            transcript_path: None,
-        });
-        true
-    }
-
     /// The persisted observed store for `sid`, only while its transcript still exists.
     fn persisted_observed_store(&self, sid: &str) -> Option<&ExecutionBinding> {
         let execution = self
@@ -1559,14 +1531,12 @@ mod tests {
         inst.view = View::Structured;
         inst.acp_session_id = Some("sid-abc".to_string());
         let worker = inst.resolve_native_execution(None).unwrap().binding;
-        assert!(inst.record_observed_acp_store("sid-abc", Some(&worker)));
-        assert!(!inst.record_observed_acp_store("sid-abc", Some(&worker)));
-        let moved = ExecutionBinding {
-            stores: vec![temp.path().join("other-store")],
-            ..worker.clone()
-        };
-        assert!(inst.record_observed_acp_store("sid-abc", Some(&moved)));
-        assert!(inst.record_observed_acp_store("sid-abc", Some(&worker)));
+        inst.agent_session_binding = Some(ConversationBinding {
+            session_id: "sid-abc".into(),
+            execution: Some(worker.clone()),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
 
         assert!(inst.terminal_keep_context_state(None).is_err());
 

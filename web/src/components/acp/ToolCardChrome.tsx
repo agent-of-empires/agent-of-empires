@@ -15,7 +15,7 @@ import { ArrowUpRight, ChevronDown } from "lucide-react";
 import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { parseJsonObject } from "../../lib/acpArgs";
 import { useAcpPrefs } from "../../lib/acpPrefs";
-import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
+import type { ActivityRow, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
 import { hasAnsi, parseAnsi, type AnsiSegment, type AnsiStyle } from "../../lib/ansi";
 import { highlightSnippet, peekHighlight } from "../../lib/snippetHighlighter";
 import { useAcpFileRef } from "./AcpFileRefContext";
@@ -38,6 +38,13 @@ export function statusFor(result?: ActivityRow): Status {
   return "ok";
 }
 
+/** Keep partial native output readable without creating a terminal tool result. */
+export function toolOutput(tool: ToolCall, result?: ActivityRow): ToolOutputBlock[] | undefined {
+  if (result) return result.output;
+  const output = parseJsonObject(tool.args_preview)?._aoe_partial_output;
+  return Array.isArray(output) ? (output as ToolOutputBlock[]) : undefined;
+}
+
 /** Keys AcpRuntime smuggles through `args_preview`; never shown as user input. */
 export function isAcpBookkeepingKey(key: string): boolean {
   return (
@@ -45,7 +52,8 @@ export function isAcpBookkeepingKey(key: string): boolean {
     key === "_aoe_started_at" ||
     key === "_aoe_parent_tool_call_id" ||
     key === "_aoe_raw_tool_name" ||
-    key === "_aoe_diffs"
+    key === "_aoe_diffs" ||
+    key === "_aoe_partial_output"
   );
 }
 

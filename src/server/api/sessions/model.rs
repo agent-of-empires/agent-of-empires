@@ -87,6 +87,7 @@ pub(super) fn session_response_from_instance_with_plan(
         last_accessed_at: timestamp(row.last_accessed_at),
         idle_entered_at: timestamp(row.idle_entered_at),
         last_error: row.last_error.map(str::to_string),
+        last_error_evidence: row.last_error_evidence,
         initial_prompt_error: inst
             .pending_initial_turn
             .as_ref()
@@ -152,6 +153,7 @@ pub(super) fn session_response_from_instance_with_plan(
         acp_worker_start: None,
         pending_approvals: Vec::new(),
         rate_limit: None,
+        rate_limit_known: None,
         rate_limit_auto_resume: None,
         rate_limit_failover_to: None,
         queued_count: inst.queued_prompts.len(),

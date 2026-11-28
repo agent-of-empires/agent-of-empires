@@ -414,7 +414,7 @@ impl HttpClient {
                         }
                         _ => coverage.push((frame.seq, frame.seq)),
                     }
-                    model.apply_event(frame.seq, &frame.event);
+                    model.apply_scoped_event(frame.seq, &frame.event, &frame.view_metadata());
                 }
             })
             .await?;
@@ -617,13 +617,21 @@ impl HttpClient {
     }
 
     /// `POST /api/sessions/{id}/acp/cancel`.
-    pub async fn cancel(&self, session_id: &str) -> Result<(), HttpError> {
+    pub async fn cancel(
+        &self,
+        session_id: &str,
+        host_prompt_intent: Option<uuid::Uuid>,
+    ) -> Result<(), HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/cancel",
             self.endpoint.base_url,
             path_segment(session_id)?
         );
-        let res = self.execute(self.http.post(&url)).await?;
+        let mut request = self.http.post(&url);
+        if let Some(id) = host_prompt_intent {
+            request = request.json(&serde_json::json!({"host_prompt_intent": id}));
+        }
+        let res = self.execute(request).await?;
         check_status(res, session_id)?;
         Ok(())
     }
@@ -1451,6 +1459,7 @@ mod tests {
                         text: text.clone(),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
@@ -1462,6 +1471,7 @@ mod tests {
                 &Event::Stopped {
                     reason: "prompt_complete".into(),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         let content = format!("{}tool-tail-🦀", "y".repeat(17 * 1024 * 1024));
@@ -1482,6 +1492,7 @@ mod tests {
                     completed_at,
                     async_subagent: false,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
 
@@ -1631,6 +1642,7 @@ mod tests {
                         text: format!("retained-{seq}"),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
@@ -1774,7 +1786,12 @@ mod tests {
         for (index, event) in events.iter().enumerate() {
             state
                 .acp_event_store
-                .record(&id, index as u64 + 1, event)
+                .record(
+                    &id,
+                    index as u64 + 1,
+                    event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .unwrap();
         }
         let app = Router::new()
@@ -1841,7 +1858,12 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![instance]);
         state
             .acp_event_store
-            .record(&id, 1, &Event::ThinkingStarted)
+            .record(
+                &id,
+                1,
+                &Event::ThinkingStarted,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         let app = Router::new()
             .route(
@@ -1869,7 +1891,12 @@ mod tests {
             .unwrap();
         state
             .acp_event_store
-            .record(&id, 2, &Event::ThinkingEnded)
+            .record(
+                &id,
+                2,
+                &Event::ThinkingEnded,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         let response = http
             .get(&url)
@@ -1901,7 +1928,7 @@ mod tests {
             move || {
                 let page = calls.fetch_add(1, Ordering::SeqCst);
                 async move { axum::Json(serde_json::json!({
-                    "frames": [{"session_id": "fixture", "seq": page + 1, "event": {"AgentMessageChunk": {"text": "readable", "message_id": null}}}],
+                    "frames": [{"session_id": "fixture", "seq": page + 1, "scope": "history_only", "event": {"AgentMessageChunk": {"text": "readable", "message_id": null}}}],
                     "lost": false, "highest_seq": 2, "lowest_seq": 1,
                     "next_cursor": page + 1, "has_more": page == 0,
                     "history_identity": if page == 0 { "first-snapshot" } else { "different-snapshot" }
@@ -1953,6 +1980,7 @@ mod tests {
                         text: format!("retained-{seq}\n\n"),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
@@ -1977,6 +2005,7 @@ mod tests {
                                             text: "retained-4".into(),
                                             message_id: None,
                                         },
+                                        &crate::acp::event_sender::EventMetadata::history(),
                                     )
                                     .unwrap();
                             }
@@ -2031,7 +2060,12 @@ mod tests {
         for seq in 1..=3 {
             state
                 .acp_event_store
-                .record(&id, seq, &chunk(format!("retained-{seq}\n\n")))
+                .record(
+                    &id,
+                    seq,
+                    &chunk(format!("retained-{seq}\n\n")),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .unwrap();
         }
         let appended = Arc::new(AtomicBool::new(false));
@@ -2048,7 +2082,12 @@ mod tests {
                             if q.since == 2 && !appended.swap(true, Ordering::SeqCst) {
                                 state
                                     .acp_event_store
-                                    .record(&id, 4, &chunk("retained-4".into()))
+                                    .record(
+                                        &id,
+                                        4,
+                                        &chunk("retained-4".into()),
+                                        &crate::acp::event_sender::EventMetadata::history(),
+                                    )
                                     .unwrap();
                             }
                             crate::server::api::acp_replay(State(state), Path(id), Query(q)).await
@@ -2088,8 +2127,9 @@ mod tests {
         use crate::acp::{event_store::EventStore, state::Event};
         use axum::{routing::get, Router};
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            std::sync::Arc::new(EventStore::open(&dir.path().join("events.db"), 3).unwrap());
+        let store = std::sync::Arc::new(
+            EventStore::open(&dir.path().join("events.db"), 3, Default::default()).unwrap(),
+        );
         let inst = crate::session::Instance::new("pinned metadata", "/tmp");
         let id = inst.id.clone();
         store
@@ -2099,6 +2139,7 @@ mod tests {
                 &Event::AvailableCommandsUpdated {
                     commands: Vec::new(),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         for seq in 2..=20 {
@@ -2110,14 +2151,16 @@ mod tests {
                         text: format!("message-{seq}"),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
         assert_eq!(
             store
                 .replay_from(&id, 0)
+                .unwrap()
                 .iter()
-                .map(|(seq, _)| *seq)
+                .map(|stored| stored.seq)
                 .collect::<Vec<_>>(),
             [1, 18, 19, 20]
         );

@@ -266,7 +266,12 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, EventStore) {
         let dir = tempfile::tempdir().unwrap();
-        let store = EventStore::open(&dir.path().join("events.db"), 100).unwrap();
+        let store = EventStore::open(
+            &dir.path().join("events.db"),
+            100,
+            std::sync::Arc::default(),
+        )
+        .unwrap();
         (dir, store)
     }
 
@@ -532,13 +537,12 @@ mod tests {
         assert!(store.account_state("/new").is_some());
     }
 
-    /// A database written before this table existed gains it on open and
-    /// keeps its events.
+    /// Opening an older database adds the table without losing events.
     #[test]
     fn a_database_without_the_table_is_upgraded_on_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.db");
-        let store = EventStore::open(&path, 100).unwrap();
+        let store = EventStore::open(&path, 100, std::sync::Arc::default()).unwrap();
         store
             .record(
                 "s-1",
@@ -546,6 +550,7 @@ mod tests {
                 &crate::acp::state::Event::Stopped {
                     reason: "end_turn".into(),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         store
@@ -554,12 +559,16 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let reopened = EventStore::open(&path, 100).unwrap();
-        assert_eq!(reopened.highest_seq("s-1"), 1, "existing events survive");
+        let reopened = EventStore::open(&path, 100, std::sync::Arc::default()).unwrap();
+        assert_eq!(
+            reopened.highest_seq("s-1").unwrap(),
+            1,
+            "existing events survive"
+        );
         reopened.record_account_limit("/a", 10, "usage", 5, false);
         assert!(reopened.account_state("/a").is_some());
         drop(reopened);
-        let again = EventStore::open(&path, 100).unwrap();
+        let again = EventStore::open(&path, 100, std::sync::Arc::default()).unwrap();
         assert!(again.account_state("/a").is_some());
     }
 }

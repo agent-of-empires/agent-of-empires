@@ -905,12 +905,66 @@ pub(crate) fn observe_lock_contention_for_test(
 }
 
 #[cfg(test)]
-fn report_lock_contention_for_test(path: &Path) {
+struct SharedLockContentionObserver {
+    path: PathBuf,
+    sender: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+static SHARED_LOCK_CONTENTION_OBSERVER: std::sync::Mutex<Option<SharedLockContentionObserver>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) struct SharedLockContentionGuard;
+
+#[cfg(test)]
+impl Drop for SharedLockContentionGuard {
+    fn drop(&mut self) {
+        let observer = SHARED_LOCK_CONTENTION_OBSERVER.lock().unwrap().take();
+        drop(observer);
+    }
+}
+
+#[cfg(test)]
+impl Storage {
+    pub(crate) fn observe_shared_lock_contention_for_test(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) -> SharedLockContentionGuard {
+        let path = self
+            .sessions_path
+            .parent()
+            .unwrap()
+            .join(STORAGE_LOCK_FILENAME);
+        let mut slot = SHARED_LOCK_CONTENTION_OBSERVER.lock().unwrap();
+        assert!(slot.is_none(), "one scoped shared-flock observer");
+        *slot = Some(SharedLockContentionObserver {
+            path,
+            sender: Some(sender),
+        });
+        SharedLockContentionGuard
+    }
+}
+
+#[cfg(test)]
+fn report_lock_contention_for_test(path: &Path, shared_flock: bool) {
     LOCK_CONTENTION_OBSERVER.with(|slot| {
-        if let Some(sender) = slot.borrow_mut().take() {
+        if let Some(sender) = slot.borrow().as_ref() {
             let _ = sender.send(path.to_path_buf());
         }
     });
+    if shared_flock {
+        let sender = {
+            let mut slot = SHARED_LOCK_CONTENTION_OBSERVER.lock().unwrap();
+            // Keep the registration until Drop so an old guard cannot clear a newer one.
+            slot.as_mut()
+                .filter(|observer| observer.path == path)
+                .and_then(|observer| observer.sender.take())
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
 }
 
 pub(crate) fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFlock> {
@@ -923,7 +977,7 @@ pub(crate) fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<
             fs::write(marker, path.as_os_str().as_encoded_bytes())?;
         }
         #[cfg(test)]
-        report_lock_contention_for_test(path);
+        report_lock_contention_for_test(path, false);
         let started = Instant::now();
         let mut warned = false;
         loop {
@@ -972,7 +1026,7 @@ fn acquire_open_storage_shared_flock(file: fs::File, path: &Path) -> Result<Stor
             return Err(e.into());
         }
         #[cfg(test)]
-        report_lock_contention_for_test(path);
+        report_lock_contention_for_test(path, true);
         let started = Instant::now();
         let mut warned = false;
         loop {
@@ -1262,6 +1316,126 @@ pub struct Storage {
     file_watch: Arc<FileWatchService>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("profile storage binding changed")]
+pub(crate) struct NativeInputBindingChanged;
+
+/// A channel-local binding to the profile and the current sessions-file name.
+pub(crate) struct NativeInputStore {
+    storage: Storage,
+    sessions_directory: super::anchored_fs::AnchoredDir,
+    sessions_leaf: PathBuf,
+    lifecycle_leaf: std::ffi::OsString,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeInputRevision {
+    profile_identity: (u64, u64),
+    device: nix::libc::dev_t,
+    inode: nix::libc::ino_t,
+    size: nix::libc::off_t,
+    modified: (nix::libc::time_t, nix::libc::c_long),
+    changed: (nix::libc::time_t, nix::libc::c_long),
+}
+
+impl NativeInputStore {
+    pub(crate) fn profile(&self) -> &str {
+        self.storage.profile()
+    }
+
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    pub(crate) fn acquire_lifecycle_lock(&self) -> Result<StorageFlock> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, path) = files.directory.open_lock(&self.lifecycle_leaf)?;
+        acquire_open_storage_flock(file, &path)
+    }
+
+    pub(crate) fn try_acquire_lifecycle_lock(&self) -> Result<Option<StorageFlock>> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, _) = files.directory.open_lock(&self.lifecycle_leaf)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(StorageFlock { file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Inspect the current directory entry, never a retained data-file descriptor.
+    pub(crate) fn revision(&self) -> Result<NativeInputRevision> {
+        self.storage.verify_bound_profile()?;
+        let stat = self
+            .sessions_directory
+            .entry_stat(&self.sessions_leaf)?
+            .context("native input sessions file is missing")?;
+        anyhow::ensure!(
+            stat.st_mode & nix::libc::S_IFMT == nix::libc::S_IFREG && stat.st_size >= 0,
+            "native input sessions file is not regular"
+        );
+        Ok(NativeInputRevision {
+            profile_identity: self.storage.bound_profile_identity()?,
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            size: stat.st_size,
+            modified: (stat.st_mtime, stat.st_mtime_nsec),
+            changed: (stat.st_ctime, stat.st_ctime_nsec),
+        })
+    }
+
+    pub(crate) fn load_complete(&self) -> Result<(NativeInputRevision, Vec<Instance>)> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, path) = files
+            .directory
+            .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
+        let _flock = acquire_open_storage_shared_flock(file, &path)?;
+        self.read_complete_locked()
+    }
+
+    /// The producer must never wait on the profile-wide writer while holding
+    /// global worker/lifecycle exclusion, even after obtaining its native flock.
+    pub(crate) fn try_load_complete(&self) -> Result<Option<(NativeInputRevision, Vec<Instance>)>> {
+        let files = self
+            .storage
+            .files
+            .as_deref()
+            .context("unbound input store")?;
+        let (file, _) = files
+            .directory
+            .open_lock(std::ffi::OsStr::new(STORAGE_LOCK_FILENAME))?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let _flock = StorageFlock { file };
+        self.read_complete_locked().map(Some)
+    }
+
+    fn read_complete_locked(&self) -> Result<(NativeInputRevision, Vec<Instance>)> {
+        let revision = self.revision()?;
+        let rows = self.storage.load_instances_complete()?;
+        anyhow::ensure!(
+            revision == self.revision()?,
+            "native input sessions revision changed while reading"
+        );
+        Ok((revision, rows))
+    }
+}
+
 pub(crate) type SessionMutation<'a> =
     dyn FnMut(&mut Vec<Instance>, &mut Vec<Group>) -> Result<()> + 'a;
 
@@ -1273,6 +1447,27 @@ pub(crate) struct NativeStoreUnavailable;
 #[derive(Debug, thiserror::Error)]
 #[error("session metadata was committed but canonical adoption failed")]
 pub(crate) struct SessionCommitApplied;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LifecycleRelease {
+    Reservation(super::LifecycleOperation),
+    IndeterminateLaunch,
+}
+
+impl LifecycleRelease {
+    pub(crate) fn apply(self, row: &mut Instance, generation: u64) {
+        let operation = match self {
+            Self::Reservation(operation) => operation,
+            Self::IndeterminateLaunch => super::LifecycleOperation::Launch,
+        };
+        if row.release_lifecycle_reservation_if_owned(operation, generation)
+            && matches!(self, Self::IndeterminateLaunch)
+            && row.status == super::Status::Creating
+        {
+            row.status = super::Status::Starting;
+        }
+    }
+}
 
 pub(crate) trait SessionStore: Send + Sync {
     fn storage(&self) -> &Storage;
@@ -1294,10 +1489,16 @@ pub(crate) trait SessionStore: Send + Sync {
     fn commit_launch_ready(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
         self.commit(mutation)
     }
+    /// Canonical post-launch metadata checkpoint on this already bound store.
+    /// The mutation must fence its original physical context, producer and full
+    /// selection. Launch-only presentation fields are not metadata authority.
+    fn commit_metadata_checkpoint(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        self.commit(mutation)
+    }
     fn release_lifecycle_reservation(
         &self,
         id: &str,
-        operation: super::LifecycleOperation,
+        release: LifecycleRelease,
         generation: u64,
         lifecycle: Option<StorageFlock>,
     ) -> Result<()> {
@@ -1308,7 +1509,7 @@ pub(crate) trait SessionStore: Send + Sync {
         };
         self.commit(&mut |rows, _| {
             if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-                row.release_lifecycle_reservation_if_owned(operation, generation);
+                release.apply(row, generation);
             }
             Ok(())
         })
@@ -1316,7 +1517,7 @@ pub(crate) trait SessionStore: Send + Sync {
     fn defer_lifecycle_release(
         self,
         id: String,
-        operation: super::LifecycleOperation,
+        release: LifecycleRelease,
         generation: u64,
         lifecycle: Option<StorageFlock>,
     ) where
@@ -1326,7 +1527,7 @@ pub(crate) trait SessionStore: Send + Sync {
         if let Err(error) = std::thread::Builder::new()
             .name("aoe-lifecycle-reservation-release".into())
             .spawn(move || {
-                if let Err(error) = self.release_lifecycle_reservation(&id, operation, generation, lifecycle) {
+                if let Err(error) = self.release_lifecycle_reservation(&id, release, generation, lifecycle) {
                     tracing::warn!(target: "session.lifecycle", session = %id, %error, "deferred reservation release failed");
                 }
             })
@@ -1371,6 +1572,8 @@ impl LaunchConfig {
 pub(crate) enum CaptureStorage<'a> {
     Profiles(&'a Arc<FileWatchService>),
     Scoped(&'a dyn SessionStore),
+    /// Caller-provided profile stores; Capture still acquires lifecycle ownership.
+    Provided(&'a dyn Fn(&str) -> Result<&'a dyn SessionStore>),
 }
 
 impl CaptureStorage<'_> {
@@ -1381,12 +1584,8 @@ impl CaptureStorage<'_> {
     ) -> Result<LaunchConfig> {
         match self {
             Self::Profiles(_) => Ok(local_launch_configuration(profile, project)),
-            Self::Scoped(storage) => {
-                anyhow::ensure!(
-                    storage.storage().profile() == profile,
-                    "capture profile changed during launch"
-                );
-                storage.launch_configuration(project)
+            Self::Scoped(_) | Self::Provided(_) => {
+                self.with_store(profile, |storage| storage.launch_configuration(project))
             }
         }
     }
@@ -1396,19 +1595,19 @@ impl CaptureStorage<'_> {
         profile: &str,
         action: impl FnOnce(&dyn SessionStore) -> Result<R>,
     ) -> Result<R> {
-        match self {
+        let storage = match self {
             Self::Profiles(file_watch) => {
                 let storage = Storage::new(profile, (*file_watch).clone())?;
-                action(&storage)
+                return action(&storage);
             }
-            Self::Scoped(storage) => {
-                anyhow::ensure!(
-                    storage.storage().profile() == profile,
-                    "capture profile changed during launch"
-                );
-                action(*storage)
-            }
-        }
+            Self::Scoped(storage) => *storage,
+            Self::Provided(provider) => provider(profile)?,
+        };
+        anyhow::ensure!(
+            storage.storage().profile() == profile,
+            "capture profile changed during launch"
+        );
+        action(storage)
     }
 }
 
@@ -1607,7 +1806,7 @@ impl ProfileFiles {
             || !self.sessions.same_target(&current.sessions)?
             || !self.groups.same_target(&current.groups)?
         {
-            anyhow::bail!("profile storage binding changed");
+            anyhow::bail!(NativeInputBindingChanged);
         }
         Ok(())
     }
@@ -1800,7 +1999,10 @@ impl Storage {
 
         Ok(Self {
             profile: profile_name,
-            files: None,
+            files: Some(Box::new(ProfileFiles::open(
+                &sessions_path,
+                ProfileRootPolicy::Reference,
+            )?)),
             sessions_path,
             save_lock,
             file_watch,
@@ -1884,6 +2086,30 @@ impl Storage {
     /// [`Storage::open`] without file-watch subscriptions.
     pub fn open_unwatched(profile: &str) -> Result<Self> {
         Self::open(profile, FileWatchService::noop())
+    }
+
+    pub(crate) fn bind_native_input(self, instance_id: &str) -> Result<NativeInputStore> {
+        super::validate_instance_id(instance_id)?;
+        self.verify_bound_profile()?;
+        let resolved = resolve_symlink_chain(&self.sessions_path)?;
+        let sessions_directory = super::anchored_fs::AnchoredDir::open_reference(
+            resolved.parent().context("sessions path needs a parent")?,
+        )?;
+        let leaf = resolved.file_name().context("sessions path needs a leaf")?;
+        let files = self.files.as_deref().context("unbound input store")?;
+        anyhow::ensure!(
+            sessions_directory
+                .bind_file(leaf)?
+                .same_target(&files.sessions)?,
+            "native input sessions binding changed"
+        );
+        self.verify_bound_profile()?;
+        Ok(NativeInputStore {
+            storage: self,
+            sessions_directory,
+            sessions_leaf: PathBuf::from(leaf),
+            lifecycle_leaf: format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock").into(),
+        })
     }
 
     /// Serialize launch/restart and explicit resume-target mutation for one
@@ -2176,6 +2402,11 @@ impl Storage {
                 .is_some_and(|intent| !intent.is_null()),
             "row retains terminal handoff authority and cannot be decoded"
         );
+        anyhow::ensure!(
+            !row.get("acp_establishment")
+                .is_some_and(|authority| !authority.is_null()),
+            "row retains ACP establishment authority and cannot be decoded"
+        );
         Ok(())
     }
 
@@ -2191,6 +2422,9 @@ impl Storage {
                         format!("invalid terminal handoff for session {}", instance.id)
                     })?;
                 }
+                instance.validate_acp_establishment(self).with_context(|| {
+                    format!("invalid ACP establishment for session {}", instance.id)
+                })?;
                 Ok(())
             },
             Self::on_corrupt_session,
@@ -2546,7 +2780,7 @@ impl Storage {
     {
         #[cfg(test)]
         let _mu = crate::session::test_support::lock_reporting_contention(&self.save_lock, || {
-            report_lock_contention_for_test(&self.sessions_path)
+            report_lock_contention_for_test(&self.sessions_path, false)
         })
         .unwrap_or_else(|error| error.into_inner());
         #[cfg(not(test))]
@@ -4027,17 +4261,36 @@ pub(crate) fn backup_before_migration(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write one copy beside `path` under `marker`, then prune the set that was
-/// there before, never the copy just made. `None` means `path` held nothing to
-/// copy.
-fn backup_beside(path: &Path, marker: &str) -> Result<Option<PathBuf>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).context(format!("failed reading {} for backup", path.display()))
-        }
-    };
+pub(crate) fn publish_migration_snapshot(
+    path: &Path,
+    snapshot: tempfile::NamedTempFile,
+) -> Result<()> {
+    anyhow::ensure!(
+        snapshot.path().parent() == path.parent(),
+        "migration snapshot must be beside its source"
+    );
+    let BackupTarget {
+        path: backup,
+        previous,
+    } = backup_target(path, MIGRATION_BACKUP_MARKER)?;
+    snapshot.as_file().sync_all()?;
+    snapshot
+        .persist_noclobber(&backup)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish migration snapshot {}", backup.display()))?;
+    sync_parent_directory(&backup)?;
+    if let Err(error) = prune_backups_beside(path, &previous, sync_resolved_parent_directory) {
+        tracing::warn!(target: "session.store", %error, path = %path.display(), "migration snapshots not pruned");
+    }
+    Ok(())
+}
+
+struct BackupTarget {
+    path: PathBuf,
+    previous: Vec<(u128, PathBuf)>,
+}
+
+fn backup_target(path: &Path, marker: &str) -> Result<BackupTarget> {
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("a file to back up needs a name: {}", path.display()))?;
@@ -4073,6 +4326,28 @@ fn backup_beside(path: &Path, marker: &str) -> Result<Option<PathBuf>> {
     let mut name = file_name.to_os_string();
     name.push(format!("{marker}{stamp}"));
     let backup = path.with_file_name(&name);
+    Ok(BackupTarget {
+        path: backup,
+        previous: backups,
+    })
+}
+
+/// Write one copy beside `path` under `marker`, then prune the set that was
+/// there before, never the copy just made. `None` means `path` held nothing to
+/// copy.
+fn backup_beside(path: &Path, marker: &str) -> Result<Option<PathBuf>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context(format!("failed reading {} for backup", path.display()))
+        }
+    };
+    let BackupTarget {
+        path: backup,
+        previous: backups,
+    } = backup_target(path, marker)?;
+    let name = backup.file_name().expect("backup target has a file name");
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("a file to back up needs a parent: {}", path.display()))?;
@@ -4446,6 +4721,51 @@ mod tests {
         write(&stores[1])?;
         assert_eq!(stores[0].load()?[0].title, "persisted");
         assert_eq!(stores[1].load()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn native_input_store_tracks_current_link_target_and_rejects_profile_retargeting() -> Result<()>
+    {
+        use std::os::unix::fs::symlink;
+        let _app = crate::session::test_support::isolate_app_dir();
+        let target = tempdir()?;
+        let source = Storage::new_unwatched("input-store-source")?;
+        let replacement = Storage::new_unwatched("input-store-replacement")?;
+        let row = Instance::new("retained input", "/tmp/retained-input");
+        source.update(|rows, _| {
+            rows.push(row.clone());
+            Ok(())
+        })?;
+        replacement.update(|rows, _| {
+            rows.push(Instance::new("replacement input", "/tmp/replacement-input"));
+            Ok(())
+        })?;
+        let resolved = target.path().join("shared-sessions.json");
+        fs::rename(source.sessions_path(), &resolved)?;
+        symlink(&resolved, source.sessions_path())?;
+        let alias = get_profile_dir_path("input-store-alias")?;
+        symlink(get_profile_dir_path("input-store-source")?, &alias)?;
+        let input = Storage::open_reference("input-store-alias")?.bind_native_input(&row.id)?;
+        let _lifecycle = input.acquire_lifecycle_lock()?;
+        let (before, rows) = input.load_complete()?;
+        assert_eq!(rows[0].id, row.id);
+        assert_eq!(before, input.revision()?);
+        let mut renamed = row.clone();
+        renamed.title = "display only".into();
+        atomic_write(&resolved, &serde_json::to_vec(&vec![renamed])?)?;
+        assert_ne!(before, input.revision()?);
+        let (_, rows) = input.load_complete()?;
+        assert_eq!(rows[0].title, "display only");
+        let source_bytes = fs::read(&resolved)?;
+        let replacement_bytes = fs::read(replacement.sessions_path())?;
+        fs::remove_file(&alias)?;
+        symlink(get_profile_dir_path("input-store-replacement")?, &alias)?;
+        assert!(input.revision().is_err());
+        assert!(input.load_complete().is_err());
+        assert_eq!(fs::read(&resolved)?, source_bytes);
+        assert_eq!(fs::read(replacement.sessions_path())?, replacement_bytes);
         Ok(())
     }
 

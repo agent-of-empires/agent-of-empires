@@ -64,9 +64,10 @@ pub(crate) fn resolve_summary_agent(
 
 /// The last `ConversationSummary` in an event list: its text and the seq it
 /// covered. `(None, 0)` when the session has never been summarized.
-pub fn last_summary(events: &[(u64, Event)]) -> (Option<String>, u64) {
+pub fn last_summary<'a>(
+    events: impl DoubleEndedIterator<Item = (u64, &'a Event)>,
+) -> (Option<String>, u64) {
     events
-        .iter()
         .rev()
         .find_map(|(_, e)| match e {
             Event::ConversationSummary {
@@ -80,7 +81,10 @@ pub fn last_summary(events: &[(u64, Event)]) -> (Option<String>, u64) {
 
 /// Reconstruct the transcript for events with seq greater than `since_seq` into a compact,
 /// agent-readable form, keeping the last `MAX_INPUT_BYTES`.
-pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (String, u64, usize) {
+pub fn extract_transcript_delta<'a>(
+    events: impl IntoIterator<Item = (u64, &'a Event)>,
+    since_seq: u64,
+) -> (String, u64, usize) {
     let (mut out, snapshot_seq, new_turns) = render_transcript_delta(events, since_seq);
     if out.len() > MAX_INPUT_BYTES {
         // Keep the tail on a char boundary and flag the drop honestly.
@@ -98,8 +102,8 @@ pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (Str
 }
 
 /// [`extract_transcript_delta`] without the size cap.
-pub(crate) fn render_transcript_delta(
-    events: &[(u64, Event)],
+pub(crate) fn render_transcript_delta<'a>(
+    events: impl IntoIterator<Item = (u64, &'a Event)>,
     since_seq: u64,
 ) -> (String, u64, usize) {
     let mut out = String::new();
@@ -108,10 +112,10 @@ pub(crate) fn render_transcript_delta(
     let mut agent_open = false;
 
     for (seq, event) in events {
-        if *seq <= since_seq {
+        if seq <= since_seq {
             continue;
         }
-        snapshot_seq = *seq;
+        snapshot_seq = seq;
         match event {
             // A rate-limit resume continuation replays a prompt already
             // captured earlier in this same event log (#4041); counting or
@@ -318,9 +322,20 @@ mod serve {
             return;
         };
 
-        let events = state.acp_event_store.replay_from(&session_id, 0);
-        let (previous, last_seq) = last_summary(&events);
-        let (delta, snapshot_seq, new_turns) = extract_transcript_delta(&events, last_seq);
+        let events = match state.acp_event_store.replay_from(&session_id, 0) {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::error!(target: "conversation_summary", session = %session_id, %error, "cannot read retained transcript");
+                return;
+            }
+        };
+        let borrowed = || {
+            events
+                .iter()
+                .map(|stored| (stored.seq, stored.event.as_ref()))
+        };
+        let (previous, last_seq) = last_summary(borrowed());
+        let (delta, snapshot_seq, new_turns) = extract_transcript_delta(borrowed(), last_seq);
         if delta.trim().is_empty() {
             return;
         }
@@ -416,19 +431,21 @@ mod tests {
 
     #[test]
     fn extract_coalesces_agent_text_and_honours_since_seq() {
-        let events = vec![
+        let events = [
             (1, user("fix the login bug")),
             (2, agent("Looking ")),
             (3, agent("at auth.rs")),
             (4, user("second")),
         ];
-        let (text, snap, turns) = extract_transcript_delta(&events[..3], 0);
+        let (text, snap, turns) =
+            extract_transcript_delta(events[..3].iter().map(|(seq, event)| (*seq, event)), 0);
         assert!(text.contains("[User]\nfix the login bug"));
         assert_eq!(text.matches("[Assistant]").count(), 1);
         assert!(text.contains("Looking at auth.rs"));
         assert_eq!((snap, turns), (3, 1));
 
-        let (text, snap, turns) = extract_transcript_delta(&events, 3);
+        let (text, snap, turns) =
+            extract_transcript_delta(events.iter().map(|(seq, event)| (*seq, event)), 3);
         assert!(!text.contains("login") && text.contains("second"));
         assert_eq!((snap, turns), (4, 1));
     }
@@ -444,8 +461,9 @@ mod tests {
             origin_plugin: Some("cron".into()),
             origin: crate::daemon::PromptOrigin::Unknown,
         };
-        let events = vec![(1, user("typed")), (2, plugin)];
-        let (text, _, turns) = extract_transcript_delta(&events, 0);
+        let events = [(1, user("typed")), (2, plugin)];
+        let (text, _, turns) =
+            extract_transcript_delta(events.iter().map(|(seq, event)| (*seq, event)), 0);
         assert!(text.contains("[Plugin cron]\nPR #7 was merged"), "{text}");
         assert_eq!(text.matches("[User]").count(), 1);
         assert_eq!(turns, 2);
@@ -453,16 +471,14 @@ mod tests {
 
     #[test]
     fn extract_skips_a_rate_limit_resend_so_it_neither_counts_nor_duplicates() {
-        // The interrupted prompt already appears once (seq 1); the daemon's
-        // redelivery at seq 3 (#4041) must not add a second [User] block or
-        // count as a new turn.
-        let events = vec![
+        let events = [
             (1, user("keep working")),
             (2, agent("on it")),
             (3, synthesized_user("keep working")),
             (4, agent("done")),
         ];
-        let (text, snap, turns) = extract_transcript_delta(&events, 0);
+        let (text, snap, turns) =
+            extract_transcript_delta(events.iter().map(|(seq, event)| (*seq, event)), 0);
         assert_eq!(text.matches("[User]").count(), 1);
         assert_eq!(turns, 1);
         assert_eq!(snap, 4);
@@ -471,8 +487,9 @@ mod tests {
     #[test]
     fn extract_reduces_tool_calls_to_intent_and_caps_args() {
         let big = "x".repeat(5000);
-        let events = vec![(1, tool("Bash", &big))];
-        let (text, _, _) = extract_transcript_delta(&events, 0);
+        let events = [(1, tool("Bash", &big))];
+        let (text, _, _) =
+            extract_transcript_delta(events.iter().map(|(seq, event)| (*seq, event)), 0);
         assert!(text.contains("[Tool: Bash]"));
         assert!(
             text.len() < 500,
@@ -484,8 +501,9 @@ mod tests {
     #[test]
     fn extract_truncates_oversized_delta_from_the_head() {
         let long = "y".repeat(MAX_INPUT_BYTES + 10_000);
-        let events = vec![(1, user("start")), (2, agent(&long))];
-        let (text, _, _) = extract_transcript_delta(&events, 0);
+        let events = [(1, user("start")), (2, agent(&long))];
+        let (text, _, _) =
+            extract_transcript_delta(events.iter().map(|(seq, event)| (*seq, event)), 0);
         assert!(text.len() <= MAX_INPUT_BYTES + 64);
         assert!(text.starts_with("[... earlier turns"));
     }
@@ -496,13 +514,19 @@ mod tests {
             text: text.into(),
             summarized_until_seq: until,
         };
-        let events = vec![
+        let events = [
             (1, summary("old", 1)),
             (2, user("more")),
             (3, summary("new", 2)),
         ];
-        assert_eq!(last_summary(&events), (Some("new".into()), 2));
-        assert_eq!(last_summary(&events[1..2]), (None, 0));
+        assert_eq!(
+            last_summary(events.iter().map(|(seq, event)| (*seq, event))),
+            (Some("new".into()), 2)
+        );
+        assert_eq!(
+            last_summary(events[1..2].iter().map(|(seq, event)| (*seq, event))),
+            (None, 0)
+        );
     }
 
     #[test]

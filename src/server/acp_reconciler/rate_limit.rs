@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use crate::time::Timestamp;
 
-use super::{is_resumable, query_store, resolve_per_profile, AppState};
-use crate::acp::state::RATE_LIMIT_EXHAUSTED_RETRIES_REASON;
+use super::{is_resumable, query_control, query_store, resolve_per_profile, AppState};
+use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
+use crate::acp::state::{RateLimitInfo, RATE_LIMIT_EXHAUSTED_RETRIES_REASON};
+use crate::acp::supervisor::SupervisorError;
 
 mod failover;
 #[cfg(test)]
@@ -45,18 +47,103 @@ fn rate_limit_resume_at(resets_at: Timestamp, recorded_at_ms: i64, grace_secs: u
     }
 }
 
-/// When a park's window is expected to end: the reported reset plus grace, else the
-/// unknown-reset schedule for the redeliveries spent.
-fn scheduled_resume_at(
-    info: &crate::acp::state::RateLimitInfo,
-    recorded_at_ms: i64,
-    streak: i64,
-) -> Timestamp {
+fn scheduled_resume_at(info: &RateLimitInfo, recorded_at_ms: i64, streak: i64) -> Timestamp {
     match info.resets_at {
-        Some(resets_at) => {
-            rate_limit_resume_at(resets_at, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
+        Some(reset) => {
+            rate_limit_resume_at(reset, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
         }
         None => rate_limit_unknown_reset_retry_at(recorded_at_ms, streak),
+    }
+}
+
+/// Use the same qualified calendar before scheduling and again at delivery.
+struct ParkCalendar {
+    info: RateLimitInfo,
+    recorded_at_ms: i64,
+    observed_at_ms: i64,
+    own: Option<Timestamp>,
+    generic: Option<Timestamp>,
+}
+
+impl ParkCalendar {
+    fn new(park: &crate::acp::event_store::RateLimitPark) -> Self {
+        use crate::acp::acp_client::{refine_from_status, Observation};
+        let info = park.info.clone().unwrap_or_else(RateLimitInfo::undated);
+        let info = match Timestamp::from_millis(park.recorded_at_ms) {
+            Some(at) => refine_from_status(info, at, Observation::Recorded),
+            None => info,
+        };
+        let carried = info.resets_at.map(|reset| {
+            rate_limit_resume_at(
+                reset,
+                park.recorded_at_ms,
+                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
+            )
+        });
+        // A reset inherited from a report that named no window may extend, but never
+        // stand in for, a named window's deadline.
+        let (own, generic) = if park.inherited_window.as_deref() == Some("rate_limit")
+            && info.kind != "rate_limit"
+        {
+            (None, carried)
+        } else {
+            (carried, None)
+        };
+        Self {
+            info,
+            recorded_at_ms: park.recorded_at_ms,
+            observed_at_ms: park.observed_at_ms,
+            own,
+            generic,
+        }
+    }
+
+    fn view(&self) -> failover::ParkView<'_> {
+        failover::ParkView {
+            kind: &self.info.kind,
+            own_ms: self.own.map(Timestamp::as_millis),
+            observed_at_ms: if self.generic.is_some() {
+                self.recorded_at_ms
+            } else {
+                self.observed_at_ms
+            },
+            generic: self.generic.map(|at| crate::acp::event_store::WindowLimit {
+                kind: "rate_limit".into(),
+                until_ms: at.as_millis(),
+                estimated: false,
+                observed_at_ms: self.observed_at_ms,
+            }),
+        }
+    }
+
+    fn scheduled_at(&self, account: &failover::Reported, streak: i64) -> Timestamp {
+        let carried = self.own.or(self.generic);
+        match account.wake.as_ref().filter(|wake| !wake.own) {
+            Some(wake) => Timestamp::from_millis(wake.at_ms).or(carried),
+            None => carried.filter(|_| !account.generic_superseded),
+        }
+        .unwrap_or_else(|| rate_limit_unknown_reset_retry_at(self.recorded_at_ms, streak))
+    }
+
+    fn evidence(
+        &self,
+        scheduled_at: Timestamp,
+        account: &failover::Reported,
+    ) -> Option<(RateLimitInfo, Timestamp)> {
+        // Always record explicit evidence under its source window and observation.
+        // Only use an estimate when no applicable account report already stands.
+        match (self.own, self.generic) {
+            (Some(own), _) => Some((self.info.clone(), own)),
+            (None, Some(generic)) => Some((
+                RateLimitInfo {
+                    kind: "rate_limit".into(),
+                    ..self.info.clone()
+                },
+                generic,
+            )),
+            (None, None) if account.wake.is_none() => Some((self.info.clone(), scheduled_at)),
+            _ => None,
+        }
     }
 }
 
@@ -83,13 +170,11 @@ fn row_minted_at_ms(entry: &crate::daemon::QueuedPromptEntry) -> Option<i64> {
 /// An unknown limit never supersedes: the interrupted request is the older one
 /// and losing it is final, since the first prompt the drain delivers retires
 /// the park.
-fn queue_supersedes(minted_at_ms: &[i64], limit_at_ms: Option<i64>) -> bool {
+fn queue_supersedes(mut minted_at_ms: impl Iterator<Item = i64>, limit_at_ms: Option<i64>) -> bool {
     let Some(limit_at_ms) = limit_at_ms else {
         return false;
     };
-    minted_at_ms
-        .iter()
-        .any(|queued_at| *queued_at > limit_at_ms)
+    minted_at_ms.any(|queued_at| queued_at > limit_at_ms)
 }
 
 /// Sent when a limit ended an agent-initiated turn, which has no prompt to redeliver.
@@ -97,6 +182,7 @@ const AGENT_TURN_CONTINUATION: &str = "continue";
 
 /// What the continuation producer decided for one session (#4092).
 #[must_use]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum ContinuationOutcome {
     /// This call installed the interrupted prompt as the next turn. Licenses
     /// the automatic `RateLimitAutoResumed`, like [`Self::Stands`].
@@ -112,158 +198,516 @@ pub(crate) enum ContinuationOutcome {
     SupersededByQueue,
 }
 
-/// Installs the rate-limit-interrupted prompt as the next turn so a resume
-/// continues the work (#3028).
-///
-/// Takes the session's submission authority by value: a second claim by the
-/// same task would deadlock on the mutex the caller already holds, and holding
-/// it across the checks is what stops a turn-accepting surface from slipping
-/// between them and the install (#4092).
-///
-/// Park liveness is not a supersession oracle here
-/// ([`crate::acp::event_store::EventStore::rate_limit_park`]): a fresh worker
-/// publishes `AcpSessionAssigned`, which retires its own park.
-pub(crate) async fn install_rate_limit_continuation(
+pub(crate) struct PreparedContinuation {
+    session_id: String,
+    created_at: crate::time::Timestamp,
+    pub(crate) prompt: Option<(String, Vec<crate::daemon::PromptAttachmentRef>)>,
+    limit_at_ms: Option<i64>,
+}
+
+impl PreparedContinuation {
+    pub(crate) async fn outcome(
+        &self,
+        state: &Arc<AppState>,
+        id: &str,
+        _submission: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<ContinuationOutcome, SupervisorError> {
+        let rows = state.instances.read().await;
+        let row = rows
+            .iter()
+            .find(|row| {
+                self.session_id == id
+                    && row.id == id
+                    && row.created_at == self.created_at
+                    && row.terminal_handoff.is_none()
+            })
+            .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?;
+        Ok(
+            if self.prompt.is_some()
+                && queue_supersedes(
+                    row.queued_prompts.iter().filter_map(row_minted_at_ms),
+                    self.limit_at_ms,
+                )
+            {
+                ContinuationOutcome::SupersededByQueue
+            } else if self.prompt.is_some() {
+                ContinuationOutcome::Installed
+            } else {
+                ContinuationOutcome::Stands
+            },
+        )
+    }
+}
+
+pub(crate) async fn resolve_continuation(
     state: &Arc<AppState>,
     id: &str,
-    _submission: tokio::sync::OwnedMutexGuard<()>,
-) -> ContinuationOutcome {
-    if state
+) -> Result<PreparedContinuation, SupervisorError> {
+    let interrupted = query_control(
+        &state.acp_event_store,
+        id,
+        "rate-limit continuation",
+        |store, id| store.rate_limited_turn_prompt(id),
+    )
+    .await?;
+    let prompt = match interrupted {
+        Known(Some(prompt)) => Some(prompt),
+        Known(None) => match query_control(
+            &state.acp_event_store,
+            id,
+            "rate-limit agent-turn continuation",
+            |store, id| store.rate_limit_interrupted_agent_turn(id),
+        )
+        .await?
+        {
+            Known(true) => Some((AGENT_TURN_CONTINUATION.to_owned(), Vec::new())),
+            Known(false) => None,
+            Indeterminate => return Err(SupervisorError::ControlStateUnavailable),
+        },
+        Indeterminate => return Err(SupervisorError::ControlStateUnavailable),
+    };
+    let limit_at_ms = if prompt.is_some() {
+        query_control(
+            &state.acp_event_store,
+            id,
+            "rate-limit supersession",
+            |store, id| Ok(store.latest_rate_limit_event(id)?.map(|(_, at)| at)),
+        )
+        .await?
+    } else {
+        None
+    };
+    #[cfg(test)]
+    state.session_service.await_install_barrier(id).await;
+    let created_at = state
         .instances
         .read()
         .await
         .iter()
-        .any(|row| row.id == id && row.terminal_handoff.is_some())
-    {
-        return ContinuationOutcome::Stands;
-    }
-    let Some(interrupted) = query_store(
-        &state.acp_event_store,
-        id,
-        "rate-limit continuation",
-        |s, id| s.rate_limited_turn_prompt(id),
-    )
-    .await
-    else {
-        return ContinuationOutcome::Stands;
-    };
-    let (text, attachments) = match interrupted {
-        Some(prompt) => prompt,
-        // Nothing to redeliver: an agent-initiated turn is continued the way
-        // a user would, with a bare prompt (#4373).
-        None => {
-            let agent_turn = query_store(
-                &state.acp_event_store,
-                id,
-                "rate-limit agent-turn continuation",
-                |s, id| s.rate_limit_interrupted_agent_turn(id),
-            )
-            .await;
-            if agent_turn != Some(true) {
-                return ContinuationOutcome::Stands;
-            }
-            (AGENT_TURN_CONTINUATION.to_string(), Vec::new())
-        }
-    };
-    #[cfg(test)]
-    state.session_service.await_install_barrier(id).await;
-    // A queued prompt publishes no event, so its row is the only record of a
-    // supersession. Only the mint times leave the read guard: a row carries its
-    // whole text, and copying that under the shared lock is not worth one
-    // timestamp.
-    let minted_at_ms: Vec<i64> = {
-        let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return ContinuationOutcome::Stands;
-        };
-        inst.queued_prompts
-            .iter()
-            .filter_map(row_minted_at_ms)
-            .collect()
-    };
-    if !minted_at_ms.is_empty() {
-        // `None` covers a pruned limit row and a failed probe alike, and
-        // neither proves a supersession, so the continuation stands.
-        let limit_at_ms = query_store(
-            &state.acp_event_store,
-            id,
-            "rate-limit supersession",
-            |s, id| {
-                s.latest_rate_limit_event(id)
-                    .map(|(_, recorded_at_ms)| recorded_at_ms)
-            },
-        )
-        .await
-        .flatten();
-        if queue_supersedes(&minted_at_ms, limit_at_ms) {
-            // A continuation an earlier cadence installed is no longer next.
-            // `/queue` never clears the slot the way `acp_prompt` does, so this
-            // is where a newer word takes it back. Only while the resume pass
-            // runs: it skips a session whose worker is already live, and that
-            // one drains the continuation ahead of the queue.
-            state.session_service.clear_pending_initial_turn(id).await;
-            return ContinuationOutcome::SupersededByQueue;
-        }
-    }
-    state
-        .session_service
-        .set_pending_initial_turn(id, text, attachments, crate::daemon::PromptOrigin::Aoe)
-        .await;
-    ContinuationOutcome::Installed
+        .find(|row| row.id == id && row.terminal_handoff.is_none())
+        .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?
+        .created_at;
+    Ok(PreparedContinuation {
+        session_id: id.to_owned(),
+        created_at,
+        prompt,
+        limit_at_ms,
+    })
 }
 
-/// Releases rate-limit parks whose window elapsed: install the interrupted
-/// prompt unless a queued one took the session, publish the breadcrumb for a
-/// delivered continuation, and free the `attempted` slot so this tick
-/// respawns. The park and its times come from the durable event store (#3514).
-/// Returns the released ids so the resume loop does not re-hold them.
+#[cfg(test)]
+pub(crate) async fn install_rate_limit_continuation(
+    state: &Arc<AppState>,
+    id: &str,
+    submission: &tokio::sync::OwnedMutexGuard<()>,
+) -> Result<ContinuationOutcome, SupervisorError> {
+    let prepared = resolve_continuation(state, id).await?;
+    let outcome = prepared.outcome(state, id, submission).await?;
+    install_prepared_continuation(state, id, submission, prepared, outcome).await
+}
+
+pub(crate) async fn install_prepared_continuation(
+    state: &Arc<AppState>,
+    id: &str,
+    _submission: &tokio::sync::OwnedMutexGuard<()>,
+    prepared: PreparedContinuation,
+    outcome: ContinuationOutcome,
+) -> Result<ContinuationOutcome, SupervisorError> {
+    if prepared.session_id != id
+        || !state.instances.read().await.iter().any(|row| {
+            row.id == id && row.created_at == prepared.created_at && row.terminal_handoff.is_none()
+        })
+    {
+        return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+    }
+    match outcome {
+        ContinuationOutcome::SupersededByQueue => {
+            state.session_service.clear_pending_initial_turn(id).await;
+        }
+        ContinuationOutcome::Installed => {
+            let (text, attachments) = prepared
+                .prompt
+                .ok_or(SupervisorError::ControlStateUnavailable)?;
+            state
+                .session_service
+                .set_pending_initial_turn(id, text, attachments, crate::daemon::PromptOrigin::Aoe)
+                .await;
+        }
+        ContinuationOutcome::Stands => {}
+    }
+    Ok(outcome)
+}
+
+pub(crate) struct QuotaDelivery {
+    park_seq: u64,
+}
+
+impl QuotaDelivery {
+    pub(crate) fn new(park_seq: u64) -> Self {
+        Self { park_seq }
+    }
+
+    pub(crate) fn park_seq(&self) -> u64 {
+        self.park_seq
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum QuotaResume {
+    Manual,
+    Automatic { park_seq: u64 },
+    QueuedAtCap { park_seq: u64 },
+    LoginQueue { park_seq: u64 },
+}
+
+pub(crate) async fn resume_rate_limited(
+    state: &Arc<AppState>,
+    id: &str,
+    submission: tokio::sync::OwnedMutexGuard<()>,
+    kind: QuotaResume,
+) -> Result<(), crate::acp::supervisor::SupervisorError> {
+    use crate::acp::supervisor::SupervisorError;
+    let park = match query_control(&state.acp_event_store, id, "quota release", |store, id| {
+        store.rate_limit_park(id)
+    })
+    .await?
+    {
+        Known(Some(park)) => park,
+        Known(None) => return Ok(()),
+        Indeterminate => return Err(SupervisorError::ControlStateUnavailable),
+    };
+    match kind {
+        QuotaResume::Automatic { park_seq } if park.seq != park_seq || park.cap_reached => {
+            return Ok(())
+        }
+        QuotaResume::QueuedAtCap { park_seq } if park.seq != park_seq || !park.cap_reached => {
+            return Ok(())
+        }
+        QuotaResume::LoginQueue { park_seq } if park.seq != park_seq => return Ok(()),
+        _ => {}
+    }
+    let (profile, generation) = {
+        let rows = state.instances.read().await;
+        rows.iter()
+            .find(|row| row.id == id && is_resumable(row))
+            .map(|row| (row.source_profile.clone(), row.lifecycle_generation))
+            .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?
+    };
+    if let Some(unavailable) = state
+        .session_service
+        .prompt_native_unavailability(id)
+        .await
+        .map_err(|_| SupervisorError::ControlStateUnavailable)?
+    {
+        return Err(crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable).into());
+    }
+    let Known(streak) = query_control(
+        &state.acp_event_store,
+        id,
+        "quota release budget",
+        |store, id| store.rate_limit_redelivery_streak(id),
+    )
+    .await?
+    else {
+        return Err(SupervisorError::ControlStateUnavailable);
+    };
+    let mut resume_at = park
+        .info
+        .as_ref()
+        .and_then(|info| info.resets_at)
+        .unwrap_or_else(Timestamp::now);
+    if matches!(kind, QuotaResume::Automatic { .. }) {
+        let settings = resolve_per_profile([profile.clone()].into_iter(), |config| {
+            (
+                config.acp.rate_limit_auto_resume,
+                failover::Settings::of(config),
+            )
+        })
+        .await;
+        let (enabled, failover_settings) = settings.get(&profile).cloned().unwrap_or_default();
+        if !enabled {
+            return Ok(());
+        }
+        let calendar = ParkCalendar::new(&park);
+        let reported = if failover_settings.enabled {
+            let row = {
+                let rows = state.instances.read().await;
+                rows.iter()
+                    .find(|row| row.id == id && is_resumable(row))
+                    .cloned()
+            };
+            match row {
+                Some(row) => failover::reported_wake(state, &row, &calendar.view()).await,
+                None => return Err(SupervisorError::SpawnCancelled(id.to_owned())),
+            }
+        } else {
+            failover::Reported::default()
+        };
+        resume_at = calendar.scheduled_at(&reported, streak);
+        if let Some(attempt) = park.last_resume_attempt_ms.and_then(Timestamp::from_millis) {
+            resume_at =
+                resume_at.max(attempt + crate::time::Duration::seconds(RATE_LIMIT_MIN_PARK_SECS));
+        }
+        if Timestamp::now() < resume_at {
+            return Ok(());
+        }
+        if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
+            let latest = query_store(
+                &state.acp_event_store,
+                id,
+                "quota release frontier",
+                |store, id| store.highest_seq(id),
+            )
+            .await
+            .ok_or(SupervisorError::NativeStoreUnavailable)?
+            .map_err(|_| SupervisorError::NativeStoreUnavailable)?;
+            if state.acp_supervisor.publish_stopped_if_seq(
+                id,
+                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+                latest,
+            ) {
+                state.session_service.clear_pending_initial_turn(id).await;
+            }
+            return Ok(());
+        }
+    }
+    let authority = if matches!(kind, QuotaResume::Manual) {
+        crate::process::worker_registry::ResumeAuthority::Explicit
+    } else {
+        crate::process::worker_registry::ResumeAuthority::Automatic
+    };
+    let prepared = if matches!(kind, QuotaResume::QueuedAtCap { .. }) {
+        None
+    } else {
+        Some(resolve_continuation(state, id).await?)
+    };
+    if matches!(kind, QuotaResume::Automatic { .. }) {
+        let enabled = resolve_per_profile([profile.clone()].into_iter(), |config| {
+            config.acp.rate_limit_auto_resume
+        })
+        .await;
+        if !enabled.get(&profile).copied().unwrap_or(false) {
+            return Ok(());
+        }
+    }
+    let current = query_control(
+        &state.acp_event_store,
+        id,
+        "quota release recheck",
+        |store, id| store.rate_limit_park(id),
+    )
+    .await?;
+    match current {
+        Known(Some(current)) if current.seq == park.seq => {}
+        Known(_) => return Ok(()),
+        Indeterminate => return Err(SupervisorError::ControlStateUnavailable),
+    }
+    let delivery = QuotaDelivery { park_seq: park.seq };
+    let outcome = if matches!(kind, QuotaResume::LoginQueue { .. }) {
+        if state
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|row| row.id == id && row.pending_initial_turn.is_some())
+        {
+            ContinuationOutcome::Stands
+        } else {
+            ContinuationOutcome::SupersededByQueue
+        }
+    } else if matches!(kind, QuotaResume::QueuedAtCap { .. }) {
+        if state
+            .session_service
+            .queued_prompts_snapshot(id)
+            .await
+            .is_empty()
+        {
+            return Ok(());
+        }
+        ContinuationOutcome::SupersededByQueue
+    } else {
+        prepared
+            .as_ref()
+            .ok_or(SupervisorError::ControlStateUnavailable)?
+            .outcome(state, id, &submission)
+            .await?
+    };
+    let manual = matches!(kind, QuotaResume::Manual);
+    if !state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|row| row.id == id && row.lifecycle_generation == generation && is_resumable(row))
+    {
+        return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+    }
+    if let Some(unavailable) = state
+        .session_service
+        .prompt_native_unavailability(id)
+        .await
+        .map_err(|_| SupervisorError::ControlStateUnavailable)?
+    {
+        return Err(crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable).into());
+    }
+    if manual
+        || matches!(
+            outcome,
+            ContinuationOutcome::Stands | ContinuationOutcome::Installed
+        )
+    {
+        if manual && park.cap_reached {
+            resume_at = Timestamp::now();
+        }
+        state
+            .acp_supervisor
+            .publish_rate_limit_auto_resumed(id, resume_at, manual)?;
+    }
+    super::resume::ensure_rate_limit_worker(state, id, authority, false).await?;
+    let control = state
+        .session_service
+        .fold_control_state(id)
+        .await
+        .map_err(|_| SupervisorError::ControlStateUnavailable)?;
+    if !control.connection_ready || control.connection_unavailable.is_some() || control.turn_active
+    {
+        return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+    }
+    let outcome = match prepared {
+        Some(prepared) => {
+            install_prepared_continuation(state, id, &submission, prepared, outcome).await?
+        }
+        None => {
+            state.session_service.clear_pending_initial_turn(id).await;
+            outcome
+        }
+    };
+    let handled = match outcome {
+        ContinuationOutcome::Stands | ContinuationOutcome::Installed => {
+            state
+                .session_service
+                .drain_pending_initial_turn_with_submission(id, &submission, Some(&delivery))
+                .await
+        }
+        ContinuationOutcome::SupersededByQueue => {
+            state
+                .session_service
+                .drain_queued_prompts_with_submission(id, &submission, Some(&delivery))
+                .await
+        }
+    };
+    if !handled {
+        if let Some(unavailable) = state
+            .session_service
+            .prompt_native_unavailability(id)
+            .await
+            .map_err(|_| SupervisorError::ControlStateUnavailable)?
+        {
+            return Err(
+                crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable).into(),
+            );
+        }
+        return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+    }
+    Ok(())
+}
+
+pub(super) async fn schedule_capped_queue(state: &Arc<AppState>, id: &str, park_seq: u64) -> bool {
+    let Some(submission) = state.session_service.try_prompt_submission(id).await else {
+        return false;
+    };
+    schedule_quota_release(
+        state.clone(),
+        id.to_owned(),
+        submission,
+        QuotaResume::QueuedAtCap { park_seq },
+    );
+    true
+}
+
+pub(super) fn schedule_quota_release(
+    state: Arc<AppState>,
+    id: String,
+    submission: tokio::sync::OwnedMutexGuard<()>,
+    kind: QuotaResume,
+) {
+    crate::task_util::spawn_supervised(
+        "acp.quota_release",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            let login_release = matches!(kind, QuotaResume::LoginQueue { .. });
+            if let Err(error) = resume_rate_limited(&state, &id, submission, kind).await {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error,
+                    "quota continuation remains held");
+            } else if login_release {
+                state.session_service.sandbox_login.release(&id);
+            }
+        },
+    );
+}
+
+/// Schedule due quota work without waiting for readiness on the global tick.
 pub(crate) async fn reap_rate_limit_resumes(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
     parked: &HashSet<String>,
-) -> HashSet<String> {
-    let mut released = HashSet::new();
+) {
     let candidates: Vec<crate::session::Instance> = {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| is_resumable(i) && attempted.contains(&i.id))
+            .filter(|i| is_resumable(i))
             .cloned()
             .collect()
     };
-    // Only a workerless session is parked; a crash-loop park waits for a manual retry.
-    let mut workerless = Vec::new();
+    let mut eligible = Vec::new();
     for candidate in candidates {
         if parked.contains(&candidate.id) {
             tracing::trace!(target: "acp.supervisor", session = %candidate.id, "rate-limit auto-resume: skipped, session is crash-loop parked");
-        } else if !state.acp_supervisor.is_running(&candidate.id).await {
-            workerless.push(candidate);
+        } else {
+            eligible.push(candidate);
         }
     }
-    if workerless.is_empty() {
-        return released;
+    if eligible.is_empty() {
+        return;
     }
-    let settings_by_profile = resolve_per_profile(
-        workerless.iter().map(|row| row.source_profile.clone()),
-        |c| (c.acp.rate_limit_auto_resume, failover::Settings::of(c)),
-    )
-    .await;
+    let settings_by_profile =
+        resolve_per_profile(eligible.iter().map(|row| row.source_profile.clone()), |c| {
+            (c.acp.rate_limit_auto_resume, failover::Settings::of(c))
+        })
+        .await;
 
     let now = Timestamp::now();
-    for row in workerless {
+    for row in eligible {
         let id = row.id.clone();
         let has_queued_prompts = !row.queued_prompts.is_empty();
+        if state.session_service.sandbox_login.is_held(&id)
+            || crate::process::worker_registry::stop_requested(&id)
+        {
+            continue;
+        }
         let skip = |reason: &str| {
             tracing::trace!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: skipped, {reason}");
         };
+        if !matches!(
+            state
+                .session_service
+                .prompt_native_unavailability(&id)
+                .await,
+            Ok(None)
+        ) {
+            skip("native ownership is unavailable");
+            continue;
+        }
+        let workerless = !state.acp_supervisor.is_running(&id).await;
         let (auto_resume, failover_settings) = settings_by_profile
             .get(&row.source_profile)
             .cloned()
             .unwrap_or_default();
-        if failover_settings.enabled {
+        if workerless && failover_settings.enabled {
             failover::note_auth_failure(state, &row).await;
         }
-        let Some(park) = query_store(
+        let Ok(Known(Some(park))) = query_control(
             &state.acp_event_store,
             &id,
             "rate-limit auto-resume",
@@ -273,41 +717,19 @@ pub(crate) async fn reap_rate_limit_resumes(
         else {
             continue;
         };
-        let Some(park) = park else {
-            skip("session is not parked on a rate limit");
-            continue;
-        };
         if park.cap_reached {
-            if !auto_resume {
-                skip("not enabled for this profile");
-                continue;
-            }
             // The held slot keeps the resume pass off; a queued prompt has no other route to a worker.
             if has_queued_prompts {
-                tracing::info!(target: "acp.supervisor", session = %id, "rate-limit auto-resume: releasing the redelivery-cap park for a queued prompt");
-                attempted.remove(&id);
-                released.insert(id.clone());
+                if schedule_capped_queue(state, &id, park.seq).await {
+                    attempted.remove(&id);
+                }
             } else {
                 skip("redelivery cap reached and no prompt queued");
             }
             continue;
         }
-        // A pruned `RateLimit` row has no reset time and follows the unknown-reset schedule.
-        // A stored status that names its date supplies its reset, read from when it was
-        // recorded; a clock-only one keeps the timed schedule, since the write can follow it.
-        let info = park
-            .info
-            .clone()
-            .unwrap_or_else(crate::acp::state::RateLimitInfo::undated);
-        let info = match Timestamp::from_millis(park.recorded_at_ms) {
-            Some(recorded_at) => crate::acp::acp_client::refine_from_status(
-                info,
-                recorded_at,
-                crate::acp::acp_client::Observation::Recorded,
-            ),
-            None => info,
-        };
-        let Some(streak) = query_store(
+        let calendar = ParkCalendar::new(&park);
+        let Ok(Known(streak)) = query_control(
             &state.acp_event_store,
             &id,
             "rate-limit redelivery streak",
@@ -317,76 +739,20 @@ pub(crate) async fn reap_rate_limit_resumes(
         else {
             continue;
         };
-        // The account table serves the failover alone; with it off the schedule is unchanged.
-        // `failover::wake_deadline` picks between the park's reset and the account's reports.
-        let carried = info.resets_at.map(|reset| {
-            rate_limit_resume_at(
-                reset,
-                park.recorded_at_ms,
-                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
-            )
-        });
-        // A reset copied from a report that named no window is generic evidence under a named
-        // park: the park's window never had that reset, so it may only extend it.
-        let generic = carried.filter(|_| {
-            park.inherited_window.as_deref() == Some("rate_limit") && info.kind != "rate_limit"
-        });
-        let own = carried.filter(|_| generic.is_none());
         let account = if failover_settings.enabled {
-            let view = failover::ParkView {
-                kind: &info.kind,
-                own_ms: own.map(|at| at.as_millis()),
-                observed_at_ms: if generic.is_some() {
-                    park.recorded_at_ms
-                } else {
-                    park.observed_at_ms
-                },
-                generic: generic.map(|at| crate::acp::event_store::WindowLimit {
-                    kind: "rate_limit".into(),
-                    until_ms: at.as_millis(),
-                    estimated: false,
-                    observed_at_ms: park.observed_at_ms,
-                }),
-            };
-            failover::reported_wake(state, &row, &view).await
+            failover::reported_wake(state, &row, &calendar.view()).await
         } else {
             failover::Reported::default()
         };
-        let wake = account.wake;
-        let reported = wake.as_ref().filter(|w| !w.own);
-        let scheduled_at = match (&reported, carried) {
-            (Some(w), _) => Timestamp::from_millis(w.at_ms).or(carried),
-            // A reset copied from a report that a newer one invalidated is no schedule; with no
-            // such report (no account row yet) it stands.
-            (None, carried) => carried.filter(|_| !account.generic_superseded),
-        }
-        .unwrap_or_else(|| rate_limit_unknown_reset_retry_at(park.recorded_at_ms, streak));
+        let scheduled_at = calendar.scheduled_at(&account, streak);
         // A park a swap or resume already touched belongs to the account it ran on then.
         let first_sight = park.last_resume_attempt_ms.is_none();
-        // The park's own reset is evidence for its window whichever wake was chosen: it is
-        // recorded with its original observation, so a sibling's older report cannot overwrite
-        // it and a generic report later corrected cannot take the window with it. Without a
-        // reset of its own the park records an estimate, unless a report already stands. A reset
-        // inherited from a window-less report is that window's evidence, recorded under it with
-        // the source's observation and never as the park's own window.
-        let evidence = match (own, generic, &reported) {
-            (Some(own), _, _) => Some((info.clone(), own)),
-            (None, Some(generic), _) => Some((
-                crate::acp::state::RateLimitInfo {
-                    kind: "rate_limit".into(),
-                    ..info.clone()
-                },
-                generic,
-            )),
-            (None, None, None) => Some((info.clone(), scheduled_at)),
-            _ => None,
-        };
-        if let Some((evidence, until)) =
-            evidence.filter(|_| failover_settings.enabled && first_sight)
-        {
-            failover::record_limit(state, &row, &evidence, until, park.observed_at_ms).await;
+        if workerless && failover_settings.enabled && first_sight {
+            if let Some((evidence, until)) = calendar.evidence(scheduled_at, &account) {
+                failover::record_limit(state, &row, &evidence, until, park.observed_at_ms).await;
+            }
         }
-        let Some(latest_seq) = query_store(
+        let Ok(latest_seq) = query_control(
             &state.acp_event_store,
             &id,
             "rate-limit latest-seq",
@@ -398,7 +764,8 @@ pub(crate) async fn reap_rate_limit_resumes(
         };
         // Below the redelivery cap only: an entirely limited pool finds no target and
         // falls through to the timed resume, whose budget ends in the terminal park.
-        if failover_settings.enabled
+        if workerless
+            && failover_settings.enabled
             && first_sight
             && streak < RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES
             && failover::maybe_fail_over(
@@ -427,66 +794,20 @@ pub(crate) async fn reap_rate_limit_resumes(
             skip("park window has not elapsed");
             continue;
         }
-        if state.acp_supervisor.is_running(&id).await {
-            skip("worker is already live");
-            continue;
-        }
-        if streak >= RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
-            // `/acp/spawn` holds this lock through its continuation install, so
-            // the CAS plus clear cannot interleave with it. `try_lock` because
-            // blocking would stall the tick; contention is a refusal.
-            let instance_lock = state.instance_lock(&id).await;
-            let Ok(_guard) = instance_lock.try_lock() else {
-                continue;
-            };
-            if state.acp_supervisor.publish_stopped_if_seq(
-                &id,
-                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
-                latest_seq,
-            ) {
-                state.session_service.clear_pending_initial_turn(&id).await;
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    redeliveries = streak,
-                    max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
-                    "rate-limit auto-resume: redelivery cap reached; parking session with a terminal stop"
-                );
-            }
-            continue;
-        }
         // Contention is a refusal, not a queue: this is one sequential pass over
         // every session and must not stall behind a submission.
         let Some(submission) = state.session_service.try_prompt_submission(&id).await else {
             skip("a prompt submission owns the session");
             continue;
         };
-        let outcome = install_rate_limit_continuation(state, &id, submission).await;
-        match outcome {
-            ContinuationOutcome::Stands | ContinuationOutcome::Installed => {
-                state
-                    .acp_supervisor
-                    .publish_rate_limit_auto_resumed(&id, resume_at, false);
-                tracing::info!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    resets_at = ?info.resets_at,
-                    resume_at = %resume_at,
-                    "rate-limit auto-resume: park window elapsed; respawning worker"
-                );
-            }
-            ContinuationOutcome::SupersededByQueue => {
-                tracing::info!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "rate-limit auto-resume: a queued prompt superseded the interrupted prompt; respawning for the queue"
-                );
-            }
-        }
         attempted.remove(&id);
-        released.insert(id.clone());
+        schedule_quota_release(
+            state.clone(),
+            id,
+            submission,
+            QuotaResume::Automatic { park_seq: park.seq },
+        );
     }
-    released
 }
 
 #[cfg(test)]
@@ -495,9 +816,79 @@ mod tests {
         enable_auto_resume, queued_prompt, startup_errors, structured_instance, test_state, Tick,
     };
     use super::*;
+    use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
+    use crate::acp::supervisor::test_support::managed::with_managed;
     use crate::acp::Event;
+    use crate::server::test_support::managed_control_session;
 
-    /// #3152 / #3688: no reported reset still retries, doubling per redelivery.
+    fn known_park(state: &AppState, id: &str) -> crate::acp::event_store::RateLimitPark {
+        match state
+            .acp_event_store
+            .rate_limit_park(id)
+            .expect("read park")
+        {
+            Known(Some(park)) => park,
+            value => panic!("expected a known park, got {value:?}"),
+        }
+    }
+
+    fn delivered_prompts(state: &AppState, id: &str, frontier: u64) -> Vec<(String, bool)> {
+        state
+            .acp_event_store
+            .replay_from(id, frontier)
+            .expect("read delivered events")
+            .iter()
+            .filter_map(|stored| match stored.event.as_ref() {
+                Event::UserPromptSent {
+                    text, synthesized, ..
+                } => Some((text.clone(), *synthesized)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn auto_resumed_breadcrumbs(state: &AppState, id: &str) -> usize {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .expect("read resume events")
+            .iter()
+            .filter(|stored| matches!(stored.event.as_ref(), Event::RateLimitAutoResumed { .. }))
+            .count()
+    }
+
+    async fn settle_delivery(state: &Arc<AppState>, id: &str) {
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                state.session_service.prompt_submission(id),
+            )
+            .await
+            .expect("quota delivery releases submission custody"),
+        );
+    }
+
+    async fn pending_turn(state: &AppState, id: &str) -> Option<bool> {
+        state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .and_then(|row| row.pending_initial_turn.as_ref())
+            .map(|turn| turn.synthesized)
+    }
+
+    struct HiddenBudgetTable(Arc<crate::acp::event_store::EventStore>);
+    impl Drop for HiddenBudgetTable {
+        fn drop(&mut self) {
+            self.0
+                .test_conn()
+                .execute_batch("ALTER TABLE hidden_quota_budgets RENAME TO acp_rate_limit_budgets")
+                .unwrap();
+        }
+    }
+
     #[test]
     fn unknown_reset_backs_off_per_redelivery_spent() {
         let recorded_at = crate::time::Timestamp::from_unix_secs(1_500_000).unwrap();
@@ -538,315 +929,6 @@ mod tests {
         }
     }
 
-    /// A session parked on an elapsed limit with `redeliveries` resume cycles
-    /// behind it; events are backdated an hour. Its pending-turn slot is empty.
-    async fn parked(
-        id: &str,
-        redeliveries: usize,
-    ) -> (
-        crate::session::test_support::AppDirGuard,
-        Arc<AppState>,
-        tempfile::TempDir,
-    ) {
-        let (home, state, project) = test_state(id);
-        enable_auto_resume(true);
-        let store = &state.acp_event_store;
-        let long_ago = Timestamp::now() - crate::time::Duration::hours(1);
-        let rate_limit = || Event::RateLimit {
-            info: crate::acp::state::RateLimitInfo {
-                status: "limited".into(),
-                resets_at: Some(long_ago),
-                kind: "usage".into(),
-            },
-        };
-        let prompt = || Event::UserPromptSent {
-            merged_prompt_ids: Vec::new(),
-            text: "run the nightly task".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-            synthesized: false,
-            origin_plugin: None,
-            origin: crate::daemon::PromptOrigin::Unknown,
-        };
-        let stopped = || Event::Stopped {
-            reason: "rate_limited".into(),
-        };
-        let mut events = vec![prompt(), rate_limit(), stopped()];
-        for _ in 0..redeliveries {
-            events.push(Event::RateLimitAutoResumed {
-                resets_at: long_ago,
-                manual: false,
-            });
-            events.extend([prompt(), rate_limit(), stopped()]);
-        }
-        for (seq, event) in events.iter().enumerate() {
-            store
-                .record_at(id, seq as u64 + 1, event, long_ago.as_millis())
-                .unwrap();
-        }
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
-        (home, state, project)
-    }
-
-    /// [`parked`] with the interrupted prompt already installed as the
-    /// pending initial turn, modelling a resume that fired and left it behind.
-    async fn parked_with_continuation(
-        id: &str,
-        redeliveries: usize,
-    ) -> (
-        crate::session::test_support::AppDirGuard,
-        Arc<AppState>,
-        tempfile::TempDir,
-    ) {
-        let (home, state, project) = parked(id, redeliveries).await;
-        state
-            .session_service
-            .set_pending_initial_turn(
-                id,
-                "run the nightly task".into(),
-                Vec::new(),
-                crate::daemon::PromptOrigin::Unknown,
-            )
-            .await;
-        (home, state, project)
-    }
-
-    /// The queued continuation's `synthesized` flag, or `None` when no turn
-    /// is queued.
-    async fn pending_turn(state: &AppState, id: &str) -> Option<bool> {
-        state
-            .instances
-            .read()
-            .await
-            .iter()
-            .find(|i| i.id == id)
-            .and_then(|i| i.pending_initial_turn.as_ref())
-            .map(|t| t.synthesized)
-    }
-
-    fn latest_stop_reason(state: &AppState, id: &str) -> Option<String> {
-        state
-            .acp_event_store
-            .replay_from(id, 0)
-            .into_iter()
-            .rev()
-            .find_map(|(_, e)| match e {
-                Event::Stopped { reason } => Some(reason),
-                _ => None,
-            })
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn rate_limit_resume_backs_off_after_a_failed_attempt() {
-        let id = "sess-3514-backoff";
-        let (_home, state, _project) = parked_with_continuation(id, 0).await;
-        state
-            .acp_supervisor
-            .publish_rate_limit_auto_resumed(id, Timestamp::now(), false);
-        state
-            .acp_supervisor
-            .publish_startup_error(id, "spawn failed".into());
-        let mut attempted: HashSet<String> = [id.to_string()].into();
-
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-
-        assert!(released.is_empty() && attempted.contains(id));
-    }
-
-    /// The resume loop holds a park even behind a newer startup error, so it
-    /// never respawns into the same limit.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn resume_loop_holds_a_parked_session_behind_a_startup_error() {
-        let id = "sess-3514-hold";
-        let (_home, state, _project) = parked_with_continuation(id, 0).await;
-        enable_auto_resume(false);
-        state
-            .acp_supervisor
-            .publish_startup_error(id, "spawn failed once".into());
-        let errors_before = startup_errors(&state, id);
-
-        let mut tick = Tick::default();
-        tick.run(&state).await;
-
-        assert!(tick.attempted.contains(id));
-        assert_eq!(
-            startup_errors(&state, id),
-            errors_before,
-            "no spawn was attempted"
-        );
-    }
-
-    /// #3688: a cap park must release its `attempted` slot for an already
-    /// queued prompt (nothing else would deliver it) and hold it otherwise.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn cap_park_releases_attempted_for_a_prompt_already_on_the_queue() {
-        for has_queue in [true, false] {
-            let id = "sess-3688-cap-queue";
-            let (_home, state, _project) = test_state(id);
-            enable_auto_resume(true);
-            assert!(state.acp_supervisor.publish_stopped_if_seq(
-                id,
-                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
-                0
-            ));
-            if has_queue {
-                state.instances.write().await[0]
-                    .queued_prompts
-                    .push(queued_prompt());
-            }
-
-            let mut tick = Tick::default();
-            tick.attempted.insert(id.to_string());
-            reap_rate_limit_resumes(&state, &mut tick.attempted, &HashSet::new()).await;
-            assert_eq!(
-                !tick.attempted.contains(id),
-                has_queue,
-                "has_queue={has_queue}"
-            );
-
-            tick.run(&state).await;
-            assert_eq!(
-                startup_errors(&state, id) > 0,
-                has_queue,
-                "has_queue={has_queue}"
-            );
-        }
-    }
-
-    enum Setup {
-        None,
-        /// A publish landed between the probe and the CAS.
-        CasAhead,
-        /// A manual `/acp/spawn` holds the instance lock.
-        LockHeld,
-    }
-
-    /// Below the cap the pass resumes; at the cap it publishes the terminal park
-    /// and drops the continuation, unless the CAS refuses or the lock is contended.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn rate_limit_reap_resumes_below_the_cap_and_parks_at_it() {
-        let max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize;
-        // (streak, setup, released, latest stop reason, queued continuation).
-        // A kept continuation is daemon-queued, not user-typed, so it carries
-        // `synthesized` and the transcript model skips a duplicate row (#4041).
-        let cases = [
-            (max - 1, Setup::None, true, "rate_limited", Some(true)),
-            (
-                max,
-                Setup::None,
-                false,
-                RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
-                None,
-            ),
-            (max, Setup::CasAhead, false, "rate_limited", Some(true)),
-            (max, Setup::LockHeld, false, "rate_limited", Some(true)),
-        ];
-        for (streak, setup, released, reason, kept) in cases {
-            let id = "sess-3688";
-            let (_home, state, _project) = parked_with_continuation(id, streak).await;
-            let lock = state.instance_lock(id).await;
-            let _guard = match setup {
-                Setup::None => None,
-                Setup::CasAhead => {
-                    let ahead = state.acp_event_store.highest_seq(id) + 1;
-                    state.acp_supervisor.hydrate_seqs([(id.to_string(), ahead)]);
-                    None
-                }
-                Setup::LockHeld => Some(lock.lock().await),
-            };
-            let mut attempted: HashSet<String> = [id.to_string()].into();
-
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()),
-            )
-            .await
-            .expect("a contended instance_lock must not block the tick");
-
-            let case = format!("streak={streak}");
-            assert_eq!(!attempted.contains(id), released, "{case}");
-            assert_eq!(
-                latest_stop_reason(&state, id).as_deref(),
-                Some(reason),
-                "{case}"
-            );
-            assert_eq!(pending_turn(&state, id).await, kept, "{case}");
-        }
-    }
-
-    /// A limit that ended an agent-initiated turn has no prompt to redeliver, so
-    /// the park resumes with a bare `continue` once its worker is gone (#4373).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn agent_initiated_park_installs_a_continue_prompt() {
-        let id = "sess-4373-continue";
-        let (_home, state, _project) = test_state(id);
-        enable_auto_resume(true);
-        let long_ago = Timestamp::now() - crate::time::Duration::hours(1);
-        let events = [
-            Event::AgentMessageChunk {
-                text: "x".into(),
-                message_id: None,
-            },
-            Event::RateLimit {
-                info: crate::acp::state::RateLimitInfo {
-                    status: "limited".into(),
-                    resets_at: Some(long_ago),
-                    kind: "usage".into(),
-                },
-            },
-            Event::Stopped {
-                reason: "rate_limited".into(),
-            },
-        ];
-        for (seq, event) in events.iter().enumerate() {
-            state
-                .acp_event_store
-                .record_at(id, seq as u64 + 1, event, long_ago.as_millis())
-                .unwrap();
-        }
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
-
-        let mut attempted: HashSet<String> = [id.to_string()].into();
-
-        // A live worker keeps the park: the reaper must not resume over it.
-        state.acp_supervisor.test_insert_worker(id).await;
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        assert!(released.is_empty() && attempted.contains(id));
-        assert_eq!(pending_turn(&state, id).await, None);
-        assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
-
-        state.acp_supervisor.test_remove_worker(id).await;
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        assert!(released.contains(id) && !attempted.contains(id));
-        let queued = state.instances.read().await[0]
-            .pending_initial_turn
-            .as_ref()
-            .map(|t| (t.text.clone(), t.synthesized));
-        assert_eq!(queued, Some((AGENT_TURN_CONTINUATION.to_string(), true)));
-        assert_eq!(auto_resumed_breadcrumbs(&state, id), 1);
-    }
-
-    fn auto_resumed_breadcrumbs(state: &AppState, id: &str) -> usize {
-        state
-            .acp_event_store
-            .replay_from(id, 0)
-            .into_iter()
-            .filter(|(_, e)| matches!(e, Event::RateLimitAutoResumed { .. }))
-            .count()
-    }
-
-    /// Only a row minted after the limit replaced the turn. A row before it and
-    /// a limit that was never recorded both leave the continuation standing: the
-    /// interrupted request is the older one and losing it is final.
     #[test]
     fn only_a_row_minted_after_the_limit_supersedes() {
         let limit = crate::time::Timestamp::from_unix_secs(1_700_000_000).unwrap();
@@ -867,9 +949,6 @@ mod tests {
         let before = crate::time::Timestamp::from_unix_secs(1_699_999_999)
             .unwrap()
             .to_rfc3339();
-        let times = |rows: &[crate::daemon::QueuedPromptEntry]| {
-            rows.iter().filter_map(row_minted_at_ms).collect::<Vec<_>>()
-        };
         let cases = [
             (
                 "row after the limit",
@@ -893,181 +972,1066 @@ mod tests {
         ];
         for (name, rows, recorded, expected) in cases {
             assert_eq!(
-                queue_supersedes(&times(&rows), recorded),
+                queue_supersedes(rows.iter().filter_map(row_minted_at_ms), recorded),
                 expected,
                 "{name}"
             );
         }
     }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_resume_backs_off_after_a_failed_attempt() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live =
+                    managed_control_session(scope, "quota-backoff", "claude", None).await;
+                let id = live.id().to_owned();
+                enable_auto_resume(true);
+                live.park("run the nightly task").await;
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
+                let requests = live.native.requests();
+                let submission = live.state.session_service.prompt_submission(&id).await;
+                resume_rate_limited(
+                    &live.state,
+                    &id,
+                    submission,
+                    QuotaResume::Automatic {
+                        park_seq: known_park(&live.state, &id).seq,
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), before);
+                assert_eq!(live.native.requests(), requests);
+                live.make_quota_due();
+                let submission = live.state.session_service.prompt_submission(&id).await;
+                resume_rate_limited(
+                    &live.state,
+                    &id,
+                    submission,
+                    QuotaResume::Automatic {
+                        park_seq: known_park(&live.state, &id).seq,
+                    },
+                )
+                .await
+                .unwrap();
+                let retried = live.next_prompt().await;
+                assert_eq!(
+                    retried["params"]["prompt"][0]["text"],
+                    "run the nightly task"
+                );
+                live.finish_prompt(&retried, Some("rate_limit")).await;
+                assert_eq!(
+                    live.state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap(),
+                    Known(1)
+                );
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                let mut attempted = HashSet::from([id.clone()]);
+                reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
+                settle_delivery(&live.state, &id).await;
+                assert!(attempted.contains(&id));
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
+                enable_auto_resume(false);
+                live.state
+                    .acp_supervisor
+                    .publish_startup_error(&id, "spawn failed once".into());
+                let errors = startup_errors(&live.state, &id);
+                Tick::default().run(&live.state).await;
+                assert_eq!(startup_errors(&live.state, &id), errors);
+                assert!(matches!(
+                    live.state.acp_event_store.rate_limit_park(&id).unwrap(),
+                    Known(Some(_))
+                ));
+            })
+        })
+        .await;
+    }
 
-    /// #4092: a queued prompt owns the next turn when at least one row was
-    /// minted after the limit that interrupted it. A row queued while the
-    /// interrupted turn was still running
-    /// is a follow-up the user wants behind it, so the continuation is installed
-    /// and its redelivery charged. A row minted after the park clears a
-    /// continuation an earlier cadence installed, because `/queue` never clears
-    /// the slot itself. The rows are seeded on the instance because the endpoint
-    /// stamps the server's clock, which no test can place in the past.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rate_limit_reap_resumes_below_the_cap_and_parks_at_it() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = managed_control_session(scope, "quota-cap", "claude", None).await;
+                let id = live.id().to_owned();
+                let owner = live
+                    .state
+                    .acp_supervisor
+                    .current_native_availability(&id)
+                    .await
+                    .unwrap()
+                    .owner;
+                enable_auto_resume(true);
+                live.park("run the nightly task").await;
+                for spent in 0..RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES {
+                    live.make_quota_due();
+                    let mut attempted = HashSet::from([id.clone()]);
+                    reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
+                    settle_delivery(&live.state, &id).await;
+                    let request = live.next_prompt().await;
+                    assert_eq!(request["params"]["sessionId"], live.sid);
+                    assert_eq!(
+                        request["params"]["prompt"][0]["text"],
+                        "run the nightly task"
+                    );
+                    live.finish_prompt(&request, Some("rate_limit")).await;
+                    assert_eq!(
+                        live.state
+                            .acp_event_store
+                            .rate_limit_redelivery_streak(&id)
+                            .unwrap(),
+                        Known(spent + 1)
+                    );
+                }
+                live.make_quota_due();
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                let held = live.state.session_service.prompt_submission(&id).await;
+                let mut attempted = HashSet::from([id.clone()]);
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()),
+                )
+                .await
+                .unwrap();
+                assert!(attempted.contains(&id));
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
+                drop(held);
+                reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
+                settle_delivery(&live.state, &id).await;
+                assert!(!live.state.acp_supervisor.publish_stopped_if_seq(
+                    &id,
+                    RATE_LIMIT_EXHAUSTED_RETRIES_REASON,
+                    frontier.saturating_sub(1)
+                ));
+                let cap = known_park(&live.state, &id);
+                assert!(cap.cap_reached);
+                assert_eq!(pending_turn(&live.state, &id).await, None);
+                assert!(delivered_prompts(&live.state, &id, frontier).is_empty());
+                assert_eq!(
+                    live.state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap(),
+                    Known(0)
+                );
+                enable_auto_resume(false);
+                let cap_frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
+                settle_delivery(&live.state, &id).await;
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    cap_frontier
+                );
+                live.state
+                    .session_service
+                    .enqueue_prompt(
+                        &id,
+                        "after-cap".into(),
+                        "new user work".into(),
+                        Vec::new(),
+                        None,
+                        crate::server::session_service::QueueSender::default(),
+                    )
+                    .await
+                    .unwrap();
+                reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
+                settle_delivery(&live.state, &id).await;
+                let queued = live.next_prompt().await;
+                assert_eq!(queued["params"]["prompt"][0]["text"], "new user work");
+                assert_eq!(
+                    auto_resumed_breadcrumbs(&live.state, &id),
+                    RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize
+                );
+                live.finish_prompt(&queued, None).await;
+                assert_eq!(
+                    live.state
+                        .acp_supervisor
+                        .current_native_availability(&id)
+                        .await
+                        .unwrap()
+                        .owner,
+                    owner
+                );
+                assert_eq!(
+                    live.native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "session/new")
+                        .count(),
+                    1
+                );
+                assert!(!live
+                    .native
+                    .requests()
+                    .iter()
+                    .any(|method| method == "session/load"));
+            })
+        })
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn only_a_prompt_queued_after_the_park_supersedes_the_continuation() {
-        // The `parked` fixture backdates the limit an hour, so these straddle it.
-        let after = Timestamp::now();
-        let before = Timestamp::now() - crate::time::Duration::hours(2);
-        // (label, continuation installed, queued at, turn kept, breadcrumbs)
-        let cases = [
-            ("queued-after", false, after.to_rfc3339(), None, 0),
-            (
-                "installed-and-queued-after",
-                true,
-                after.to_rfc3339(),
-                None,
-                0,
-            ),
-            ("queued-before", false, before.to_rfc3339(), Some(true), 1),
-            ("queued-at-unreadable", false, "t0".into(), Some(true), 1),
-        ];
-        for (label, installed, queued_at, kept, breadcrumbs) in cases {
-            let id = format!("sess-4092-{label}");
-            let (_home, state, _project) = parked(&id, 0).await;
-            if installed {
-                state
+        with_managed(|scope| {
+            Box::pin(async move {
+                for (label, installed, offset, expect_queue) in [
+                    ("queued-after", false, Some(1000_i64), true),
+                    ("installed-and-queued-after", true, Some(1000), true),
+                    ("queued-before", false, Some(-1000), false),
+                    ("queued-unreadable", false, None, false),
+                ] {
+                    let mut live = managed_control_session(scope, label, "claude", None).await;
+                    let id = live.id().to_owned();
+                    enable_auto_resume(true);
+                    live.park("run the nightly task").await;
+                    live.make_quota_due();
+                    if installed {
+                        live.state
+                            .session_service
+                            .set_pending_initial_turn(
+                                &id,
+                                "run the nightly task".into(),
+                                Vec::new(),
+                                crate::daemon::PromptOrigin::Unknown,
+                            )
+                            .await;
+                    }
+                    let park = known_park(&live.state, &id);
+                    let mut queued = queued_prompt();
+                    queued.text = "manual prompt B".into();
+                    queued.created_at = offset
+                        .map(|offset| {
+                            crate::time::Timestamp::from_millis(park.recorded_at_ms + offset)
+                                .unwrap()
+                                .to_rfc3339()
+                        })
+                        .unwrap_or_else(|| "unreadable".into());
+                    live.state
+                        .instances
+                        .write()
+                        .await
+                        .iter_mut()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .queued_prompts
+                        .push(queued);
+                    let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                    let mut attempted = HashSet::from([id.clone()]);
+                    reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
+                    settle_delivery(&live.state, &id).await;
+                    let request = live.next_prompt().await;
+                    let expected = if expect_queue {
+                        "manual prompt B"
+                    } else {
+                        "run the nightly task"
+                    };
+                    assert_eq!(request["params"]["prompt"][0]["text"], expected, "{label}");
+                    assert_eq!(
+                        delivered_prompts(&live.state, &id, frontier),
+                        vec![(expected.into(), !expect_queue)]
+                    );
+                    assert_eq!(
+                        auto_resumed_breadcrumbs(&live.state, &id),
+                        usize::from(!expect_queue)
+                    );
+                    assert_eq!(pending_turn(&live.state, &id).await, None);
+                    assert!(!attempted.contains(&id));
+                    live.finish_prompt(&request, None).await;
+                }
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unavailable_control_queries_preserve_intent_and_refuse_automation() {
+        with_managed(|scope| Box::pin(async move {
+            for fault in ["sql", "ownership", "budget"] {
+                let mut live = managed_control_session(scope, fault, "claude", None).await;
+                let id = live.id().to_owned();
+                enable_auto_resume(true);
+                live.park("original interrupted work").await;
+                live.make_quota_due();
+                live.state.session_service.set_pending_initial_turn(&id, "original interrupted work".into(), Vec::new(), crate::daemon::PromptOrigin::Unknown).await;
+                let park = known_park(&live.state, &id);
+                let before = live.state.instances.read().await.iter().find(|row| row.id == id).unwrap().clone();
+                let requests = live.native.requests();
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                let hidden = if fault == "sql" {
+                    live.state.acp_event_store.test_conn().execute_batch("ALTER TABLE acp_rate_limit_budgets RENAME TO hidden_quota_budgets").unwrap();
+                    Some(HiddenBudgetTable(live.state.acp_event_store.clone()))
+                } else {
+                    if fault == "ownership" {
+                        live.state.acp_event_store.test_conn().execute("DELETE FROM acp_events WHERE session_id=?1 AND seq<?2",
+                            rusqlite::params![id, i64::try_from(park.seq).unwrap()]).unwrap();
+                    } else {
+                        live.state.acp_event_store.test_conn().execute("UPDATE acp_rate_limit_budgets SET known=0 WHERE session_id=?1", [&id]).unwrap();
+                    }
+                    None
+                };
+                live.state.acp_event_store.control_cache().forget(&id);
+                if fault == "sql" {
+                    assert!(live.state.acp_event_store.rate_limit_park(&id).is_err());
+                } else if fault == "ownership" {
+                    assert!(matches!(live.state.acp_event_store.rate_limit_park(&id).unwrap(), Indeterminate));
+                } else {
+                    assert_eq!(live.state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap(), Indeterminate);
+                }
+                if fault != "budget" {
+                    let submission = live.state.session_service.prompt_submission(&id).await;
+                    assert!(install_rate_limit_continuation(&live.state, &id, &submission).await.is_err());
+                    drop(submission);
+                }
+                let submission = live.state.session_service.prompt_submission(&id).await;
+                assert!(resume_rate_limited(&live.state, &id, submission, QuotaResume::Automatic { park_seq: park.seq }).await.is_err());
+                let submission = live.state.session_service.prompt_submission(&id).await;
+                assert!(resume_rate_limited(&live.state, &id, submission, QuotaResume::Manual).await.is_err(),
+                    "RESUME NOW repeats old work; it is not distinct explicit input after readiness");
+                let mut attempted = HashSet::from([id.clone()]);
+                reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
+                settle_delivery(&live.state, &id).await;
+                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
+                assert_eq!(live.native.requests(), requests);
+                let after = live.state.instances.read().await.iter().find(|row| row.id == id).unwrap().clone();
+                assert_eq!(serde_json::to_value(&after.pending_initial_turn).unwrap(), serde_json::to_value(&before.pending_initial_turn).unwrap());
+                assert_eq!(serde_json::to_value(&after.queued_prompts).unwrap(), serde_json::to_value(&before.queued_prompts).unwrap());
+                assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
+                drop(hidden);
+                live.state.acp_event_store.control_cache().forget(&id);
+                // Retire this original while its Native request lane still has
+                // an observer. Later fixture creation must not revive its intent.
+                live.client.stop_session().await;
+            }
+        })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn quota_publication_io_failure_installs_no_worker_or_new_pending_turn() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                for pending in [false, true] {
+                    let mut live = managed_control_session(scope, if pending {
+                        "quota-io-existing-pending"
+                    } else {
+                        "quota-io-no-pending"
+                    }, "claude", None)
+                    .await;
+                    let id = live.id().to_owned();
+                    enable_auto_resume(true);
+                    live.park("original interrupted work").await;
+                    live.make_quota_due();
+                    if pending {
+                        live.state
+                            .session_service
+                            .set_pending_initial_turn(
+                                &id,
+                                "existing pending work".into(),
+                                Vec::new(),
+                                crate::daemon::PromptOrigin::Unknown,
+                            )
+                            .await;
+                    }
+                    let park = known_park(&live.state, &id);
+                    let budget = live
+                        .state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap();
+                    let original = {
+                        let registry = crate::process::worker_registry::registry_lock_until(
+                            &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                        ).await.expect("the actual runner releases registry admission");
+                        registry.record().unwrap().expect("the original runner remains registered")
+                    };
+                    assert!(original.detached_at.is_none());
+                    let original_identity =
+                        crate::acp::runner_lifecycle::RunnerIdentity::from_record(&original);
+                    let original_birth = crate::process::process_birth_identity(original.pid)
+                        .unwrap()
+                        .expect("the original runner has a real kernel birth");
+                    assert_eq!(
+                        original_identity.birth_fingerprint,
+                        Some(original_birth.fingerprint())
+                    );
+                    let original_lease = live.state.acp_supervisor.current_lease(&id).unwrap();
+                    let original_actual = live.client.actual();
+                    let available = live
+                        .state
+                        .acp_supervisor
+                        .current_native_availability(&id)
+                        .await
+                        .expect("this supervisor owns the original installed Native client");
+                    assert_eq!(available.lease, original_lease);
+                    assert_eq!(available.owner, Some(original_identity));
+                    assert!(std::sync::Arc::ptr_eq(&available.client, &original_actual));
+                    assert!(original_actual.ensure_available().is_ok());
+                    live.client = scope
+                        .adopt_with(live.client, false, || async {
+                            assert_eq!(live.state.acp_supervisor.count().await, 0);
+                            assert!(live
+                                .state
+                                .acp_supervisor
+                                .current_native_availability(&id)
+                                .await
+                                .is_none());
+                            assert_eq!(
+                                live.state.acp_supervisor.current_lease(&id).as_ref(),
+                                Some(&original_lease)
+                            );
+                            assert!(original_actual.ensure_available().is_err());
+                            // SDK shutdown closes its socket before the runner records detach.
+                            // Wait for that write so quota admission does not race its registry lock.
+                            tokio::time::timeout(Duration::from_secs(10), async {
+                                loop {
+                                    let record = crate::process::worker_registry::load(&id)
+                                        .unwrap()
+                                        .expect("the original runner remains registered");
+                                    if record.detached_at.is_some() {
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .expect("the original runner committed its detach");
+                            let retained = {
+                                let registry = crate::process::worker_registry::registry_lock_until(
+                                    &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                                ).await.expect("the actual runner releases registry admission");
+                                registry.record().unwrap().expect("the original runner remains registered")
+                            };
+                            assert_eq!(
+                                crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
+                                original_identity
+                            );
+                            assert!(crate::process::process_birth_is_live(
+                                original.pid,
+                                &original_birth
+                            )
+                            .unwrap());
+                            assert!(
+                                crate::process::worker_registry::retained_process_may_be_alive(
+                                    &original
+                                )
+                            );
+                            let requests = live.native.requests();
+                            let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                            assert_eq!(
+                                live.state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == id)
+                                    .unwrap()
+                                    .pending_initial_turn
+                                    .as_ref()
+                                    .map(|turn| turn.text.as_str()),
+                                pending.then_some("existing pending work")
+                            );
+                            live.state.acp_event_store.test_conn().execute_batch(
+                    "CREATE TEMP TRIGGER fail_quota_publication BEFORE INSERT ON acp_events
+                     WHEN NEW.discriminant = 'RateLimitAutoResumed'
+                     BEGIN SELECT RAISE(ABORT, 'genuine quota publication IO failure'); END;"
+                ).unwrap();
+                            for kind in [
+                                QuotaResume::Manual,
+                                QuotaResume::Automatic { park_seq: park.seq },
+                            ] {
+                                let submission =
+                                    live.state.session_service.prompt_submission(&id).await;
+                                let result =
+                                    resume_rate_limited(&live.state, &id, submission, kind).await;
+                                assert!(
+                                    matches!(result, Err(SupervisorError::NativeStoreUnavailable)),
+                                    "{result:?}"
+                                );
+                                assert_eq!(
+                                    live.state.acp_supervisor.count().await,
+                                    0,
+                                    "failed durable publication must precede any worker installation"
+                                );
+                                assert!(live
+                                    .state
+                                    .acp_supervisor
+                                    .current_native_availability(&id)
+                                    .await
+                                    .is_none());
+                                assert_eq!(
+                                    live.state.acp_supervisor.current_lease(&id).as_ref(),
+                                    Some(&original_lease)
+                                );
+                                assert!(original_actual.ensure_available().is_err());
+                                assert_eq!(
+                                    live.state
+                                        .instances
+                                        .read()
+                                        .await
+                                        .iter()
+                                        .find(|row| row.id == id)
+                                        .unwrap()
+                                        .pending_initial_turn
+                                        .as_ref()
+                                        .map(|turn| turn.text.as_str()),
+                                    pending.then_some("existing pending work")
+                                );
+                                let profile = live
+                                    .state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == id)
+                                    .unwrap()
+                                    .source_profile
+                                    .clone();
+                                let durable = crate::session::Storage::open_unwatched(&profile)
+                                    .unwrap()
+                                    .load_instances_complete()
+                                    .unwrap()
+                                    .into_iter()
+                                    .find(|row| row.id == id)
+                                    .unwrap();
+                                assert_eq!(
+                                    durable
+                                        .pending_initial_turn
+                                        .as_ref()
+                                        .map(|turn| turn.text.as_str()),
+                                    pending.then_some("existing pending work"),
+                                    "genuine SQL refusal must preserve durable pending intent too"
+                                );
+                                assert_eq!(live.native.requests(), requests,
+                        "failed publication must neither attach nor deliver autonomous input");
+                                assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), frontier);
+                                assert_eq!(
+                                    live.state
+                                        .acp_event_store
+                                        .rate_limit_redelivery_streak(&id)
+                                        .unwrap(),
+                                    budget
+                                );
+                                assert_eq!(known_park(&live.state, &id).seq, park.seq);
+                                assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
+                                let retained = {
+                                    let registry = crate::process::worker_registry::registry_lock_until(
+                                        &id, tokio::time::Instant::now() + Duration::from_secs(10),
+                                    ).await.expect("the actual runner releases registry admission");
+                                    registry.record().unwrap().expect("the original runner remains registered")
+                                };
+                                assert_eq!(
+                                    crate::acp::runner_lifecycle::RunnerIdentity::from_record(
+                                        &retained
+                                    ),
+                                    original_identity
+                                );
+                                assert!(crate::process::process_birth_is_live(
+                                    original.pid,
+                                    &original_birth
+                                )
+                                .unwrap());
+                                assert!(
+                                    crate::process::worker_registry::retained_process_may_be_alive(
+                                        &retained
+                                    )
+                                );
+                            }
+                            live.state
+                                .acp_event_store
+                                .test_conn()
+                                .execute_batch("DROP TRIGGER fail_quota_publication")
+                                .unwrap();
+                        })
+                        .await;
+                    live.client.ready().await;
+                    live.client.stop_session().await;
+                }
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_unknown_history_allows_only_read_only_attach_then_distinct_explicit_input() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live =
+                    managed_control_session(scope, "quota-unknown-retained", "claude", None).await;
+                let id = live.id().to_owned();
+                live.park("old work must not replay").await;
+                let original = live
+                    .state
+                    .acp_supervisor
+                    .current_native_availability(&id)
+                    .await
+                    .unwrap();
+                let park = known_park(&live.state, &id);
+                live.state
+                    .acp_event_store
+                    .test_conn()
+                    .execute(
+                        "DELETE FROM acp_events WHERE session_id=?1 AND seq<?2",
+                        rusqlite::params![id, i64::try_from(park.seq).unwrap()],
+                    )
+                    .unwrap();
+                live.state.acp_event_store.control_cache().forget(&id);
+                assert!(matches!(
+                    live.state.acp_event_store.rate_limit_park(&id).unwrap(),
+                    Indeterminate
+                ));
+                let durable_budget = live
+                    .state
+                    .acp_event_store
+                    .rate_limit_redelivery_streak(&id)
+                    .unwrap();
+                assert_eq!(durable_budget, Known(0));
+                live.client = scope.adopt(live.client, false).await;
+                live.client.ready().await;
+                live.state = live.client.app_state();
+                // Usability precedes the final assignment/capability publications.
+                // Observe those actual durable frames before the no-auto-resume frontier.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let (mut assigned, mut capabilities) = (false, false);
+                    while !assigned || !capabilities {
+                        match live
+                            .client
+                            .next_event()
+                            .await
+                            .expect("actual retained handshake publication")
+                        {
+                            Event::AcpSessionAssigned { acp_session_id, .. }
+                                if acp_session_id == live.sid =>
+                            {
+                                assigned = true
+                            }
+                            Event::PromptCapabilities { .. } => capabilities = true,
+                            Event::AgentStartupError { message, .. } => panic!("{message}"),
+                            Event::AcpConnectionUnavailable { .. } => {
+                                panic!("the original retained channel stays live")
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+                .await
+                .expect("the retained handshake publications precede its negative frontier");
+                let attached = live
+                    .state
+                    .acp_supervisor
+                    .current_native_availability(&id)
+                    .await
+                    .unwrap();
+                assert_eq!(attached.owner, original.owner);
+                assert_eq!(
+                    attached.client.connected_runner(),
+                    original.client.connected_runner()
+                );
+                assert!(matches!(
+                    live.state.acp_event_store.rate_limit_park(&id).unwrap(),
+                    Indeterminate
+                ));
+                assert_eq!(
+                    live.state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap(),
+                    durable_budget
+                );
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                let mut attempted = HashSet::from([id.clone()]);
+                reap_rate_limit_resumes(&live.state, &mut attempted, &HashSet::new()).await;
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
+                assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
+                let request = live
+                    .start_prompt("a distinct explicit input after readiness")
+                    .await;
+                assert_eq!(request["params"]["sessionId"], live.sid);
+                assert_eq!(
+                    request["params"]["prompt"][0]["text"],
+                    "a distinct explicit input after readiness"
+                );
+                assert_eq!(
+                    delivered_prompts(&live.state, &id, frontier),
+                    vec![("a distinct explicit input after readiness".into(), false)]
+                );
+                live.finish_prompt(&request, None).await;
+                assert_eq!(
+                    live.state
+                        .acp_event_store
+                        .has_in_flight_main_turn(&id)
+                        .unwrap(),
+                    Known(false)
+                );
+                assert_eq!(
+                    live.state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap(),
+                    Known(0)
+                );
+                assert_eq!(
+                    live.native
+                        .requests()
+                        .iter()
+                        .filter(|method| *method == "session/new")
+                        .count(),
+                    1
+                );
+                assert!(!live
+                    .native
+                    .requests()
+                    .iter()
+                    .any(|method| method == "session/load"));
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn qualified_native_loss_preserves_quota_pending_queue_and_budget_before_delivery() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live =
+                    managed_control_session(scope, "quota-native-loss", "claude", None).await;
+                let id = live.id().to_owned();
+                live.park("original work").await;
+                live.state
                     .session_service
                     .set_pending_initial_turn(
                         &id,
-                        "run the nightly task".into(),
+                        "original work".into(),
                         Vec::new(),
                         crate::daemon::PromptOrigin::Unknown,
                     )
                     .await;
-            }
-            state.instances.write().await[0].queued_prompts.push(
-                crate::daemon::QueuedPromptEntry {
-                    id: "q-1".into(),
-                    seq: 0,
-                    text: "manual prompt B".into(),
-                    attachments: Vec::new(),
-                    created_at: queued_at,
-                    origin_device: None,
-                    origin_plugin: None,
-                    origin: crate::daemon::PromptOrigin::Unknown,
-                },
-            );
-            assert!(
-                !state
-                    .session_service
-                    .queued_prompts_snapshot(&id)
-                    .await
-                    .is_empty(),
-                "{label}: the queue row must land, or the case asserts nothing"
-            );
-            assert!(
-                state.acp_event_store.rate_limit_park(&id).is_some(),
-                "{label}: a queued prompt must leave the park standing"
-            );
-            let mut attempted: HashSet<String> = [id.clone()].into();
-
-            let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-
-            assert_eq!(pending_turn(&state, &id).await, kept, "{label}");
-            assert_eq!(
-                auto_resumed_breadcrumbs(&state, &id),
-                breadcrumbs,
-                "{label}: a refused continuation must not spend a redelivery"
-            );
-            assert!(
-                !attempted.contains(&id) && released.contains(&id),
-                "{label}: the queued prompt has no other route to a worker"
-            );
-        }
+                let before = live.state.acp_event_store.highest_seq(&id).unwrap();
+                let budget = live
+                    .state
+                    .acp_event_store
+                    .rate_limit_redelivery_streak(&id)
+                    .unwrap();
+                let requests = live.native.requests();
+                live.client.actual().test_observe_native_loss();
+                for automatic in [false, true] {
+                    let submission = live.state.session_service.prompt_submission(&id).await;
+                    let kind = if automatic {
+                        QuotaResume::Automatic {
+                            park_seq: known_park(&live.state, &id).seq,
+                        }
+                    } else {
+                        QuotaResume::Manual
+                    };
+                    assert!(matches!(
+                        resume_rate_limited(&live.state, &id, submission, kind).await,
+                        Err(SupervisorError::Acp(
+                            crate::acp::acp_client::AcpError::ConnectionUnavailable(_)
+                        ))
+                    ));
+                    assert_eq!(live.state.acp_event_store.highest_seq(&id).unwrap(), before);
+                    assert_eq!(
+                        live.state
+                            .acp_event_store
+                            .rate_limit_redelivery_streak(&id)
+                            .unwrap(),
+                        budget
+                    );
+                    assert_eq!(pending_turn(&live.state, &id).await, Some(true));
+                    assert_eq!(live.native.requests(), requests);
+                }
+            })
+        })
+        .await;
     }
 
-    /// #4092: a spawn's own worker publishes `AcpSessionAssigned`, which
-    /// retires the park without any prompt having superseded anything, so the
-    /// install must key on the interrupted prompt rather than on park liveness.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_manual_install_lands_after_its_own_worker_assigns_the_session() {
-        let id = "sess-4092-assigned";
-        let (_home, state, _project) = parked(id, 0).await;
-        let next_seq = state.acp_event_store.highest_seq(id) + 1;
+    async fn native_loss_during_continuation_preparation_does_not_publish_a_resume() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                for automatic in [false, true] {
+                    let mut live =
+                        managed_control_session(scope, "quota-loss-during-prepare", "claude", None)
+                            .await;
+                    let id = live.id().to_owned();
+                    enable_auto_resume(true);
+                    live.park("preserve original work").await;
+                    live.make_quota_due();
+                    live.state
+                        .session_service
+                        .set_pending_initial_turn(
+                            &id,
+                            "existing pending work".into(),
+                            Vec::new(),
+                            crate::daemon::PromptOrigin::Unknown,
+                        )
+                        .await;
+                    if !automatic {
+                        let submission = live.state.session_service.prompt_submission(&id).await;
+                        live.state
+                            .session_service
+                            .enqueue_prompt(
+                                &id,
+                                "retained-queue".into(),
+                                "queued work must remain".into(),
+                                Vec::new(),
+                                None,
+                                crate::server::session_service::QueueSender::default(),
+                            )
+                            .await
+                            .unwrap();
+                        drop(submission);
+                    }
+                    let park_seq = known_park(&live.state, &id).seq;
+                    let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                    let budget = live
+                        .state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap();
+                    let requests = live.native.requests();
+                    let lease = live.state.acp_supervisor.current_lease(&id).unwrap();
+                    let before = live
+                        .state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    let mut barrier = live.state.session_service.arm_install_barrier();
+                    let state = live.state.clone();
+                    let target = id.clone();
+                    let release_task = tokio::spawn(async move {
+                        let submission = state.session_service.prompt_submission(&target).await;
+                        let kind = if automatic {
+                            QuotaResume::Automatic { park_seq }
+                        } else {
+                            QuotaResume::Manual
+                        };
+                        resume_rate_limited(&state, &target, submission, kind).await
+                    });
+                    let (observed, release) =
+                        tokio::time::timeout(Duration::from_secs(10), barrier.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(observed, id);
+                    live.client.actual().test_observe_native_loss();
+                    release.send(()).unwrap();
+                    let result = release_task.await.unwrap();
+                    assert!(
+                        matches!(
+                            result,
+                            Err(SupervisorError::Acp(
+                                crate::acp::acp_client::AcpError::ConnectionUnavailable(_)
+                            ))
+                        ),
+                        "{result:?}"
+                    );
+                    let after = live
+                        .state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    assert_eq!(
+                        live.state.acp_event_store.highest_seq(&id).unwrap(),
+                        frontier
+                    );
+                    assert_eq!(
+                        live.state
+                            .acp_event_store
+                            .rate_limit_redelivery_streak(&id)
+                            .unwrap(),
+                        budget
+                    );
+                    assert_eq!(known_park(&live.state, &id).seq, park_seq);
+                    assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
+                    assert_eq!(
+                        serde_json::to_value(after.pending_initial_turn).unwrap(),
+                        serde_json::to_value(before.pending_initial_turn).unwrap()
+                    );
+                    assert_eq!(
+                        serde_json::to_value(after.queued_prompts).unwrap(),
+                        serde_json::to_value(before.queued_prompts).unwrap()
+                    );
+                    assert_eq!(live.native.requests(), requests);
+                    assert_eq!(live.state.acp_supervisor.current_lease(&id), Some(lease));
+                    drop(barrier);
+                }
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_aged_quota_hold_prevents_idle_reaping_without_spending_retry_budget() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live =
+                    managed_control_session(scope, "quota-idle-hold", "claude", None).await;
+                let id = live.id().to_owned();
+                live.park("original work").await;
+                std::fs::write(
+                    crate::session::get_app_dir().unwrap().join("config.toml"),
+                    "[acp]\nrate_limit_auto_resume = true\nauto_stop_idle_secs = 1\n",
+                )
+                .unwrap();
+                live.client.lease.test_backdate_idle_baseline(
+                    (crate::time::Timestamp::now() - crate::time::Duration::days(1)).as_millis(),
+                );
+                live.make_quota_due();
+                let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                let requests = live.native.requests();
+                super::super::idle::reap_idle_workers(&live.state).await;
+                assert_eq!(
+                    live.state.acp_event_store.highest_seq(&id).unwrap(),
+                    frontier
+                );
+                assert_eq!(live.native.requests(), requests);
+                assert_eq!(
+                    live.state.acp_supervisor.current_lease(&id),
+                    Some(live.client.lease.clone())
+                );
+                assert!(!live
+                    .state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .is_idle_dormant());
+                assert_eq!(
+                    live.state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap(),
+                    Known(0)
+                );
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn known_agent_turn_selects_continue_but_unknown_history_does_not() {
+        use crate::acp::event_sender::EventMetadata;
+        let (_home, state, _project) = test_state("agent-projection-data-only");
+        let id = "agent-projection-data-only";
+        let mut metadata = crate::server::test_support::sql_projection_metadata();
+        let body = Event::AgentMessageChunk {
+            text: "agent initiated".into(),
+            message_id: None,
+        };
         state
             .acp_event_store
-            .record_at(
-                id,
-                next_seq,
-                &Event::AcpSessionAssigned {
-                    acp_session_id: "sid-1".into(),
-                },
-                Timestamp::now().as_millis(),
-            )
+            .record(id, 1, &Event::ThinkingStarted, &metadata)
             .unwrap();
-        assert!(
-            state.acp_event_store.rate_limit_park(id).is_none(),
-            "the assignment must retire the park, or the case asserts nothing"
-        );
-
-        let _outcome = install_rate_limit_continuation(
-            &state,
-            id,
-            state.session_service.prompt_submission(id).await,
-        )
-        .await;
-
+        state
+            .acp_event_store
+            .record(id, 2, &body, &metadata)
+            .unwrap();
+        metadata.operation.as_mut().unwrap().outcome =
+            Some(crate::acp::protocol::AcpOriginalRequestResult::Failed);
+        metadata.prompt_observation = Some(crate::acp::protocol::AcpPromptObservation::Written {
+            window_id: crate::acp::protocol::AcpPromptWindowId::new(),
+        });
+        let quota = Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo::undated(),
+        };
+        state
+            .acp_event_store
+            .record(id, 3, &quota, &metadata)
+            .unwrap();
+        let stopped = Event::Stopped {
+            reason: "rate_limited".into(),
+        };
+        state
+            .acp_event_store
+            .record(id, 4, &stopped, &metadata)
+            .unwrap();
+        assert!(matches!(
+            state.acp_event_store.rate_limited_turn_prompt(id).unwrap(),
+            Known(None)
+        ));
         assert_eq!(
-            pending_turn(&state, id).await,
-            Some(true),
-            "the interrupted prompt is still the work to continue"
+            state
+                .acp_event_store
+                .rate_limit_interrupted_agent_turn(id)
+                .unwrap(),
+            Known(true)
         );
+        let (text, attachments) = resolve_continuation(&state, id)
+            .await
+            .unwrap()
+            .prompt
+            .expect("known agent continuation");
+        assert_eq!(text, AGENT_TURN_CONTINUATION);
+        assert!(attachments.is_empty());
+        state
+            .acp_event_store
+            .test_conn()
+            .execute("DELETE FROM acp_events WHERE session_id=?1 AND seq<3", [id])
+            .unwrap();
+        state.acp_event_store.control_cache().forget(id);
+        assert!(matches!(
+            resolve_continuation(&state, id).await,
+            Err(SupervisorError::ControlStateUnavailable)
+        ));
+        let host_stop = Event::Stopped {
+            reason: "explicit_stop".into(),
+        };
+        state
+            .acp_event_store
+            .record(id, 5, &host_stop, &EventMetadata::host(&host_stop))
+            .unwrap();
+        assert!(resolve_continuation(&state, id)
+            .await
+            .unwrap()
+            .prompt
+            .is_none());
+        assert_eq!(
+            state
+                .acp_event_store
+                .rate_limit_redelivery_streak(id)
+                .unwrap(),
+            Known(0)
+        );
+        state.shutdown.cancel();
     }
-
-    /// A prompt submission owns the session, so the pass refuses rather than
-    /// stalling its single sequential run behind it: the held slot keeps the
-    /// resume pass off, nothing is released and no breadcrumb is spent, and
-    /// the next cadence retries (#4092).
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn the_pass_refuses_while_a_prompt_submission_owns_the_session() {
-        let id = "sess-4092-contended";
-        let (_home, state, _project) = parked(id, 0).await;
-        assert!(
-            state.acp_event_store.rate_limit_park(id).is_some(),
-            "the fixture must arm a park, or the pass skips it for an unrelated reason"
-        );
-        let _submission = state.session_service.prompt_submission(id).await;
-        let mut attempted: HashSet<String> = [id.to_string()].into();
-
-        let released = tokio::time::timeout(
-            Duration::from_secs(5),
-            reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()),
-        )
-        .await
-        .expect("a contended submission guard must not block the tick");
-
-        assert!(
-            attempted.contains(id),
-            "the session stays held until the next cadence"
-        );
-        assert!(
-            !released.contains(id),
-            "nothing was resumed, so nothing is released"
-        );
-        assert_eq!(pending_turn(&state, id).await, None);
-        assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
-    }
-
     /// Two accounts of one agent, failover on with `claude-b` in the pool, and the
     /// session's row on `claude-a`.
-    async fn failover_session(
+    async fn calendar_session(
         id: &str,
-        redeliveries: usize,
     ) -> (
         crate::session::test_support::AppDirGuard,
         Arc<AppState>,
         tempfile::TempDir,
         crate::tmux::status_rules::ProfileRegistryGuard,
     ) {
-        let (home, state, project) = parked(id, redeliveries).await;
+        let (home, state, project) = test_state(id);
         let app = crate::session::get_app_dir().unwrap();
         std::fs::write(
             app.join("config.toml"),
@@ -1092,180 +2056,6 @@ mod tests {
         failover::path_key(&dirs::home_dir().unwrap().join(format!(".{tool}")))
     }
 
-    /// A pool name without its own `[session.agent_config_dir]` entry would resolve to the
-    /// environment's or the default directory, an account the pool never named.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_pool_account_needs_a_declared_config_directory() {
-        let (_home, state, _project, _registry) = failover_session("sess-pool-declared", 0).await;
-        let row = state.instances.read().await[0].clone();
-        let pool = failover::resolve_pool(&row, &["claude-b".into(), "claude-c".into()]);
-        assert_eq!(
-            pool.iter().map(|a| a.tool.as_str()).collect::<Vec<_>>(),
-            ["claude-b"],
-            "claude-c declares no directory"
-        );
-    }
-
-    /// With the failover off the account table is never touched: a park keeps its own schedule
-    /// and nothing it reports lands in, or is read from, the table.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_park_leaves_the_account_table_alone_when_failover_is_off() {
-        let id = "sess-failover-off";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
-        std::fs::write(
-            crate::session::get_app_dir().unwrap().join("config.toml"),
-            "[acp]\nrate_limit_auto_resume = true\nrate_limit_failover = false\n\
-             [session.agent_detect_as]\nclaude-a = \"claude\"\n\
-             [session.agent_config_dir]\nclaude-a = \"~/.claude-a\"\n",
-        )
-        .unwrap();
-        crate::session::config::profile_config::resolve_config_or_warn(
-            &crate::session::config::effective_profile("default"),
-        );
-        let mut attempted: HashSet<String> = [id.to_string()].into();
-
-        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-
-        assert!(
-            state
-                .acp_event_store
-                .account_state(&account_key_of("claude-a"))
-                .is_none(),
-            "no account state is written while the failover is off"
-        );
-    }
-
-    /// A running swap has already moved the row onto its target, so the list still names that
-    /// target instead of recomputing one from the moved row.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn the_list_keeps_naming_the_target_of_a_running_swap() {
-        let id = "sess-failover-running";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
-        state.instances.write().await[0].tool = "claude-b".into();
-        let _running = failover::hold_in_flight(id, "claude-b");
-
-        state.runtime.publish(&state).await.unwrap();
-        let response = crate::server::api::list_sessions(
-            axum::extract::State(Arc::clone(&state)),
-            axum::extract::Query(crate::daemon::ListSessionsQuery { state: None }),
-            axum::http::HeaderMap::new(),
-        )
-        .await;
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .unwrap();
-        let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&body).unwrap();
-        let row = envelope.sessions.into_iter().find(|s| s.id == id).unwrap();
-        assert_eq!(row.rate_limit_failover_to.as_deref(), Some("claude-b"));
-    }
-
-    /// While a swap runs, its launch can fail and leave the row naming the target before the
-    /// rollback puts the old account back. A park seen in that window belongs to the old account:
-    /// the reaper must not write its window under the target, whether it reads the row during the
-    /// swap or holds a snapshot of it past the rollback.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_park_seen_mid_swap_never_lands_on_the_swap_target() {
-        let id = "sess-failover-midswap";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
-        let before = state.instances.read().await[0].clone();
-        state.instances.write().await[0].tool = "claude-b".into();
-        let target_snapshot = state.instances.read().await[0].clone();
-        let key_b = account_key_of("claude-b");
-        let weekly = crate::acp::state::RateLimitInfo {
-            status: "limited".into(),
-            resets_at: Some(Timestamp::now() + crate::time::Duration::days(7)),
-            kind: "seven_day".into(),
-        };
-        let until = Timestamp::now() + crate::time::Duration::days(7);
-
-        // The reaper pass runs while the claim is held and the row still names the target.
-        let running = failover::hold_in_flight(id, "claude-b");
-        let mut attempted: HashSet<String> = [id.to_string()].into();
-        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        assert!(
-            state.acp_event_store.account_state(&key_b).is_none(),
-            "nothing is recorded for the target during the swap"
-        );
-
-        // A snapshot taken then, used after the rollback restored the old account.
-        state.instances.write().await[0].tool = before.tool.clone();
-        drop(running);
-        failover::record_limit(&state, &target_snapshot, &weekly, until, 1).await;
-        assert!(
-            state.acp_event_store.account_state(&key_b).is_none(),
-            "a stale snapshot of the target cannot write the old account's window"
-        );
-        assert!(failover::reported_wake(
-            &state,
-            &target_snapshot,
-            &failover::ParkView {
-                kind: &weekly.kind,
-                own_ms: None,
-                observed_at_ms: 0,
-                generic: None,
-            }
-        )
-        .await
-        .wake
-        .is_none());
-    }
-
-    /// An agent whose conversation AoE cannot locate in an account root has no account here: its
-    /// limit must not be written under, or read back from, the default Claude account.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_non_claude_agent_takes_no_part_in_the_account_limits() {
-        let id = "sess-non-claude-limits";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
-        {
-            let mut rows = state.instances.write().await;
-            rows[0].tool = "codex".into();
-            rows[0].detect_as = "codex".into();
-        }
-        let row = state.instances.read().await[0].clone();
-        let claude_default = dirs::home_dir().unwrap().join(".claude");
-        let claude_key = claude_default.to_string_lossy().into_owned();
-        let now_ms = Timestamp::now().as_millis();
-        state.acp_event_store.record_account_limit(
-            &claude_key,
-            now_ms + 3_600_000,
-            "usage",
-            now_ms,
-            false,
-        );
-
-        assert_eq!(failover::account_key(&row), None);
-        assert_eq!(
-            failover::reported_wake(
-                &state,
-                &row,
-                &failover::ParkView {
-                    kind: "usage",
-                    own_ms: None,
-                    observed_at_ms: 0,
-                    generic: None,
-                }
-            )
-            .await
-            .wake,
-            None,
-            "the non-Claude park inherits no Claude deadline"
-        );
-
-        let mut attempted: HashSet<String> = [id.to_string()].into();
-        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        let claude = state.acp_event_store.account_state(&claude_key).unwrap();
-        assert_eq!(
-            claude.window("usage").map(|w| w.until_ms),
-            Some(now_ms + 3_600_000),
-            "the Claude account's window is untouched by the non-Claude park"
-        );
-    }
-
     /// Midnight UTC of the day `at` falls on, and that day as a status text names it ("Nov 18").
     fn utc_midnight(at: Timestamp) -> (Timestamp, String) {
         let midnight =
@@ -1277,241 +2067,111 @@ mod tests {
         (midnight, day.strftime("%b %-d").to_string())
     }
 
-    /// Waits for the detached failover task to finish.
-    async fn failover_settled(id: &str) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while failover::in_flight(id) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the failover task must finish");
-    }
-
-    /// A park records its account's limit, and a failover the swap refuses (this row has
-    /// no recorded conversation) leaves the park to the timed resume: one redelivery, never
-    /// a second failover for the same park.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_refused_failover_falls_back_to_the_timed_resume() {
-        let id = "sess-failover-refused";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
-        let mut attempted: HashSet<String> = [id.to_string()].into();
-
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        assert!(
-            released.is_empty(),
-            "the failover owns the park while it runs"
-        );
-        failover_settled(id).await;
-
-        let key = account_key_of("claude-a");
-        let limit = state.acp_event_store.account_state(&key);
-        assert!(
-            limit.is_some_and(|s| s.window("usage").is_some()),
-            "limit recorded under {key}"
-        );
-        assert_eq!(state.instances.read().await[0].tool, "claude-a");
-        assert_eq!(auto_resumed_breadcrumbs(&state, id), 0);
-
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        assert!(released.contains(id), "the timed resume takes over");
-        assert_eq!(auto_resumed_breadcrumbs(&state, id), 1);
-        assert_eq!(pending_turn(&state, id).await, Some(true));
-    }
-
-    /// With every pool account limited there is no target: the park runs the timed
-    /// resume under its budget, and at the cap it still ends in the terminal park. The pool is
-    /// limited in another window than the park's own, whose reset has passed.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn an_entirely_limited_pool_keeps_the_redelivery_budget() {
-        let max = RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES as usize;
-        for (streak, released, reason) in [
-            (0, true, "rate_limited"),
-            (max, false, RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
-        ] {
-            let id = "sess-failover-pool-limited";
-            let (_home, state, _project, _registry) = failover_session(id, streak).await;
-            for tool in ["claude-a", "claude-b"] {
-                state.acp_event_store.record_account_limit(
-                    &account_key_of(tool),
-                    Timestamp::now().as_millis() + 3_600_000,
-                    "other_window",
-                    Timestamp::now().as_millis(),
-                    false,
-                );
-            }
-            let mut attempted: HashSet<String> = [id.to_string()].into();
-
-            let out = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-
-            assert!(!failover::in_flight(id), "no failover was started");
-            assert_eq!(out.contains(id), released, "streak={streak}");
-            assert_eq!(latest_stop_reason(&state, id).as_deref(), Some(reason));
-        }
-    }
-
-    /// The list response names the account a failover is about to move a parked session to, so
-    /// the banner shows the switch instead of a choice; with no headroom in the pool, or with
-    /// the failover off, it stays absent and the choice remains.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn the_session_list_announces_a_pending_failover_only_while_one_can_happen() {
-        let id = "sess-failover-signal";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
-        let listed = || async {
-            state.runtime.publish(&state).await.unwrap();
-            let response = crate::server::api::list_sessions(
-                axum::extract::State(Arc::clone(&state)),
-                axum::extract::Query(crate::daemon::ListSessionsQuery { state: None }),
-                axum::http::HeaderMap::new(),
-            )
-            .await;
-            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                .await
-                .unwrap();
-            let envelope: crate::daemon::SessionsEnvelope = serde_json::from_slice(&body).unwrap();
-            let row = envelope.sessions.into_iter().find(|s| s.id == id).unwrap();
-            assert!(row.rate_limit.is_some(), "the fixture session is parked");
-            row.rate_limit_failover_to
+    fn record_calendar(
+        state: &AppState,
+        id: &str,
+        reports: impl IntoIterator<Item = (RateLimitInfo, i64, Option<(i64, &'static str)>)>,
+    ) {
+        use crate::acp::event_sender::EventMetadata;
+        use crate::acp::protocol::{
+            AcpOriginalRequestResult, AcpPromptObservation, AcpPromptWindowId,
         };
-        assert_eq!(listed().await.as_deref(), Some("claude-b"));
-
-        let now_ms = Timestamp::now().as_millis();
-        state.acp_event_store.record_account_limit(
-            &account_key_of("claude-b"),
-            now_ms + 3_600_000,
-            "usage",
-            now_ms,
-            false,
-        );
-        assert_eq!(listed().await, None, "no pool account has headroom");
-
-        state.acp_event_store.record_account_limit(
-            &account_key_of("claude-b"),
-            now_ms - 1,
-            "usage",
-            now_ms + 1,
-            false,
-        );
-        assert_eq!(listed().await.as_deref(), Some("claude-b"), "it freed up");
-
-        crate::session::config::update_config(|c| c.acp.rate_limit_failover = false).unwrap();
-        assert_eq!(listed().await, None, "failover is off");
-    }
-
-    /// A park made while the whole pool was limited fails over on a later pass once an
-    /// account frees up, as long as the timed resume has not fired yet.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_park_made_while_the_pool_was_limited_fails_over_when_an_account_frees_up() {
-        let id = "sess-failover-later";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
-        let now_ms = Timestamp::now().as_millis();
-        // The park's own window is two hours out, and both accounts are limited that long.
-        let resets_at = Timestamp::now() + crate::time::Duration::hours(2);
-        let next = state.acp_event_store.highest_seq(id);
-        for (offset, event) in [
-            Event::RateLimit {
-                info: crate::acp::state::RateLimitInfo {
-                    status: "limited".into(),
-                    resets_at: Some(resets_at),
-                    kind: "usage".into(),
-                },
-            },
-            Event::Stopped {
-                reason: "rate_limited".into(),
-            },
-        ]
-        .iter()
-        .enumerate()
-        {
-            state
-                .acp_event_store
-                .record_at(id, next + 1 + offset as u64, event, now_ms)
+        let store = &state.acp_event_store;
+        let mut seq = store.highest_seq(id).unwrap();
+        let mut metadata = crate::server::test_support::sql_projection_metadata();
+        let mut reports = reports.into_iter().peekable();
+        let at = reports.peek().expect("a calendar report").1;
+        let prompt = crate::acp::state::test_support::prompt("run the nightly task");
+        seq += 1;
+        store
+            .record_quota_calendar_at(id, seq, &prompt, &EventMetadata::host(&prompt), at, None)
+            .unwrap();
+        seq += 1;
+        store
+            .record_quota_calendar_at(id, seq, &Event::ThinkingStarted, &metadata, at, None)
+            .unwrap();
+        metadata.operation.as_mut().unwrap().outcome = Some(AcpOriginalRequestResult::Failed);
+        metadata.prompt_observation = Some(AcpPromptObservation::Written {
+            window_id: AcpPromptWindowId::new(),
+        });
+        let mut last = at;
+        for (info, at, inherited) in reports {
+            seq += 1;
+            store
+                .record_quota_calendar_at(
+                    id,
+                    seq,
+                    &Event::RateLimit { info },
+                    &metadata,
+                    at,
+                    inherited,
+                )
                 .unwrap();
+            last = at;
         }
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
-        for tool in ["claude-a", "claude-b"] {
-            state.acp_event_store.record_account_limit(
-                &account_key_of(tool),
-                now_ms + 7_200_000,
-                "usage",
-                now_ms,
-                false,
-            );
-        }
-        let park = state
-            .acp_event_store
-            .rate_limit_park(id)
-            .unwrap()
-            .recorded_at_ms;
-        let mut attempted: HashSet<String> = [id.to_string()].into();
-
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        assert!(released.is_empty(), "the window has not elapsed");
-        assert!(
-            failover::attempts_made(id, park).is_none(),
-            "no pool account had headroom, so nothing was tried"
-        );
-
-        state.acp_event_store.record_account_limit(
-            &account_key_of("claude-b"),
-            now_ms - 1,
-            "usage",
-            now_ms + 1,
-            false,
-        );
-        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
-        failover_settled(id).await;
-        assert!(
-            failover::attempts_made(id, park).is_some(),
-            "the freed account was tried on the next pass"
-        );
+        let stopped = crate::acp::state::test_support::stopped("rate_limited");
+        seq += 1;
+        store
+            .record_quota_calendar_at(
+                id,
+                seq,
+                &stopped,
+                &EventMetadata::host(&stopped),
+                last,
+                None,
+            )
+            .unwrap();
+        state.acp_supervisor.hydrate_seqs([(id.to_owned(), seq)]);
+        assert_eq!(known_park(state, id).recorded_at_ms, last);
     }
 
-    /// A fresh session parked on an account-wide limit never saw the dated reset, so its own
-    /// park has none. The account's reported deadline, still in force for the same window,
-    /// stands in for it: the timed resume waits for it instead of the 1h estimate, and the
-    /// estimate never overwrites it.
+    async fn reap_calendar(
+        state: &Arc<AppState>,
+        attempted: &mut HashSet<String>,
+    ) -> HashSet<String> {
+        let before = attempted.clone();
+        reap_rate_limit_resumes(state, attempted, &HashSet::new()).await;
+        let released: HashSet<_> = before.difference(attempted).cloned().collect();
+        for id in &released {
+            settle_delivery(state, id).await;
+        }
+        released
+    }
+
+    fn park_at(
+        state: &AppState,
+        id: &str,
+        at_ms: i64,
+        info: RateLimitInfo,
+        inherited: Option<(i64, &'static str)>,
+    ) {
+        record_calendar(state, id, [(info, at_ms, inherited)]);
+    }
+
     /// A weekly park stored with no `resets_at` still names its reset in the status: the
     /// resume waits for it, not the 1h estimate, and the account records that window as reported.
     #[tokio::test]
     #[serial_test::serial]
     async fn an_undated_weekly_park_waits_for_the_reset_its_status_names() {
         let id = "sess-failover-weekly-text";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let two_hours_ago = (Timestamp::now() - crate::time::Duration::hours(2)).as_millis();
         let (reset, day) = utc_midnight(Timestamp::now() + crate::time::Duration::days(2));
         let status =
             format!("Internal error: You've hit your weekly limit · resets {day}, 12am (UTC)");
-        let next = state.acp_event_store.highest_seq(id);
-        for (offset, event) in [
-            Event::RateLimit {
-                info: crate::acp::state::RateLimitInfo {
+        record_calendar(
+            &state,
+            id,
+            [(
+                RateLimitInfo {
                     status,
                     resets_at: None,
                     kind: "rate_limit".into(),
                 },
-            },
-            Event::Stopped {
-                reason: "rate_limited".into(),
-            },
-        ]
-        .iter()
-        .enumerate()
-        {
-            state
-                .acp_event_store
-                .record_at(id, next + 1 + offset as u64, event, two_hours_ago)
-                .unwrap();
-        }
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+                two_hours_ago,
+                None,
+            )],
+        );
         let now_ms = Timestamp::now().as_millis();
         state.acp_event_store.record_account_limit(
             &account_key_of("claude-b"),
@@ -1522,7 +2182,7 @@ mod tests {
         );
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        let released = reap_calendar(&state, &mut attempted).await;
 
         assert!(
             released.is_empty() && attempted.contains(id),
@@ -1550,35 +2210,24 @@ mod tests {
     #[serial_test::serial]
     async fn a_status_reset_never_outranks_a_newer_reported_deadline() {
         let id = "sess-failover-text-vs-report";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let recorded = Timestamp::now() - crate::time::Duration::days(3);
         let (_, day) = utc_midnight(recorded + crate::time::Duration::days(1));
         let status =
             format!("Internal error: You've hit your weekly limit · resets {day}, 12am (UTC)");
-        let next = state.acp_event_store.highest_seq(id);
-        for (offset, event) in [
-            Event::RateLimit {
-                info: crate::acp::state::RateLimitInfo {
+        record_calendar(
+            &state,
+            id,
+            [(
+                RateLimitInfo {
                     status,
                     resets_at: None,
                     kind: "rate_limit".into(),
                 },
-            },
-            Event::Stopped {
-                reason: "rate_limited".into(),
-            },
-        ]
-        .iter()
-        .enumerate()
-        {
-            state
-                .acp_event_store
-                .record_at(id, next + 1 + offset as u64, event, recorded.as_millis())
-                .unwrap();
-        }
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+                recorded.as_millis(),
+                None,
+            )],
+        );
         let now_ms = Timestamp::now().as_millis();
         for tool in ["claude-a", "claude-b"] {
             state.acp_event_store.record_account_limit(
@@ -1591,7 +2240,7 @@ mod tests {
         }
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        let released = reap_calendar(&state, &mut attempted).await;
 
         assert!(
             released.is_empty() && attempted.contains(id),
@@ -1608,32 +2257,21 @@ mod tests {
             ("seven_day", "sess-dated-named"),
             ("rate_limit", "sess-dated-unnamed"),
         ] {
-            let (_home, state, _project, _registry) = failover_session(id, 0).await;
+            let (_home, state, _project, _registry) = calendar_session(id).await;
             let recorded = Timestamp::now() - crate::time::Duration::hours(2);
-            let next = state.acp_event_store.highest_seq(id);
-            for (offset, event) in [
-                Event::RateLimit {
-                    info: crate::acp::state::RateLimitInfo {
+            record_calendar(
+                &state,
+                id,
+                [(
+                    RateLimitInfo {
                         status: "You've hit your weekly limit".into(),
                         resets_at: Some(Timestamp::now() - crate::time::Duration::hours(1)),
                         kind: "seven_day".into(),
                     },
-                },
-                Event::Stopped {
-                    reason: "rate_limited".into(),
-                },
-            ]
-            .iter()
-            .enumerate()
-            {
-                state
-                    .acp_event_store
-                    .record_at(id, next + 1 + offset as u64, event, recorded.as_millis())
-                    .unwrap();
-            }
-            state
-                .acp_supervisor
-                .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+                    recorded.as_millis(),
+                    None,
+                )],
+            );
             let now_ms = Timestamp::now().as_millis();
             for tool in ["claude-a", "claude-b"] {
                 state.acp_event_store.record_account_limit(
@@ -1646,7 +2284,7 @@ mod tests {
             }
             let mut attempted: HashSet<String> = [id.to_string()].into();
 
-            let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+            let released = reap_calendar(&state, &mut attempted).await;
 
             assert!(
                 released.is_empty() && attempted.contains(id),
@@ -1669,34 +2307,23 @@ mod tests {
             ("sess-obs-park-corrects-down", -1, 24, -3, true),
             ("sess-obs-park-corrects-up", 10, 1, -3, false),
         ] {
-            let (_home, state, _project, _registry) = failover_session(id, 0).await;
+            let (_home, state, _project, _registry) = calendar_session(id).await;
             let recorded = Timestamp::now() - crate::time::Duration::hours(2);
-            let next = state.acp_event_store.highest_seq(id);
-            for (offset, event) in [
-                Event::RateLimit {
-                    info: crate::acp::state::RateLimitInfo {
+            record_calendar(
+                &state,
+                id,
+                [(
+                    RateLimitInfo {
                         status: "You've hit your weekly limit".into(),
                         resets_at: Some(
                             Timestamp::now() + crate::time::Duration::hours(park_reset),
                         ),
                         kind: "seven_day".into(),
                     },
-                },
-                Event::Stopped {
-                    reason: "rate_limited".into(),
-                },
-            ]
-            .iter()
-            .enumerate()
-            {
-                state
-                    .acp_event_store
-                    .record_at(id, next + 1 + offset as u64, event, recorded.as_millis())
-                    .unwrap();
-            }
-            state
-                .acp_supervisor
-                .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+                    recorded.as_millis(),
+                    None,
+                )],
+            );
             let now_ms = Timestamp::now().as_millis();
             state.acp_event_store.record_account_limit(
                 &account_key_of("claude-a"),
@@ -1715,7 +2342,7 @@ mod tests {
             );
             let mut attempted: HashSet<String> = [id.to_string()].into();
 
-            let got = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+            let got = reap_calendar(&state, &mut attempted).await;
 
             assert_eq!(got.contains(id), released, "{id}");
         }
@@ -1728,7 +2355,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_legacy_clock_only_park_recorded_after_its_reset_keeps_the_timed_schedule() {
         let id = "sess-legacy-clock-only";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let recorded = Timestamp::now() - crate::time::Duration::hours(3);
         let clock = jiff::Timestamp::from_second(
             (recorded - crate::time::Duration::hours(1)).as_unix_secs(),
@@ -1738,30 +2365,19 @@ mod tests {
         .strftime("%-I:%M%p")
         .to_string();
         let status = format!("Internal error: You've hit your limit · resets {clock} (UTC)");
-        let next = state.acp_event_store.highest_seq(id);
-        for (offset, event) in [
-            Event::RateLimit {
-                info: crate::acp::state::RateLimitInfo {
+        record_calendar(
+            &state,
+            id,
+            [(
+                RateLimitInfo {
                     status,
                     resets_at: None,
                     kind: "rate_limit".into(),
                 },
-            },
-            Event::Stopped {
-                reason: "rate_limited".into(),
-            },
-        ]
-        .iter()
-        .enumerate()
-        {
-            state
-                .acp_event_store
-                .record_at(id, next + 1 + offset as u64, event, recorded.as_millis())
-                .unwrap();
-        }
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+                recorded.as_millis(),
+                None,
+            )],
+        );
         let now_ms = Timestamp::now().as_millis();
         state.acp_event_store.record_account_limit(
             &account_key_of("claude-b"),
@@ -1772,7 +2388,7 @@ mod tests {
         );
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        assert!(reap_calendar(&state, &mut attempted).await.contains(id));
 
         let stored = state
             .acp_event_store
@@ -1798,7 +2414,7 @@ mod tests {
             } else {
                 (older, later)
             };
-            let (_home, state, project, _registry) = failover_session(first, 0).await;
+            let (_home, state, project, _registry) = calendar_session(first).await;
             {
                 let mut second_row = structured_instance(second, &project.path().to_string_lossy());
                 second_row.tool = "claude-a".into();
@@ -1807,39 +2423,19 @@ mod tests {
             }
             let now_ms = Timestamp::now().as_millis();
             for (id, parked_at) in [(older, now_ms - 40 * MIN_MS), (later, now_ms - 5 * MIN_MS)] {
-                let next = state.acp_event_store.highest_seq(id);
-                for (offset, event) in [
-                    Event::UserPromptSent {
-                        merged_prompt_ids: Vec::new(),
-                        text: "run the nightly task".into(),
-                        attachments: Vec::new(),
-                        prompt_id: None,
-                        synthesized: false,
-                        origin_plugin: None,
-                        origin: crate::daemon::PromptOrigin::Unknown,
-                    },
-                    Event::RateLimit {
-                        info: crate::acp::state::RateLimitInfo {
+                record_calendar(
+                    &state,
+                    id,
+                    [(
+                        RateLimitInfo {
                             status: "You've hit your weekly limit".into(),
                             resets_at: None,
                             kind: "seven_day".into(),
                         },
-                    },
-                    Event::Stopped {
-                        reason: "rate_limited".into(),
-                    },
-                ]
-                .iter()
-                .enumerate()
-                {
-                    state
-                        .acp_event_store
-                        .record_at(id, next + 1 + offset as u64, event, parked_at)
-                        .unwrap();
-                }
-                state
-                    .acp_supervisor
-                    .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+                        parked_at,
+                        None,
+                    )],
+                );
             }
             // The account's reported weekly deadline ran out ten minutes ago; the pool has no room.
             state.acp_event_store.record_account_limit(
@@ -1858,7 +2454,7 @@ mod tests {
             );
             let mut attempted: HashSet<String> = [older.to_string(), later.to_string()].into();
 
-            let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+            let released = reap_calendar(&state, &mut attempted).await;
 
             assert!(
                 released.contains(older),
@@ -1871,43 +2467,6 @@ mod tests {
         }
     }
 
-    /// Seeds `id` with a prompt, a `RateLimit` and its stop, recorded at `at_ms`; the limit is
-    /// recorded through `record_inherited_rate_limit` when `inherited` names its source window.
-    fn park_at(
-        state: &AppState,
-        id: &str,
-        at_ms: i64,
-        info: crate::acp::state::RateLimitInfo,
-        inherited: Option<(i64, &str)>,
-    ) {
-        let store = &state.acp_event_store;
-        let next = store.highest_seq(id);
-        let prompt = Event::UserPromptSent {
-            merged_prompt_ids: Vec::new(),
-            text: "run the nightly task".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-            synthesized: false,
-            origin_plugin: None,
-            origin: crate::daemon::PromptOrigin::Unknown,
-        };
-        store.record_at(id, next + 1, &prompt, at_ms).unwrap();
-        let limit = Event::RateLimit { info };
-        match inherited {
-            Some((observed_at_ms, source)) => store
-                .record_inherited_rate_limit_at(id, next + 2, &limit, observed_at_ms, source, at_ms)
-                .unwrap(),
-            None => store.record_at(id, next + 2, &limit, at_ms).unwrap(),
-        }
-        let stopped = Event::Stopped {
-            reason: "rate_limited".into(),
-        };
-        store.record_at(id, next + 3, &stopped, at_ms).unwrap();
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
-    }
-
     /// A weekly park's own reset is evidence for the weekly window even when a newer window-less
     /// report extends the wake past it. If the session then moves away and that report is
     /// corrected to an earlier deadline, the account is still held until the weekly reset, not
@@ -1917,7 +2476,7 @@ mod tests {
     async fn a_weekly_parks_reset_outlives_a_corrected_window_less_report() {
         const HOUR_MS: i64 = 3_600_000;
         let id = "sess-own-evidence";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let now_ms = Timestamp::now().as_millis();
         let weekly_reset = Timestamp::from_millis(now_ms + 5 * HOUR_MS).unwrap();
         let weekly_wake = rate_limit_resume_at(
@@ -1929,7 +2488,7 @@ mod tests {
             &state,
             id,
             now_ms - 5 * HOUR_MS,
-            crate::acp::state::RateLimitInfo {
+            RateLimitInfo {
                 status: "You've hit your weekly limit".into(),
                 resets_at: Some(weekly_reset),
                 kind: "seven_day".into(),
@@ -1954,7 +2513,7 @@ mod tests {
         );
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        reap_calendar(&state, &mut attempted).await;
 
         // The session moves away; its window-less report is corrected to end sooner.
         state.acp_event_store.record_account_limit(
@@ -1983,7 +2542,7 @@ mod tests {
     async fn an_inherited_window_less_reset_never_replaces_a_weekly_report() {
         const HOUR_MS: i64 = 3_600_000;
         let id = "sess-inherited-generic";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let now_ms = Timestamp::now().as_millis();
         // The rejection was recorded three hours ago and copied a reset that ended ten minutes
         // ago, from a window-less report observed then.
@@ -1991,7 +2550,7 @@ mod tests {
             &state,
             id,
             now_ms - 3 * HOUR_MS,
-            crate::acp::state::RateLimitInfo {
+            RateLimitInfo {
                 status: "You've hit your weekly limit".into(),
                 resets_at: Timestamp::from_millis(now_ms - 10 * 60_000),
                 kind: "seven_day".into(),
@@ -2015,7 +2574,7 @@ mod tests {
         );
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        let released = reap_calendar(&state, &mut attempted).await;
 
         assert!(
             !released.contains(id),
@@ -2041,13 +2600,13 @@ mod tests {
     async fn an_elapsed_correction_invalidates_the_reset_a_park_carries() {
         const HOUR_MS: i64 = 3_600_000;
         let id = "sess-elapsed-correction";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let now_ms = Timestamp::now().as_millis();
         park_at(
             &state,
             id,
             now_ms - 3 * HOUR_MS,
-            crate::acp::state::RateLimitInfo {
+            RateLimitInfo {
                 status: "You've hit your weekly limit".into(),
                 resets_at: Timestamp::from_millis(now_ms + 8 * HOUR_MS),
                 kind: "seven_day".into(),
@@ -2070,7 +2629,7 @@ mod tests {
         );
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        let released = reap_calendar(&state, &mut attempted).await;
 
         assert!(
             released.contains(id),
@@ -2087,7 +2646,7 @@ mod tests {
     async fn an_inherited_window_less_reset_is_recorded_as_window_less_evidence() {
         const HOUR_MS: i64 = 3_600_000;
         let id = "sess-inherited-backfill";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let now_ms = Timestamp::now().as_millis();
         let reset = Timestamp::from_millis(now_ms + HOUR_MS).unwrap();
         let wake = rate_limit_resume_at(
@@ -2099,7 +2658,7 @@ mod tests {
             &state,
             id,
             now_ms - 3 * HOUR_MS,
-            crate::acp::state::RateLimitInfo {
+            RateLimitInfo {
                 status: "You've hit your weekly limit".into(),
                 resets_at: Some(reset),
                 kind: "seven_day".into(),
@@ -2117,7 +2676,7 @@ mod tests {
         assert!(state.acp_event_store.account_state(&key).is_none());
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        let released = reap_calendar(&state, &mut attempted).await;
         assert!(
             !released.contains(id),
             "with no account row yet, the inherited reset still holds the session parked"
@@ -2146,32 +2705,21 @@ mod tests {
             ("sess-unnamed-shorter", -1, false),
             ("sess-unnamed-longer", 24, false),
         ] {
-            let (_home, state, _project, _registry) = failover_session(id, 0).await;
+            let (_home, state, _project, _registry) = calendar_session(id).await;
             let recorded = Timestamp::now() - crate::time::Duration::hours(2);
-            let next = state.acp_event_store.highest_seq(id);
-            for (offset, event) in [
-                Event::RateLimit {
-                    info: crate::acp::state::RateLimitInfo {
+            record_calendar(
+                &state,
+                id,
+                [(
+                    RateLimitInfo {
                         status: "You've hit your weekly limit".into(),
                         resets_at: Some(Timestamp::now() + crate::time::Duration::hours(10)),
                         kind: "seven_day".into(),
                     },
-                },
-                Event::Stopped {
-                    reason: "rate_limited".into(),
-                },
-            ]
-            .iter()
-            .enumerate()
-            {
-                state
-                    .acp_event_store
-                    .record_at(id, next + 1 + offset as u64, event, recorded.as_millis())
-                    .unwrap();
-            }
-            state
-                .acp_supervisor
-                .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+                    recorded.as_millis(),
+                    None,
+                )],
+            );
             let now_ms = Timestamp::now().as_millis();
             state.acp_event_store.record_account_limit(
                 &account_key_of("claude-a"),
@@ -2189,7 +2737,7 @@ mod tests {
             );
             let mut attempted: HashSet<String> = [id.to_string()].into();
 
-            let got = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+            let got = reap_calendar(&state, &mut attempted).await;
 
             assert_eq!(got.contains(id), released, "{id}");
         }
@@ -2203,34 +2751,27 @@ mod tests {
     async fn an_inherited_reset_keeps_its_original_observation_time() {
         const HOUR_MS: i64 = 3_600_000;
         let id = "sess-obs-inherited";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let now_ms = Timestamp::now().as_millis();
         let reset = Timestamp::now() + crate::time::Duration::hours(10);
-        let next = state.acp_event_store.highest_seq(id);
-        let limit = Event::RateLimit {
-            info: crate::acp::state::RateLimitInfo {
-                status: "You've hit your weekly limit".into(),
-                resets_at: Some(reset),
-                kind: "seven_day".into(),
-            },
-        };
-        let stopped = Event::Stopped {
-            reason: "rate_limited".into(),
+        let limit = RateLimitInfo {
+            status: "You've hit your weekly limit".into(),
+            resets_at: Some(reset),
+            kind: "seven_day".into(),
         };
         // Report four hours ago; a later rejection inherited it, carrying that time.
-        let store = &state.acp_event_store;
-        store
-            .record_at(id, next + 1, &limit, now_ms - 4 * HOUR_MS)
-            .unwrap();
-        store
-            .record_inherited_rate_limit(id, next + 2, &limit, now_ms - 4 * HOUR_MS, "seven_day")
-            .unwrap();
-        store
-            .record_at(id, next + 3, &stopped, now_ms - HOUR_MS)
-            .unwrap();
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+        record_calendar(
+            &state,
+            id,
+            [
+                (limit.clone(), now_ms - 4 * HOUR_MS, None),
+                (
+                    limit,
+                    now_ms - HOUR_MS,
+                    Some((now_ms - 4 * HOUR_MS, "seven_day")),
+                ),
+            ],
+        );
         // Another session corrected the window two hours ago: it has already cleared.
         state.acp_event_store.record_account_limit(
             &account_key_of("claude-a"),
@@ -2248,7 +2789,7 @@ mod tests {
         );
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        let released = reap_calendar(&state, &mut attempted).await;
 
         assert!(
             released.contains(id),
@@ -2270,36 +2811,26 @@ mod tests {
     async fn a_direct_report_repeating_a_reset_is_observed_when_it_is_repeated() {
         const HOUR_MS: i64 = 3_600_000;
         let id = "sess-obs-reported-again";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let now_ms = Timestamp::now().as_millis();
         let reset = Timestamp::now() + crate::time::Duration::hours(10);
-        let limit = Event::RateLimit {
-            info: crate::acp::state::RateLimitInfo {
-                status: "You've hit your weekly limit".into(),
-                resets_at: Some(reset),
-                kind: "seven_day".into(),
-            },
-        };
-        let stopped = Event::Stopped {
-            reason: "rate_limited".into(),
+        let limit = RateLimitInfo {
+            status: "You've hit your weekly limit".into(),
+            resets_at: Some(reset),
+            kind: "seven_day".into(),
         };
         // This session reports the reset, a sibling on the account corrects it, then this
         // session reports the same reset again: its history reads A, A, but the second is a
         // fresh observation, newer than the correction.
         let store = &state.acp_event_store;
-        let next = store.highest_seq(id);
-        store
-            .record_at(id, next + 1, &limit, now_ms - 4 * HOUR_MS)
-            .unwrap();
-        store
-            .record_at(id, next + 2, &limit, now_ms - HOUR_MS)
-            .unwrap();
-        store
-            .record_at(id, next + 3, &stopped, now_ms - HOUR_MS)
-            .unwrap();
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
+        record_calendar(
+            &state,
+            id,
+            [
+                (limit.clone(), now_ms - 4 * HOUR_MS, None),
+                (limit, now_ms - HOUR_MS, None),
+            ],
+        );
         store.record_account_limit(
             &account_key_of("claude-a"),
             now_ms - HOUR_MS,
@@ -2316,7 +2847,7 @@ mod tests {
         );
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        let released = reap_calendar(&state, &mut attempted).await;
 
         assert!(
             !released.contains(id),
@@ -2334,34 +2865,20 @@ mod tests {
     async fn a_newer_confirmation_of_the_same_deadline_is_recorded() {
         const HOUR_MS: i64 = 3_600_000;
         let id = "sess-obs-confirmed";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         let now_ms = Timestamp::now().as_millis();
         let reset = Timestamp::from_millis(now_ms + 10 * HOUR_MS).unwrap();
         let deadline_ms =
             now_ms + 10 * HOUR_MS + i64::from(RATE_LIMIT_AUTO_RESUME_GRACE_SECS) * 1000;
         let store = &state.acp_event_store;
-        let next = store.highest_seq(id);
-        let limit = Event::RateLimit {
-            info: crate::acp::state::RateLimitInfo {
-                status: "You've hit your weekly limit".into(),
-                resets_at: Some(reset),
-                kind: "seven_day".into(),
-            },
-        };
-        let stopped = Event::Stopped {
-            reason: "rate_limited".into(),
+        let limit = RateLimitInfo {
+            status: "You've hit your weekly limit".into(),
+            resets_at: Some(reset),
+            kind: "seven_day".into(),
         };
         // The session confirms, an hour ago, the deadline the table already holds from a
         // report four hours old.
-        store
-            .record_at(id, next + 1, &limit, now_ms - HOUR_MS)
-            .unwrap();
-        store
-            .record_at(id, next + 2, &stopped, now_ms - HOUR_MS)
-            .unwrap();
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), store.highest_seq(id))]);
+        record_calendar(&state, id, [(limit, now_ms - HOUR_MS, None)]);
         let key = account_key_of("claude-a");
         store.record_account_limit(&key, deadline_ms, "seven_day", now_ms - 4 * HOUR_MS, false);
         store.record_account_limit(
@@ -2373,7 +2890,7 @@ mod tests {
         );
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        reap_calendar(&state, &mut attempted).await;
 
         // A sibling's delayed report, observed between the two, must not override it.
         store.record_account_limit(
@@ -2393,34 +2910,15 @@ mod tests {
     #[serial_test::serial]
     async fn an_undated_park_uses_the_accounts_reported_deadline() {
         let id = "sess-failover-undated";
-        let (_home, state, _project, _registry) = failover_session(id, 0).await;
+        let (_home, state, _project, _registry) = calendar_session(id).await;
         // The park carries no reset time; it was recorded two hours ago.
         let two_hours_ago = (Timestamp::now() - crate::time::Duration::hours(2)).as_millis();
-        let next = state.acp_event_store.highest_seq(id);
-        for (offset, event) in [
-            Event::RateLimit {
-                info: crate::acp::state::RateLimitInfo::undated(),
-            },
-            Event::Stopped {
-                reason: "rate_limited".into(),
-            },
-        ]
-        .iter()
-        .enumerate()
-        {
-            state
-                .acp_event_store
-                .record_at(id, next + 1 + offset as u64, event, two_hours_ago)
-                .unwrap();
-        }
-        state
-            .acp_supervisor
-            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
-        let kind = state
-            .acp_event_store
-            .latest_rate_limit_event(id)
-            .map(|(info, _)| info.kind)
-            .unwrap();
+        record_calendar(
+            &state,
+            id,
+            [(RateLimitInfo::undated(), two_hours_ago, None)],
+        );
+        let kind = known_park(&state, id).info.unwrap().kind;
         // The weekly reset was reported on another session two days out; the pool has no room.
         let now_ms = Timestamp::now().as_millis();
         let two_days = now_ms + 2 * 24 * 3600 * 1000;
@@ -2440,7 +2938,7 @@ mod tests {
         );
         let mut attempted: HashSet<String> = [id.to_string()].into();
 
-        let released = reap_rate_limit_resumes(&state, &mut attempted, &HashSet::new()).await;
+        let released = reap_calendar(&state, &mut attempted).await;
 
         assert!(
             released.is_empty() && attempted.contains(id),
@@ -2452,5 +2950,179 @@ mod tests {
             .unwrap();
         let window = stored.window(&kind).unwrap();
         assert_eq!((window.until_ms, window.estimated), (two_days, false));
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn selected_quota_queue_delivers_stored_bytes_without_owning_historical_background_resources(
+    ) {
+        use base64::Engine as _;
+        with_managed(|scope| {
+            Box::pin(async move {
+                for automatic in [false, true] {
+                    let mut live = managed_control_session(
+                        scope,
+                        if automatic {
+                            "quota-background-auto"
+                        } else {
+                            "quota-background-manual"
+                        },
+                        "claude",
+                        None,
+                    )
+                    .await;
+                    let id = live.id().to_owned();
+                    enable_auto_resume(automatic);
+                    live.park("older interrupted input").await;
+                    live.make_quota_due();
+                    let park = known_park(&live.state, &id);
+                    let history = Event::BackgroundAgentLaunched {
+                        agent_id: "historical-background".into(),
+                        tool_call_id: "historical-tool".into(),
+                        description: "retained transcript".into(),
+                        prompt: "historical work".into(),
+                        model: "test".into(),
+                        output_file: String::new(),
+                        workflow: None,
+                        started_at: crate::time::Timestamp::now(),
+                    };
+                    live.state
+                        .acp_event_store
+                        .record(
+                            &id,
+                            live.state.acp_event_store.highest_seq(&id).unwrap() + 1,
+                            &history,
+                            &crate::acp::event_sender::EventMetadata::history(),
+                        )
+                        .unwrap();
+                    live.state
+                        .acp_supervisor
+                        .hydrate_seqs(live.state.acp_event_store.all_session_seqs().unwrap());
+                    let control = live
+                        .state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .unwrap();
+                    assert!(control.has_active_background_agent());
+                    assert!(control
+                        .background_agents
+                        .iter()
+                        .all(|agent| agent.resource_ref.is_none()));
+                    assert_eq!(
+                        live.state
+                            .acp_event_store
+                            .has_in_flight_main_turn(&id)
+                            .unwrap(),
+                        Known(false)
+                    );
+                    assert_eq!(
+                        live.state.acp_event_store.has_in_flight_turn(&id).unwrap(),
+                        Known(true)
+                    );
+                    let bytes = [
+                        b"original-old-image".to_vec(),
+                        b"original-new-image".to_vec(),
+                    ];
+                    for (index, data) in bytes.iter().enumerate() {
+                        let mut queued = queued_prompt();
+                        queued.id = format!("queued-{index}");
+                        queued.seq = index as u64 + 1;
+                        queued.text = if index == 0 {
+                            "older queued intent"
+                        } else {
+                            "newer queued intent"
+                        }
+                        .into();
+                        queued.created_at = crate::time::Timestamp::from_millis(
+                            park.recorded_at_ms + if index == 0 { -1000 } else { 1000 },
+                        )
+                        .unwrap()
+                        .to_rfc3339();
+                        queued.attachments = vec![crate::daemon::PromptAttachmentRef {
+                            id: format!("image-{index}"),
+                            kind: crate::daemon::PromptAttachmentKind::Image,
+                            mime_type: "image/png".into(),
+                            name: Some(format!("original-{index}.png")),
+                            size: data.len() as u64,
+                        }];
+                        assert!(live.state.acp_event_store.record_pending_attachment(
+                            &id,
+                            &queued.id,
+                            &crate::acp::event_store::AttachmentBlob {
+                                id: format!("image-{index}"),
+                                kind: crate::daemon::PromptAttachmentKind::Image,
+                                mime_type: "image/png".into(),
+                                name: Some(format!("original-{index}.png")),
+                                data: data.clone(),
+                            }
+                        ));
+                        live.state
+                            .instances
+                            .write()
+                            .await
+                            .iter_mut()
+                            .find(|row| row.id == id)
+                            .unwrap()
+                            .queued_prompts
+                            .push(queued);
+                    }
+                    let frontier = live.state.acp_event_store.highest_seq(&id).unwrap();
+                    live.state
+                        .session_service
+                        .drain_queued_prompts_once(&id)
+                        .await;
+                    assert_eq!(
+                        live.state.acp_event_store.highest_seq(&id).unwrap(),
+                        frontier
+                    );
+                    let submission = live.state.session_service.prompt_submission(&id).await;
+                    let kind = if automatic {
+                        QuotaResume::Automatic { park_seq: park.seq }
+                    } else {
+                        QuotaResume::Manual
+                    };
+                    resume_rate_limited(&live.state, &id, submission, kind)
+                        .await
+                        .unwrap();
+                    let request = live.next_prompt().await;
+                    assert_eq!(request["params"]["sessionId"], live.sid);
+                    let blocks = request["params"]["prompt"].as_array().unwrap();
+                    let text = blocks
+                        .iter()
+                        .filter(|block| block["type"] == "text")
+                        .map(|block| block["text"].as_str().unwrap())
+                        .collect::<Vec<_>>()
+                        .join("");
+                    assert_eq!(text, "older queued intent\n\nnewer queued intent");
+                    let images = blocks
+                        .iter()
+                        .filter(|block| block["type"] == "image")
+                        .map(|block| {
+                            base64::engine::general_purpose::STANDARD
+                                .decode(block["data"].as_str().unwrap())
+                                .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(images, bytes);
+                    assert_eq!(
+                        delivered_prompts(&live.state, &id, frontier),
+                        vec![(text, false)]
+                    );
+                    assert_eq!(
+                        auto_resumed_breadcrumbs(&live.state, &id),
+                        usize::from(!automatic)
+                    );
+                    assert!(live
+                        .state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .unwrap()
+                        .has_active_background_agent());
+                    live.finish_prompt(&request, None).await;
+                }
+            })
+        })
+        .await;
     }
 }

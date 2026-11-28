@@ -1,4 +1,4 @@
-//! Registered `Instance.started_at`, retired by v064.
+//! Registered `Instance.started_at`, retired by v066.
 
 use anyhow::Result;
 
