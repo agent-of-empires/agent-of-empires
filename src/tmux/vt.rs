@@ -1821,7 +1821,7 @@ fn parse_tmux_pipe_support(version: &str) -> Option<bool> {
     parse_tmux_version(version).map(|v| v >= (3, 4))
 }
 
-fn parse_tmux_pipe_input_support(version: &str) -> Option<bool> {
+pub(super) fn parse_tmux_pipe_input_support(version: &str) -> Option<bool> {
     parse_tmux_version(version).map(|v| v >= (3, 8))
 }
 
@@ -2662,14 +2662,12 @@ impl VtChannel {
         session: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> Result<Arc<VtChannel>, VtUnavailable> {
-        Self::arm(session, deadline).map(|channel| {
-            let channel = Arc::new(channel);
-            REGISTRY
-                .lock()
-                .unwrap()
-                .insert(session.to_string(), Arc::downgrade(&channel));
-            channel
-        })
+        let channel = Arc::new(Self::arm(session, deadline)?);
+        REGISTRY
+            .lock()
+            .unwrap()
+            .insert(session.to_string(), Arc::downgrade(&channel));
+        Ok(channel)
     }
 
     fn arm(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> Result<Self, VtUnavailable> {
@@ -3404,6 +3402,10 @@ impl VtChannel {
 
     pub(crate) fn lifecycle(&self) -> VtLifecycle {
         VtLifecycle::load(&self.lifecycle)
+    }
+    #[cfg(feature = "e2e-tests")]
+    pub(crate) fn e2e_arm_result(&self) -> (bool, &str) {
+        (self.input, &self.owner_id)
     }
 
     /// Take the newest OSC 52 clipboard write the pane has emitted since the

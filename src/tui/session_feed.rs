@@ -256,6 +256,43 @@ impl NativeLease {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NativeInputLease {
+    grant: Arc<AtomicU64>,
+    generation: u64,
+}
+
+impl NativeInputLease {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.grant.load(Ordering::SeqCst) == self.generation
+    }
+
+    pub(crate) fn same_authority(&self, other: &Self) -> bool {
+        self.generation == other.generation && Arc::ptr_eq(&self.grant, &other.grant)
+    }
+
+    pub(crate) fn with_valid_effect<T>(&self, effect: impl FnOnce() -> T) -> Option<T> {
+        if !self.is_valid() {
+            return None;
+        }
+        let result = effect();
+        self.is_valid().then_some(result)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn valid_for_test() -> Self {
+        Self {
+            grant: Arc::new(AtomicU64::new(1)),
+            generation: 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn revoke_for_test(&self) {
+        set_grant(&self.grant, false);
+    }
+}
+
 pub(crate) struct NativePreparation {
     pub lease: NativeLease,
     pub result: tokio::sync::oneshot::Receiver<Result<String, String>>,
@@ -431,6 +468,7 @@ fn set_grant(grant: &AtomicU64, allowed: bool) {
         ((value & 1 == 1) != allowed).then(|| value + 1)
     });
 }
+
 async fn run_namespace(
     client: &crate::daemon::DaemonClient,
     request: crate::daemon::NamespaceMutation,
@@ -1033,15 +1071,14 @@ impl SessionFeed {
                 .is_some_and(|commands| !commands.is_closed())
     }
 
-    pub(crate) fn native_input_lease(&self) -> Option<NativeLease> {
+    pub(crate) fn native_input_lease(&self) -> Option<NativeInputLease> {
         let generation = self.native_grant.load(Ordering::SeqCst);
         if generation & 1 == 0 || !self.native_interaction_available() {
             return None;
         }
-        Some(NativeLease {
+        Some(NativeInputLease {
             grant: self.native_grant.clone(),
             generation,
-            cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -2451,6 +2488,19 @@ impl Drop for SessionFeed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_input_effect_drops_a_result_revoked_while_running() {
+        let lease = NativeInputLease::valid_for_test();
+        let revoker = lease.clone();
+        let sentinel = Arc::new(());
+        let result = lease.with_valid_effect(|| {
+            revoker.revoke_for_test();
+            sentinel.clone()
+        });
+        assert!(result.is_none());
+        assert_eq!(Arc::strong_count(&sentinel), 1);
+    }
 
     #[test]
     fn create_transport_timeout_is_not_reported_as_refusal() {

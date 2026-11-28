@@ -34,6 +34,20 @@ pub use utils::{attach_return_hint, first_pane_id, tmux_prefix_display};
 
 pub(crate) use session_kind::{append_session_kind_args, SessionKind};
 
+#[doc(hidden)]
+#[cfg(feature = "e2e-tests")]
+pub fn tmux_pipe_input_version_supported(version: &str) -> bool {
+    #[cfg(unix)]
+    {
+        vt::parse_tmux_pipe_input_support(version) == Some(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = version;
+        false
+    }
+}
+
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod test_support {
