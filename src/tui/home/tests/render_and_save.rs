@@ -135,7 +135,7 @@ fn test_row_tag_profile_modes_in_filtered_view() {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     let rendered = crate::tui::home::render::RowTag {
         content: crate::tui::home::render::profile_short_code("alpha"),
         max_width: 4,
@@ -166,7 +166,7 @@ fn plugin_statuses_align_before_activity_age() {
     let ids = [first.id.clone(), second.id.clone()];
     seed_profile("alpha", &[first, second]);
     let mut view = test_view(Some("alpha"));
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.show_activity_age = true;
     view.flat_items = view.build_flat_items();
     view.plugin_ui.snapshot = serde_json::from_value(serde_json::json!({
@@ -259,7 +259,7 @@ fn test_show_activity_age_toggles_age_column() {
     inst.idle_entered_at = Some(crate::time::Timestamp::now() - crate::time::Duration::minutes(5));
     seed_profile("alpha", &[inst]);
     let mut view = test_view(Some("alpha"));
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     let row = view
         .flat_items
@@ -312,7 +312,7 @@ fn test_empty_age_slot_does_not_truncate_active_title() {
     inst.status = Status::Running;
     seed_profile("alpha", &[inst]);
     let mut view = test_view(Some("alpha"));
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     let row = view
         .flat_items
@@ -361,7 +361,7 @@ fn test_show_structured_badge_toggle() {
     inst.status = Status::Running;
     seed_profile("alpha", &[inst]);
     let mut view = test_view(Some("alpha"));
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     let row = view
         .flat_items
@@ -403,7 +403,7 @@ fn test_agent_row_marks_running_paired_terminal() {
     let term = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
     seed_profile("alpha", &[inst]);
     let mut view = test_view(Some("alpha"));
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     let row = view
         .flat_items
@@ -468,7 +468,7 @@ fn test_branch_tag_yields_to_title_on_narrow_row() {
     let (_temp, _guard) = test_home();
     seed_profile("alpha", &[worktree_instance("my-session")]);
     let mut view = test_view(Some("alpha"));
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.row_tag_mode = crate::session::config::RowTagMode::Branch;
     view.show_activity_age = false;
     view.flat_items = view.build_flat_items();
@@ -526,7 +526,7 @@ async fn test_create_session_in_all_mode_is_findable() {
         HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     let state = native_state(&["alpha"]).await;
     apply_published(&mut view, &state).await;
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
@@ -596,7 +596,7 @@ async fn test_canonical_refresh_preserves_per_profile_collapsed_state() {
     let profiles = crate::session::list_profiles().unwrap();
     let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
     apply_published(&mut view, &state).await;
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
@@ -686,7 +686,7 @@ async fn test_group_delete_scoped_to_owning_profile() {
     let profiles = crate::session::list_profiles().unwrap();
     let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
     apply_published(&mut view, &state).await;
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
@@ -943,7 +943,7 @@ async fn test_rename_profile_change_prunes_source_group() {
     let profiles = crate::session::list_profiles().unwrap();
     let state = native_state(&profiles.iter().map(String::as_str).collect::<Vec<_>>()).await;
     apply_published(&mut view, &state).await;
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     view.selected_session = Some(id.clone());
 
@@ -1191,7 +1191,7 @@ fn a_session_created_without_setup_shows_its_badge() {
     plain.status = Status::Running;
     seed_profile("alpha", &[tagged, plain]);
     let mut view = test_view(Some("alpha"));
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     let row_text = |view: &HomeView, title: &str| {
         let row = view
@@ -1240,7 +1240,7 @@ fn a_narrow_row_with_two_badges_gives_the_title_the_row() {
     inst.status = Status::Running;
     seed_profile("alpha", &[inst]);
     let mut view = test_view(Some("alpha"));
-    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_by = crate::session::config::GroupByMode::Group;
     view.flat_items = view.build_flat_items();
     let row = view
         .flat_items

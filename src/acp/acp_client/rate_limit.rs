@@ -405,6 +405,55 @@ pub(super) fn take_rate_limit_from_captured_rejection(
     })
 }
 
+/// The agent text of the current turn while it has no prompt and ran no tool,
+/// so a limit reported only as text can park it (#5990). `None` once the turn
+/// is disqualified; each terminal starts it over.
+pub(super) struct AgentTurnText(Option<String>);
+
+impl Default for AgentTurnText {
+    fn default() -> Self {
+        Self(Some(String::new()))
+    }
+}
+
+impl AgentTurnText {
+    pub(super) fn observe(&mut self, event: &crate::acp::Event) {
+        use crate::acp::Event;
+        match event {
+            Event::AgentMessageChunk { text, .. } => {
+                if let Some(turn) = &mut self.0 {
+                    turn.push_str(if turn.is_empty() {
+                        text.trim_start()
+                    } else {
+                        text
+                    });
+                    // Bytes, so the check is constant time: a limit sentence
+                    // fits in four bytes a char, plus a little trailing space.
+                    if turn.len() > RateLimitInfo::AGENT_TEXT_MAX_CHARS * 4 + 64 {
+                        self.disqualify();
+                    }
+                }
+            }
+            Event::UserPromptSent { .. }
+            | Event::UserDiffCommentsPrompt { .. }
+            | Event::ToolCallStarted { .. } => self.disqualify(),
+            Event::Stopped { .. } => *self = Self::default(),
+            _ => {}
+        }
+    }
+
+    pub(super) fn disqualify(&mut self) {
+        self.0 = None;
+    }
+
+    /// The limit the turn's only text reports, starting the next turn over.
+    pub(super) fn take_rate_limit(&mut self) -> Option<RateLimitInfo> {
+        std::mem::take(self)
+            .0
+            .and_then(|text| RateLimitInfo::from_agent_text(&text))
+    }
+}
+
 /// Captures belong to the turn that observed them, so each turn boundary drops them.
 pub(super) fn clear_captured_rejections(captures: &std::sync::Mutex<HashMap<String, i64>>) {
     captures
@@ -778,6 +827,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(info.kind, "billing_error");
+    }
+
+    #[test]
+    fn agent_turn_text_parks_only_a_lone_limit_sentence() {
+        use crate::acp::Event;
+        let chunk = |text: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: None,
+        };
+        let stopped = || Event::Stopped {
+            reason: "agent_idle".into(),
+        };
+        let tool = || Event::ToolCallStarted {
+            tool_call: crate::acp::state::ToolCall {
+                prompt: None,
+                id: "t".into(),
+                name: "Bash".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: crate::time::Timestamp::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        };
+        // (name, events, parks)
+        let cases = [
+            (
+                "limit in two chunks",
+                vec![
+                    chunk("You've hit your 5-hour limit"),
+                    chunk(" · resets 10pm"),
+                ],
+                true,
+            ),
+            (
+                "the previous turn's text is dropped at its terminal",
+                vec![chunk("Done."), stopped(), chunk("You've hit your limit")],
+                true,
+            ),
+            (
+                "after a tool call",
+                vec![tool(), chunk("You've hit your limit")],
+                false,
+            ),
+            ("ordinary text", vec![chunk("Build passed.")], false),
+            (
+                "long text stops collecting",
+                vec![chunk(&"x".repeat(201)), chunk("You've hit your limit")],
+                false,
+            ),
+        ];
+        for (name, events, parks) in cases {
+            let mut turn = AgentTurnText::default();
+            events.iter().for_each(|e| turn.observe(e));
+            assert_eq!(turn.take_rate_limit().is_some(), parks, "{name}");
+            assert!(turn.take_rate_limit().is_none(), "{name}: taking resets");
+        }
+        for filler in ["x", " "] {
+            let mut long = AgentTurnText::default();
+            long.observe(&chunk("Working."));
+            for _ in 0..=RateLimitInfo::AGENT_TEXT_MAX_CHARS * 4 + 64 {
+                long.observe(&chunk(filler));
+            }
+            assert!(
+                long.0.is_none(),
+                "{filler:?}: long text releases its buffer"
+            );
+        }
+        let mut padded = AgentTurnText::default();
+        for _ in 0..1000 {
+            padded.observe(&chunk(" "));
+        }
+        padded.observe(&chunk("You've hit your limit"));
+        assert!(
+            padded.take_rate_limit().is_some(),
+            "leading space is dropped"
+        );
+        let mut prompted = AgentTurnText::default();
+        prompted.disqualify();
+        prompted.observe(&chunk("You've hit your limit"));
+        assert!(prompted.take_rate_limit().is_none(), "prompted turn");
     }
 
     #[test]

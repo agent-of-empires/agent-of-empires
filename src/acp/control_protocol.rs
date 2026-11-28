@@ -6,8 +6,9 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Current wire generation.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 8;
+/// Current wire generation. Older peers do not carry both Native custody and
+/// proxy adapter frame accounting.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 9;
 
 /// Maximum NDJSON frame accepted from the ACP agent.
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -515,7 +516,14 @@ pub enum ControlBody {
         original_delivery: bool,
         delivery: NativeReplayDelivery,
         local_failure: Option<std::sync::Arc<HandshakeFailure>>,
+        /// Proxy adapter frames already counted by the runner that this
+        /// attachment will not replay. Excludes queued updates and shed
+        /// markers that follow this reply. Independent of Native replay ordinals.
+        adapter_frames: u64,
     },
+    /// Adapter frames the runner shed from a full queue. They stay numbered by
+    /// the proxy, so the daemon counts them in the position they held.
+    AdapterFramesShed { count: u64 },
     /// The runner-owned handshake failed (agent incompatible, `session/new`
     /// error, transport failure).
     HandshakeFailed {
@@ -793,7 +801,7 @@ mod tests {
             native.join_observer().await;
             let frames = native.frames().await;
             assert!(frames.iter().any(|frame| matches!(frame,
-                ControlBody::SessionReady { receipt, postimage: Some(_), .. }
+                ControlBody::SessionReady { receipt, postimage: Some(_), adapter_frames: 0, .. }
                     if receipt.attempt.as_ref() == native.attempt.as_ref()
                         && receipt.replay.closed && receipt.replay.notifications == 1
             )));
@@ -822,6 +830,18 @@ mod tests {
                 } if receipt.attempt.as_ref() == native.attempt.as_ref()
             )));
         }
+    }
+
+    #[test]
+    fn adapter_frames_shed_roundtrips() {
+        let body = ControlBody::AdapterFramesShed { count: 3 };
+        let encoded = encode_frame(&body).expect("encode");
+        let len = u32::from_be_bytes(encoded[..4].try_into().unwrap());
+        assert_eq!(len as usize, encoded.len() - 4);
+        assert_eq!(
+            serde_json::from_slice::<ControlBody>(&encoded[4..]).unwrap(),
+            body
+        );
     }
 
     #[tokio::test]

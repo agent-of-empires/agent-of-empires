@@ -794,15 +794,6 @@ impl HomeView {
             }
             return true;
         }
-        if self.sort_order == crate::session::config::SortOrder::Attention {
-            // Attention sort is a triage flow: the cursor advances to the next
-            // item that needs attention.
-            self.select_top_attention(None);
-            if self.selected_session.as_deref() == Some(pending.id.as_str()) {
-                self.clear_selection_off_archived_row();
-            }
-            return true;
-        }
         // Advance to the next session rather than following the archived row into
         // the Archived section: archiving reads as "I'm done with this one".
         match pending.successor {

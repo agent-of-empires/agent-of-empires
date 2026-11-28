@@ -1014,7 +1014,7 @@ describe("SessionBanners startup line", () => {
 });
 
 describe("accepted integration-loss snapshot diagnostics", () => {
-  const message = "Agent integration lost: hold overflow";
+  const message = /The integration held back too many messages/;
   const banners = (state: AcpState) => (
     <SessionBanners
       sessionId="snapshot-diagnostic"
@@ -1043,12 +1043,14 @@ describe("accepted integration-loss snapshot diagnostics", () => {
 
   it.each<[IntegrationLostReason, string]>([
     [{ kind: "contract_violation", detail: "invalid primitive epoch" }, "invalid primitive epoch"],
-    [{ kind: "hold_overflow" }, "hold overflow"],
-    [{ kind: "lease_overflow" }, "lease overflow"],
+    [{ kind: "hold_overflow" }, "held back too many messages"],
+    [{ kind: "lease_overflow" }, "left too many requests open"],
+    [{ kind: "proxy_exited" }, "process exited"],
   ])("renders snapshot-only reason %j without a raw frame or native authority (%s)", (reason, detail) => {
     const state = snapshot(emptyAcpState(), reason, 20);
     render(banners(state));
-    expect(screen.getByText(`Agent integration lost: ${detail}`)).toBeTruthy();
+    expect(screen.getAllByTestId("integration-lost-banner")).toHaveLength(1);
+    expect(screen.getByTestId("integration-lost-line").textContent).toContain(detail);
     expect(screen.queryByTestId("startup-error-banner")).toBeNull();
     expect(screen.queryByRole("button", { name: /retry/i })).toBeNull();
     expect(state).toMatchObject({
@@ -1096,7 +1098,7 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     const view = render(banners(state));
     const expectDiagnostic = () => {
       if (reason) expect(screen.getByText(message)).toBeTruthy();
-      else expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+      else expect(screen.queryByTestId("integration-lost-banner")).toBeNull();
       expect(nativeInputAvailable(state)).toBe(false);
     };
     expectDiagnostic();
@@ -1133,7 +1135,7 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     }
     state = snapshot(state, null, 24);
     view.rerender(banners(state));
-    expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+    expect(screen.queryByTestId("integration-lost-banner")).toBeNull();
     expect(state.integrationLost).toBeNull();
     expect(nativeInputAvailable(state)).toBe(false);
   });
@@ -1173,7 +1175,7 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     expect(screen.getByText(message)).toBeTruthy();
     const cleared = snapshot(lost, null, 21);
     view.rerender(banners(cleared));
-    expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+    expect(screen.queryByTestId("integration-lost-banner")).toBeNull();
     expect(cleared.startupError).toBe("Unrelated startup diagnostic");
     expect(cleared.lastError).toBe("Retained operation diagnostic");
     expect(cleared.interactionError).toEqual(initial.interactionError);

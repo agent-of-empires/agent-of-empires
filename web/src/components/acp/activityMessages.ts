@@ -8,7 +8,7 @@ import type { ThreadMessageLike } from "@assistant-ui/react";
 import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { clearHistoryProjection, lastClearIndex } from "../../lib/acpHistoryWindow";
 import type { ActivityRow, ToolCall, ToolOutputBlock } from "../../lib/acpTypes";
-import { type AgentProfile, DEFAULT_AGENT_PROFILE, isSubagentToolName } from "../../lib/agentProfiles";
+import { type AgentProfile, DEFAULT_AGENT_PROFILE } from "../../lib/agentProfile";
 
 /** Synthetic part for a subagent Task with its child tool calls. */
 export const SUBAGENT_TASK_NAME = "_aoe_subagent_task";
@@ -348,7 +348,7 @@ function collapseSubagents(parts: DraftPart[], routedChildren: ToolPart[], profi
       out.push(subagentPart(p, [], true));
     } else if (childrenByParent.has(p.toolCallId)) {
       out.push(subagentPart(p, childrenByParent.get(p.toolCallId)!));
-    } else if (isSubagentToolName(argString(p.argsText, "_aoe_raw_tool_name"), profile)) {
+    } else if (profile.subagent_tool_names.includes(argString(p.argsText, "_aoe_raw_tool_name") ?? "")) {
       out.push(subagentPart(p, []));
     } else {
       out.push(p);

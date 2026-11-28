@@ -12,6 +12,7 @@ import {
   type SessionRecovery,
 } from "../../src/lib/acpTypes";
 import { currentControlSnapshot } from "./acpControlSnapshot";
+import { CLAUDE_PROFILE } from "../../src/lib/__tests__/agentProfileFixtures";
 
 /** `prompt_id` is the client-minted id echoed on `UserPromptSent`. */
 export interface AcpPromptBody {
@@ -52,7 +53,7 @@ export interface AcpSessionMockOptions {
   promptWakeEligible?: boolean;
   /** Let a spec hold current authority while the socket/replay is already open. */
   emitNativeSnapshot?: boolean;
-  /** Extra `SessionResponse` fields, such as the agent's `clear_aliases` and `compact_aliases`. */
+  /** Extra `SessionResponse` fields, such as `agent_profile` (Claude's by default). */
   sessionFields?: Record<string, unknown>;
 }
 
@@ -288,6 +289,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             ...(opts.acpSessionId ? { acp_session_id: opts.acpSessionId } : {}),
             ...(opts.importPending ? { import_pending: true } : {}),
             ...(opts.rateLimitAutoResume === undefined ? {} : { rate_limit_auto_resume: opts.rateLimitAutoResume }),
+            agent_profile: CLAUDE_PROFILE,
             ...opts.sessionFields,
             claude_fullscreen: false,
           },

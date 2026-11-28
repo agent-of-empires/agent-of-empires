@@ -802,3 +802,86 @@ describe("a diagnosed startup cause", () => {
     );
   });
 });
+
+describe("integration lost", () => {
+  const frame = (seq: number, event: AcpFrame["event"]): Action => ({
+    kind: "frame",
+    frame: { session_id: "s", seq, event },
+  });
+  const lost = (seq: number) => frame(seq, { IntegrationLost: { reason: { kind: "proxy_exited" } } });
+  it.each<[string, Action[], boolean]>([
+    ["the event sets it without a startup error", [lost(1)], true],
+    ["historical assignment keeps it", [lost(1), frame(2, { AcpSessionAssigned: { acp_session_id: "a" } })], true],
+    [
+      "Agent switch clears it",
+      [lost(1), frame(2, { AgentSwitched: { from: "claude", to: "codex", reason: "manual" } })],
+      false,
+    ],
+    [
+      "a new turn keeps it, as the daemon does",
+      [lost(1), frame(2, { UserPromptSent: { text: "hi", prompt_id: "p" } })],
+      true,
+    ],
+  ])("%s", (_label, actions, set) => {
+    const state = run(empty(), ...actions);
+    expect(state.integrationLost).toEqual(set ? { kind: "proxy_exited" } : null);
+    expect(state.startupError).toBeNull();
+  });
+
+  it("a current diagnostic snapshot clears loss and fences covered loss and switch frames", () => {
+    const prior = run(empty(), lost(1));
+    const recovered = currentControlSnapshot({ ...prior, integrationLost: null }, { ready: true }, 3);
+    expect(run(prior, recovered, lost(2)).integrationLost).toBeNull();
+
+    const latestLoss = currentControlSnapshot(prior, { ready: false }, 3);
+    const switched = frame(2, { AgentSwitched: { from: "claude", to: "codex", reason: "manual" } });
+    expect(run(prior, latestLoss, switched).integrationLost).toEqual({ kind: "proxy_exited" });
+    expect(run(prior, recovered, lost(4)).integrationLost).toEqual({ kind: "proxy_exited" });
+  });
+
+  it("a new turn retires advisories except the degraded-proxy banner", () => {
+    const notice = (seq: number, title: string, key?: string) =>
+      frame(seq, { SessionNotice: { severity: "warning", title, description: null, key } });
+    const state = run(
+      empty(),
+      notice(1, "Fake features unavailable", "proxy-degraded"),
+      notice(2, "stale"),
+      frame(3, { UserPromptSent: { text: "hi", prompt_id: "p" } }),
+    );
+    expect(state.sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable"]);
+  });
+
+  it("later notices do not evict the degraded-proxy banner, and a turn keeps it", () => {
+    const notice = (seq: number, title: string, key?: string) =>
+      frame(seq, { SessionNotice: { severity: "warning", title, description: null, key } });
+    const state = run(
+      empty(),
+      notice(1, "Fake features unavailable", "proxy-degraded"),
+      notice(2, "a"),
+      notice(3, "b"),
+      notice(4, "c"),
+      notice(5, "d"),
+    );
+    expect(state.sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable", "c", "d"]);
+    const next = run(state, frame(6, { UserPromptSent: { text: "hi", prompt_id: "p" } }));
+    expect(next.sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable"]);
+  });
+
+  it("only current projection retires the degraded-proxy banner after assignment", () => {
+    const degraded = (seq: number) =>
+      frame(seq, {
+        SessionNotice: {
+          severity: "warning",
+          title: "Fake features unavailable",
+          description: null,
+          key: "proxy-degraded",
+        },
+      });
+    const assigned = frame(2, { AcpSessionAssigned: { acp_session_id: "a" } });
+    const state = run(empty(), degraded(1), assigned);
+    expect(state.sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable"]);
+    const ready = currentControlSnapshot({ ...state, sessionNotices: [] }, { ready: true }, 3);
+    expect(run(state, ready).sessionNotices).toEqual([]);
+    expect(run(state, ready, degraded(4)).sessionNotices.map((n) => n.title)).toEqual(["Fake features unavailable"]);
+  });
+});

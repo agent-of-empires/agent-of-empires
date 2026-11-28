@@ -676,6 +676,7 @@ impl ProjectionWindow {
 #[derive(Default)]
 struct Emissions {
     next: u64,
+    verified_proxy: bool,
     window: Option<ProjectionWindow>,
 }
 
@@ -710,6 +711,34 @@ impl ProjectionState {
                 Some(ProjectionWindow::new(attempt, 0, false));
         }
         state
+    }
+
+    pub(crate) fn observe_verified_proxy(&self) {
+        self.emissions
+            .lock()
+            .expect("SDK projection lock")
+            .verified_proxy = true;
+    }
+
+    /// Freeze a failed, pre-hello constructor without discarding native evidence.
+    pub(crate) fn seal_unissued_proxy_failure(&self) -> bool {
+        let mut emissions = self.emissions.lock().expect("SDK projection lock");
+        if emissions.verified_proxy {
+            return false;
+        }
+        let Some(window) = emissions.window.as_mut() else {
+            return false;
+        };
+        if !window.original
+            || window.rpc_possible
+            || window.sealed
+            || window.receipt.is_some()
+            || window.delivery.is_some()
+        {
+            return false;
+        }
+        window.sealed = true;
+        true
     }
 
     pub(crate) fn observe_original_invocation(&self, attempt: Arc<EstablishmentAttempt>) -> bool {
@@ -2086,6 +2115,45 @@ mod metadata_tests {
             })
         })
         .await;
+    }
+
+    #[test]
+    fn proxy_fallback_seals_only_an_unissued_unverified_original_attempt() {
+        use crate::acp::establishment::{EstablishmentOrigin, EstablishmentTarget};
+        use crate::acp::state::{NativeBindingState, NativeEventContext};
+
+        let row = crate::session::Instance::new("fallback", "/tmp");
+        let binding = NativeBindingState::capture(&row);
+        let context: NativeEventContext =
+            serde_json::from_value(serde_json::to_value([0_u8; 32]).unwrap()).unwrap();
+        let attempt = Arc::new(EstablishmentAttempt {
+            id: uuid::Uuid::new_v4().to_string().parse().unwrap(),
+            profile: "default".into(),
+            session_id: row.id.clone(),
+            created_at: row.created_at,
+            source_context: context,
+            context,
+            generation: 1,
+            preimage: binding.clone(),
+            destination: binding,
+            target: EstablishmentTarget::New,
+            origin: EstablishmentOrigin::Fresh,
+            producer: None,
+        });
+
+        let unissued = ProjectionState::new(Some(Arc::clone(&attempt)));
+        assert!(unissued.seal_unissued_proxy_failure());
+        assert!(!unissued.rpc_may_be_issued(attempt.id));
+
+        let possibly_issued = ProjectionState::new(Some(Arc::clone(&attempt)));
+        assert!(possibly_issued.rpc_may_be_issued(attempt.id));
+        assert!(!possibly_issued.seal_unissued_proxy_failure());
+
+        let verified = ProjectionState::new(Some(Arc::clone(&attempt)));
+        verified.observe_verified_proxy();
+        assert!(!verified.seal_unissued_proxy_failure());
+
+        assert!(!ProjectionState::read_only(Some(attempt)).seal_unissued_proxy_failure());
     }
 
     #[test]

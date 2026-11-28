@@ -1655,14 +1655,11 @@ impl HomeView {
         }
         // Pin the set the count describes: status buckets reshuffle while the dialog is open.
         self.pending_archive_group_ids = Some(ids);
-        // Project/Org group by repo or owner and Manual by assigned path, so name the
-        // scope and show the full path, or nested groups sharing a leaf segment
+        // Name the scope and show the full path, or nested groups sharing a leaf segment
         // would be ambiguous.
         let (title, scope) = match self.group_by {
-            crate::session::config::GroupByMode::Project => ("Archive project", "project"),
-            crate::session::config::GroupByMode::Org => ("Archive org", "org"),
-            crate::session::config::GroupByMode::Status => ("Archive status", "status"),
-            crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
+            crate::session::config::GroupByMode::Project => ("Archive repository", "repository"),
+            crate::session::config::GroupByMode::Group => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
         self.confirm_dialog = Some(
@@ -1924,7 +1921,7 @@ impl HomeView {
         }
         if let Some(dialog) = &self.info_dialog {
             if let Some(DialogResult::Cancel) = dialog.handle_click(col, row) {
-                self.info_dialog = None;
+                self.dismiss_info_dialog();
             }
             return true;
         }
@@ -2204,31 +2201,38 @@ impl HomeView {
                 } else {
                     data.command_override.clone()
                 };
-                if let Some(hook_agent) =
-                    crate::session::host_hook_agent(&tool_name, &command, &resolved_config.session)
-                {
-                    let config = crate::session::config::load_config().ok().flatten();
-                    let hooks_enabled = resolved_config.session.agent_status_hooks;
-                    let acknowledged = config
-                        .as_ref()
-                        .map(|c| c.app_state.has_acknowledged_agent_hooks)
-                        .unwrap_or(false);
-
-                    // A sandboxed session stages its hooks in its own container
-                    // config and the launch gate never asks, so asking here
-                    // would consent to a write that cannot happen.
-                    if !data.sandbox
+                let config = crate::session::config::load_config().ok().flatten();
+                let hooks_enabled = resolved_config.session.agent_status_hooks;
+                let acknowledged = config
+                    .as_ref()
+                    .map(|c| c.app_state.has_acknowledged_agent_hooks)
+                    .unwrap_or(false);
+                // A sandboxed session stages its hooks in its own container
+                // config and the launch gate never asks, so asking here
+                // would consent to a write that cannot happen.
+                let dialog_for = |hook_agent: &crate::agents::AgentDef| {
+                    (!data.sandbox
                         && crate::agents::hook_install_required(hook_agent, hooks_enabled)
-                        && !acknowledged
-                    {
-                        self.hooks_install_dialog = Some(HooksInstallDialog::new(
-                            &tool_name,
-                            hook_agent,
-                            &resolved_config,
-                        ));
-                        self.pending_hooks_install_data = Some(data);
-                        return None;
-                    }
+                        && !acknowledged)
+                        .then(|| HooksInstallDialog::new(&tool_name, hook_agent, &resolved_config))
+                };
+                let dialog = match crate::session::host_hook_declared_agent(
+                    &tool_name,
+                    &command,
+                    &resolved_config.session,
+                ) {
+                    Some(declared) => declared.with_definition(dialog_for).flatten(),
+                    None => crate::session::host_hook_agent(
+                        &tool_name,
+                        &command,
+                        &resolved_config.session,
+                    )
+                    .and_then(dialog_for),
+                };
+                if let Some(dialog) = dialog {
+                    self.hooks_install_dialog = Some(dialog);
+                    self.pending_hooks_install_data = Some(data);
+                    return None;
                 }
 
                 self.maybe_confirm_volume_ignores_globs(data)
@@ -2627,7 +2631,7 @@ impl HomeView {
                 match dialog.handle_key(key) {
                     DialogResult::Continue => {}
                     DialogResult::Cancel | DialogResult::Submit(_) => {
-                        self.info_dialog = None;
+                        self.dismiss_info_dialog();
                         if let Some(session_id) = self.pending_attach_after_warning.take() {
                             return Some(Action::AttachSession(session_id));
                         }
@@ -3434,17 +3438,7 @@ impl HomeView {
                 SidebarPosition::Left => self.grow_list(),
                 SidebarPosition::Right => self.shrink_list(),
             },
-            KeyCode::Left | KeyCode::Char('h') => {
-                if let Some(Item::Group {
-                    path, collapsed, ..
-                }) = self.flat_items.get(self.cursor)
-                {
-                    if !collapsed {
-                        let path = path.clone();
-                        self.toggle_group_collapsed(&path);
-                    }
-                }
-            }
+            KeyCode::Left | KeyCode::Char('h') => self.collapse_group_at_cursor(),
             KeyCode::Right | KeyCode::Char('l') => {
                 if self.focus_suggestions_pane() {
                     return None;
@@ -3753,6 +3747,12 @@ impl HomeView {
                         Some(InfoDialog::new("Favorite not changed", &e.to_string()));
                 }
             }
+            // Snooze shares non-strict `h` with the vim-style collapse, which a header keeps.
+            ActionId::ToggleSnooze
+                if matches!(self.flat_items.get(self.cursor), Some(Item::Group { .. })) =>
+            {
+                self.collapse_group_at_cursor();
+            }
             ActionId::ToggleSnooze => {
                 if let Err(e) = self.toggle_snooze_at_cursor() {
                     self.info_dialog = Some(InfoDialog::new("Snooze not changed", &e.to_string()));
@@ -3848,10 +3848,14 @@ impl HomeView {
                 }
             })
             .or_else(|| {
-                // Status headers name a state, not a group, so prefilling the field
-                // would create a manual group called "Waiting".
-                if self.group_by == GroupByMode::Status {
-                    return None;
+                // A Repository header is not a Group; a Group nested under one prefills
+                // only its own path.
+                if self.group_by == GroupByMode::Project {
+                    return self
+                        .selected_group
+                        .as_deref()
+                        .and_then(|g| super::rows::split_project_view_path(g).1)
+                        .map(str::to_string);
                 }
                 // The scratch bucket's group_path is an internal sentinel; show
                 // its display label in the Group field, not the raw sentinel (#3237).
@@ -4194,16 +4198,21 @@ impl HomeView {
         if crate::session::is_synthetic_project_header(group_path) {
             return None;
         }
+        let nested = format!("{group_path}/");
+        let profile = self.selected_group_profile.as_deref();
+        // Newest live member first, matching the rows the header is built from.
         self.instances
             .values()
-            .find(|inst| match self.group_by {
-                GroupByMode::Project => super::project_group_key(inst) == group_path,
-                GroupByMode::Org | GroupByMode::Status => false,
-                GroupByMode::Manual => {
-                    inst.group_path == group_path
-                        || inst.group_path.starts_with(&format!("{group_path}/"))
-                }
+            .filter(|inst| !inst.is_archived() && !inst.is_trashed())
+            .filter(|inst| profile.is_none_or(|p| inst.source_profile == p))
+            .filter(|inst| {
+                let path = match self.group_by {
+                    GroupByMode::Project => super::rows::project_view_path(inst),
+                    GroupByMode::Group => inst.group_path.clone(),
+                };
+                path == group_path || path.starts_with(&nested)
             })
+            .max_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)))
             .map(|inst| inst.repo_path().to_string())
             .or_else(|| {
                 // An empty pinned project has no members to borrow from, so fall back to
@@ -4212,7 +4221,10 @@ impl HomeView {
                 if self.group_by == GroupByMode::Project {
                     self.registered_projects
                         .iter()
-                        .find(|p| crate::session::projects::repo_label(&p.path) == group_path)
+                        .find(|p| {
+                            crate::session::projects::repo_label(&p.path)
+                                == super::rows::split_project_view_path(group_path).0
+                        })
                         .map(|p| p.path.clone())
                 } else {
                     None
@@ -4630,7 +4642,6 @@ impl HomeView {
     fn bindings_ctx(&self, live_send: bool) -> bindings::Ctx {
         bindings::Ctx {
             view_mode: self.view_mode.clone(),
-            sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
             session_selected: self.selected_session.is_some(),
             project_group_selected: self.project_group_at_cursor().is_some(),
@@ -5240,26 +5251,45 @@ impl HomeView {
         }
     }
 
-    /// Info-dialog copy for a rename/delete attempted on a header derived automatically
-    /// (Project/Org/Status), where there is no user-owned group to act on. `None` for `Manual`,
-    /// where the caller proceeds with its normal flow.
-    pub(super) fn automatic_group_hint(&self) -> Option<(String, String)> {
-        let mode_label = match self.group_by {
-            GroupByMode::Manual => return None,
-            GroupByMode::Project => "Project",
-            GroupByMode::Org => "Org",
-            GroupByMode::Status => "Status",
-        };
+    /// Info-dialog copy for a rename/delete attempted on a header under the Repository grouping.
+    /// `None` under Groups, where the caller proceeds with its normal flow.
+    pub(super) fn automatic_group_hint(&self, path: &str) -> Option<(String, String)> {
+        if self.group_by == GroupByMode::Group {
+            return None;
+        }
         let toggle = self.key_label(ActionId::GroupBy);
-        let how = if toggle.is_empty() {
-            "Pick Manual grouping".to_string()
-        } else {
-            format!("Press {toggle} and pick Manual")
+        let how = |what: &str| {
+            if toggle.is_empty() {
+                format!("Pick the Groups grouping to {what}.")
+            } else {
+                format!("Press {toggle} and pick Groups to {what}.")
+            }
         };
-        Some((
-            format!("Cannot Modify {mode_label} Groups"),
-            format!("{mode_label} groups are automatic. {how} to manage groups."),
-        ))
+        let nested_group = !crate::session::is_synthetic_project_header(path)
+            && super::rows::split_project_view_path(path).1.is_some();
+        Some(if nested_group {
+            (
+                "Manage Groups Under My Groups".to_string(),
+                format!("This is one of your Groups. {}", how("rename or delete it")),
+            )
+        } else {
+            (
+                "Cannot Modify Repository Headers".to_string(),
+                format!("Repository headers are automatic. {}", how("manage groups")),
+            )
+        })
+    }
+
+    fn collapse_group_at_cursor(&mut self) {
+        if let Some(Item::Group {
+            path,
+            collapsed: false,
+            ..
+        }) = self.flat_items.get(self.cursor)
+        {
+            let path = path.clone();
+            self.toggle_group_collapsed(&path);
+        }
     }
 
     fn toggle_group_collapsed(&mut self, path: &str) {
@@ -5283,26 +5313,6 @@ impl HomeView {
                 .insert(path.to_string(), !collapsed);
             self.rebuild_flat_items();
             self.save_project_group_collapsed();
-            return;
-        }
-        if self.group_by == GroupByMode::Org {
-            let collapsed = self.org_group_collapsed.get(path).copied().unwrap_or(false);
-            self.org_group_collapsed
-                .insert(path.to_string(), !collapsed);
-            self.rebuild_flat_items();
-            self.save_org_group_collapsed();
-            return;
-        }
-        if self.group_by == GroupByMode::Status {
-            let collapsed = self
-                .status_group_collapsed
-                .get(path)
-                .copied()
-                .unwrap_or(false);
-            self.status_group_collapsed
-                .insert(path.to_string(), !collapsed);
-            self.rebuild_flat_items();
-            self.save_status_group_collapsed();
             return;
         }
         let result = (|| -> anyhow::Result<()> {
@@ -6398,7 +6408,7 @@ impl HomeView {
             self.group_rename_context = None;
             self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
-            if let Some((title, hint)) = self.automatic_group_hint() {
+            if let Some((title, hint)) = self.automatic_group_hint(group_path) {
                 self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
@@ -6595,7 +6605,7 @@ impl HomeView {
                 }
             }
         } else if let Some(group_path) = &self.selected_group {
-            if let Some((title, hint)) = self.automatic_group_hint() {
+            if let Some((title, hint)) = self.automatic_group_hint(group_path) {
                 self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }

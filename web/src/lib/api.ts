@@ -1,9 +1,9 @@
-import type { AgentLifecycleInfo } from "./agentProfiles";
 import { notifySettingsChanged } from "./settingsEvents";
 import { clientFormFactor } from "./formFactor";
 import { reportError } from "./logger";
 import type { SchemaSettings } from "./generated/settingsKeys";
 import type {
+  AgentLifecycleInfo,
   SessionResponse,
   RichDiffFilesResponse,
   RichFileContentsResponse,

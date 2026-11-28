@@ -5586,7 +5586,13 @@ async fn list_sessions_advertises_the_running_agents_reset_command() {
         .await
         .unwrap()
         .into_iter()
-        .map(|s| (s.id, s.clear_aliases, s.compact_aliases))
+        .map(|s| {
+            (
+                s.id,
+                s.agent_profile.clear_aliases,
+                s.agent_profile.compact_aliases,
+            )
+        })
         .collect();
     let row = |id: &str, clear: &[&str], compact: &[&str]| {
         (
@@ -5917,7 +5923,7 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
             let mut inst = make_test_instance();
             inst.tool = tool.to_string();
             assert_eq!(
-                session_response_from_instance(&inst, false).acp_can_fork,
+                session_response_from_instance(&inst).acp_can_fork,
                 crate::session::fork::structured_fork_capable(tool, None),
                 "acp_can_fork and the create guard disagree for '{tool}'"
             );
@@ -5934,9 +5940,12 @@ fn session_response_carries_the_agents_solo_commands() {
     for (tool, clear, compact) in cases {
         let mut inst = make_test_instance();
         inst.tool = tool.to_string();
-        let response = session_response_from_instance(&inst, false);
+        let response = session_response_from_instance(&inst);
         assert_eq!(
-            (response.clear_aliases, response.compact_aliases),
+            (
+                response.agent_profile.clear_aliases,
+                response.agent_profile.compact_aliases
+            ),
             (
                 clear.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 compact.iter().map(|s| s.to_string()).collect::<Vec<_>>()
@@ -6394,7 +6403,7 @@ fn session_response_from_instance_reports_managed_worktree_for_workspace_session
         cleanup_on_delete: true,
     });
 
-    let resp = session_response_from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst);
     assert!(
         resp.has_cleanable_worktree,
         "workspace session must report a cleanable worktree so the delete checkbox shows"
@@ -6421,11 +6430,11 @@ fn session_response_from_instance_surfaces_hook_urgent_flag() {
     )
     .unwrap();
 
-    let urgent_resp = session_response_from_instance(&inst, false);
+    let urgent_resp = session_response_from_instance(&inst);
     assert!(urgent_resp.urgent, "hook-flagged session must be urgent");
 
     crate::hooks::cleanup_hook_status_dir(&inst.id);
-    let plain_resp = session_response_from_instance(&inst, false);
+    let plain_resp = session_response_from_instance(&inst);
     assert!(
         !plain_resp.urgent,
         "session with no hook file must not be urgent"
@@ -6771,15 +6780,15 @@ fn session_response_dormant_reflects_shown_dormant() {
 
     // Live idle: not dormant.
     inst.status = Status::Idle;
-    assert!(!session_response_from_instance(&inst, false).dormant);
+    assert!(!session_response_from_instance(&inst).dormant);
 
     // Idle-reaped (marker set, status left Idle): dormant.
     inst.mark_idle_dormant();
-    assert!(session_response_from_instance(&inst, false).dormant);
+    assert!(session_response_from_instance(&inst).dormant);
 
     // A deliberate stop keeps the neutral Stopped dot rather than dormant (#2250).
     inst.status = Status::Stopped;
-    assert!(!session_response_from_instance(&inst, false).dormant);
+    assert!(!session_response_from_instance(&inst).dormant);
 }
 
 #[test]
@@ -6999,7 +7008,7 @@ fn session_response_flags_a_working_directory_outside_any_repository() {
     ];
     for (label, inst, outside) in cases {
         assert_eq!(
-            session_response_from_instance(&inst, false).outside_repository,
+            session_response_from_instance(&inst).outside_repository,
             outside,
             "{label}"
         );
@@ -7106,12 +7115,12 @@ fn session_response_gates_snoozed_until_on_active_snooze() {
     let mut inst = make_test_instance();
 
     // Not snoozed -> field omitted.
-    let resp = session_response_from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst);
     assert!(resp.snoozed_until.is_none());
 
     // Active snooze -> field surfaced.
     inst.snooze(30);
-    let resp = session_response_from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst);
     assert!(resp.snoozed_until.is_some());
 
     // Expired snooze -> stays on disk for the next mutation to rewrite,
@@ -7119,7 +7128,7 @@ fn session_response_gates_snoozed_until_on_active_snooze() {
     // This prevents the web from rendering "snoozed 0m" on rows that
     // have already woken on the server.
     inst.snoozed_until = Some(crate::time::Timestamp::now() - crate::time::Duration::seconds(1));
-    let resp = session_response_from_instance(&inst, false);
+    let resp = session_response_from_instance(&inst);
     assert!(
         resp.snoozed_until.is_none(),
         "expired snooze must be filtered out on the wire even though the persisted field stays set"
@@ -10100,6 +10109,95 @@ async fn send_strips_bracketed_paste_escape_from_captured_snippet() {
     assert!(captured.contains(expected), "{captured:?}");
     assert!(!captured.contains('\x1b'), "{captured:?}");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn send_refuses_a_draft_without_stamping_input_recency() -> anyhow::Result<()> {
+    use crate::tmux::test_helpers::{
+        only_pane_id, wait_for_pane_command, TmuxTestSession, INPUT_BOX_SCRIPT,
+    };
+    if !crate::tmux::test_helpers::tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut inst = make_test_instance();
+    inst.source_profile = "default".into();
+    let id = inst.id.clone();
+    let before = inst.last_accessed_at;
+    let storage = Storage::new_unwatched("default")?;
+    storage.update(|rows, _| {
+        rows.push(inst.clone());
+        Ok(())
+    })?;
+    let name = crate::tmux::Session::generate_name(&id, &inst.title);
+    let _pane_guard = TmuxTestSession::from_name(&name);
+    let mut args: Vec<_> = [
+        "new-session",
+        "-d",
+        "-s",
+        &name,
+        "sh",
+        "-c",
+        INPUT_BOX_SCRIPT,
+    ]
+    .map(str::to_owned)
+    .into();
+    crate::tmux::utils::append_pane_base_index_args(&mut args, &name);
+    assert!(crate::tmux::tmux_command().args(args).status()?.success());
+    let pane = only_pane_id(&name);
+    wait_for_pane_command(&pane, "cat");
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    let tmux = crate::tmux::Session::from_name(&name);
+    assert!(crate::tmux::tmux_command()
+        .args(["send-keys", "-t", &pane, "-l", "half typed"])
+        .status()?
+        .success());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !tmux.try_capture_pane_in(&pane, 0)?.contains("❯ half typed") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the draft never appeared"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let send = || {
+        send_message(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(SendMessageRequest {
+                message: "automation".into(),
+                revive: false,
+            })),
+        )
+    };
+    let response = send().await.into_response();
+    let [(header, value)] = crate::daemon::ApiErrorCode::InputLineBusy.header();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.headers().get(header).and_then(|v| v.to_str().ok()),
+        Some(value)
+    );
+    assert_eq!(
+        storage.load_instances_complete()?[0].last_accessed_at,
+        before
+    );
+    let screen = tmux.try_capture_pane_in(&pane, 0)?;
+    assert!(
+        screen.contains("❯ half typed") && !screen.contains("automation"),
+        "{screen}"
+    );
+
+    assert!(crate::tmux::tmux_command()
+        .args(["send-keys", "-t", &pane, "C-u"])
+        .status()?
+        .success());
+    assert_eq!(send().await.into_response().status(), StatusCode::OK);
+    assert!(storage.load_instances_complete()?[0].last_accessed_at > before);
+    Ok(())
+}
+
 /// #4116: web `/send` rechecks the stored row under the lifecycle lock, so a peer's archive or
 /// purge of a session with a live pane refuses the keystrokes, and an archive survives the send.
 #[tokio::test]
@@ -10671,6 +10769,7 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
             project_sessions(&state, &Default::default(), &Default::default())
                 .await
                 .unwrap()[0]
+                .agent_profile
                 .clear_aliases,
             ["/clear"]
         );
@@ -10697,6 +10796,7 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
                 project_sessions(&state, &Default::default(), &Default::default())
                     .await
                     .unwrap()[0]
+                    .agent_profile
                     .clear_aliases,
                 ["/new"]
             );
@@ -11980,7 +12080,7 @@ fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
                 native_interaction: true,
             },
             default_profile: "default".into(),
-            sessions: vec![session_response_from_instance(&instance, false)],
+            sessions: vec![session_response_from_instance(&instance)],
             profiles: Vec::new(),
             workspace_ordering: Vec::new(),
             global_projects: Vec::new(),

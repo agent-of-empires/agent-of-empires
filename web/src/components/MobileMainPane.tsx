@@ -194,8 +194,7 @@ export function MobileMainPane({
                   acpAgent={session.acp_agent ?? null}
                   startedBefore={hasStartedBefore(session)}
                   acpProvider={session.acp_provider ?? null}
-                  clearAliases={session.clear_aliases}
-                  compactAliases={session.compact_aliases}
+                  agentProfile={session.agent_profile}
                   onStartSession={onStartSession && (() => onStartSession(session.id))}
                   archivedAt={session.archived_at ?? null}
                   snoozedUntil={session.snoozed_until ?? null}

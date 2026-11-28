@@ -26,7 +26,9 @@ use super::rate_limit::classify_rate_limit_error;
 /// scope behind a partial write to an unavailable peer.
 const LOSS_WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 use super::runner::runner_socket_deadline;
-use super::session_identity::{ControlIngressMetadata, SessionIngress, CONTROL_FRAME_BYTES_FIELD};
+use super::session_identity::{
+    ControlIngressMetadata, SessionIngress, ADAPTER_FRAMES_SHED_METHOD, CONTROL_FRAME_BYTES_FIELD,
+};
 
 /// Cancels a socket handshake abandoned mid-construction. Closing this exact
 /// channel cancels only its own runner.
@@ -70,7 +72,11 @@ pub(super) struct DaemonControlClient {
     correlation: Arc<std::sync::Mutex<ShimCorrelation>>,
     reverse_changed: Arc<tokio::sync::Notify>,
     closed_locally: Arc<AtomicBool>,
-    loss: Arc<std::sync::OnceLock<ControlLoss>>,
+    loss: Arc<std::sync::OnceLock<(Option<std::io::ErrorKind>, bool)>>,
+    /// The agent sent a valid proxy hello on this connection.
+    proxied: Arc<AtomicBool>,
+    #[cfg(test)]
+    disconnected: tokio_util::sync::CancellationToken,
 }
 
 struct ApplicationSlot {
@@ -144,6 +150,31 @@ pub(crate) struct ControlLoss {
     /// `None` for a clean EOF.
     pub(crate) io_error: Option<std::io::ErrorKind>,
     pub(crate) turn_in_flight: bool,
+    /// A proxied agent was behind the channel, so its loss is the proxy's.
+    /// Read from the validated hello when the loss is read, never at EOF,
+    /// which can beat the hello's handoff.
+    pub(crate) proxied: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct ControlLossHandle {
+    loss: Arc<std::sync::OnceLock<(Option<std::io::ErrorKind>, bool)>>,
+    proxied: Arc<AtomicBool>,
+}
+
+impl ControlLossHandle {
+    pub(super) fn proxied(&self) -> bool {
+        self.proxied.load(AtomicOrdering::Acquire)
+    }
+
+    pub(super) fn get(&self) -> Option<ControlLoss> {
+        let &(io_error, turn_in_flight) = self.loss.get()?;
+        Some(ControlLoss {
+            io_error,
+            turn_in_flight,
+            proxied: self.proxied(),
+        })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -677,8 +708,16 @@ impl DaemonControlClient {
         self.clear_correlation();
     }
 
-    pub(super) fn loss_handle(&self) -> Arc<std::sync::OnceLock<ControlLoss>> {
-        Arc::clone(&self.loss)
+    pub(super) fn mark_proxied(&self) {
+        self.projection.observe_verified_proxy();
+        self.proxied.store(true, AtomicOrdering::Release);
+    }
+
+    pub(super) fn loss_handle(&self) -> ControlLossHandle {
+        ControlLossHandle {
+            loss: Arc::clone(&self.loss),
+            proxied: Arc::clone(&self.proxied),
+        }
     }
 
     async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
@@ -1364,6 +1403,11 @@ pub(super) async fn connect_runner_control(
     let closed_locally = Arc::new(AtomicBool::new(false));
     let loss = Arc::new(std::sync::OnceLock::new());
     let (reader_closed_locally, reader_loss) = (closed_locally.clone(), loss.clone());
+    let proxied = Arc::new(AtomicBool::new(false));
+    #[cfg(test)]
+    let disconnected = tokio_util::sync::CancellationToken::new();
+    #[cfg(test)]
+    let reader_disconnected = disconnected.clone();
     let client = Arc::new(DaemonControlClient {
         correlation: Arc::clone(&correlation),
         reverse_changed,
@@ -1384,6 +1428,9 @@ pub(super) async fn connect_runner_control(
         peer_process,
         closed_locally,
         loss,
+        proxied,
+        #[cfg(test)]
+        disconnected,
     });
     let _ = client.connection_state.control.set(Arc::downgrade(&client));
     #[cfg(test)]
@@ -1402,21 +1449,19 @@ pub(super) async fn connect_runner_control(
             if reader_closed_locally.load(AtomicOrdering::Acquire) {
                 return;
             }
-            let loss = ControlLoss {
-                io_error,
-                turn_in_flight: reader_prompt_in_flight.load(AtomicOrdering::Relaxed),
-            };
+            let turn_in_flight = reader_prompt_in_flight.load(AtomicOrdering::Relaxed);
             warn!(
                 target: "acp.protocol",
                 session = %reader_session,
-                io_error = ?loss.io_error,
-                turn_in_flight = loss.turn_in_flight,
+                io_error = ?io_error,
+                turn_in_flight,
                 "runner closed the control channel"
             );
-            let _ = reader_loss.set(loss);
+            let _ = reader_loss.set((io_error, turn_in_flight));
         };
         async {
             let mut native_loss_relayed = false;
+            let mut adapter_baseline_applied = false;
             loop {
                 match control_protocol::read_frame_with_size(&mut read_half).await {
                     Ok(Some((ControlBody::OriginalEstablishment { invocation }, _))) => {
@@ -1456,6 +1501,17 @@ pub(super) async fn connect_runner_control(
                             return;
                         }
                     }
+                    // The SDK credits this only after earlier queued frames.
+                    Ok(Some((ControlBody::AdapterFramesShed { count }, _))) => {
+                        let line = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": ADAPTER_FRAMES_SHED_METHOD,
+                            "params": { "count": count },
+                        });
+                        if !shim_write_line_releasing(
+                            &reader_shim_write, &line, &reader_settled, &reader_connection_state,
+                        ).await { return; }
+                    }
                     Ok(Some((
                         frame @ (ControlBody::Initialized { .. }
                         | ControlBody::SessionReady { .. }
@@ -1463,6 +1519,9 @@ pub(super) async fn connect_runner_control(
                         | ControlBody::EstablishmentFailed { .. }),
                         _,
                     ))) => {
+                        if matches!(&frame, ControlBody::Initialized { .. }) {
+                            reader_connection_state.received_managed_initialize();
+                        }
                         let captured = match &frame {
                             ControlBody::SessionReady {
                                 receipt, original_delivery, delivery,
@@ -1567,6 +1626,7 @@ pub(super) async fn connect_runner_control(
                         if let ControlBody::SessionReady {
                             acp_session_id,
                             native_channel,
+                            adapter_frames,
                             ..
                         } = &frame
                         {
@@ -1581,6 +1641,10 @@ pub(super) async fn connect_runner_control(
                                     && reader_connection_state.loss().is_none(),
                                 AtomicOrdering::Release,
                             );
+                            if !adapter_baseline_applied {
+                                reader_ingress.skip_adapter_frames(*adapter_frames);
+                                adapter_baseline_applied = true;
+                            }
                             reader_ingress.resolve(None, acp_session_id.clone().into());
                             #[cfg(test)]
                             if reader_native_ready.load(AtomicOrdering::Acquire) {
@@ -1859,6 +1923,7 @@ pub(super) async fn connect_runner_control(
                         if PromptCompletedMarker::matches_method(&method)
                             || NativeChannelLostMarker::matches_method(&method)
                             || method == control_protocol::NATIVE_AUTONOMOUS_SNAPSHOT_METHOD
+                            || method == ADAPTER_FRAMES_SHED_METHOD
                         {
                             continue;
                         }
@@ -2005,6 +2070,8 @@ pub(super) async fn connect_runner_control(
                 *completion = PromptCompletion::LocalIdle;
             }
         }
+        #[cfg(test)]
+        reader_disconnected.cancel();
         let mut shim_write = reader_shim_write.lock().await;
         let _ = shim_write.shutdown().await;
     });
@@ -2558,7 +2625,7 @@ mod tests {
     use crate::acp::event_sender::EventScope;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
 
     struct ManagedControlFixture {
@@ -3808,6 +3875,68 @@ mod tests {
         fake.await.unwrap();
     }
 
+    /// A shed marker keeps its place among the buffered adapter frames, so it
+    /// credits only after the frames sent before it.
+    #[tokio::test]
+    async fn a_shed_marker_keeps_its_stream_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (control, listener) = bind(&tmp);
+        let fake = tokio::spawn(async move {
+            let mut peer = accept_hello(
+                &listener,
+                "shed",
+                control_protocol::CONTROL_PROTOCOL_VERSION,
+            )
+            .await;
+            let forged = ControlBody::Notify {
+                method: ADAPTER_FRAMES_SHED_METHOD.into(),
+                params: serde_json::json!({ "count": 100 }),
+                replay: None,
+                evidence: Default::default(),
+            };
+            control_protocol::write_frame(&mut peer, &forged)
+                .await
+                .unwrap();
+            for n in 1..=2 {
+                let body = ControlBody::Notify {
+                    method: "x/frame".into(),
+                    params: serde_json::json!({ "n": n }),
+                    replay: None,
+                    evidence: Default::default(),
+                };
+                control_protocol::write_frame(&mut peer, &body)
+                    .await
+                    .unwrap();
+            }
+            control_protocol::write_frame(&mut peer, &ControlBody::AdapterFramesShed { count: 3 })
+                .await
+                .unwrap();
+            peer
+        });
+        let (client, crate_side) = connect(&control, "shed", Arc::new(TerminalClaim::new()), false)
+            .await
+            .unwrap();
+        let _peer = fake.await.unwrap();
+        let mut lines = BufReader::new(crate_side).lines();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("the reader relays every frame")
+                .unwrap()
+                .expect("stream open");
+            seen.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+        }
+        let methods: Vec<_> = seen.iter().map(|v| v["method"].as_str().unwrap()).collect();
+        assert_eq!(methods, ["x/frame", "x/frame", ADAPTER_FRAMES_SHED_METHOD]);
+        assert_eq!(seen[2]["params"]["count"], 3);
+        assert_eq!(
+            client.ingress.take_discarded_adapter_frames(),
+            0,
+            "the reader credits nothing itself"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn attached_prompt_errors_never_rebase_a_successfully_resumed_session() {
@@ -3876,6 +4005,78 @@ mod tests {
                 assert_eq!(requests.iter().filter(|method| *method == "session/prompt").count(), 2);
                 assert!(!requests.iter().any(|method| matches!(method.as_str(), "session/load" | "session/fork")));
         })).await;
+    }
+
+    #[tokio::test]
+    async fn runner_control_eof_closes_transport_and_cancels_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (control, listener) = bind(&tmp);
+        let fake = tokio::spawn(async move {
+            let mut peer =
+                accept_hello(&listener, "eof", control_protocol::CONTROL_PROTOCOL_VERSION).await;
+            assert!(matches!(
+                control_protocol::read_frame(&mut peer).await.unwrap(),
+                Some(ControlBody::Attach { .. })
+            ));
+            assert!(matches!(
+                control_protocol::read_frame(&mut peer).await.unwrap(),
+                Some(ControlBody::Prompt { .. })
+            ));
+        });
+        let (client, crate_side) = connect(&control, "eof", Arc::new(TerminalClaim::new()), false)
+            .await
+            .unwrap();
+        let completion = client
+            .prompt(
+                serde_json::json!({}),
+                crate::acp::establishment::NativeRequestScope::Observation,
+            )
+            .await
+            .unwrap();
+        fake.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .expect("prompt completion must resolve after control EOF")
+            .is_err());
+        let (mut crate_read, _crate_write) = tokio::io::split(crate_side);
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), crate_read.read(&mut byte))
+            .await
+            .expect("crate transport must observe control EOF");
+        assert_eq!(read.unwrap(), 0);
+    }
+
+    /// EOF can be read before `establish` marks the validated proxy hello. The
+    /// loss still reports the proxy, so the order is forced here: the reader
+    /// records the loss first, the mark lands after.
+    #[tokio::test]
+    async fn control_loss_reports_a_proxy_hello_validated_after_eof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (control, listener) = bind(&tmp);
+        let fake = tokio::spawn(async move {
+            let mut peer = accept_hello(
+                &listener,
+                "late",
+                control_protocol::CONTROL_PROTOCOL_VERSION,
+            )
+            .await;
+            assert!(matches!(
+                control_protocol::read_frame(&mut peer).await.unwrap(),
+                Some(ControlBody::Attach { .. })
+            ));
+        });
+        let (client, _crate_side) =
+            connect(&control, "late", Arc::new(TerminalClaim::new()), false)
+                .await
+                .unwrap();
+        fake.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), client.disconnected.cancelled())
+            .await
+            .expect("reader must observe control EOF");
+        let handle = client.loss_handle();
+        assert!(!handle.get().expect("loss recorded").proxied);
+        client.mark_proxied();
+        assert!(handle.get().expect("loss recorded").proxied);
     }
 
     #[tokio::test]

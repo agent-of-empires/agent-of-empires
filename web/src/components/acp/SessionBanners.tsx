@@ -14,6 +14,7 @@ import { recoverSession, stopSession } from "../../lib/api";
 import { RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
 import { RATTLES } from "../../lib/rattles";
 import type { RecreateContainerBlock } from "../sidebar/sessionActionTargets";
+import { IntegrationLostBanner } from "./IntegrationLostBanner";
 import { ContainerGoneBanner, type NewSessionLike } from "./ContainerGoneBanner";
 import { BUTTON_SECONDARY_SM, BUTTON_WARNING_SM } from "../../lib/surfaces";
 import { Spinner } from "../Dialog";
@@ -79,9 +80,6 @@ export function SessionBanners({
   // A prior current input receipt changes the diagnostic, never today's control authority.
   const startupDiagnosticOnly = nativeReady || state.sessionAssigned;
   const reason = state.integrationLost;
-  const integrationError = reason
-    ? `Agent integration lost: ${reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")}`
-    : null;
   const startupError = state.startupError;
   const variant = reason
     ? "none"
@@ -104,7 +102,7 @@ export function SessionBanners({
   const errorMessage = state.interactionError?.message ?? (recovery ? null : state.lastError);
   return (
     <>
-      {integrationError && <InteractionErrorBanner title="Structured view diagnostic" message={integrationError} />}
+      {reason && <IntegrationLostBanner reason={reason} />}
       {state.startupError && !startupDiagnosticOnly && state.startupCause?.kind === "container_missing" && (
         <ContainerGoneBanner
           sessionId={sessionId}

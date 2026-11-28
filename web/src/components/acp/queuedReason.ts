@@ -1,4 +1,4 @@
-import { isClearAlias } from "../../lib/agentProfiles";
+import { isClearAlias } from "../../lib/agentProfile";
 import type { RateLimitInfo } from "../../lib/acpTypes";
 
 /** What a queued row's action does, given why the queue is waiting. */

@@ -16,6 +16,23 @@ mod tests;
 #[cfg(test)]
 pub(super) use prompt::{SelectProbe as TestSelectProbe, SELECT_PROBE as TEST_SELECT_PROBE};
 
+use super::commands::{ConnectMode, QueuedClientCmd};
+use super::control::DaemonControlClient;
+use super::errors::{acp_internal_error, AcpError};
+use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
+use super::pending::PendingResponders;
+use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
+use super::rate_limit::{captured_rate_limit_reset, classify_rate_limit_error};
+use super::session_identity::{
+    spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress,
+    SessionIngressNotification,
+};
+use super::spawn::ProxySpec;
+use super::terminal_handlers::{
+    handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
+    handle_wait_for_terminal_exit,
+};
+use super::{SessionResources, SessionState};
 use crate::acp::agent_compat::ExpectedAgent;
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::event_sender::EventSender;
@@ -32,30 +49,13 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::{ConnectionTo, Responder};
 use agent_client_protocol::{Agent, ByteStreams, Client};
+use notifications::Shared;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{error, info, warn};
-
-use super::commands::{ConnectMode, QueuedClientCmd};
-use super::control::DaemonControlClient;
-use super::errors::{acp_internal_error, AcpError};
-use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
-use super::pending::PendingResponders;
-use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
-use super::rate_limit::{captured_rate_limit_reset, classify_rate_limit_error};
-use super::session_identity::{
-    spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress,
-    SessionIngressNotification,
-};
-use super::terminal_handlers::{
-    handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
-    handle_wait_for_terminal_exit,
-};
-use super::{SessionResources, SessionState};
-use notifications::Shared;
 
 /// After a cancel, declare the adapter unresponsive if no prompt response
 /// arrives. A transport-wedge defense even for adapters that cancel promptly.
@@ -69,6 +69,7 @@ pub(super) type ReadyTx = Mutex<Option<oneshot::Sender<Result<(), AcpError>>>>;
 #[derive(Default)]
 pub(crate) struct ConnectionState {
     phase: AtomicU8,
+    managed_initialize_received: AtomicBool,
     unavailable: OnceLock<AcpConnectionUnavailability>,
     reported: AtomicBool,
     usable: AtomicBool,
@@ -305,8 +306,31 @@ impl ConnectionState {
         }
     }
 
+    pub(super) fn received_managed_initialize(&self) {
+        self.managed_initialize_received
+            .store(true, Ordering::Release);
+    }
+
+    fn pending_managed_initialize(&self) -> bool {
+        self.managed_initialize_received.load(Ordering::Acquire)
+            && self.phase.load(Ordering::Acquire) == 0
+    }
+
+    async fn wait_managed_initialize_verdict(&self) {
+        loop {
+            let changed = self.unavailable_wake.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.pending_managed_initialize() || self.driver_finished() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub(super) fn initialized(&self) {
         self.phase.store(1, Ordering::Release);
+        self.unavailable_wake.notify_waiters();
     }
 
     pub(super) fn established(&self) {
@@ -520,6 +544,7 @@ pub(super) struct ConnectionParams {
     pub(super) ready_tx: oneshot::Sender<Result<(), AcpError>>,
     pub(super) profile: &'static AgentProfile,
     pub(super) expected_agent: ExpectedAgent,
+    pub(super) proxy: Option<ProxySpec>,
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
     pub(super) default_model_config: std::collections::BTreeMap<String, String>,
@@ -889,6 +914,7 @@ pub(super) async fn run_connection_task<W, R>(
         ready_tx,
         profile,
         expected_agent,
+        proxy,
         source_profile,
         default_effort,
         default_model_config,
@@ -958,7 +984,7 @@ pub(super) async fn run_connection_task<W, R>(
         .v1()
         .name("aoe-acp")
         .on_close({
-            let control = control.clone();
+            let (control, shared) = (control.clone(), shared.clone());
             let shared = shared.clone();
             move |_connection| async move {
                 shared
@@ -984,6 +1010,7 @@ pub(super) async fn run_connection_task<W, R>(
                 drop(shared.ingress.fence.read().await);
                 shared.wait_local_prompt_settled().await;
                 shared.connection_state.wait_completed_outcomes().await;
+                shared.connection_state.wait_managed_initialize_verdict().await;
                 Err(acp_internal_error("agent transport closed".into()))
             }
         })
@@ -1073,6 +1100,12 @@ pub(super) async fn run_connection_task<W, R>(
                                     shared.handle_ingress_marker(
                                         PendingIngress::Autonomous { first: Box::new(notification), second: None },
                                     ).await?;
+                                }
+                                return Ok(());
+                            }
+                            SessionIngressNotification::AdapterFramesShed(count) => {
+                                if control_notifications {
+                                    shared.handle_ingress_marker(PendingIngress::AdapterFramesShed(count)).await?;
                                 }
                                 return Ok(());
                             }
@@ -1289,6 +1322,7 @@ pub(super) async fn run_connection_task<W, R>(
         ready_tx: ready_tx.clone(),
         mode,
         expected_agent,
+        proxy,
         mcp_servers,
         default_effort,
         default_model_config,
@@ -1399,7 +1433,7 @@ pub(super) async fn run_connection_task<W, R>(
                 }
                 if let Some(observation) = foreground_state.loss() {
                     if let Some(tx) = foreground_ready.lock().await.take() {
-                        let _ = tx.send(Err(AcpError::ConnectionUnavailable(observation)));
+                        let _ = tx.send(foreground_shared.unavailable_ready(observation));
                     }
                     // Earlier responses and buffered markers get their
                     // ordered boundary before the failed establish unwinds.
@@ -1431,8 +1465,12 @@ pub(super) async fn run_connection_task<W, R>(
         biased;
         result = &mut connection => result,
         observation = connection_state.wait_unavailable() => {
-            if let Some(tx) = ready_tx.lock().await.take() {
-                let _ = tx.send(Err(AcpError::ConnectionUnavailable(observation)));
+            // A buffered initialize result can distinguish a rejected proxy
+            // from a retained transport loss. Let its compatibility verdict win.
+            if !connection_state.pending_managed_initialize() {
+                if let Some(tx) = ready_tx.lock().await.take() {
+                    let _ = tx.send(shared.unavailable_ready(observation));
+                }
             }
             // Install owned-unavailable state even if foreground event/replay
             // backpressure prevented its early handshake reply.
@@ -1536,7 +1574,7 @@ async fn report_connection_error(
     if let Some(observation) = shared.connection_state.loss() {
         shared.connection_state.mark_ordered_loss();
         if let Some(tx) = ready_tx.lock().await.take() {
-            let _ = tx.send(Err(AcpError::ConnectionUnavailable(observation)));
+            let _ = tx.send(shared.unavailable_ready(observation));
         }
         shared.finish_unavailable_ingress().await;
         shared.publish_connection_unavailable().await;

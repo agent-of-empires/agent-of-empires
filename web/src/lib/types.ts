@@ -1,5 +1,5 @@
 import type { OperationErrorEvidence, RateLimitInfo, SessionRecovery } from "./acpTypes";
-import type { AgentLifecycleInfo } from "./agentProfiles";
+import type { AgentProfile } from "./agentProfile";
 import type { SchemaSettings } from "./generated/settingsKeys";
 
 export interface AuxiliaryObservation {
@@ -7,6 +7,16 @@ export interface AuxiliaryObservation {
   state: "absent" | "alive" | "dead" | "unknown";
   tmux_session?: string | null;
 }
+
+/** Mirrors `AgentLifecycle` in src/agents.rs. */
+export type AgentLifecycleInfo =
+  | { state: "active" }
+  | {
+      state: "deprecated";
+      since: string;
+      note: string;
+      replacement: string | null;
+    };
 
 export interface SessionResponse {
   id: string;
@@ -115,15 +125,13 @@ export interface SessionResponse {
   acp_provider?: string;
   /** Switching views preserves the conversation (server-computed). */
   keeps_context?: boolean;
-  /** Slash commands that reset the conversation for this agent. */
-  clear_aliases?: string[];
-  /** Slash commands that compact the conversation for this agent. */
-  compact_aliases?: string[];
+  /** The agent's capabilities and classifier data; absent from an older daemon. */
+  agent_profile?: AgentProfile;
   /** The agent implements ACP `session/fork` (resume-only agents do not). */
   acp_can_fork?: boolean;
   /** `acp.structured_view = off` for this session: a terminal session cannot switch to structured. */
   structured_view_off?: boolean;
-  /** Claude's fullscreen renderer is on, so mobile skips copy-mode scrollback workarounds. */
+  /** @deprecated Read `agent_profile.fullscreen`. */
   claude_fullscreen: boolean;
   workspace_repos: WorkspaceRepoSummary[];
   /** Non-fatal notes: on create, rename, trash and restore responses. */

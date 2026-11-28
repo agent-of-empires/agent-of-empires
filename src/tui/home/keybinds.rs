@@ -527,7 +527,6 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         let ctx = Ctx {
             view_mode: super::super::ViewMode::Structured,
-            sort_order: crate::session::config::SortOrder::Newest,
             has_search: false,
             session_selected: false,
             project_group_selected: false,

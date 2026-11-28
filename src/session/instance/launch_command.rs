@@ -1720,8 +1720,9 @@ impl Instance {
                     .map(str::to_owned)
             })
         });
-        let mut env_prefix =
-            host_launch_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
+        let mut env_prefix = self.with_hook_agent(|this, agent| {
+            host_launch_env_prefix(profile, &this.id, agent, program.as_deref())
+        });
         // The publisher is pane-scoped, including for safe Default wrappers.
         self.pi_extension_launched = false;
         if let Some((_, ref env)) = identity_extension {

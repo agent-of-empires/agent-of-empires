@@ -23,7 +23,7 @@ import {
 import { useSkillIndex } from "../../hooks/useSkillIndex";
 import { parseJsonObject, pickStr } from "../../lib/acpArgs";
 import type { ToolCall } from "../../lib/acpTypes";
-import type { AgentProfile } from "../../lib/agentProfiles";
+import type { AgentProfile } from "../../lib/agentProfile";
 import { diffPair } from "../../lib/diffPair";
 import { humanizeServer, humanizeVerb } from "../../lib/mcpClassify";
 import { cleanRecalledMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
@@ -140,7 +140,7 @@ export function classifySkill(
 ): { isSkill: true; name: string } | { isSkill: false } {
   if (tool.kind !== "other") return { isSkill: false };
   const title = tool.name?.trim().toLowerCase() ?? "";
-  if (!profile.specialTitles.skillNames.includes(title)) return { isSkill: false };
+  if (!profile.special_titles.skill_names.includes(title)) return { isSkill: false };
   const name = pickStr(parseJsonObject(tool.args_preview), "skill", "name", "skill_name") ?? "skill";
   return { isSkill: true, name };
 }
@@ -173,7 +173,7 @@ export function classifyWorkflow(tool: ToolCall, profile: AgentProfile): boolean
     tool.name ??
     ""
   ).trim();
-  return profile.specialTitles.workflowNames.includes(title);
+  return profile.special_titles.workflow_names.includes(title);
 }
 
 function lastEnd(agents: { endedAt: string | null }[]): string | undefined {

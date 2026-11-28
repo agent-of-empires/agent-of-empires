@@ -16,6 +16,7 @@ vi.mock("../../hooks/useShikiTheme", () => ({
 }));
 
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import { profileFor } from "../../lib/__tests__/agentProfileFixtures";
 import type { ToolCardProps } from "./ToolCardChrome";
 import { ToolGroupCard } from "./GroupToolCards";
 import { TodoGroupCard } from "./TodoCards";
@@ -47,7 +48,7 @@ function Thread({
   cards?: typeof items;
 }) {
   return (
-    <AgentProfileProvider toolKey={null}>
+    <AgentProfileProvider profile={null}>
       <ToolDisplayModeProvider density={density}>
         <ToolExpansionProvider>
           {folded ? (
@@ -155,7 +156,7 @@ describe("folding todo snapshots into a group", () => {
 
   function TodoThread({ folded }: { folded: boolean }) {
     return (
-      <AgentProfileProvider toolKey="claude">
+      <AgentProfileProvider profile={profileFor("claude")}>
         <ToolDisplayModeProvider density="detailed">
           <ToolExpansionProvider>
             {folded ? (

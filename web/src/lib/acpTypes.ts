@@ -303,7 +303,8 @@ export type IncompatibleAgentDetail =
 export type IntegrationLostReason =
   | { kind: "contract_violation"; detail: string }
   | { kind: "hold_overflow" }
-  | { kind: "lease_overflow" };
+  | { kind: "lease_overflow" }
+  | { kind: "proxy_exited" };
 
 export interface OperationErrorEvidence {
   source: "terminal_text" | "tmux_observation" | "local_prompt_result" | "runner_completion" | "transcript_recovery";
@@ -1330,6 +1331,8 @@ function isSteeredContinuation(state: AcpState, precedingTurnActive: boolean): b
   return precedingTurnActive && !!state.promptCapabilities?.steering;
 }
 
+const PROXY_DEGRADED_NOTICE_ID = "notice-proxy-degraded";
+
 function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
   next.startupCause = null;
@@ -1360,9 +1363,9 @@ function applyNewTurnResets(next: AcpState): void {
   next.monitorWorkSeen = false;
   next.monitorDescription = null;
   next.contextPrimerAvailable = null;
-  // Advisories describe the turn they arrived in; the transcript keeps history.
-  next.sessionNotices = [];
-  next.dismissedNoticeIds = [];
+  // Advisories describe the turn they arrived in, except the degraded-proxy banner; the transcript keeps history.
+  next.sessionNotices = next.sessionNotices.filter((n) => n.id === PROXY_DEGRADED_NOTICE_ID);
+  next.dismissedNoticeIds = next.dismissedNoticeIds.filter((id) => id === PROXY_DEGRADED_NOTICE_ID);
 }
 
 /** Pure reducer. Drops frames whose seq is not above `state.lastSeq` so replays are idempotent. */
@@ -1496,11 +1499,6 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
       next.lastErrorEvidence = null;
       next.interactionError = null;
     }
-    if (event === "SessionCleared") {
-      next.lastError = null;
-      next.lastErrorEvidence = null;
-      next.interactionError = null;
-    }
     return next;
   }
   if ("AgentThoughtChunk" in event) {
@@ -1561,7 +1559,14 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
       next.sessionNotices = next.sessionNotices.map((n) => (n.id === id ? entry : n));
       return next;
     }
-    next.sessionNotices = [...next.sessionNotices, entry].slice(-MAX_SESSION_NOTICES);
+    // The degraded-proxy banner outlives the cap, like the daemon's reducer.
+    const notices = [...next.sessionNotices, entry];
+    while (notices.length > MAX_SESSION_NOTICES) {
+      const oldest = notices.findIndex((n) => n.id !== PROXY_DEGRADED_NOTICE_ID);
+      if (oldest < 0) break;
+      notices.splice(oldest, 1);
+    }
+    next.sessionNotices = notices;
     return next;
   }
   if ("AuthStatusUpdated" in event) {
@@ -1794,6 +1799,9 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.lastError = null;
     next.lastErrorEvidence = null;
     next.interactionError = null;
+    if (state.integrationLostSnapshotSeq == null || frame.seq > state.integrationLostSnapshotSeq) {
+      next.integrationLost = null;
+    }
     next.retriedError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
     // The switch emits Stopped { user_stopped } first; keep its banner hidden through the handshake.
@@ -2110,6 +2118,8 @@ export function applyReducedState(
     subagentsSeq: authoritative ? Math.max(state.subagentsSeq ?? 0, snapshotSeq) : state.subagentsSeq,
     locallyResolved,
   };
+  // A current projection can restore a loss outside replay or explicitly clear it.
+  // Older daemons omit the field and leave raw diagnostics in charge.
   if (
     authoritative &&
     reduced.integration_lost !== undefined &&

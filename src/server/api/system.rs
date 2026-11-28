@@ -1976,33 +1976,6 @@ pub async fn filesystem_home(State(state): State<Arc<AppState>>) -> impl IntoRes
     }
 }
 
-/// Standard system folders that live directly under $HOME. On macOS several
-/// of these (Downloads, Desktop, Pictures/Photos, Music) are TCC-protected:
-/// opening them triggers a permission prompt. None is ever a git repo, so the
-/// directory browser skips its `.git` probe for them and avoids the prompt.
-const HOME_SYSTEM_DIRS: &[&str] = &[
-    "Desktop",
-    "Documents",
-    "Downloads",
-    "Movies",
-    "Music",
-    "Pictures",
-    "Public",
-    "Library",
-];
-
-/// The TCC prompt only exists on macOS, so gate the skip there. On other
-/// platforms these folders are probed normally and keep their git badge.
-fn skip_git_probe(parent: &std::path::Path, name: &str, home: Option<&std::path::Path>) -> bool {
-    if !cfg!(target_os = "macos") {
-        return false;
-    }
-    match home {
-        Some(home) => parent == home && HOME_SYSTEM_DIRS.contains(&name),
-        None => false,
-    }
-}
-
 pub async fn browse_filesystem(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BrowseQuery>,
@@ -2048,11 +2021,12 @@ pub async fn browse_filesystem(
             }
             // Probing `.git` opens the directory, which prompts under macOS
             // TCC. None of the standard $HOME folders is ever a repo.
-            let is_git_repo = if skip_git_probe(&canonical, &name, home.as_deref()) {
-                false
-            } else {
-                entry_path.join(".git").exists()
-            };
+            let is_git_repo =
+                if crate::process::is_tcc_protected_home_dir(&canonical, &name, home.as_deref()) {
+                    false
+                } else {
+                    entry_path.join(".git").exists()
+                };
             entries.push(DirEntry {
                 name,
                 path: entry_path.to_string_lossy().to_string(),
@@ -3960,34 +3934,6 @@ mod tests {
             first_non_cityhall_profile_leaf(&serde_json::json!({"theme": {"name": "x"}})),
             Some("theme.name".to_string())
         );
-    }
-
-    #[test]
-    fn skip_git_probe_avoids_protected_home_folders() {
-        let home = std::path::Path::new("/Users/alice");
-
-        // The TCC prompt is macOS-only, so other platforms probe normally.
-        let macos = cfg!(target_os = "macos");
-
-        // Protected folders directly under $HOME: skipped on macOS.
-        for name in ["Downloads", "Desktop", "Music", "Pictures", "Documents"] {
-            assert_eq!(
-                skip_git_probe(home, name, Some(home)),
-                macos,
-                "unexpected probe decision for ~/{name}"
-            );
-        }
-
-        // A real project directly under $HOME still gets probed, so its git
-        // badge is preserved.
-        assert!(!skip_git_probe(home, "myproject", Some(home)));
-
-        // A system-looking name that is not directly under $HOME is probed.
-        let sub = std::path::Path::new("/Users/alice/code");
-        assert!(!skip_git_probe(sub, "Downloads", Some(home)));
-
-        // No home resolved: never skip (falls back to normal probing).
-        assert!(!skip_git_probe(home, "Downloads", None));
     }
 
     fn custom_agents(entries: &[(&str, &str)]) -> HashMap<String, String> {

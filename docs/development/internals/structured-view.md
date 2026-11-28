@@ -30,7 +30,7 @@ Invariants worth knowing before touching this code:
 - **Clear display boundary.** Successful Fresh publishes `SessionCleared` with the establishment journal's certified `clear_after_seq`. Transcript rows retain their actual creation sequence through patches. Web and TUI place the new conversation's pre-result messages and plan after that boundary without rewriting or duplicating raw history. The cut is display metadata, never Native identity, readiness or operation authority.
 - **Command preparation.** Before enqueue, the client freezes its original receipt, Applied projection, owner and operation correlation. The first lifecycle-locked capture fixes the permission; subsequent waits cannot rebase it onto a newer generation. Identified lifecycle or registry contention waits outside physical guards within one deadline, with cancellation on client termination. The same anchored profile, candidate and live owner are revalidated before the command is queued once. No Native RPC or user intent is replayed.
   Cancel consumption retains that captured permission through bounded contention waits before arming, sending and publishing. It neither recaptures a successor nor retries an issued Native send.
-  A successful Fresh result waits for the same Original physical exclusion within its caller deadline before local adoption; contention never reissues New.
+  A successful Fresh result waits for the same Original physical exclusion before local adoption, even if the caller deadline has passed. Contention never reissues New.
 - **Launch authority.** Preparation pins the native profile, title, lifecycle generation and provider under owned namespace, submission and instance exclusion. Startup is reserved before those preparation guards are released; hooks and readiness never run while holding them. Blocking admission owns its namespace guard through native checkpoints, including caller cancellation.
 - **First creation.** Inserting a genuinely absent structured row captures its sole Original attempt. Setup finalization retains that attempt and its selected target; permission is consumed once after the same-generation and selection checks. It proves neither Native readiness nor permission to retry an unresolved outcome.
 - **Establishment readiness.** Initial client capture is observational, without physical Native admission competing with original replay. Applied binding and replay durability precede actual SDK usability, then final physical admission. The waiter retains its captured client, establishment and original deadline. Saved-mode restoration retains the same source through waiting and permission capture; concurrent Fresh cannot redirect it.
@@ -298,6 +298,12 @@ close cannot wait forever for that foreground to finish. Pending-ingress
 overflow fails closed, discards its uncommitted replay and establishes its own
 ordered protocol-failure boundary; it does not wait for the SDK close that
 depends on foreground completion.
+
+Control wire v9 preserves Native establishment receipts, result custody and replay
+ordinals independently of proxy adapter frame counts. `SessionReady.adapter_frames`
+is the baseline for frames the attachment will not replay. Queued updates and
+`AdapterFramesShed` markers advance the count in delivery order after readiness.
+
 Shared turn delivery, pending-initial-turn drains, dormant queue wakes and the
 existing rate-limit auto-resume admission consult qualified unavailability
 before resume, publication, redelivery-budget or mutation effects. Refusal
@@ -754,6 +760,12 @@ park holds ambient turn inference, pending delivery and idle reaping; observing
 the same actor through Attach or a Ready receipt is not replay consent.
 Canonical park metadata is independent of worker liveness.
 
+An agent-initiated turn can report a limit without an RPC error. For a qualified
+ambient turn that ran no tool, the idle tick may park it on a captured rejection
+or a lone usage-limit sentence. Terminal repair has only the transcript: for
+otherwise eligible agent-initiated work, it parks on that sole sentence instead
+of emitting `inferred_prompt_complete`. Neither path settles an open Native prompt.
+
 Quota windows such as `five_hour` and `seven_day` belong in `RateLimitInfo.kind`,
 not in `errorKind`. `RateLimitInfo.resets_at` uses a reset attributed to the
 rejection: the reported epoch for its window, or a reset parsed from its status
@@ -881,12 +893,9 @@ Claude-family provider changes restart the worker, preserve conversation and rea
 
 ## Agent profiles
 
-Each agent has two profile sources, kept aligned by registry key:
+`src/acp/agent_profiles.rs` is the single source: reset and compact aliases, capability gates, the card-classifier alias map, MCP prefixes, special-title patterns, the memory path regex and the daemon-side fullscreen probe. Each session row sends it to clients as the versioned `agent_profile` object (`AgentProfileWire`, `v`); the web client reads it from the row and keeps no per-agent table. Changing its shape needs a `WIRE_VERSION` bump.
 
-- **Server**, `src/acp/agent_profiles.rs`: `parent_meta_namespaces`, `clear_aliases`, and the `supports_exit_plan_mode` / `supports_wakeup_tools` gates.
-- **Frontend**, `web/src/lib/agentProfiles.ts`: the card-classifier alias map, claude-specialized capabilities (`todos`, `skills`, `wakeup`), the MCP prefix list, and special-title patterns matched only when the capability is on.
-
-Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId` on child tool calls; for a profile that supports subagents the link comes from the delegation `session_message` instead (see Subagent sessions). An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagentToolNames`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
+Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId` on child tool calls; for a profile that supports subagents the link comes from the delegation `session_message` instead (see Subagent sessions). An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagent_tool_names`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
 
 ## Security model
 

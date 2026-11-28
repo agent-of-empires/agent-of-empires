@@ -834,6 +834,32 @@ impl EventStore {
         })
     }
 
+    /// The agent text of the open turn when that turn has no prompt and ran no
+    /// tool, else `None`.
+    pub fn agent_turn_sole_text(&self, session_id: &str) -> Option<String> {
+        let rows = query_strings(
+            &self.conn(),
+            "SELECT event_json FROM acp_events
+             WHERE session_id = ?1
+               AND seq > (SELECT IFNULL(MAX(seq), 0) FROM acp_events
+                          WHERE session_id = ?1
+                            AND discriminant IN ('Stopped', 'AgentStartupError'))
+               AND discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt',
+                                    'ToolCallStarted', 'AgentMessageChunk')
+             ORDER BY seq ASC",
+            "agent_turn_sole_text",
+            session_id,
+        );
+        let mut text = String::new();
+        for json in rows {
+            match decode_logged(&json, session_id, "agent_turn_sole_text")? {
+                Event::AgentMessageChunk { text: chunk, .. } => text.push_str(&chunk),
+                _ => return None,
+            }
+        }
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Read the inputs the terminal-repair pass decides on.
     pub fn terminal_repair_probe(&self, session_id: &str) -> Option<TerminalRepairProbe> {
         let conn = self.conn();

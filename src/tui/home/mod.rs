@@ -46,8 +46,8 @@ use tui_input::Input;
 use crate::session::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
-    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
-    DefaultTerminalMode, Group, GroupTree, Instance, Item, Storage,
+    flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn, DefaultTerminalMode, Group,
+    GroupTree, Instance, Item, Storage,
 };
 use crate::tmux::AvailableTools;
 
@@ -69,7 +69,7 @@ use self::icons::{
     ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD, UNREAD_DWELL,
 };
 use self::preview::{PreviewCache, PreviewSelection, PreviewTextView, PreviewTimings};
-use self::rows::project_group_key;
+use self::rows::{project_group_key, project_view_path};
 pub(super) use self::watchers::{
     log_legacy_duplicates_once, ConfigRefreshOrigin, ConfigWatchState, DiskWatchState,
     ReloadFailureState,
@@ -159,17 +159,8 @@ pub(super) struct CreatingHookProgress {
 pub(super) struct PendingArchiveCursor {
     pub(super) id: String,
     pub(super) archived: bool,
-    /// Where the cursor lands when the row sinks (non-Attention sorts).
+    /// Where the cursor lands when the row sinks.
     pub(super) successor: Option<String>,
-}
-
-/// Status flash owed to the snapshot that reflects a snooze toggle: the view
-/// submits the change, and the message waits for the canonical stamp so it
-/// never announces a change the daemon has not applied.
-pub(super) struct PendingSnoozeFlash {
-    pub(super) id: String,
-    pub(super) snoozed: bool,
-    pub(super) message: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -354,9 +345,6 @@ pub struct HomeView {
     pub(super) vt_live_enabled: bool,
     pub(super) profile_default_attach_mode: crate::session::AttachMode,
     pub(super) project_group_collapsed: HashMap<String, bool>,
-    pub(super) org_group_collapsed: HashMap<String, bool>,
-    pub(super) status_group_collapsed: HashMap<String, bool>,
-    pub(super) remote_owner_cache: std::cell::RefCell<HashMap<String, Option<(String, String)>>>,
     pub(super) registered_projects: Vec<crate::session::Project>,
 
     pub(super) show_help: bool,
@@ -476,6 +464,9 @@ pub struct HomeView {
     /// Input for a row whose mount is still connecting, split at each Enter.
     pub(super) pending_paste_for_structured_view: HashMap<String, PendingStructuredInput>,
     pub(super) pending_attach_after_warning: Option<String>,
+    /// A send refused at delivery, reopened with its text once its refusal is dismissed:
+    /// the session, target, title and message.
+    pub(super) refused_send: Option<(String, live_send::LiveSendTarget, String, String)>,
     pub(super) pending_stop_session: Option<StopIntent>,
     /// Target captured when the auxiliary stop confirmation opens.
     pub(super) pending_stop_auxiliary: Option<(String, crate::daemon::StopAuxiliaryBody)>,
@@ -548,9 +539,6 @@ pub struct HomeView {
 
     /// Cursor placement owed to the applied snapshot after an archive toggle.
     pub(super) pending_archive_cursor: Option<PendingArchiveCursor>,
-
-    /// Status flash owed to the applied snapshot after a snooze toggle.
-    pub(super) pending_snooze_flash: Option<PendingSnoozeFlash>,
 
     pub(super) preview_cache: PreviewCache,
     pub(super) terminal_preview_cache: PreviewCache,

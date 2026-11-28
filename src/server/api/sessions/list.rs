@@ -87,7 +87,7 @@ pub(crate) async fn project_sessions_with_recovery(
     recovery: &HashMap<String, crate::server::session_service::RecoverySnapshot>,
 ) -> anyhow::Result<Vec<SessionResponse>> {
     let instances = state.instances.read().await;
-    let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
+    let probes = crate::json_probe::Memo::default();
     // Every positional overlay shares this filtered view.
     let scoped_instances: Vec<&Instance> = instances
         .iter()
@@ -131,7 +131,7 @@ pub(crate) async fn project_sessions_with_recovery(
                 .unwrap_or((crate::daemon::AcpWorkerState::Absent, None));
             let mut session = session_response_from_instance_with_plan(
                 inst,
-                claude_fullscreen,
+                &probes,
                 plan_summary,
                 acp_worker_state,
                 next_wakeup_at,
@@ -246,16 +246,11 @@ pub(crate) async fn project_sessions_with_recovery(
                     agent.profile_with(&acp_registry, session_cfg, default_agent)
                 }
             };
-            resp.clear_aliases = profile
-                .clear_aliases
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            resp.compact_aliases = profile
-                .compact_aliases
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            resp.agent_profile = crate::acp::agent_profiles::AgentProfileWire::new(
+                profile,
+                profile.probe_fullscreen(&probes),
+            );
+            resp.claude_fullscreen = inst.tool == "claude" && resp.agent_profile.fullscreen;
         }
         // Only a terminal session that could switch needs the setting resolved.
         if resp.acp_capable && !inst.is_structured() {
@@ -995,8 +990,7 @@ mod workspace_ordering_tests {
             acp_can_fork: false,
             structured_view_off: false,
             keeps_context: false,
-            clear_aliases: Vec::new(),
-            compact_aliases: Vec::new(),
+            agent_profile: Default::default(),
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             workspace_dir: None,
