@@ -341,7 +341,8 @@ describe("AssistantMessage sync Task prompt", () => {
     const { getByRole, getAllByRole, queryByText } = render(
       <Harness messages={activityToThreadMessages(rows, false)} />,
     );
-    fireEvent.click(getByRole("button", { name: /subagentTask1/ }));
+    // The header's name is "subagentTask" + a live elapsed badge, so anchor on the prefix.
+    fireEvent.click(getByRole("button", { name: /^subagentTask/ }));
     // The first "Copy prompt" belongs to the user message; the card's Input section is the last.
     fireEvent.click(await waitFor(() => getAllByRole("button", { name: "Copy prompt" }).at(-1)!));
     await waitFor(() => expect(writeClipboard).toHaveBeenLastCalledWith(prompt));
