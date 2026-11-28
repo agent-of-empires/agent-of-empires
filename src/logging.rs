@@ -1225,7 +1225,7 @@ mod tests {
         });
     }
 
-    /// Every `target:` used in `src/` as `(file, target)`, excluding test-only targets.
+    /// Every explicit tracing target in AoE and its Daemon client.
     fn source_targets() -> Vec<(PathBuf, String)> {
         fn walk(dir: &Path, pattern: &regex::Regex, out: &mut Vec<(PathBuf, String)>) {
             for entry in std::fs::read_dir(dir).unwrap() {
@@ -1249,11 +1249,10 @@ mod tests {
         )
         .unwrap();
         let mut out = Vec::new();
-        walk(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &pattern,
-            &mut out,
-        );
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for source in ["src", "aoe-daemon-client/src"] {
+            walk(&workspace.join(source), &pattern, &mut out);
+        }
         out
     }
 
@@ -1282,7 +1281,7 @@ mod tests {
             .collect();
         assert!(
             unused.is_empty(),
-            "KNOWN_SUB_TARGETS entries no longer used in src/: {unused:?}"
+            "KNOWN_SUB_TARGETS entries no longer used in source: {unused:?}"
         );
     }
 

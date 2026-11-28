@@ -144,7 +144,7 @@ impl SessionRef for crate::daemon::SessionResponse {
 pub fn resolve_session<'a, S: SessionRef>(identifier: &str, instances: &'a [S]) -> Result<&'a S> {
     lookup_session(identifier, instances.iter().enumerate())
         .map(|(_, row)| row)
-        .map_err(|error| error.for_cli(identifier))
+        .map_err(|error| session_lookup_error_for_cli(error, identifier))
 }
 
 pub(crate) fn terminal_text(value: &str) -> std::borrow::Cow<'_, str> {
@@ -157,31 +157,34 @@ pub(crate) fn terminal_text(value: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(clean)
 }
 
-impl crate::daemon::SessionLookupError {
-    pub(crate) fn for_cli(self, identifier: &str) -> anyhow::Error {
-        match self {
-            Self::NotFound => anyhow::anyhow!("Session not found: {}", terminal_text(identifier)),
-            Self::ProfileNotFound(profile) => {
-                anyhow::anyhow!("Profile '{}' does not exist", terminal_text(&profile))
+fn session_lookup_error_for_cli(
+    error: crate::daemon::SessionLookupError,
+    identifier: &str,
+) -> anyhow::Error {
+    use crate::daemon::SessionLookupError;
+
+    match error {
+        SessionLookupError::NotFound => {
+            anyhow::anyhow!("Session not found: {}", terminal_text(identifier))
+        }
+        SessionLookupError::ProfileNotFound(profile) => {
+            anyhow::anyhow!("Profile '{}' does not exist", terminal_text(&profile))
+        }
+        SessionLookupError::Ambiguous { count, candidates } => {
+            let mut lines: Vec<_> = candidates
+                .iter()
+                .map(|(id, title)| format!("  {} ({})", terminal_text(id), terminal_text(title)))
+                .collect();
+            lines.sort_unstable();
+            if count > lines.len() {
+                lines.push(format!("  ({} more)", count - lines.len()));
             }
-            Self::Ambiguous { count, candidates } => {
-                let mut lines: Vec<_> = candidates
-                    .iter()
-                    .map(|(id, title)| {
-                        format!("  {} ({})", terminal_text(id), terminal_text(title))
-                    })
-                    .collect();
-                lines.sort_unstable();
-                if count > lines.len() {
-                    lines.push(format!("  ({} more)", count - lines.len()));
-                }
-                anyhow::anyhow!(
-                    "Ambiguous session identifier {:?} matches {} sessions:\n{}\nUse a longer prefix or the full ID.",
-                    identifier,
-                    count,
-                    lines.join("\n")
-                )
-            }
+            anyhow::anyhow!(
+                "Ambiguous session identifier {:?} matches {} sessions:\n{}\nUse a longer prefix or the full ID.",
+                identifier,
+                count,
+                lines.join("\n")
+            )
         }
     }
 }

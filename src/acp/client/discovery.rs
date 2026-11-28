@@ -14,7 +14,7 @@ pub(crate) fn local_unix_endpoint(path: PathBuf) -> DaemonEndpoint {
         .into_iter()
         .next()
         .map(|entry| entry.url);
-    DaemonEndpoint::local_unix(path, dashboard_url)
+    crate::daemon::local_unix_endpoint(path, dashboard_url)
 }
 
 /// Explicit TCP credentials require HTTPS or a direct loopback transport.
@@ -111,8 +111,8 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
     if daemon_pid().is_none() {
         return Err(DiscoveryError::NoLocalDaemon);
     }
-    let path =
-        crate::daemon::transport::local_socket_path().map_err(|_| DiscoveryError::LocalPath)?;
+    let path = crate::daemon::host_transport::local_socket_path()
+        .map_err(|_| DiscoveryError::LocalPath)?;
     Ok(local_unix_endpoint(path))
 }
 

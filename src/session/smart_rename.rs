@@ -19,7 +19,7 @@ use crate::acp::agent_profiles::{resolve, AgentProfile};
 use crate::agents;
 use crate::session::civilizations::is_default_civ_name;
 use crate::session::config::SessionConfig;
-use serde::{Deserialize, Serialize};
+use aoe_daemon_client::deadlines::{RENAME_DEADLINE, RENAME_ONESHOT_TIMEOUT as ONESHOT_TIMEOUT};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, PoisonError};
@@ -29,20 +29,7 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 /// sessions each hold a slot for up to `ONESHOT_TIMEOUT`. See #2348.
 pub const MAX_CONCURRENT: usize = 2;
 
-/// Per-session smart-rename state surfaced to the dashboard so the sidebar can show that a session
-/// will be (or is being) auto-named.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum SmartRenameState {
-    #[default]
-    Inactive,
-    /// Eligible and still default-named: will auto-name on the next prompt.
-    Pending,
-    /// A one-shot title call is in flight for this session right now.
-    Running,
-}
+pub use aoe_daemon_client::SmartRenameState;
 
 /// Why a session is not eligible for smart rename, for logging and to gate the
 /// `Pending` indicator. The same predicate drives both the runtime gate and the
@@ -570,15 +557,6 @@ pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
     }
     &s[..end]
 }
-
-// The ACP one-shot is deferred to the first `prompt_complete` `Event::Stopped`, so it never races
-// the live worker for the same provider API.
-pub(crate) const ONESHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Budget for a structured rename's one-shot plus its wait for a [`MAX_CONCURRENT`] slot. The title
-/// write after it is never cut short.
-pub(crate) const RENAME_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(ONESHOT_TIMEOUT.as_secs() + 15);
 
 /// Run the agent one-shot in the session's working directory, capturing stdout. The error is a
 /// user-facing reason: the agent's last error line on a non-zero exit, or the spawn/timeout cause.

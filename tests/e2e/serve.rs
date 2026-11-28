@@ -353,8 +353,8 @@ fn tui_disconnect_hides_sessions_and_explicit_reconnect_restores_them() {
 async fn daemon_group_move_preserves_live_terminal_and_restarts_in_target_profile() {
     use agent_of_empires::{
         daemon::{
-            CreateProfileBody, DaemonClient, GroupLocation, MoveGroupBody, ProfileMutation,
-            RuntimeSnapshot, SessionMutation, StartSessionBody,
+            CreateProfileBody, GroupLocation, MoveGroupBody, ProfileMutation, RuntimeSnapshot,
+            SessionMutation, StartSessionBody,
         },
         session::{Group, Instance, Status},
     };
@@ -405,7 +405,7 @@ async fn daemon_group_move_preserves_live_terminal_and_restarts_in_target_profil
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let sdk = DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(app.join("daemon/api.sock")).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
     sdk.mutate_profile(
         &ProfileMutation::Create(CreateProfileBody {
@@ -650,8 +650,8 @@ async fn daemon_group_move_preserves_live_terminal_and_restarts_in_target_profil
 #[parallel]
 async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
     use agent_of_empires::daemon::{
-        ApiErrorCode, CreateSessionBody, CreationTrustRequest, DaemonClient, DaemonClientError,
-        PromptOrigin, RUNTIME_EPOCH_HEADER,
+        ApiErrorCode, CreateSessionBody, CreationTrustRequest, DaemonClientError, PromptOrigin,
+        RUNTIME_EPOCH_HEADER,
     };
     require_tmux!();
     if std::process::Command::new("curl")
@@ -721,7 +721,7 @@ async fn native_creation_hooks_preserve_borrowed_scratch_resources() {
             String::from_utf8_lossy(&daemon.stderr)
         );
         let socket = app.join("daemon/api.sock");
-        let sdk = DaemonClient::new_unix(&socket).unwrap();
+        let sdk = agent_of_empires::daemon::local_unix_client(&socket).unwrap();
         let epoch = sdk.runtime_info().await.unwrap().epoch;
         let owner_body: CreateSessionBody = serde_json::from_value(serde_json::json!({
             "title":"scratch owner", "path":"", "tool":"creation-agent", "scratch":true,
@@ -930,8 +930,7 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
 #[parallel]
 async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
     use agent_of_empires::daemon::{
-        ApiErrorCode, CreateSessionBody, DaemonClient, DaemonClientError, PromptOrigin,
-        RuntimeSnapshot,
+        ApiErrorCode, CreateSessionBody, DaemonClientError, PromptOrigin, RuntimeSnapshot,
     };
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("cancelled_creation_publish");
@@ -959,7 +958,7 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
         String::from_utf8_lossy(&daemon.stderr)
     );
     let socket = app.join("daemon/api.sock");
-    let sdk = DaemonClient::new_unix(&socket).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(&socket).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
     let http = reqwest::Client::builder()
         .unix_socket(socket.clone())
@@ -1064,8 +1063,8 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
 #[parallel]
 async fn native_creation_progress_reports_phases_to_the_local_stream() {
     use agent_of_empires::daemon::{
-        ApiErrorCode, CreateSessionBody, CreationPhase, CreationProgress, DaemonClient,
-        DaemonEndpoint, RuntimeConnection, RuntimeEvent, RUNTIME_EPOCH_HEADER,
+        ApiErrorCode, CreateSessionBody, CreationPhase, CreationProgress, RuntimeConnection,
+        RuntimeEvent, RUNTIME_EPOCH_HEADER,
     };
     const PHASE_TIMEOUT: Duration = Duration::from_secs(20);
     require_tmux!();
@@ -1118,7 +1117,7 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         String::from_utf8_lossy(&daemon.stderr)
     );
     let socket = app.join("daemon/api.sock");
-    let sdk = DaemonClient::new_unix(&socket).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(&socket).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
     let http = reqwest::Client::builder()
         .unix_socket(socket.clone())
@@ -1126,7 +1125,7 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         .timeout(PHASE_TIMEOUT * 5)
         .build()
         .unwrap();
-    let endpoint = DaemonEndpoint::local_unix(socket, None);
+    let endpoint = agent_of_empires::daemon::local_unix_endpoint(socket, None);
     let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
     assert!(
         connection.creation_progress().is_empty(),
@@ -1266,8 +1265,7 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
 async fn native_agent_hooks_can_reenter_without_releasing_launch_ownership() {
     use agent_of_empires::{
         daemon::{
-            DaemonClient, RuntimeSnapshot, StartSessionBody, RUNTIME_EPOCH_HEADER,
-            RUNTIME_REVISION_HEADER,
+            RuntimeSnapshot, StartSessionBody, RUNTIME_EPOCH_HEADER, RUNTIME_REVISION_HEADER,
         },
         session::{Instance, Status},
     };
@@ -1320,7 +1318,7 @@ async fn native_agent_hooks_can_reenter_without_releasing_launch_ownership() {
             String::from_utf8_lossy(&daemon.stderr)
         );
         let socket = app.join("daemon/api.sock");
-        let sdk = DaemonClient::new_unix(&socket).unwrap();
+        let sdk = agent_of_empires::daemon::local_unix_client(&socket).unwrap();
         let epoch = sdk.runtime_info().await.unwrap().epoch;
         let http = reqwest::Client::builder()
             .unix_socket(socket.as_path())
@@ -1644,8 +1642,7 @@ async fn daemon_trash_restore_purge_preserves_collisions_and_allows_retry() {
         .build()
         .unwrap();
     let base = format!("http://localhost/api/sessions/{id}");
-    let sdk =
-        agent_of_empires::daemon::DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(app.join("daemon/api.sock")).unwrap();
     let initial: RuntimeSnapshot = client
         .get("http://localhost/api/runtime/snapshot")
         .send()
@@ -2108,8 +2105,7 @@ async fn daemon_terminal_commands_apply_dimensions_archive_and_abandon_policy() 
         }
     }
 
-    let sdk =
-        agent_of_empires::daemon::DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(app.join("daemon/api.sock")).unwrap();
     let initial: agent_of_empires::daemon::RuntimeSnapshot = client
         .get("http://localhost/api/runtime/snapshot")
         .send()
@@ -3536,7 +3532,7 @@ fn cli_serve_passphrase_keeps_unix_owner_access_without_tcp_bypass() {
             }
         }
         let socket = crate::harness::app_dir_in(h.home_path()).join("daemon/api.sock");
-        let native = agent_of_empires::daemon::DaemonClient::new_unix(socket)
+        let native = agent_of_empires::daemon::local_unix_client(socket)
             .map_err(|error| error.to_string())?;
         let info = native
             .runtime_info()

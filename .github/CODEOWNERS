@@ -38,6 +38,7 @@
 
 # Daemon, session lifecycle, worktrees, process, containers and build
 /src/daemon/                            @agent-of-empires/runtime
+/aoe-daemon-client/                      @agent-of-empires/runtime
 /src/session/                           @agent-of-empires/runtime
 /src/server/session_*                   @agent-of-empires/runtime
 /src/server/api/sessions/               @agent-of-empires/runtime

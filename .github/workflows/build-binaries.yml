@@ -103,8 +103,9 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ inputs.version }}
-        # Only the root package's first `version =` line; cargo refreshes Cargo.lock on build.
-        run: perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' Cargo.toml
+        # Keep the native Daemon client's HTTP User-Agent on the binary's version.
+        # Cargo refreshes Cargo.lock on build.
+        run: perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{VERSION}"/m' Cargo.toml aoe-daemon-client/Cargo.toml
 
       - name: Install web frontend dependencies
         working-directory: web

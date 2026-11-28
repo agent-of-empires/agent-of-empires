@@ -160,7 +160,7 @@ fn purge_refused_while_restore_reservation_present_then_removes_row() {
 #[parallel]
 async fn daemon_purge_keeps_peer_retrash_when_only_identity_is_stale() {
     use agent_of_empires::daemon::{
-        DaemonClient, DeleteSessionBody, PurgeOutcome, RuntimeSnapshot, TrashSessionBody,
+        DeleteSessionBody, PurgeOutcome, RuntimeSnapshot, TrashSessionBody,
     };
     use std::time::Duration;
 
@@ -169,7 +169,7 @@ async fn daemon_purge_keeps_peer_retrash_when_only_identity_is_stale() {
     h.stop_daemon_on_drop();
     create_trashed(&h, "RaceIdentity");
     let socket = crate::harness::app_dir_in(h.home_path()).join("daemon/api.sock");
-    let sdk = DaemonClient::new_unix(&socket).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(&socket).unwrap();
     let client = reqwest::Client::builder()
         .unix_socket(socket.as_path())
         .no_proxy()

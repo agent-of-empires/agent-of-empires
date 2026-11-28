@@ -185,10 +185,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                     agent.profile_with(&acp_registry, session_cfg, default_agent)
                 }
             };
-            resp.agent_profile = crate::acp::agent_profiles::AgentProfileWire::new(
-                profile,
-                profile.probe_fullscreen(&probes),
-            );
+            resp.agent_profile =
+                crate::acp::agent_profiles::to_wire(profile, profile.probe_fullscreen(&probes));
             resp.claude_fullscreen = inst.tool == "claude" && resp.agent_profile.fullscreen;
         }
         // Only a terminal session that could switch needs the setting resolved.

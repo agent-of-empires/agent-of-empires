@@ -5966,9 +5966,19 @@ mod tests {
         let inst = terminal_turn_instance("sess-pane", "term-pane", "unused");
         let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
         let tmux = crate::tmux::Session::from_name(pane.name());
-        let pane_id = crate::server::api::sessions::ready_agent_pane_for_automatic_input(&inst)
-            .unwrap()
-            .expect("agent pane");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let pane_id = loop {
+            if let Some(pane_id) =
+                crate::server::api::sessions::ready_agent_pane_for_automatic_input(&inst).unwrap()
+            {
+                break pane_id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent pane did not become ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         let tmux_ok = |args: &[&str]| {
             let out = crate::tmux::tmux_command().args(args).output().unwrap();
             assert!(out.status.success(), "{args:?}");

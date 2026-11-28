@@ -28,22 +28,19 @@ use crate::tui::session_feed::MutationBlock;
 use crate::tui::styles::Theme;
 use crate::tui::worker::Worker;
 
-impl Item {
-    /// Open and not started: what Start, and marking for a batch, act on.
-    fn startable(&self) -> bool {
-        !self.stale && !self.dismissed && self.started_session.is_none()
-    }
+/// Open and not started: what Start and batch marking act on.
+fn item_startable(item: &Item) -> bool {
+    !item.stale && !item.dismissed && item.started_session.is_none()
+}
 
-    /// `(key, name)` of the pane's group: the repo, named by its last
-    /// segment, else the resolved Project.
-    fn group(&self) -> Option<(&str, &str)> {
-        if let Some(repo) = self.mapping_key.as_deref() {
-            return Some((repo, repo.rsplit('/').next().unwrap_or(repo)));
-        }
-        self.resolved_project
-            .as_ref()
-            .map(|p| (p.path.as_str(), p.name.as_str()))
+/// `(key, name)` for the item's repository or resolved Project.
+fn item_group(item: &Item) -> Option<(&str, &str)> {
+    if let Some(repo) = item.mapping_key.as_deref() {
+        return Some((repo, repo.rsplit('/').next().unwrap_or(repo)));
     }
+    item.resolved_project
+        .as_ref()
+        .map(|p| (p.path.as_str(), p.name.as_str()))
 }
 
 /// The kind's preset rows the New Session dialog starts from.
@@ -776,7 +773,7 @@ impl SuggestionsView {
     /// The group an item sits under; empty when it names no repo and resolved to no Project.
     fn group_key<'a>(&self, store: &'a SuggestionsFeed, index: usize) -> &'a str {
         self.item_at(store, index)
-            .and_then(Item::group)
+            .and_then(item_group)
             .map_or("", |(key, _)| key)
     }
 
@@ -796,7 +793,7 @@ impl SuggestionsView {
             .filter(|i| store.is_listed(i, self.show_dismissed))
             .collect();
         let mut seen: Vec<&str> = Vec::new();
-        for (group, _) in listed.iter().filter_map(|i| i.group()) {
+        for (group, _) in listed.iter().filter_map(|item| item_group(item)) {
             if !seen.contains(&group) {
                 seen.push(group);
             }
@@ -804,8 +801,7 @@ impl SuggestionsView {
         let mut ranked: Vec<(usize, &Item)> = listed
             .into_iter()
             .map(|i| {
-                let rank = i
-                    .group()
+                let rank = item_group(i)
                     .and_then(|(g, _)| seen.iter().position(|s| *s == g))
                     .unwrap_or(usize::MAX);
                 (rank, i)
@@ -915,7 +911,7 @@ impl SuggestionsView {
                 };
                 if !self
                     .item_at(store, self.selected)
-                    .is_some_and(Item::startable)
+                    .is_some_and(item_startable)
                 {
                     self.notice =
                         Some("Only an open suggestion that is not started can be marked.".into());
@@ -962,7 +958,7 @@ impl SuggestionsView {
                 }
                 let keys: Vec<ItemKey> = std::mem::take(&mut self.marked)
                     .into_iter()
-                    .filter(|key| store.item(key).is_some_and(Item::startable))
+                    .filter(|key| store.item(key).is_some_and(item_startable))
                     .collect();
                 self.begin();
                 if keys.is_empty() {
@@ -1481,7 +1477,7 @@ impl SuggestionsView {
             let first = lines.len();
             let group = self.group_key(store, index);
             if headed && (index == 0 || group != self.group_key(store, index - 1)) {
-                let name = item.group().map_or("No project", |(_, name)| name);
+                let name = item_group(item).map_or("No project", |(_, name)| name);
                 let repo = item
                     .mapping_key
                     .as_deref()
@@ -1654,7 +1650,7 @@ impl SuggestionsView {
             .as_ref()
             .map(|p| p.name.clone())
             .or_else(|| item.project.clone());
-        if !(headed && item.group().is_some()) {
+        if !(headed && item_group(item).is_some()) {
             parts.extend(named.or_else(|| (!headed).then(|| "No project".to_string())));
         }
         if let Some(s) = &item.started_session {

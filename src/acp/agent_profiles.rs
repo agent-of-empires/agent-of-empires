@@ -1,10 +1,8 @@
 //! Server-side per-agent capability and naming profiles.
 
-use std::collections::BTreeMap;
+use aoe_daemon_client::{AgentProfileWire, SpecialTitlesWire, WIRE_VERSION};
 
 use crate::json_probe::JsonProbe;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 /// Tool names routed to each tool card when `tool.kind` does not indicate it.
 #[derive(Debug, Clone, Copy)]
@@ -169,103 +167,52 @@ impl AgentProfile {
     }
 }
 
-/// Current `AgentProfileWire` shape version. Bump when a field is renamed, removed or retyped.
-pub const WIRE_VERSION: u32 = 1;
-
-/// `SpecialTitles` as sent to clients.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct SpecialTitlesWire {
-    pub skill_names: Vec<String>,
-    pub schedule_names: Vec<String>,
-    pub harness_names: Vec<String>,
-    pub workflow_names: Vec<String>,
-}
-
-/// The client-facing view of an [`AgentProfile`], sent on each session as `agent_profile`.
-/// The fullscreen probe declaration, lifecycle and one-shot banner patterns are not part of it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(default)]
-pub struct AgentProfileWire {
-    /// Shape version, see [`WIRE_VERSION`].
-    pub v: u32,
-    pub key: String,
-    pub parent_meta_namespaces: Vec<String>,
-    pub clear_aliases: Vec<String>,
-    pub compact_aliases: Vec<String>,
-    pub clear_requires_driven_reset: bool,
-    pub supports_exit_plan_mode: bool,
-    pub supports_wakeup_tools: bool,
-    pub emits_heartbeat_keepalives: bool,
-    pub yolo_mode_id: Option<String>,
-    pub supports_subagents: bool,
-    pub todos: bool,
-    pub skills: bool,
-    pub legacy_mode_fallback: bool,
-    pub subagent_tool_names: Vec<String>,
-    pub mcp_prefixes: Vec<String>,
-    /// Tool names per card kind; kinds without aliases are absent.
-    pub card_aliases: BTreeMap<String, Vec<String>>,
-    pub special_titles: SpecialTitlesWire,
-    pub memory_path_regex: Option<String>,
-    pub mobile_monitor_only: bool,
-    /// Result of the profile's fullscreen probe, evaluated by the daemon.
-    pub fullscreen: bool,
-}
-
 fn owned(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
-impl AgentProfileWire {
-    pub fn new(profile: &AgentProfile, fullscreen: bool) -> Self {
-        let cards = &profile.card_aliases;
-        let titles = &profile.special_titles;
-        Self {
-            v: WIRE_VERSION,
-            key: profile.key.to_string(),
-            parent_meta_namespaces: owned(profile.parent_meta_namespaces),
-            clear_aliases: owned(profile.clear_aliases),
-            compact_aliases: owned(profile.compact_aliases),
-            clear_requires_driven_reset: profile.clear_requires_driven_reset,
-            supports_exit_plan_mode: profile.supports_exit_plan_mode,
-            supports_wakeup_tools: profile.supports_wakeup_tools,
-            emits_heartbeat_keepalives: profile.emits_heartbeat_keepalives,
-            yolo_mode_id: profile.yolo_mode_id.map(str::to_string),
-            supports_subagents: profile.supports_subagents,
-            todos: profile.todos,
-            skills: profile.skills,
-            legacy_mode_fallback: profile.legacy_mode_fallback,
-            subagent_tool_names: owned(profile.subagent_tool_names),
-            mcp_prefixes: owned(profile.mcp_prefixes),
-            card_aliases: [
-                ("execute", cards.execute),
-                ("read", cards.read),
-                ("edit", cards.edit),
-                ("delete", cards.delete),
-                ("search", cards.search),
-                ("fetch", cards.fetch),
-                ("think", cards.think),
-            ]
-            .into_iter()
-            .filter(|(_, names)| !names.is_empty())
-            .map(|(kind, names)| (kind.to_string(), owned(names)))
-            .collect(),
-            special_titles: SpecialTitlesWire {
-                skill_names: owned(titles.skill_names),
-                schedule_names: owned(titles.schedule_names),
-                harness_names: owned(titles.harness_names),
-                workflow_names: owned(titles.workflow_names),
-            },
-            memory_path_regex: profile.memory_path_regex.map(str::to_string),
-            mobile_monitor_only: profile.mobile_monitor_only,
-            fullscreen,
-        }
-    }
-}
-
-impl Default for AgentProfileWire {
-    fn default() -> Self {
-        Self::new(&DEFAULT, false)
+pub(crate) fn to_wire(profile: &AgentProfile, fullscreen: bool) -> AgentProfileWire {
+    let cards = &profile.card_aliases;
+    let titles = &profile.special_titles;
+    AgentProfileWire {
+        v: WIRE_VERSION,
+        key: profile.key.to_string(),
+        parent_meta_namespaces: owned(profile.parent_meta_namespaces),
+        clear_aliases: owned(profile.clear_aliases),
+        compact_aliases: owned(profile.compact_aliases),
+        clear_requires_driven_reset: profile.clear_requires_driven_reset,
+        supports_exit_plan_mode: profile.supports_exit_plan_mode,
+        supports_wakeup_tools: profile.supports_wakeup_tools,
+        emits_heartbeat_keepalives: profile.emits_heartbeat_keepalives,
+        yolo_mode_id: profile.yolo_mode_id.map(str::to_string),
+        supports_subagents: profile.supports_subagents,
+        todos: profile.todos,
+        skills: profile.skills,
+        legacy_mode_fallback: profile.legacy_mode_fallback,
+        subagent_tool_names: owned(profile.subagent_tool_names),
+        mcp_prefixes: owned(profile.mcp_prefixes),
+        card_aliases: [
+            ("execute", cards.execute),
+            ("read", cards.read),
+            ("edit", cards.edit),
+            ("delete", cards.delete),
+            ("search", cards.search),
+            ("fetch", cards.fetch),
+            ("think", cards.think),
+        ]
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(kind, names)| (kind.to_string(), owned(names)))
+        .collect(),
+        special_titles: SpecialTitlesWire {
+            skill_names: owned(titles.skill_names),
+            schedule_names: owned(titles.schedule_names),
+            harness_names: owned(titles.harness_names),
+            workflow_names: owned(titles.workflow_names),
+        },
+        memory_path_regex: profile.memory_path_regex.map(str::to_string),
+        mobile_monitor_only: profile.mobile_monitor_only,
+        fullscreen,
     }
 }
 
@@ -686,7 +633,7 @@ mod tests {
             "my-agent",
         ] {
             let profile = resolve_with_config(key, &session);
-            let value = serde_json::to_value(AgentProfileWire::new(profile, false)).unwrap();
+            let value = serde_json::to_value(to_wire(profile, false)).unwrap();
             let mut keys: Vec<&str> = value
                 .as_object()
                 .unwrap()
@@ -698,7 +645,7 @@ mod tests {
             assert_eq!(value["v"], 1, "{key}");
             assert_eq!(keys, KEYS, "{key}");
         }
-        let claude = serde_json::to_value(AgentProfileWire::new(&CLAUDE, true)).unwrap();
+        let claude = serde_json::to_value(to_wire(&CLAUDE, true)).unwrap();
         assert_eq!(claude["clear_aliases"], serde_json::json!(["/clear"]));
         assert_eq!(claude["fullscreen"], true);
         assert!(claude["memory_path_regex"].is_string());
@@ -787,7 +734,7 @@ mod tests {
             ("unknown", plain(&[], false, &[], json!({}))),
         ];
         for (key, expected) in cases {
-            let wire = serde_json::to_value(AgentProfileWire::new(resolve(key), false)).unwrap();
+            let wire = serde_json::to_value(to_wire(resolve(key), false)).unwrap();
             for (field, want) in expected.as_object().unwrap() {
                 assert_eq!(&wire[field], want, "{key}.{field}");
             }

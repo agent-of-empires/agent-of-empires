@@ -1424,7 +1424,7 @@ mod tests {
         let router = crate::server::test_support::build_router_for_test(state.clone());
         let server =
             crate::server::test_support::serve_owner_router_for_test(&socket, router.clone()).await;
-        let endpoint = crate::daemon::DaemonEndpoint::local_unix(socket.clone(), None);
+        let endpoint = crate::daemon::local_unix_endpoint(socket.clone(), None);
         let mut connection = RuntimeConnection::connect(&endpoint, Some("test")).await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -1609,7 +1609,7 @@ mod tests {
         let router = crate::server::test_support::build_router_for_test(state.clone());
         let server =
             crate::server::test_support::serve_owner_router_for_test(&socket, router).await;
-        let endpoint = crate::daemon::DaemonEndpoint::local_unix(socket, None);
+        let endpoint = crate::daemon::local_unix_endpoint(socket, None);
         let mut connection = RuntimeConnection::connect(&endpoint, Some("test"))
             .await
             .unwrap();

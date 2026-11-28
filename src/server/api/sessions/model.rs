@@ -45,10 +45,8 @@ pub(super) fn session_response_from_instance_with_plan(
             .filter(|s| !s.is_empty())
             .unwrap_or(inst.tool.as_str()),
     );
-    let agent_profile_wire = crate::acp::agent_profiles::AgentProfileWire::new(
-        agent_profile,
-        agent_profile.probe_fullscreen(probes),
-    );
+    let agent_profile_wire =
+        crate::acp::agent_profiles::to_wire(agent_profile, agent_profile.probe_fullscreen(probes));
     let timestamp = |value: Option<Timestamp>| value.map(|t| t.to_rfc3339());
     let status = if inst
         .lifecycle_reservation

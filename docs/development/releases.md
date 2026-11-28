@@ -10,9 +10,9 @@ In the merge queue, the `Release PR Up To Date` step of CI's `Quick checks` job 
 
 Until #5504 moves it to a GitHub App, `RELEASE_TOKEN` is a personal access token of @njbrake, so the release PR is authored by him and must be approved by another member of `@agent-of-empires/protected`, since it changes `Cargo.toml` and `Cargo.lock`.
 
-Configuration lives in `release-plz.toml`: only `agent-of-empires` is tagged, versions come from `v*` tags, and nothing is published to crates.io. The workspace crates share its version, so a change to `aoe-plugin-api`, `aoe-settings-derive` or `xtask` alone still bumps the release and appears in its changelog. The changelog groups commits by conventional-commit type; `pr-title-check.yml` keeps PR titles, which become squash-commit subjects, within those types.
+Configuration lives in `release-plz.toml`: only `agent-of-empires` is tagged, versions come from `v*` tags, and nothing is published to crates.io. The workspace crates share its version, so a change confined to a workspace member still bumps the release and appears in its changelog. The changelog groups commits by conventional-commit type; `pr-title-check.yml` keeps PR titles, which become squash-commit subjects, within those types.
 
-release-plz force-pushes the release PR on every update, so edits made on its branch are lost. To ship a different version, merge a normal PR that sets the same version in all four workspace `Cargo.toml` files (the root, `aoe-plugin-api`, `aoe-settings-derive` and `xtask`) and in `Cargo.lock`. The version group takes the highest proposed version, so a root-only override loses to child commits. release-plz keeps a version that is already ahead of the last tag.
+release-plz force-pushes the release PR on every update, so edits made on its branch are lost. To ship a different version, merge a normal PR that sets the same version in all workspace `Cargo.toml` files and in `Cargo.lock`. The version group takes the highest proposed version, so a root-only override loses to child commits. release-plz keeps a version that is already ahead of the last tag.
 
 ## Rebuilding an existing tag
 

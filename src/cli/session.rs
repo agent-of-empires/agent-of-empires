@@ -461,7 +461,7 @@ async fn set_favorite(profile: &str, args: SessionIdArgs, favorited: bool) -> Re
             Err(DaemonClientError::FavoriteSelection(error)),
             UpdateFavoriteBody::Scoped { selector, .. },
         ) => {
-            return Err(error.for_cli(&selector));
+            return Err(super::session_lookup_error_for_cli(error, &selector));
         }
         (
             Err(
@@ -618,7 +618,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         crate::session::claim::RestoreClaimDecision::Busy(holder) => anyhow::bail!(
             "Session {} is {}, so it was not restored",
             inst.title,
-            holder.busy_reason()
+            crate::session::lifecycle_busy_reason(holder)
         ),
         crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
     };

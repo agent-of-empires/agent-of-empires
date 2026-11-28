@@ -106,7 +106,7 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
         .flatten();
         if let Some(info) = sole_text
             .as_deref()
-            .and_then(crate::acp::state::RateLimitInfo::from_agent_text)
+            .and_then(crate::acp::state::rate_limit_from_agent_text)
         {
             park_limited_agent_turn(state, &id, info, latest.latest_seq, observed).await;
             continue;
@@ -854,7 +854,7 @@ mod tests {
                 None => vec![],
                 Some("rate_limited") => vec![
                     Event::RateLimit {
-                        info: crate::acp::state::RateLimitInfo::from_agent_text(LIMIT).unwrap(),
+                        info: crate::acp::state::rate_limit_from_agent_text(LIMIT).unwrap(),
                     },
                     stop("rate_limited"),
                 ],

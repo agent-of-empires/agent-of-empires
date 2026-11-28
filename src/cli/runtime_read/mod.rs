@@ -352,7 +352,7 @@ async fn execute_inner(
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             {
                 let _ = establishment_deadline;
-                let path = crate::daemon::transport::local_socket_path()
+                let path = crate::daemon::host_transport::local_socket_path()
                     .map_err(|_| ReadFailure::pre("unavailable"))?;
                 execute_local_api(command, source, &path).await
             }
@@ -396,15 +396,12 @@ async fn execute_local_api(
 ) -> Result<render::Projection, ReadFailure> {
     let deadline = Instant::now() + CONNECTION_BUDGET;
     let stream = tokio::time::timeout_at(deadline, async {
-        let stream =
-            crate::daemon::transport::connect_unix(path)
-                .await
-                .map_err(|error| match error {
-                    crate::daemon::DaemonClientError::PeerIdentity => {
-                        ReadFailure::pre("peer_identity")
-                    }
-                    _ => ReadFailure::local_absence(),
-                })?;
+        let stream = crate::daemon::host_transport::connect_unix(path)
+            .await
+            .map_err(|error| match error {
+                crate::daemon::DaemonClientError::PeerIdentity => ReadFailure::pre("peer_identity"),
+                _ => ReadFailure::local_absence(),
+            })?;
         let request = "ws://localhost/api/runtime/read/ws"
             .into_client_request()
             .map_err(|_| ReadFailure::pre("invalid_endpoint"))?;
@@ -883,7 +880,7 @@ mod tests {
         let state =
             build_test_app_state_with_policy(vec![row], vec!["localhost".into()], Vec::new(), None);
         accept_runtime_read_cache_for_test(&state).await;
-        let path = crate::daemon::transport::local_socket_path().unwrap();
+        let path = crate::daemon::host_transport::local_socket_path().unwrap();
         let server = serve_owner_router_for_test(&path, build_router_for_test(state.clone())).await;
         let source = ReadRequestSource {
             explicit_url: None,

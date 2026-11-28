@@ -17,9 +17,9 @@
 cargo build                         # TUI + daemon, no Node needed
 cargo build --features web          # web dashboard, requires Node and npm
 cargo build --profile dev-release   # optimized local build without LTO
-cargo test
-cargo fmt
-cargo clippy
+cargo test --workspace
+cargo fmt --all
+cargo clippy --workspace
 AGENT_OF_EMPIRES_DEBUG=1 cargo run
 ```
 
@@ -119,8 +119,8 @@ for the harness API.
 Follow [CONTRIBUTING.md](CONTRIBUTING.md) for branches, titles and the PR
 template, and [MAINTAINERS.md](MAINTAINERS.md) for review and merge rules.
 
-- Before review, run `cargo fmt`, `cargo clippy`, and `cargo test`, adding
-  `--features web` when relevant.
+- Before review, run the checks in [CONTRIBUTING.md](CONTRIBUTING.md), adding
+  `--features web` to Clippy and tests when relevant.
 - For `web/` changes also run its format, lint, type, and applicable test checks
   from `web/AGENTS.md`, including the coverage matrix requirement.
 - Push once per round of fixes, not after each small change: every push to a

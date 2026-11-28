@@ -1798,7 +1798,7 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
         request = request.header(reqwest::header::AUTHORIZATION, authorization);
     }
     let request = request.build().map_err(|_| DaemonClientError::Transport)?;
-    let response = daemon::transport::execute(&client, None, request).await?;
+    let response = daemon::transport::execute(&client, request).await?;
     let status = response.status();
     if !status.is_success() {
         return Err(DaemonClientError::Status {
@@ -1871,12 +1871,11 @@ pub(crate) async fn ensure_local_daemon(
         None
     };
     let endpoint = crate::acp::client::discovery::local_unix_endpoint(
-        crate::daemon::transport::local_socket_path()?,
+        crate::daemon::host_transport::local_socket_path()?,
     );
     let client = endpoint.daemon_client()?;
     if let Some(profile) = native_profile {
-        client
-            .local_runtime_ready((!profile.is_empty()).then_some(profile))
+        crate::daemon::local_runtime_ready(&client, (!profile.is_empty()).then_some(profile))
             .await
             .map_err(|error| pin_protocol_skew(error, existing))?;
     } else {
@@ -1884,7 +1883,7 @@ pub(crate) async fn ensure_local_daemon(
             .or(started)
             .context("Local daemon has no verified owner after startup")?;
         anyhow::ensure!(
-            client.local_daemon_ready(pid).await?,
+            crate::daemon::local_daemon_ready(&client, pid).await?,
             "Local daemon runtime identity or protocol is incompatible"
         );
     }
@@ -1974,7 +1973,7 @@ async fn connect_owned_dashboard(
             .and_then(|(_, _, owner)| owner.as_deref())
             .context("Successor instance proof is missing")?;
         let endpoint = crate::acp::client::discovery::local_unix_endpoint(
-            crate::daemon::transport::local_socket_path()?,
+            crate::daemon::host_transport::local_socket_path()?,
         );
         let connection = crate::daemon::RuntimeConnection::connect(
             &endpoint,
@@ -2206,7 +2205,7 @@ async fn start_daemon(
     }
     drop(_state_lock);
     let endpoint = crate::acp::client::discovery::local_unix_endpoint(
-        crate::daemon::transport::local_socket_path()?,
+        crate::daemon::host_transport::local_socket_path()?,
     );
     let client = endpoint.daemon_client()?;
     // A remote child stops itself at the tunnel deadline with the reason in the log, so wait
@@ -2229,7 +2228,10 @@ async fn start_daemon(
             let owner = std::sync::Arc::clone(&owner);
             let client = &client;
             Box::pin(async move {
-                if !client.local_daemon_ready(pid).await.unwrap_or(false) {
+                if !crate::daemon::local_daemon_ready(client, pid)
+                    .await
+                    .unwrap_or(false)
+                {
                     return Ok(false);
                 }
                 tokio::task::spawn_blocking(move || {
@@ -3766,7 +3768,7 @@ mod tests {
         };
         let mut original = spawn("receipt-owner");
         let (receipt, original_target) = publish(&mut original, "receipt-owner");
-        let socket = crate::daemon::transport::local_socket_path().unwrap();
+        let socket = crate::daemon::host_transport::local_socket_path().unwrap();
         assert!(socket.starts_with(
             crate::session::get_app_dir()
                 .unwrap()

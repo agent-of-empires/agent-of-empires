@@ -3,6 +3,7 @@
 
 const PREFIXES = [
   'src/process/', 'src/git/', 'src/migrations/', 'src/containers/',
+  'aoe-daemon-client/',
   'src/session/config/container_config/',
   '.github/actions/rust-toolchain/',
 ];

@@ -16,6 +16,7 @@ on:
       - 'flake.nix'
       - 'flake.lock'
       - 'src/**'
+      - 'aoe-daemon-client/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'build.rs'

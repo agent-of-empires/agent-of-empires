@@ -36,7 +36,6 @@ pub mod rename_transaction;
 pub mod restart;
 pub(crate) mod sandbox_login;
 pub mod sandbox_store_reclaim;
-pub mod scope;
 pub mod scratch;
 pub(crate) mod serde_helpers;
 pub mod skills_model;
@@ -80,6 +79,7 @@ pub(crate) use instance::before_start_slot_waiters;
 pub(crate) use instance::generate_id;
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
+pub(crate) use instance::lifecycle_busy_reason;
 pub(crate) use instance::resume_profile_config;
 #[cfg(test)]
 pub(crate) use instance::test_helpers::publish_host_pi_transcript;
@@ -191,6 +191,7 @@ pub fn set_preview_link_prefixes(prefixes: &[String]) {
         .write()
         .unwrap_or_else(|e| e.into_inner()) = prefixes.to_vec();
 }
+pub use aoe_daemon_client::SessionScope;
 pub use config::profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, update_profile_config, validate_capability_format,
@@ -206,7 +207,6 @@ pub use config::repo_config::{
 };
 pub use projects::{Project, ProjectOverrides, ProjectScope};
 pub use recovery::HookTimeoutScope;
-pub use scope::SessionScope;
 #[cfg(test)]
 pub(crate) use storage::migration_backups;
 pub(crate) use storage::{

@@ -261,7 +261,7 @@ pub(crate) fn recover_worker(session_id: &str) -> Result<()> {
         if let Some(expected) = &record.runner_identity {
             let runner = crate::process::RunnerProcessGuard::capture(
                 record.pid,
-                Some(expected.fingerprint()),
+                Some(crate::process::process_birth_fingerprint(expected)),
             )?;
             anyhow::ensure!(
                 !runner.executing()?,
@@ -802,7 +802,7 @@ fn settle_runner_sync(record: &WorkerRecord, grace: std::time::Duration) -> Resu
         if current_boot != expected.boot_id {
             return Ok(());
         }
-        Some(expected.fingerprint())
+        Some(crate::process::process_birth_fingerprint(expected))
     } else {
         let before = crate::process::runner_birth_identity(record.pid)?;
         if before.is_some() {
@@ -813,7 +813,7 @@ fn settle_runner_sync(record: &WorkerRecord, grace: std::time::Duration) -> Resu
                 "runner incarnation changed while attesting its control socket"
             );
         }
-        before.map(|identity| identity.fingerprint())
+        before.map(|identity| crate::process::process_birth_fingerprint(&identity))
     };
     crate::process::RunnerProcessGuard::capture(record.pid, fingerprint)
         .and_then(|runner| runner.settle(grace))
@@ -1296,7 +1296,7 @@ mod tests {
                     let fingerprint = record
                         .runner_identity
                         .as_ref()
-                        .map(|birth| birth.fingerprint());
+                        .map(crate::process::process_birth_fingerprint);
                     let guard =
                         crate::process::RunnerProcessGuard::capture(pid, fingerprint).unwrap();
                     assert!(

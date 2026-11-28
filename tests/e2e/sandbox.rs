@@ -351,7 +351,7 @@ fn two_sandboxed_codex_sessions_capture_their_own_ids() {
 #[tokio::test]
 #[parallel]
 async fn native_purge_never_starts_the_managed_container() {
-    use agent_of_empires::{daemon::DaemonClient, session::Instance};
+    use agent_of_empires::session::Instance;
     use std::{fs, path::PathBuf, process::Command, time::Duration};
     crate::harness::require_tmux!();
     const IMAGE: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
@@ -504,7 +504,7 @@ async fn native_purge_never_starts_the_managed_container() {
         "{}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let sdk = DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let sdk = agent_of_empires::daemon::local_unix_client(app.join("daemon/api.sock")).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
     let http = reqwest::Client::builder()
         .unix_socket(app.join("daemon/api.sock"))

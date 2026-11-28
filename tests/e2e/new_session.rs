@@ -252,7 +252,6 @@ fn test_quit_during_creation_shows_confirm() {
 #[tokio::test]
 #[parallel]
 async fn test_quit_creation_waits_for_cancellation_admission_before_exit() {
-    use agent_of_empires::daemon::DaemonEndpoint;
     use agent_of_empires::daemon::{RuntimeConnection, RuntimeEvent};
     require_tmux!();
     let mut h = TuiTestHarness::new_in_tmp("quit_creation_ack");
@@ -282,8 +281,10 @@ async fn test_quit_creation_waits_for_cancellation_admission_before_exit() {
     let project = h.project_path();
     h.spawn_tui();
     h.wait_for_runtime_ready();
-    let endpoint =
-        DaemonEndpoint::local_unix(app_dir_in(h.home_path()).join("daemon/api.sock"), None);
+    let endpoint = agent_of_empires::daemon::local_unix_endpoint(
+        app_dir_in(h.home_path()).join("daemon/api.sock"),
+        None,
+    );
     let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
     h.send_keys("n");
     h.wait_for("Title");

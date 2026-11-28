@@ -77,7 +77,7 @@ mod linux {
         for ancestor in dir.ancestors().skip(1) {
             let meta = std::fs::symlink_metadata(ancestor)?;
             if !meta.is_dir()
-                || !crate::daemon::transport::trusted_ancestor(meta.uid(), meta.mode(), owner)
+                || !crate::daemon::host_transport::trusted_ancestor(meta.uid(), meta.mode(), owner)
             {
                 return Err(refused(
                     ancestor,

@@ -24,7 +24,14 @@ pr_draft = true
 name = "agent-of-empires"
 release = true
 version_group = "aoe"
-changelog_include = ["aoe-plugin-api", "aoe-settings-derive", "xtask"]
+changelog_include = ["aoe-daemon-client", "aoe-plugin-api", "aoe-settings-derive", "xtask"]
+
+[[package]]
+name = "aoe-daemon-client"
+release = true
+version_group = "aoe"
+git_tag_enable = false
+changelog_update = false
 
 [[package]]
 name = "aoe-plugin-api"

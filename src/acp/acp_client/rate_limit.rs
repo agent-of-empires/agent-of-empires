@@ -1,6 +1,6 @@
 //! Rate-limit classification and the captured rejected-window reset time.
 
-use crate::acp::state::RateLimitInfo;
+use crate::acp::state::{rate_limit_from_agent_text, RateLimitInfo, AGENT_TEXT_MAX_CHARS};
 use std::collections::HashMap;
 
 /// The rejected window that clears last, which is the one the park waits for.
@@ -425,7 +425,7 @@ impl AgentTurnText {
                     });
                     // Bytes, so the check is constant time: a limit sentence
                     // fits in four bytes a char, plus a little trailing space.
-                    if turn.len() > RateLimitInfo::AGENT_TEXT_MAX_CHARS * 4 + 64 {
+                    if turn.len() > AGENT_TEXT_MAX_CHARS * 4 + 64 {
                         self.disqualify();
                     }
                 }
@@ -446,7 +446,7 @@ impl AgentTurnText {
     pub(super) fn take_rate_limit(&mut self) -> Option<RateLimitInfo> {
         std::mem::take(self)
             .0
-            .and_then(|text| RateLimitInfo::from_agent_text(&text))
+            .and_then(|text| rate_limit_from_agent_text(&text))
     }
 }
 
@@ -872,7 +872,7 @@ mod tests {
         for filler in ["x", " "] {
             let mut long = AgentTurnText::default();
             long.observe(&chunk("Working."));
-            for _ in 0..=RateLimitInfo::AGENT_TEXT_MAX_CHARS * 4 + 64 {
+            for _ in 0..=AGENT_TEXT_MAX_CHARS * 4 + 64 {
                 long.observe(&chunk(filler));
             }
             assert!(

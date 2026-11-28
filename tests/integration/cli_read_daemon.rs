@@ -490,7 +490,7 @@ fn legacy_publication_artifacts_are_ignored() {
 #[tokio::test]
 #[parallel]
 async fn a_cityhall_daemon_refuses_reads_with_the_typed_cityhall_mode() {
-    use agent_of_empires::daemon::{DaemonClient, RUNTIME_PROTOCOL_VERSION};
+    use agent_of_empires::daemon::RUNTIME_PROTOCOL_VERSION;
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::net::UnixDatagram;
@@ -536,7 +536,8 @@ async fn a_cityhall_daemon_refuses_reads_with_the_typed_cityhall_mode() {
             std::fs::read_to_string(log_path).unwrap()
         )
     });
-    let client = DaemonClient::new_unix(fixture.app.join("daemon/api.sock")).unwrap();
+    let client =
+        agent_of_empires::daemon::local_unix_client(fixture.app.join("daemon/api.sock")).unwrap();
     let ready = client.runtime_info().await.unwrap();
     assert_eq!(ready.protocol_version, RUNTIME_PROTOCOL_VERSION);
     assert_eq!(
@@ -818,7 +819,7 @@ fn configured_alias_does_not_choose_an_unlisted_startup_profile() {
     ignore = "macOS local reads exercise shared acquisition during reuse"
 )]
 async fn read_reuse_does_not_require_an_unadopted_startup_profile() {
-    use agent_of_empires::daemon::{DaemonClient, RuntimeHealth};
+    use agent_of_empires::daemon::RuntimeHealth;
     use fs2::FileExt;
 
     let fixture = Fixture::new();
@@ -829,7 +830,8 @@ async fn read_reuse_does_not_require_an_unadopted_startup_profile() {
     .unwrap();
     let started = fixture.run(&["list", "--json"]);
     assert!(started.status.success(), "{started:?}");
-    let client = DaemonClient::new_unix(fixture.app.join("daemon/api.sock")).unwrap();
+    let client =
+        agent_of_empires::daemon::local_unix_client(fixture.app.join("daemon/api.sock")).unwrap();
     let before = client.runtime_info().await.unwrap();
     assert_eq!(before.health, RuntimeHealth::Healthy);
     assert_eq!(before.profiles, ["main"]);

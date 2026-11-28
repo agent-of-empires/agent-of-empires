@@ -2412,12 +2412,11 @@ mod mouse_tests {
                     notice: notice.clone(),
                 }
             };
-            let client =
-                crate::acp::client::HttpClient::new(crate::daemon::DaemonEndpoint::local_unix(
-                    PathBuf::from("/unused-preview-fixture"),
-                    None,
-                ))
-                .unwrap();
+            let client = crate::acp::client::HttpClient::new(crate::daemon::local_unix_endpoint(
+                PathBuf::from("/unused-preview-fixture"),
+                None,
+            ))
+            .unwrap();
             let (tx, rx) = oneshot::channel();
             dialog.pending_plugin = Some("acme.notice".into());
             dialog.pending = Some(Pending::Preview(rx));
@@ -2672,10 +2671,9 @@ mod daemon_update_tests {
             submissions.clone(),
         )
         .await;
-        let client = crate::acp::client::HttpClient::new(
-            crate::daemon::DaemonEndpoint::local_unix(socket, None),
-        )
-        .unwrap();
+        let client =
+            crate::acp::client::HttpClient::new(crate::daemon::local_unix_endpoint(socket, None))
+                .unwrap();
         let outcome = std::panic::AssertUnwindSafe(async {
             for (index, phase) in ["build", "restart"].into_iter().enumerate() {
                 tokio::time::timeout(Duration::from_secs(10), async {

@@ -79,15 +79,37 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  daemon-client-windows:
+    name: Daemon Client (Windows MSVC)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: $/.github/actions/rust-toolchain
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/cache@v6.1.0
+        with:
+          path: target/x86_64-pc-windows-msvc
+          key: daemon-client-msvc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo check --locked -p aoe-daemon-client --target x86_64-pc-windows-msvc
+
   clippy:
     name: Clippy
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')
+    needs: daemon-client-windows
+    # Clippy is required on main. A failed Windows check must fail it, not skip it.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) }}
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-clippy-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb:125mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
     steps:
+      - name: Require the Daemon Client Windows check
+        env:
+          WINDOWS_CHECK: ${{ needs.daemon-client-windows.result }}
+        run: test "$WINDOWS_CHECK" = success
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
       - uses: runs-on/action@v2.6.0
       - uses: actions/checkout@v7.0.1
@@ -108,7 +130,7 @@ jobs:
         run: |
           mkdir -p target/ci-web-dist
           printf '<!doctype html><title>aoe clippy placeholder</title>\n' > target/ci-web-dist/index.html
-          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo clippy --all-features --all-targets -- -D warnings
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo clippy -p agent-of-empires -p aoe-daemon-client --all-features --all-targets -- -D warnings
       # `serve` is a deprecated alias that only turns on `web` (#3619). A
       # `cfg(feature = "serve")` would therefore compile out under
       # `--features web` while still working under the alias: a silent split.
@@ -230,13 +252,13 @@ jobs:
       - name: Build xtask and workspace member tests
         run: |
           cargo build -p xtask
-          cargo test -p xtask -p aoe-plugin-api --no-run
+          cargo test -p xtask -p aoe-plugin-api -p aoe-daemon-client --no-run
       - name: Check skill file references valid CLI commands
         run: cargo xtask check-skill
       # The workspace declares no `default-members`, so every other `cargo
       # test` in these workflows is scoped to the root package (#3479).
       - name: Cargo test (non-default workspace members)
-        run: cargo test -p xtask -p aoe-plugin-api
+        run: cargo test -p xtask -p aoe-plugin-api -p aoe-daemon-client
       - name: Check CLI docs are up-to-date
         run: |
           cargo xtask gen-docs
@@ -384,7 +406,7 @@ jobs:
     # Runs if the gate did not succeed, so a broken gate cannot pass this check.
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'release-plz-')) && (needs.nix-changes.result != 'success' || needs.nix-changes.outputs.build == 'true') }}
     runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb:250mbs/extras=s3-cache', github.run_id, github.run_attempt) }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     # Builds the default (aoe) crate through crane. Nix Eval only evaluates
     # derivations, so a flake recipe that compiles nowhere (a bad source filter,
     # a missing buildInput) passes it but fails here.

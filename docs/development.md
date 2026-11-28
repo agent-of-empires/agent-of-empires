@@ -7,9 +7,9 @@ cargo build                         # debug: TUI + daemon, no Node
 cargo build --release               # shipping build with LTO
 cargo build --profile dev-release   # optimized, without LTO
 cargo build --features web          # include the web dashboard
-cargo test
-cargo fmt
-cargo clippy
+cargo test --workspace
+cargo fmt --all
+cargo clippy --workspace
 ```
 
 Local dashboard end-to-end tests on Linux require `bubblewrap`, `iproute2`, and
@@ -66,10 +66,10 @@ aoe logs
 `cargo xtask dev` runs a `--features web` debug backend on 8081, embedding `web/dist` without rebuilding it, and Vite with HMR on 5173; `--watch` rebuilds and restarts the backend when Rust inputs change, leaving the previous backend running if a rebuild fails.
 
 Use explicit dotted tracing area targets so per-target logging overrides affect
-native and dashboard failures consistently. Every `target:` root used in `src/`
-must be listed in `DEFAULT_TARGET_ROOTS` in `src/logging.rs`; a unit test
-enforces it, and an unlisted root only reaches the file at `warn` and above.
-Dependency crates log at `warn` regardless of `default_level`. Clearing one override in
+native and dashboard failures consistently. Every explicit tracing target in
+`src/` or `aoe-daemon-client/src/` must have a root listed in `DEFAULT_TARGET_ROOTS`
+in `src/logging.rs`. A unit test checks both trees. Targets outside the default
+roots log at `warn` and above unless overridden. Clearing one override in
 Settings > Logging restores inheritance without clearing other targets.
 
 Filter changes saved in Settings > Logging apply to the TUI, running daemon and structured runners in the same app namespace. Sink and rotation changes require restart. No-op and unrelated saves preserve temporary runtime filters.

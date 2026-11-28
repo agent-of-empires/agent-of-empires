@@ -2490,6 +2490,14 @@ pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<
     Ok(stream.peer_cred()?.uid())
 }
 
+pub(crate) fn unix_peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    stream
+        .peer_cred()
+        .ok()?
+        .pid()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
     let mut pids = vec![pid];

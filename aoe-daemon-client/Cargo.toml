@@ -1,0 +1,39 @@
+[package]
+name = "aoe-daemon-client"
+version = "1.25.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+license = "MIT AND Apache-2.0"
+description = "Wire types and HTTP client for the Agent of Empires Daemon"
+
+[dependencies]
+percent-encoding = "2"
+reqwest = { version = "0.13", features = ["json", "query", "stream"], default-features = false }
+schemars = "1"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "2.0"
+time = { version = "0.3.55", features = ["parsing"] }
+tokio = { version = "1.52", features = ["time"] }
+tracing = "0.1"
+
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { version = "0.13", features = ["rustls"], default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+# Schannel needs no C toolchain for a Linux-to-MSVC cargo check.
+reqwest = { version = "0.13", features = ["native-tls"], default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+futures-util = "0.3"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1.52", features = ["net", "rt"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tempfile = "3.14"
+tokio = { version = "1.52", features = ["macros", "net", "rt", "sync", "test-util"] }

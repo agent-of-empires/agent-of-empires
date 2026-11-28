@@ -5431,10 +5431,11 @@ time.sleep(60)
                 .collect();
             assert_eq!(stops, ["prompt_complete"]);
             assert_eq!(
-                crate::process::process_birth_identity(runner.identity.pid)
-                    .unwrap()
-                    .unwrap()
-                    .fingerprint(),
+                crate::process::process_birth_fingerprint(
+                    &crate::process::process_birth_identity(runner.identity.pid)
+                        .unwrap()
+                        .unwrap(),
+                ),
                 runner.identity.birth_fingerprint.unwrap()
             );
             sup.detach_all().await;

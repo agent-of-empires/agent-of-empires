@@ -48,81 +48,7 @@ impl From<serde_json::Error> for RegistryError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProjectScope {
-    Global,
-    Profile,
-}
-
-impl ProjectScope {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProjectScope::Global => "global",
-            ProjectScope::Profile => "profile",
-        }
-    }
-}
-
-/// Per-project overrides for otherwise-global settings. Every field is
-/// `None` when the project doesn't override that setting, so resolution
-/// falls through to the global/profile default. Add a field here to make
-/// a new global toggle project-overridable; existing call sites that
-/// resolve overrides (`find_by_canonical_path`, `resolve_smart_rename_config`)
-/// don't need to change shape, only the new call site that consults the
-/// new field.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProjectOverrides {
-    /// Overrides `worktree.enabled` (create-worktree-by-default) for new
-    /// sessions launched against this project.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree_enabled: Option<bool>,
-    /// Overrides `session.smart_rename` (agent-driven auto-naming) for
-    /// sessions launched against this project.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub smart_rename: Option<bool>,
-    /// Overrides `sandbox.enabled_by_default` (start in container by default)
-    /// for new sessions launched against this project.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox_enabled: Option<bool>,
-    /// Plugin settings declared `per_project`, keyed by plugin id then setting key.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub plugin_settings: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
-}
-
-impl ProjectOverrides {
-    pub fn is_empty(&self) -> bool {
-        self.worktree_enabled.is_none()
-            && self.smart_rename.is_none()
-            && self.sandbox_enabled.is_none()
-            && self.plugin_settings.is_empty()
-    }
-
-    /// Set (`Some`) or clear (`None`) one plugin setting, dropping emptied plugin entries.
-    pub fn set_plugin_setting(
-        &mut self,
-        plugin_id: &str,
-        key: &str,
-        value: Option<serde_json::Value>,
-    ) {
-        match value {
-            Some(value) => {
-                self.plugin_settings
-                    .entry(plugin_id.to_string())
-                    .or_default()
-                    .insert(key.to_string(), value);
-            }
-            None => {
-                if let Some(settings) = self.plugin_settings.get_mut(plugin_id) {
-                    settings.remove(key);
-                    if settings.is_empty() {
-                        self.plugin_settings.remove(plugin_id);
-                    }
-                }
-            }
-        }
-    }
-}
+pub use aoe_daemon_client::{ProjectOverrides, ProjectPatch, ProjectScope};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -156,59 +82,6 @@ pub struct Project {
     /// Populated by the loader; not persisted.
     #[serde(skip, default = "default_scope")]
     pub scope: ProjectScope,
-}
-
-#[derive(Debug, Default, PartialEq)]
-pub struct ProjectPatch {
-    /// Absent preserves the value; present None clears it.
-    pub base_branch: Option<Option<String>>,
-    pub pinned: Option<bool>,
-    /// Absent preserves the override; present None restores inheritance.
-    pub worktree_enabled: Option<Option<bool>>,
-    pub smart_rename: Option<Option<bool>>,
-    pub sandbox_enabled: Option<Option<bool>>,
-    pub plugin_settings: BTreeMap<String, BTreeMap<String, Option<serde_json::Value>>>,
-}
-
-impl Serialize for ProjectPatch {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Overrides<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            worktree_enabled: Option<&'a Option<bool>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            smart_rename: Option<&'a Option<bool>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            sandbox_enabled: Option<&'a Option<bool>>,
-            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-            plugin_settings: &'a BTreeMap<String, BTreeMap<String, Option<serde_json::Value>>>,
-        }
-        #[derive(Serialize)]
-        struct Body<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            default_base_branch: Option<&'a Option<String>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            pinned: Option<bool>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            overrides: Option<Overrides<'a>>,
-        }
-        let overrides = (self.worktree_enabled.is_some()
-            || self.smart_rename.is_some()
-            || self.sandbox_enabled.is_some()
-            || !self.plugin_settings.is_empty())
-        .then_some(Overrides {
-            worktree_enabled: self.worktree_enabled.as_ref(),
-            smart_rename: self.smart_rename.as_ref(),
-            sandbox_enabled: self.sandbox_enabled.as_ref(),
-            plugin_settings: &self.plugin_settings,
-        });
-        Body {
-            default_base_branch: self.base_branch.as_ref(),
-            pinned: self.pinned,
-            overrides,
-        }
-        .serialize(serializer)
-    }
 }
 
 fn default_scope() -> ProjectScope {

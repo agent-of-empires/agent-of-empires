@@ -17,31 +17,21 @@ use super::*;
 ///
 /// Ordinary crashed reservations expire after their TTL. Pending Trash teardown
 /// and terminal handoff require matching-intent recovery under a new generation.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum LifecycleOperation {
-    Launch,
-    Capture,
-    Stop,
-    Purge,
-    Restore,
-    Trash,
+pub use aoe_daemon_client::{LifecycleOperation, LifecycleReservation};
+
+pub(crate) fn lifecycle_busy_reason(operation: LifecycleOperation) -> String {
+    if operation == LifecycleOperation::Trash {
+        return "in an unfinished Trash transition; retry Trash before another lifecycle action"
+            .into();
+    }
+    format!("busy with lifecycle operation {operation:?}")
 }
 
-impl LifecycleOperation {
-    pub(crate) fn busy_reason(self) -> String {
-        if self == Self::Trash {
-            return "in an unfinished Trash transition; retry Trash before another lifecycle action".into();
-        }
-        format!("busy with lifecycle operation {self:?}")
+pub(crate) fn lifecycle_in_progress_reason(operation: LifecycleOperation) -> String {
+    if operation == LifecycleOperation::Trash {
+        return "Trash is in progress or unfinished; if interrupted, retry Trash before another lifecycle action".into();
     }
-
-    pub(crate) fn already_in_progress_reason(self) -> String {
-        if self == Self::Trash {
-            return "Trash is in progress or unfinished; if interrupted, retry Trash before another lifecycle action".into();
-        }
-        format!("lifecycle operation {self:?} is already in progress")
-    }
+    format!("lifecycle operation {operation:?} is already in progress")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +44,7 @@ pub enum LifecycleReservationError {
 impl std::fmt::Display for LifecycleReservationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy(operation) => f.write_str(&operation.already_in_progress_reason()),
+            Self::Busy(operation) => f.write_str(&lifecycle_in_progress_reason(*operation)),
             Self::GenerationOverflow => f.write_str("lifecycle generation overflow"),
             Self::Superseded => f.write_str("lifecycle reservation was superseded"),
         }
@@ -63,20 +53,15 @@ impl std::fmt::Display for LifecycleReservationError {
 
 impl std::error::Error for LifecycleReservationError {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
-pub struct LifecycleReservation {
-    pub op: LifecycleOperation,
-    pub generation: u64,
-    pub at: Timestamp,
-}
-
 impl Instance {
     /// Ordinary crashed owners expire; generation checks fence late commits.
     pub const LIFECYCLE_RESERVATION_TTL: crate::time::Duration = crate::time::Duration::minutes(10);
 
     /// Sandbox Launch leases share this floor with native preparation requests.
     pub(crate) const SANDBOX_PREPARATION_WINDOW: crate::time::Duration =
-        crate::time::Duration::minutes(30);
+        crate::time::Duration::seconds(
+            aoe_daemon_client::deadlines::SANDBOX_PREPARATION_WINDOW.as_secs() as i64,
+        );
 
     fn lifecycle_reservation_ttl(
         &self,
@@ -433,8 +418,9 @@ impl Instance {
             let generation = stored
                 .try_acquire_lifecycle_reservation(operation, Self::LIFECYCLE_RESERVATION_TTL, now)
                 .map_err(|error| match error {
-                    LifecycleReservationError::Busy(holder) => anyhow::Error::new(error)
-                        .context(format!("session {} is {}", self.id, holder.busy_reason())),
+                    LifecycleReservationError::Busy(holder) => anyhow::Error::new(error).context(
+                        format!("session {} is {}", self.id, lifecycle_busy_reason(holder)),
+                    ),
                     LifecycleReservationError::GenerationOverflow => anyhow::Error::new(error)
                         .context(format!("session {} lifecycle generation overflow", self.id)),
                     LifecycleReservationError::Superseded => anyhow::Error::new(error),

@@ -33,7 +33,7 @@ git clone https://github.com/YOUR_USERNAME/agent-of-empires.git
 cd agent-of-empires
 git remote add upstream https://github.com/agent-of-empires/agent-of-empires.git
 cargo build
-cargo test
+cargo test --workspace
 ```
 
 See [Development](docs/development.md) for local builds, logging, the web dev
@@ -78,9 +78,9 @@ and answer reviewer questions yourself, not with generated replies.
 Before requesting review, run:
 
 ```sh
-cargo fmt --check
-cargo clippy
-cargo test
+cargo fmt --all -- --check
+cargo clippy --workspace
+cargo test --workspace
 ```
 
 Web changes have additional checks in [web/AGENTS.md](web/AGENTS.md).

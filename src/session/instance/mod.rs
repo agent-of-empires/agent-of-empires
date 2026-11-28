@@ -86,6 +86,7 @@ mod types;
 
 pub(crate) use accessors::{resolved_agent_for, UNBOUND_STORE_HINT};
 pub use flags::{SandboxLoginRequired, SandboxLoginUnsupported, SessionBucket, StartBlocked};
+pub(crate) use lifecycle::{lifecycle_busy_reason, lifecycle_in_progress_reason};
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 #[cfg(test)]

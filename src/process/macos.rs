@@ -1794,6 +1794,12 @@ pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<
     Ok(stream.peer_cred()?.uid())
 }
 
+pub(crate) fn unix_peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
+        .ok()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
 #[cfg(test)]
 mod peer_uid_tests {
     #[tokio::test]
@@ -3608,8 +3614,11 @@ mod tests {
             "enumeration must include the live leader"
         );
 
-        let guard =
-            super::super::RunnerProcessGuard::capture(pid, Some(birth.fingerprint())).unwrap();
+        let guard = super::super::RunnerProcessGuard::capture(
+            pid,
+            Some(crate::process::process_birth_fingerprint(&birth)),
+        )
+        .unwrap();
         let roots = |guard: &super::super::RunnerProcessGuard| {
             guard
                 .members

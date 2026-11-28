@@ -16,106 +16,11 @@ pub struct TerminalInfo {
     pub created: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AuxiliaryTarget {
-    Host { index: u32 },
-    Container { index: u32 },
-    Tool { tool_name: String },
-}
-
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum PanePresence {
-    Absent,
-    Alive,
-    Dead,
-    #[default]
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyToolIdentity {
-    pub session_id: String,
-    pub pane_id: String,
-    #[serde(deserialize_with = "Option::deserialize")]
-    pub pane_pid: Option<u32>,
-}
-
-impl std::fmt::Display for LegacyToolIdentity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} / {}, ", self.session_id, self.pane_id)?;
-        match self.pane_pid {
-            Some(pid) => write!(formatter, "PID {pid}"),
-            None => formatter.write_str("leader exited"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct TmuxServerIdentity {
-    pub socket: String,
-    pub pid: u32,
-    pub birth: crate::process::ProcessBirthIdentity,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyToolObservation {
-    pub identity: LegacyToolIdentity,
-    pub server: std::sync::Arc<TmuxServerIdentity>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyToolAdoption {
-    pub tmux_session: String,
-    pub identity: LegacyToolIdentity,
-    pub server: std::sync::Arc<TmuxServerIdentity>,
-    pub profile: String,
-    pub lifecycle_generation: u64,
-}
-
-/// Native handoff requires Alive without a pending ownership adoption.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct PaneObservation {
-    #[serde(default)]
-    pub state: PanePresence,
-    #[serde(default)]
-    pub tmux_session: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_tool: Option<LegacyToolObservation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct AuxiliaryObservation {
-    pub target: AuxiliaryTarget,
-    #[serde(flatten)]
-    pub pane: PaneObservation,
-}
-
-/// ACP-native structured view or raw tmux terminal.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum View {
-    #[default]
-    Terminal,
-    Structured,
-}
-
-impl View {
-    /// `skip_serializing_if` predicate: only the non-default `Structured`
-    /// value is persisted, mirroring the old `structured_view` bool shape.
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, View::Terminal)
-    }
-}
+pub use aoe_daemon_client::{
+    AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity,
+    LegacyToolObservation, PaneObservation, PanePresence, SuggestionOrigin, TmuxServerIdentity,
+    View,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorktreeInfo {
@@ -400,17 +305,6 @@ pub struct PluginCreateIdempotency {
 
 /// Largest accepted `initial_prompt`, in bytes.
 pub const MAX_INITIAL_PROMPT_BYTES: usize = 64 * 1024;
-
-/// The suggestion a session was started from. `profile` is the profile the
-/// suggestion was published under, which can differ from the session's own
-/// profile; the server sets it, so a client-supplied value is ignored.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SuggestionOrigin {
-    pub provider_id: String,
-    pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
-}
 
 #[cfg(test)]
 mod tests {
