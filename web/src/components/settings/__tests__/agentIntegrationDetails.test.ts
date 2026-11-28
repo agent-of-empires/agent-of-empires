@@ -90,4 +90,27 @@ describe("agentIntegrationDetails", () => {
       "ACP failure policy: refuse the session",
     ]);
   });
+
+  it("omits absent ACP sections and an empty launch table", () => {
+    expect(
+      agentIntegrationDetails({
+        tool: "agent",
+        launch: { container_env: {} },
+        acp: {
+          id: "min",
+          aliases: ["min-cli", "m"],
+          display_name: "Min",
+          proxy: { command: "bin/p" },
+          compat: { capability_min_versions: { steering: "1.2.0" } },
+          failure_policy: "neutral_boot",
+        },
+      }),
+    ).toEqual([
+      "native replies: no",
+      "Provides ACP agent min (Min) through proxy bin/p",
+      "ACP aliases: min-cli, m",
+      "ACP compat: steering from 1.2.0",
+      "ACP failure policy: start on the neutral boot",
+    ]);
+  });
 });
