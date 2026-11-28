@@ -758,11 +758,11 @@ park holds ambient turn inference, pending delivery and idle reaping; observing
 the same actor through Attach or a Ready receipt is not replay consent.
 Canonical park metadata is independent of worker liveness.
 
-An agent-initiated turn can report a limit without an RPC error. For a qualified
-ambient turn that ran no tool, the idle tick may park it on a captured rejection
-or a lone usage-limit sentence. Terminal repair has only the transcript: for
-otherwise eligible agent-initiated work, it parks on that sole sentence instead
-of emitting `inferred_prompt_complete`. Neither path settles an open Native prompt.
+Managed terminal repair can park an attested autonomous run that ran no tool.
+The run's own transcript must contain only the usage-limit message and final
+usage evidence. Repair rechecks the run and worker ownership before retirement.
+Ambient quota reports do not authorize a park, and repair cannot settle an
+open Native prompt.
 
 Quota windows such as `five_hour` and `seven_day` belong in `RateLimitInfo.kind`,
 not in `errorKind`. `RateLimitInfo.resets_at` uses a reset attributed to the

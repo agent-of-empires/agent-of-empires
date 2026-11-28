@@ -596,7 +596,7 @@ impl ControlChannel {
 
     pub(super) fn make_room(&mut self, kind: QueuedKind, incoming_bytes: usize) -> bool {
         let management = matches!(kind, QueuedKind::Handshake | QueuedKind::SessionReplayed);
-        let frame_limit = control_protocol::MAX_CONTROL_QUEUE_FRAMES - 1
+        let frame_limit = control_protocol::MAX_CONTROL_QUEUE_FRAMES
             + if management {
                 control_protocol::CONTROL_BOOTSTRAP_RESERVED_FRAMES
             } else {
@@ -700,6 +700,7 @@ impl ControlChannel {
         }
     }
 
+    /// The tail marker may borrow a replay slot if all ordinary slots are full.
     /// Credit an adapter frame dropped before admission, after the tail.
     fn record_dropped_adapter_frame(&mut self, scope: DeliveryScope) {
         self.count_adapter_frame();
@@ -5174,13 +5175,13 @@ mod tests {
         let wire = Arc::<[u8]>::from(&[0; 8][..]);
         {
             let mut channel = shared.control.lock().await;
-            for _ in 0..cap - 1 {
+            for _ in 0..cap {
                 channel.push(scope, QueuedKind::AgentReply, Arc::clone(&wire));
             }
         }
         enqueue_adapter_frames(&shared, 2).await;
         let channel = shared.control.lock().await;
-        assert_eq!(channel.queue.len(), cap);
+        assert_eq!(channel.queue.len(), cap + 1);
         assert_eq!(channel.adapter_frames, 2);
         assert_eq!(channel.unreplayed_adapter_frames(), 0);
         let tail = channel.queue.back().unwrap();

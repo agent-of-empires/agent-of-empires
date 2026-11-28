@@ -582,6 +582,7 @@ impl EventStore {
         seq: u64,
         event: &Event,
         metadata: &EventMetadata,
+        retires_limited_run: bool,
     ) -> Result<()> {
         use crate::acp::operation_effect::ControlKind;
         let current = matches!(
@@ -596,6 +597,9 @@ impl EventStore {
                 AutonomousBoundaryDisposition::Retired
             }
             ControlKind::Stopped("orphaned_at_restart") if metadata.host_action => {
+                AutonomousBoundaryDisposition::Retired
+            }
+            ControlKind::Stopped("rate_limited") if retires_limited_run => {
                 AutonomousBoundaryDisposition::Retired
             }
             ControlKind::Unavailable { channel_loss: true }

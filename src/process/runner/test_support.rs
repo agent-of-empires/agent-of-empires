@@ -16,6 +16,10 @@ use tokio::sync::Mutex;
 pub(crate) use super::shared::managed_runner;
 
 #[cfg(unix)]
+#[path = "../../../tests/integration/acp_proxy_launch.rs"]
+mod acp_proxy_launch;
+
+#[cfg(unix)]
 #[path = "../../../tests/integration/acp_runner_orphan.rs"]
 mod acp_runner_orphan;
 

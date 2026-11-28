@@ -26,10 +26,10 @@ pub const MAX_CONTROL_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 /// Further management waits for real writes; the byte bound is unchanged.
 pub(crate) const CONTROL_BOOTSTRAP_RESERVED_FRAMES: usize = 2;
 
-/// Retained completion and sticky loss each add one replay item outside the
-/// ordinary queue. Completion bytes use the actual cached wire length; only
-/// the fixed-size native-loss receipt has a constant byte reservation.
-pub(crate) const CONTROL_REPLAY_RESERVED_FRAMES: usize = 2;
+/// An ordered adapter shed marker, retained completion and sticky loss can
+/// each add one item beyond the ordinary queue. Completion bytes use the actual
+/// cached wire length; the shed and loss markers have fixed byte reservations.
+pub(crate) const CONTROL_REPLAY_RESERVED_FRAMES: usize = 3;
 pub(super) const MAX_COMPLETION_MARKER_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_NATIVE_LOSS_FRAME_BYTES: usize = 256;
 

@@ -310,6 +310,26 @@ impl<S: BroadcastSink> Supervisor<S> {
             .is_some_and(|(_, stored)| stored)
     }
 
+    pub(crate) fn publish_autonomous_rate_limit_if_seq(
+        &self,
+        session_id: &str,
+        info: crate::acp::state::RateLimitInfo,
+        identity: Arc<crate::acp::event_sender::NativeAutonomousIdentity>,
+        expected_seq: u64,
+    ) -> bool {
+        let mut data = AcpEventData::from_host(Event::RateLimit { info });
+        data.metadata.autonomous_rate_limit = Some(identity);
+        self.sink
+            .queue_persisted(
+                session_id,
+                Arc::clone(&self.next_seqs),
+                data,
+                Some(expected_seq),
+            )
+            .wait()
+            .is_some_and(|(_, stored)| stored)
+    }
+
     pub fn publish_agent_switched(
         &self,
         session_id: &str,

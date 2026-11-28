@@ -834,30 +834,90 @@ impl EventStore {
         })
     }
 
-    /// The agent text of the open turn when that turn has no prompt and ran no
-    /// tool, else `None`.
-    pub fn agent_turn_sole_text(&self, session_id: &str) -> Option<String> {
-        let rows = query_strings(
-            &self.conn(),
-            "SELECT event_json FROM acp_events
-             WHERE session_id = ?1
-               AND seq > (SELECT IFNULL(MAX(seq), 0) FROM acp_events
-                          WHERE session_id = ?1
-                            AND discriminant IN ('Stopped', 'AgentStartupError'))
-               AND discriminant IN ('UserPromptSent', 'UserDiffCommentsPrompt',
-                                    'ToolCallStarted', 'AgentMessageChunk')
-             ORDER BY seq ASC",
-            "agent_turn_sole_text",
-            session_id,
-        );
-        let mut text = String::new();
-        for json in rows {
-            match decode_logged(&json, session_id, "agent_turn_sole_text")? {
-                Event::AgentMessageChunk { text: chunk, .. } => text.push_str(&chunk),
-                _ => return None,
+    /// A lone usage-limit sentence and cost marker from the active Native run.
+    pub(crate) fn autonomous_turn_limit(
+        &self,
+        session_id: &str,
+        latest_seq: u64,
+    ) -> Result<
+        Option<(
+            crate::acp::state::RateLimitInfo,
+            Arc<crate::acp::event_sender::NativeAutonomousIdentity>,
+        )>,
+    > {
+        use crate::acp::state::RateLimitInfo;
+        use ControlKnowledge::Known;
+        self.with_control_snapshot(session_id, |conn, cursor| {
+            if cursor.seq != latest_seq
+                || cursor.projection.main_open != Known(false)
+                || cursor.projection.autonomous_open != Known(true)
+                || !matches!(cursor.projection.park, Known(None))
+            {
+                return Ok(None);
             }
-        }
-        (!text.is_empty()).then_some(text)
+            let Some(run) = Self::autonomous_commit(conn, session_id)?
+                .filter(|run| run.activity() == Known(true))
+            else {
+                return Ok(None);
+            };
+            let mut statement = conn.prepare_cached(
+                "SELECT seq, discriminant, event_json, scope, qualification_json
+                   FROM acp_events WHERE session_id = ?1 AND seq > ?2 AND seq <= ?3
+                   ORDER BY seq",
+            )?;
+            let mut rows = statement.query(params![
+                session_id,
+                i64::try_from(run.started)?,
+                i64::try_from(latest_seq)?,
+            ])?;
+            let mut next = run.started + 1;
+            let mut text = String::new();
+            let mut terminal_usage = false;
+            while let Some(row) = rows.next()? {
+                if u64::try_from(row.get::<_, i64>(0)?)? != next {
+                    return Ok(None);
+                }
+                next += 1;
+                let kind = row.get_ref(1)?.as_str()?;
+                match kind {
+                    "Stopped" | "UserPromptSent" | "UserDiffCommentsPrompt" | "ToolCallStarted" => {
+                        return Ok(None);
+                    }
+                    "AgentMessageChunk" | "UsageUpdated" => {}
+                    _ => continue,
+                }
+                let qualification = row.get_ref(4)?.as_str_or_null()?;
+                let metadata = EventMetadata::decode_private(row.get(3)?, qualification)?;
+                if metadata.native_origin != Some(run.identity.origin)
+                    || metadata.reported_session_id.as_ref() != Some(&run.identity.root_session_id)
+                    || metadata.operation.is_some()
+                {
+                    return Ok(None);
+                }
+                match serde_json::from_str::<Event>(row.get_ref(2)?.as_str()?)? {
+                    Event::AgentMessageChunk { text: chunk, .. } => {
+                        let chunk = if text.is_empty() {
+                            chunk.trim_start()
+                        } else {
+                            &chunk
+                        };
+                        if text.len().saturating_add(chunk.len())
+                            > RateLimitInfo::AGENT_TEXT_MAX_CHARS * 4
+                        {
+                            return Ok(None);
+                        }
+                        text.push_str(chunk);
+                        terminal_usage = false;
+                    }
+                    Event::UsageUpdated { usage } => terminal_usage = usage.cost.is_some(),
+                    _ => return Ok(None),
+                }
+            }
+            if next != latest_seq + 1 || !terminal_usage {
+                return Ok(None);
+            }
+            Ok(RateLimitInfo::from_agent_text(&text).map(|info| (info, run.identity)))
+        })
     }
 
     /// Read the inputs the terminal-repair pass decides on.
