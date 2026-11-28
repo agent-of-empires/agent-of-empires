@@ -1520,7 +1520,7 @@ impl PluginManagerDialog {
                 Style::default().fg(theme.waiting),
             )));
             for agent in &consent.agent_integrations {
-                for line in crate::plugin::agent_integration::consent_lines(agent) {
+                for line in crate::plugin::agent_integration::consent_lines(&consent.id, agent) {
                     lines.push(Line::from(Span::styled(
                         format!("  {line}"),
                         Style::default().fg(theme.dimmed),
@@ -1635,7 +1635,7 @@ impl PluginManagerDialog {
                 Style::default().fg(theme.waiting),
             )));
             for agent in &consent.agent_integrations {
-                for line in crate::plugin::agent_integration::consent_lines(agent) {
+                for line in crate::plugin::agent_integration::consent_lines(&consent.id, agent) {
                     lines.push(Line::from(Span::styled(
                         format!("  {line}"),
                         Style::default().fg(theme.dimmed),
@@ -1720,7 +1720,7 @@ impl PluginManagerDialog {
                 Style::default().fg(theme.waiting),
             )));
             for agent in &consent.agent_integrations {
-                for line in crate::plugin::agent_integration::consent_lines(agent) {
+                for line in crate::plugin::agent_integration::consent_lines(&consent.id, agent) {
                     lines.push(Line::from(Span::styled(
                         format!("  {line}"),
                         Style::default().fg(theme.dimmed),

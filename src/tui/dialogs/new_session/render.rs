@@ -296,9 +296,11 @@ impl NewSessionDialog {
         // are shared with the Restart dialog.
         let is_tool_focused = has_tool_selection && self.focused_field == fields.tool;
         let selected_tool = self.available_tools[self.tool_index].as_str();
+        let shown_tool = crate::agents::labels_for(selected_tool)
+            .map_or_else(|| selected_tool.to_owned(), |labels| labels.0);
         let mut tool_spans = tool_cycler_spans(
             "Tool:",
-            selected_tool,
+            &shown_tool,
             self.tool_index,
             self.available_tools.len(),
             true,

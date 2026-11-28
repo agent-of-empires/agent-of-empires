@@ -70,8 +70,17 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                         });
                         continue;
                     }
+                    // The native identity still owns its file while a plugin takes the listing.
                     if let Some(agent) =
                         crate::session::resolved_agent_for(&profile, tool, detect_as)
+                            .or_else(|| crate::agents::native_definition(tool))
+                            .or_else(|| {
+                                crate::agents::native_definition(
+                                    &crate::tmux::status_rules::effective_detect_as(
+                                        &profile, tool, detect_as,
+                                    ),
+                                )
+                            })
                     {
                         if agent.hook_config.is_some() {
                             push_relocated_target(&mut targets, agent, root, &config);
@@ -149,7 +158,7 @@ pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
                                 kind: HookTargetKind::JsonSettings,
                                 path,
                                 events: crate::agents::resolved_hook_events(
-                                    crate::agents::get_agent("claude")
+                                    crate::agents::native_definition("claude")
                                         .expect("built-in Claude agent"),
                                     &crate::session::config::Config::default(),
                                 )
@@ -206,8 +215,7 @@ pub(crate) fn is_other_builtin_hook_path(
     session: &crate::session::config::SessionConfig,
 ) -> bool {
     let destination = resolved(path);
-    let relocated = crate::agents::AGENTS
-        .iter()
+    let relocated = crate::agents::native_agents()
         .filter(|agent| agent.name != agent_name)
         .filter_map(|agent| {
             let leaf = Path::new(agent.hook_config.as_ref()?.settings_rel_path).file_name()?;
@@ -231,7 +239,7 @@ fn builtin_hook_targets_in(
     defaults: &crate::session::config::Config,
 ) -> Vec<HookTarget> {
     let mut out = Vec::new();
-    for agent in crate::agents::AGENTS {
+    for agent in crate::agents::native_agents() {
         push_hook_config_targets(&mut out, agent, home, env_lists, defaults);
         if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
             out.push(HookTarget {
@@ -528,6 +536,79 @@ mod tests {
         assert!(malformed.contains("session.store"), "{malformed}");
     }
 
+    // The bundled Claude fallback is a native hook target, and its settings file
+    // stays protected from other declarations even after a plugin takes `claude` over.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn the_bundled_claude_fallback_stays_a_protected_hook_target() {
+        let app = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        crate::session::test_support::install_agent_plugin(
+            "aoe.claude",
+            "id = \"aoe.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
+             command = \"claude-next\"\n[agent_integrations.launch]\noneshot_flag = \"-p\"\n",
+        );
+        assert!(crate::agents::get_agent("claude").is_none());
+
+        let home = TempDir::new().unwrap();
+        let targets = builtin_hook_targets_in(
+            home.path(),
+            &[Vec::new()],
+            &crate::session::config::Config::default(),
+        );
+        let claude: Vec<_> = targets
+            .iter()
+            .filter(|target| target.agent_name == "claude")
+            .collect();
+        assert_eq!(claude.len(), 1);
+        assert!(matches!(claude[0].kind, HookTargetKind::JsonSettings));
+        assert_eq!(claude[0].path, home.path().join(".claude/settings.json"));
+        assert!(!claude[0].events.is_empty());
+        assert!(is_other_builtin_hook_path(
+            &home.path().join(".claude/settings.json"),
+            "example",
+            home.path(),
+            &[],
+            &Default::default(),
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn relocated_claude_wrapper_is_a_hook_target_while_a_plugin_takes_claude_over() {
+        let app = TempDir::new().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _home = crate::session::test_support::isolate_home(app.path());
+        crate::session::test_support::install_agent_plugin(
+            "aoe.claude",
+            "id = \"aoe.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
+             command = \"claude-next\"\n[agent_integrations.launch]\noneshot_flag = \"-p\"\n",
+        );
+        assert!(crate::agents::get_agent("claude").is_none());
+
+        let relocated = app.path().join("work-claude-dir");
+        let profile_dir = crate::session::get_profile_dir("relocated-claude").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "[session.agent_config_dir]\nwork-claude = \"{}\"\n\
+                 [session.agent_detect_as]\nwork-claude = \"claude\"\n",
+                relocated.display()
+            ),
+        )
+        .unwrap();
+
+        assert!(iter_hook_targets()
+            .into_iter()
+            .any(|target| target.agent_name == "claude"
+                && target.path == relocated.join("settings.json")));
+    }
+
     #[test]
     #[serial_test::serial(shell_env)]
     fn plugin_declared_hooks_are_listed_and_consented() {
@@ -558,6 +639,7 @@ mod tests {
         assert_eq!(target.events.len(), 1);
 
         let lines = crate::plugin::agent_integration::consent_lines(
+            "acme.example",
             &aoe_plugin_api::PluginManifest::from_toml_str(manifest)
                 .unwrap()
                 .agent_integrations[0],

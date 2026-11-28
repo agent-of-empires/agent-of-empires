@@ -139,6 +139,7 @@ impl<'a> DefinitionData<'a> {
         });
         Some(AgentDef {
             name: &entry.tool,
+            display_name: entry.display_name.as_deref().unwrap_or(&entry.tool),
             binary,
             launch_subcommand: None,
             aliases: &self.aliases,
@@ -230,7 +231,7 @@ status = "running"
 
     #[test]
     #[serial_test::serial]
-    fn declared_claude_shaped_hooks_install_byte_identical_to_the_built_in() {
+    fn declared_claude_shaped_hooks_install_like_the_bundled_fallback_and_the_old_built_in() {
         let app = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(app.path());
         let manifest = aoe_plugin_api::PluginManifest::from_toml_str(&format!(
@@ -260,7 +261,65 @@ status = "running"
                 .unwrap();
             std::fs::read(path).unwrap()
         });
-        assert!(!from_built_in.is_empty());
         assert_eq!(from_declared, from_built_in);
+        // Golden from the removed built-in Claude hook table (CLAUDE_HOOK_EVENTS).
+        let golden = serde_json::json!({
+            "SessionStart": [{"matcher": null, "hooks": [["identity"]]}],
+            "PreToolUse": [{"matcher": null, "hooks": [["running", "waiting", "AskUserQuestion"]]}],
+            "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [["running"]]}],
+            "UserPromptSubmit": [{"matcher": null, "hooks": [["identity"], ["running"]]}],
+            "Stop": [{"matcher": null, "hooks": [["idle"]]}],
+            "StopFailure": [{"matcher": null, "hooks": [["idle"]]}],
+            "Notification": [
+                {"matcher": "permission_prompt|elicitation_dialog|agent_needs_input", "hooks": [["waiting"]]},
+                {"matcher": "idle_prompt|agent_completed", "hooks": [["idle"]]}
+            ],
+            "ElicitationResult": [{"matcher": null, "hooks": [["running"]]}],
+        });
+        assert_eq!(hook_summary(&from_declared), golden);
+        assert_eq!(hook_summary(&from_built_in), golden);
+    }
+
+    /// Per event and matcher, what each installed hook does: the status it
+    /// writes, the waiting tool it guards, or `identity` for the session-id
+    /// publisher. Independent of the uid-bearing shell text.
+    fn hook_summary(installed: &[u8]) -> serde_json::Value {
+        let settings: serde_json::Value = serde_json::from_slice(installed).unwrap();
+        let mut summary = serde_json::Map::new();
+        for (event, groups) in settings["hooks"].as_object().unwrap() {
+            let groups: Vec<_> = groups
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|group| {
+                    let hooks: Vec<_> = group["hooks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|hook| {
+                            let command = hook["command"].as_str().unwrap();
+                            let mut tags = Vec::new();
+                            if command.contains("__extract-session-id --field session-id") {
+                                tags.push("identity".to_string());
+                            }
+                            for status in ["running", "waiting", "idle"] {
+                                if command.contains(&format!("printf {status} >"))
+                                    || command.contains(&format!("S={status}"))
+                                {
+                                    tags.push(status.to_string());
+                                }
+                            }
+                            if command.contains("AskUserQuestion") {
+                                tags.push("AskUserQuestion".to_string());
+                            }
+                            tags
+                        })
+                        .collect();
+                    serde_json::json!({ "matcher": group.get("matcher"), "hooks": hooks })
+                })
+                .collect();
+            summary.insert(event.clone(), groups.into());
+        }
+        summary.into()
     }
 }

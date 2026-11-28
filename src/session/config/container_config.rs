@@ -2360,7 +2360,9 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
         return Ok(());
     };
 
-    if let Some(trust) = declared_sandbox_agent(tool, command, session_config)
+    let declared = declared_sandbox_agent(tool, command, session_config);
+    if let Some(trust) = declared
+        .as_ref()
         .and_then(|declared| declared.contribution().trust.clone())
     {
         let applies = crate::hooks::declared_trust_applies_in_sandbox(&trust, is_yolo_mode);
@@ -2420,6 +2422,11 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
                 "cannot revoke the staged sandbox trust left by a removed declaration for {tool}; refusing to reuse the container; make the files writable or remove the session's container and relaunch"
             ))
         })?;
+    }
+    // A declaration that took over a bundled fallback owns its trust, even with none,
+    // so the native mount's name-based record is not written for it.
+    if declared.is_some() && crate::plugin::bundled_agents::contains(tool) {
+        return Ok(());
     }
 
     let active_agent = resolve_active_agent(tool, command, session_config);
@@ -7981,6 +7988,75 @@ sandbox = "SANDBOX"
         revoke().unwrap();
     }
 
+    // The native mount's name-based record belongs to the bundled fallback. A
+    // declaration that took over `claude` replaces it with its own table, or with
+    // none, but never inherits the name-based write.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_claude_takeover_does_not_inherit_the_name_based_sandbox_trust() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let native = temp_home
+            .path()
+            .join(".claude")
+            .join(SANDBOX_PRIVATE_SUBDIR)
+            .join("takeover/.claude.json");
+        let trust = |id: &str| {
+            ensure_folder_trust_config_for_active_agent(
+                "claude",
+                Some("claude-next"),
+                &super::super::SessionConfig::default(),
+                id,
+                "/workspace/project",
+                false,
+            )
+            .unwrap()
+        };
+        let manifest = |trust: &str| {
+            format!(
+                "id = \"aoe.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+                 api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
+                 command = \"claude-next\"\n[agent_integrations.launch]\n\
+                 oneshot_flag = \"-p\"\n{trust}"
+            )
+        };
+
+        crate::session::test_support::install_agent_plugin("aoe.claude", &manifest(""));
+        assert!(crate::agents::get_agent("claude").is_none());
+        trust("takeover");
+        assert!(
+            !native.exists(),
+            "a takeover without a table writes nothing"
+        );
+        assert!(!crate::hooks::declared_sandbox_dir("takeover")
+            .unwrap()
+            .join("home")
+            .exists());
+
+        crate::session::test_support::install_agent_plugin(
+            "aoe.claude",
+            &manifest(
+                "[agent_integrations.trust]\nfile = \".claude-next.json\"\n\
+                 location = \"config_dir_or_home\"\npointer = \"/projects/{path}/trusted\"\n\
+                 value = true\nsandbox = \"always\"\n",
+            ),
+        );
+        trust("takeover");
+        assert!(
+            !native.exists(),
+            "a declared table replaces the native record"
+        );
+        let staged = crate::hooks::declared_sandbox_dir("takeover")
+            .unwrap()
+            .join("home/.claude-next.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(staged).unwrap()).unwrap();
+        assert_eq!(parsed["projects"]["/workspace/project"]["trusted"], true);
+    }
+
     // A running container mounts the staged trust file by inode, so a changed record
     // is written through that inode rather than replacing it.
     #[cfg(unix)]
@@ -8703,10 +8779,7 @@ sandbox = "SANDBOX"
             before_start_hook_env: Vec::new(),
             container_workdir: None,
         };
-        for agent in crate::agents::AGENTS
-            .iter()
-            .filter(|agent| !agent.host_only)
-        {
+        for agent in crate::agents::native_agents().filter(|agent| !agent.host_only) {
             let mounts: Vec<_> = AGENT_CONFIG_MOUNTS
                 .iter()
                 .filter(|mount| mount.tool_name == agent.name)
@@ -9095,10 +9168,10 @@ sandbox = "SANDBOX"
 
         let plugin = crate::plugin::plugins_dir()
             .unwrap()
-            .join("acme.omp-cutover");
+            .join("aoe.omp-cutover");
         fs::remove_dir_all(&plugin).unwrap();
         crate::session::update_config(|config| {
-            config.plugins.remove("acme.omp-cutover");
+            config.plugins.remove("aoe.omp-cutover");
         })
         .unwrap();
         crate::plugin::reload_registry();
@@ -9172,10 +9245,10 @@ sandbox = "SANDBOX"
 
         let plugin = crate::plugin::plugins_dir()
             .unwrap()
-            .join("acme.omp-cutover");
+            .join("aoe.omp-cutover");
         fs::remove_dir_all(&plugin).unwrap();
         crate::session::update_config(|config| {
-            config.plugins.remove("acme.omp-cutover");
+            config.plugins.remove("aoe.omp-cutover");
         })
         .unwrap();
         crate::plugin::reload_registry();

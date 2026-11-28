@@ -402,6 +402,8 @@ pub enum SidecarFormat {
 
 pub struct AgentDef<'a> {
     pub name: &'a str,
+    /// How copy names the agent; `name` is the tool id.
+    pub display_name: &'a str,
     pub binary: &'a str,
     /// Must not be combined with `ResumeStrategy::Subcommand`, which inserts after the binary.
     pub launch_subcommand: Option<&'a str>,
@@ -420,7 +422,8 @@ pub struct AgentDef<'a> {
     pub detect_status: fn(&str) -> Status,
     pub container_env: &'a [(&'a str, &'a str)],
     pub hook_config: Option<AgentHookConfig<'a>>,
-    /// Plugin-declared folder trust; built-in agents write theirs through `trust_host_project`.
+    /// Declared folder trust, written for plugin declarations only; native agents, the
+    /// bundled Claude fallback included, write theirs through `trust_host_project`.
     pub trust: Option<&'a aoe_plugin_api::agent_integration::AgentTrustDeclaration>,
     pub sidecar_hooks: Option<SidecarHooks>,
     pub session_support: Option<SessionSupport<'a>>,
@@ -479,38 +482,6 @@ const fn sidecar(name: &'static str, status: HookStatus) -> SidecarHookEvent {
         identity_field: None,
     }
 }
-
-/// `Notification`/`idle_prompt` and `StopFailure` backstop `Stop`, which misses API-error and
-/// interrupted turn ends. `waiting_tools` marks `AskUserQuestion` as waiting until `PostToolUse`.
-const CLAUDE_HOOK_EVENTS: &[HookEvent<'static>] = &[
-    HookEvent {
-        status: None,
-        identity_field: Some(HookIdentityField::SessionId),
-        ..hook("SessionStart", HookStatus::Idle)
-    },
-    HookEvent {
-        waiting_tools: ToolNames::Static(&["AskUserQuestion"]),
-        ..hook("PreToolUse", HookStatus::Running)
-    },
-    matched_hook("PostToolUse", "AskUserQuestion", HookStatus::Running),
-    HookEvent {
-        identity_field: Some(HookIdentityField::SessionId),
-        ..hook("UserPromptSubmit", HookStatus::Running)
-    },
-    hook("Stop", HookStatus::Idle),
-    hook("StopFailure", HookStatus::Idle),
-    matched_hook(
-        "Notification",
-        "permission_prompt|elicitation_dialog|agent_needs_input",
-        HookStatus::Waiting,
-    ),
-    matched_hook(
-        "Notification",
-        "idle_prompt|agent_completed",
-        HookStatus::Idle,
-    ),
-    hook("ElicitationResult", HookStatus::Running),
-];
 
 /// generation_id is turn-scoped and must never be used as resume identity.
 const CURSOR_HOOK_EVENTS: &[SidecarHookEvent] = &[
@@ -639,6 +610,7 @@ const fn agent(
 ) -> AgentDef<'static> {
     AgentDef {
         name,
+        display_name: name,
         binary,
         launch_subcommand: None,
         aliases: &[],
@@ -667,45 +639,6 @@ const fn agent(
 }
 
 pub const AGENTS: &[AgentDef<'static>] = &[
-    AgentDef {
-        oneshot_flag: Some("-p"),
-        yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
-        instruction_flag: Some("--append-system-prompt {}"),
-        detect_status: status_detection::detect_claude_status,
-        container_env: &[("CLAUDE_CONFIG_DIR", "/root/.claude")],
-        hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".claude/settings.json",
-            config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
-            events: CLAUDE_HOOK_EVENTS,
-            format: HookFormat::JsonSettings,
-            strict: false,
-        }),
-        session_support: session_support(
-            ResumeStrategy::FlagPair {
-                existing: "--resume",
-                new_session: "--session-id",
-            },
-            SessionCaptureBackend::Claude,
-            SessionCaptureContext::PaneScoped,
-            SessionCaptureContext::PaneScoped,
-        ),
-        fork_strategy: ForkStrategy::ClaudeFork,
-        // The mode line under the input box, which varies with the permission
-        // mode and the build. The trust dialog shows none of these.
-        ready_markers: &["shift+tab to cycle", "manual mode on", "for shortcuts", "for agents"],
-        // Claude's 100ms paste completion window swallows an earlier Enter.
-        send_keys_enter_delay_ms: 150,
-        permission_response: Some(PermissionResponse {
-            allow: &[KeyToken::Literal("1")],
-            allow_always: Some(&[KeyToken::Literal("2")]),
-            deny: &[KeyToken::Literal("3")],
-        }),
-        ..agent(
-            "claude",
-            "claude",
-            "npm install -g @anthropic-ai/claude-code",
-        )
-    },
     AgentDef {
         oneshot_flag: Some("run"),
         aliases: &["open-code"],
@@ -744,6 +677,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
                 KeyToken::Named("Enter"),
             ],
         }),
+        display_name: "OpenCode",
         ..agent(
             "opencode",
             "opencode",
@@ -757,6 +691,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         yolo: Some(YoloMode::CliFlag("--agent auto-approve")),
         detect_status: status_detection::detect_vibe_status,
         session_support: resume_only(ResumeStrategy::Flag("--resume")),
+        display_name: "Mistral Vibe",
         ..agent("vibe", "vibe", "pip install mistral-vibe")
     },
     AgentDef {
@@ -788,6 +723,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             allow_always: Some(&[KeyToken::Literal("a")]),
             deny: &[KeyToken::Literal("d")],
         }),
+        display_name: "Codex",
         ..agent("codex", "codex", "npm install -g @openai/codex")
     },
     AgentDef {
@@ -810,6 +746,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             note: "consumer accounts cut off by Google; enterprise/API-key remain valid",
             replacement: Some("antigravity"),
         },
+        display_name: "Gemini CLI",
         ..agent("gemini", "gemini", "npm install -g @google/gemini-cli")
     },
     AgentDef {
@@ -835,6 +772,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::PaneScoped,
             SessionCaptureContext::PaneScoped,
         ),
+        display_name: "Cursor",
         ..agent("cursor", "agent", "see https://docs.cursor.com/cli")
     },
     AgentDef {
@@ -844,6 +782,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         detect_status: status_detection::detect_copilot_status,
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
         session_support: resume_only(ResumeStrategy::Flag("--session-id")),
+        display_name: "Copilot CLI",
         ..agent(
             "copilot",
             "copilot",
@@ -865,6 +804,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::PaneScoped,
         ),
         fork_strategy: ForkStrategy::PiFork,
+        display_name: "Pi",
         ..agent(
             "pi",
             "pi",
@@ -875,6 +815,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
         aliases: &["factory-droid"],
         yolo: Some(YoloMode::CliFlag("--skip-permissions-unsafe")),
         detect_status: status_detection::detect_droid_status,
+        display_name: "Factory Droid",
         ..agent("droid", "droid", "npm install -g droid")
     },
     AgentDef {
@@ -893,6 +834,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             post_install_note: None,
         }),
         host_only: true,
+        display_name: "Settl",
         ..agent(
             "settl",
             "settl",
@@ -924,6 +866,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::PaneScoped,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
+        display_name: "Hermes",
         ..agent(
             "hermes",
             "hermes",
@@ -950,6 +893,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             sibling_settings: &[],
             post_install_note: Some(crate::hooks::KIRO_DEFAULT_AGENT_NOTE),
         }),
+        display_name: "Kiro CLI",
         ..agent(
             "kiro",
             "kiro-cli",
@@ -965,12 +909,14 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             QWEN_HOOK_EVENTS,
             HookFormat::JsonSettings,
         ),
+        display_name: "Qwen Code",
         ..agent("qwen", "qwen", "npm install -g @qwen-code/qwen-code")
     },
     AgentDef {
         aliases: &["agy"],
         yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
         detect_status: status_detection::detect_antigravity_status,
+        display_name: "Antigravity CLI",
         ..agent(
             "antigravity",
             "agy",
@@ -1000,6 +946,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
+        display_name: "Kimi Code",
         ..agent(
             "kimi",
             "kimi",
@@ -1022,6 +969,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
             SessionCaptureContext::ManagedExclusiveStore,
         ),
         fork_strategy: ForkStrategy::ValueFlag("--fork"),
+        display_name: "Prime Agent",
         ..agent(
             "prime-agent",
             "prime-agent",
@@ -1032,6 +980,7 @@ pub const AGENTS: &[AgentDef<'static>] = &[
     #[cfg(feature = "e2e-tests")]
     AgentDef {
         host_only: true,
+        display_name: "Fake Agent",
         ..agent("fake-agent", "fake-agent", "test-only agent, nothing to install")
     },
 ];
@@ -1563,21 +1512,57 @@ const HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 const HELP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const HELP_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Every native definition, whether or not a plugin has taken it over. Bundled
+/// Claude leads so pickers and defaults keep their order; the other bundled
+/// fallbacks trail the table.
+pub(crate) fn native_agents() -> impl Iterator<Item = &'static AgentDef<'static>> {
+    let mut bundled = crate::plugin::bundled_agents::definitions();
+    bundled.next().into_iter().chain(AGENTS).chain(bundled)
+}
+
+/// Whether `agent` is a native definition, not one built from a plugin declaration.
+pub(crate) fn is_native(agent: &AgentDef<'_>) -> bool {
+    native_agents().any(|native| std::ptr::eq(native, agent))
+}
+
+/// The trust table a plugin declaration writes. Native agents, the bundled Claude
+/// fallback included, write theirs by name through `trust_host_project`.
+pub(crate) fn declared_trust<'a>(
+    agent: &AgentDef<'a>,
+) -> Option<&'a aoe_plugin_api::agent_integration::AgentTrustDeclaration> {
+    agent.trust.filter(|_| !is_native(agent))
+}
+
+/// `native_agents` minus the bundled fallbacks an active plugin has taken over.
+pub(crate) fn listed_agents() -> impl Iterator<Item = &'static AgentDef<'static>> {
+    let registry = crate::plugin::registry();
+    native_agents()
+        .filter(move |agent| !crate::plugin::bundled_agents::taken_over(&registry, agent.name))
+}
+
+/// Display name and install hint of `tool`: the listed native agent, else the
+/// approved plugin declaration that provides it.
+pub(crate) fn labels_for(tool: &str) -> Option<(String, String)> {
+    if let Some(agent) = get_agent(tool) {
+        return Some((agent.display_name.to_owned(), agent.install_hint.to_owned()));
+    }
+    crate::plugin::agent_integration::declared_agent(
+        crate::plugin::registry(),
+        tool,
+        std::iter::empty(),
+    )?
+    .with_definition(|agent| (agent.display_name.to_owned(), agent.install_hint.to_owned()))
+}
+
 pub fn get_agent(name: &str) -> Option<&'static AgentDef<'static>> {
-    AGENTS
-        .iter()
-        .chain(crate::plugin::bundled_agents::available())
-        .find(|a| a.name == name)
+    listed_agents().find(|a| a.name == name)
 }
 
 /// The native identity for `name`, whether or not a declaration supersedes it
 /// in listings. A tool keeps the identity its own contract names, so mounts,
 /// stores and recovery do not depend on which plugin currently provides it.
 pub(crate) fn native_definition(name: &str) -> Option<&'static AgentDef<'static>> {
-    AGENTS
-        .iter()
-        .chain(crate::plugin::bundled_agents::definitions())
-        .find(|agent| agent.name == name)
+    native_agents().find(|agent| agent.name == name)
 }
 
 pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
@@ -1635,7 +1620,7 @@ pub fn effective_status_map(
     agent_name: &str,
 ) -> anyhow::Result<BTreeMap<String, HookStatus>> {
     let overrides = configured_status_map(config, agent_name);
-    let Some(agent) = get_agent(agent_name) else {
+    let Some(agent) = get_agent(agent_name).or_else(|| native_definition(agent_name)) else {
         if let Some(map) = overrides {
             return Ok(map.clone());
         }
@@ -1783,33 +1768,36 @@ fn is_safe_agent_name(name: &str) -> bool {
 /// A declared integration paces through `Instance::send_keys_enter_delay`,
 /// which keeps this table as the fallback for every program it does not own.
 pub fn send_keys_enter_delay(tool: &str) -> u64 {
-    get_agent(tool)
+    native_definition(tool)
         .map(|a| a.send_keys_enter_delay_ms)
         .unwrap_or(0)
 }
 
 pub fn ready_markers(tool: &str) -> &'static [&'static str] {
-    get_agent(tool).map_or(&[], |a| a.ready_markers)
+    native_definition(tool).map_or(&[], |a| a.ready_markers)
 }
 
 pub fn agent_names() -> Vec<&'static str> {
-    AGENTS
-        .iter()
-        .chain(crate::plugin::bundled_agents::available())
-        .map(|a| a.name)
-        .collect()
+    listed_agents().map(|a| a.name).collect()
 }
 
 /// The longest matching token wins: `prime-agent` contains cursor's `agent` alias.
+/// OMP, unlike the rest, matches only its exact name: `prompt-helper` is not OMP.
 pub(crate) fn resolve_builtin_tool_name(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
     if cmd_lower.is_empty() {
         return Some("claude");
     }
     let mut best: Option<(usize, &'static str)> = None;
-    for agent in AGENTS {
+    for agent in native_agents() {
+        let exact_only = agent.name == "omp";
         for token in std::iter::once(agent.name).chain(agent.aliases.iter().copied()) {
-            if cmd_lower.contains(token) && best.is_none_or(|(len, _)| token.len() > len) {
+            let matches = if exact_only {
+                cmd_lower == token
+            } else {
+                cmd_lower.contains(token)
+            };
+            if matches && best.is_none_or(|(len, _)| token.len() > len) {
                 best = Some((token.len(), agent.name));
             }
         }
@@ -1823,10 +1811,7 @@ pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
         return Some("claude");
     }
     let mut best: Option<(usize, &'static str)> = None;
-    for agent in AGENTS
-        .iter()
-        .chain(crate::plugin::bundled_agents::available())
-    {
+    for agent in listed_agents() {
         for token in std::iter::once(agent.name).chain(agent.aliases.iter().copied()) {
             if lower.contains(token) && best.is_none_or(|(len, _)| token.len() > len) {
                 best = Some((token.len(), agent.name));
@@ -1842,9 +1827,7 @@ pub fn install_hint(name: &str) -> Option<&'static str> {
 
 pub fn settings_index_from_name(name: Option<&str>) -> usize {
     match name {
-        Some(n) => AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::available())
+        Some(n) => listed_agents()
             .position(|a| a.name == n)
             .map(|i| i + 1)
             .unwrap_or(0),
@@ -1856,18 +1839,12 @@ pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
     if index == 0 {
         None
     } else {
-        AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::available())
-            .nth(index - 1)
-            .map(|a| a.name)
+        listed_agents().nth(index - 1).map(|a| a.name)
     }
 }
 
 pub fn oneshot_capable_names() -> Vec<&'static str> {
-    AGENTS
-        .iter()
-        .chain(crate::plugin::bundled_agents::available())
+    listed_agents()
         .filter(|a| a.oneshot_flag.is_some())
         .map(|a| a.name)
         .collect()
@@ -1929,6 +1906,38 @@ mod tests {
         assert!(get_agent("omp").is_none());
         assert_eq!(terminal_tool_for_acp_agent("omp"), Some("omp"));
         assert_eq!(terminal_tool_for_acp_agent("not-a-tool"), None);
+    }
+
+    /// The native defaults and user overrides survive a plugin taking `claude` over.
+    #[test]
+    #[serial_test::serial]
+    fn effective_status_map_keeps_native_defaults_after_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_agent_plugin(
+            "aoe.claude",
+            "id = \"aoe.claude\"\nname = \"Claude\"\nversion = \"2.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"claude\"\n\
+             command = \"claude-next\"\n[agent_integrations.launch]\noneshot_flag = \"-p\"\n",
+        );
+        assert!(get_agent("claude").is_none());
+
+        let defaults = default_status_map_for_agent(native_definition("claude").unwrap());
+        let mut config = crate::session::config::Config::default();
+        assert_eq!(effective_status_map(&config, "claude").unwrap(), defaults);
+
+        let event = defaults.keys().next().unwrap().clone();
+        config
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert(event.clone(), HookStatus::Waiting);
+        let merged = effective_status_map(&config, "claude").unwrap();
+        assert_eq!(merged[&event], HookStatus::Waiting);
+        assert_eq!(merged.len(), defaults.len());
     }
 
     #[cfg(unix)]
@@ -2019,7 +2028,7 @@ mod tests {
 
     #[test]
     fn always_yolo_follows_each_agents_declaration() {
-        for agent in AGENTS {
+        for agent in native_agents() {
             let declared = agent.yolo.as_ref().is_some_and(YoloMode::always_on);
             assert_eq!(is_always_yolo(agent.name), declared, "{}", agent.name);
         }
@@ -2042,7 +2051,8 @@ mod tests {
 
     #[test]
     fn registry_invariants() {
-        for agent in AGENTS {
+        // OMP left this table, so its checks stay out.
+        for agent in native_agents().filter(|agent| agent.name != "omp") {
             let name = agent.name;
             assert!(
                 !(agent.hook_config.is_some() && agent.sidecar_hooks.is_some()),
@@ -2563,9 +2573,7 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
 
     #[test]
     fn lifecycle_notice_label_and_wire_shape() {
-        assert!(AGENTS
-            .iter()
-            .all(|a| a.lifecycle.is_active() == (a.name != "gemini")));
+        assert!(native_agents().all(|a| a.lifecycle.is_active() == (a.name != "gemini")));
         let claude = get_agent("claude").unwrap();
         assert_eq!(claude.lifecycle_label(), None);
         assert_eq!(claude.lifecycle_notice(), None);
@@ -2719,12 +2727,30 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
     }
 
     #[test]
+    #[serial_test::serial]
+    fn native_agents_keep_claude_first_and_the_bundled_fallbacks_around_the_table() {
+        let names: Vec<_> = native_agents().map(|agent| agent.name).collect();
+        assert_eq!(names.first(), Some(&"claude"));
+        assert_eq!(names.last(), Some(&"omp"));
+        assert_eq!(names.len(), AGENTS.len() + 2);
+        assert_eq!(names.iter().filter(|name| **name == "claude").count(), 1);
+        assert!(AGENTS.iter().all(|agent| agent.name != "claude"));
+        assert_eq!(
+            AGENTS.iter().map(|agent| agent.name).collect::<Vec<_>>(),
+            names[1..names.len() - 1]
+        );
+        assert_eq!(settings_index_from_name(Some("claude")), 1);
+        assert_eq!(name_from_settings_index(1), Some("claude"));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn test_settings_index_roundtrip() {
         assert_eq!(settings_index_from_name(None), 0);
         assert_eq!(settings_index_from_name(Some("unknown")), 0);
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(agent_names().len() + 1), None);
-        for (i, agent) in AGENTS.iter().enumerate() {
+        for (i, agent) in listed_agents().enumerate() {
             assert_eq!(settings_index_from_name(Some(agent.name)), i + 1);
             assert_eq!(name_from_settings_index(i + 1), Some(agent.name));
         }

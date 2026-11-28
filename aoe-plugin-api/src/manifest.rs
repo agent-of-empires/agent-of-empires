@@ -1619,6 +1619,33 @@ impl PluginManifest {
                 self.api_version >= 22 || integration.session_id.is_none(),
                 format!("agent_integrations[{i}].session_id requires api_version >= 22"),
             );
+            if let Some(name) = &integration.display_name {
+                check(
+                    !name.is_empty()
+                        && name.chars().count() <= crate::agent_integration::AGENT_DISPLAY_NAME_MAX
+                        && name.trim() == name
+                        && name.chars().all(declaration_character_ok),
+                    format!(
+                        "agent_integrations[{i}].display_name must be 1..={} printable characters without surrounding whitespace",
+                        crate::agent_integration::AGENT_DISPLAY_NAME_MAX
+                    ),
+                );
+            }
+            if let Some(icon) = &integration.icon {
+                check(
+                    lucide_icon_name_ok(icon),
+                    format!("agent_integrations[{i}].icon must be a lucide kebab-case icon name"),
+                );
+            }
+            for (field, declared) in [
+                ("display_name", integration.display_name.is_some()),
+                ("icon", integration.icon.is_some()),
+            ] {
+                check(
+                    self.api_version >= 29 || !declared,
+                    format!("agent_integrations[{i}].{field} requires api_version >= 29"),
+                );
+            }
             for (table, declared) in [
                 ("hooks", integration.hooks.is_some()),
                 ("trust", integration.trust.is_some()),

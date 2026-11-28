@@ -75,6 +75,9 @@ pub struct AgentInfo {
     pub name: String,
     /// How copy names the agent; custom agents are named by `name`.
     pub display_name: String,
+    /// A lucide icon name from the plugin that declares the agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     pub binary: String,
     pub host_only: bool,
     /// The agent always runs in Yolo mode in a terminal session, so the wizard locks the switch on.
@@ -196,6 +199,7 @@ fn build_custom_agent_infos(
                 kind: "custom".to_string(),
                 name: name.clone(),
                 display_name: name.clone(),
+                icon: None,
                 binary: name.clone(),
                 host_only: false,
                 always_yolo: crate::acp::runs_always_yolo(
@@ -295,18 +299,15 @@ pub async fn list_agents(
         // control and a profile override must not widen it (#3241).
         let policy = crate::acp::agent_policy::AgentPolicy::load();
         let data_dir = crate::session::get_app_dir().ok();
-        let mut agents = crate::agents::AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::available())
+        let mut agents = crate::agents::listed_agents()
             .map(|a| {
                 let (acp_command, acp_args) =
                     acp_command_fields(acp_registry.get(a.name), data_dir.as_deref());
                 AgentInfo {
                     kind: "builtin".to_string(),
                     name: a.name.to_string(),
-                    display_name: crate::acp::display_name_for(a.name)
-                        .unwrap_or(a.name)
-                        .to_string(),
+                    display_name: a.display_name.to_string(),
+                    icon: None,
                     binary: a.binary.to_string(),
                     host_only: a.host_only,
                     always_yolo: crate::agents::is_always_yolo(a.name),
@@ -358,7 +359,8 @@ pub async fn list_agents(
             agents.push(AgentInfo {
                 kind: "plugin".to_string(),
                 name: integration.tool.to_string(),
-                display_name: integration.tool.to_string(),
+                display_name: integration.display_name.to_string(),
+                icon: integration.icon.map(str::to_owned),
                 binary: aoe_plugin_api::agent_integration::launch_prefix(integration.command)
                     .and_then(|(prefix, _)| prefix.last().map(|word| (*word).to_owned()))
                     .unwrap_or_else(|| integration.tool.to_owned()),
@@ -4214,28 +4216,37 @@ mod tests {
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _home = crate::session::test_support::isolate_app_dir();
         let manifest = r#"
-id = "acme.takeover"
+id = "aoe.takeover"
 name = "Takeover"
 version = "1.0.0"
-api_version = 21
+api_version = 29
 
 [[agent_integrations]]
 tool = "omp"
+display_name = "Takeover Pi"
 command = "omp --takeover"
 [agent_integrations.launch]
 instruction_flag = "--prompt={}"
 
 [[agent_integrations]]
 tool = "zzzeta"
+display_name = "Zeta"
+icon = "rocket"
 command = "zzzeta"
+
+[[agent_integrations]]
+tool = "zzplain"
+command = "zzplain"
 "#;
-        let dir = crate::plugin::plugins_dir().unwrap().join("acme.takeover");
+        let dir = crate::plugin::plugins_dir().unwrap().join("aoe.takeover");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
         crate::session::update_config(|config| {
             config.plugins.insert(
-                "acme.takeover".into(),
+                "aoe.takeover".into(),
                 crate::session::PluginConfig {
+                    dev: true,
+                    source: Some("local".into()),
                     grant: Some(crate::session::CapabilityGrant {
                         manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
                             manifest.as_bytes(),
@@ -4274,6 +4285,16 @@ command = "zzzeta"
         assert!(!foreign.acp_capable);
         assert!(foreign.acp_command.is_none());
         assert!(foreign.acp_args.is_empty());
+
+        let name_and_icon = |tool: &str| {
+            let row = agents.iter().find(|agent| agent.name == tool).unwrap();
+            (row.display_name.as_str(), row.icon.as_deref())
+        };
+        assert_eq!(name_and_icon("omp"), ("Takeover Pi", None));
+        assert_eq!(name_and_icon("zzzeta"), ("Zeta", Some("rocket")));
+        assert_eq!(name_and_icon("zzplain"), ("zzplain", None));
+        assert_eq!(name_and_icon("codex"), ("Codex", None));
+        assert_eq!(name_and_icon("claude"), ("Claude Code", None));
     }
 
     /// Both fields follow the structured create check, so a custom agent counts when its

@@ -967,6 +967,45 @@ fn hooks_and_trust_require_api_26() {
 }
 
 #[test]
+fn agent_display_name_and_icon_are_validated() {
+    let body = |fields: &str| {
+        format!("[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n{fields}")
+    };
+    let ok = parse(
+        29,
+        &body("display_name = \"Example CLI\"\nicon = \"bot\"\n"),
+    );
+    let integration = &ok.agent_integrations[0];
+    assert_eq!(integration.display_name.as_deref(), Some("Example CLI"));
+    assert_eq!(integration.icon.as_deref(), Some("bot"));
+
+    let gated = invalid(28, &body("display_name = \"Example\"\nicon = \"bot\"\n"));
+    for field in ["display_name", "icon"] {
+        let want = format!("agent_integrations[0].{field} requires api_version >= 29");
+        assert!(gated.iter().any(|error| error.contains(&want)), "{gated:?}");
+    }
+
+    let long = "x".repeat(41);
+    for (fields, want) in [
+        ("display_name = \"\"\n".to_string(), "display_name"),
+        (format!("display_name = \"{long}\"\n"), "display_name"),
+        ("display_name = \" Padded\"\n".to_string(), "display_name"),
+        (
+            "display_name = \"A\\u001b[2J\"\n".to_string(),
+            "display_name",
+        ),
+        ("display_name = \"A\\u202eB\"\n".to_string(), "display_name"),
+        ("icon = \"Not An Icon\"\n".to_string(), "icon"),
+    ] {
+        let errors = invalid(29, &body(&fields));
+        assert!(
+            errors.iter().any(|error| error.contains(want)),
+            "{fields}: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn hooks_declarations_are_validated() {
     let with = |from: &str, to: &str| agent(&HOOKS.replace(from, to));
     let cases = [

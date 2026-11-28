@@ -173,9 +173,7 @@ mod tests {
             "v015 wrote an empty hooks object; canonical check would be vacuous on {}",
             claude.display(),
         );
-        let claude_events = crate::agents::AGENTS
-            .iter()
-            .find(|a| a.name == "claude")
+        let claude_events = crate::agents::native_definition("claude")
             .and_then(|a| a.hook_config.as_ref())
             .map(|hc| hc.events)
             .expect("Claude must declare hook_config");

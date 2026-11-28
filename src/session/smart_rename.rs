@@ -2555,10 +2555,7 @@ mod tests {
             build_oneshot_argv(claude(), "name this", OneshotModel::CliDefault).unwrap(),
             vec!["claude", "-p", "name this"]
         );
-        for agent in agents::AGENTS
-            .iter()
-            .filter(|agent| agent.oneshot_flag.is_some())
-        {
+        for agent in agents::native_agents().filter(|agent| agent.oneshot_flag.is_some()) {
             let default_args = resolve_title_model_args(agent, &HashMap::new());
             let model_arg_count = default_args.len();
             let title = build_oneshot_argv(agent, "name this", OneshotModel::Title(default_args))

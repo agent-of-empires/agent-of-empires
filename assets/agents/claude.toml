@@ -1,0 +1,74 @@
+# Offline launch, reply, hook and trust contract; an approved plugin declaration supersedes it.
+id = "aoe.claude-fallback"
+name = "Claude offline fallback"
+version = "1.0.0"
+api_version = 29
+
+[[agent_integrations]]
+tool = "claude"
+display_name = "Claude Code"
+command = "claude"
+
+[agent_integrations.launch]
+oneshot_flag = "-p"
+instruction_flag = "--append-system-prompt {}"
+install_hint = "npm install -g @anthropic-ai/claude-code"
+send_keys_enter_delay_ms = 150
+
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--dangerously-skip-permissions"
+
+[agent_integrations.launch.container_env]
+CLAUDE_CONFIG_DIR = "/root/.claude"
+
+[agent_integrations.reply_fallback]
+allow = [{ kind = "literal", value = "1" }]
+allow_always = [{ kind = "literal", value = "2" }]
+deny = [{ kind = "literal", value = "3" }]
+
+[agent_integrations.trust]
+file = ".claude.json"
+location = "config_dir_or_home"
+config_dir_env_var = "CLAUDE_CONFIG_DIR"
+pointer = "/projects/{path}/hasTrustDialogAccepted"
+value = true
+sandbox = "always"
+
+[agent_integrations.hooks]
+settings_rel_path = ".claude/settings.json"
+config_dir_env_var = "CLAUDE_CONFIG_DIR"
+format = "json_settings"
+
+[[agent_integrations.hooks.events]]
+event = "SessionStart"
+identity_field = "session_id"
+[[agent_integrations.hooks.events]]
+event = "PreToolUse"
+status = "running"
+waiting_tools = ["AskUserQuestion"]
+[[agent_integrations.hooks.events]]
+event = "PostToolUse"
+matcher = "AskUserQuestion"
+status = "running"
+[[agent_integrations.hooks.events]]
+event = "UserPromptSubmit"
+status = "running"
+identity_field = "session_id"
+[[agent_integrations.hooks.events]]
+event = "Stop"
+status = "idle"
+[[agent_integrations.hooks.events]]
+event = "StopFailure"
+status = "idle"
+[[agent_integrations.hooks.events]]
+event = "Notification"
+matcher = "permission_prompt|elicitation_dialog|agent_needs_input"
+status = "waiting"
+[[agent_integrations.hooks.events]]
+event = "Notification"
+matcher = "idle_prompt|agent_completed"
+status = "idle"
+[[agent_integrations.hooks.events]]
+event = "ElicitationResult"
+status = "running"

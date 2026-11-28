@@ -480,10 +480,10 @@ mod tests {
     fn revoke_omp_takeover() {
         let plugin = crate::plugin::plugins_dir()
             .unwrap()
-            .join("acme.omp-cutover");
+            .join("aoe.omp-cutover");
         std::fs::remove_dir_all(&plugin).unwrap();
         crate::session::update_config(|config| {
-            config.plugins.remove("acme.omp-cutover");
+            config.plugins.remove("aoe.omp-cutover");
         })
         .unwrap();
         crate::plugin::reload_registry();

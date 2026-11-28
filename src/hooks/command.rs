@@ -992,7 +992,7 @@ mod tests {
             Some("co'dex"),
         );
         assert!(!unsafe_name.contains("--agent"), "{unsafe_name}");
-        for agent in crate::agents::AGENTS {
+        for agent in crate::agents::native_agents() {
             let command = hook_command_session_id(
                 HookInstallTarget::Host,
                 HookIdentityField::SessionId,

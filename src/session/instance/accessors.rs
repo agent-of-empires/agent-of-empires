@@ -614,9 +614,7 @@ impl Instance {
         {
             return None;
         }
-        if crate::agents::AGENTS
-            .iter()
-            .chain(crate::plugin::bundled_agents::definitions())
+        if crate::agents::native_agents()
             .any(|other| other.binary == program && other.name != agent.name)
         {
             return None;

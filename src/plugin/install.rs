@@ -2228,7 +2228,7 @@ fn confirm_capabilities(
     if !integrations.is_empty() {
         println!("Plugin {id} declares these agent behaviors (commands run as you, unsandboxed):");
         for integration in integrations {
-            for line in super::agent_integration::consent_lines(integration) {
+            for line in super::agent_integration::consent_lines(id, integration) {
                 println!("  {line}");
             }
         }

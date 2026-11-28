@@ -605,6 +605,18 @@ fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusC
     }
 }
 
+/// Title and body prefix of a status push; `agent` is the session's agent display name.
+fn status_push_text(event: NotificationEvent, agent: Option<&str>) -> (String, &'static str) {
+    match event {
+        NotificationEvent::Waiting => (
+            format!("{} is waiting", agent.unwrap_or("Agent")),
+            "Waiting for input",
+        ),
+        NotificationEvent::Idle => ("Session finished".to_string(), "Agent is idle"),
+        NotificationEvent::Error => ("Session error".to_string(), "Agent errored"),
+    }
+}
+
 /// Resolve whether a given event type should fire for a given instance,
 /// combining server-wide defaults with per-session overrides.
 fn should_fire(
@@ -783,11 +795,7 @@ async fn fire_due_pushes(
             "status push fired"
         );
 
-        let (title, body_prefix) = match event {
-            NotificationEvent::Waiting => ("Claude is waiting", "Waiting for input"),
-            NotificationEvent::Idle => ("Session finished", "Agent is idle"),
-            NotificationEvent::Error => ("Session error", "Agent errored"),
-        };
+        let (title, body_prefix) = status_push_text(event, agent_display_name(instance).as_deref());
         let body = if instance_title.is_empty() {
             body_prefix.to_string()
         } else {
@@ -1426,8 +1434,85 @@ pub async fn test(
     }))
 }
 
+/// The wrapper's base agent name, so `work-claude` reads as Claude.
+fn agent_display_name(instance: &crate::session::Instance) -> Option<String> {
+    let tool = crate::tmux::status_rules::detection_tool(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    let alias = crate::tmux::status_rules::effective_detect_as(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    crate::agents::labels_for(&tool)
+        .or_else(|| crate::agents::labels_for(&alias))
+        .map(|(name, _)| name)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn waiting_push_title_names_the_session_agent() {
+        for tool in ["claude", "codex", "opencode"] {
+            let name = crate::agents::labels_for(tool).unwrap().0;
+            assert_eq!(
+                status_push_text(NotificationEvent::Waiting, Some(&name)).0,
+                format!("{name} is waiting")
+            );
+        }
+        assert_eq!(
+            status_push_text(NotificationEvent::Waiting, Some("Zeta")).0,
+            "Zeta is waiting"
+        );
+        assert_eq!(
+            status_push_text(NotificationEvent::Waiting, None).0,
+            "Agent is waiting"
+        );
+        assert_eq!(
+            status_push_text(NotificationEvent::Idle, Some("Codex")).0,
+            "Session finished"
+        );
+        assert!(crate::agents::labels_for("not-an-agent").is_none());
+
+        let mut wrapper = crate::session::Instance::new("w", "/tmp/push-title");
+        wrapper.tool = "work-claude".to_string();
+        wrapper.detect_as = "claude".to_string();
+        let claude = crate::agents::labels_for("claude").unwrap().0;
+        assert_eq!(agent_display_name(&wrapper), Some(claude));
+        wrapper.detect_as.clear();
+        wrapper.tool = "codex".to_string();
+        assert_eq!(agent_display_name(&wrapper).as_deref(), Some("Codex"));
+        wrapper.tool = "unknown-wrapper".to_string();
+        assert_eq!(agent_display_name(&wrapper), None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn wrapper_with_own_status_rules_keeps_its_base_agent_label() {
+        const PROFILE: &str = "push-title-rules";
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let mut config = crate::session::Config::default();
+        config
+            .agents
+            .entry("work-claude".to_string())
+            .or_default()
+            .status_rules = vec![crate::session::config::StatusRule {
+            status: crate::agents::HookStatus::Waiting,
+            contains: Some("approve?".to_string()),
+            regex: None,
+        }];
+        crate::tmux::status_rules::install_from_config(PROFILE, &config);
+
+        let mut wrapper = crate::session::Instance::new("w", "/tmp/push-title-rules");
+        wrapper.source_profile = PROFILE.to_string();
+        wrapper.tool = "work-claude".to_string();
+        wrapper.detect_as = "claude".to_string();
+        let claude = crate::agents::labels_for("claude").unwrap().0;
+        assert_eq!(agent_display_name(&wrapper), Some(claude));
+    }
+
     #[test]
     fn publish_status_change_carries_the_profile_and_skips_a_no_op() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);

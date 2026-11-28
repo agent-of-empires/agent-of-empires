@@ -5136,7 +5136,7 @@ mod tests {
         ]);
 
         for deliver_result in [true, false] {
-            for agent in crate::agents::AGENTS {
+            for agent in crate::agents::native_agents() {
                 memo.seed(agent.name, false);
             }
             assert!(

@@ -518,7 +518,7 @@ fn test_new_from_selection_starts_on_the_selected_sessions_agent() {
             let rest = &line[line.find("Tool: [")? + "Tool: [".len()..];
             let (digit, rest) = rest.split_once("] ")?;
             digit.parse::<u8>().ok()?;
-            Some(rest.split_whitespace().next()?.to_string())
+            Some(rest.split_whitespace().next()?.to_lowercase())
         });
         assert_eq!(
             tool_row.as_deref(),
