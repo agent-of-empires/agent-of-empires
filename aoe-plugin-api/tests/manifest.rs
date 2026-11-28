@@ -1206,6 +1206,18 @@ fn agent_profile_is_validated() {
             Some("memory_path_regex"),
         ),
         (
+            PROFILE.replace("\"(^|/)", "\"^a*a*a*b$"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"a+a+a+"),
+            Some("memory_path_regex"),
+        ),
+        (
+            PROFILE.replace("\"(^|/)", "\"a{1,}b{1,}c{2,}"),
+            Some("memory_path_regex"),
+        ),
+        (
             PROFILE.replace("\"(^|/)", "\"(?:a)(?P<n>b)"),
             Some("memory_path_regex"),
         ),

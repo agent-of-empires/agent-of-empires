@@ -966,6 +966,32 @@ fn has_nested_quantifier(pattern: &str) -> bool {
     false
 }
 
+/// Number of unbounded repeats (`*`, `+`, `{n,}`) in the pattern. Sequential overlapping ones
+/// backtrack polynomially in the browser's regex engine.
+fn unbounded_repeats(pattern: &str) -> usize {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut count = 0;
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 1,
+            _ if in_class => in_class = chars[i] != ']',
+            '[' => in_class = true,
+            '*' | '+' => count += 1,
+            '{' => {
+                if let Some(end) = brace_quantifier(&chars, i) {
+                    count += usize::from(chars[end - 1] == ',');
+                    i = end;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    count
+}
+
 /// True when the pattern uses syntax the Rust `regex` crate accepts but a browser's
 /// `RegExp` rejects or reads differently: every `(?` group but `(?:`, and the escapes `\A`,
 /// `\z`, `\Z`, `\p`, `\P`, `\U`, `\a`, `\<`, `\>`, `\x{`, `\u{` and `\b{`.
@@ -1007,6 +1033,7 @@ fn validate_agent_profile(
     use crate::agent_integration::{
         AGENT_PROFILE_LIST_MAX, AGENT_PROFILE_REGEX_MAX, AGENT_PROFILE_STRING_MAX,
     };
+    const AGENT_PROFILE_REGEX_UNBOUNDED_MAX: usize = 2;
     let cards = &profile.card_aliases;
     let titles = &profile.special_titles;
     let lists: [(&str, &[String]); 14] = [
@@ -1075,6 +1102,13 @@ fn validate_agent_profile(
             format!(
                 "agent_integrations[{i}].profile.memory_path_regex must not repeat a group that \
                  holds a quantifier or an alternation"
+            ),
+        );
+        check(
+            unbounded_repeats(pattern) <= AGENT_PROFILE_REGEX_UNBOUNDED_MAX,
+            format!(
+                "agent_integrations[{i}].profile.memory_path_regex must have at most \
+                 {AGENT_PROFILE_REGEX_UNBOUNDED_MAX} unbounded repeats (`*`, `+`, `{{n,}}`)"
             ),
         );
         check(
