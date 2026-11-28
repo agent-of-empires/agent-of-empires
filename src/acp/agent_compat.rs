@@ -361,8 +361,8 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
     Ok(())
 }
 
-/// [`validate`] for a plugin adapter, against the compat its plugin declared. A missing
-/// `agent_info` passes: a proxy's hello check has already refused it when compat is declared.
+/// [`validate`] for a plugin adapter, against the compat its plugin declared. A declared
+/// `min_version` refuses an adapter that reports no `agent_info` or an empty version.
 pub fn validate_declared(
     compat: &DeclaredCompat,
     init: &InitializeResponse,
@@ -373,10 +373,26 @@ pub fn validate_declared(
             received: format!("{:?}", init.protocol_version),
         });
     }
-    let Some(info) = init.agent_info.as_ref() else {
-        return Ok(());
-    };
     let install_command = "(see the plugin's documentation)".to_string();
+    let unparseable = |package_name: String, raw_version: String, required: &semver::Version| {
+        StartupError::UnparseableAgentVersion {
+            package_name,
+            raw_version,
+            required: required.to_string(),
+            install_command: install_command.clone(),
+            auto_install: false,
+        }
+    };
+    let Some(info) = init.agent_info.as_ref() else {
+        return match compat.min_version.as_ref() {
+            Some(min) => Err(unparseable(
+                compat.expected_agent_name.clone().unwrap_or_default(),
+                String::new(),
+                min,
+            )),
+            None => Ok(()),
+        };
+    };
     if let Some(expected) = compat.expected_agent_name.as_ref() {
         if info.name != *expected {
             return Err(StartupError::MismatchedAgentName {
@@ -391,17 +407,8 @@ pub fn validate_declared(
         return Ok(());
     };
     let raw = info.version.trim();
-    if raw.is_empty() {
-        return Ok(());
-    }
     let Ok(parsed) = semver::Version::parse(raw) else {
-        return Err(StartupError::UnparseableAgentVersion {
-            package_name: info.name.clone(),
-            raw_version: raw.to_string(),
-            required: min.to_string(),
-            install_command,
-            auto_install: false,
-        });
+        return Err(unparseable(info.name.clone(), raw.to_string(), min));
     };
     if parsed < *min {
         return Err(StartupError::IncompatibleAgentVersion {
@@ -563,12 +570,23 @@ mod tests {
                 Some("unparseable_agent_version"),
             ),
             (Some(("other", "2.0.0")), Some("mismatched_agent_name")),
-            (Some(("acme-adapter", "")), None),
-            (None, None),
+            (
+                Some(("acme-adapter", "")),
+                Some("unparseable_agent_version"),
+            ),
+            (None, Some("unparseable_agent_version")),
         ];
         for (info, want) in cases {
             let got = validate_declared(&compat, &init(info)).err();
             assert_eq!(got.as_ref().map(|e| e.kind()), want, "{info:?}");
+        }
+        // Without a declared floor, a missing or empty version passes.
+        let unfloored = declared(Some("acme-adapter"), None, None);
+        for info in [Some(("acme-adapter", "")), None] {
+            assert!(
+                validate_declared(&unfloored, &init(info)).is_ok(),
+                "{info:?}"
+            );
         }
         // No declared compat means no name or version requirement, whatever the command.
         let open = DeclaredCompat::from_declared(None).unwrap();
