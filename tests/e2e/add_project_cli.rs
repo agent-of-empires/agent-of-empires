@@ -52,7 +52,7 @@ fn add_project_converts_the_session_into_a_workspace() {
         "add",
         backend.to_str().unwrap(),
         "--cmd",
-        "claude",
+        "fake-agent",
         "-t",
         "Attach",
     ]);
@@ -119,7 +119,8 @@ fn add_project_converts_the_session_into_a_workspace() {
 #[test]
 #[parallel]
 fn add_project_gates_an_existing_branch_behind_the_opt_in() {
-    let h = TuiTestHarness::new("add_project_branch");
+    let mut h = TuiTestHarness::new("add_project_branch");
+    h.use_claude_agent();
     let backend = h.home_path().join("backend");
     let frontend = h.home_path().join("frontend");
     init_repo(&backend);
@@ -202,7 +203,8 @@ fn add_project_gates_an_existing_branch_behind_the_opt_in() {
 #[test]
 #[parallel]
 fn a_workspace_session_attaches_a_project_without_moving() {
-    let h = TuiTestHarness::new("add_project_workspace_start");
+    let mut h = TuiTestHarness::new("add_project_workspace_start");
+    h.use_claude_agent();
     let backend = h.home_path().join("backend");
     let frontend = h.home_path().join("frontend");
     init_repo(&backend);
@@ -255,7 +257,8 @@ fn a_workspace_session_attaches_a_project_without_moving() {
 #[test]
 #[parallel]
 fn workspace_by_default_applies_on_the_daemon() {
-    let h = TuiTestHarness::new("add_workspace_by_default");
+    let mut h = TuiTestHarness::new("add_workspace_by_default");
+    h.use_claude_agent();
     h.append_config("[worktree]\nworkspace_by_default = true");
     let repo = h.home_path().join("backend");
     init_repo(&repo);

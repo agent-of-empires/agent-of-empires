@@ -46,7 +46,7 @@ impl AgentRegistry {
         let claude_description =
             format!("Anthropic Claude via the official ACP adapter ({claude_install})");
         // (name, command, args, description)
-        let defaults: [(&str, &str, &[&str], &str); 11] = [
+        let defaults: Vec<(&str, &str, &[&str], &str)> = vec![
             ("claude", "claude-agent-acp", &[], &claude_description),
             // Legacy alias from older session records.
             (
@@ -111,6 +111,17 @@ impl AgentRegistry {
                 "aoe's bundled multi-provider agent (Vercel AI SDK)",
             ),
         ];
+        #[cfg(feature = "e2e-tests")]
+        let defaults = {
+            let mut defaults = defaults;
+            defaults.push((
+                "fake-agent",
+                "claude-agent-acp",
+                &[],
+                "Test-only agent, served by the fake ACP adapter",
+            ));
+            defaults
+        };
         let agents = defaults
             .into_iter()
             .map(|(name, command, args, description)| {
@@ -427,7 +438,7 @@ mod tests {
         let with_allowlist: Vec<&str> = reg
             .list()
             .into_iter()
-            .filter(|(_, spec)| spec.env_allowlist.is_some())
+            .filter(|(name, spec)| *name != "fake-agent" && spec.env_allowlist.is_some())
             .map(|(name, _)| name.as_str())
             .collect();
         assert_eq!(

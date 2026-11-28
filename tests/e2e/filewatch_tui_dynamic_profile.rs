@@ -97,12 +97,12 @@ fn filtered_profile_switch_rewires_disk_watch_to_new_profile() {
     std::fs::create_dir_all(&beta_dir).expect("create beta profile dir");
     std::fs::write(
         alpha_dir.join("sessions.json"),
-        r#"[{"id":"alpha-session","title":"Alpha Session","project_path":"/tmp/alpha","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}]"#,
+        r#"[{"id":"alpha-session","title":"Alpha Session","project_path":"/tmp/alpha","group_path":"","command":"","tool":"fake-agent","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}]"#,
     )
     .expect("write alpha sessions.json");
     std::fs::write(
         beta_dir.join("sessions.json"),
-        r#"[{"id":"beta-session","title":"Beta Session","project_path":"/tmp/beta","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}]"#,
+        r#"[{"id":"beta-session","title":"Beta Session","project_path":"/tmp/beta","group_path":"","command":"","tool":"fake-agent","yolo_mode":false,"status":"idle","created_at":"2026-01-01T00:00:00Z"}]"#,
     )
     .expect("write beta sessions.json");
 

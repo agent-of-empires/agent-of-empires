@@ -16,7 +16,6 @@
 //! and proves preassignment ran without triggering the nested-runtime panic.
 
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -61,13 +60,7 @@ fn install_fake_opencode(h: &mut TuiTestHarness) -> PathBuf {
 }
 
 fn enable_preassign(h: &TuiTestHarness) {
-    let config_path = crate::harness::app_dir_in(h.home_path()).join("config.toml");
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(&config_path)
-        .unwrap_or_else(|error| panic!("failed to open {}: {error}", config_path.display()));
-    file.write_all(b"\n[session]\nopencode_preassign_session_id = true\n")
-        .expect("enable OpenCode preassignment");
+    h.append_config("[session]\nopencode_preassign_session_id = true");
 }
 
 fn normal_launch_after_serve(invocations: &str) -> Option<&str> {

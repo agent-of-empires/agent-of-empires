@@ -3878,7 +3878,7 @@ fn cli_acp_prompt_authenticates_against_behind_proxy_passphrase_daemon() {
         "-t",
         "passphrase-prompt",
         "-c",
-        "claude",
+        "fake-agent",
         "--structured-view",
     ]);
     assert!(
@@ -4078,7 +4078,7 @@ fn cli_acp_tail_connects_to_behind_proxy_passphrase_daemon() {
         "-t",
         "passphrase-tail",
         "-c",
-        "claude",
+        "fake-agent",
         "--structured-view",
     ]);
     assert!(
@@ -4136,8 +4136,8 @@ fn cli_acp_tail_connects_to_behind_proxy_passphrase_daemon() {
 ///   2. `GET /api/about` reports `work`.
 ///   3. `GET /api/settings` with no query resolves over `work`'s overrides:
 ///      `work` pins `session.default_tool = "codex"` and the machine pins
-///      `"claude"`, so the served-profile read must report `codex` while
-///      `?layer=machine` reports `claude`. The pair proves the read is
+///      `"fake-agent"`, so the served-profile read must report `codex` while
+///      `?layer=machine` reports `fake-agent`. The pair proves the read is
 ///      addressed to `work` specifically, not merely that `about` names it.
 #[test]
 #[parallel]
@@ -4150,7 +4150,7 @@ fn cli_serve_daemon_profile_reaches_the_served_layer() {
     // Pin the machine default to `default` so the daemon's `--profile work`
     // is unambiguously the operator's choice and not the machine's.
     let machine_config = format!(
-        "default_profile = \"default\"\n\n[updates]\nupdate_check_mode = \"off\"\n\n[session]\ndefault_tool = \"claude\"\n\n[app_state]\nhas_seen_welcome = true\nhas_responded_to_telemetry = true\nhas_acknowledged_agent_hooks = true\nlast_seen_version = \"{version}\"\n"
+        "default_profile = \"default\"\n\n[updates]\nupdate_check_mode = \"off\"\n\n[session]\ndefault_tool = \"fake-agent\"\n\n[app_state]\nhas_seen_welcome = true\nhas_responded_to_telemetry = true\nhas_acknowledged_agent_hooks = true\nlast_seen_version = \"{version}\"\n"
     );
     std::fs::write(app.join("config.toml"), machine_config).expect("write machine config.toml");
     std::fs::create_dir_all(app.join("profiles").join("default")).expect("default profile dir");
@@ -4235,9 +4235,9 @@ fn cli_serve_daemon_profile_reaches_the_served_layer() {
             .json()
             .await
             .map_err(|e| format!("decode machine settings: {e}"))?;
-        if machine["session"]["default_tool"] != "claude" {
+        if machine["session"]["default_tool"] != "fake-agent" {
             return Err(format!(
-                "the machine layer must keep its own default_tool=claude, got {}",
+                "the machine layer must keep its own default_tool=fake-agent, got {}",
                 machine["session"]["default_tool"]
             ));
         }

@@ -75,7 +75,8 @@ fn assert_no_scratch_dirs(h: &TuiTestHarness) {
 #[test]
 #[parallel]
 fn fork_from_seeds_child_with_fork_intent() {
-    let h = TuiTestHarness::new("fork_cli_happy");
+    let mut h = TuiTestHarness::new("fork_cli_happy");
+    h.use_claude_agent();
     let project = h.project_path();
     seed_parent(&h, &project, "ForkParent", "claude");
     #[cfg(unix)]
@@ -134,7 +135,8 @@ fn fork_from_seeds_child_with_fork_intent() {
 #[test]
 #[parallel]
 fn fork_from_inherits_the_parents_agent() {
-    let h = TuiTestHarness::new("fork_cli_inherit");
+    let mut h = TuiTestHarness::new("fork_cli_inherit");
+    h.use_claude_agent();
     let project = h.project_path();
     seed_parent(&h, &project, "MatchParent", "claude");
 
@@ -219,6 +221,7 @@ fn assert_launch_refused(h: &TuiTestHarness, title: &str) {
 #[parallel]
 fn fork_from_mismatched_tool_is_refused_at_launch() {
     let mut h = TuiTestHarness::new("fork_cli_tool_match");
+    h.use_claude_agent();
     let project = h.project_path();
     install_dispatch_marker(&mut h, "gemini");
     seed_parent(&h, &project, "MatchParent", "claude");
@@ -320,6 +323,7 @@ fn fork_from_refusals_persist_nothing() {
 
     for case in cases {
         let mut h = TuiTestHarness::new("fork_cli_refusal");
+        h.use_claude_agent();
         h.install_path_command("gemini");
         let project = h.project_path();
         match case.parent {
@@ -371,7 +375,8 @@ fn fork_from_refusals_persist_nothing() {
 #[test]
 #[parallel]
 fn a_preallocated_parent_is_told_to_talk_not_to_reassert() {
-    let h = TuiTestHarness::new("fork_cli_preallocated");
+    let mut h = TuiTestHarness::new("fork_cli_preallocated");
+    h.use_claude_agent();
     let project = h.project_path();
     h.run_cli_ok(&[
         "add",

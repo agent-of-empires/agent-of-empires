@@ -35,6 +35,7 @@ has_acknowledged_agent_hooks = true
 
 [session]
 default_attach_mode = "live_send"
+default_tool = "fake-agent"
 
 {systemd_off}"#,
         version = env!("CARGO_PKG_VERSION"),
@@ -81,9 +82,9 @@ fn test_live_send_paste_into_non_bracketed_pane_has_no_marker_debris() {
 
     // Stand in for a raw shell / SQL REPL: echoes what it receives, never
     // enables bracketed paste, and outlives the test.
-    let bin = h.install_path_command("claude");
+    let bin = h.install_path_command("fake-agent");
     std::fs::write(
-        bin.join("claude"),
+        bin.join("fake-agent"),
         // `-icanon` matters: in canonical mode the tty buffers input until a
         // complete line, so a paste with no trailing newline would strand its
         // last line in the line discipline and never reach the program.

@@ -423,8 +423,10 @@ pub struct TuiTestHarness {
     /// Exported on every spawned process (tmux session and `run_cli`).
     extra_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     extra_env_remove: Vec<String>,
-    /// Prepended to PATH ahead of the `claude` stub.
+    /// Prepended to PATH ahead of the stub dir.
     extra_path_dirs: Vec<PathBuf>,
+    /// Replace the inherited system PATH with `<home>/sys-bin`.
+    isolate_host_path: bool,
     /// Stop structured view workers and attempt daemon shutdown during teardown.
     stop_daemon_on_drop: bool,
     /// When true, `install_acp_shim` bakes `FAKE_ACP_FORK_FAIL=1` into the shim
@@ -441,8 +443,8 @@ const ESCAPE_CSI_U: &[&str] = &["1b", "5b", "32", "37", "75"];
 
 #[allow(dead_code)]
 impl TuiTestHarness {
-    /// Create a new harness with an isolated `$HOME` and a fake `claude` stub
-    /// so tool detection succeeds.
+    /// Create a new harness with an isolated `$HOME`, a `fake-agent` PATH stub,
+    /// and `fake-agent` as the default tool.
     pub fn new(test_name: &str) -> Self {
         let home_dir = TempDir::new().expect("failed to create temp home");
         Self::with_home(test_name, home_dir)
@@ -469,17 +471,15 @@ impl TuiTestHarness {
         // Path to unique tmux socket for this test.
         let socket_path = home_dir.path().join("tmux.sock");
 
-        // Create fake `claude` and `fake-agent` scripts so `which` succeeds.
+        // Create a `fake-agent` script so `which` succeeds.
         let stub_path = stub_dir.path().to_path_buf();
-        for name in ["claude", "fake-agent"] {
-            let stub = stub_path.join(name);
-            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write agent stub");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod agent stub");
-            }
+        let stub = stub_path.join("fake-agent");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write agent stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod agent stub");
         }
 
         // Pre-seed config.toml to skip the welcome dialog and update checks.
@@ -496,6 +496,9 @@ impl TuiTestHarness {
         let config_content = format!(
             r#"[updates]
 update_check_mode = "off"
+
+[session]
+default_tool = "fake-agent"
 
 [acp]
 structured_view = "off"
@@ -556,17 +559,20 @@ last_seen_version = "{}"
             ],
             extra_env_remove: Vec::new(),
             extra_path_dirs: Vec::new(),
+            isolate_host_path: false,
             stop_daemon_on_drop: false,
             acp_fork_fail: false,
         }
     }
 
-    /// Build the PATH with structured view shim dirs (if any) and the stub
-    /// directory prepended so the fake agent / fake `claude` is found.
-    /// `extra_path_dirs` come first so an installed ACP shim shadows the
-    /// exit-0 `claude` stub.
+    /// Build the PATH with `extra_path_dirs` first, then the stub directory,
+    /// so installed shims shadow the exit-0 stubs.
     fn env_path(&self) -> String {
-        let system_path = std::env::var("PATH").unwrap_or_default();
+        let system_path = if self.isolate_host_path {
+            self.home_path().join("sys-bin").display().to_string()
+        } else {
+            std::env::var("PATH").unwrap_or_default()
+        };
         let mut parts: Vec<String> = self
             .extra_path_dirs
             .iter()
@@ -575,6 +581,37 @@ last_seen_version = "{}"
         parts.push(self.stub_path.display().to_string());
         parts.push(system_path);
         parts.join(":")
+    }
+
+    /// Hide host-installed agent CLIs: the system PATH shrinks to symlinks for
+    /// the tools aoe needs, and `$SHELL` probes run without a login profile, so
+    /// tool auto-selection only sees the fake agent.
+    /// Returns false, leaving the PATH untouched, when a needed tool is missing.
+    pub fn isolate_host_path(&mut self) -> bool {
+        let system_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut tools = Vec::new();
+        for tool in ["tmux", "git", "sh", "which"] {
+            let Some(real) = std::env::split_paths(&system_path)
+                .map(|dir| dir.join(tool))
+                .find(|candidate| candidate.is_file())
+            else {
+                return false;
+            };
+            tools.push((tool, real));
+        }
+        let bin = self.home_path().join("sys-bin");
+        std::fs::create_dir_all(&bin).expect("create sys-bin");
+        for (tool, real) in tools {
+            std::os::unix::fs::symlink(real, bin.join(tool)).expect("symlink system tool");
+        }
+        let shell = self.home_path().join("isolated-shell");
+        write_executable(
+            &shell,
+            "#!/bin/sh\n[ \"${1-}\" = -lc ] && { shift; exec /bin/sh -c \"$@\"; }\nexec /bin/sh \"$@\"\n",
+        );
+        self.set_env("SHELL", shell.to_str().expect("UTF-8 isolated shell path"));
+        self.isolate_host_path = true;
+        true
     }
 
     /// Tear the TUI's own tmux session down so a test can `spawn_tui` again and assert on
@@ -623,11 +660,11 @@ last_seen_version = "{}"
         self.acp_fork_fail = true;
     }
 
-    /// Install the shared Node fake-ACP agent as the `claude`,
+    /// Install the shared Node fake-ACP agent as the `fake-agent`, `claude`,
     /// `claude-agent-acp`, and `aoe-agent` commands on PATH. The structured view
-    /// supervisor resolves the `claude` tool key to the `claude-agent-acp`
-    /// command via `AgentRegistry`, so all three names must point at the
-    /// fake. `FAKE_ACP_SCRIPT` / `FAKE_ACP_DEBUG_LOG` are baked into the
+    /// supervisor resolves a tool key to its ACP command via `AgentRegistry`
+    /// (`fake-agent` falls back to `claude-agent-acp`), so every name must
+    /// point at the fake. `FAKE_ACP_SCRIPT` / `FAKE_ACP_DEBUG_LOG` are baked into the
     /// shim (the daemon -> runner -> node spawn chain does not reliably
     /// propagate process env). Also sets the runner-socket timeout high
     /// so a contended CI box doesn't trip the spawn deadline.
@@ -682,7 +719,7 @@ last_seen_version = "{}"
             node.display(),
             fake_agent.display(),
         );
-        for name in ["claude", "claude-agent-acp", "aoe-agent"] {
+        for name in ["fake-agent", "claude", "claude-agent-acp", "aoe-agent"] {
             let path = bin.join(name);
             std::fs::write(&path, &script).expect("write acp shim");
             #[cfg(unix)]
@@ -714,6 +751,14 @@ last_seen_version = "{}"
         }
         self.extra_path_dirs.push(bin.clone());
         bin
+    }
+
+    /// Install a no-op `claude` and make it the default tool. For tests that
+    /// need an agent allowed in worktrees or sandboxes, which the host-only
+    /// `fake-agent` refuses.
+    pub fn use_claude_agent(&mut self) {
+        self.install_path_command("claude");
+        self.append_config("[session]\ndefault_tool = \"claude\"");
     }
 
     /// Install a PATH stub that records the argv it was invoked with to
@@ -778,7 +823,7 @@ last_seen_version = "{}"
         parse_session_id(&self.run_cli_ok(&[&["add"], args].concat()))
     }
 
-    /// Start a daemon and add a `claude --structured-view` session titled
+    /// Start a daemon and add a `fake-agent --structured-view` session titled
     /// `title` over a fresh git project; returns the daemon port and session id.
     pub fn start_structured_session(&self, title: &str) -> (u16, String) {
         let project = self.project_path();
@@ -789,7 +834,7 @@ last_seen_version = "{}"
             "-t",
             title,
             "-c",
-            "claude",
+            "fake-agent",
             "--structured-view",
         ]);
         (port, id)
@@ -822,7 +867,32 @@ last_seen_version = "{}"
     pub fn append_config(&self, toml: &str) {
         let path = app_dir_in(self.home_path()).join("config.toml");
         let seeded = std::fs::read_to_string(&path).expect("read seeded config");
-        std::fs::write(&path, format!("{seeded}\n{toml}\n")).expect("write config.toml");
+        // Merge when both sides parse so a test can extend a table the harness
+        // seeds (`[session]`); unparsable input is appended verbatim for tests
+        // that exercise invalid config.
+        let merged = match (seeded.parse::<toml::Table>(), toml.parse::<toml::Table>()) {
+            (Ok(mut base), Ok(extra)) => {
+                merge_toml(&mut base, extra);
+                toml::to_string(&base).expect("serialize merged config")
+            }
+            _ => format!("{seeded}\n{toml}\n"),
+        };
+        std::fs::write(&path, merged).expect("write config.toml");
+    }
+
+    /// Remove the seeded `session.default_tool` so tests can exercise tool
+    /// auto-selection.
+    pub fn clear_default_tool(&self) {
+        let path = app_dir_in(self.home_path()).join("config.toml");
+        let mut config: toml::Table = std::fs::read_to_string(&path)
+            .expect("read seeded config")
+            .parse()
+            .expect("parse seeded config");
+        if let Some(toml::Value::Table(session)) = config.get_mut("session") {
+            session.remove("default_tool");
+        }
+        std::fs::write(&path, toml::to_string(&config).expect("serialize config"))
+            .expect("write config.toml");
     }
 
     pub fn sessions_path(&self) -> PathBuf {
@@ -1920,5 +1990,19 @@ fn tui_launch_isolates_daemon_endpoint_from_the_tmux_server() {
             vec![expected; panes],
             "server hostile {hostile}, set_env {explicit:?}"
         );
+    }
+}
+
+/// Recursively merge `extra` into `base`; scalar and array values in `extra` win.
+fn merge_toml(base: &mut toml::Table, extra: toml::Table) {
+    for (key, value) in extra {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(extra_table)) => {
+                merge_toml(base_table, extra_table);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
     }
 }

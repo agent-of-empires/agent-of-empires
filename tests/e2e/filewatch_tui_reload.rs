@@ -19,9 +19,9 @@ fn peer_cli_add_reflects_during_live_send_without_changing_target() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("filewatch_live_send_reload");
-    let bin = h.install_path_command("claude");
-    std::fs::write(bin.join("claude"), "#!/bin/sh\ncat > live-send-input\n")
-        .expect("write interactive claude");
+    let bin = h.install_path_command("fake-agent");
+    std::fs::write(bin.join("fake-agent"), "#!/bin/sh\ncat > live-send-input\n")
+        .expect("write interactive agent");
 
     let active_project = h.project_path();
     let active = h.run_cli(&[
@@ -30,7 +30,7 @@ fn peer_cli_add_reflects_during_live_send_without_changing_target() {
         "-t",
         "active-live",
         "-c",
-        "claude",
+        "fake-agent",
     ]);
     assert!(
         active.status.success(),
@@ -54,7 +54,7 @@ fn peer_cli_add_reflects_during_live_send_without_changing_target() {
         "-t",
         "peer-added",
         "-c",
-        "claude",
+        "fake-agent",
     ]);
     assert!(
         peer.status.success(),

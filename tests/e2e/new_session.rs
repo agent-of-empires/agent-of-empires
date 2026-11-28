@@ -91,6 +91,9 @@ on_create = ["{hook_cmd}"]
 [updates]
 update_check_mode = "off"
 
+[session]
+default_tool = "fake-agent"
+
 [acp]
 structured_view = "off"
 
@@ -258,9 +261,9 @@ async fn test_quit_creation_waits_for_cancellation_admission_before_exit() {
     let mut h = TuiTestHarness::new_in_tmp("quit_creation_ack");
     h.stop_daemon_on_drop();
     h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
-    let bin = h.install_path_command("claude");
+    let bin = h.install_path_command("fake-agent");
     let launched = h.home_path().join("agent-launched");
-    std::fs::write(bin.join("claude"), format!(
+    std::fs::write(bin.join("fake-agent"), format!(
         "#!/bin/sh\ncase \"$1\" in --version|--help) echo '2.1.0'; exit 0;; esac\n: > '{}'\nexec sleep 120\n",
         launched.display(),
     )).unwrap();
@@ -361,8 +364,6 @@ async fn test_quit_creation_waits_for_cancellation_admission_before_exit() {
 /// historical tmux default while opening newly-created sessions in live mode.
 /// No hooks; the sync create path applies.
 fn write_config_new_session_mode_live_send(h: &TuiTestHarness) {
-    let config_path = app_dir_in(h.home_path()).join("config.toml");
-    let config_content = std::fs::read_to_string(&config_path).expect("read harness config");
     std::fs::write(
         app_dir_in(h.home_path()).join("state.toml"),
         format!(
@@ -371,11 +372,7 @@ fn write_config_new_session_mode_live_send(h: &TuiTestHarness) {
         ),
     )
     .expect("write state with harness flags and hook acknowledgment");
-    std::fs::write(
-        config_path,
-        format!("{config_content}\n[session]\nnew_session_mode = \"live_send\"\n"),
-    )
-    .expect("write config with new session mode");
+    h.append_config("[session]\nnew_session_mode = \"live_send\"");
 }
 
 /// New-session mode must remain independent from the setting that controls
@@ -390,8 +387,8 @@ fn test_new_session_enters_live_mode_when_configured() {
     // The daemon starts the agent while creating, so the pane must outlive the
     // attach this test is about: a stub agent that exits immediately would make
     // the live-send preparation fail for a reason unrelated to the mode.
-    let bin = h.install_path_command("claude");
-    std::fs::write(bin.join("claude"), "#!/bin/sh\nexec sleep 120\n").unwrap();
+    let bin = h.install_path_command("fake-agent");
+    std::fs::write(bin.join("fake-agent"), "#!/bin/sh\nexec sleep 120\n").unwrap();
     let project = h.project_path();
     h.spawn_tui();
 
@@ -533,7 +530,7 @@ fn test_new_from_selection_starts_on_the_selected_sessions_agent() {
         h.wait_for_absent(" New Session ", Duration::from_secs(5));
     };
 
-    new_from_selection_shows("group", "claude");
+    new_from_selection_shows("group", "fake-agent");
     h.send_keys("j");
     new_from_selection_shows("session", "codex");
 }
@@ -545,12 +542,12 @@ fn test_new_from_selection_starts_on_the_selected_sessions_agent() {
 fn test_a_failing_on_create_hook_offers_create_without_setup() {
     require_tmux!();
     let mut h = TuiTestHarness::new("create_hook_failed");
-    let bin = h.install_path_command("claude");
+    let bin = h.install_path_command("fake-agent");
     std::fs::write(
-        bin.join("claude"),
+        bin.join("fake-agent"),
         "#!/bin/sh\ncase \"$1\" in --help) exit 0;; esac\nexec sleep 300\n",
     )
-    .expect("write claude stub");
+    .expect("write fake-agent stub");
     write_config_with_hooks(&h, "exit 3");
     // Live mode keeps the home view, and so the new row, on screen after the create.
     h.append_config("[session]\nnew_session_mode = \"live_send\"");

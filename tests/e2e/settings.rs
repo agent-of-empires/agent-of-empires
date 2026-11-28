@@ -61,14 +61,10 @@ fn settings_shortcut_bar_hides_the_row_and_survives_restart() {
 fn shortcut_bar_hidden_live_still_relays_input_and_exits() {
     require_tmux!();
     let mut h = TuiTestHarness::new("shortcut_bar_live");
-    let config_path = app_dir_in(h.home_path()).join("config.toml");
-    let mut config = std::fs::read_to_string(&config_path).unwrap();
-    config
-        .push_str("\n[session]\nshow_shortcut_bar = false\ndefault_attach_mode = \"live_send\"\n");
-    std::fs::write(&config_path, config).unwrap();
-    let bin = h.install_path_command("claude");
+    h.append_config("[session]\nshow_shortcut_bar = false\ndefault_attach_mode = \"live_send\"");
+    let bin = h.install_path_command("fake-agent");
     std::fs::write(
-        bin.join("claude"),
+        bin.join("fake-agent"),
         "#!/bin/sh\nstty -echo\ncount=0\ntrap 'count=$((count + 1)); printf \"interrupt-%s-reached-agent\\n\" \"$count\"' INT\nprintf 'agent-ready\\n'\nwhile :; do IFS= read -r line && printf '%s\\n' \"$line\"; done\n",
     )
     .unwrap();
@@ -259,6 +255,8 @@ fn settings_migration_applies_poller_limit_on_the_first_tui_start() {
 
     require_tmux!();
     let mut h = TuiTestHarness::new("settings_migration_poller_limit");
+    // Only agents with session-id capture compete for the poller budget.
+    h.install_path_command("claude");
     h.set_env("AOE_LOG_LEVEL", "debug");
     let app = app_dir_in(h.home_path());
     let mut config: toml::Table = fs::read_to_string(app.join("config.toml"))
