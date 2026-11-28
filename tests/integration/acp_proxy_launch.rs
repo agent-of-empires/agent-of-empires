@@ -363,6 +363,7 @@ mod attach {
             None,
             Some(proxy_spec()),
             false,
+            Some(proxy_spec().adapter),
         )
         .await
     }
