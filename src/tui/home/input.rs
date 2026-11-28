@@ -29,6 +29,7 @@ use crate::tui::dialogs::{DashboardLaunch, ServeAction, ServeView};
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
+use crate::tui::suggestions::SuggestionsAction;
 
 /// Empty Trash checkbox keys.
 const EMPTY_TRASH_FORCE_FAILED: &str = "force_failed";
@@ -1391,7 +1392,38 @@ impl HomeView {
                 }
                 None
             }
+            "approve_suggestion_hooks" => {
+                self.suggestions_feed.approve_held_trust();
+                None
+            }
+            "suggestion_auto_start" => {
+                let turned = self.suggestions_feed.confirm_auto_start();
+                if let Some(view) = &mut self.suggestions_view {
+                    match turned {
+                        Ok(()) => view.set_notice("Turning on auto start…"),
+                        Err(reason) => view.set_error(reason),
+                    }
+                }
+                None
+            }
+            "suggestion_pre_trust" => {
+                let turned = self.suggestions_feed.turn_on_pre_trust();
+                if let Some(view) = &mut self.suggestions_view {
+                    match turned {
+                        Ok(()) => view.set_notice("Turning on pre-trust…"),
+                        Err(reason) => view.set_error(reason),
+                    }
+                }
+                None
+            }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
+            "copy_undelivered_prompt" => {
+                if let Some(text) = self.undelivered_prompt.take() {
+                    crate::tui::clipboard::copy_to_clipboard(&text);
+                    self.flash_status("Prompt copied");
+                }
+                None
+            }
             "resume_reveal" => {
                 if let Some(intent) = self.retained_reveal.take() {
                     if let Err(error) = self.continue_reveal(intent) {
@@ -1869,7 +1901,7 @@ impl HomeView {
         }
         if let Some(dialog) = &self.info_dialog {
             if let Some(DialogResult::Cancel) = dialog.handle_click(col, row) {
-                self.info_dialog = None;
+                self.dismiss_info_dialog();
             }
             return true;
         }
@@ -1980,6 +2012,11 @@ impl HomeView {
             return true;
         }
         if let Some(dialog) = &mut self.worktree_name_dialog {
+            let key = dialog.handle_click(col, row);
+            self.press_dialog_key(key);
+            return true;
+        }
+        if let Some(dialog) = &mut self.sandbox_login_dialog {
             let key = dialog.handle_click(col, row);
             self.press_dialog_key(key);
             return true;
@@ -2144,31 +2181,38 @@ impl HomeView {
                 } else {
                     data.command_override.clone()
                 };
-                if let Some(hook_agent) =
-                    crate::session::host_hook_agent(&tool_name, &command, &resolved_config.session)
-                {
-                    let config = crate::session::config::load_config().ok().flatten();
-                    let hooks_enabled = resolved_config.session.agent_status_hooks;
-                    let acknowledged = config
-                        .as_ref()
-                        .map(|c| c.app_state.has_acknowledged_agent_hooks)
-                        .unwrap_or(false);
-
-                    // A sandboxed session stages its hooks in its own container
-                    // config and the launch gate never asks, so asking here
-                    // would consent to a write that cannot happen.
-                    if !data.sandbox
+                let config = crate::session::config::load_config().ok().flatten();
+                let hooks_enabled = resolved_config.session.agent_status_hooks;
+                let acknowledged = config
+                    .as_ref()
+                    .map(|c| c.app_state.has_acknowledged_agent_hooks)
+                    .unwrap_or(false);
+                // A sandboxed session stages its hooks in its own container
+                // config and the launch gate never asks, so asking here
+                // would consent to a write that cannot happen.
+                let dialog_for = |hook_agent: &crate::agents::AgentDef| {
+                    (!data.sandbox
                         && crate::agents::hook_install_required(hook_agent, hooks_enabled)
-                        && !acknowledged
-                    {
-                        self.hooks_install_dialog = Some(HooksInstallDialog::new(
-                            &tool_name,
-                            hook_agent,
-                            &resolved_config,
-                        ));
-                        self.pending_hooks_install_data = Some(data);
-                        return None;
-                    }
+                        && !acknowledged)
+                        .then(|| HooksInstallDialog::new(&tool_name, hook_agent, &resolved_config))
+                };
+                let dialog = match crate::session::host_hook_declared_agent(
+                    &tool_name,
+                    &command,
+                    &resolved_config.session,
+                ) {
+                    Some(declared) => declared.with_definition(dialog_for).flatten(),
+                    None => crate::session::host_hook_agent(
+                        &tool_name,
+                        &command,
+                        &resolved_config.session,
+                    )
+                    .and_then(dialog_for),
+                };
+                if let Some(dialog) = dialog {
+                    self.hooks_install_dialog = Some(dialog);
+                    self.pending_hooks_install_data = Some(data);
+                    return None;
                 }
 
                 self.maybe_confirm_volume_ignores_globs(data)
@@ -2257,6 +2301,121 @@ impl HomeView {
                     return None;
                 }
             }
+        }
+
+        if !self.has_non_live_send_overlay()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('k' | 'K'))
+        {
+            if let Some(selected) = self
+                .suggestions_view
+                .as_ref()
+                .filter(|_| self.suggestions_focused)
+                .map(|v| v.selected_key())
+            {
+                // Nothing selected (empty or loading list): nothing to open, no error.
+                if let Some(key) = selected {
+                    match self.open_source_command(&key) {
+                        Some(command) => {
+                            self.command_palette = Some(CommandPaletteDialog::new(vec![command]));
+                        }
+                        None => {
+                            if let Some(view) = &mut self.suggestions_view {
+                                view.set_error("This suggestion has no link to open");
+                            }
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+        let overlay = self.has_non_live_send_overlay();
+        if let (Some(view), true, false) = (
+            &mut self.suggestions_view,
+            self.suggestions_focused,
+            overlay,
+        ) {
+            let block = self.session_feed.mutation_block();
+            match view.handle_key(key, block, &mut self.suggestions_feed) {
+                SuggestionsAction::Continue => {}
+                SuggestionsAction::Unfocus => self.suggestions_focused = false,
+                SuggestionsAction::TurnOnPreTrust if !self.suggestions_feed.hold_pre_trust() => {
+                    if let Some(view) = &mut self.suggestions_view {
+                        view.set_error(
+                            "Suggestions are not loaded, so pre-trust was not turned on.",
+                        );
+                    }
+                }
+                SuggestionsAction::ConfirmAutoStart {
+                    provider_id,
+                    criterion,
+                    yolo,
+                } => {
+                    self.suggestions_feed
+                        .hold_auto_start(provider_id, criterion);
+                    let yolo = if yolo {
+                        "\n\nThis kind runs in YOLO mode, so its suggestions are never auto started."
+                    } else {
+                        ""
+                    };
+                    self.confirm_dialog = Some(
+                        ConfirmDialog::new(
+                            "Turn on auto start",
+                            &format!(
+                                "Auto start launches an agent on text written by others (issue and PR content) with no human check.{yolo}\n\nFrom the next refresh, new suggestions of this kind start with their preset, up to 3 per refresh and once each. A suggestion whose repo is not linked to one Project, or whose hooks need a review, stays a normal suggestion with a note.\n\nTurn it on?"
+                            ),
+                            "suggestion_auto_start",
+                        )
+                        .neutral()
+                        .buttons("Turn on auto start", "Cancel"),
+                    );
+                }
+                SuggestionsAction::TurnOnPreTrust => {
+                    self.confirm_dialog = Some(
+                        ConfirmDialog::new(
+                            "Turn on pre-trust",
+                            "Claude Code asked whether to trust this folder, so the prompt was not typed.\n\nPre-trust starts each new Session's folder trusted. It also turns on the repository's own Claude Code settings file, so its hooks run without asking.\n\nTurn it on?",
+                            "suggestion_pre_trust",
+                        )
+                        .neutral()
+                        .buttons("Turn on pre-trust", "Cancel"),
+                    );
+                }
+                // One retry continues at a time: a second would replace the first's.
+                SuggestionsAction::TryAgain(..) if self.start_after_trash.is_some() => {
+                    if let Some(view) = &mut self.suggestions_view {
+                        view.set_error(
+                            "Another Session is still moving to Trash. Try again once it has started.",
+                        );
+                    }
+                }
+                SuggestionsAction::TryAgain(key, session_id) => {
+                    let epoch = self.session_feed.applied_epoch().map(str::to_owned);
+                    let origin = self.suggestions_feed.origin();
+                    if let Some(epoch) = epoch.filter(|_| self.trash_session_by_id(&session_id)) {
+                        self.start_after_trash = Some(super::RetryAfterTrash {
+                            session_id,
+                            key,
+                            epoch,
+                            origin,
+                        });
+                        if let Some(view) = &mut self.suggestions_view {
+                            view.set_notice(
+                                "Moving the blocked Session to Trash, then starting again…",
+                            );
+                        }
+                    }
+                }
+                SuggestionsAction::OpenSession(id) => match self.try_open_linked_session(&id) {
+                    Ok(()) => self.suggestions_focused = false,
+                    Err(reason) => {
+                        if let Some(view) = &mut self.suggestions_view {
+                            view.set_error(reason);
+                        }
+                    }
+                },
+            }
+            return None;
         }
 
         // Live-send capture normally wins over every other key handler: the home view is
@@ -2452,7 +2611,7 @@ impl HomeView {
                 match dialog.handle_key(key) {
                     DialogResult::Continue => {}
                     DialogResult::Cancel | DialogResult::Submit(_) => {
-                        self.info_dialog = None;
+                        self.dismiss_info_dialog();
                         if let Some(session_id) = self.pending_attach_after_warning.take() {
                             return Some(Action::AttachSession(session_id));
                         }
@@ -2741,6 +2900,15 @@ impl HomeView {
                         }
                     }
                 }
+            }
+            return None;
+        }
+
+        if let Some(dialog) = &mut self.sandbox_login_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => self.close_sandbox_login(),
+                DialogResult::Submit(request) => self.run_sandbox_login_request(request),
             }
             return None;
         }
@@ -3218,36 +3386,6 @@ impl HomeView {
                 SidebarPosition::Left => self.grow_list(),
                 SidebarPosition::Right => self.shrink_list(),
             },
-            KeyCode::Enter => {
-                if self.selected_session.is_some() {
-                    return self.activate_selected_session();
-                } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
-                    let path = path.clone();
-                    self.toggle_group_collapsed(&path);
-                }
-            }
-            // Tab is the activation key's complement: whichever of live-send and tmux
-            // attach `Enter` doesn't do. Only fires when `live_send` is None.
-            KeyCode::Tab => {
-                if self.selected_is_trashed() {
-                    return None;
-                }
-                let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
-                // Neither Tab meaning has a pane to reach in a structured view, so the
-                // press takes the session's native view through the same activation as
-                // Enter: that dismisses System Health, which would otherwise leave the
-                // composer it focuses behind a panel the next key cannot reach.
-                if live_key == Some(None) {
-                    return self.activate_selected_session();
-                }
-                if live_key == Some(Some(LiveKey::Enter)) {
-                    if let Some(action) = self.tab_attach_action() {
-                        return Some(action);
-                    }
-                } else if let Some(action) = self.start_live_send() {
-                    return Some(action);
-                }
-            }
             KeyCode::Left | KeyCode::Char('h') => {
                 if let Some(Item::Group {
                     path, collapsed, ..
@@ -3260,6 +3398,9 @@ impl HomeView {
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
+                if self.focus_suggestions_pane() {
+                    return None;
+                }
                 if let Some(Item::Group {
                     path, collapsed, ..
                 }) = self.flat_items.get(self.cursor)
@@ -3355,7 +3496,7 @@ impl HomeView {
 
     /// Execute a resolved [`ActionId`], the single home for each action's behavior, so
     /// the keyboard dispatcher and the command palette cannot diverge.
-    fn run_action(
+    pub(super) fn run_action(
         &mut self,
         id: ActionId,
         update_info: Option<&crate::update::UpdateInfo>,
@@ -3383,6 +3524,7 @@ impl HomeView {
                     | ActionId::Projects
                     | ActionId::Plugins
                     | ActionId::Skills
+                    | ActionId::SandboxLogin
                     | ActionId::Update
                     | ActionId::ToggleArchive
                     | ActionId::Delete
@@ -3403,6 +3545,7 @@ impl HomeView {
                     | ActionId::PreviewScrollUp
                     | ActionId::PreviewScrollDown
                     | ActionId::DismissUpdateBanner
+                    | ActionId::Activate
             )
         {
             return None;
@@ -3412,6 +3555,31 @@ impl HomeView {
         }
         match id {
             ActionId::Quit => return Some(Action::Quit),
+            ActionId::Activate => {
+                if self.focus_suggestions_pane() {
+                    return None;
+                }
+                if self.selected_session.is_some() {
+                    return self.activate_selected_session();
+                } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
+                    let path = path.clone();
+                    self.toggle_group_collapsed(&path);
+                }
+            }
+            ActionId::ActivateAlt => {
+                let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
+                // Neither meaning has a pane to reach in a structured view, so the press
+                // takes the session's native view through the same activation as
+                // `Activate`: that dismisses System Health, which would otherwise leave the
+                // composer it focuses behind a panel the next key cannot reach.
+                if live_key == Some(None) {
+                    return self.activate_selected_session();
+                }
+                if live_key == Some(Some(LiveKey::Enter)) {
+                    return self.tab_attach_action();
+                }
+                return self.start_live_send();
+            }
             ActionId::ResolveIndeterminate => {
                 if self.pending_indeterminate_queue.is_empty()
                     && !self.session_feed.namespace_indeterminate()
@@ -3495,6 +3663,7 @@ impl HomeView {
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_connections(),
             ActionId::Settings => self.open_settings(),
+            ActionId::Suggestions => self.focus_suggestions(),
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
                 let profile = self.config_profile();
@@ -3506,6 +3675,7 @@ impl HomeView {
             ActionId::Skills => {
                 self.skills_manager_dialog = Some(crate::tui::dialogs::SkillsManagerDialog::new());
             }
+            ActionId::SandboxLogin => self.open_sandbox_login(),
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
             ActionId::ToggleArchive => {
@@ -3915,7 +4085,8 @@ impl HomeView {
                 Err(denied) => {
                     let dialog_title = match denied {
                         crate::session::ForkDenied::AgentCannotFork { .. }
-                        | crate::session::ForkDenied::ChildNotCapturable { .. } => {
+                        | crate::session::ForkDenied::ChildNotCapturable { .. }
+                        | crate::session::ForkDenied::SandboxedParent { .. } => {
                             "Fork not supported"
                         }
                         crate::session::ForkDenied::NoParentSession
@@ -4391,6 +4562,7 @@ impl HomeView {
             view_mode: self.view_mode.clone(),
             sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
+            session_selected: self.selected_session.is_some(),
             project_group_selected: self.project_group_at_cursor().is_some(),
             preview_scroll: live_send || (self.selected_is_trashed() && !self.system_health_open),
         }
@@ -4399,15 +4571,8 @@ impl HomeView {
     /// The jump and preview-scroll actions live-send takes from the agent; every other
     /// registry chord relays to the pane.
     fn live_send_action(&self, key: &KeyEvent) -> Option<ActionId> {
-        bindings::resolve(key, self.strict_hotkeys, &self.bindings_ctx(true)).filter(|id| {
-            matches!(
-                id,
-                ActionId::JumpPrevFinished
-                    | ActionId::JumpNextFinished
-                    | ActionId::PreviewScrollUp
-                    | ActionId::PreviewScrollDown
-            )
-        })
+        bindings::resolve(key, self.strict_hotkeys, &self.bindings_ctx(true))
+            .filter(|id| super::keybinds::is_live_action(*id))
     }
 
     fn open_command_palette(&mut self) {
@@ -4427,6 +4592,11 @@ impl HomeView {
             hotkey: bindings::label(ActionId::Quit, self.strict_hotkeys),
             payload: PaletteAction::Invoke(ActionId::Quit),
         });
+
+        if !self.sandbox_login_listed() {
+            let login = bindings::palette_id(ActionId::SandboxLogin);
+            entries.retain(|entry| entry.id != login);
+        }
 
         // Dynamic session/group entries, one per flat_items row, so the user can
         // fuzzy-search and jump to it. In-flight sessions are tagged in the title so it is
@@ -4492,6 +4662,7 @@ impl HomeView {
                         payload: PaletteAction::JumpToCursor(idx),
                     });
                 }
+                Item::Suggested { .. } => {}
             }
         }
 
@@ -4562,11 +4733,15 @@ impl HomeView {
                 None
             }
             PaletteAction::ToolSession(tool_name) => self.activate_tool(tool_name, false),
+            PaletteAction::OpenLink(url) => {
+                self.open_link(&url);
+                None
+            }
             PaletteAction::Cheat(message) => Some(Action::SetTransientStatus(message)),
         }
     }
 
-    fn jump_to_session_id(&mut self, id: &str) {
+    pub(super) fn jump_to_session_id(&mut self, id: &str) {
         if let Some(idx) = self
             .flat_items
             .iter()
@@ -4626,7 +4801,7 @@ impl HomeView {
             .iter()
             .filter_map(|item| match item {
                 Item::Session { id, .. } => Some(id.clone()),
-                Item::Group { .. } => None,
+                Item::Group { .. } | Item::Suggested { .. } => None,
             })
             .collect();
         let current_session = self.selected_session.clone();
@@ -4889,6 +5064,13 @@ impl HomeView {
                         self.selected_group_profile = self.profile_for_cursor(self.cursor);
                     }
                 }
+                Item::Suggested { .. } => {
+                    self.selected_session = None;
+                    self.selected_group = None;
+                    self.selected_group_profile = None;
+                    self.system_health_open = false;
+                    self.ensure_suggestions_view();
+                }
             }
             if self.selected_session != prev_session {
                 self.live_takeover = None;
@@ -4991,19 +5173,22 @@ impl HomeView {
     /// Info-dialog copy for a rename/delete attempted on a header derived automatically
     /// (Project/Org/Status), where there is no user-owned group to act on. `None` for `Manual`,
     /// where the caller proceeds with its normal flow.
-    fn automatic_group_hint(&self) -> Option<(String, String)> {
+    pub(super) fn automatic_group_hint(&self) -> Option<(String, String)> {
         let mode_label = match self.group_by {
             GroupByMode::Manual => return None,
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
             GroupByMode::Status => "Status",
         };
-        let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
+        let toggle = self.key_label(ActionId::GroupBy);
+        let how = if toggle.is_empty() {
+            "Pick Manual grouping".to_string()
+        } else {
+            format!("Press {toggle} and pick Manual")
+        };
         Some((
             format!("Cannot Modify {mode_label} Groups"),
-            format!(
-                "{mode_label} groups are automatic. Press {toggle} and pick Manual to manage groups."
-            ),
+            format!("{mode_label} groups are automatic. {how} to manage groups."),
         ))
     }
 
@@ -5529,6 +5714,10 @@ impl HomeView {
                     return true;
                 }
             }
+            // The Suggested row has no session or group actions to offer.
+            if matches!(self.flat_items[idx], super::Item::Suggested { .. }) {
+                return true;
+            }
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
             // A real project header in project view gets the pin menu; the cursor was
             // just moved onto this row, so `project_group_at_cursor` reflects it.
@@ -5544,13 +5733,11 @@ impl HomeView {
                         .get_instance(id)
                         .map(|inst| (inst.is_archived(), inst.is_snoozed(), inst.is_unread()))
                         .unwrap_or((false, false, false)),
-                    super::Item::Group { .. } => (false, false, false),
+                    _ => (false, false, false),
                 };
-                // Snooze is an Attention-sort triage primitive: the `'h'`
-                // keybinding only fires in Attention sort, so the menu omits
-                // the Snooze row everywhere else to keep the mouse and keyboard
-                // paths in step.
-                let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
+                // Snooze acts on a session row in any sort order, matching `'h'`.
+                // A group header has no session, so it keeps `h` for collapse.
+                let snooze = matches!(self.flat_items[idx], super::Item::Session { .. })
                     .then_some(is_snoozed);
                 // The unread toggle is always-on (any sort), so it shows
                 // whenever the feature is enabled.
@@ -5560,7 +5747,7 @@ impl HomeView {
                 // refuse. Matches the web sidebar's `acp_can_fork` gating.
                 let can_fork = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_can_fork(id),
-                    super::Item::Group { .. } => false,
+                    _ => false,
                 };
                 // View switching mirrors the web sidebar's per-session
                 // switch action: offered when a structured session can go
@@ -5568,25 +5755,16 @@ impl HomeView {
                 // ACP-capable. The swap runs through the daemon.
                 let switch_view = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
-                    super::Item::Group { .. } => None,
+                    _ => None,
                 };
-                let update_restart = match &self.flat_items[idx] {
-                    super::Item::Session { id, .. } => self.update_restart_offered(id),
-                    super::Item::Group { .. } => false,
-                };
-                let menu = ContextMenuDialog::for_session(
+                ContextMenuDialog::for_session(
                     anchor,
                     is_archived,
                     snooze,
                     unread,
                     can_fork,
                     switch_view,
-                );
-                if update_restart {
-                    menu.with_restart_for_update()
-                } else {
-                    menu
-                }
+                )
             });
             return true;
         }
@@ -5722,15 +5900,6 @@ impl HomeView {
             ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::Fork => self.open_fork_from_selection(),
             ContextMenuAction::SwitchView => self.prompt_switch_view_for_selected(),
-            ContextMenuAction::RestartForUpdate => {
-                if let Err(e) = self.restart_selected_for_update() {
-                    tracing::warn!("restart_selected_for_update failed: {}", e);
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Restart Failed",
-                        &format!("Could not restart session: {e}"),
-                    ));
-                }
-            }
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::AddProject => self.open_add_project_for_selected(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
@@ -5813,7 +5982,7 @@ impl HomeView {
     pub(super) fn open_tips_dialog(&mut self) {
         crate::tui::telemetry::report_feature_use(crate::telemetry::feature_use::FeatureUse::Tips);
         let config = load_config().ok().flatten().unwrap_or_default();
-        let signals = crate::tips::TipSignals::from(&config);
+        let signals = self.tip_signals(&config);
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
             eligible,
@@ -5848,7 +6017,7 @@ impl HomeView {
             }
         }
         if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
-            self.tips_unseen = super::tips_unseen_count(&config);
+            self.tips_unseen = self.tips_unseen_count(&config);
         }
     }
 
@@ -5863,7 +6032,7 @@ impl HomeView {
             return;
         }
         if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
-            self.tips_unseen = super::tips_unseen_count(&config);
+            self.tips_unseen = self.tips_unseen_count(&config);
         }
     }
 
@@ -5888,14 +6057,14 @@ impl HomeView {
             return;
         }
         if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
-            self.tips_unseen = super::tips_unseen_count(&config);
+            self.tips_unseen = self.tips_unseen_count(&config);
         }
     }
 
     /// Refresh on startup and the storage heartbeat, including creates in other profiles.
     pub(super) fn refresh_shortcut_bar_tip(&mut self) {
         if let Ok(Some(config)) = load_config() {
-            self.tips_unseen = super::tips_unseen_count(&config);
+            self.tips_unseen = self.tips_unseen_count(&config);
             self.queue_shortcut_bar_tip(&config);
         }
     }
@@ -5907,7 +6076,7 @@ impl HomeView {
         self.pending_tip_pop = crate::tips::eligible_unseen(
             crate::tips::TipSurface::Tui,
             &config.app_state.tips_seen,
-            &crate::tips::TipSignals::from(config),
+            &self.tip_signals(config),
         )
         .into_iter()
         .find(|tip| tip.id == crate::tips::SHORTCUT_BAR_TIP_ID);
@@ -5941,12 +6110,39 @@ impl HomeView {
         if !config.session.show_tips {
             return;
         }
-        let signals = crate::tips::TipSignals::from(&config);
+        let signals = self.tip_signals(&config);
         self.pending_tip_pop = crate::tips::next_earned_pop(
             crate::tips::TipSurface::Tui,
             &config.app_state.tips_seen,
             &signals,
         );
+    }
+
+    /// Arm the suggested-sessions tip at launch. Its signal comes from the
+    /// daemon's suggestions snapshot, so it queues once the first one loads.
+    pub(in crate::tui) fn arm_suggested_sessions_tip(&mut self) {
+        self.suggested_sessions_tip_armed = true;
+    }
+
+    /// Queue the armed suggested-sessions tip when it is eligible and unseen.
+    /// An ineligible one would hold the single pop slot until a key drains it,
+    /// blocking the shortcut bar tip the heartbeat queues.
+    pub(super) fn queue_suggested_sessions_tip(&mut self) {
+        if self.suggestions_feed.providers_enabled().is_none() {
+            return;
+        }
+        self.suggested_sessions_tip_armed = false;
+        let config = load_config().ok().flatten().unwrap_or_default();
+        self.tips_unseen = self.tips_unseen_count(&config);
+        if self.pending_tip_pop.is_none() && config.session.show_tips {
+            self.pending_tip_pop = crate::tips::eligible_unseen(
+                crate::tips::TipSurface::Tui,
+                &config.app_state.tips_seen,
+                &self.tip_signals(&config),
+            )
+            .into_iter()
+            .find(|tip| tip.id == crate::tips::SUGGESTED_SESSIONS_TIP_ID);
+        }
     }
 
     /// Open the queued earned tip as a one-tip overlay, if any. Called when the home view
@@ -5961,7 +6157,7 @@ impl HomeView {
             || !crate::tips::eligible_unseen(
                 crate::tips::TipSurface::Tui,
                 &config.app_state.tips_seen,
-                &crate::tips::TipSignals::from(&config),
+                &self.tip_signals(&config),
             )
             .iter()
             .any(|eligible| eligible.id == tip.id)
@@ -6332,6 +6528,8 @@ impl HomeView {
         row: u16,
     ) -> Option<Action> {
         let abs_idx = self.resolve_row_to_index(col, row)?;
+        // A click in the list gives it the keys back from the suggestions pane.
+        self.suggestions_focused = false;
 
         let is_double_click = matches!(
             self.last_click,
@@ -6359,12 +6557,29 @@ impl HomeView {
                     self.activate_selected_session()
                 }
                 Item::Group { .. } => None,
+                Item::Suggested { .. } => {
+                    if let Some(state) = self.live_send.clone() {
+                        self.exit_live_send_and_restore_sizing(&state);
+                    }
+                    self.cursor = abs_idx;
+                    self.update_selected();
+                    self.focus_suggestions_pane();
+                    None
+                }
             };
         }
 
         match item {
             Item::Group { path, .. } => {
                 self.toggle_group_collapsed(&path);
+                None
+            }
+            Item::Suggested { .. } => {
+                if let Some(state) = self.live_send.clone() {
+                    self.exit_live_send_and_restore_sizing(&state);
+                }
+                self.cursor = abs_idx;
+                self.update_selected();
                 None
             }
             Item::Session { id, .. } => {
@@ -6589,6 +6804,9 @@ impl HomeView {
         if let Some(dialog) = &mut self.worktree_name_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
+        if let Some(dialog) = &mut self.sandbox_login_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
         if let Some(dialog) = &mut self.send_message_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
@@ -6796,6 +7014,10 @@ impl HomeView {
             return;
         }
         if let Some(ref mut dialog) = self.worktree_name_dialog {
+            dialog.handle_paste(text);
+            return;
+        }
+        if let Some(ref mut dialog) = self.sandbox_login_dialog {
             dialog.handle_paste(text);
             return;
         }
@@ -7147,7 +7369,7 @@ impl HomeView {
     /// live-send's resize loop forces manual sizing, which would leave the next attach
     /// from a full-size terminal cramped at the preview dimensions. Re-setting
     /// `window-size latest` is best-effort, so a stuck pane never blocks the exit.
-    fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
+    pub(super) fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
         let session = crate::tmux::Session::from_name(&state.tmux_name);
         session.reset_size_to_latest_client();
         self.teardown_live_send();
@@ -7326,10 +7548,16 @@ impl HomeView {
     pub(super) fn note_live_takeover(&mut self, taken: live_send::TakenLive) {
         if !self.show_shortcut_bar {
             let label = taken.taker.label();
-            self.flash_status(match self.live_key(&taken.session_id) {
-                Some(LiveKey::Tab) => format!("{label}: Tab to take it back"),
-                Some(LiveKey::Enter) => format!("{label}: Enter to take it back"),
-                None => label.to_string(),
+            let id = match self.live_key(&taken.session_id) {
+                Some(LiveKey::Tab) => Some(ActionId::ActivateAlt),
+                Some(LiveKey::Enter) => Some(ActionId::Activate),
+                None => None,
+            };
+            let key = id.map_or_else(String::new, |id| bindings::label(id, self.strict_hotkeys));
+            self.flash_status(if key.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label}: {key} to take it back")
             });
         }
         self.live_takeover = Some(taken);
@@ -7604,6 +7832,10 @@ impl HomeView {
             dialog.handle_paste(&s);
             return;
         }
+        if let Some(ref mut dialog) = self.sandbox_login_dialog {
+            dialog.handle_paste(&s);
+            return;
+        }
 
         if let Some((id, title, target)) = self.resolve_send_target() {
             let label = live_send::format_target_label(&title, &target);
@@ -7672,6 +7904,7 @@ impl HomeView {
                 Item::Group { name, path, .. } => {
                     format!("{} {}", name, path)
                 }
+                Item::Suggested { .. } => "Suggested".to_string(),
             };
 
             let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
@@ -7726,6 +7959,7 @@ impl HomeView {
                 Item::Group { name, path, .. } => {
                     format!("{} {}", name, path)
                 }
+                Item::Suggested { .. } => "Suggested".to_string(),
             };
 
             let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
@@ -8334,6 +8568,8 @@ mod tests {
             scratch: false,
             fork_seed: None,
             structured: false,
+            initial_prompt: None,
+            suggestion: None,
         }
     }
 

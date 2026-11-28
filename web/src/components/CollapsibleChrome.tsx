@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 
 import { collapsibleInnerClass, collapsibleRegionClass } from "../lib/collapsibleChrome";
 
-/** Chrome region (top bar, composer) that collapses to zero layout height. */
+/** Chrome region, such as a phone's composer, that collapses to zero layout height. */
 export function CollapsibleRegion({
   id,
   collapsed,
@@ -25,9 +25,6 @@ export function CollapsibleRegion({
 }
 
 interface HandleProps {
-  /** `top` hangs the handle below the region (collapsing top chrome),
-   *  `bottom` hangs it above the region (collapsing bottom chrome). */
-  edge: "top" | "bottom";
   collapsed: boolean;
   onToggle: () => void;
   collapseLabel: string;
@@ -37,9 +34,8 @@ interface HandleProps {
   testId: string;
 }
 
-/** Persistent collapse handle for a {@link CollapsibleRegion}. */
+/** Persistent collapse handle hung above a {@link CollapsibleRegion} at the bottom of the screen. */
 export function ChromeCollapseHandle({
-  edge,
   collapsed,
   onToggle,
   collapseLabel,
@@ -47,9 +43,8 @@ export function ChromeCollapseHandle({
   controlsId,
   testId,
 }: HandleProps) {
-  // Expanded top chrome points up (tap to fold it away upward); expanded
-  // bottom chrome points down. Collapsed flips both.
-  const pointsUp = edge === "top" ? !collapsed : collapsed;
+  // Expanded, it points down (tap to fold the region away); collapsed, up.
+  const pointsUp = collapsed;
   const label = collapsed ? expandLabel : collapseLabel;
   return (
     <div className="relative z-20 h-0 shrink-0">
@@ -61,9 +56,7 @@ export function ChromeCollapseHandle({
         aria-label={label}
         title={label}
         data-testid={testId}
-        className={`absolute right-3 flex h-4 w-7 items-center justify-center border-surface-700/60 bg-surface-850/95 text-brand-500 shadow-sm cursor-pointer transition-colors hover:text-brand-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
-          edge === "top" ? "top-0 rounded-b-md border-x border-b" : "bottom-0 rounded-t-md border-x border-t"
-        }`}
+        className="absolute right-3 bottom-0 flex h-4 w-7 items-center justify-center rounded-t-md border-x border-t border-surface-700/60 bg-surface-850/95 text-brand-500 shadow-sm cursor-pointer transition-colors hover:text-brand-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600"
       >
         <svg
           width="7"

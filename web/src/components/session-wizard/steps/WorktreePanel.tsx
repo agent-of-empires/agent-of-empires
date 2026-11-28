@@ -5,6 +5,9 @@ import { ToggleRow } from "./Toggle";
 import type { WizardData } from "../wizardReducer";
 import { hasFinePointer } from "../../../lib/platform";
 import { isImeComposing } from "../../../lib/ime";
+import { INPUT } from "../../../lib/surfaces";
+import { LISTBOX, LISTBOX_OPTION, LISTBOX_OPTION_ACTIVE } from "../WizardRows";
+import { FIELD_HINT, FIELD_LABEL } from "../../../lib/surfaces";
 
 interface Props {
   data: WizardData;
@@ -16,7 +19,7 @@ export function WorktreePanel({ data, onChange }: Props) {
   const hasExtraRepos = data.extraRepoPaths.length > 0;
   return (
     <div>
-      <label htmlFor="wizard-worktree-branch" className="block text-sm text-text-dim mb-1.5">
+      <label htmlFor="wizard-worktree-branch" className={FIELD_LABEL}>
         Branch / worktree name
       </label>
       <input
@@ -26,9 +29,9 @@ export function WorktreePanel({ data, onChange }: Props) {
         value={data.worktreeBranch}
         onChange={(e) => onChange("worktreeBranch", e.target.value)}
         placeholder="Uses session title if empty"
-        className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2.5 text-base md:text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+        className={`${INPUT} font-mono`}
       />
-      <p className="text-xs text-text-dim mt-1">The branch name is also the worktree directory name.</p>
+      <p className={`${FIELD_HINT} mt-1`}>The branch name is also the worktree directory name.</p>
       {data.attachExisting && <ExistingWorktrees data={data} onChange={onChange} />}
 
       <ToggleRow
@@ -86,14 +89,15 @@ function ExistingWorktrees({
     };
   }, [data.path]);
 
-  if (loaded?.path !== data.path) return <p className="text-xs text-text-dim mt-2">Loading worktrees...</p>;
-  if (!loaded.rows) return <p className="text-xs text-text-dim mt-2">Could not list worktrees.</p>;
-  if (loaded.rows.length === 0) return <p className="text-xs text-text-dim mt-2">No existing worktrees found.</p>;
+  const note = `${FIELD_HINT} mt-2`;
+  if (loaded?.path !== data.path) return <p className={note}>Loading worktrees...</p>;
+  if (!loaded.rows) return <p className={note}>Could not list worktrees.</p>;
+  if (loaded.rows.length === 0) return <p className={note}>No existing worktrees found.</p>;
 
   return (
     <ul
       aria-label="Existing worktrees"
-      className="mt-2 max-h-48 overflow-y-auto border border-surface-700/60 rounded-lg"
+      className="mt-2 max-h-48 overflow-y-auto rounded-lg border border-surface-700/60 bg-surface-900"
     >
       {loaded.rows.map((wt) => (
         <li key={wt.path}>
@@ -101,11 +105,11 @@ function ExistingWorktrees({
             type="button"
             aria-pressed={data.worktreeBranch === wt.branch}
             onClick={() => onChange("worktreeBranch", wt.branch)}
-            className={`w-full text-left px-3 py-1.5 cursor-pointer ${
-              data.worktreeBranch === wt.branch ? "bg-surface-800" : "hover:bg-surface-800/60"
+            className={`w-full text-left px-3 py-1.5 max-md:py-2.5 cursor-pointer transition-colors ${
+              data.worktreeBranch === wt.branch ? "bg-surface-700/60" : "hover:bg-surface-700/40"
             }`}
           >
-            <span className="block text-sm font-mono text-text-primary truncate">{wt.branch}</span>
+            <span className="block text-[15px] md:text-sm font-mono text-text-primary truncate">{wt.branch}</span>
             <span className="block text-xs font-mono text-text-dim truncate">{wt.path}</span>
           </button>
         </li>
@@ -128,7 +132,7 @@ function BaseBranchPicker({ data, onChange }: { data: WizardData; onChange: (fie
 
   return (
     <div className="mt-4">
-      <label className="block text-sm text-text-dim mb-1.5">Base branch</label>
+      <label className={FIELD_LABEL}>Base branch</label>
       <div className="relative">
         <input
           type="text"
@@ -161,13 +165,13 @@ function BaseBranchPicker({ data, onChange }: { data: WizardData; onChange: (fie
           placeholder={loading ? "Loading branches..." : "Defaults to project default branch"}
           aria-label="Base branch"
           autoComplete="off"
-          className="w-full bg-surface-900 border border-surface-700 rounded-lg px-3 py-2 text-sm font-mono text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+          className={`${INPUT} font-mono`}
         />
         {hasFocus && suggestions.length > 0 && (
           <ul
             role="listbox"
             aria-label="Branch suggestions"
-            className="absolute z-10 left-0 right-0 mt-1 max-h-64 overflow-y-auto bg-surface-900 border border-surface-700/60 rounded-lg shadow-lg"
+            className={`${LISTBOX} absolute z-10 left-0 right-0 mt-1 max-h-64`}
           >
             {suggestions.map((b, i) => (
               <li
@@ -179,9 +183,7 @@ function BaseBranchPicker({ data, onChange }: { data: WizardData; onChange: (fie
                   e.preventDefault();
                   choose(b.name);
                 }}
-                className={`flex items-center justify-between gap-2 px-3 py-1.5 text-sm font-mono cursor-pointer ${
-                  i === highlightIdx ? "bg-surface-800 text-text-primary" : "text-text-secondary"
-                }`}
+                className={i === highlightIdx ? LISTBOX_OPTION_ACTIVE : LISTBOX_OPTION}
               >
                 <span className="truncate">{b.name}</span>
                 <span className="text-[10px] uppercase tracking-wider text-text-dim shrink-0">
@@ -192,7 +194,7 @@ function BaseBranchPicker({ data, onChange }: { data: WizardData; onChange: (fie
           </ul>
         )}
       </div>
-      <p className="text-xs text-text-dim mt-1">
+      <p className={`${FIELD_HINT} mt-1`}>
         Stack a new worktree on top of a different branch (an in-flight PR, a release branch, a teammate's branch).
         Leave blank for the repo's default.
       </p>

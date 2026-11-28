@@ -235,6 +235,8 @@ pub(super) async fn handle_control_connection(
                             Ok((acp_session_id, result)) => ControlBody::SessionReady {
                                 acp_session_id,
                                 result,
+                                // Filled in by `enqueue` under the queue lock.
+                                adapter_frames: 0,
                             },
                             Err(error) => ControlBody::HandshakeFailed { error },
                         }
@@ -255,6 +257,7 @@ pub(super) async fn handle_control_connection(
                                 ControlBody::SessionReady {
                                     acp_session_id,
                                     result,
+                                    adapter_frames: 0,
                                 }
                             }
                             Err(error) => {

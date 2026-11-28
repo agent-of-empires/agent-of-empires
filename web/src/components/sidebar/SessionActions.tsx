@@ -37,7 +37,6 @@ export interface SessionActionHandlers {
   onDelete?: (sessionIds: string[]) => void;
   onStop?: (sessionId: string) => void;
   onStart?: (sessionId: string) => void;
-  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   /** Opens the wizard prefilled from this row's project, like the group header's "+". */
   onCreateSession?: (repoPath: string) => void;
@@ -252,7 +251,6 @@ function buildRowActions(
     }),
     stop: afterTarget("stop", (s) => props.onStop?.(s.id)),
     start: afterTarget("start", (s) => props.onStart?.(s.id)),
-    restartUpdate: afterTarget("restartUpdate", (s) => props.onRestartForUpdate?.(s.id)),
     recreateContainer: afterTarget("recreateContainer", setRecreating),
     pin: () => props.onPinToggle(workspace, !model.effectivePinned),
     archive: after(() => props.onArchiveToggle(workspace, !model.effectiveArchived)),

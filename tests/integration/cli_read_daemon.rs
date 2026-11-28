@@ -96,6 +96,218 @@ fn assert_refused(output: &Output, code: &str) {
     assert!(!stderr.contains("Started aoe daemon"), "{stderr}");
 }
 
+#[test]
+#[parallel]
+fn favorite_writes_require_a_writable_daemon_and_stay_in_profile() {
+    let fixture = Fixture::new();
+    let main = fixture.app.join("profiles/main/sessions.json");
+    let other = fixture.app.join("profiles/other/sessions.json");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    let mut rows: Vec<Instance> = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
+    rows[0].archive();
+    std::fs::write(&other, serde_json::to_vec(&rows).unwrap()).unwrap();
+    rows[0].unarchive();
+    rows[0].trash();
+    let mut marked = Instance::new("Already\nfavorited\u{1b}", "/isolated/marked");
+    marked.id = "marked-row".into();
+    marked.view = View::Structured;
+    marked.favorite();
+    rows.push(marked);
+    std::fs::write(&main, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let before = std::fs::read(&main).unwrap();
+
+    let run = |verb, id| fixture.run(&["--no-autostart", "session", verb, id]);
+    let favorite = |path: &std::path::Path| {
+        let rows: Vec<Instance> = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        rows[0].is_favorited()
+    };
+    assert_refused(&run("favorite", "daemon-only-row"), "aoe serve");
+    assert_refused(&run("unfavorite", "marked-row"), "aoe serve");
+    assert_eq!(std::fs::read(&main).unwrap(), before);
+    assert!(!favorite(&main));
+    fixture.assert_not_started();
+
+    let start = fixture.run(&["serve", "--core-only", "--daemon", "--read-only"]);
+    assert!(start.status.success(), "{start:?}");
+    assert_refused(&run("favorite", "daemon-only-row"), "read-only");
+    assert_refused(&run("unfavorite", "marked-row"), "read-only");
+    let stored: Vec<Instance> = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
+    assert!(stored
+        .iter()
+        .find(|row| row.id == "marked-row")
+        .unwrap()
+        .is_favorited());
+    assert!(!favorite(&main));
+    let stop = fixture.run(&["serve", "--stop"]);
+    assert!(stop.status.success(), "{stop:?}");
+
+    let start = fixture.run(&["serve", "--core-only", "--daemon"]);
+    assert!(start.status.success(), "{start:?}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let output = fixture
+            .command(&["session", "favorite", "daemon-only-row"])
+            .env("AOE_DAEMON_URL", std::ffi::OsString::from_vec(vec![0xff]))
+            .output()
+            .unwrap();
+        assert_refused(&output, "AOE_DAEMON_URL must be valid UTF-8");
+        assert!(!favorite(&main));
+    }
+    assert_refused(&run("favorite", "missing"), "Session not found: missing");
+    let ambiguous = run("favorite", "");
+    assert_refused(&ambiguous, "matches 2 sessions");
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("Alreadyfavorited)"));
+    assert!(!ambiguous.stderr.contains(&0x1b));
+    let output = run("favorite", "marked-row");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"Favorited: Alreadyfavorited\n");
+    let output = run("favorite", "Disk must not answer");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"Favorited: Disk must not answer\n");
+    assert!(favorite(&main));
+    assert!(!favorite(&other));
+    let output = run("unfavorite", "daemon-only");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"Unfavorited: Disk must not answer\n");
+    assert!(!favorite(&main));
+    let stored: Vec<Instance> = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
+    assert!(stored
+        .iter()
+        .find(|row| row.id == "daemon-only-row")
+        .unwrap()
+        .is_trashed());
+    let output = fixture.run(&[
+        "--no-autostart",
+        "-p",
+        "other",
+        "session",
+        "favorite",
+        "Disk must not answer",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let rows: Vec<Instance> = serde_json::from_slice(&std::fs::read(&other).unwrap()).unwrap();
+    assert!(rows[0].is_favorited());
+    assert!(!rows[0].is_archived());
+    assert!(!favorite(&main));
+}
+
+#[tokio::test]
+#[parallel]
+async fn favorite_requires_cursor_support_and_never_replays_a_patch() {
+    use agent_of_empires::daemon::{
+        RUNTIME_EPOCH_HEADER, RUNTIME_PROTOCOL_VERSION, RUNTIME_REVISION_HEADER,
+    };
+    use axum::response::IntoResponse;
+
+    let fixture = Fixture::new();
+    for (epoch, revision, patch_revision, title, diagnostic) in [
+        (
+            false,
+            false,
+            Some("7"),
+            Some("Unconfirmed"),
+            "Upgrade the Daemon",
+        ),
+        (
+            true,
+            false,
+            Some("7"),
+            Some("Unconfirmed"),
+            "mutation acknowledgment does not match",
+        ),
+        (
+            false,
+            true,
+            Some("7"),
+            Some("Unconfirmed"),
+            "mutation acknowledgment does not match",
+        ),
+        (
+            true,
+            true,
+            Some("7"),
+            Some("Unconfirmed"),
+            "Favorite outcome may be unknown",
+        ),
+        (
+            true,
+            true,
+            Some("8"),
+            None,
+            "Favorite outcome may be unknown",
+        ),
+        (true, true, None, None, "Favorite outcome may be unknown"),
+    ] {
+        let (requests, seen) = std::sync::mpsc::channel();
+        let router = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let requests = requests.clone();
+            async move {
+                let method = request.method().as_str().to_owned();
+                let path = request.uri().path().to_owned();
+                requests.send((method.clone(), path)).unwrap();
+                if method == "GET" {
+                    let mut response = axum::Json(serde_json::json!({
+                        "protocol_version": RUNTIME_PROTOCOL_VERSION,
+                        "epoch": "test-epoch",
+                        "namespace": "test",
+                        "local_owner": false,
+                        "profiles": ["main"],
+                        "read_only": false,
+                        "cityhall_mode": false,
+                        "health": {"state": "healthy"},
+                        "interaction_capabilities": {"mutations": true, "native_interaction": false}
+                    }))
+                    .into_response();
+                    if epoch {
+                        response
+                            .headers_mut()
+                            .insert(RUNTIME_EPOCH_HEADER, "test-epoch".parse().unwrap());
+                    }
+                    if revision {
+                        response
+                            .headers_mut()
+                            .insert(RUNTIME_REVISION_HEADER, "7".parse().unwrap());
+                    }
+                    response
+                } else if let Some(patch_revision) = patch_revision {
+                    (
+                        [
+                            (RUNTIME_EPOCH_HEADER, "test-epoch"),
+                            (RUNTIME_REVISION_HEADER, patch_revision),
+                        ],
+                        axum::Json(serde_json::json!({"title": title})),
+                    )
+                        .into_response()
+                } else {
+                    axum::http::StatusCode::GATEWAY_TIMEOUT.into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut command = fixture.command(&[
+            "--daemon-url",
+            &url,
+            "session",
+            "favorite",
+            "daemon-only-row",
+        ]);
+        let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+            .await
+            .unwrap();
+        assert_refused(&output, diagnostic);
+        let mut expected: Vec<(String, String)> = vec![("GET".into(), "/api/runtime".into())];
+        if epoch && revision {
+            expected.push(("PATCH".into(), "/api/sessions/by-selector/favorite".into()));
+        }
+        assert_eq!(seen.try_iter().collect::<Vec<_>>(), expected);
+        fixture.assert_not_started();
+        server.abort();
+    }
+}
+
 #[tokio::test]
 #[parallel]
 async fn unreachable_selected_targets_never_answer_from_disk() {

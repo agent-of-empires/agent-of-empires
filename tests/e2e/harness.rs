@@ -9,7 +9,7 @@
 //!
 //! Set `RECORD_E2E=1` to record each TUI test as an asciinema `.cast` file and
 //! convert it to a GIF via `agg`. Recordings are saved to
-//! `target/e2e-recordings/`. Both `asciinema` and `agg` must be on `$PATH`.
+//! `target/e2e-media/`. Both `asciinema` and `agg` must be on `$PATH`.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::net::{TcpListener, TcpStream};
@@ -261,6 +261,37 @@ pub fn write_executable(path: &Path, content: &str) {
     }
 }
 
+/// Strip inherited OMP and Pi store routing from every spawned process and
+/// give the panes a login shell that keeps `path_bin` first on `PATH`, so a
+/// fake `omp` there runs against the harness home rather than the caller's store.
+pub fn install_path_preserving_test_shell(h: &mut TuiTestHarness, path_bin: &Path) {
+    for key in [
+        "NODE_ENV",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "OMP_CODING_AGENT_DIR",
+        "OMP_CODING_AGENT_SESSION_DIR",
+        "OMP_CONFIG_DIR",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "AOE_INSTANCE_ID",
+    ] {
+        h.remove_env(key);
+    }
+    let shell = h.home_path().join("omp-test-shell");
+    write_executable(
+        &shell,
+        &format!(
+            "#!/bin/sh\n[ \"${{1-}}\" = -l ] && shift\nexport PATH={}:\"$PATH\"\nexec /bin/sh \"$@\"\n",
+            shell_words::quote(path_bin.to_str().expect("UTF-8 OMP test PATH"))
+        ),
+    );
+    h.set_env("SHELL", shell.to_str().expect("UTF-8 OMP test shell"));
+}
+
 /// Create a git repo with one empty commit on `main`, isolated from user git config.
 pub fn init_git_repo(path: &Path) {
     std::fs::create_dir_all(path).expect("create repo dir");
@@ -337,8 +368,8 @@ fn agg_available() -> bool {
         .unwrap_or(false)
 }
 
-fn recordings_dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/e2e-recordings");
+pub fn recordings_dir() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/e2e-media");
     std::fs::create_dir_all(&dir).expect("create recordings dir");
     dir
 }

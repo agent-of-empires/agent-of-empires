@@ -406,14 +406,14 @@ pub(super) fn build_fork_flags(
     child_id: &str,
     generation: crate::agents::AgentGeneration,
 ) -> String {
-    use crate::agents::{get_agent, ForkStrategy};
+    use crate::agents::{native_definition, ForkStrategy};
 
     if !is_valid_session_id(parent_id) || !is_valid_session_id(child_id) {
         tracing::warn!(target: "session.store",
             "Refusing to build fork flags: invalid id (parent={parent_id:?} child={child_id:?})");
         return String::new();
     }
-    let Some(agent) = get_agent(tool) else {
+    let Some(agent) = native_definition(tool) else {
         return String::new();
     };
     let Some(strategy) = agent.fork_strategy.resolve(generation) else {
@@ -1716,8 +1716,9 @@ impl Instance {
                     .map(str::to_owned)
             })
         });
-        let mut env_prefix =
-            host_launch_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
+        let mut env_prefix = self.with_hook_agent(|this, agent| {
+            host_launch_env_prefix(profile, &this.id, agent, program.as_deref())
+        });
         // The publisher is pane-scoped, including for safe Default wrappers.
         self.pi_extension_launched = false;
         if let Some((_, ref env)) = identity_extension {

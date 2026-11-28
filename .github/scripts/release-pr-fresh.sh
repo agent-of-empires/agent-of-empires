@@ -3,7 +3,7 @@ set -euo pipefail
 
 # release-pr-fresh.sh: in the merge queue, fail a release-plz PR when commits
 # landed on main after its last refresh, since they would ship without
-# CHANGELOG.md entries. Other PRs pass. ci.yml's `Release PR Up To Date` job runs
+# CHANGELOG.md entries. Other PRs pass. ci.yml's `Format` job runs
 # it with HEAD_REF and GROUP_HEAD from the merge_group event, plus GH_TOKEN.
 #
 #   --self-test   Checks the decision logic against a throwaway repo.

@@ -55,7 +55,7 @@ async function readWorkspaceTitles(page: Page): Promise<string[]> {
   });
 }
 
-const TOGGLE = "[data-testid='sidebar-sort-toggle']";
+const TOGGLE = "[data-testid='sidebar-view-toggle']";
 
 async function selectSortMode(page: Page, mode: string): Promise<void> {
   await page.locator(TOGGLE).click();
@@ -149,10 +149,13 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
     await expect(toggle).not.toHaveAttribute("title", /.+/);
 
     await toggle.hover();
-    const tip = page.getByRole("tooltip").filter({ hasText: "Sort: manual, drag enabled" });
+    const tip = page.getByRole("tooltip").filter({ hasText: "View options" });
     await expect(tip).toHaveClass(/bg-surface-950/);
     await expect(tip).toHaveClass(/fixed/);
 
-    await expect(page.locator("div.overflow-y-auto.border-t")).toHaveCount(1);
+    // One scroller, whose pinned title row draws the separator above the list.
+    const scroller = page.locator('[aria-label="Sessions sidebar"] div.overflow-y-auto');
+    await expect(scroller).toHaveCount(1);
+    await expect(scroller.locator("> div.sticky")).toHaveClass(/md:border-b/);
   });
 });

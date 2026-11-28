@@ -567,6 +567,18 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `POST /api/suggestions/push`: adds or replaces one built-in agent
+    /// suggestion. Returns its id.
+    pub async fn push_suggestion(&self, body: &serde_json::Value) -> Result<String, HttpError> {
+        let url = format!("{}/api/suggestions/push", self.endpoint.base_url);
+        let res = self
+            .execute_elevated(|| self.http.post(&url).json(body))
+            .await?;
+        let res = check_global_status(res)?;
+        let reply: serde_json::Value = crate::daemon::decode_json(res).await?;
+        Ok(reply["id"].as_str().unwrap_or_default().to_string())
+    }
+
     /// A config mutation on a daemon-wide endpoint, retried after a passphrase
     /// step-up. Returns the JSON body, `Null` when empty.
     pub async fn mutate(
@@ -888,6 +900,35 @@ impl HttpClient {
 
     pub(crate) async fn daemon_client(&self) -> Result<crate::daemon::DaemonClient, HttpError> {
         self.daemon_client_with(false).await
+    }
+
+    pub(crate) async fn runtime_mutation_client(
+        &self,
+    ) -> Result<
+        (
+            crate::daemon::DaemonClient,
+            crate::daemon::RuntimeInfo,
+            crate::daemon::RuntimeCursor,
+        ),
+        HttpError,
+    > {
+        use crate::daemon::DaemonClientError;
+        let may_login = self.may_retry_with_login();
+        let client = self.daemon_client().await?;
+        let (client, result) = match client.runtime_info_with_cursor().await {
+            Err(DaemonClientError::Status {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            }) if may_login => {
+                self.passphrase_session.invalidate(&self.endpoint);
+                let client = self.daemon_client_with(true).await?;
+                let result = client.runtime_info_with_cursor().await;
+                (client, result)
+            }
+            result => (client, result),
+        };
+        let (info, cursor) = result?;
+        Ok((client, info, cursor))
     }
 
     /// Same credential order as [`Self::attach_credential`].
@@ -2761,8 +2802,17 @@ mod tests {
         let token = "b".repeat(64);
         let _phrase =
             crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_PASSPHRASE", phrase)]);
+        let mut row = crate::session::Instance::new("Original", "/tmp/isolated-favorite");
+        row.source_profile = "main".into();
+        let storage = crate::session::Storage::new_unwatched("main").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
         let state = test_support::build_test_app_state_with_policy_configured(
-            Vec::new(),
+            vec![row],
             vec!["127.0.0.1".into()],
             Vec::new(),
             Some(token.clone()),
@@ -2771,6 +2821,13 @@ mod tests {
                     std::sync::Arc::new(crate::server::login::LoginManager::new(Some(phrase)));
             },
         );
+        test_support::refresh_canonical_metadata_for_test(&state).await;
+        storage
+            .update(|rows, _| {
+                rows[0].title = "Renamed on disk".into();
+                Ok(())
+            })
+            .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let app = test_support::build_router_for_test(state.clone());
@@ -2794,6 +2851,31 @@ mod tests {
             1,
             "one login, then the cached session"
         );
+        client.passphrase_session.invalidate(&client.endpoint);
+        use crate::daemon::{DaemonClientError, SessionLookupError, UpdateFavoriteBody};
+        let (daemon, _, before) = client.runtime_mutation_client().await.unwrap();
+        let selection = |selector: &str, select_favorited| UpdateFavoriteBody::Scoped {
+            profile: "main".into(),
+            selector: selector.into(),
+            select_favorited,
+        };
+        assert!(matches!(
+            daemon
+                .set_favorite_by_selector(&selection("Original", true), &before)
+                .await,
+            Err(DaemonClientError::FavoriteSelection(
+                SessionLookupError::NotFound
+            ))
+        ));
+        for favorited in [true, false, false] {
+            let (_, before) = daemon.runtime_info_with_cursor().await.unwrap();
+            let outcome = daemon
+                .set_favorite_by_selector(&selection("Renamed on disk", favorited), &before)
+                .await
+                .unwrap();
+            assert_eq!(outcome.title, "Renamed on disk");
+            assert_eq!(storage.load().unwrap()[0].is_favorited(), favorited);
+        }
         state.shutdown.cancel();
         server.await.unwrap();
     }

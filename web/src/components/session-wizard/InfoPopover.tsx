@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Info } from "lucide-react";
 import { useClampedMenuPosition } from "../../lib/menuPosition";
+import { MENU } from "../../lib/surfaces";
 
 /**
  * An info icon that opens a small non-modal dialog. Unlike the shared Tooltip it takes clicks and
@@ -103,7 +104,7 @@ export function InfoPopover({ title, children }: { title: string; children: Reac
               close(true);
             }}
             // Above the wizard's z-[60] overlay.
-            className="fixed z-[70] w-[min(20rem,calc(100vw-16px))] rounded-lg border border-surface-700 bg-surface-800 p-3 text-sm shadow-lg outline-none"
+            className={`${MENU} fixed z-[70] w-[min(20rem,calc(100vw-16px))] px-3 py-3 text-sm outline-none`}
             style={{ left: pos.x, top: pos.y }}
           >
             <p id={titleId} className="font-medium text-text-primary">

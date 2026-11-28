@@ -814,6 +814,7 @@ mod tests {
                 cancel_capable: true,
                 model: None,
                 background: false,
+                runs: 0,
             },
             at: crate::time::Timestamp::from_unix_secs(0).unwrap(),
         };

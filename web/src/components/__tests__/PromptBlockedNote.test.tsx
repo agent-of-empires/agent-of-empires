@@ -1,0 +1,170 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { PromptBlockedNote } from "../PromptBlockedNote";
+
+const updateSettings = vi.fn();
+vi.mock("../../lib/api", () => ({ updateSettings: (...a: unknown[]) => updateSettings(...a) }));
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+const LONG =
+  "Claude Code is asking whether to trust this folder, so the prompt was not typed. Turn on `pre_trust_agent_folders` ...";
+
+describe("PromptBlockedNote", () => {
+  it("an untrusted folder: plain reason, Turn on pre-trust after a confirmation, then Try again", async () => {
+    updateSettings.mockResolvedValue("committed");
+    const onTryAgain = vi.fn();
+    render(
+      <PromptBlockedNote
+        label="Prompt not sent"
+        code="agent_folder_not_trusted"
+        message={LONG}
+        onTryAgain={onTryAgain}
+      />,
+    );
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Prompt not sent: Claude Code is asking whether to trust this folder, so the prompt was not typed.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Turn on pre-trust" }));
+    expect(updateSettings).not.toHaveBeenCalled();
+    expect(screen.getByText(/also runs the repo's own \.claude\/settings\.json hooks/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith({ session: { pre_trust_agent_folders: true } }));
+    fireEvent.click(await screen.findByRole("button", { name: "Try again" }));
+    expect(onTryAgain).toHaveBeenCalled();
+  });
+
+  it("without Try again it says how to go on, and a failed save says so", async () => {
+    updateSettings.mockResolvedValueOnce("rejected").mockResolvedValueOnce("committed");
+    render(<PromptBlockedNote label="Initial prompt not sent" code="agent_folder_not_trusted" message={LONG} />);
+    fireEvent.click(screen.getByRole("button", { name: "Turn on pre-trust" }));
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    expect(await screen.findByText("Couldn't turn on pre-trust.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Turn on pre-trust" }));
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    expect(await screen.findByText(/Pre-trust is on: new Sessions start trusted/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  it("Cancel and a failed save hand focus back to Turn on pre-trust", async () => {
+    updateSettings.mockResolvedValue("rejected");
+    render(<PromptBlockedNote label="Prompt not sent" code="agent_folder_not_trusted" message={LONG} />);
+    const reopen = () => screen.getByRole("button", { name: "Turn on pre-trust" });
+    fireEvent.click(reopen());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(document.activeElement).toBe(reopen());
+    fireEvent.click(reopen());
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    await screen.findByText("Couldn't turn on pre-trust.");
+    expect(document.activeElement).toBe(reopen());
+  });
+
+  it("a failed save leaves focus where the user moved while it was pending", async () => {
+    let settle: (v: string) => void = () => {};
+    updateSettings.mockReturnValue(new Promise((resolve) => (settle = resolve)));
+    render(
+      <div>
+        <PromptBlockedNote
+          label="Prompt not sent"
+          code="agent_folder_not_trusted"
+          message={LONG}
+          onCopyPrompt={() => {}}
+        />
+        <button type="button">elsewhere</button>
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Turn on pre-trust" }));
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    const elsewhere = screen.getByRole("button", { name: "elsewhere" });
+    elsewhere.focus();
+    settle("rejected");
+    await screen.findByText("Couldn't turn on pre-trust.");
+    expect(document.activeElement).toBe(elsewhere);
+  });
+
+  it("an untrusted folder names the direct fix first, with Copy prompt, then pre-trust", () => {
+    const onCopyPrompt = vi.fn();
+    const { container, rerender } = render(
+      <PromptBlockedNote
+        label="Prompt not sent"
+        code="agent_folder_not_trusted"
+        message={LONG}
+        onCopyPrompt={onCopyPrompt}
+      />,
+    );
+    expect(container.textContent).toContain(
+      "Open the Session and choose \u201cYes, I trust this folder\u201d, then paste the prompt.",
+    );
+    const names = screen.getAllByRole("button").map((b) => b.textContent);
+    expect(names).toEqual(["Copy prompt", "Turn on pre-trust"]);
+    fireEvent.click(screen.getByRole("button", { name: "Copy prompt" }));
+    expect(onCopyPrompt).toHaveBeenCalled();
+    expect(container.textContent).toContain("Or trust every folder AoE starts Claude Code in:");
+    fireEvent.click(screen.getByRole("button", { name: "Turn on pre-trust" }));
+    expect(container.textContent).toContain("Pre-trust agent folders");
+
+    // On the Session page the terminal is right there.
+    rerender(
+      <PromptBlockedNote label="Initial prompt not sent" code="agent_folder_not_trusted" message={LONG} inSession />,
+    );
+    expect(container.textContent).toContain("Choose \u201cYes, I trust this folder\u201d in the terminal");
+  });
+
+  it("Bypass Permissions and unknown codes have no action", () => {
+    const { rerender } = render(
+      <PromptBlockedNote
+        label="Prompt not sent"
+        code="agent_bypass_not_accepted"
+        message="long"
+        onTryAgain={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Prompt not sent: Claude Code is waiting for Bypass Permissions to be accepted once. Open the Session and accept it.",
+    );
+    expect(screen.queryByRole("button")).toBeNull();
+    rerender(<PromptBlockedNote label="Prompt not sent" code="something_new" message="the agent was not ready" />);
+    expect(screen.getByRole("alert").textContent).toBe("Prompt not sent: the agent was not ready");
+  });
+
+  it("Try again runs once while it is in flight, and focus follows each step", async () => {
+    updateSettings.mockResolvedValue("committed");
+    let finish!: () => void;
+    const onTryAgain = vi.fn(() => new Promise<void>((r) => (finish = r)));
+    render(
+      <PromptBlockedNote
+        label="Prompt not sent"
+        code="agent_folder_not_trusted"
+        message={LONG}
+        onTryAgain={onTryAgain}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Turn on pre-trust" }));
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Turn on" }));
+    fireEvent.click(screen.getByRole("button", { name: "Turn on" }));
+    const again = await screen.findByRole("button", { name: "Try again" });
+    expect(document.activeElement).toBe(again);
+    fireEvent.click(again);
+    fireEvent.click(again);
+    expect(onTryAgain).toHaveBeenCalledTimes(1);
+    finish();
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Try again" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
+  it("a row note is a status, not an alert", () => {
+    render(<PromptBlockedNote label="Prompt not sent" code="x" message="m" live="status" />);
+    expect(screen.getByRole("status").textContent).toBe("Prompt not sent: m");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("read-only shows the reason without actions", () => {
+    render(<PromptBlockedNote label="Prompt not sent" code="agent_folder_not_trusted" message={LONG} disabled />);
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+});

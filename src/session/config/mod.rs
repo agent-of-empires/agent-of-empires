@@ -109,6 +109,13 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, ToolSessionConfig>,
 
+    /// TUI home-view key overrides: action name to chords in the
+    /// `live_send_leader` grammar, replacing that action's keys in both
+    /// hotkey modes. `[]` unbinds. Global only; outside the settings schema
+    /// because the TUI page that lists it is read-only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keybinds: BTreeMap<String, Vec<String>>,
+
     /// Per-plugin configuration keyed by plugin id (`[plugins."aoe.web"]`).
     /// An explicit typed map rather than a root-level flatten, so plugin
     /// enable-state survives every save without a root catch-all quietly
@@ -1759,28 +1766,6 @@ pub struct SessionConfig {
     )]
     pub prevent_sleep_idle_grace_minutes: u32,
 
-    /// Text sent after a successful explicit restart, or automatic startup
-    /// recovery when `startup_recovery_wake` is enabled, once the pane is ready.
-    /// An empty string disables the message without disabling the restart.
-    #[serde(default = "default_restart_wake_message")]
-    #[setting(
-        label = "Wake message",
-        widget = "text",
-        summary = "What AoE sends to wake a Session."
-    )]
-    pub restart_wake_message: String,
-
-    /// Send `restart_wake_message` after automatic Daemon startup recovery.
-    /// Disabled by default; recovery still restores missing panes and resumes
-    /// conversations. Explicit restarts are unaffected. An empty message stays off.
-    #[serde(default)]
-    #[setting(
-        label = "Wake after recovery",
-        widget = "toggle",
-        summary = "Send the wake message below to Sessions AoE recovers at startup."
-    )]
-    pub startup_recovery_wake: bool,
-
     /// What to show next to each session title: Branch (default), Auto
     /// (profile in all-profiles view), None, Profile (always), or Sandbox
     /// (sb on sandboxed rows).
@@ -1816,6 +1801,18 @@ pub struct SessionConfig {
         summary = "The [structured] marker on Structured view rows in the session list."
     )]
     pub show_structured_badge: bool,
+
+    /// Count snoozed Sessions among the stopped rows the TUI's `y` filter hides.
+    /// Off by default: snoozing defers a Session without stopping it, so it stays
+    /// visible while stopped ones are hidden.
+    #[serde(default)]
+    #[setting(
+        label = "Hide snoozed Sessions too",
+        widget = "toggle",
+        tui_only,
+        summary = "While stopped Sessions are hidden with y, drop snoozed ones out of groups as well."
+    )]
+    pub hide_snoozed_with_stopped: bool,
 
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
@@ -2372,11 +2369,10 @@ impl Default for SessionConfig {
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             prevent_sleep_when_active: false,
             prevent_sleep_idle_grace_minutes: default_prevent_sleep_idle_grace_minutes(),
-            restart_wake_message: default_restart_wake_message(),
-            startup_recovery_wake: false,
             row_tag: RowTagMode::default(),
             show_activity_age: true,
             show_structured_badge: true,
+            hide_snoozed_with_stopped: false,
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),
@@ -2420,10 +2416,6 @@ fn default_session_id_poller_max_threads() -> u32 {
 
 fn default_trash_retention_minutes() -> u32 {
     30 * 24 * 60
-}
-
-fn default_restart_wake_message() -> String {
-    "wake up: pick up what you were doing".to_string()
 }
 
 fn default_live_send_exit_chord() -> String {

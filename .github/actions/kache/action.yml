@@ -32,13 +32,13 @@ runs:
         fi
         echo "KACHE_PULL_REQUEST_PREFIX=artifacts-pr" >> "$GITHUB_ENV"
     - if: steps.role.outputs.role != ''
-      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      uses: aws-actions/configure-aws-credentials@v6.3.0
       with:
         role-to-assume: arn:aws:iam::745600963472:role/${{ steps.role.outputs.role }}
         aws-region: us-east-1
         # Covers the longest job (90 min); the daemon keeps these credentials.
         role-duration-seconds: 7200
-    - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+    - uses: kunobi-ninja/kache-action@v1
       with:
         version: v2.0.0
         s3-bucket: ${{ steps.role.outputs.role != '' && 'aoe-rust-kache' || '' }}

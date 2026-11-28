@@ -6,20 +6,24 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 ## Layout
 
-- **Workspace sidebar** (left) lists every session grouped by repo, with a live status glyph per row. On phones it collapses behind a top-bar toggle. On wider screens, drag its right edge to resize it: below the minimum width it snaps to a compact rail of glyphs and short titles, and further still it closes, until the top-bar toggle reopens it as it was. Focus the edge to resize it with the arrow keys, **Home** for the rail and **Enter** to collapse to or restore from the rail; double-click it to reset the width. With no sessions, it shows a hint and a **New session** button.
-- **Main pane** shows the selected session: the agent terminal (or structured view), with the diff and paired terminal reachable from the top bar.
-- **Top bar** carries the command-palette trigger, the right-panel picker, and the overflow (three-dot) **More options** menu.
+- **Workspace sidebar** (left) starts with **New session** and **Search** (the command palette, also **Ctrl+K**, **⌘K** on a Mac), then lists every session grouped by repo, with a live status glyph per row; the open session's row is a filled pill. On a phone it is a drawer (see [On mobile](#on-mobile)). On wider screens, drag its right edge to resize it: below the minimum width it snaps to a compact rail of glyphs and short titles, and further still it closes, until the top-bar toggle reopens it as it was. Focus the edge to resize it with the arrow keys, **Home** for the rail and **Enter** to collapse to or restore from the rail; double-click it to reset the width. With no sessions, it shows a hint and a **New session** button.
+- **Main pane** shows the selected session: the agent terminal (or structured view), with the review panel (right dock, the paired terminal stacked below its review panes) reachable from the top bar.
+- **Top bar** names the open session as `project / title` on desktop (elsewhere it carries the command-palette trigger), then the terminal and review panel buttons and the overflow (three-dot) **More options** menu.
 - **Home screen** (no session selected) shows the AoE logo and a count of running, waiting, and error sessions.
 
 ### Side panels
 
-The diff and terminal panels start closed. Open one from its top-bar icon; a closed diff icon shows how many files had changed when you opened the Session. A Session keeps the panels you open or close in it, in that browser. **Settings > Panels** sets the defaults; they apply to every Session whose panels you haven't changed.
+The review panel (the right dock) and the terminal start closed. The top bar has a button for each: the review panel button opens Diff when the panel is empty and, while the panel is closed, shows how many files had changed when you opened the Session. The chevron beside the review panel button opens a menu that opens or closes Diff, Files, Background and plugin panes. A Session keeps the panels you open or close in it, in that browser. Terminal tabs open in the right dock below the review panes and are the exception: each shows one Session's shell and stays open as you switch Sessions (see [Paired terminal](terminal.md#paired-terminal)). **Settings > Panels** sets the defaults; they apply to every Session whose panels you haven't changed.
+
+The right dock is the Session's review panel: **Diff**, **Files**, **Background** (structured-view sessions) and plugin panes, in that order. Picking a file in Diff opens it in the main area with an **Agent | <file>** tab strip above it: **Agent** returns to the session without closing the file, the file tab brings it back, and **×** closes it. Picking another file replaces it. Files opens a picked file inside the pane, with a back button to the file list. The **maximize** button on the right dock's tab strip lets the dock take the whole main area until you restore it; a reload restores it too. Between 768px and 1100px of window width the right dock opens as a sheet over the main area instead of a third column; **Escape** or a click outside closes it, and picking a file in Diff closes it to show the file.
+
+The Diff pane's **Branch | Uncommitted** picker sets what the working tree is compared against: **Branch** (the default) shows the branch's changes since it left its base branch, which the base picker beside it chooses; **Uncommitted** shows what isn't committed yet. Untracked files count as changes in both. The file list, the open file and the changed-file count follow the picked comparison, and this browser remembers it per Session.
 
 ### Status glyphs
 
 Each sidebar row carries an animated braille glyph encoding the session's state: a spinner of dots while **Running**, an orbiting dot while **Waiting** or **Creating**, a slow breathe while **Starting** or freshly idle. Errors render in the error color. The frame is offset by each session's creation time so rows don't pulse in lockstep.
 
-The **?** in the sidebar header opens a legend of every glyph and mark: the status glyphs, Unread, Pinned Session, Favorite, Project, Pinned project and the Group dot. It's a popover on desktop and a sheet on a phone. Hovering a glyph or mark with a mouse shows what it means, and a row that needs attention for another reason adds that on a second line. With a row focused from the keyboard, its glyph's meaning shows too, along with **Press Enter to open**. Animated glyphs in the legend hold still when your system asks for reduced motion.
+**Symbol legend** in the **⋯** menu opens a legend of every glyph and mark: the status glyphs, Unread, Pinned Session, Favorite, Project, Pinned project and the Group dot. It's a popover on desktop and a sheet on a phone. Hovering a glyph or mark with a mouse shows what it means, and a row that needs attention for another reason adds that on a second line. With a row focused from the keyboard, its glyph's meaning shows too, along with **Press Enter to open**. Animated glyphs in the legend hold still when your system asks for reduced motion.
 
 An Error row's tooltip shows the first line of the error AoE recorded for the session, or says that none was recorded. Opening a Terminal view session in Error doesn't restart it. It shows that error in full, with **Copy error** and **Restart**, so on a phone you tap the row to read it.
 
@@ -74,29 +78,31 @@ Once setup is out of the way, an interactive walkthrough highlights the major re
 
 Completing or skipping the tour records `app_state.has_seen_web_tour` on the server, so it does not relaunch on reload or on another device pointed at the same server. That flag persists in the server's `state.toml` (a sibling of `config.toml`, see [Configuration Reference](../configuration.md#statetoml)); the `GET /api/settings` JSON key is unchanged, still `app_state.has_seen_web_tour`. To replay it, open the overflow menu and choose **Show tutorial**; re-triggering adapts to where you are (dashboard regions, or composer / mode picker / send controls inside a session). It does not auto-launch on touch devices, where it is menu-only.
 
+While no plugin that provides suggestions is installed and a featured one exists, the homepage shows a one-line hint under the action cards. **Set up suggestions** opens a sheet that installs the featured providers you pick, then shows each plugin's setup checks (with its fix text and **Check again**). **More sources in the Marketplace** opens Settings > Plugins > Marketplace with the Suggestions filter on (`/settings/plugins?marketplace=suggestions`). The hint is skipped during the tour, on read-only and CityHall dashboards, and when the homepage section is off in Settings > Suggestions. Dismissing it stores `aoe-suggestions-hint-dismissed` in the synced web UI state, so it stays hidden on your other devices.
+
 ## Sidebar sort
 
 By default the sidebar shows your manually-ordered list. Drag a row (press-and-hold) to move it; the order persists across browsers and devices via `workspace-ordering.json`. To reorder whole projects, press-and-drag the project/group header itself (there is no separate handle); this group order is per-browser (localStorage), not synced. Group drag is disabled while a filter is active or a computed sort mode is selected.
 
-Each project header shows the project icon next to its name, with a count of the sessions it holds. Hovering the header swaps the icon for a fold chevron; clicking the header collapses or expands the project's sessions.
+Each project header shows the project icon next to its name, with a count of the sessions it holds. Hovering the header swaps the icon for a fold chevron and shows its **+** (always shown on touch screens); clicking the header collapses or expands the project's sessions.
 
-A sort picker next to the filter button offers three modes:
+The **View options** button (sliders icon) beside the **Sessions** label holds the sidebar's view in one menu: **Group by**, **Sort by**, **Filter sessions** and, when plugins add them, **Plugin facets**. A dot on the button means the view differs from the default. **Sort by** offers three modes:
 
 - **Manual** (default): keeps your drag-ordered list, drag enabled.
 - **Recent activity**: orders by the most recent of `last_accessed_at`, `idle_entered_at`, and `created_at` across each workspace's sessions, descending.
 - **Attention**: floats sessions needing a human to the top, mirroring the TUI's Attention sort. Ranks by status (Waiting, Error, Idle, Unknown, Running, Stopped, transient states last); session and plugin attention requests rise within their tier, favorited rows come first within a status rank, and ties break by most-recent activity.
 
-Drag-to-reorder is disabled in the computed modes. The picker's state is per-browser (localStorage), not synced and not tied to your profile. The Multi-repo and Scratch groups default to the bottom; in manual mode you can drag them anywhere, in computed modes they stay at the bottom.
+Drag-to-reorder is disabled in the computed modes. The sort is per-browser (localStorage), not synced and not tied to your profile. The Multi-repo and Scratch groups default to the bottom; in manual mode you can drag them anywhere, in computed modes they stay at the bottom.
 
 ## Sidebar grouping: repo, organization, group, both, or status
 
-A grouping picker (layers icon) next to the sort picker opens a menu of axes, so any of them is one pick away:
+**Group by** in **View options** lists the axes, so any of them is one pick away:
 
-![The sidebar grouped by session status, with the grouping picker open](../../assets/web/sidebar-grouping.png)
+![The sidebar grouped by session status](../../assets/web/sidebar-grouping.png)
 
 - **By repo** (default): groups by git repository.
 - **By organization**: groups repositories by the owner in their git remote (any hosted remote, not only GitHub), with each repository's header inside its owner. Repos with no resolvable owner fall into a **No organization** bucket pinned to the bottom.
-- **By group** (**Group** in the picker): groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
+- **By group** (**Group** in the menu): groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
 - **By repo and group**: repository headers with user groups nested inside each. A session split across groups appears once per subgroup.
 - **By status**: groups by each session's actual execution status, in the same attention order the Attention sort and the Board's cards use: Waiting, Error, Idle, Unknown, Running, Stopped, then the transient Creating, Deleting and Starting. A workspace whose sessions differ in status appears once per status. This mirrors the TUI's Status grouping (`g` then Status).
 
@@ -172,6 +178,6 @@ Lifecycle hooks are shown **read-only** here, each labeled with its source (prof
 
 ## On mobile
 
-Below the `md` breakpoint the dashboard shows a single full-viewport pane instead of the desktop split. The right-panel button opens a picker for **Agent terminal**, **Paired terminal**, and whichever panes the session allows: **Background** in structured-view sessions, **Diff** and **Files** outside CityHall mode, and plugin panes. A back chip returns to the agent terminal. The agent terminal and paired shell stay alive in the background when you switch away, preserving scrollback and focus.
+Below the `md` breakpoint the dashboard's landing page is home, and a session opens full screen. The session list is a drawer: the round **☰** at the top left, a swipe right, or **Ctrl+Q** uncovers it by sliding the page aside as a card, following your finger, and a tap on the card or a swipe left closes it. Its title row holds **Home**, back to the landing page, the view options and a **⋯** with Help and the rest; its bottom row holds Settings, **Search** and **New session**. Each row adds a second line with the session's status and branch. The **☰** carries the count of sessions waiting for you or unread. A swipe left on a page opens the header's **⋯**, and a tap anywhere outside a menu closes it. The pill in the middle names the session, with what it is doing and its project beneath (left out when it repeats the name); tap it for the session's actions, the menu a long press on its row opens. The **⋯** at the right switches the session's view (**Agent**, **Terminal**, **Diff**, **Files**, and **More panes…**, a sheet with every other pane the session allows and every live paired shell across sessions), then holds its actions (Copy branch, Pin, Snooze, Archive, Stop, Move to Trash), then Help and the rest. Away from the agent, the pill names the view. Views stay alive in the background when you switch away, preserving scrollback and focus.
 
-In a structured-view conversation, the top bar and the message composer can each be folded away to give the transcript their height back. A small tab sits at the top right, below the bar and any banners under it, and another at the bottom right, just above the composer; tap one to collapse that region and tap it again to bring it back. The two are independent, so you can hide either or both, and both tabs stay on screen while collapsed so you are never stranded. Leaving the conversation for the dashboard, settings, or the diff pane shows the top bar again, since it is the only navigation those views have.
+On a session the header's controls float over it, so the conversation and the terminal scroll beneath them. In a structured-view conversation the message composer can also be folded away to give the transcript its height back: tap the small tab at the bottom right, just above the composer, and tap it again to bring it back. The tab stays on screen while collapsed, so you are never stranded.

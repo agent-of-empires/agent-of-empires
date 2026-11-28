@@ -79,6 +79,8 @@ fn spawn_config(
         prior_conversation: false,
         generation: 0,
         artifact_dir: None,
+        proxy: None,
+        degraded: None,
         sandbox_info: None,
         workspace_info: None,
         source_profile: None,
@@ -86,6 +88,7 @@ fn spawn_config(
         claude_store_pin: None,
         base_host_environment: vec![],
         provider_routing: routing_for(provider),
+        mcp_credentials: Default::default(),
     }
 }
 

@@ -386,6 +386,7 @@ async fn tools_list_advertises_each_tool_with_an_output_schema() {
             "list_sessions",
             "read_output",
             "send",
+            "suggest_session",
             "wait_for",
             "whoami"
         ]
@@ -1358,6 +1359,236 @@ async fn terminal_sessions_send_and_read_through_their_pane() {
     assert_eq!(sent["structuredContent"]["disposition"], "sent", "{sent}");
     assert!(sent["structuredContent"].get("seq").is_none(), "{sent}");
     pane_shows("from-the-child").await;
+}
+
+/// MCP `send` types into the pane its dialog check read, or refuses, even when the live target
+/// moves to another pane after the check, or the checked pane leaves the session. A draft typed
+/// after the check refuses at once rather than being waited out.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_mcp_send_types_into_the_pane_it_checked() {
+    use crate::tmux::test_helpers::{
+        on_draft_seen, on_input_checked, only_pane_id, split_pane, wait_for_pane_command,
+        TmuxTestSession, INPUT_BOX_SCRIPT,
+    };
+    if !crate::tmux::test_helpers::tmux_available() {
+        return;
+    }
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let shows = |pane: &str, text: &str| {
+        crate::tmux::tmux_command()
+            .args(["capture-pane", "-p", "-t", pane])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(text))
+    };
+    let start_cat = |name: &str| {
+        let mut args: Vec<String> = ["new-session", "-d", "-s", name, "exec cat"]
+            .map(str::to_string)
+            .to_vec();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, name);
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    #[derive(Clone, Copy, PartialEq)]
+    enum Then {
+        Unpin,
+        Kill,
+        Move,
+        Draft,
+    }
+    // (case, what happens to the checked pane after the check besides losing its pin, the code)
+    for (case, then, want) in [
+        ("unpinned", Then::Unpin, None),
+        ("killed", Then::Kill, Some("not_running")),
+        ("moved", Then::Move, Some("send_failed")),
+        ("drafted-after-check", Then::Draft, Some("input_line_busy")),
+    ] {
+        let mut live = Instance::new("mcp-checked", "/tmp/aoe-mcp-checked");
+        live.source_profile = "default".into();
+        let live_id = live.id.clone();
+        let session = live.tmux_session().unwrap();
+        let (app, _state, _secret) = seeded_app_with_secret(vec![live], false).await;
+        start_cat(session.name());
+        let _cleanup = TmuxTestSession::from_name(session.name());
+        let other = TmuxTestSession::new("mcp_checked_other");
+        start_cat(other.name());
+        let first = only_pane_id(session.name());
+        wait_for_pane_command(&first, "cat");
+        let checked = split_pane(
+            session.name(),
+            if then == Then::Draft {
+                INPUT_BOX_SCRIPT
+            } else {
+                "exec cat"
+            },
+        );
+        wait_for_pane_command(&checked, "cat");
+        if then == Then::Draft {
+            // The draft's clear, at the send's first read of it, would let a wait type.
+            let target = checked.clone();
+            on_draft_seen(&checked, move || {
+                assert!(crate::tmux::tmux_command()
+                    .args(["send-keys", "-t", &target, "C-u"])
+                    .status()
+                    .unwrap()
+                    .success());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while shows(&target, "half typed") {
+                    assert!(std::time::Instant::now() < deadline, "the draft clears");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            });
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pin =
+            crate::tmux::vt::register_live_target_for_test(session.name(), dir.path(), &checked);
+        let (target, to) = (checked.clone(), format!("={}:", other.name()));
+        // The hook runs on the check's blocking thread, where a panic would read as an
+        // unreadable pane; it reports to the test thread instead.
+        let (mutated, mutation) = std::sync::mpsc::channel();
+        on_input_checked(&checked, move || {
+            drop(pin);
+            let action = match then {
+                Then::Kill => vec!["kill-pane", "-t", &target],
+                Then::Move => vec!["join-pane", "-d", "-s", &target, "-t", &to],
+                Then::Draft => vec!["send-keys", "-t", &target, "-l", "half typed"],
+                Then::Unpin => {
+                    let _ = mutated.send(true);
+                    return;
+                }
+            };
+            let done = crate::tmux::tmux_command()
+                .args(action)
+                .status()
+                .is_ok_and(|status| status.success());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while then == Then::Draft
+                && !shows(&target, "❯ half typed")
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let _ = mutated.send(done && (then != Then::Draft || shows(&target, "❯ half typed")));
+        });
+
+        let arguments = json!({"session_id": live_id, "message": "typed-by-mcp"});
+        let result = call_result(&app, "send", arguments).await;
+        assert!(
+            mutation
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the check ran its hook"),
+            "{case}: the mutation failed"
+        );
+        // `display-message -t` falls back to another pane for a gone one; the pane list doesn't.
+        let panes = crate::tmux::tmux_command()
+            .args(["list-panes", "-a", "-F", "#{pane_id} #{session_name}"])
+            .output()
+            .unwrap();
+        assert!(
+            panes.status.success(),
+            "{case}: list-panes: {}",
+            String::from_utf8_lossy(&panes.stderr)
+        );
+        let checked_session = String::from_utf8_lossy(&panes.stdout)
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(&format!("{checked} "))
+                    .map(str::to_string)
+            });
+        match then {
+            Then::Kill => assert_eq!(checked_session, None, "{case}: still there"),
+            Then::Move => assert_eq!(checked_session.as_deref(), Some(other.name()), "{case}"),
+            Then::Unpin | Then::Draft => {}
+        }
+
+        if then == Then::Unpin {
+            assert_eq!(
+                result["structuredContent"]["disposition"], "sent",
+                "{case}: {result}"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !shows(&checked, "typed-by-mcp") {
+                assert!(std::time::Instant::now() < deadline, "{case}: never typed");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        } else {
+            assert_eq!(error_code(&result), want, "{case}: {result}");
+            // A killed pane is shown gone by the pane list above; any other is captured.
+            if then != Then::Kill {
+                assert!(
+                    !captured(&checked).contains("typed-by-mcp"),
+                    "{case}: typed after the check"
+                );
+            }
+        }
+        assert!(
+            !captured(&first).contains("typed-by-mcp"),
+            "{case}: typed into the other pane"
+        );
+    }
+}
+
+/// MCP `send` never types without a pane its check read. A snapshot that says `Stopped` reads
+/// `Gone` before any capture, so it is refused as not running even while its pane is live.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_mcp_send_without_a_checked_pane_is_refused() {
+    use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_command, TmuxTestSession};
+    if !crate::tmux::test_helpers::tmux_available() {
+        return;
+    }
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut stopped = Instance::new("mcp-stopped", "/tmp/aoe-mcp-stopped");
+    stopped.source_profile = "default".into();
+    stopped.status = crate::session::Status::Stopped;
+    let id = stopped.id.clone();
+    let session = stopped.tmux_session().unwrap();
+    let (app, _state, _secret) = seeded_app_with_secret(vec![stopped], false).await;
+    let mut args: Vec<String> = ["new-session", "-d", "-s", session.name(), "exec cat"]
+        .map(str::to_string)
+        .to_vec();
+    crate::tmux::utils::append_pane_base_index_args(&mut args, session.name());
+    assert!(crate::tmux::tmux_command()
+        .args(&args)
+        .status()
+        .unwrap()
+        .success());
+    let _cleanup = TmuxTestSession::from_name(session.name());
+    let pane = only_pane_id(session.name());
+    wait_for_pane_command(&pane, "cat");
+
+    let arguments = json!({"session_id": id, "message": "typed-by-mcp"});
+    let result = call_result(&app, "send", arguments).await;
+    assert_eq!(
+        error_code(&result),
+        Some("not_running"),
+        "stopped-snapshot: {result}"
+    );
+    assert_eq!(
+        result["structuredContent"]["message"], "The terminal session is not running",
+        "stopped-snapshot: {result}"
+    );
+    assert!(
+        !captured(&pane).contains("typed-by-mcp"),
+        "stopped-snapshot: typed without a checked pane"
+    );
+}
+
+/// The pane's screen; a failed capture fails the test rather than reading as nothing typed.
+fn captured(pane: &str) -> String {
+    let out = crate::tmux::tmux_command()
+        .args(["capture-pane", "-p", "-t", pane])
+        .output()
+        .expect("tmux capture-pane");
+    assert!(
+        out.status.success(),
+        "capture {pane}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// A retried `idempotency_key` answers with the first create's session and delivers nothing:

@@ -25,10 +25,12 @@ const SCHEMA = [
 ];
 
 vi.mock("../../lib/api", () => ({
+  fetchSuggestions: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve([{ name: "main", is_default: true }])),
   fetchSettings: vi.fn(() => Promise.resolve({ worktree: {}, sandbox: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
   getWebUiState: vi.fn(),
+  getSandboxLoginStatus: vi.fn(() => Promise.resolve(null)),
 }));
 
 const KEY = (id: string) => `aoe-settings-intro-${id}`;

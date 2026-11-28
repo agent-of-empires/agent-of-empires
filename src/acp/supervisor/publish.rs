@@ -9,7 +9,7 @@ use super::{
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
-use crate::acp::state::{BackgroundAgentStatus, Event, SubagentState};
+use crate::acp::state::{BackgroundAgentStatus, Event, StartupCause, SubagentState};
 
 /// A prompt to record and route through [`Supervisor::publish_user_prompt_with_attachments`].
 #[derive(Default)]
@@ -34,7 +34,17 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
     pub fn publish_startup_error(&self, session_id: &str, message: String) {
-        self.queue_startup_error(session_id, message).wait();
+        self.publish_startup_error_with_cause(session_id, message, None);
+    }
+
+    /// As [`Self::publish_startup_error`], naming the cause for clients that act on it.
+    pub fn publish_startup_error_with_cause(
+        &self,
+        session_id: &str,
+        message: String,
+        cause: Option<StartupCause>,
+    ) {
+        self.publish_next(session_id, &Event::AgentStartupError { message, cause });
     }
 
     /// Allocate a startup error's seq and queue it; the receipt waits for the store.
@@ -43,6 +53,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         publish_with_next_seq(&self.next_seqs, session_id, |seq| {
             self.sink.queue_persisted(session_id, seq, &event)
         })
+    }
+
+    /// The startup error of a launch held for the sandbox login: the instruction, and the
+    /// `command` and `profile` the recovery needs, as the 409 body carries them.
+    pub fn publish_login_required(
+        &self,
+        session_id: &str,
+        blocked: &crate::session::SandboxLoginRequired,
+    ) {
+        self.publish_startup_error_with_cause(
+            session_id,
+            blocked.to_string(),
+            Some(blocked.startup_cause()),
+        );
     }
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
@@ -54,6 +78,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         reason: &str,
         expected_seq: u64,
     ) -> bool {
+        self.publish_if_seq(
+            session_id,
+            &Event::Stopped {
+                reason: reason.to_string(),
+            },
+            expected_seq,
+        )
+    }
+
+    /// [`Self::publish_stopped_if_seq`] for any event. True only once the
+    /// event is stored.
+    pub fn publish_if_seq(&self, session_id: &str, event: &Event, expected_seq: u64) -> bool {
         let counter = super::session_seq(&self.next_seqs, session_id);
         let persisted = super::sink::blocking_io(|| {
             let mut last = super::lock_recover(&counter.next);
@@ -61,20 +97,13 @@ impl<S: BroadcastSink> Supervisor<S> {
                 return None;
             }
             let seq = counter.allocate(&mut last);
-            Some(self.sink.queue_persisted(
-                session_id,
-                seq,
-                &Event::Stopped {
-                    reason: reason.to_string(),
-                },
-            ))
+            Some(self.sink.queue_persisted(session_id, seq, event))
         });
         let Some(persisted) = persisted else {
             return false;
         };
         // A failed save is already broadcast as an AgentStartupError.
-        persisted.wait();
-        true
+        persisted.wait()
     }
 
     pub fn publish_agent_switched(
@@ -161,7 +190,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             classified_as,
         } = prompt;
         // Before any await or store, so an idle stop cannot claim the worker in between.
-        super::lock_recover(&self.lifecycle).note_admission(session_id);
+        let _admission = super::lock_recover(&self.lifecycle).note_admission(session_id);
         let profile = match classified_as {
             Some(profile) => profile,
             None => self.profile_for_session(session_id, &text).await,
@@ -228,7 +257,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         comments: Vec<crate::acp::state::DiffComment>,
         assembled_markdown: String,
     ) {
-        super::lock_recover(&self.lifecycle).note_admission(session_id);
+        let _admission = super::lock_recover(&self.lifecycle).note_admission(session_id);
         self.publish_next(
             session_id,
             &Event::UserDiffCommentsPrompt {
@@ -565,6 +594,48 @@ mod tests {
     use crate::acp::approvals::Nonce;
     use crate::process::worker_registry;
 
+    #[test]
+    fn login_required_startup_error_carries_the_recovery_fields() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let blocked = crate::session::SandboxLoginRequired {
+            tool: "claude".to_string(),
+            credential: std::path::PathBuf::from("/test/.credentials.json"),
+            command: Some("my claude".to_string()),
+            profile: Some("work".to_string()),
+        };
+        sup.publish_login_required("s-1", &blocked);
+        sup.publish_login_required(
+            "s-2",
+            &crate::session::SandboxLoginRequired {
+                command: None,
+                profile: None,
+                ..blocked.clone()
+            },
+        );
+
+        let frames = sink.frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), 2);
+        let Event::AgentStartupError { message, cause } = &frames[0].2 else {
+            panic!("expected a startup error, got {:?}", frames[0].2);
+        };
+        assert_eq!(*message, blocked.to_string());
+        assert_eq!(
+            *cause,
+            Some(StartupCause::SandboxLoginRequired {
+                command: Some("my claude".to_string()),
+                profile: Some("work".to_string()),
+            })
+        );
+        // Only what is set goes on the wire, as in the 409 body.
+        let wire = serde_json::to_value(&frames[1].2).unwrap();
+        assert_eq!(
+            wire["AgentStartupError"]["cause"],
+            serde_json::json!({ "kind": "sandbox_login_required" }),
+            "{wire}"
+        );
+    }
+
     #[tokio::test]
     async fn seq_counters_are_per_session_hydratable_and_forgettable() {
         let sink = VecSink::new();
@@ -606,6 +677,20 @@ mod tests {
 
         sup.forget_session("s-1").unwrap();
         assert_eq!(publish_with_next_seq(&sup.next_seqs, "s-1", |seq| seq), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_if_seq_is_false_when_the_save_fails() {
+        struct FailingSink;
+        impl BroadcastSink for FailingSink {
+            fn publish(&self, _: &str, _: u64, _: &Event) {}
+            fn publish_persisted(&self, _: &str, _: u64, _: &Event) -> bool {
+                false
+            }
+        }
+        let sup = Supervisor::new(std::sync::Arc::new(FailingSink));
+        sup.hydrate_seqs([("s-1".to_string(), 7)]);
+        assert!(!sup.publish_stopped_if_seq("s-1", "rate_limited", 7));
     }
 
     #[tokio::test]

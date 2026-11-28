@@ -44,7 +44,7 @@ pub(super) fn host_launch_env_prefix(
 
 pub(crate) fn generic_host_config_path_for(
     tool_name: &str,
-    hook_cfg: &crate::agents::AgentHookConfig,
+    hook_cfg: &crate::agents::AgentHookConfig<'_>,
     home: &Path,
     session_cfg: &crate::session::config::SessionConfig,
     host_environment: &[String],
@@ -97,6 +97,9 @@ pub(crate) fn sidecar_host_config_path_for(
 /// both describe the same install from the same resolution.
 pub(crate) struct HostHookDisclosure {
     pub settings_paths: Vec<String>,
+    /// Plugin-declared trust files a launch may write when
+    /// `session.pre_trust_agent_folders` is on.
+    pub trust_paths: Vec<String>,
     pub hook_commands: Vec<(String, String)>,
     pub needs_codex_trust_note: bool,
     /// Files the installer writes beside `settings_paths`, as
@@ -136,6 +139,34 @@ pub(crate) fn host_hook_agent(
         })
 }
 
+/// The active plugin declaration that runs `tool` as `command`. It outranks the
+/// built-in a command's first word names, as at launch (`Instance::resolved_agent`),
+/// so what is disclosed is what is installed.
+pub(crate) fn host_hook_declared_agent(
+    tool_name: &str,
+    command: &str,
+    session: &crate::session::config::SessionConfig,
+) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+    if crate::agents::get_agent(tool_name).is_some()
+        || session
+            .agent_command_override
+            .get(tool_name)
+            .is_some_and(|command| !command.trim().is_empty())
+    {
+        return None;
+    }
+    crate::plugin::agent_integration::declared_agent(
+        crate::plugin::registry(),
+        tool_name,
+        session
+            .custom_agents
+            .iter()
+            .filter(|(_, command)| !command.trim().is_empty())
+            .map(|(name, _)| name.as_str()),
+    )
+    .filter(|agent| agent.contribution().command.as_deref() == Some(command))
+}
+
 /// The repo-merged config the creation dialog's disclosure must read. A repo
 /// can move `agent_detect_as`, which is where the launcher's agent comes from;
 /// the other fields the disclosure reads are repo-denied, so merging costs
@@ -159,7 +190,7 @@ pub(crate) fn host_hook_disclosure_config_with_repo(
 /// is what the launch exports to the agent, so it is what the agent reads.
 fn host_hook_config_path(
     tool_name: &str,
-    agent: &'static crate::agents::AgentDef,
+    agent: &crate::agents::AgentDef,
     home: &std::path::Path,
     session_config: &crate::session::config::SessionConfig,
     host_environment: &[String],
@@ -194,7 +225,7 @@ fn host_hook_config_path(
 /// whole `~/.claude`-style directory, so the file keeps only its own name.
 fn routed_settings_path(
     routed_root: Option<&std::path::Path>,
-    hook_cfg: &crate::agents::AgentHookConfig,
+    hook_cfg: &crate::agents::AgentHookConfig<'_>,
 ) -> Option<std::path::PathBuf> {
     Some(routed_root?.join(Path::new(hook_cfg.settings_rel_path).file_name()?))
 }
@@ -204,11 +235,12 @@ fn routed_settings_path(
 /// decide the paths.
 pub(crate) fn host_hook_disclosure(
     tool_name: &str,
-    agent: &'static crate::agents::AgentDef,
+    agent: &crate::agents::AgentDef,
     config: &crate::session::config::Config,
 ) -> HostHookDisclosure {
     let mut disclosure = HostHookDisclosure {
         settings_paths: Vec::new(),
+        trust_paths: Vec::new(),
         hook_commands: Vec::new(),
         needs_codex_trust_note: false,
         status_hooks_enabled: false,
@@ -218,6 +250,21 @@ pub(crate) fn host_hook_disclosure(
     let host_env = config.environment.as_slice();
     let home = host_home(host_env).unwrap_or_else(|| std::path::PathBuf::from("~"));
     let session_config = &config.session;
+
+    if let Some(trust) = agent.trust {
+        disclosure.trust_paths.push(
+            crate::hooks::declared_trust_path(
+                trust,
+                &home,
+                host_env,
+                session_config
+                    .agent_config_dir_for(tool_name, &home)
+                    .as_deref(),
+            )
+            .to_string_lossy()
+            .into_owned(),
+        );
+    }
 
     // No session is in scope here, so there is no routed store to apply: the
     // dialog and `aoe hooks approve` name what a launch on the profile's own
@@ -272,7 +319,7 @@ pub(crate) fn host_hook_disclosure(
                 effects.push(format!(
                     "runs aoe __extract-session-id --field {}{}",
                     crate::hooks::identity_field_name(field),
-                    crate::hooks::identity_publisher_arg(event.publisher),
+                    crate::hooks::identity_publisher_arg(event.publisher.as_deref()),
                 ));
             }
             if let Some(status) = event.status {
@@ -369,12 +416,14 @@ impl Instance {
                 &self.extra_args,
             ))?;
         }
-        let agent = self.status_agent();
-        self.ensure_disclosed_host_hook_path(agent)?;
-        if self.is_sandboxed() {
-            self.install_agent_status_hooks(agent);
-        }
-        self.ensure_host_folder_trust(agent);
+        self.with_hook_agent(|this, agent| {
+            this.ensure_disclosed_host_hook_path(agent)?;
+            if this.is_sandboxed() {
+                this.install_agent_status_hooks(agent);
+            }
+            this.ensure_host_folder_trust(agent);
+            Ok::<(), anyhow::Error>(())
+        })?;
         self.propagate_managed_skills();
         let on_launch_hooks = if skip_on_launch {
             None
@@ -551,9 +600,31 @@ impl Instance {
         crate::session::skills_model::log_sync_outcomes(&self.tool, &outcomes);
     }
 
+    /// Runs `use_agent` with the agent this launch's hooks and trust belong to: the
+    /// session's active plugin declaration, else a built-in or bundled one.
+    pub(super) fn with_hook_agent<R>(
+        &mut self,
+        use_agent: impl FnOnce(&mut Self, Option<&crate::agents::AgentDef<'_>>) -> R,
+    ) -> R {
+        let Some(declared) = self.declared_agent() else {
+            let agent = self.status_agent();
+            return use_agent(self, agent);
+        };
+        let mut use_agent = Some(use_agent);
+        let result = declared
+            .with_definition(|agent| (use_agent.take().expect("called once"))(self, Some(agent)));
+        match result {
+            Some(result) => result,
+            None => {
+                let agent = self.status_agent();
+                (use_agent.take().expect("declaration yielded no agent"))(self, agent)
+            }
+        }
+    }
+
     fn ensure_disclosed_host_hook_path(
         &self,
-        agent: Option<&'static crate::agents::AgentDef<'static>>,
+        agent: Option<&crate::agents::AgentDef<'_>>,
     ) -> Result<()> {
         let Some(agent) = agent else {
             return Ok(());
@@ -622,10 +693,7 @@ impl Instance {
     /// which never receives it, so the file hooks are installed into is the
     /// file the agent opens. An agent that routes no store gets no root, and
     /// keeps resolving its config directory from the environment.
-    fn routed_hook_root(
-        &self,
-        agent: &'static crate::agents::AgentDef,
-    ) -> Option<std::path::PathBuf> {
+    fn routed_hook_root(&self, agent: &crate::agents::AgentDef) -> Option<std::path::PathBuf> {
         let (_, binding, _) = self.conversation_target()?;
         let binding = binding.filter(|binding| binding.is_known())?;
         let execution = binding.execution.as_ref()?;
@@ -637,7 +705,7 @@ impl Instance {
     /// Install optional status hooks and mandatory authoritative identity hooks.
     pub(super) fn install_agent_status_hooks(
         &mut self,
-        agent: Option<&'static crate::agents::AgentDef<'static>>,
+        agent: Option<&crate::agents::AgentDef<'_>>,
     ) {
         self.identity_publisher_launched = false;
         let config = crate::session::config::profile_config::resolve_config_or_warn(
@@ -689,7 +757,7 @@ impl Instance {
     /// settings file written here is the file the agent reads.
     fn install_host_hooks(
         &self,
-        agent: &'static crate::agents::AgentDef,
+        agent: &crate::agents::AgentDef,
         home: &Path,
         session_cfg: &crate::session::config::SessionConfig,
         host_environment: &[String],
@@ -738,7 +806,25 @@ impl Instance {
                     }
                 }
             }
-            crate::agents::HookFormat::JsonSettings => self.install_json_host_hooks(&path, events),
+            crate::agents::HookFormat::JsonSettings => {
+                // An install replaces every AoE entry in the file, so a plugin
+                // must not share a built-in agent's file and strip its hooks.
+                if hook_cfg.strict
+                    && crate::hooks::is_other_builtin_hook_path(
+                        &path,
+                        agent.name,
+                        home,
+                        host_environment,
+                        session_cfg,
+                    )
+                {
+                    tracing::warn!(target: "session.store",
+                        "Not installing {} hooks into {}: it is another agent's settings file",
+                        agent.name, path.display());
+                    return false;
+                }
+                self.install_json_host_hooks(hook_cfg, &path, events)
+            }
         }
     }
 
@@ -750,7 +836,7 @@ impl Instance {
     /// `session.pre_trust_agent_folders`. The path is canonicalized because
     /// agents key trust on the resolved directory, not the symlink used to
     /// reach it.
-    fn ensure_host_folder_trust(&self, agent: Option<&'static crate::agents::AgentDef<'static>>) {
+    fn ensure_host_folder_trust(&self, agent: Option<&crate::agents::AgentDef<'_>>) {
         if self.is_sandboxed() {
             return;
         }
@@ -778,6 +864,58 @@ impl Instance {
             tracing::warn!(target: "session.store",
                 "Failed to pre-trust {} in the host {} config: {}", project_path, agent.name, e);
         }
+        if let Some(trust) = agent.trust {
+            let path = crate::hooks::declared_trust_path(
+                trust,
+                &home,
+                &environment,
+                config_dir.as_deref(),
+            );
+            // `aoe hooks status` discloses the path the profile resolves; a
+            // `before_session` redirect must not move the write elsewhere.
+            let profile_environment = self.profile_host_environment();
+            let disclosed = host_home(&profile_environment).map(|profile_home| {
+                crate::hooks::declared_trust_path(
+                    trust,
+                    &profile_home,
+                    &profile_environment,
+                    config
+                        .session
+                        .agent_config_dir_for(&self.tool, &profile_home)
+                        .as_deref(),
+                )
+            });
+            if disclosed
+                .as_deref()
+                .is_some_and(|disclosed| !same_hook_target(disclosed, &path))
+            {
+                tracing::warn!(target: "session.store",
+                    "Not pre-trusting {} for {}: before_session moved the trust file to {}, which was not disclosed",
+                    project_path, agent.name, path.display());
+                return;
+            }
+            if crate::hooks::is_other_builtin_trust_file(
+                &path,
+                agent.name,
+                &home,
+                &environment,
+                &config.session,
+            ) {
+                tracing::warn!(target: "session.store",
+                    "Not pre-trusting {} for {}: {} is another agent's trust file",
+                    project_path, agent.name, path.display());
+                return;
+            }
+            if let Err(e) = crate::hooks::write_declared_trust(
+                &path,
+                trust,
+                &project_path,
+                crate::hooks::SymlinkPolicy::Follow,
+            ) {
+                tracing::warn!(target: "session.store",
+                    "Failed to pre-trust {} in {}: {}", project_path, path.display(), e);
+            }
+        }
     }
 
     /// Install a sidecar agent's host hooks. For agents whose hooks are scoped
@@ -787,7 +925,7 @@ impl Instance {
     /// agent's standalone config and run any `post_install_host` follow-up.
     fn install_sidecar_host_hooks(
         &self,
-        sidecar: &'static crate::agents::SidecarHooks,
+        sidecar: &crate::agents::SidecarHooks,
         home: &Path,
         session_cfg: &crate::session::config::SessionConfig,
         host_environment: &[String],
@@ -866,10 +1004,12 @@ impl Instance {
     /// file than the one the guard approved.
     fn install_json_host_hooks(
         &self,
+        hook_cfg: &crate::agents::AgentHookConfig<'_>,
         settings_path: &Path,
         events: &[crate::agents::ResolvedHookEvent],
     ) -> bool {
-        match crate::hooks::install_hooks(
+        match crate::hooks::install_json_hooks(
+            hook_cfg,
             settings_path,
             events,
             crate::hooks::HookInstallTarget::Host,
@@ -973,7 +1113,7 @@ pub(super) fn host_home(host_environment: &[String]) -> Option<std::path::PathBu
 }
 
 fn resolved_host_hook_events(
-    agent: &'static crate::agents::AgentDef,
+    agent: &crate::agents::AgentDef,
     config: &crate::session::config::Config,
     status_hooks_enabled: bool,
 ) -> Option<Vec<crate::agents::ResolvedHookEvent>> {
@@ -1344,6 +1484,206 @@ mod tests {
             "hooks landed outside the store the launch routes to"
         );
         assert!(inst.identity_publisher_launched);
+    }
+
+    /// A `before_session` redirect of the declared trust path is not written to,
+    /// since the path it resolves to was never disclosed.
+    #[test]
+    #[serial_test::serial]
+    fn a_redirected_declared_trust_path_is_not_written() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = EnvGuard::unset(&["EXAMPLE_CONFIG_DIR"]);
+        crate::session::test_support::install_agent_plugin(
+            "acme.redirected-trust",
+            "id = \"acme.redirected-trust\"\nname = \"Redirected\"\nversion = \"1.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             command = \"example-helper\"\n[agent_integrations.launch.container_env]\n\
+             EXAMPLE_CONFIG_DIR = \"/opt/example\"\n[agent_integrations.trust]\n\
+             file = \".example.json\"\nlocation = \"config_dir_or_home\"\n\
+             config_dir_env_var = \"EXAMPLE_CONFIG_DIR\"\n\
+             pointer = \"/projects/{path}/trusted\"\nvalue = true\nsandbox = \"always\"\n",
+        );
+        let disclosed = tmp.path().join("disclosed");
+        let redirected = tmp.path().join("redirected");
+        crate::session::config::update_config(|config| {
+            config.session.pre_trust_agent_folders = true;
+            config.environment = vec![format!("EXAMPLE_CONFIG_DIR={}", disclosed.display())];
+        })
+        .unwrap();
+        let trust = |inst: &mut Instance| {
+            inst.with_hook_agent(|this, agent| this.ensure_host_folder_trust(agent))
+        };
+
+        let mut redirect = tool_instance("example-helper", tmp.path().to_str().unwrap());
+        redirect.pending_host_env = vec![(
+            "EXAMPLE_CONFIG_DIR".to_string(),
+            redirected.to_string_lossy().into_owned(),
+        )];
+        trust(&mut redirect);
+        assert!(!redirected.join(".example.json").exists());
+        assert!(!disclosed.join(".example.json").exists());
+
+        trust(&mut tool_instance(
+            "example-helper",
+            tmp.path().to_str().unwrap(),
+        ));
+        assert!(disclosed.join(".example.json").exists());
+    }
+
+    /// A declared agent aliased to a built-in through `detect_as` still gets its own
+    /// hooks and trust on a host launch.
+    #[test]
+    #[serial_test::serial]
+    fn a_declared_agent_is_selected_before_its_detect_as_alias() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        crate::session::test_support::install_agent_plugin(
+            "acme.aliased-declared",
+            "id = \"acme.aliased-declared\"\nname = \"Aliased\"\nversion = \"1.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             command = \"example-helper\"\n[agent_integrations.hooks]\n\
+             settings_rel_path = \".example/settings.json\"\nformat = \"json_settings\"\n\
+             [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n\
+             [agent_integrations.trust]\nfile = \".example.json\"\nlocation = \"config_dir_or_home\"\n\
+             pointer = \"/projects/{path}/trusted\"\nvalue = true\nsandbox = \"always\"\n",
+        );
+        let mut instance = tool_instance("example-helper", tmp.path().to_str().unwrap());
+        instance.detect_as = "claude".into();
+
+        let name = instance.with_hook_agent(|_, agent| agent.map(|a| a.name.to_string()));
+
+        assert_eq!(name.as_deref(), Some("example-helper"));
+    }
+
+    /// A declaration whose command is a built-in binary is disclosed as the
+    /// declaration, which is what launch installs.
+    #[test]
+    #[serial_test::serial]
+    fn disclosure_prefers_the_declaration_over_the_built_in_its_command_names() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-claude-command",
+            "id = \"acme.declared-claude-command\"\nname = \"Declared\"\nversion = \"1.0.0\"\n\
+             api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+             command = \"claude\"\n[agent_integrations.hooks]\n\
+             settings_rel_path = \".example/settings.json\"\nformat = \"json_settings\"\n\
+             [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n",
+        );
+        let config = crate::session::config::profile_config::resolve_config_or_warn("");
+        assert_eq!(
+            host_hook_agent("example-helper", "claude", &config.session).map(|a| a.name),
+            Some("claude"),
+            "the command alone names the built-in"
+        );
+        let declared = host_hook_declared_agent("example-helper", "claude", &config.session)
+            .expect("the declaration is selected first");
+        let paths = declared
+            .with_definition(|agent| {
+                host_hook_disclosure("example-helper", agent, &config).settings_paths
+            })
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec![tmp
+                .path()
+                .join(".example/settings.json")
+                .to_string_lossy()
+                .into_owned()]
+        );
+    }
+
+    /// A plugin-declared agent gets its hooks and trust through the same launch
+    /// wiring as a built-in one, and its writers fail closed.
+    #[test]
+    #[serial_test::serial]
+    fn a_plugin_declared_agent_gets_hooks_and_trust_through_the_launch() {
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = EnvGuard::unset(&["EXAMPLE_CONFIG_DIR"]);
+        let manifest = |settings: &str, trust_file: &str| {
+            format!(
+                "id = \"acme.declared-launch\"\nname = \"Declared launch\"\nversion = \"1.0.0\"\n\
+                 api_version = 28\n[[agent_integrations]]\ntool = \"example-helper\"\n\
+                 command = \"example-helper\"\n[agent_integrations.hooks]\n\
+                 settings_rel_path = \"{settings}\"\nformat = \"json_settings\"\n\
+                 [[agent_integrations.hooks.events]]\nevent = \"Stop\"\nstatus = \"idle\"\n\
+                 [agent_integrations.trust]\nfile = \"{trust_file}\"\n\
+                 location = \"config_dir_or_home\"\npointer = \"/projects/{{path}}/trusted\"\n\
+                 value = true\nsandbox = \"always\"\n"
+            )
+        };
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-launch",
+            &manifest(".example/settings.json", ".example.json"),
+        );
+        acknowledge_hooks();
+        crate::session::config::update_config(|config| {
+            config.session.pre_trust_agent_folders = true;
+        })
+        .unwrap();
+        let mut inst = tool_instance("example-helper", tmp.path().to_str().unwrap());
+        let launch = |inst: &mut Instance| {
+            inst.with_hook_agent(|this, agent| {
+                assert_eq!(agent.map(|agent| agent.name), Some("example-helper"));
+                this.ensure_disclosed_host_hook_path(agent).unwrap();
+                this.install_agent_status_hooks(agent);
+                this.ensure_host_folder_trust(agent);
+            })
+        };
+
+        launch(&mut inst);
+        let settings = tmp.path().join(".example/settings.json");
+        let installed = std::fs::read_to_string(&settings).unwrap();
+        assert!(installed.contains("aoe-hooks"), "{installed}");
+        let trusted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join(".example.json")).unwrap(),
+        )
+        .unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_eq!(
+            trusted["projects"][project.to_str().unwrap()]["trusted"],
+            true
+        );
+
+        // The installed file is a hook target, and uninstall removes the hooks but
+        // keeps the trust record.
+        let target = crate::hooks::iter_all_hook_targets_in(tmp.path(), &[])
+            .into_iter()
+            .find(|target| target.agent_name == "example-helper")
+            .expect("declared agent is a hook target");
+        assert_eq!(target.path, settings);
+        assert!(crate::hooks::has_aoe_marker(&target));
+        assert!(crate::hooks::uninstall_hooks(&settings).unwrap());
+        assert!(!crate::hooks::has_aoe_marker(&target));
+        assert!(tmp.path().join(".example.json").exists());
+
+        // A settings file that is not JSON is never replaced.
+        std::fs::write(&settings, "{not json").unwrap();
+        launch(&mut inst);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{not json");
+
+        // Another agent's settings file is never taken over.
+        crate::session::test_support::install_agent_plugin(
+            "acme.declared-launch",
+            &manifest(".claude/settings.json", ".claude.json"),
+        );
+        launch(&mut inst);
+        assert!(!tmp.path().join(".claude/settings.json").exists());
+        assert!(
+            !tmp.path().join(".claude.json").exists(),
+            "another agent's trust file is never written"
+        );
     }
 
     #[test]
@@ -2175,11 +2515,9 @@ mod tests {
             let _ = session.kill();
 
             let err = result.expect_err(label);
-            // The recovery names the profile unless it is the default one (the first label's is).
             let mut expected =
                 crate::session::test_support::login_required_under("claude", temp.path());
-            expected.profile =
-                (profile != crate::session::config::effective_profile("")).then(|| profile.clone());
+            expected.profile = Some(profile.clone());
             assert_eq!(
                 err.downcast_ref::<SandboxLoginRequired>(),
                 Some(&expected),

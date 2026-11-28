@@ -368,7 +368,7 @@ impl<'a> Screen<'a> {
 }
 
 /// A run of box-drawing dashes, optionally broken by a right-aligned label.
-fn line_is_horizontal_rule(trimmed: &str) -> bool {
+pub(super) fn line_is_horizontal_rule(trimmed: &str) -> bool {
     trimmed.chars().take_while(|c| *c == '─').count() >= 3 && trimmed.ends_with('─')
 }
 

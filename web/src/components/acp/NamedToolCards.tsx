@@ -23,7 +23,7 @@ import {
 import { useSkillIndex } from "../../hooks/useSkillIndex";
 import { parseJsonObject, pickStr } from "../../lib/acpArgs";
 import type { ToolCall } from "../../lib/acpTypes";
-import type { AgentProfile } from "../../lib/agentProfiles";
+import type { AgentProfile } from "../../lib/agentProfile";
 import { diffPair } from "../../lib/diffPair";
 import { humanizeServer, humanizeVerb } from "../../lib/mcpClassify";
 import { cleanRecalledMemory, parseMemoryFrontmatter, type MemoryHit } from "../../lib/memoryClassify";
@@ -53,6 +53,7 @@ import {
   type ToolCardProps,
 } from "./ToolCardChrome";
 import { ToolErrorBody } from "./ToolErrorBody";
+import { BUTTON_INLINE } from "../../lib/surfaces";
 
 const ICON = "h-3.5 w-3.5";
 const TABULAR_META = "hidden md:inline text-[11px] text-text-dim tabular-nums";
@@ -139,7 +140,7 @@ export function classifySkill(
 ): { isSkill: true; name: string } | { isSkill: false } {
   if (tool.kind !== "other") return { isSkill: false };
   const title = tool.name?.trim().toLowerCase() ?? "";
-  if (!profile.specialTitles.skillNames.includes(title)) return { isSkill: false };
+  if (!profile.special_titles.skill_names.includes(title)) return { isSkill: false };
   const name = pickStr(parseJsonObject(tool.args_preview), "skill", "name", "skill_name") ?? "skill";
   return { isSkill: true, name };
 }
@@ -172,7 +173,7 @@ export function classifyWorkflow(tool: ToolCall, profile: AgentProfile): boolean
     tool.name ??
     ""
   ).trim();
-  return profile.specialTitles.workflowNames.includes(title);
+  return profile.special_titles.workflow_names.includes(title);
 }
 
 function lastEnd(agents: { endedAt: string | null }[]): string | undefined {
@@ -232,7 +233,7 @@ export function WorkflowToolCard({ tool, result }: ToolCardProps) {
                 );
               })}
               {openPane && (
-                <button type="button" onClick={() => openPane()} className="mt-1.5 text-accent-500 hover:underline">
+                <button type="button" onClick={() => openPane()} className={`${BUTTON_INLINE} mt-1.5 self-start`}>
                   Open Background
                 </button>
               )}

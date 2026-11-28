@@ -26,7 +26,7 @@ const edit = (text: string) => {
 
 const ui = (tool: ReturnType<typeof edit>) => (
   <AcpFileRefContext.Provider value={{ fileRefSession: null, onOpenFileRef: undefined }}>
-    <AgentProfileProvider toolKey={null}>
+    <AgentProfileProvider profile={null}>
       <EditToolCard tool={tool} />
     </AgentProfileProvider>
   </AcpFileRefContext.Provider>

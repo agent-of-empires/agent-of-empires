@@ -39,6 +39,7 @@ import {
 import { writeClipboard } from "../../lib/clipboard";
 import { highlightSnippet, peekHighlight } from "../../lib/snippetHighlighter";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import { profileFor } from "../../lib/__tests__/agentProfileFixtures";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { buildSkillIndex, type SkillIndex } from "../../lib/skillProvenance";
 import { AcpFileRefContext } from "./AcpFileRefContext";
@@ -65,7 +66,7 @@ interface RenderOpts {
 function wrap(node: React.ReactNode, { toolKey = null, session = null, onOpenFileRef }: RenderOpts = {}) {
   return (
     <AcpFileRefContext.Provider value={{ fileRefSession: session, onOpenFileRef }}>
-      <AgentProfileProvider toolKey={toolKey}>{node}</AgentProfileProvider>
+      <AgentProfileProvider profile={profileFor(toolKey)}>{node}</AgentProfileProvider>
     </AcpFileRefContext.Provider>
   );
 }
@@ -160,7 +161,7 @@ describe("ToolCard headers", () => {
       "memory file",
       makeToolCall({ kind: "read", args_preview: args({ path: `${MEMORY_DIR}/feedback_x.md` }) }),
       makeCompletion({ text: "body" }),
-      {},
+      { toolKey: "claude" },
       ["Memory", "recalled", "feedback_x.md"],
       [],
     ],
@@ -168,7 +169,7 @@ describe("ToolCard headers", () => {
       "memory index",
       makeToolCall({ kind: "read", args_preview: args({ path: `${MEMORY_DIR}/MEMORY.md` }) }),
       makeCompletion({ text: "index body" }),
-      {},
+      { toolKey: "claude" },
       ["Memory index", "read index"],
       [],
     ],
@@ -402,6 +403,8 @@ describe("ToolCard expanded bodies", () => {
           { path, old_text: "---\nname: x\n---\nold line", new_text: "---\nname: x\n---\nnew line", created_at: "" },
         ],
       }),
+      undefined,
+      { toolKey: "claude" },
     );
     expect(text()).toContain("updated");
     expect(text()).toContain("+1");
@@ -425,6 +428,8 @@ describe("ToolCard expanded bodies", () => {
           { path, old_text: oldText, new_text: "new line", created_at: "" },
         ],
       }),
+      undefined,
+      { toolKey: "claude" },
     );
     toggle();
     expect(container.querySelectorAll('[data-testid="string-diff"]').length).toBe(expectedDiffs);
@@ -443,6 +448,8 @@ describe("ToolCard expanded bodies", () => {
           { path, old_text: null, new_text: "---\nname: y\ndescription: a note\n---\nfresh body", created_at: "" },
         ],
       }),
+      undefined,
+      { toolKey: "claude" },
     );
     toggle();
     expect(text()).toContain("saved");

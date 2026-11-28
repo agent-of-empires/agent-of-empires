@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { findMatches, type FindMatch, type SearchableLine } from "./findMatches";
 import { isImeComposing } from "../../../lib/ime";
+import { INPUT } from "../../../lib/surfaces";
+import { ACTIVE, IDLE, SEGMENT } from "../viewerChrome";
 
 interface Props {
   lines: SearchableLine[];
@@ -55,7 +57,7 @@ export function FindBar({ lines, onJump, onClose }: Props) {
   };
 
   return (
-    <div className="flex items-center gap-1 px-3 py-1.5 border-b border-surface-700/20 bg-surface-850 shrink-0">
+    <div className="flex items-center gap-1 px-3 py-1.5 border-b border-surface-700/50 bg-surface-850 shrink-0">
       <input
         ref={inputRef}
         type="text"
@@ -75,7 +77,7 @@ export function FindBar({ lines, onJump, onClose }: Props) {
         }}
         placeholder="Find in diff"
         aria-label="Find in diff"
-        className="flex-1 min-w-0 bg-surface-900 border border-surface-700/40 rounded px-2 py-0.5 text-[12px] font-mono text-text-primary outline-none focus:border-brand-600"
+        className={`${INPUT} !w-auto flex-1 min-w-0 !py-1 font-mono`}
       />
       <span className={`font-mono text-[11px] tabular-nums ${error ? "text-status-error" : "text-text-dim"}`}>
         {error ? error : matches.length === 0 ? (query ? "0/0" : "") : `${activeIdx + 1}/${matches.length}`}
@@ -128,9 +130,7 @@ function ToggleButton({
       aria-pressed={active}
       aria-label={title}
       title={title}
-      className={`px-1.5 py-0.5 rounded text-[11px] font-mono cursor-pointer transition-colors ${
-        active ? "bg-brand-600 text-white" : "text-text-dim hover:text-text-secondary"
-      }`}
+      className={`${SEGMENT} rounded-md ${active ? ACTIVE : IDLE}`}
     >
       {label}
     </button>
@@ -155,7 +155,7 @@ function IconButton({
       title={title}
       disabled={disabled}
       aria-label={title}
-      className="px-1.5 py-0.5 rounded text-[11px] font-mono text-text-dim hover:text-text-secondary cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-default"
+      className={`${SEGMENT} rounded-md ${IDLE} disabled:opacity-40 disabled:cursor-default`}
     >
       {label}
     </button>

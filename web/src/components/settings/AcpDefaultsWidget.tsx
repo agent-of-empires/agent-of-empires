@@ -5,11 +5,16 @@ import { useEffect, useState } from "react";
 
 import { fetchAcpOptionCatalog, fetchAgents } from "../../lib/api";
 import type { AgentOptionEntry } from "../../lib/api";
-import { effectiveLifecycle } from "../../lib/agentProfiles";
 import type { ConfigOptionCategory, ConfigOptionDescriptor } from "../../lib/acpTypes";
 import type { AgentInfo } from "../../lib/types";
 import type { CustomWidgetProps } from "./customWidgets";
+import { INPUT } from "../../lib/surfaces";
+import { BUTTON_GHOST_SM, FIELD_DESCRIPTION, FIELD_LABEL, INSET } from "../../lib/surfaces";
+import { PanelMessage } from "../panelParts";
 import { SelectField, TextField } from "./FormFields";
+
+// Per-model rows sit in a dense line, so their controls stay content-width.
+const ROW_INPUT = `${INPUT} !w-auto`;
 
 interface AcpAgentDefaults {
   model?: string;
@@ -130,22 +135,22 @@ function AgentDefaultsCard({
   const addableModels = modelChoices.filter((c) => !(c.value in (defaults.effort_by_model ?? {})));
 
   return (
-    <div className="rounded-md border border-surface-700 bg-surface-850 p-3 space-y-3">
+    <div className={`${INSET} p-3 space-y-3`}>
       <div className="flex items-baseline justify-between">
-        <h5 className="text-sm font-semibold text-text-primary">{agent.name}</h5>
+        <h5 className="text-[15px] md:text-sm font-semibold text-text-primary">{agent.name}</h5>
         <span className="flex items-baseline gap-1.5">
-          {effectiveLifecycle(agent, agent.name).state === "deprecated" && (
+          {agent.lifecycle?.state === "deprecated" && (
             <span
-              className="text-[10px] uppercase text-status-warning"
+              className="font-mono text-[11px] text-status-warning"
               data-testid={`acp-defaults-deprecated-${agent.name}`}
             >
               deprecated
             </span>
           )}
-          {!agent.installed && <span className="text-[10px] uppercase text-text-dim">not installed</span>}
+          {!agent.installed && <span className="font-mono text-[11px] text-text-dim">not installed</span>}
         </span>
       </div>
-      <p className="text-xs text-text-dim">{freshness(entry)}</p>
+      <PanelMessage>{freshness(entry)}</PanelMessage>
 
       <OptionField
         label="Default model"
@@ -173,13 +178,15 @@ function AgentDefaultsCard({
       />
 
       <div className="space-y-2">
-        <div className="text-sm text-text-bright">Per-model thinking</div>
-        <div className="text-xs text-text-dim">
-          Overrides the default thinking when that model is the resolved model.
+        <div>
+          <div className={FIELD_LABEL}>Per-model thinking</div>
+          <div className={FIELD_DESCRIPTION.replace("mb-2", "mb-0")}>
+            Overrides the default thinking when that model is the resolved model.
+          </div>
         </div>
         {perModel.map(([model, effort]) => (
           <div key={model} className="flex items-center gap-2" data-testid={`per-model-row-${model}`}>
-            <span className="flex-1 truncate font-mono text-xs text-text-secondary" title={model}>
+            <span className="flex-1 truncate font-mono text-[12px] text-text-secondary" title={model}>
               {model}
             </span>
             {effortChoices.length > 0 ? (
@@ -187,7 +194,7 @@ function AgentDefaultsCard({
                 aria-label={`Thinking for ${model}`}
                 value={effort}
                 onChange={(e) => setPerModel(model, e.target.value)}
-                className="bg-surface-900 border border-surface-700 rounded-md px-2 py-1 text-xs text-text-primary focus:border-brand-600 focus:outline-none"
+                className={ROW_INPUT}
               >
                 {selectOptions(effortDesc, effort, "Adapter default").map((o) => (
                   <option key={o.value} value={o.value}>
@@ -201,14 +208,14 @@ function AgentDefaultsCard({
                 aria-label={`Thinking for ${model}`}
                 value={effort}
                 onChange={(e) => setPerModel(model, e.target.value)}
-                className="w-24 bg-surface-900 border border-surface-700 rounded-md px-2 py-1 font-mono text-xs text-text-primary focus:border-brand-600 focus:outline-none"
+                className={`${INPUT} !w-24 font-mono`}
               />
             )}
             <button
               type="button"
               aria-label={`Remove override for ${model}`}
               onClick={() => removePerModel(model)}
-              className="rounded px-2 py-1 text-xs text-text-dim hover:text-text-primary"
+              className={BUTTON_GHOST_SM}
             >
               Remove
             </button>
@@ -222,7 +229,7 @@ function AgentDefaultsCard({
               const model = e.target.value;
               if (model) setPerModel(model, effortChoices[0]?.value ?? "high");
             }}
-            className="bg-surface-900 border border-surface-700 rounded-md px-2 py-1 text-xs text-text-primary focus:border-brand-600 focus:outline-none"
+            className={ROW_INPUT}
           >
             <option value="">Add override for model…</option>
             {addableModels.map((c) => (
@@ -277,7 +284,7 @@ export function AcpDefaultsWidget({ value, save, row }: CustomWidgetProps) {
   return (
     <div role="group" aria-labelledby={row.labelId} className="space-y-3">
       {acpAgents.length === 0 ? (
-        <p className="text-xs text-text-dim">No ACP-capable agents detected.</p>
+        <PanelMessage>No ACP-capable agents detected.</PanelMessage>
       ) : (
         acpAgents.map((agent) => (
           <AgentDefaultsCard
@@ -301,7 +308,7 @@ export function AcpDefaultsWidget({ value, save, row }: CustomWidgetProps) {
           }
         }}
       >
-        <summary className="cursor-pointer text-xs text-text-dim hover:text-text-primary">
+        <summary className="min-h-7 max-md:min-h-11 flex items-center cursor-pointer text-[13px] text-text-dim hover:text-text-primary">
           Advanced: edit raw JSON
         </summary>
         <div className="mt-2 space-y-1">
@@ -332,7 +339,7 @@ export function AcpDefaultsWidget({ value, save, row }: CustomWidgetProps) {
             mono
             multiline
           />
-          {rawError && <div className="text-xs text-red-400">{rawError}</div>}
+          {rawError && <PanelMessage tone="error">{rawError}</PanelMessage>}
         </div>
       </details>
     </div>

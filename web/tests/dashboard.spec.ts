@@ -39,7 +39,7 @@ test.describe("Sidebar", () => {
   test("sidebar can be toggled closed and open on desktop", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
-    const addBtn = page.getByLabel("New project session");
+    const addBtn = page.getByTestId("sidebar-new-session");
     await expect(addBtn).toBeVisible();
 
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
@@ -97,7 +97,7 @@ test.describe("Create session from home screen", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
-    await page.getByLabel("New project session").first().click();
+    await page.getByTestId("sidebar-new-session").first().click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
 
     await page.getByRole("button", { name: "Close" }).click();
@@ -119,7 +119,7 @@ test.describe("Settings", () => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await pressShortcut(page, "s");
-    await expect(page.getByTestId("settings-header").getByRole("button", { name: "← Back" })).toBeVisible();
+    await expect(page.getByRole("banner").getByRole("button", { name: "Back", exact: true })).toBeVisible();
   });
 });
 
@@ -134,83 +134,84 @@ test.describe("Keyboard shortcuts", () => {
   });
 });
 
-test.describe("Mobile responsive", () => {
-  test("mobile home screen's Show sessions button opens the sidebar", async ({ page }) => {
-    // Dashboard.tsx's own `md:hidden` trigger, not TopBar's "Toggle sidebar":
-    // the two are separate elements and nothing else in web/ drives this one.
-    await page.setViewportSize({ width: 375, height: 812 });
-    await page.goto("/");
-    await page.getByText("Show sessions").click();
-    await expect(page.getByLabel("New project session")).toBeInViewport();
-  });
+test.describe("Phone session stack", () => {
+  const phoneSessions = [
+    sessionResponse({ id: "alpha", title: "Alpha", project_path: "/repo/shop", branch: "feat/cart" }),
+    sessionResponse({ id: "beta", title: "Beta", project_path: "/repo/api", status: "Waiting" }),
+    sessionResponse({ id: "gamma", title: "docs", project_path: "/repo/docs", status: "Idle" }),
+  ];
 
-  test("mobile home offers the five most recent sessions while desktop keeps them hidden", async ({ page }) => {
-    const sessions = [
-      ["old", "2026-01-02T00:00:00Z"],
-      ["new", "2026-01-07T00:00:00Z"],
-      ["middle", "2026-01-04T00:00:00Z"],
-      ["four", "2026-01-05T00:00:00Z"],
-      ["five", "2026-01-06T00:00:00Z"],
-      ["six", "2026-01-03T00:00:00Z"],
-      ["trash", "2026-01-08T00:00:00Z"],
-    ].map(([id, last_accessed_at]) =>
-      sessionResponse({
-        id: id!,
-        title: `Session ${id}`,
-        project_path: `/repo/${id}`,
-        artifact_dir: `/tmp/${id}`,
-        group_path: "",
-        dormant: false,
-        created_at: "2026-01-01T00:00:00Z",
-        last_accessed_at,
-        main_repo_path: `/repo/${id}`,
-        scratch: false,
-        favorited: false,
-        has_managed_worktree: false,
-        cleanup_defaults: {},
-        remote_owner: null,
-        notify_on_waiting: null,
-        notify_on_idle: null,
-        notify_on_error: null,
-        trashed_at: id === "trash" ? "2026-01-08T00:00:00Z" : null,
-      }),
-    );
+  test.beforeEach(async ({ page }) => {
     await page.route(/\/api\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
-        json: { sessions, workspace_ordering: [] },
+        json: { sessions: phoneSessions, workspace_ordering: [] },
       }),
     );
-
     await page.setViewportSize({ width: 375, height: 812 });
-    await page.goto("/");
-    const recent = page.getByLabel("Recent sessions");
-    await expect(recent).toBeVisible();
-    await expect(recent.getByRole("button")).toHaveCount(5);
-    await expect(recent.getByRole("button").allTextContents()).resolves.toEqual([
-      expect.stringContaining("Session new"),
-      expect.stringContaining("Session five"),
-      expect.stringContaining("Session four"),
-      expect.stringContaining("Session middle"),
-      expect.stringContaining("Session six"),
-    ]);
-
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await expect(recent).not.toBeAttached();
-
-    await page.setViewportSize({ width: 375, height: 812 });
-    await expect(recent).toBeVisible();
-    await recent.getByRole("button", { name: /Session new/ }).click();
-    await expect(page).toHaveURL(/\/session\/new$/);
   });
 
-  test("sidebar closes via toggle on mobile", async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 812 });
+  test("the landing page is home; ☰ opens the session drawer, whose Home goes back to it", async ({ page }) => {
     await page.goto("/");
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByLabel("New project session")).toBeInViewport();
-    // Toggle the sidebar closed again
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByLabel("New project session")).not.toBeInViewport();
+    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
+    const drawer = page.getByTestId("sidebar-new-session-pill");
+    await expect(drawer).toBeHidden();
+    // Beta waits, so ☰ carries the count.
+    const menu = page.getByTestId("topbar-menu");
+    await expect(menu).toHaveAccessibleName("Show sessions, 1 waiting for your input");
+
+    await menu.click();
+    await expect(drawer).toBeInViewport();
+    await expect(page.getByTestId("sidebar-row-status-line").first()).toBeVisible();
+    await page.getByTestId("sidebar-session-row").filter({ hasText: "Alpha" }).click();
+    await expect(page).toHaveURL(/\/session\/alpha$/);
+    const pill = page.getByTestId("session-title-pill");
+    await expect(pill).toContainText("Alpha");
+    await expect(pill).toContainText("shop");
+    await expect(drawer).toBeHidden();
+
+    await menu.click();
+    await expect(drawer).toBeInViewport();
+    await page.getByTestId("sidebar-home").click();
+    await expect(page).toHaveURL(/\/$/);
+    await expect(drawer).toBeHidden();
+    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
+  });
+
+  test("tapping the title pill opens the Session's menu; its folder drops out where it repeats the title", async ({
+    page,
+  }) => {
+    await page.goto("/session/beta");
+    const pill = page.getByTestId("session-title-pill");
+    await expect(pill).toContainText("api");
+    await pill.click();
+    const menu = page.getByTestId("sidebar-context-menu");
+    await expect(menu).toBeVisible();
+    await expect(menu.getByTestId("sidebar-context-menu-rename")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+
+    await page.goto("/session/gamma");
+    await expect(page.getByTestId("session-title-status")).toHaveText("Idle");
+  });
+
+  test("the header's ⋯ holds the open Session's views, then its actions", async ({ page }) => {
+    await page.goto("/session/alpha");
+    await page.getByRole("button", { name: "More options" }).click();
+    const items = page.getByRole("menuitem");
+    await expect(items).toHaveText([
+      /Copy branch\s*feat\/cart/,
+      "Pin",
+      "Snooze…",
+      "Archive",
+      "Stop",
+      "Move to Trash",
+      "Help",
+      "Symbol legend",
+      "Show tutorial",
+      "Tips",
+      "About",
+    ]);
+    await expect(page.getByRole("separator")).toHaveCount(2);
   });
 });

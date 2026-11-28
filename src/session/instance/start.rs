@@ -719,7 +719,7 @@ impl Instance {
         // for either would then be watching the pane this launch is replacing.
         self.capture_poller.clear();
         if !self.is_sandboxed() {
-            self.install_agent_status_hooks(self.status_agent());
+            self.with_hook_agent(|this, agent| this.install_agent_status_hooks(agent));
         }
         self.report_store_override(prepared.execution.as_ref());
         let canonicalized = prepared.canonical_conversation.is_some();
@@ -936,10 +936,6 @@ impl Instance {
             .as_ref()
             .filter(|execution| execution.inputs.container.is_none())
             .map(|execution| execution.program.clone());
-        self.launch_resolved_executable = self
-            .launch_executable
-            .as_deref()
-            .and_then(|program| std::fs::canonicalize(program).ok());
         if let Some(execution) = prepared.execution.take() {
             let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
@@ -1150,7 +1146,6 @@ impl Instance {
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
-        self.started_at = Some(Timestamp::now());
 
         // Apply status bar options in a background thread to avoid blocking
         // the TUI on the multiple tmux subprocess calls they require.

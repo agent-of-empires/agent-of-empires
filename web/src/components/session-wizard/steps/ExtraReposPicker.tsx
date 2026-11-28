@@ -4,6 +4,9 @@ import { hasFinePointer } from "../../../lib/platform";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
 import { isImeComposing } from "../../../lib/ime";
+import { BUTTON_SECONDARY, INPUT } from "../../../lib/surfaces";
+import { LISTBOX, LISTBOX_OPTION } from "../WizardRows";
+import { FIELD_HINT } from "../../../lib/surfaces";
 
 interface Props {
   profile: string | undefined;
@@ -69,13 +72,13 @@ function RepoBaseInput({
         placeholder="base branch (optional)"
         aria-label={`Base branch for ${label}`}
         autoComplete="off"
-        className="w-full px-2 py-1 text-[12px] bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
+        className={`${INPUT} font-mono`}
       />
       {focused && suggestions.length > 0 && (
         <ul
           role="listbox"
           aria-label={`Branch suggestions for ${label}`}
-          className="absolute left-0 right-0 top-full z-20 mt-1 max-h-48 overflow-y-auto bg-surface-900 border border-surface-700/60 rounded-md shadow-lg"
+          className={`${LISTBOX} absolute left-0 right-0 top-full z-20 mt-1 max-h-48`}
         >
           {suggestions.map((b) => (
             <li
@@ -87,7 +90,7 @@ function RepoBaseInput({
                 onChange(b.name);
                 setFocused(false);
               }}
-              className="px-2 py-1 text-[12px] font-mono cursor-pointer text-text-secondary hover:bg-surface-800 hover:text-text-primary"
+              className={LISTBOX_OPTION}
             >
               {b.name}
             </li>
@@ -162,7 +165,7 @@ export function ExtraReposPicker({
 
   return (
     <div data-testid="extra-repos-picker">
-      <p className="text-[11px] text-text-dim mb-3">
+      <p className={`${FIELD_HINT} mb-3`}>
         Include additional repositories in the same workspace. Each gets its own worktree on the same branch, forked
         from the session's base branch unless you give it one of its own.{" "}
         <span className="text-text-secondary">
@@ -177,16 +180,16 @@ export function ExtraReposPicker({
             const recentMatch = recent.find((r) => r.path === path);
             const label = known?.name || recentMatch?.displayName || path.split("/").filter(Boolean).pop() || path;
             return (
-              <div key={path} className="flex items-center gap-1.5">
+              <div key={path} className="flex items-center gap-2">
                 <span
-                  className="inline-flex items-center gap-1.5 px-2 py-1 bg-brand-600/20 border border-brand-600/40 rounded-md text-[12px] text-text-primary shrink-0"
+                  className="inline-flex items-center gap-1 pl-2.5 bg-brand-600/15 border border-brand-600/40 rounded-lg text-[13px] text-text-primary shrink-0"
                   title={path}
                 >
                   <span className="font-mono">{label}</span>
                   <button
                     type="button"
                     onClick={() => removePath(path)}
-                    className="text-text-dim hover:text-text-primary cursor-pointer"
+                    className="inline-flex items-center justify-center w-7 h-8 max-md:w-10 max-md:h-10 text-text-dim hover:text-text-primary cursor-pointer"
                     aria-label={`Remove ${label}`}
                   >
                     &times;
@@ -221,7 +224,7 @@ export function ExtraReposPicker({
       )}
 
       {!loading && saved.length === 0 && recent.length === 0 && (
-        <p className="text-[11px] text-text-dim mb-3">
+        <p className={`${FIELD_HINT} mb-3`}>
           {hasAnyProjects ? (
             "No other projects to add — the primary repo is the only one registered or recent."
           ) : (
@@ -246,18 +249,9 @@ export function ExtraReposPicker({
             }
           }}
           placeholder="/path/to/another/repo"
-          className="flex-1 px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
+          className={`${INPUT} flex-1 font-mono`}
         />
-        <button
-          type="button"
-          onClick={addFreeText}
-          disabled={!freeText.trim()}
-          className={`px-3 py-2 text-sm rounded-md transition-colors ${
-            !freeText.trim()
-              ? "bg-surface-800 text-text-dim cursor-not-allowed"
-              : "bg-surface-700 hover:bg-surface-600 text-text-primary cursor-pointer"
-          }`}
-        >
+        <button type="button" onClick={addFreeText} disabled={!freeText.trim()} className={BUTTON_SECONDARY}>
           Add
         </button>
       </div>

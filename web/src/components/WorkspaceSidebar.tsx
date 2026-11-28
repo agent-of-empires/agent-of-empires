@@ -2,6 +2,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
+import type { WizardPrefill } from "./session-wizard/SessionWizard";
 import type { RuntimeCursor, SessionMutation } from "../lib/api";
 import type { TrashRecoveryTarget } from "../lib/trashActions";
 import { SidebarSystemHealth } from "./SystemHealthStrip";
@@ -23,6 +24,8 @@ import { useSidebarTriage } from "../hooks/useSidebarTriage";
 import { sessionWorkspaces } from "../lib/sessionWorkspace";
 import { ProjectsSection } from "./ProjectsSection";
 import { FoldChevron, PlusIcon, StrokeIcon } from "./icons";
+import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
+import { Search, SquarePen } from "lucide-react";
 import { usePersistedFlag } from "./usePersistedFlag";
 import { NAV_ITEM, ROWS, onSidebarArrowKey } from "./sidebar/keyboardNav";
 import { newDragClickGuard, useSuppressClickAfterDrag, type DragClickGuard } from "./sidebar/dnd";
@@ -38,11 +41,16 @@ import {
 } from "./sidebar/filterGroups";
 import { FlatGroupList, NestedGroupList, OrgGroupList, type ListContext } from "./sidebar/GroupLists";
 import { SessionRow } from "./sidebar/SessionRow";
+import { SidebarSuggestions } from "./sidebar/SidebarSuggestions";
 import { FacetPanel, SidebarToolbar } from "./sidebar/SidebarToolbar";
+import { SidebarNav } from "./sidebar/SidebarNav";
 import { TrashMenu } from "./sidebar/TrashMenu";
 import { useFacetFilter } from "./sidebar/useFacetFilter";
 import { useSidebarSelection } from "./sidebar/useSidebarSelection";
 import { useSidebarWidth } from "./sidebar/useSidebarWidth";
+
+/** The phone drawer moves on the iOS sheet curve; reduced motion skips it. */
+const DRAWER_MOTION = "max-md:duration-[400ms] max-md:ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none";
 
 /** Rows of the "Snoozed & archived" section. Outside `rowsId`'s "sidebar-rows-" namespace, so no Group,
  *  whatever its name, can share it. */
@@ -77,6 +85,14 @@ interface Props {
   onSelect: (workspaceId: string, sessionId: string | null) => void;
   onToggleGroup: (groupId: string) => void;
   onNew: (prefill?: { group?: string }) => void;
+  /** Opens the command palette from the sidebar's Search row. */
+  onOpenPalette?: () => void;
+  /** Phone: the list is a drawer from the left, opened and closed through `open`. */
+  drawer?: boolean;
+  /** Phone: the drawer's title is a Home button that calls this. */
+  onHome?: () => void;
+  /** The app's ⋯ items, which a phone's list carries in its title row. */
+  menuItems?: OverflowItem[];
   onCreateSession: (repoPath: string) => void;
   onPinProject?: (repoPath: string) => void;
   onUnpinProject?: (group: SidebarGroup) => void;
@@ -95,7 +111,6 @@ interface Props {
   onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
   onStopSession?: (sessionId: string) => void;
   onStartSession?: (sessionId: string) => void;
-  onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   /** False in CityHall client mode, which hides project management. */
@@ -106,6 +121,16 @@ interface Props {
   onPluginSortChange: (ref: { pluginId: string; entryId: string }) => void;
   axis: SidebarAxis;
   onAxisChange: (axis: SidebarAxis) => void;
+  /** Enables the "Suggested" Group, which shows only while the `sidebar` suggestions pref is on. */
+  suggestions?: {
+    /** Overrides the sidebar's `readOnly` for the Group. */
+    readOnly?: boolean;
+    cityhall?: boolean;
+    onEditPreset?: (providerId: string, criterion: string) => void;
+    onPrepare: (prefill: WizardPrefill) => void;
+    onViewAll: () => void;
+    onOpenSession: (sessionId: string) => void;
+  };
 }
 
 export function WorkspaceSidebar(props: Props) {
@@ -121,8 +146,7 @@ export function WorkspaceSidebar(props: Props) {
     axis,
   } = props;
   const { settings: webSettings, update: updateWebSettings } = useWebSettings();
-  const rightSide = webSettings.sidebarSide === "right";
-  // Only the in-flow sidebar has the handle that leaves the rail, so the phone drawer ignores a saved rail.
+  // Only the in-flow sidebar has the handle that leaves the rail, so the phone page ignores a saved rail.
   const inFlow = useMediaQuery("(min-width: 768px)");
   const compact = webSettings.sidebarCompact && inFlow;
   const offline = useServerDown();
@@ -266,7 +290,6 @@ export function WorkspaceSidebar(props: Props) {
       onDelete: props.onDeleteSession,
       onStop: props.onStopSession,
       onStart: props.onStartSession,
-      onRestartForUpdate: props.onRestartForUpdate,
       onSwitchView: props.onSwitchView,
       readOnly,
       optimistic: triage.optimisticFor(v.workspace),
@@ -302,170 +325,203 @@ export function WorkspaceSidebar(props: Props) {
     if (!filterOpen) requestAnimationFrame(() => filterRef.current?.focus());
   };
 
-  // The phone overlay starts under the header, which the app root insets below the status bar.
+  // A row the arrow keys focus scrolls into view clear of the pinned title row, which grows with the filter and facets.
+  const padScrollerForPinnedRow = useCallback((el: HTMLDivElement | null) => {
+    const scroller = el?.parentElement;
+    if (!el || !scroller) return;
+    const observer = new ResizeObserver(() => {
+      scroller.style.scrollPaddingTop = `${el.offsetHeight}px`;
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const searchPrimerRef = useRef<HTMLInputElement>(null);
+  const openSearch = () => {
+    searchPrimerRef.current?.focus();
+    props.onOpenPalette?.();
+  };
+
+  // A phone lists sessions as Muse does, in a drawer under the page, which slides aside to uncover it and hides once
+  // it has slid back. It runs the full height on a solid colour, which iOS 26 extends under its bars.
+  const phoneClass = props.drawer
+    ? `max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-0 max-md:!w-[var(--aoe-drawer-w)] max-md:pt-[env(safe-area-inset-top)] max-md:bg-surface-950 max-md:transition-[visibility] ${DRAWER_MOTION} ${
+        open ? "" : "max-md:invisible"
+      }`
+    : "max-md:hidden";
   return (
     <SidebarCompactContext.Provider value={compact}>
       <div
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] inset-x-0 bottom-0 z-30 md:hidden transition-opacity duration-300 ${
-          open ? "bg-black/50" : "opacity-0 pointer-events-none"
-        }`}
-        onClick={() => props.onOpenChange(false)}
-      />
-      <div
-        {...tourAnchor(TOUR_ANCHORS.sidebar)}
+        // A phone's list fills the screen, leaving the tour no room beside it, so its title takes the anchor.
+        {...(props.drawer ? {} : tourAnchor(TOUR_ANCHORS.sidebar))}
         role="navigation"
         aria-label="Sessions sidebar"
         tabIndex={-1}
         ref={panelRef}
         style={{ width: effectiveWidth }}
         data-compact={compact ? "true" : undefined}
-        className={`fixed top-[calc(3rem+env(safe-area-inset-top))] bottom-0 z-40 max-md:max-w-full md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
-          rightSide ? "right-0 border-l md:border-l-0 md:border-r" : "left-0 border-r"
-        } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
+        className={`${phoneClass} flex flex-col h-full min-h-0 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
+          open ? "" : "md:hidden"
+        }`}
       >
-        <SidebarToolbar
-          compact={compact}
-          axis={axis}
-          onAxisChange={props.onAxisChange}
-          sortMode={props.sortMode}
-          onSortModeChange={props.onSortModeChange}
-          pluginSorts={pluginSorts}
-          pluginSortRef={props.pluginSortRef}
-          onPluginSortChange={props.onPluginSortChange}
-          hasFacets={facets.facetSpecs.length > 0}
-          facetsActive={facets.activeFacets.length > 0}
-          facetOpen={facetOpen}
-          onToggleFacets={() => setFacetOpen((o) => !o)}
-          filterOpen={filterOpen}
-          onToggleFilter={toggleFilter}
-          offline={offline}
-          onNew={() => props.onNew()}
-          onClose={() => props.onOpenChange(false)}
-        />
-
-        {filterOpen && !compact && (
-          <div className="px-3 pb-2">
-            <input
-              ref={filterRef}
-              type="text"
-              value={filterQuery}
-              onChange={(e) => setFilterQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") toggleFilter();
-              }}
-              placeholder="Filter by name, branch, agent..."
-              data-testid="sidebar-filter-input"
-              className="w-full bg-surface-800 border border-surface-700 rounded-md px-2.5 py-1.5 text-[13px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+        {/* New session and Search scroll away with the list, as Claude's do; the list's title row, with its view options
+            and filters, stays at the top. */}
+        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
+          <SidebarNav compact={compact} offline={offline} onNew={() => props.onNew()} onSearch={props.onOpenPalette} />
+          {/* The canvas gradient, fixed to the viewport, so the pinned row matches what it scrolls over. */}
+          <div
+            ref={padScrollerForPinnedRow}
+            className="sticky top-0 z-10 max-md:bg-surface-950 md:chrome-canvas md:bg-fixed md:border-b md:border-surface-700/40"
+          >
+            <SidebarToolbar
+              compact={compact}
+              axis={axis}
+              onAxisChange={props.onAxisChange}
+              sortMode={props.sortMode}
+              onSortModeChange={props.onSortModeChange}
+              pluginSorts={pluginSorts}
+              pluginSortRef={props.pluginSortRef}
+              onPluginSortChange={props.onPluginSortChange}
+              hasFacets={facets.facetSpecs.length > 0}
+              facetsActive={facets.activeFacets.length > 0}
+              facetOpen={facetOpen}
+              onToggleFacets={() => setFacetOpen((o) => !o)}
+              filterOpen={filterOpen}
+              onToggleFilter={toggleFilter}
+              headingAnchored={!!props.drawer}
+              onHome={props.onHome}
+              phoneMenu={
+                props.menuItems && (
+                  <OverflowMenu items={props.menuItems} phoneFloating triggerDataTour={TOUR_ANCHORS.topbarMore} />
+                )
+              }
             />
-          </div>
-        )}
 
-        {facetOpen && !compact && facets.facetSpecs.length > 0 && (
-          <FacetPanel
-            facetSpecs={facets.facetSpecs}
-            selectedValues={facets.selectedValues}
-            onToggle={facets.toggleValue}
-          />
-        )}
-
-        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
-          {isNested ? (
-            <NestedGroupList
-              ctx={ctx}
-              groups={filteredNested}
-              fullGroups={nestedGroups}
-              onToggleGroup={props.onToggleGroup}
-              onToggleSubgroup={props.onToggleSubgroup}
-            />
-          ) : isOrgAxis ? (
-            <OrgGroupList
-              ctx={ctx}
-              groups={filteredOrgGroups}
-              fullGroups={orgGroups}
-              onToggleOrg={props.onToggleOrg}
-              onToggleOrgRepo={props.onToggleOrgRepo}
-            />
-          ) : (
-            <FlatGroupList
-              ctx={ctx}
-              groups={filteredGroups}
-              fullGroups={groups}
-              reorderDisabled={reorderDisabled}
-              groupDragDisabled={reorderDisabled || q.length > 0}
-              onToggleGroup={props.onToggleGroup}
-              onReorderGroups={props.onReorderGroups}
-              onReorderWorkspaces={props.onReorderWorkspaces}
-              dragClickGuard={dragClickGuard}
-            />
-          )}
-
-          {sunk.length > 0 && (
-            <div data-testid="sidebar-sunk-section">
-              <button
-                onClick={toggleSunkExpanded}
-                onKeyDown={onSidebarArrowKey}
-                data-testid="sidebar-sunk-toggle"
-                aria-expanded={sunkExpanded}
-                // A header for the arrow keys like a Group's, so Left on one of its rows comes back here.
-                aria-controls={SUNK_ROWS}
-                {...{ [NAV_ITEM]: "" }}
-                className={`w-full flex items-center gap-2 py-1.5 text-[11px] font-mono uppercase text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 ${
-                  compact ? "px-2" : "px-3 tracking-widest"
-                }`}
-              >
-                <FoldChevron
-                  className={`shrink-0 transition-transform duration-75 ${sunkExpanded ? "" : "-rotate-90"}`}
+            {filterOpen && !compact && (
+              <div className="px-3 pb-2">
+                <input
+                  ref={filterRef}
+                  type="text"
+                  value={filterQuery}
+                  onChange={(e) => setFilterQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") toggleFilter();
+                  }}
+                  placeholder="Filter by name, branch, agent..."
+                  data-testid="sidebar-filter-input"
+                  className="w-full bg-surface-800 border border-surface-700 rounded-md px-2.5 py-1.5 text-[13px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
                 />
-                {/* The count and wide tracking do not fit the compact rail. */}
-                <span className="truncate">Snoozed &amp; archived{compact ? "" : ` (${sunk.length})`}</span>
-              </button>
-              <div id={SUNK_ROWS} {...{ [ROWS]: "" }}>
-                {sunkExpanded && sunk.map((v) => <SessionRow key={v.key} {...ctx.rowProps(v)} indented />)}
               </div>
-            </div>
-          )}
+            )}
 
-          {(props.canManageProjects ?? true) && (
-            <ProjectsSection
-              projects={props.savedProjects}
-              drawsRepoHeaders={axisDrawsRepoHeaders(axis)}
-              query={q}
-              readOnly={readOnly}
-              offline={offline}
-              onCreateSession={props.onCreateSession}
-              onAddProject={props.onAddProject}
-              onEditProject={props.onEditProject}
-              onRemoveProject={props.onRemoveProject}
-            />
-          )}
+            {facetOpen && !compact && facets.facetSpecs.length > 0 && (
+              <FacetPanel
+                facetSpecs={facets.facetSpecs}
+                selectedValues={facets.selectedValues}
+                onToggle={facets.toggleValue}
+              />
+            )}
+          </div>
+          <div className="px-2 pt-1">
+            {isNested ? (
+              <NestedGroupList
+                ctx={ctx}
+                groups={filteredNested}
+                fullGroups={nestedGroups}
+                onToggleGroup={props.onToggleGroup}
+                onToggleSubgroup={props.onToggleSubgroup}
+              />
+            ) : isOrgAxis ? (
+              <OrgGroupList
+                ctx={ctx}
+                groups={filteredOrgGroups}
+                fullGroups={orgGroups}
+                onToggleOrg={props.onToggleOrg}
+                onToggleOrgRepo={props.onToggleOrgRepo}
+              />
+            ) : (
+              <FlatGroupList
+                ctx={ctx}
+                groups={filteredGroups}
+                fullGroups={groups}
+                reorderDisabled={reorderDisabled}
+                groupDragDisabled={reorderDisabled || q.length > 0}
+                onToggleGroup={props.onToggleGroup}
+                onReorderGroups={props.onReorderGroups}
+                onReorderWorkspaces={props.onReorderWorkspaces}
+                dragClickGuard={dragClickGuard}
+              />
+            )}
 
-          {!hasResults && hasFilter && (
-            <div className="px-4 py-8 text-center">
-              <p className="text-sm text-text-muted">No matches for &ldquo;{activeFilterQuery}&rdquo;</p>
-            </div>
-          )}
+            {sunk.length > 0 && (
+              <div data-testid="sidebar-sunk-section">
+                <button
+                  onClick={toggleSunkExpanded}
+                  onKeyDown={onSidebarArrowKey}
+                  data-testid="sidebar-sunk-toggle"
+                  aria-expanded={sunkExpanded}
+                  // A header for the arrow keys like a Group's, so Left on one of its rows comes back here.
+                  aria-controls={SUNK_ROWS}
+                  {...{ [NAV_ITEM]: "" }}
+                  className={`w-full flex items-center gap-2 py-1.5 rounded-md text-[12px] font-medium text-text-dim hover:text-text-secondary hover:bg-surface-800/60 cursor-pointer transition-colors border-t border-surface-800/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-500 max-md:mt-4 max-md:border-t-0 max-md:text-[12px] max-md:uppercase max-md:tracking-[0.06em] max-md:font-semibold ${
+                    compact ? "px-2" : "px-3 md:tracking-widest"
+                  }`}
+                >
+                  <FoldChevron
+                    className={`shrink-0 transition-transform duration-75 ${sunkExpanded ? "" : "-rotate-90"}`}
+                  />
+                  {/* The count and wide tracking do not fit the compact rail. */}
+                  <span className="truncate">Snoozed &amp; archived{compact ? "" : ` (${sunk.length})`}</span>
+                </button>
+                <div id={SUNK_ROWS} {...{ [ROWS]: "" }}>
+                  {sunkExpanded && sunk.map((v) => <SessionRow key={v.key} {...ctx.rowProps(v)} indented />)}
+                </div>
+              </div>
+            )}
 
-          {!hasResults && !hasFilter && (
-            <div className="px-4 py-10 text-center" data-testid="sidebar-empty-state">
-              <p className="text-sm font-medium text-text-secondary">No sessions yet</p>
-              <p className="mt-1 text-[13px] text-text-muted">Create a session to start working in a repo.</p>
-              <button
-                onClick={() => props.onNew()}
-                disabled={offline}
-                className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-600"
-              >
-                <PlusIcon size={14} />
-                New session
-              </button>
-            </div>
-          )}
+            {(props.canManageProjects ?? true) && (
+              <ProjectsSection
+                projects={props.savedProjects}
+                drawsRepoHeaders={axisDrawsRepoHeaders(axis)}
+                query={q}
+                readOnly={readOnly}
+                offline={offline}
+                onCreateSession={props.onCreateSession}
+                onAddProject={props.onAddProject}
+                onEditProject={props.onEditProject}
+                onRemoveProject={props.onRemoveProject}
+              />
+            )}
+
+            {!hasResults && hasFilter && (
+              <div className="px-4 py-8 text-center">
+                <p className="text-sm text-text-muted">No matches for &ldquo;{activeFilterQuery}&rdquo;</p>
+              </div>
+            )}
+
+            {/* Unreachable, the list is unknown rather than empty; the banner above says why. */}
+            {!hasResults && !hasFilter && !offline && (
+              <div className="px-4 py-10 text-center" data-testid="sidebar-empty-state">
+                <p className="text-sm font-medium text-text-secondary">No sessions yet</p>
+                <p className="mt-1 text-[13px] text-text-muted">Create a session to start working in a repo.</p>
+                <button
+                  onClick={() => props.onNew()}
+                  disabled={offline}
+                  className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-600"
+                >
+                  <PlusIcon size={14} />
+                  New session
+                </button>
+              </div>
+            )}
+
+            {props.suggestions && <SidebarSuggestions readOnly={readOnly} {...props.suggestions} />}
+          </div>
         </div>
-
-        <SidebarSystemHealth />
 
         {/* The rail is a fixed 88px, so its controls stack to fit a scaled root font. */}
         <div
-          className={`border-t border-surface-700/20 p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center ${
+          className={`relative p-2 max-md:px-4 max-md:pb-[max(0.75rem,env(safe-area-inset-bottom))] max-md:sticky max-md:bottom-0 max-md:bg-surface-950 max-md:gap-2 max-md:flex-wrap flex items-center ${
             compact ? "flex-col gap-2" : "gap-1"
           }`}
         >
@@ -487,7 +543,8 @@ export function WorkspaceSidebar(props: Props) {
           <button
             onClick={props.onSettings}
             {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
-            className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
+            // A phone's row reads as Muse's: settings, search, then a new session.
+            className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors max-md:-order-1 max-md:w-11 max-md:h-11 max-md:rounded-full max-md:float-control"
             title="Settings"
             aria-label="Settings"
           >
@@ -496,6 +553,48 @@ export function WorkspaceSidebar(props: Props) {
               <circle cx="12" cy="12" r="3" />
             </StrokeIcon>
           </button>
+          {/* Beside Settings on a wide screen; a phone gives it a line of its own above its controls. */}
+          <div className="contents max-md:flex max-md:order-first max-md:basis-full">
+            <SidebarSystemHealth />
+          </div>
+          {/* Wide screens keep Search and New session in the row above the list. */}
+          {!compact && props.onOpenPalette && (
+            // iOS raises the keyboard only for a focus inside the tap, and the palette's input mounts after it: this
+            // takes the focus first, and the palette's input then takes it over with the keyboard already up.
+            <input
+              ref={searchPrimerRef}
+              data-focus-primer
+              aria-hidden="true"
+              tabIndex={-1}
+              className="md:hidden fixed top-0 left-0 w-px h-px opacity-0 pointer-events-none text-[16px]"
+            />
+          )}
+          {!compact && props.onOpenPalette && (
+            <button
+              type="button"
+              onClick={openSearch}
+              {...tourAnchor(TOUR_ANCHORS.topbar)}
+              data-testid="sidebar-search-pill"
+              className="md:hidden flex-1 min-w-0 h-11 px-4 flex items-center gap-2 rounded-full float-control text-[15px] text-text-dim cursor-pointer active:scale-[0.98] transition-transform"
+            >
+              <Search className="size-[18px] shrink-0" strokeWidth={1.75} aria-hidden />
+              Search
+            </button>
+          )}
+          {!compact && (
+            <button
+              type="button"
+              onClick={() => props.onNew()}
+              disabled={offline}
+              aria-label="New session"
+              title="New session"
+              {...tourAnchor(TOUR_ANCHORS.dashboardNewSession)}
+              data-testid="sidebar-new-session-pill"
+              className="md:hidden w-11 h-11 shrink-0 flex items-center justify-center rounded-full bg-text-primary text-surface-950 shadow-(--pill-shadow) cursor-pointer active:scale-95 transition-transform disabled:opacity-40"
+            >
+              <SquarePen className="size-[19px]" strokeWidth={1.9} aria-hidden />
+            </button>
+          )}
         </div>
       </div>
       {/* Hidden with the panel so no dead drag bar lingers when the sidebar is closed. On a touch screen the
@@ -503,7 +602,7 @@ export function WorkspaceSidebar(props: Props) {
       <div
         data-testid="sidebar-resize-handle"
         {...handleProps}
-        className={`${open ? "hidden md:block" : "hidden"} relative z-10 w-1 cursor-col-resize shrink-0 touch-none bg-surface-800 hover:bg-brand-600/50 focus-visible:bg-brand-600/50 focus-visible:outline-none pointer-coarse:before:absolute pointer-coarse:before:inset-y-0 pointer-coarse:before:left-0 pointer-coarse:before:-right-2 pointer-coarse:before:content-[''] transition-colors duration-75`}
+        className={`${open ? "hidden md:block" : "hidden"} relative z-10 w-1 cursor-col-resize shrink-0 touch-none hover:bg-brand-600/50 focus-visible:bg-brand-600/50 focus-visible:outline-none pointer-coarse:before:absolute pointer-coarse:before:inset-y-0 pointer-coarse:before:left-0 pointer-coarse:before:-right-2 pointer-coarse:before:content-[''] transition-colors duration-75`}
       />
     </SidebarCompactContext.Provider>
   );

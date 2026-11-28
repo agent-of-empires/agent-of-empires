@@ -1,5 +1,53 @@
 //! Server-side per-agent capability and naming profiles.
 
+use std::collections::BTreeMap;
+
+use crate::json_probe::JsonProbe;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// Tool names routed to each tool card when `tool.kind` does not indicate it.
+#[derive(Debug, Clone, Copy)]
+pub struct CardAliases {
+    pub execute: &'static [&'static str],
+    pub read: &'static [&'static str],
+    pub edit: &'static [&'static str],
+    pub delete: &'static [&'static str],
+    pub search: &'static [&'static str],
+    pub fetch: &'static [&'static str],
+    pub think: &'static [&'static str],
+}
+
+impl CardAliases {
+    pub const NONE: CardAliases = CardAliases {
+        execute: &[],
+        read: &[],
+        edit: &[],
+        delete: &[],
+        search: &[],
+        fetch: &[],
+        think: &[],
+    };
+}
+
+/// Exact titles that select the specialised cards.
+#[derive(Debug, Clone, Copy)]
+pub struct SpecialTitles {
+    pub skill_names: &'static [&'static str],
+    pub schedule_names: &'static [&'static str],
+    pub harness_names: &'static [&'static str],
+    pub workflow_names: &'static [&'static str],
+}
+
+impl SpecialTitles {
+    pub const NONE: SpecialTitles = SpecialTitles {
+        skill_names: &[],
+        schedule_names: &[],
+        harness_names: &[],
+        workflow_names: &[],
+    };
+}
+
 /// Per-agent server-side profile.
 #[derive(Debug, Clone)]
 pub struct AgentProfile {
@@ -31,6 +79,31 @@ pub struct AgentProfile {
     /// When true, the agent implements the ACP subagents RFD, so aoe declares
     /// the client capability and each subagent arrives as a child session.
     pub supports_subagents: bool,
+    /// The agent expands `${VAR}` in MCP entries from its own environment, so aoe can pass
+    /// plugin credentials as references and keep the values off the command line. Verified
+    /// for `claude-agent-acp` only; other agents get no plugin entries.
+    pub expands_mcp_env_refs: bool,
+    /// The agent's todo tool is trusted, so title heuristics may render a todo card.
+    pub todos: bool,
+    /// The agent has a Skill tool, so title heuristics may render a skill card.
+    pub skills: bool,
+    /// May fall back to Claude's mode taxonomy when the agent advertises no modes.
+    pub legacy_mode_fallback: bool,
+    /// `raw_name`s that launch an off-protocol subagent, matched case-sensitively.
+    pub subagent_tool_names: &'static [&'static str],
+    pub mcp_prefixes: &'static [&'static str],
+    pub card_aliases: CardAliases,
+    pub special_titles: SpecialTitles,
+    /// Regex a tool path must match to be a memory file op.
+    pub memory_path_regex: Option<&'static str>,
+    /// The mobile terminal shows only the Monitor view for this agent.
+    pub mobile_monitor_only: bool,
+    /// Daemon-side probe of the agent's fullscreen renderer setting. Never sent to clients.
+    pub fullscreen_probe: Option<JsonProbe>,
+    /// Case-insensitive regex the one-shot capture must match before banner lines are stripped.
+    pub oneshot_gate: Option<&'static str>,
+    /// Case-insensitive line regexes of the startup banner dropped from a one-shot capture.
+    pub oneshot_strip_patterns: &'static [&'static str],
 }
 
 fn matches_alias(aliases: &[&str], text: &str) -> bool {
@@ -81,11 +154,118 @@ impl AgentProfile {
         None
     }
 
+    /// Evaluate the fullscreen probe through `memo`, false without one.
+    pub fn probe_fullscreen(&self, memo: &crate::json_probe::Memo) -> bool {
+        self.fullscreen_probe
+            .as_ref()
+            .is_some_and(|probe| memo.matches(probe))
+    }
+
     /// True iff the agent surfaces session-start memory recall through
     /// the tool channel with the `_meta.claudeCode.toolName` namespace
     /// claude-agent-acp adopted in v0.37.0 (upstream).
     pub fn supports_memory_recall_tool(&self) -> bool {
         self.parent_meta_namespaces.contains(&"claudeCode")
+    }
+}
+
+/// Current `AgentProfileWire` shape version. Bump when a field is renamed, removed or retyped.
+pub const WIRE_VERSION: u32 = 1;
+
+/// `SpecialTitles` as sent to clients.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SpecialTitlesWire {
+    pub skill_names: Vec<String>,
+    pub schedule_names: Vec<String>,
+    pub harness_names: Vec<String>,
+    pub workflow_names: Vec<String>,
+}
+
+/// The client-facing view of an [`AgentProfile`], sent on each session as `agent_profile`.
+/// The fullscreen probe declaration, lifecycle and one-shot banner patterns are not part of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct AgentProfileWire {
+    /// Shape version, see [`WIRE_VERSION`].
+    pub v: u32,
+    pub key: String,
+    pub parent_meta_namespaces: Vec<String>,
+    pub clear_aliases: Vec<String>,
+    pub compact_aliases: Vec<String>,
+    pub clear_requires_driven_reset: bool,
+    pub supports_exit_plan_mode: bool,
+    pub supports_wakeup_tools: bool,
+    pub emits_heartbeat_keepalives: bool,
+    pub yolo_mode_id: Option<String>,
+    pub supports_subagents: bool,
+    pub todos: bool,
+    pub skills: bool,
+    pub legacy_mode_fallback: bool,
+    pub subagent_tool_names: Vec<String>,
+    pub mcp_prefixes: Vec<String>,
+    /// Tool names per card kind; kinds without aliases are absent.
+    pub card_aliases: BTreeMap<String, Vec<String>>,
+    pub special_titles: SpecialTitlesWire,
+    pub memory_path_regex: Option<String>,
+    pub mobile_monitor_only: bool,
+    /// Result of the profile's fullscreen probe, evaluated by the daemon.
+    pub fullscreen: bool,
+}
+
+fn owned(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+impl AgentProfileWire {
+    pub fn new(profile: &AgentProfile, fullscreen: bool) -> Self {
+        let cards = &profile.card_aliases;
+        let titles = &profile.special_titles;
+        Self {
+            v: WIRE_VERSION,
+            key: profile.key.to_string(),
+            parent_meta_namespaces: owned(profile.parent_meta_namespaces),
+            clear_aliases: owned(profile.clear_aliases),
+            compact_aliases: owned(profile.compact_aliases),
+            clear_requires_driven_reset: profile.clear_requires_driven_reset,
+            supports_exit_plan_mode: profile.supports_exit_plan_mode,
+            supports_wakeup_tools: profile.supports_wakeup_tools,
+            emits_heartbeat_keepalives: profile.emits_heartbeat_keepalives,
+            yolo_mode_id: profile.yolo_mode_id.map(str::to_string),
+            supports_subagents: profile.supports_subagents,
+            todos: profile.todos,
+            skills: profile.skills,
+            legacy_mode_fallback: profile.legacy_mode_fallback,
+            subagent_tool_names: owned(profile.subagent_tool_names),
+            mcp_prefixes: owned(profile.mcp_prefixes),
+            card_aliases: [
+                ("execute", cards.execute),
+                ("read", cards.read),
+                ("edit", cards.edit),
+                ("delete", cards.delete),
+                ("search", cards.search),
+                ("fetch", cards.fetch),
+                ("think", cards.think),
+            ]
+            .into_iter()
+            .filter(|(_, names)| !names.is_empty())
+            .map(|(kind, names)| (kind.to_string(), owned(names)))
+            .collect(),
+            special_titles: SpecialTitlesWire {
+                skill_names: owned(titles.skill_names),
+                schedule_names: owned(titles.schedule_names),
+                harness_names: owned(titles.harness_names),
+                workflow_names: owned(titles.workflow_names),
+            },
+            memory_path_regex: profile.memory_path_regex.map(str::to_string),
+            mobile_monitor_only: profile.mobile_monitor_only,
+            fullscreen,
+        }
+    }
+}
+
+impl Default for AgentProfileWire {
+    fn default() -> Self {
+        Self::new(&DEFAULT, false)
     }
 }
 
@@ -104,6 +284,19 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     yolo_mode_id: None,
     native_config_agent: None,
     supports_subagents: false,
+    expands_mcp_env_refs: false,
+    todos: false,
+    skills: false,
+    legacy_mode_fallback: false,
+    subagent_tool_names: &[],
+    mcp_prefixes: &["mcp__"],
+    card_aliases: CardAliases::NONE,
+    special_titles: SpecialTitles::NONE,
+    memory_path_regex: None,
+    mobile_monitor_only: false,
+    fullscreen_probe: None,
+    oneshot_gate: None,
+    oneshot_strip_patterns: &[],
 };
 
 /// Claude via `claude-agent-acp`.
@@ -119,7 +312,41 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     yolo_mode_id: Some("bypassPermissions"),
     native_config_agent: Some("claude"),
     supports_subagents: true,
+    expands_mcp_env_refs: true,
+    todos: true,
+    skills: true,
+    legacy_mode_fallback: true,
+    special_titles: SpecialTitles {
+        skill_names: &["skill", "claude-skill"],
+        schedule_names: &["ScheduleWakeup", "CronCreate", "CronList", "CronDelete"],
+        harness_names: &["ToolSearch", "Monitor", "TaskStop", "SendMessage"],
+        workflow_names: &["Workflow"],
+    },
+    memory_path_regex: Some(r"/\.claude/projects/[^/]+/memory/.*\.md$"),
+    mobile_monitor_only: true,
+    fullscreen_probe: Some(JsonProbe {
+        path: ".claude/settings.json",
+        pointer: "/tui",
+        equals: "fullscreen",
+    }),
+    oneshot_gate: Some("claude code"),
+    oneshot_strip_patterns: CLAUDE_BANNER_PATTERNS,
+    ..DEFAULT
 };
+
+/// Line patterns of the Claude Code startup banner: a box whose borders and
+/// edges are box-drawing glyphs and whose logo is block elements, the notices
+/// printed under it, and numbered tips.
+const CLAUDE_BANNER_PATTERNS: &[&str] = &[
+    // Blank, or only box-drawing (U+2500..=U+257F) and block-element (U+2580..=U+259F) glyphs.
+    r"^[\s\x{2500}-\x{259F}]*$",
+    r"^\s*[\x{2500}-\x{259F}|]",
+    r"claude code v|welcome to claude code|welcome back|tips for getting started|what's new|/release-notes|run /mcp|need authentication|/help for help",
+    // Notice and tip callouts: U+26A0, U+203B, "tip:".
+    r"^\s*(?:[\x{26A0}\x{203B}]|tip:)",
+    // Numbered tip: "1." or "2)".
+    r"^\s*[0-9][.)]",
+];
 
 /// Legacy alias key carried by older session records (`agent_name="claude-code"`).
 pub const CLAUDE_CODE: AgentProfile = AgentProfile {
@@ -134,6 +361,13 @@ pub const CODEX: AgentProfile = AgentProfile {
     clear_requires_driven_reset: true,
     yolo_mode_id: Some("agent-full-access"),
     native_config_agent: Some("codex"),
+    supports_subagents: true,
+    card_aliases: CardAliases {
+        execute: &["shell", "bash"],
+        edit: &["apply_patch"],
+        read: &["view_file", "read_file", "read"],
+        ..CardAliases::NONE
+    },
     ..DEFAULT
 };
 
@@ -143,6 +377,16 @@ pub const OPENCODE: AgentProfile = AgentProfile {
     key: "opencode",
     clear_aliases: &["/new"],
     native_config_agent: Some("opencode"),
+    todos: true,
+    subagent_tool_names: &["task"],
+    card_aliases: CardAliases {
+        execute: &["bash"],
+        read: &["read"],
+        edit: &["edit", "write"],
+        search: &["grep", "glob"],
+        fetch: &["webfetch"],
+        ..CardAliases::NONE
+    },
     ..DEFAULT
 };
 
@@ -152,6 +396,14 @@ pub const GEMINI: AgentProfile = AgentProfile {
     key: "gemini",
     yolo_mode_id: Some("yolo"),
     native_config_agent: Some("gemini"),
+    card_aliases: CardAliases {
+        execute: &["run_shell_command"],
+        read: &["read_file", "read_many_files"],
+        edit: &["write_file", "edit"],
+        search: &["grep", "glob"],
+        fetch: &["web_fetch"],
+        ..CardAliases::NONE
+    },
     ..DEFAULT
 };
 
@@ -389,6 +641,156 @@ mod tests {
                 "{}",
                 profile.key
             );
+        }
+    }
+
+    #[test]
+    fn agent_profile_wire_shape_is_versioned() {
+        const KEYS: [&str; 21] = [
+            "card_aliases",
+            "clear_aliases",
+            "clear_requires_driven_reset",
+            "compact_aliases",
+            "emits_heartbeat_keepalives",
+            "fullscreen",
+            "key",
+            "legacy_mode_fallback",
+            "mcp_prefixes",
+            "memory_path_regex",
+            "mobile_monitor_only",
+            "parent_meta_namespaces",
+            "skills",
+            "special_titles",
+            "subagent_tool_names",
+            "supports_exit_plan_mode",
+            "supports_subagents",
+            "supports_wakeup_tools",
+            "todos",
+            "v",
+            "yolo_mode_id",
+        ];
+        let mut session = crate::session::config::SessionConfig::default();
+        session
+            .agent_clear_alias
+            .insert("my-agent".into(), "/new".into());
+        session
+            .agent_acp_cmd
+            .insert("my-agent".into(), "my-agent-bridge acp".into());
+        for key in [
+            "claude",
+            "claude-code",
+            "codex",
+            "opencode",
+            "gemini",
+            "unknown",
+            "my-agent",
+        ] {
+            let profile = resolve_with_config(key, &session);
+            let value = serde_json::to_value(AgentProfileWire::new(profile, false)).unwrap();
+            let mut keys: Vec<&str> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            // Changing the shape needs a WIRE_VERSION bump and a new `v` here.
+            assert_eq!(value["v"], 1, "{key}");
+            assert_eq!(keys, KEYS, "{key}");
+        }
+        let claude = serde_json::to_value(AgentProfileWire::new(&CLAUDE, true)).unwrap();
+        assert_eq!(claude["clear_aliases"], serde_json::json!(["/clear"]));
+        assert_eq!(claude["fullscreen"], true);
+        assert!(claude["memory_path_regex"].is_string());
+        let custom = resolve_with_config("my-agent", &session);
+        assert_eq!(custom.clear_aliases, ["/new"]);
+    }
+
+    /// Pins the values `web/src/lib/__tests__/agentProfileFixtures.ts` hardcodes.
+    #[test]
+    fn serialized_profile_values_match_the_web_fixtures() {
+        use serde_json::{json, Value};
+        let claude = json!({
+            "todos": true, "skills": true, "legacy_mode_fallback": true,
+            "subagent_tool_names": [], "card_aliases": {},
+            "special_titles": {
+                "skill_names": ["skill", "claude-skill"],
+                "schedule_names": ["ScheduleWakeup", "CronCreate", "CronList", "CronDelete"],
+                "harness_names": ["ToolSearch", "Monitor", "TaskStop", "SendMessage"],
+                "workflow_names": ["Workflow"],
+            },
+            "memory_path_regex": r"/\.claude/projects/[^/]+/memory/.*\.md$",
+            "mobile_monitor_only": true,
+            "clear_aliases": ["/clear"], "compact_aliases": ["/compact"],
+            "mcp_prefixes": ["mcp__"],
+        });
+        let plain = |clear: &[&str], todos: bool, subagents: &[&str], cards: Value| {
+            json!({
+                "todos": todos, "skills": false, "legacy_mode_fallback": false,
+                "subagent_tool_names": subagents, "card_aliases": cards,
+                "special_titles": {
+                    "skill_names": [], "schedule_names": [],
+                    "harness_names": [], "workflow_names": [],
+                },
+                "memory_path_regex": null,
+                "mobile_monitor_only": false,
+                "clear_aliases": clear, "compact_aliases": [],
+                "mcp_prefixes": ["mcp__"],
+            })
+        };
+        let cases = [
+            ("claude", claude.clone()),
+            ("claude-code", claude),
+            (
+                "codex",
+                plain(
+                    &["/new"],
+                    false,
+                    &[],
+                    json!({
+                        "execute": ["shell", "bash"],
+                        "edit": ["apply_patch"],
+                        "read": ["view_file", "read_file", "read"],
+                    }),
+                ),
+            ),
+            (
+                "opencode",
+                plain(
+                    &["/new"],
+                    true,
+                    &["task"],
+                    json!({
+                        "execute": ["bash"],
+                        "read": ["read"],
+                        "edit": ["edit", "write"],
+                        "search": ["grep", "glob"],
+                        "fetch": ["webfetch"],
+                    }),
+                ),
+            ),
+            (
+                "gemini",
+                plain(
+                    &[],
+                    false,
+                    &[],
+                    json!({
+                        "execute": ["run_shell_command"],
+                        "read": ["read_file", "read_many_files"],
+                        "edit": ["write_file", "edit"],
+                        "search": ["grep", "glob"],
+                        "fetch": ["web_fetch"],
+                    }),
+                ),
+            ),
+            ("unknown", plain(&[], false, &[], json!({}))),
+        ];
+        for (key, expected) in cases {
+            let wire = serde_json::to_value(AgentProfileWire::new(resolve(key), false)).unwrap();
+            for (field, want) in expected.as_object().unwrap() {
+                assert_eq!(&wire[field], want, "{key}.{field}");
+            }
         }
     }
 }

@@ -17,6 +17,8 @@ pub enum WorkerRequestError {
     /// The running worker was launched from another manifest than the one the request was
     /// chosen from, so it is not delivered.
     Superseded,
+    /// The worker answered JSON-RPC "method not found".
+    MethodNotFound,
     Rejected,
 }
 
@@ -35,15 +37,47 @@ impl std::fmt::Display for WorkerRequestError {
             Self::Timeout => f.write_str("timed out"),
             Self::WorkerGone => f.write_str("worker exited"),
             Self::Superseded => f.write_str("worker was launched from a different manifest"),
+            Self::MethodNotFound => f.write_str("worker does not implement the method"),
             Self::Rejected => f.write_str("worker rejected the request"),
         }
+    }
+}
+
+/// A host request's envelope id and the stdin channel of the worker process it was queued
+/// to, set once it is. A later notification about the request goes to that instance only.
+#[derive(Debug)]
+pub struct CallTicket {
+    id: String,
+    queued_to: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+impl CallTicket {
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            queued_to: Default::default(),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The channel of the process that was handed the request. It is closed once that process
+    /// ends, whatever replaces it.
+    pub fn queued_to(&self) -> Option<&tokio::sync::mpsc::UnboundedSender<String>> {
+        self.queued_to.get()
+    }
+
+    pub fn set_queued_to(&self, channel: tokio::sync::mpsc::UnboundedSender<String>) {
+        let _ = self.queued_to.set(channel);
     }
 }
 
 struct Entry {
     plugin_id: String,
     generation: u64,
-    tx: oneshot::Sender<Result<Value, String>>,
+    tx: oneshot::Sender<Result<Value, WorkerRequestError>>,
 }
 
 #[derive(Default)]
@@ -70,28 +104,45 @@ impl PendingRequests {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `generation` is the supervisor id, which an in-place respawn keeps, so an exit fails
-    /// every request of that supervisor.
+    #[cfg(test)]
     pub fn register(
         &self,
         plugin_id: &str,
         generation: u64,
-    ) -> (String, oneshot::Receiver<Result<Value, String>>) {
-        let id = format!("h-{}", self.next.fetch_add(1, Ordering::Relaxed) + 1);
+    ) -> (String, oneshot::Receiver<Result<Value, WorkerRequestError>>) {
+        let id = self.next_id();
+        let rx = self.register_as(&id, plugin_id, generation);
+        (id, rx)
+    }
+
+    /// A fresh request id, unique for this host.
+    pub fn next_id(&self) -> String {
+        format!("h-{}", self.next.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// Registers under `id`, which must come from [`Self::next_id`]. `generation` is the
+    /// supervisor id, which an in-place respawn keeps, so an exit fails every request of that
+    /// supervisor.
+    pub fn register_as(
+        &self,
+        id: &str,
+        plugin_id: &str,
+        generation: u64,
+    ) -> oneshot::Receiver<Result<Value, WorkerRequestError>> {
         let (tx, rx) = oneshot::channel();
         let mut state = self.state();
         if state.closed.get(plugin_id) == Some(&generation) {
-            return (id, rx);
+            return rx;
         }
         state.entries.insert(
-            id.clone(),
+            id.to_string(),
             Entry {
                 plugin_id: plugin_id.to_string(),
                 generation,
                 tx,
             },
         );
-        (id, rx)
+        rx
     }
 
     /// Runs `send` only while `id` is still registered. Retirement takes the same lock, so a
@@ -183,7 +234,7 @@ mod tests {
     }
 
     /// Still waiting: `try_recv` also errors on a closed channel, which is not the same.
-    fn is_open(rx: &mut oneshot::Receiver<Result<Value, String>>) -> bool {
+    fn is_open<T>(rx: &mut oneshot::Receiver<T>) -> bool {
         matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty))
     }
 
