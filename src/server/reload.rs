@@ -745,9 +745,7 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
         .map(|row| (row.id.clone(), row.status))
         .collect();
     replace_committed_profiles(&mut current, &mut metadata, committed, committed_status)?;
-    state
-        .mutation_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.note_row_mutation();
     state.runtime.request_publish();
     for (id, old) in prior_statuses {
         if let Some(row) = current.iter().find(|row| row.id == id) {
@@ -1568,6 +1566,7 @@ pub(super) fn merge_loaded_rows(
                     old: prior.status,
                     new: row.status,
                     at: now,
+                    restores_prior: false,
                 });
             }
         }

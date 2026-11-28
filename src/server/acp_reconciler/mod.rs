@@ -4,6 +4,8 @@ mod idle;
 mod rate_limit;
 mod resume;
 #[cfg(test)]
+pub(crate) use resume::seed_in_flight_status;
+#[cfg(test)]
 mod test_fixtures;
 
 use std::collections::{HashMap, HashSet};
@@ -278,6 +280,13 @@ pub async fn reconcile_acp_workers(
         HashSet<String>,
     ) = {
         let instances = state.instances.read().await;
+        // A rolled-back Retry's owner waits for its new worker's next frame, which a deleted row
+        // never sends. Every row counts here, not only `targets`: a triaged row can still be one.
+        state
+            .retry_starting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|id, _| instances.iter().any(|i| i.id == *id));
         (
             instances
                 .iter()
@@ -755,6 +764,35 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 mod tests {
     use super::test_fixtures::{capacity_startup_errors, startup_errors, test_state, Tick};
     use super::*;
+
+    /// #5921: a tick drops the Retry owner of a row that's gone, and keeps one whose row is
+    /// still there, even archived and so not a resume target.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_tick_drops_the_retry_owner_of_a_deleted_row() {
+        let (_home, state, _project) = test_state("s-retry-kept");
+        state.instances.write().await[0].archive();
+        state.retry_starting.lock().unwrap().extend([
+            (
+                "s-retry-kept".to_string(),
+                crate::server::acp_events::RetryAttempt::rolled_back_for_test(),
+            ),
+            (
+                "s-retry-deleted".to_string(),
+                crate::server::acp_events::RetryAttempt::rolled_back_for_test(),
+            ),
+        ]);
+        Tick::default().run(&state).await;
+        let mut owners: Vec<String> = state
+            .retry_starting
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        owners.sort();
+        assert_eq!(owners, ["s-retry-kept"]);
+    }
 
     #[test]
     #[serial_test::serial]

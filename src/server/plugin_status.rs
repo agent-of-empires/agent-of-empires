@@ -33,6 +33,7 @@ pub(crate) async fn run_forwarder(
     loop {
         tokio::select! {
             recv = rx.recv() => match recv {
+                Ok(change) if change.rearms_error() => {}
                 Ok(change) => {
                     host.emit_session_status_changed(&change).await;
                 }
@@ -81,6 +82,7 @@ mod tests {
             old: Status::Running,
             new: Status::Idle,
             at: crate::time::Timestamp::now(),
+            restores_prior: false,
         }
     }
 

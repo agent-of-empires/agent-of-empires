@@ -1668,6 +1668,7 @@ mod tests {
             old,
             new,
             at: crate::time::Timestamp::parse_rfc3339("2026-10-03T12:00:00Z").unwrap(),
+            restores_prior: false,
         }
     }
 

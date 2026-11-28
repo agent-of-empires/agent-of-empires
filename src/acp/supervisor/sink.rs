@@ -633,7 +633,7 @@ mod tests {
             };
             let counter = super::super::session_seq(&sup.next_seqs, "stalled");
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !counter.try_lock().is_ok_and(|seq| *seq == 1) {
+            while !counter.next.try_lock().is_ok_and(|seq| *seq == 1) {
                 assert!(
                     Instant::now() < deadline,
                     "{name}: the seq lock stayed held while the publisher waited for the writer"

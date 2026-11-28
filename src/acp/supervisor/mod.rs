@@ -64,7 +64,31 @@ pub(crate) type Launcher = Arc<
 type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
 /// Per-session seq counter; outlives workers so every publisher shares one sequence.
 /// Each session's last allocated seq, under its own lock so sessions publish independently.
-type SeqMap = std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>;
+type SeqMap = std::sync::Mutex<HashMap<String, Arc<SeqCounter>>>;
+
+/// A session's seq counter. Allocation and publication are serialised by `next`, held through
+/// store I/O; `last` mirrors the last allocated seq so a reader never waits on that I/O.
+#[derive(Default, Debug)]
+struct SeqCounter {
+    next: std::sync::Mutex<u64>,
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl SeqCounter {
+    fn starting_at(seq: u64) -> Self {
+        Self {
+            next: std::sync::Mutex::new(seq),
+            last: std::sync::atomic::AtomicU64::new(seq),
+        }
+    }
+
+    /// Allocates the next seq; the caller holds `next` (`last` is that guard).
+    fn allocate(&self, last: &mut u64) -> u64 {
+        *last = last.saturating_add(1);
+        self.last.store(*last, std::sync::atomic::Ordering::Release);
+        *last
+    }
+}
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
 
 type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
@@ -231,6 +255,9 @@ pub struct Supervisor<S: BroadcastSink> {
     registry: Arc<Mutex<AgentRegistry>>,
     workers: Workers,
     next_seqs: Arc<SeqMap>,
+    /// Per session, the epoch last installed and the seq its install published through for the
+    /// worker it replaced, before the new worker's own events.
+    retired_through: std::sync::Mutex<HashMap<String, (u64, u64)>>,
     /// Owner of every runner epoch. Lock order: `workers` before `lifecycle`.
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     /// Explicit restart requests currently operating on each session.
@@ -501,6 +528,17 @@ pub struct SpawnRequest {
     pub proxy: Option<crate::acp::acp_client::ProxySpec>,
 }
 
+impl SpawnRequest {
+    /// `Spawn` resumes a stored conversation; `SpawnFirst` starts one.
+    pub(crate) fn resume_kind(&self) -> ResumeKind {
+        if self.stored_acp_session_id.is_some() {
+            ResumeKind::Spawn
+        } else {
+            ResumeKind::SpawnFirst
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct LaunchAdmission {
     pub store: Arc<dyn crate::session::SessionStore>,
@@ -528,6 +566,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::default(),
             next_seqs: Arc::default(),
+            retired_through: std::sync::Mutex::default(),
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
                 crate::time::Timestamp::now().as_millis().max(1) as u64,
             ))),
@@ -665,6 +704,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
+        lock_recover(&self.retired_through).remove(session_id);
         Ok(())
     }
 
@@ -674,9 +714,21 @@ impl<S: BroadcastSink> Supervisor<S> {
             guard.extend(
                 pairs
                     .into_iter()
-                    .map(|(id, seq)| (id, Arc::new(std::sync::Mutex::new(seq)))),
+                    .map(|(id, seq)| (id, Arc::new(SeqCounter::starting_at(seq)))),
             );
         }
+    }
+
+    /// The last seq allocated for the session, 0 before any. Never waits on a publish in
+    /// progress, so it is safe under other locks.
+    pub(crate) fn latest_seq(&self, session_id: &str) -> u64 {
+        latest_seq_in(&self.next_seqs, session_id)
+    }
+
+    /// The `(epoch, seq)` the session's last install published through for the worker it
+    /// replaced. Takes only its own lock, so it is safe under other locks.
+    pub(crate) fn retired_through(&self, session_id: &str) -> Option<(u64, u64)> {
+        lock_recover(&self.retired_through).get(session_id).copied()
     }
 
     /// The running epoch, for a caller that must stop only that epoch.
@@ -939,7 +991,13 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
-fn session_seq(next_seqs: &SeqMap, session_id: &str) -> Arc<std::sync::Mutex<u64>> {
+fn latest_seq_in(next_seqs: &SeqMap, session_id: &str) -> u64 {
+    session_seq(next_seqs, session_id)
+        .last
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn session_seq(next_seqs: &SeqMap, session_id: &str) -> Arc<SeqCounter> {
     Arc::clone(
         lock_recover(next_seqs)
             .entry(session_id.to_string())
@@ -958,9 +1016,9 @@ fn publish_with_next_seq<R>(
     let counter = session_seq(next_seqs, session_id);
     // A holder blocks on store I/O, so waiters and the holder both run off the async worker.
     sink::blocking_io(|| {
-        let mut last = lock_recover(&counter);
-        *last = last.saturating_add(1);
-        publish(*last)
+        let mut last = lock_recover(&counter.next);
+        let seq = counter.allocate(&mut last);
+        publish(seq)
     })
 }
 
@@ -991,6 +1049,23 @@ fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    /// #5921: a Retry reads the latest seq under `instances.write()`, so it must not wait for
+    /// the counter lock a publish holds through store I/O. It reads the seq that publish took.
+    #[test]
+    fn latest_seq_does_not_wait_on_a_publish_in_progress() {
+        let seqs: Arc<SeqMap> = Arc::default();
+        lock_recover(&seqs).insert("s".into(), Arc::new(SeqCounter::starting_at(5)));
+        let read = publish_with_next_seq(&seqs, "s", |seq| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = Arc::clone(&seqs);
+            std::thread::spawn(move || {
+                let _ = tx.send(latest_seq_in(&reader, "s"));
+            });
+            (seq, rx.recv_timeout(std::time::Duration::from_secs(5)))
+        });
+        assert_eq!(read, (6, Ok(6)));
+    }
+
     use super::test_support::*;
     use super::*;
 

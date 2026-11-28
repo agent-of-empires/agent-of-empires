@@ -522,6 +522,679 @@ mod tests {
         assert_eq!(state.instances.read().await[0].group_path, "moved");
     }
 
+    /// Whether `id`'s Retry owner is rolled back, `None` with no owner. A failed Retry keeps its
+    /// rolled-back owner for the new worker's startup error.
+    fn rolled_back(state: &AppState, id: &str) -> Option<bool> {
+        state
+            .retry_starting
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(crate::server::acp_events::RetryAttempt::is_rolled_back)
+    }
+
+    fn retry_request(
+    ) -> Result<Json<worker::SpawnAcpRequest>, axum::extract::rejection::JsonRejection> {
+        Ok(Json(worker::SpawnAcpRequest {
+            agent: Some("codex".into()),
+            model: None,
+            additional_dirs: Vec::new(),
+            provider_env: Vec::new(),
+        }))
+    }
+
+    async fn errored_retry_state(
+        project: &std::path::Path,
+        id: &str,
+    ) -> Arc<crate::server::state::AppState> {
+        let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+        errored_retry_state_with(project, id, launcher, None).await
+    }
+
+    async fn errored_retry_state_with(
+        project: &std::path::Path,
+        id: &str,
+        launcher: crate::acp::supervisor::Launcher,
+        acp_mode_id: Option<&str>,
+    ) -> Arc<crate::server::state::AppState> {
+        use crate::server::test_support as support;
+        let mut inst = crate::session::Instance::new("acp-5671", project.to_str().unwrap());
+        inst.id = id.into();
+        inst.acp_mode_id = acp_mode_id.map(str::to_owned);
+        inst.source_profile = "default".into();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Error;
+        support::seed_instances_on_disk_for_test("default", vec![inst.clone()]);
+        let state = support::build_test_app_state_with_launcher(vec![inst], launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        state
+    }
+
+    async fn next_change(
+        changes: &mut tokio::sync::broadcast::Receiver<crate::server::push::StatusChange>,
+    ) -> (crate::session::Status, crate::session::Status) {
+        let change = tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+            .await
+            .expect("a status change")
+            .expect("status channel open");
+        (change.old, change.new)
+    }
+
+    /// #5671: Retry on an Error row shows `Starting`, and a failed launch puts the row back.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_retry_shows_starting_then_returns_to_error() {
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        for endpoint in ["spawn", "restart"] {
+            let id = format!("sess-5671-{endpoint}");
+            let state = errored_retry_state(project.path(), &id).await;
+            let mut changes = state.status_tx.subscribe();
+            let response = if endpoint == "spawn" {
+                spawn_acp(State(state.clone()), Path(id.clone()), retry_request())
+                    .await
+                    .into_response()
+            } else {
+                restart_acp(State(state.clone()), Path(id.clone()), retry_request())
+                    .await
+                    .into_response()
+            };
+            assert!(
+                !response.status().is_success(),
+                "{endpoint}: {}",
+                response.status()
+            );
+            assert_eq!(
+                next_change(&mut changes).await,
+                (Error, Starting),
+                "{endpoint}"
+            );
+            assert_eq!(
+                next_change(&mut changes).await,
+                (Starting, Error),
+                "{endpoint}"
+            );
+            assert_eq!(state.instances.read().await[0].status, Error, "{endpoint}");
+            assert_eq!(rolled_back(&state, &id), Some(true), "{endpoint}");
+        }
+    }
+
+    /// #5921: a Retry from a Stopped row shows Idle, not Starting, through either handler:
+    /// `resume_structured_stop` resumes it before `RetryStartingGuard::begin`, which admits only
+    /// Error. A Starting glyph here is #5977.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_from_stopped_shows_idle_through_the_handlers() {
+        use crate::session::Status;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut got = Vec::new();
+        for endpoint in ["spawn", "restart"] {
+            let id = format!("sess-5921-stopped-{endpoint}");
+            let state = errored_retry_state(project.path(), &id).await;
+            {
+                let mut rows = state.instances.write().await;
+                rows[0].status = Status::Stopped;
+                crate::server::test_support::seed_instances_on_disk_for_test(
+                    "default",
+                    rows.clone(),
+                );
+            }
+            let mut changes = state.status_tx.subscribe();
+            let _ = if endpoint == "spawn" {
+                spawn_acp(State(state.clone()), Path(id.clone()), retry_request())
+                    .await
+                    .into_response()
+            } else {
+                restart_acp(State(state.clone()), Path(id.clone()), retry_request())
+                    .await
+                    .into_response()
+            };
+            let mut sent = Vec::new();
+            while let Ok(change) = changes.try_recv() {
+                sent.push((change.old, change.new));
+            }
+            got.push((endpoint, sent, state.instances.read().await[0].status));
+        }
+        let want = [
+            ("spawn", vec![(Status::Stopped, Status::Idle)], Status::Idle),
+            (
+                "restart",
+                vec![(Status::Stopped, Status::Idle)],
+                Status::Idle,
+            ),
+        ];
+        assert_eq!(got, want);
+    }
+
+    /// #5921: restart takes its capacity slot before it shows `Starting`. With the only slot held
+    /// by another session it is refused with no status change; its own worker in that slot is
+    /// stopped first, so it restarts.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_restart_is_admitted_at_capacity_before_it_shows_starting() {
+        use crate::acp::supervisor::ResumeKind;
+        use crate::process::worker_registry::ResumeAuthority;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        for held_by_another in [true, false] {
+            let id = format!("sess-5921-capacity-{held_by_another}");
+            let launcher = crate::server::test_support::succeeding_launcher();
+            let state = errored_retry_state_with(project.path(), &id, launcher, None).await;
+            let _other = if held_by_another {
+                Some(
+                    state
+                        .acp_supervisor
+                        .reserve_spawn("other", ResumeKind::SpawnFirst, ResumeAuthority::Explicit)
+                        .await
+                        .expect("the other session takes the only slot"),
+                )
+            } else {
+                state.acp_supervisor.test_insert_worker(&id).await;
+                None
+            };
+            let mut changes = state.status_tx.subscribe();
+            let response = restart_acp(State(state.clone()), Path(id.clone()), retry_request())
+                .await
+                .into_response();
+            if held_by_another {
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&body).contains("capacity"),
+                    "{status}: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                // Every status change is sent before the handler returns.
+                assert!(matches!(
+                    changes.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ));
+                assert_eq!(
+                    state.instances.read().await[0].status,
+                    crate::session::Status::Error
+                );
+                assert_eq!(rolled_back(&state, &id), None);
+            } else {
+                assert!(response.status().is_success(), "{}", response.status());
+                assert_ne!(
+                    state.acp_supervisor.worker_state(&id).await,
+                    crate::daemon::AcpWorkerState::Absent
+                );
+            }
+        }
+    }
+
+    /// #5671: a Retry dropped after it wrote `Starting` (the client went away mid-launch) still
+    /// puts the row back. Only spawn runs in the request future; restart runs as runtime work.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_dropped_retry_restores_the_prior_status() {
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let [ready, release, done] = ["ready", "release", "done"].map(|f| project.path().join(f));
+        let hook = format!(
+            ": > '{}'; while [ ! -e '{}' ]; do sleep 0.01; done; : > '{}'",
+            ready.display(),
+            release.display(),
+            done.display()
+        );
+        crate::session::config::update_config(|global| {
+            global.host_hooks.before_session = vec![hook];
+        })
+        .unwrap();
+        // Nothing awaits the dropped launch's hook, and the runtime joins its blocking thread at
+        // shutdown: release it on every exit path and wait until it has seen the release.
+        struct Release([std::path::PathBuf; 2]);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let [release, done] = &self.0;
+                let _ = std::fs::write(release, b"release");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !done.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        let release = Release([release, done]);
+        let id = "sess-5671-drop".to_string();
+        let state = errored_retry_state(project.path(), &id).await;
+        let mut changes = state.status_tx.subscribe();
+        let mut launch = Box::pin(spawn_acp(State(state.clone()), Path(id), retry_request()));
+        let hook_running = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        tokio::select! {
+            response = &mut launch => panic!("launch ended before its hook: {}", response.into_response().status()),
+            waited = hook_running => waited.expect("before_session hook started"),
+        }
+        assert_eq!(next_change(&mut changes).await, (Error, Starting));
+
+        drop(launch);
+        let restored = next_change(&mut changes).await;
+        drop(release);
+        assert_eq!(restored, (Starting, Error));
+        assert_eq!(state.instances.read().await[0].status, Error);
+        assert_eq!(rolled_back(&state, "sess-5671-drop"), Some(true));
+    }
+
+    /// #5921: a Retry the agent policy refuses answers 403 before it shows `Starting`, as a
+    /// restart does.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_the_agent_policy_refuses_never_shows_starting() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let id = "sess-5921-policy".to_string();
+        let state = errored_retry_state(project.path(), &id).await;
+        crate::session::config::update_config(|config| {
+            config.acp.restrict_agents = true;
+            config.acp.allowed_agents = vec!["claude".into()];
+        })
+        .unwrap();
+        let mut changes = state.status_tx.subscribe();
+        let response = spawn_acp(State(state.clone()), Path(id.clone()), retry_request())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            state.instances.read().await[0].status,
+            crate::session::Status::Error
+        );
+        assert_eq!(rolled_back(&state, &id), None);
+    }
+
+    /// #5921: once a Retry's worker is installed its launch has succeeded, so a request dropped
+    /// after that, while its mode is applied or past it, leaves `Starting` for the worker's own
+    /// frames rather than rolling back. A worker that then fails still turns the row Error.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_dropped_after_its_worker_is_installed_keeps_starting() {
+        use crate::server::acp_events::retry_test_gate::RevertGate;
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        for (gate_at, mode, worker_fails) in [
+            ("launched", None, false),
+            ("mode", Some("plan"), false),
+            ("mode", Some("plan"), true),
+        ] {
+            let id = format!("sess-5921-{gate_at}-{worker_fails}");
+            let (launcher, workers) =
+                crate::server::test_support::succeeding_launcher_with_senders();
+            let state = errored_retry_state_with(project.path(), &id, launcher, mode).await;
+            let listener =
+                tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()));
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while state.acp_events_tx.receiver_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener subscribes");
+            let (gate, parked) = RevertGate::arm(&format!("{id}#{gate_at}"));
+            let mut changes = state.status_tx.subscribe();
+            let mut launch = Box::pin(spawn_acp(
+                State(state.clone()),
+                Path(id.clone()),
+                retry_request(),
+            ));
+            tokio::select! {
+                response = &mut launch => panic!("{gate_at}: launch ended before the gate: {}", response.into_response().status()),
+                parked = tokio::time::timeout(std::time::Duration::from_secs(10), parked) => {
+                    parked.expect("the launch reaches the gate").expect("gate open");
+                }
+            }
+            assert_eq!(next_change(&mut changes).await, (Error, Starting));
+            drop(launch);
+            drop(gate);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                state.runtime.work.drain(),
+            )
+            .await
+            .expect("runtime work settles");
+            assert!(
+                matches!(
+                    changes.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ),
+                "{id}: no rollback"
+            );
+            assert_eq!(state.instances.read().await[0].status, Starting, "{id}");
+            assert_eq!(rolled_back(&state, &id), Some(false), "{id}");
+            if worker_fails {
+                let worker = workers.lock().unwrap().last().cloned().expect("a worker");
+                worker
+                    .send(crate::acp::Event::startup_error("adapter exited"))
+                    .await
+                    .expect("drain open");
+                assert_eq!(next_change(&mut changes).await, (Starting, Error), "{id}");
+                assert_eq!(
+                    rolled_back(&state, &id),
+                    None,
+                    "{id}: the failure settles it"
+                );
+            }
+            listener.abort();
+            let _ = listener.await;
+        }
+    }
+
+    /// #5921: replacing the worker publishes cancellations and detaches for the retired one,
+    /// past the Retry's watermark. Neither the listener, even while the install is still
+    /// publishing, nor lag recovery lets them settle `Starting`; the new worker's own frames, a
+    /// background one included, still do.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retry_starting_ignores_what_its_install_publishes_for_the_retired_worker() {
+        use crate::acp::Event;
+        use crate::server::acp_events::retry_test_gate::RevertGate;
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let task = |id: &str| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: None,
+            description: "sleep 60".into(),
+            workflow: None,
+            started_at: None,
+        };
+        let approval = Event::ApprovalRequested {
+            approval: crate::acp::approvals::Approval {
+                nonce: crate::acp::approvals::Nonce("orphan".into()),
+                tool_call: crate::acp::state::ToolCall {
+                    prompt: None,
+                    id: "tc-1".into(),
+                    name: "Terminal".into(),
+                    kind: "execute".into(),
+                    args_preview: "{}".into(),
+                    started_at: crate::time::Timestamp::now(),
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+                destructive: false,
+                options: Vec::new(),
+                choice: false,
+                plan: None,
+                requested_at: crate::time::Timestamp::now(),
+                resolved: None,
+            },
+        };
+        // (case, the retired worker's unresolved event, what the new worker sends; None runs
+        // lag recovery instead of the listener)
+        for (case, orphan, fresh) in [
+            (
+                "detach",
+                Some(task("old")),
+                Some(Event::startup_error("adapter exited")),
+            ),
+            (
+                "orphaned-approval",
+                Some(approval.clone()),
+                Some(Event::startup_error("adapter exited")),
+            ),
+            (
+                "orphaned-approval-mid-install",
+                Some(approval),
+                Some(Event::startup_error("adapter exited")),
+            ),
+            ("detach-recovery", Some(task("old")), None),
+            ("own-background", None, Some(task("new"))),
+        ] {
+            let id = format!("sess-5921-retired-{case}");
+            let (launcher, workers) =
+                crate::server::test_support::succeeding_launcher_with_senders();
+            let state = errored_retry_state_with(project.path(), &id, launcher, None).await;
+            let mut seq = 0;
+            for event in orphan.iter().chain([&Event::Stopped {
+                reason: "end_turn".into(),
+            }]) {
+                seq += 1;
+                state.acp_event_store.record(&id, seq, event).unwrap();
+            }
+            state.acp_supervisor.hydrate_seqs([(id.clone(), seq)]);
+            let listener = fresh.is_some().then(|| {
+                tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()))
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while listener.is_some() && state.acp_events_tx.receiver_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener subscribes");
+            let mut changes = state.status_tx.subscribe();
+            let gate = (case == "orphaned-approval-mid-install")
+                .then(|| RevertGate::arm(&format!("{id}#retire")));
+            let mut launch = Box::pin(spawn_acp(
+                State(state.clone()),
+                Path(id.clone()),
+                retry_request(),
+            ));
+            let mid_install = gate.is_some();
+            if let Some((gate, parked)) = gate {
+                tokio::select! {
+                    response = &mut launch => panic!("{case}: launch ended before the gate: {}", response.into_response().status()),
+                    parked = tokio::time::timeout(std::time::Duration::from_secs(10), parked) => {
+                        parked.expect("the install reaches the gate").expect("gate open");
+                    }
+                }
+                assert_eq!(next_change(&mut changes).await, (Error, Starting), "{case}");
+                // Queued behind the cleanup frames, so its change proves the listener has
+                // handled them while the install had not yet recorded their cutoff.
+                let mut sentinel =
+                    crate::session::Instance::new("sentinel", project.path().to_str().unwrap());
+                sentinel.id = format!("{id}-sentinel");
+                sentinel.view = crate::session::View::Structured;
+                sentinel.source_profile = "default".into();
+                sentinel.status = crate::session::Status::Idle;
+                state.instances.write().await.push(sentinel.clone());
+                state
+                    .acp_events_tx
+                    .send(crate::acp::protocol::AcpBroadcastFrame {
+                        session_id: sentinel.id.clone(),
+                        seq: 1,
+                        event: Arc::new(Event::startup_error("sentinel")),
+                        worker_generation: None,
+                        sidebar_status: None,
+                    })
+                    .unwrap();
+                let change =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), changes.recv())
+                        .await
+                        .expect("a status change")
+                        .expect("status channel open");
+                assert_eq!(
+                    (change.instance_id.as_str(), change.new),
+                    (sentinel.id.as_str(), Error),
+                    "{case}: the retired worker's frames moved the row first"
+                );
+                assert_eq!(state.instances.read().await[0].status, Starting, "{case}");
+                assert_eq!(rolled_back(&state, &id), Some(false), "{case}");
+                gate.release();
+            }
+            let response = launch.await.into_response();
+            assert!(
+                response.status().is_success(),
+                "{case}: {}",
+                response.status()
+            );
+            if !mid_install {
+                assert_eq!(next_change(&mut changes).await, (Error, Starting), "{case}");
+            }
+            assert_eq!(
+                state.acp_supervisor.latest_seq(&id) > seq,
+                orphan.is_some(),
+                "{case}: the install published for the retired worker"
+            );
+            match fresh {
+                Some(event) => {
+                    let worker = workers.lock().unwrap().last().cloned().expect("a worker");
+                    worker.send(event).await.expect("drain open");
+                    let change = next_change(&mut changes).await;
+                    if case == "own-background" {
+                        assert_eq!(change.0, Starting, "{case}: {change:?}");
+                        assert_ne!(change.1, Starting, "{case}");
+                    } else {
+                        assert_eq!(change, (Starting, Error), "{case}");
+                    }
+                    assert_eq!(rolled_back(&state, &id), None, "{case}: settled");
+                }
+                None => {
+                    crate::server::acp_events::recover_structured_unread_after_lag(
+                        &state.instances,
+                        &state.session_service,
+                        &state.instance_locks,
+                        crate::file_watch::FileWatchService::noop(),
+                        &state.status_tx,
+                        &state.retry_starting,
+                    )
+                    .await;
+                    assert!(
+                        changes.try_recv().is_err(),
+                        "{case}: recovery left Starting"
+                    );
+                    assert_eq!(state.instances.read().await[0].status, Starting, "{case}");
+                    assert_eq!(rolled_back(&state, &id), Some(false), "{case}");
+                }
+            }
+            if let Some(listener) = listener {
+                listener.abort();
+                let _ = listener.await;
+            }
+        }
+    }
+
+    /// #5921: a status read that scans while an install holds its provisional cutoff and applies
+    /// after the final one is written leaves the Retry's Starting, and its owner, alone: the scan
+    /// found no status evidence, which is not a seq newer than the cutoff.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_scan_inside_the_retire_fence_leaves_starting() {
+        use crate::acp::Event;
+        use crate::server::acp_events::retry_test_gate::RevertGate;
+        use crate::session::Status::{Error, Starting};
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        // (case, the status read, whether the attempt is rolled back, the retired worker's last
+        // event)
+        for (case, seed, rolled, last) in [
+            (
+                "lag",
+                false,
+                false,
+                Event::Stopped {
+                    reason: "end_turn".into(),
+                },
+            ),
+            (
+                "seed",
+                true,
+                false,
+                Event::Stopped {
+                    reason: "end_turn".into(),
+                },
+            ),
+            (
+                "rolled-back",
+                false,
+                true,
+                Event::startup_error("adapter exited"),
+            ),
+        ] {
+            let id = format!("sess-5921-fence-{case}");
+            let launcher = crate::server::test_support::succeeding_launcher();
+            let state = errored_retry_state_with(project.path(), &id, launcher, None).await;
+            state.acp_event_store.record(&id, 1, &last).unwrap();
+            state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
+            let mut changes = state.status_tx.subscribe();
+            let (install, installing) = RevertGate::arm(&format!("{id}#retire"));
+            let mut launch = Box::pin(spawn_acp(
+                State(state.clone()),
+                Path(id.clone()),
+                retry_request(),
+            ));
+            tokio::select! {
+                response = &mut launch => panic!("{case}: launch ended before the gate: {}", response.into_response().status()),
+                parked = tokio::time::timeout(std::time::Duration::from_secs(10), installing) => {
+                    parked.expect("the install reaches the gate").expect("gate open");
+                }
+            }
+            assert_eq!(next_change(&mut changes).await, (Error, Starting), "{case}");
+            let (epoch, fence) = state.acp_supervisor.retired_through(&id).expect("a fence");
+            assert_eq!(fence, u64::MAX, "{case}: the provisional cutoff");
+            if rolled {
+                crate::server::acp_events::RetryAttempt::mark_rolled_back_for_test(
+                    &state.retry_starting,
+                    &id,
+                );
+            }
+
+            let (read, scanned) = RevertGate::arm(&format!("{id}#evidence"));
+            let status_read = tokio::spawn({
+                let state = state.clone();
+                let id = id.clone();
+                async move {
+                    if seed {
+                        crate::server::acp_reconciler::seed_in_flight_status(&state, &id).await;
+                    } else {
+                        crate::server::acp_events::recover_structured_unread_after_lag(
+                            &state.instances,
+                            &state.session_service,
+                            &state.instance_locks,
+                            crate::file_watch::FileWatchService::noop(),
+                            &state.status_tx,
+                            &state.retry_starting,
+                        )
+                        .await;
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), scanned)
+                .await
+                .expect("the status read scans")
+                .expect("gate open");
+            install.release();
+            let response = launch.await.into_response();
+            assert!(
+                response.status().is_success(),
+                "{case}: {}",
+                response.status()
+            );
+            let (now_epoch, cutoff) = state.acp_supervisor.retired_through(&id).expect("a cutoff");
+            assert!(
+                now_epoch == epoch && cutoff != u64::MAX,
+                "{case}: the final cutoff is written: {cutoff}"
+            );
+            read.release();
+            status_read.await.unwrap();
+
+            // Every change the status read makes is sent before it returns.
+            assert!(
+                changes.try_recv().is_err(),
+                "{case}: the status read moved the row"
+            );
+            assert_eq!(state.instances.read().await[0].status, Starting, "{case}");
+            assert_eq!(
+                rolled_back(&state, &id),
+                Some(rolled),
+                "{case}: the owner survives"
+            );
+        }
+    }
+
     /// #4116: a peer archive committed while the `before_session` hook runs (after the handler's
     /// recheck) still refuses the launch, on both the spawn and the agent-switch endpoint.
     #[tokio::test]

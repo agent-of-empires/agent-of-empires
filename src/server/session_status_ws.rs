@@ -194,6 +194,7 @@ mod tests {
             old: Status::Running,
             new,
             at: Timestamp::now(),
+            restores_prior: false,
         }
     }
 

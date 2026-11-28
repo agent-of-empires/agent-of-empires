@@ -298,7 +298,7 @@ async fn handle_status_change(
     semaphore: Arc<tokio::sync::Semaphore>,
     change: StatusChange,
 ) {
-    if !is_fire_worthy(change.new) {
+    if change.rearms_error() || !is_fire_worthy(change.new) {
         return;
     }
     let session_id = change.instance_id.clone();

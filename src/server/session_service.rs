@@ -2469,6 +2469,37 @@ impl SessionService {
         })
     }
 
+    /// Whether an event that bears a status (`status_policy`, as the live listener filters) has
+    /// a seq in `(after, upto]`, where `upto` is the `last_seq` of the fold being judged: a later
+    /// event isn't in that fold's projection. A read that fails answers false, so a Retry's
+    /// Starting holds until a status-bearing frame, its rollback, or the next recovery moves it.
+    pub(crate) async fn reports_status_after(&self, id: &str, after: u64, upto: u64) -> bool {
+        const PAGE: usize = 256;
+        let store = Arc::clone(&self.acp_event_store);
+        let sid = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut since = after;
+            while since < upto {
+                let page = store.replay_page(&sid, since, Some(PAGE));
+                if page
+                    .events
+                    .iter()
+                    .take_while(|(seq, _)| *seq <= upto)
+                    .any(|(_, event)| crate::server::acp_events::status_policy(event).is_some())
+                {
+                    return true;
+                }
+                match page.last_scanned_seq {
+                    Some(last) if page.has_more && last > since => since = last,
+                    _ => return false,
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     /// The sidebar status projected at `seq`, for a frame published while the
     /// control cache was cold or behind, so no status rode with it.
     ///

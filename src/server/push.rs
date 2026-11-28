@@ -31,6 +31,8 @@ pub struct StatusChange {
     pub old: Status,
     pub new: Status,
     pub at: Timestamp,
+    /// Puts back the status a failed Retry's `Starting` replaced, rather than reporting a new one.
+    pub restores_prior: bool,
 }
 
 /// Publish once after the authoritative status commit; unchanged rows emit nothing.
@@ -38,6 +40,24 @@ pub fn publish_status_change(
     status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
     inst: &crate::session::Instance,
     old: Status,
+) {
+    publish_committed(status_tx, inst, old, false);
+}
+
+/// [`publish_status_change`] for a failed Retry's rollback to the status it replaced.
+pub fn publish_retry_rollback(
+    status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
+    inst: &crate::session::Instance,
+    old: Status,
+) {
+    publish_committed(status_tx, inst, old, true);
+}
+
+fn publish_committed(
+    status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
+    inst: &crate::session::Instance,
+    old: Status,
+    restores_prior: bool,
 ) {
     if inst.status == old {
         return;
@@ -51,8 +71,38 @@ pub fn publish_status_change(
             old,
             new: inst.status,
             at: Timestamp::now(),
+            restores_prior,
         },
     );
+}
+
+/// Re-arms push's error dwell for a row already in Error: a failed Retry's rollback put that
+/// status back before the new worker's own startup error arrived, so the failure is new. Every
+/// other consumer, the status WebSocket's sound dwell included, skips it
+/// ([`StatusChange::rearms_error`]).
+pub fn publish_new_failure(
+    status_tx: &tokio::sync::broadcast::Sender<StatusChange>,
+    inst: &crate::session::Instance,
+) {
+    publish(
+        status_tx,
+        StatusChange {
+            instance_id: inst.id.clone(),
+            instance_title: inst.title.clone(),
+            effective_profile: inst.effective_profile(),
+            old: Status::Error,
+            new: Status::Error,
+            at: Timestamp::now(),
+            restores_prior: false,
+        },
+    );
+}
+
+impl StatusChange {
+    /// Only [`publish_new_failure`] sends a change that moves nothing; it is for push alone.
+    pub fn rearms_error(&self) -> bool {
+        self.old == self.new
+    }
 }
 
 /// Logs then broadcasts; the log must not depend on a subscriber existing.
@@ -514,6 +564,12 @@ struct DwellState {
     idle_since: Option<std::time::Instant>,
     /// When the session most recently entered Error.
     error_since: Option<std::time::Instant>,
+    /// Set while a Retry's `Starting` follows an `Error`: that error's `error_since`, `None`
+    /// once it notified. A return to Error resumes it rather than arming a new one.
+    error_before_start: Option<Option<std::time::Instant>>,
+    /// The `since` of the candidate last put back, so a stale one is put back only once: a lagged
+    /// receiver may never see the change that would settle it.
+    put_back_since: Option<std::time::Instant>,
     /// Last time a push fired for this session (any event type). Used
     /// for a shared per-session cooldown: rapid-fire events like
     /// Error → brief Running → Error don't double-buzz.
@@ -587,15 +643,31 @@ pub async fn spawn_consumer(state: std::sync::Arc<super::AppState>) {
 fn handle_status_change(dwell: &mut HashMap<String, DwellState>, change: StatusChange) {
     let entry = dwell.entry(change.instance_id.clone()).or_default();
     entry.title = change.instance_title;
+    entry.put_back_since = None;
     let now = std::time::Instant::now();
     // Exactly one `*_since` is set at a time.
+    let resumed_error = match (change.old, change.new) {
+        (Status::Error, Status::Starting) => {
+            entry.error_before_start = Some(entry.error_since);
+            None
+        }
+        // Only a rollback resumes the earlier error's dwell; any other launch failure is new.
+        (Status::Starting, Status::Error) => entry
+            .error_before_start
+            .take()
+            .filter(|_| change.restores_prior),
+        _ => {
+            entry.error_before_start = None;
+            None
+        }
+    };
     entry.waiting_since = None;
     entry.idle_since = None;
     entry.error_since = None;
     match change.new {
         Status::Waiting => entry.waiting_since = Some(now),
         Status::Idle => entry.idle_since = Some(now),
-        Status::Error => entry.error_since = Some(now),
+        Status::Error => entry.error_since = resumed_error.unwrap_or(Some(now)),
         _ => {}
     }
     // Drop entries for transitions into Stopped/Deleting so the map doesn't grow forever in
@@ -645,15 +717,40 @@ fn notification_matches_live_instance(
     )
 }
 
-/// Returns the `(instance_id, title, event)` notifications whose dwell has
-/// elapsed at `now`, and disarms those sessions. A session a foreground window
-/// already shows (`web_watch`) is skipped with its dwell still armed, so it
+/// A notification whose dwell elapsed, with what selecting it consumed.
+struct Due {
+    id: String,
+    title: String,
+    event: NotificationEvent,
+    since: std::time::Instant,
+    last_notified: Option<std::time::Instant>,
+}
+
+/// Puts back what `due` consumed: the cooldown it started, as nothing was sent, and its dwell
+/// once, as if never selected.
+fn put_back(dwell: &mut HashMap<String, DwellState>, due: Due) {
+    let Some(state) = dwell.get_mut(&due.id) else {
+        return;
+    };
+    state.last_notified = due.last_notified;
+    if state.put_back_since.replace(due.since) == Some(due.since) {
+        return;
+    }
+    match due.event {
+        NotificationEvent::Waiting => state.waiting_since = Some(due.since),
+        NotificationEvent::Idle => state.idle_since = Some(due.since),
+        NotificationEvent::Error => state.error_since = Some(due.since),
+    }
+}
+
+/// The notifications whose dwell has elapsed at `now`, with those sessions disarmed. A session
+/// a foreground window already shows (`web_watch`) is skipped with its dwell still armed, so it
 /// fires once no window covers it.
 fn due_events(
     dwell: &mut HashMap<String, DwellState>,
     web_watch: &super::state::WebWatch,
     now: std::time::Instant,
-) -> Vec<(String, String, NotificationEvent)> {
+) -> Vec<Due> {
     let mut to_fire = Vec::new();
     for (id, state) in dwell.iter_mut() {
         if web_watch.covers(id) {
@@ -677,11 +774,16 @@ fn due_events(
             if now.duration_since(since).as_millis() < event.dwell_ms() as u128 {
                 continue;
             }
-            state.last_notified = Some(now);
+            to_fire.push(Due {
+                id: id.clone(),
+                title: state.title.clone(),
+                event,
+                since,
+                last_notified: state.last_notified.replace(now),
+            });
             state.waiting_since = None;
             state.idle_since = None;
             state.error_since = None;
-            to_fire.push((id.clone(), state.title.clone(), event));
             break;
         }
     }
@@ -740,7 +842,8 @@ async fn fire_due_pushes(
     let instances = app_state.instances.read().await.clone();
     let web_config = app_state.web_config.clone();
 
-    for (instance_id, instance_title, event) in to_fire {
+    for due in to_fire {
+        let (instance_id, instance_title, event) = (due.id.clone(), due.title.clone(), due.event);
         // If the instance vanished (externally deleted, tmux killed, storage file
         // hand-edited) between the dwell timer starting and firing, skip rather than
         // sending a notification that deep-links to a 404.
@@ -749,6 +852,11 @@ async fn fire_due_pushes(
             continue;
         };
         if !notification_matches_live_instance(event, instance) {
+            // The row moved on before its change reached this consumer, such as a Retry's
+            // Starting over an Error: the candidate stays pending so that change decides it.
+            if !instance.is_trashed() {
+                put_back(dwell, due);
+            }
             continue;
         }
         if !should_fire(event, &web_config, Some(instance)) {
@@ -1426,6 +1534,25 @@ pub async fn test(
     }))
 }
 
+/// Test-only: how many "errored" pushes `changes` send when the consumer ticks after each one,
+/// every tick past both the dwell and the cooldown.
+#[cfg(test)]
+pub(crate) fn errors_pushed(changes: impl IntoIterator<Item = StatusChange>) -> usize {
+    let watch = super::state::WebWatch::Nothing;
+    let start = std::time::Instant::now();
+    let mut dwell = HashMap::new();
+    let mut pushed = 0;
+    for (tick, change) in (1u32..).zip(changes) {
+        handle_status_change(&mut dwell, change);
+        let now = start + std::time::Duration::from_secs(3600) * tick;
+        pushed += due_events(&mut dwell, &watch, now)
+            .iter()
+            .filter(|due| due.event == NotificationEvent::Error)
+            .count();
+    }
+    pushed
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1779,6 +1906,7 @@ mod tests {
                 old: Status::Running,
                 new: Status::Waiting,
                 at: Timestamp::now(),
+                restores_prior: false,
             },
         );
         assert!(dwell.get(&id).unwrap().waiting_since.is_some());
@@ -1795,9 +1923,95 @@ mod tests {
                 old: Status::Waiting,
                 new: Status::Running,
                 at: Timestamp::now(),
+                restores_prior: false,
             },
         );
         assert!(dwell.get(&id).unwrap().waiting_since.is_none());
+    }
+
+    /// #5671: a Retry's rollback to Error resumes the earlier error instead of arming a second
+    /// "errored" push. Any other launch failure, such as a Terminal launch or a Retry's new worker
+    /// failing, is new and notifies again once the cooldown has passed.
+    #[test]
+    fn only_a_retry_rollback_resumes_the_earlier_error() {
+        let change = |old, new, restores_prior| StatusChange {
+            instance_id: "sess-5671".into(),
+            instance_title: "retry".into(),
+            effective_profile: "default".into(),
+            old,
+            new,
+            at: Timestamp::now(),
+            restores_prior,
+        };
+        let watch = crate::server::state::WebWatch::Nothing;
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        // (statuses before the launch, whether the error already notified and its cooldown has
+        // passed, whether a tick selected it but the live row was already Starting, whether the
+        // Error is a rollback, notifications due)
+        let cases = [
+            (vec![Status::Running, Status::Error], true, false, true, 0),
+            (vec![Status::Running, Status::Error], false, false, true, 1),
+            (vec![Status::Running, Status::Error], false, true, true, 1),
+            (vec![Status::Running, Status::Error], true, false, false, 1),
+        ];
+        for (before, notified, skipped, rollback, want) in cases {
+            let mut dwell: HashMap<String, DwellState> = HashMap::new();
+            for pair in before.windows(2) {
+                handle_status_change(&mut dwell, change(pair[0], pair[1], false));
+            }
+            if notified {
+                assert_eq!(due_events(&mut dwell, &watch, later).len(), 1, "{before:?}");
+                dwell.get_mut("sess-5671").unwrap().last_notified = None;
+            }
+            if skipped {
+                let due = due_events(&mut dwell, &watch, later);
+                assert_eq!(due.len(), 1, "{before:?}");
+                due.into_iter().for_each(|due| put_back(&mut dwell, due));
+            }
+            let prior = *before.last().unwrap();
+            handle_status_change(&mut dwell, change(prior, Status::Starting, false));
+            handle_status_change(
+                &mut dwell,
+                change(Status::Starting, Status::Error, rollback),
+            );
+            let due = due_events(&mut dwell, &watch, later);
+            assert_eq!(
+                due.len(),
+                want,
+                "{before:?} notified={notified} skipped={skipped} rollback={rollback}"
+            );
+        }
+    }
+
+    /// #5921: a candidate the live row no longer matches is put back once, for the change that
+    /// will decide it. A receiver that lagged past that change doesn't keep re-selecting it; a
+    /// change that does arrive allows one more.
+    #[test]
+    fn a_stale_candidate_is_put_back_once_until_a_change_arrives() {
+        let change = |old, new| StatusChange {
+            instance_id: "sess-5921".into(),
+            instance_title: "stale".into(),
+            effective_profile: "default".into(),
+            old,
+            new,
+            at: Timestamp::now(),
+            restores_prior: false,
+        };
+        let watch = crate::server::state::WebWatch::Nothing;
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let mut dwell: HashMap<String, DwellState> = HashMap::new();
+        handle_status_change(&mut dwell, change(Status::Running, Status::Error));
+        let mut selected = Vec::new();
+        for _ in 0..3 {
+            let due = due_events(&mut dwell, &watch, later);
+            selected.push(due.len());
+            due.into_iter().for_each(|due| put_back(&mut dwell, due));
+        }
+        // A discarded candidate sent nothing, so it leaves no cooldown behind: the change's own
+        // candidate is selected at the same instant.
+        handle_status_change(&mut dwell, change(Status::Error, Status::Error));
+        selected.push(due_events(&mut dwell, &watch, later).len());
+        assert_eq!(selected, [1, 1, 0, 1]);
     }
 
     #[test]
@@ -1814,8 +2028,8 @@ mod tests {
             ("focused".to_string(), waiting("f")),
             ("other".to_string(), waiting("o")),
         ]);
-        let ids = |fired: Vec<(String, String, NotificationEvent)>| {
-            let mut ids: Vec<String> = fired.into_iter().map(|(id, ..)| id).collect();
+        let ids = |fired: Vec<Due>| {
+            let mut ids: Vec<String> = fired.into_iter().map(|due| due.id).collect();
             ids.sort();
             ids
         };
@@ -1855,6 +2069,7 @@ mod tests {
             old: Status::Running,
             new,
             at: Timestamp::now(),
+            restores_prior: false,
         };
 
         handle_status_change(&mut dwell, ev(Status::Waiting));
@@ -1951,6 +2166,7 @@ mod tests {
                 old: Status::Running,
                 new: Status::Waiting,
                 at: Timestamp::now(),
+                restores_prior: false,
             },
         );
         assert!(dwell.contains_key(&id));
@@ -1963,6 +2179,7 @@ mod tests {
                 old: Status::Waiting,
                 new: Status::Stopped,
                 at: Timestamp::now(),
+                restores_prior: false,
             },
         );
         assert!(!dwell.contains_key(&id));

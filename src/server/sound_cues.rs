@@ -32,7 +32,9 @@ impl Dwells {
     }
 
     pub(super) fn on_change(&mut self, change: &StatusChange, now: Instant) {
-        self.track(&change.instance_id, change.new, now);
+        if !(change.new == Status::Error && change.rearms_error()) {
+            self.track(&change.instance_id, change.new, now);
+        }
     }
 
     /// A dwell for every session already in a cueing status, so a new connection still cues a
@@ -183,6 +185,7 @@ mod tests {
             old: Status::Running,
             new,
             at: Timestamp::now(),
+            restores_prior: false,
         }
     }
 
@@ -205,6 +208,38 @@ mod tests {
         );
         assert!(dwells.take_due(t0 + Duration::from_secs(60)).is_empty());
         assert_eq!(dwells.next_due(), None);
+    }
+
+    /// #5921: push's Error to Error re-arm moves nothing, so the sound dwell keeps its time and
+    /// a cued Error doesn't replay. A Retry's rollback, Error to Starting to Error, does move the
+    /// status, and cues once.
+    #[test]
+    fn a_rollback_cues_once_and_a_push_only_rearm_replays_nothing() {
+        use Status::{Error, Starting};
+        let step = |old, new, restores_prior| StatusChange {
+            old,
+            restores_prior,
+            ..change("a", new)
+        };
+        let t0 = Instant::now();
+        let later = |secs| t0 + Duration::from_secs(secs);
+        let mut dwells = Dwells::default();
+        dwells.on_change(&change("a", Error), t0);
+        let pending = dwells.next_due();
+        assert!(pending.is_some(), "an Error cues");
+        dwells.on_change(&step(Error, Error, false), later(1));
+        assert_eq!(
+            dwells.next_due(),
+            pending,
+            "a re-arm keeps a pending cue's time"
+        );
+        let mut cues = vec![dwells.take_due(later(60)).len()];
+        dwells.on_change(&step(Error, Starting, false), later(61));
+        dwells.on_change(&step(Starting, Error, true), later(62));
+        cues.push(dwells.take_due(later(120)).len());
+        dwells.on_change(&step(Error, Error, false), later(121));
+        cues.push(dwells.take_due(later(180)).len());
+        assert_eq!(cues, [1, 1, 0], "the first Error, the rollback, the re-arm");
     }
 
     #[test]
@@ -265,6 +300,39 @@ mod tests {
         assert!(
             at - sent >= Duration::from_millis(2_000),
             "idle sounded before its dwell"
+        );
+
+        state.shutdown.cancel();
+        player.await.unwrap();
+    }
+
+    /// #5921: the host player shares the dwells, so a push-only Error re-arm after a played
+    /// Error plays nothing on the host either.
+    #[tokio::test(start_paused = true)]
+    async fn host_player_does_not_replay_an_error_on_a_push_only_rearm() {
+        let mut row = Instance::new("r", "/tmp/aoe-host-sound-r");
+        row.status = Status::Error;
+        let id = row.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        let (played_tx, mut played) = tokio::sync::mpsc::unbounded_channel();
+        let player = tokio::spawn(run_host_player(
+            state.clone(),
+            state.status_tx.subscribe(),
+            move |_, event| played_tx.send(event).unwrap(),
+        ));
+
+        state.status_tx.send(change(&id, Status::Error)).unwrap();
+        assert_eq!(next_played(&mut played).await, SoundEvent::Error);
+        let rearm = StatusChange {
+            old: Status::Error,
+            ..change(&id, Status::Error)
+        };
+        state.status_tx.send(rearm).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), played.recv())
+                .await
+                .is_err(),
+            "a re-arm replayed the Error"
         );
 
         state.shutdown.cancel();
