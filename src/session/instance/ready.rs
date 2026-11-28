@@ -486,7 +486,7 @@ impl Instance {
                 crate::agents::ready_markers(&self.tool),
             );
         }
-        session.admit_agent_input(self.expects_shell())?;
+        session.admit_agent_input(self.expects_shell(), true)?;
         Ok(session)
     }
 }

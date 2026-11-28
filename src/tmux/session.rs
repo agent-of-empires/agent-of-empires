@@ -719,7 +719,11 @@ impl Session {
 
     /// Readiness is sampled after caller waits, then checked again by tmux in
     /// each input effect, including the Enter following a delayed paste.
-    pub(crate) fn admit_agent_input(&mut self, expects_shell: bool) -> Result<()> {
+    pub(crate) fn admit_agent_input(
+        &mut self,
+        expects_shell: bool,
+        require_first: bool,
+    ) -> Result<()> {
         let physical = self
             .physical
             .as_ref()
@@ -727,6 +731,7 @@ impl Session {
         let observation = super::utils::probe_owned_pane_readiness(
             physical,
             &crate::tmux::TmuxCommandDeadline::new(),
+            require_first,
         )
         .context(crate::session::NativeInputError::Ownership)?;
         let Some((super::utils::PaneProbe::Alive, shell, command)) = observation else {
@@ -1469,11 +1474,32 @@ impl Session {
             ready_markers,
             |_| None,
             || {
-                let live = crate::tmux::tmux_command()
-                    .args(["display-message", "-p", "-t", pane, "#{pane_dead}"])
-                    .output()?;
-                if !live.status.success() || String::from_utf8_lossy(&live.stdout).trim() != "0" {
+                let deadline = crate::tmux::TmuxCommandDeadline::new();
+                let live = deadline.run(self.input_command()?.args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane,
+                    "#{pane_id}|#{pane_dead}|#{session_id}|#{pane_pid}",
+                ]))?;
+                let observed = std::str::from_utf8(&live.stdout)?.trim_end();
+                let Some((session_id, pane_pid)) = observed
+                    .strip_prefix(pane)
+                    .and_then(|rest| rest.strip_prefix("|0|"))
+                    .and_then(|identity| identity.split_once('|'))
+                    .filter(|_| live.status.success())
+                else {
                     bail!("tmux pane '{pane}' is gone or dead");
+                };
+                if let Some(physical) = &self.physical {
+                    let pid = pane_pid
+                        .parse::<u32>()
+                        .context(crate::session::NativeInputError::Ownership)?;
+                    anyhow::ensure!(
+                        session_id == physical.identity.session_id
+                            && Some(pid) == physical.identity.pane_pid,
+                        crate::session::NativeInputError::Ownership
+                    );
                 }
                 self.capture_target(pane, 0)
             },
