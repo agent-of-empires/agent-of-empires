@@ -9,12 +9,12 @@ use crate::time::Timestamp;
 /// Convert session facts without runtime snapshots.
 pub(crate) fn session_response_from_instance(inst: &Instance) -> SessionResponse {
     let mut response = session_response_from_instance_with_plan(
+        &crate::acp::AgentRegistry::with_defaults(),
         inst,
         &crate::json_probe::Memo::default(),
         None,
         crate::daemon::AcpWorkerState::Absent,
-        None,
-        None,
+        (None, None),
         None,
     );
     response.context_resume = Some(context_resume_for(inst));
@@ -23,12 +23,12 @@ pub(crate) fn session_response_from_instance(inst: &Instance) -> SessionResponse
 
 /// Convert backend session facts with the request's plan and runtime snapshots.
 pub(super) fn session_response_from_instance_with_plan(
+    registry: &crate::acp::AgentRegistry,
     inst: &Instance,
     probes: &crate::json_probe::Memo,
     plan_summary: Option<PlanSummary>,
     acp_worker_state: crate::daemon::AcpWorkerState,
-    next_wakeup_at: Option<String>,
-    next_wakeup_reason: Option<String>,
+    (next_wakeup_at, next_wakeup_reason): (Option<String>, Option<String>),
     // `Some(description)` when the session has an armed `Monitor`, `None`
     // otherwise, mirroring `EventStore::latest_active_monitor`.
     active_monitor: Option<Option<String>>,
@@ -165,9 +165,7 @@ pub(super) fn session_response_from_instance_with_plan(
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(inst.tool.as_str());
-            crate::acp::AgentRegistry::with_defaults()
-                .get(resolved)
-                .is_some()
+            registry.get(resolved).is_some()
         },
         acp_session_id: inst.acp_session_id.clone(),
         import_pending: inst.import_pending == Some(true),
@@ -365,6 +363,7 @@ pub(super) fn context_resume_with<'a>(
 /// `agent_detect_as`. Built-in capability is handled separately in the
 /// constructor, so this only covers the custom case.
 pub(super) fn custom_agent_acp_capable(
+    registry: &crate::acp::AgentRegistry,
     session: &crate::session::config::SessionConfig,
     tool: &str,
 ) -> bool {
@@ -372,7 +371,9 @@ pub(super) fn custom_agent_acp_capable(
         .agent_acp_cmd
         .get(tool)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
-        || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
+        || registry
+            .inherited_base(tool, &session.agent_detect_as)
+            .is_some()
 }
 
 /// Read `path` once per request, so an input many entries share costs one read.
